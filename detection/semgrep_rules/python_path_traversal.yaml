@@ -1,0 +1,46 @@
+rules:
+  - id: py-path-traversal-join-open
+    languages: [python]
+    severity: WARNING
+    metadata:
+      cwe: "CWE-22"
+      category: security
+    message: >-
+      A file path is built by joining a base directory with a variable and
+      then opened. If the variable can contain "../" segments or an
+      absolute path and is not validated/contained beforehand, this is
+      path traversal. Confirm whether the code checks the resolved path
+      stays inside the base directory (e.g. os.path.realpath +
+      os.path.commonpath) before this point.
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $P = os.path.join($BASE, $NAME)
+              with open($P, ...) as $F:
+                  ...
+          - pattern: |
+              $P = os.path.join($BASE, $NAME)
+              ...
+              open($P, ...)
+          - pattern: open(os.path.join($BASE, $NAME), ...)
+
+  - id: py-path-traversal-fstring-open
+    languages: [python]
+    severity: WARNING
+    metadata:
+      cwe: "CWE-22"
+      category: security
+    message: >-
+      A file path is built with an f-string containing a variable and then
+      opened, with no visible containment check. Confirm the variable
+      can't introduce "../" segments or an absolute path.
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $P = f"...{$NAME}..."
+              with open($P, ...) as $F:
+                  ...
+          - pattern: |
+              $P = f"...{$NAME}..."
+              ...
+              open($P, ...)

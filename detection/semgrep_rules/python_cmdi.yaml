@@ -1,0 +1,47 @@
+rules:
+  - id: py-cmdi-os-system
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: "CWE-78"
+      category: security
+    message: >-
+      os.system() runs its argument through the shell. If any part of the
+      command string is built from a variable, this is OS command injection.
+      Use subprocess.run([...], shell=False) with an argument list instead.
+    patterns:
+      - pattern-either:
+          - pattern: os.system($A + $B)
+          - pattern: os.system(f"...{$X}...")
+          - pattern: os.system($A % $B)
+          - pattern: os.system($A.format(...))
+          - pattern: |
+              $CMD = $A + $B
+              ...
+              os.system($CMD)
+          - pattern: |
+              $CMD = f"...{$X}..."
+              ...
+              os.system($CMD)
+
+  - id: py-cmdi-subprocess-shell-true
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: "CWE-78"
+      category: security
+    message: >-
+      subprocess call uses shell=True with a command string built from a
+      variable. This runs the string through /bin/sh, so shell
+      metacharacters (; | & $() `` ) in the variable are interpreted, not
+      treated as literal text. Use shell=False with an argument list.
+    patterns:
+      - pattern-either:
+          - pattern: subprocess.run(f"...{$X}...", shell=True, ...)
+          - pattern: subprocess.run($A + $B, shell=True, ...)
+          - pattern: subprocess.call(f"...{$X}...", shell=True, ...)
+          - pattern: subprocess.Popen(f"...{$X}...", shell=True, ...)
+          - pattern: |
+              $CMD = f"...{$X}..."
+              ...
+              subprocess.run($CMD, shell=True, ...)

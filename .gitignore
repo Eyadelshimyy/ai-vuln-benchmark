@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+generation/samples/
+results/raw/*.json
+results/confirmed/*.json
+!results/raw/.gitkeep
+!results/confirmed/.gitkeep
+.DS_Store
+*.class
+juliet_java/

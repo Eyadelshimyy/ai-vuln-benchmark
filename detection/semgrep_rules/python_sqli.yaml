@@ -1,0 +1,42 @@
+rules:
+  - id: py-sqli-string-concat
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: "CWE-89"
+      category: security
+    message: >-
+      A SQL query is built with string concatenation ('+') that includes a
+      variable. If any part of that variable is influenced by untrusted
+      input, this is SQL injection. Use parameterized queries instead
+      (cursor.execute(query, params)).
+    patterns:
+      - pattern-either:
+          - pattern: $CUR.execute($A + $B, ...)
+          - pattern: |
+              $Q = $A + $B
+              ...
+              $CUR.execute($Q, ...)
+
+  - id: py-sqli-fstring-or-format
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: "CWE-89"
+      category: security
+    message: >-
+      A SQL query is built with an f-string or .format()/％ formatting
+      containing a variable. This interpolates the variable's value
+      directly into SQL syntax. Use parameterized queries instead.
+    patterns:
+      - pattern-either:
+          - pattern: $CUR.execute(f"...{$X}...", ...)
+          - pattern: |
+              $Q = f"...{$X}..."
+              ...
+              $CUR.execute($Q, ...)
+          - pattern: $CUR.execute("...".format(...), ...)
+          - pattern: |
+              $Q = "...".format(...)
+              ...
+              $CUR.execute($Q, ...)
