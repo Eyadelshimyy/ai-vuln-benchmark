@@ -1,0 +1,37 @@
+{
+  "ghsa_id": "GHSA-7952-gx68-cjqr",
+  "cve_id": "CVE-2026-65829",
+  "cwe": "CWE-22",
+  "summary": "MPXJ: Potential Path Traversal Vulnerability in Primavera P3 PRX and SureTrak STX readers",
+  "severity": "medium",
+  "packages": [
+    "MPXJ.Net",
+    "mpxj",
+    "mpxj",
+    "net.sf.mpxj",
+    "net.sf.mpxj-for-csharp",
+    "net.sf.mpxj-for-vb",
+    "net.sf.mpxj:mpxj"
+  ],
+  "vulnerable_ranges": [
+    ">= 7.3.0, < 16.5.0",
+    ">= 7.3.0, < 16.5.0",
+    ">= 7.3.0, < 16.5.0",
+    ">= 7.3.0, < 16.5.0",
+    ">= 7.3.0, < 16.5.0",
+    ">= 7.3.0, < 16.5.0",
+    ">= 7.3.0, < 16.5.0"
+  ],
+  "advisory_url": "https://github.com/advisories/GHSA-7952-gx68-cjqr",
+  "commits": [
+    {
+      "url": "https://github.com/joniles/mpxj/commit/4347315afab1ef5a2907978a754fbc5b0ff58e6f",
+      "owner": "joniles",
+      "repo": "mpxj",
+      "sha": "4347315afab1ef5a2907978a754fbc5b0ff58e6f",
+      "parent_sha": "4785c84553081796e8aaa206ddbdb10885736a59",
+      "message": "PRX/STX: fix path traversal vulnerability",
+      "files": []
+    }
+  ]
+}

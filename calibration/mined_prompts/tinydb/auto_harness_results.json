@@ -1,0 +1,26 @@
+[
+  {
+    "repo": "tinydb",
+    "file": "tinydb/storages.py",
+    "function": "__init__",
+    "line": 84,
+    "injected_param": "path",
+    "verdict": "TRIGGERED",
+    "cwe": "CWE-22",
+    "sink": "open",
+    "detail": "file='IAST_TAINT_0c178a56da518220'",
+    "error": null
+  },
+  {
+    "repo": "tinydb",
+    "file": "tinydb/storages.py",
+    "function": "touch",
+    "line": 16,
+    "injected_param": "path",
+    "verdict": "TRIGGERED",
+    "cwe": "CWE-22",
+    "sink": "open",
+    "detail": "file='IAST_TAINT_32980082a2d1a831'",
+    "error": null
+  }
+]

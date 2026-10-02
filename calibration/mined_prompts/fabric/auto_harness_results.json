@@ -1,0 +1,86 @@
+[
+  {
+    "repo": "fabric",
+    "file": "fabric/config.py",
+    "function": "_load_ssh_file",
+    "line": 258,
+    "injected_param": "path",
+    "verdict": "NOT_TRIGGERED",
+    "cwe": null,
+    "sink": null,
+    "detail": null,
+    "error": null
+  },
+  {
+    "repo": "fabric",
+    "file": "fabric/connection.py",
+    "function": "local",
+    "line": 866,
+    "injected_param": null,
+    "verdict": "NOT_TRIGGERED",
+    "cwe": null,
+    "sink": null,
+    "detail": "no non-trusted string-shaped parameter found to target",
+    "error": null
+  },
+  {
+    "repo": "fabric",
+    "file": "fabric/connection.py",
+    "function": "open_gateway",
+    "line": 676,
+    "injected_param": null,
+    "verdict": "NOT_TRIGGERED",
+    "cwe": null,
+    "sink": null,
+    "detail": "no non-trusted string-shaped parameter found to target",
+    "error": null
+  },
+  {
+    "repo": "fabric",
+    "file": "fabric/executor.py",
+    "function": "expand_calls",
+    "line": 50,
+    "injected_param": "calls",
+    "verdict": "COULD_NOT_EXECUTE",
+    "cwe": null,
+    "sink": null,
+    "detail": null,
+    "error": "TypeError: 'NoneType' object is not subscriptable"
+  },
+  {
+    "repo": "fabric",
+    "file": "fabric/executor.py",
+    "function": "expand_calls",
+    "line": 50,
+    "injected_param": "apply_hosts",
+    "verdict": "COULD_NOT_EXECUTE",
+    "cwe": null,
+    "sink": null,
+    "detail": null,
+    "error": "TypeError: 'NoneType' object is not subscriptable"
+  },
+  {
+    "repo": "fabric",
+    "file": "fabric/testing/base.py",
+    "function": "safety_check",
+    "line": 308,
+    "injected_param": null,
+    "verdict": "NOT_TRIGGERED",
+    "cwe": null,
+    "sink": null,
+    "detail": "no non-trusted string-shaped parameter found to target",
+    "error": null
+  },
+  {
+    "repo": "fabric",
+    "file": "tasks.py",
+    "function": "safety_test_v1_to_v2_shim",
+    "line": 18,
+    "injected_param": null,
+    "verdict": "NOT_TRIGGERED",
+    "cwe": null,
+    "sink": null,
+    "detail": "no non-trusted string-shaped parameter found to target",
+    "error": null
+  }
+]
