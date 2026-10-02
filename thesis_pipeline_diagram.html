@@ -1,0 +1,256 @@
+<title>Thesis Pipeline Map</title>
+<style>
+  /* layout: two source tracks converge on one detect->confirm pipeline, then split into two different results */
+  :root {
+    --bg: #faf9f6;
+    --surface: #ffffff;
+    --border: #dcd7cc;
+    --fg: #201d17;
+    --muted: #6b6558;
+    --accent: #b5502f;
+    --accent-soft: #f2e4dc;
+    --ok: #3f7a52;
+    --font-display: 'Fraunces', Georgia, serif;
+    --font-body: 'Inter', -apple-system, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #17140f;
+      --surface: #211d16;
+      --border: #3a352a;
+      --fg: #f1ede3;
+      --muted: #a89f8c;
+      --accent: #e08a5f;
+      --accent-soft: #3a2820;
+      --ok: #7cbf8f;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #17140f;
+    --surface: #211d16;
+    --border: #3a352a;
+    --fg: #f1ede3;
+    --muted: #a89f8c;
+    --accent: #e08a5f;
+    --accent-soft: #3a2820;
+    --ok: #7cbf8f;
+    color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-body);
+    padding-inline: 16px;
+    padding-block: 32px;
+    max-width: 920px;
+    margin: 0 auto;
+  }
+  link[href*="fonts.googleapis"] { }
+  h1 {
+    font-family: var(--font-display);
+    font-size: clamp(1.5rem, 4vw, 2.1rem);
+    font-weight: 600;
+    margin: 0 0 4px;
+    text-wrap: balance;
+  }
+  .subtitle {
+    color: var(--muted);
+    font-size: 0.95rem;
+    margin: 0 0 28px;
+    max-width: 65ch;
+  }
+  figure { margin: 0 0 28px; }
+  figcaption {
+    font-size: 0.85rem;
+    color: var(--muted);
+    margin-top: 10px;
+    max-width: 65ch;
+  }
+  svg { width: 100%; height: auto; display: block; }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    font-size: 0.8rem;
+    color: var(--muted);
+    margin: 0 0 28px;
+    padding: 12px 16px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+  }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .steps {
+    display: grid;
+    gap: 12px;
+    margin-top: 8px;
+  }
+  .step {
+    border: 1px solid var(--border);
+    background: var(--surface);
+    border-radius: 10px;
+    padding: 14px 16px;
+    display: flex;
+    gap: 14px;
+    align-items: baseline;
+  }
+  .step.active { border-color: var(--accent); background: var(--accent-soft); }
+  .step-num {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--muted);
+    flex-shrink: 0;
+    width: 1.5em;
+  }
+  .step.active .step-num { color: var(--accent); font-weight: 600; }
+  .step-body h3 {
+    margin: 0 0 3px;
+    font-size: 0.95rem;
+    font-weight: 600;
+  }
+  .step-body p { margin: 0; font-size: 0.85rem; color: var(--muted); }
+  code {
+    font-family: var(--font-mono);
+    font-size: 0.85em;
+    background: var(--accent-soft);
+    padding: 0.1em 0.4em;
+    border-radius: 4px;
+  }
+</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+
+<h1>Thesis pipeline: from real code to a confirmed-exploit number</h1>
+<p class="subtitle">Two separate data sources feed the same detect-then-confirm pipeline, and each produces a different kind of result. This is where the current work (fetching real CVEs) sits in the whole picture.</p>
+
+<figure>
+  <svg viewBox="0 0 900 560" role="img" aria-label="Diagram: real CVE advisories and real-repo LLM generations both flow into a shared SAST-then-DAST pipeline; the CVE path produces a validation accuracy number, the LLM path produces the thesis's vulnerability and exploit-confirmation rates.">
+    <defs>
+      <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+      </marker>
+    </defs>
+    <style>
+      text { font-family: Inter, sans-serif; fill: currentColor; }
+      .lbl { font-size: 12px; }
+      .lbl-sm { font-size: 10.5px; fill: currentColor; opacity: 0.65; }
+      .box { fill: var(--surface); stroke: currentColor; stroke-width: 1.3; opacity: 0.9; }
+      .box-active { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.6; }
+      .edge { stroke: currentColor; stroke-width: 1.3; fill: none; opacity: 0.75; marker-end: url(#arrow); }
+    </style>
+
+    <!-- Source A: real CVEs -->
+    <rect class="box-active" x="30" y="20" width="270" height="70" rx="8"/>
+    <text class="lbl" x="165" y="46" text-anchor="middle" font-weight="600">Real CVE advisories</text>
+    <text class="lbl-sm" x="165" y="63" text-anchor="middle">GitHub Security Advisories, filtered</text>
+    <text class="lbl-sm" x="165" y="77" text-anchor="middle">by ecosystem=pip + CWE-89/78/22</text>
+
+    <!-- Source B: repo mining -->
+    <rect class="box" x="600" y="20" width="270" height="70" rx="8"/>
+    <text class="lbl" x="735" y="46" text-anchor="middle" font-weight="600">Real repo signatures</text>
+    <text class="lbl-sm" x="735" y="63" text-anchor="middle">mined from popular PyPI repos,</text>
+    <text class="lbl-sm" x="735" y="77" text-anchor="middle">fed to multiple LLMs to regenerate</text>
+
+    <line class="edge" x1="165" y1="90" x2="165" y2="140"/>
+    <text class="lbl-sm" x="180" y="118">fix-commit diff</text>
+
+    <line class="edge" x1="735" y1="90" x2="735" y2="140"/>
+    <text class="lbl-sm" x="655" y="118">generated code</text>
+
+    <!-- Held-out set A -->
+    <rect class="box-active" x="30" y="140" width="270" height="60" rx="8"/>
+    <text class="lbl" x="165" y="164" text-anchor="middle" font-weight="600">Held-out ground truth</text>
+    <text class="lbl-sm" x="165" y="181" text-anchor="middle">pre-fix vulnerable functions, labeled</text>
+
+    <!-- AI-gen set B -->
+    <rect class="box" x="600" y="140" width="270" height="60" rx="8"/>
+    <text class="lbl" x="735" y="164" text-anchor="middle" font-weight="600">AI-generated sample set</text>
+    <text class="lbl-sm" x="735" y="181" text-anchor="middle">per model, per CWE-targeted prompt</text>
+
+    <!-- convergence -->
+    <line class="edge" x1="165" y1="200" x2="420" y2="255"/>
+    <line class="edge" x1="735" y1="200" x2="480" y2="255"/>
+
+    <!-- Shared pipeline -->
+    <rect class="box" x="280" y="260" width="340" height="70" rx="8"/>
+    <text class="lbl" x="450" y="286" text-anchor="middle" font-weight="600">SAST triage</text>
+    <text class="lbl-sm" x="450" y="303" text-anchor="middle"><tspan font-family="JetBrains Mono, monospace">taint_scan.py</tspan> flags candidate sinks</text>
+    <text class="lbl-sm" x="450" y="318" text-anchor="middle">(source -&gt; sink, unsanitized)</text>
+
+    <line class="edge" x1="450" y1="330" x2="450" y2="370"/>
+    <text class="lbl-sm" x="466" y="354">flagged function</text>
+
+    <rect class="box" x="280" y="375" width="340" height="70" rx="8"/>
+    <text class="lbl" x="450" y="401" text-anchor="middle" font-weight="600">DAST confirmation</text>
+    <text class="lbl-sm" x="450" y="418" text-anchor="middle">exploit harness actually attacks it</text>
+    <text class="lbl-sm" x="450" y="433" text-anchor="middle">(sandboxed execution, real payload)</text>
+
+    <!-- split to two outcomes -->
+    <line class="edge" x1="380" y1="445" x2="200" y2="495"/>
+    <line class="edge" x1="520" y1="445" x2="700" y2="495"/>
+
+    <rect class="box-active" x="40" y="500" width="320" height="55" rx="8"/>
+    <text class="lbl" x="200" y="524" text-anchor="middle" font-weight="600">Validation accuracy</text>
+    <text class="lbl-sm" x="200" y="541" text-anchor="middle">tool checked against known-real CVEs</text>
+
+    <rect class="box" x="540" y="500" width="320" height="55" rx="8"/>
+    <text class="lbl" x="700" y="524" text-anchor="middle" font-weight="600">Vulnerability + exploit rate</text>
+    <text class="lbl-sm" x="700" y="541" text-anchor="middle">per model -- the thesis's actual result</text>
+  </svg>
+  <figcaption>The same detect-then-confirm pipeline runs twice, on two different inputs, for two different reasons: real CVEs prove the tool works, AI-generated code produces the thesis's findings.</figcaption>
+</figure>
+
+<div class="legend">
+  <span><span class="dot" style="background:var(--accent)"></span> where we're working right now</span>
+  <span><span class="dot" style="background:var(--muted); opacity:0.5"></span> built but not yet run against real data</span>
+</div>
+
+<div class="steps">
+  <div class="step active">
+    <div class="step-num">1</div>
+    <div class="step-body">
+      <h3>Pull real CVE ground truth <span style="color:var(--accent)">&larr; you are here</span></h3>
+      <p><code>fetch_real_cves.py</code> queries GitHub Advisories for real, disclosed pip-package vulnerabilities in your three CWEs and saves the pre-fix vulnerable code.</p>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num">2</div>
+    <div class="step-body">
+      <h3>Triage candidates by hand</h3>
+      <p>Skim the saved JSON files, keep the ones that isolate cleanly as a single vulnerable function -- this becomes your held-out test set.</p>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num">3</div>
+    <div class="step-body">
+      <h3>Run the pipeline against ground truth</h3>
+      <p><code>taint_scan.py</code> then the exploit harnesses run against the held-out set, producing a real (non-self-tuned) accuracy number.</p>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num">4</div>
+    <div class="step-body">
+      <h3>Mine realistic prompts</h3>
+      <p>Pull real function signatures/docstrings from popular repos, strip the bodies -- these become the prompts for the actual generation experiment.</p>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num">5</div>
+    <div class="step-body">
+      <h3>Generate + run the real experiment</h3>
+      <p>Multiple LLMs regenerate the stripped functions; the same pipeline runs against their output, producing per-model vulnerability and confirmed-exploit rates.</p>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num">6</div>
+    <div class="step-body">
+      <h3>Write it up</h3>
+      <p>Methodology section leans on steps 1-3 (honest validation); results section is steps 4-5 (the actual finding).</p>
+    </div>
+  </div>
+</div>
