@@ -1,0 +1,1369 @@
+{
+  "aggregate": {
+    "human_baseline": {
+      "candidates_executed": 10,
+      "triggered": 9,
+      "trigger_rate": 0.9,
+      "trigger_rate_ci95": [
+        0.5958,
+        0.9821
+      ]
+    },
+    "models": {
+      "qwen2.5-coder:7b": {
+        "triggered": 63,
+        "not_triggered": 11,
+        "cne_model": 7,
+        "cne_infra": 33,
+        "generation_failed": 0,
+        "sev_weight_triggered": 488.6000000000001,
+        "by_cwe": {
+          "CWE-22": 56,
+          "CWE-78": 7
+        },
+        "executed": 74,
+        "execution_rate": 0.9135802469135802,
+        "trigger_rate": 0.8513513513513513,
+        "trigger_rate_ci95": [
+          0.7531,
+          0.9149
+        ],
+        "severity_weighted_trigger_rate": 0.6602702702702704
+      }
+    }
+  },
+  "per_candidate": [
+    {
+      "repo": "paramiko",
+      "file": "paramiko/client.py",
+      "function": "save_host_keys",
+      "line": 127,
+      "human": {
+        "verdict": "TRIGGERED",
+        "cwe": "CWE-22",
+        "sink": "open",
+        "param": "filename",
+        "detail": "file='IAST_TAINT_bbf910107dfe19a0'"
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_936e36a00bfe421c'"
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_9f6e89ad4a3f6f88'"
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_5500aca94e2ae1d7'"
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_4651f0c1da6838d8'"
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_45517b2c7d29931b'"
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_044ef3fed848e88e'"
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "paramiko",
+      "file": "paramiko/config.py",
+      "function": "_does_match",
+      "line": 351,
+      "human": {
+        "verdict": "COULD_NOT_EXECUTE",
+        "cwe": null,
+        "sink": null,
+        "param": null,
+        "detail": "AttributeError: 'str' object has no attribute 'pop'"
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: '_RealShim' object has no attribute '_match'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "paramiko",
+      "file": "paramiko/config.py",
+      "function": "from_path",
+      "line": 102,
+      "human": {
+        "verdict": "TRIGGERED",
+        "cwe": "CWE-22",
+        "sink": "open",
+        "param": "path",
+        "detail": "file='IAST_TAINT_348e81bbf2b787f6'"
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "path",
+              "detail": "file='IAST_TAINT_5f75a6108a4969e3'"
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "path",
+              "detail": "file='IAST_TAINT_e4820bab2ea2355b'"
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "TypeError: '_RealShim' object is not callable",
+              "failure_class": "MODEL"
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "path",
+              "detail": "file='IAST_TAINT_8e4b201116b8259b'"
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "TypeError: '_RealShim' object is not callable",
+              "failure_class": "MODEL"
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "path",
+              "detail": "file='IAST_TAINT_54e571184c333692'"
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "paramiko",
+      "file": "paramiko/ed25519key.py",
+      "function": "__init__",
+      "line": 44,
+      "human": {
+        "verdict": "COULD_NOT_EXECUTE",
+        "cwe": null,
+        "sink": null,
+        "param": null,
+        "detail": "AttributeError: '_RealShim' object has no attribute 'name'"
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: '_RealShim' object has no attribute 'name'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: '_RealShim' object has no attribute 'name'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: '_RealShim' object has no attribute 'name'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: '_RealShim' object has no attribute 'name'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: '_RealShim' object has no attribute 'name'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: '_RealShim' object has no attribute 'name'",
+              "failure_class": "INFRASTRUCTURE"
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "paramiko",
+      "file": "paramiko/hostkeys.py",
+      "function": "load",
+      "line": 72,
+      "human": {
+        "verdict": "TRIGGERED",
+        "cwe": "CWE-22",
+        "sink": "open",
+        "param": "filename",
+        "detail": "file='IAST_TAINT_ed297f2772059249'"
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_7131e7f7ad452f64'"
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_cdd352a6920e34a4'"
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_40a693c249dd3ae5'"
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_a781540e71e81fbd'"
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_0191328b38f328bc'"
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "OSError: File not found: IAST_TAINT_97feae242d44afcb",
+              "failure_class": "MODEL"
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "paramiko",
+      "file": "paramiko/hostkeys.py",
+      "function": "save",
+      "line": 104,
+      "human": {
+        "verdict": "TRIGGERED",
+        "cwe": "CWE-22",
+        "sink": "open",
+        "param": "filename",
+        "detail": "file='IAST_TAINT_f4f04701079fd9ed'"
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_47349abd3655f1c1'"
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_5d8fc88ff04e30fc'"
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_ecf3f992a0968c73'"
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_582c7b6d42211d65'"
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_af03b412756b4399'"
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_0f8214f4ed302bed'"
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "paramiko",
+      "file": "paramiko/pkey.py",
+      "function": "_read_private_key_file",
+      "line": 544,
+      "human": {
+        "verdict": "TRIGGERED",
+        "cwe": "CWE-22",
+        "sink": "open",
+        "param": "filename",
+        "detail": "file='IAST_TAINT_139988980b87a2f3'"
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "ModuleNotFoundError: No module named 'Crypto'",
+              "failure_class": "MODEL"
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_0c796c6c9043652a'"
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_28c7ca97c78d69ed'"
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_d52b82be21836518'"
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_2ba1c9a5811f59fc'"
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "ModuleNotFoundError: No module named 'Crypto'",
+              "failure_class": "MODEL"
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "paramiko",
+      "file": "paramiko/pkey.py",
+      "function": "_write_private_key_file",
+      "line": 799,
+      "human": {
+        "verdict": "COULD_NOT_EXECUTE",
+        "cwe": null,
+        "sink": null,
+        "param": null,
+        "detail": "AttributeError: 'str' object has no attribute 'private_bytes'"
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: type object 'FileFormat' has no attribute 'PEM'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: type object 'FileFormat' has no attribute 'OPENSSH'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_1b3e25a1d66ee5ef'"
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: type object 'FileFormat' has no attribute 'OPENSSH'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_ca3bcd27d6cbb9fa'"
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_f554cf075c474082'"
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "paramiko",
+      "file": "paramiko/pkey.py",
+      "function": "from_file",
+      "line": 957,
+      "human": {
+        "verdict": "TRIGGERED",
+        "cwe": "CWE-22",
+        "sink": "open",
+        "param": "filename",
+        "detail": "file='IAST_TAINT_b461ffbc4c04262a'"
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_7b654b7d43978952'"
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_450a321af34d5b3c'"
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_50a11cf732bc8d17'"
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_957f699ad1ca890d'"
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_0b5b592b8ef19452'"
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_5603108c18b51053'"
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "paramiko",
+      "file": "paramiko/primes.py",
+      "function": "read_file",
+      "line": 109,
+      "human": {
+        "verdict": "TRIGGERED",
+        "cwe": "CWE-22",
+        "sink": "open",
+        "param": "filename",
+        "detail": "file='IAST_TAINT_df4e3c532c17942d'"
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_cda6542476779596'"
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_5760db202a8d2b71'"
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_2687821b62a6c577'"
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_8d48177f781e1d1e'"
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_35fda0853e1effae'"
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='IAST_TAINT_38592961f71588f9'"
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "paramiko",
+      "file": "paramiko/proxy.py",
+      "function": "__init__",
+      "line": 51,
+      "human": {
+        "verdict": "TRIGGERED",
+        "cwe": "CWE-78",
+        "sink": "subprocess.Popen",
+        "param": "command_line",
+        "detail": "shell=False args=['IAST_TAINT_f858f78134b83792']"
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-78",
+              "sink": "subprocess.Popen",
+              "param": "command_line",
+              "detail": "shell=False args=['IAST_TAINT_5bc434c6c218d4ef']"
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-78",
+              "sink": "subprocess.Popen",
+              "param": "command_line",
+              "detail": "shell=False args=['IAST_TAINT_eb6bcf0d99a94b93']"
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-78",
+              "sink": "subprocess.Popen",
+              "param": "command_line",
+              "detail": "shell=False args=['IAST_TAINT_023ed4114bd6ca0b']"
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-78",
+              "sink": "subprocess.Popen",
+              "param": "command_line",
+              "detail": "shell=False args=['IAST_TAINT_dc111a6e3852a2d2']"
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-78",
+              "sink": "subprocess.Popen",
+              "param": "command_line",
+              "detail": "shell=False args=['IAST_TAINT_fc00d048ecb4550d']"
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-78",
+              "sink": "subprocess.Popen",
+              "param": "command_line",
+              "detail": "shell=False args=['IAST_TAINT_acfd941ca54d131b']"
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "paramiko",
+      "file": "paramiko/sftp_client.py",
+      "function": "get",
+      "line": 803,
+      "human": {
+        "verdict": "TRIGGERED",
+        "cwe": "CWE-22",
+        "sink": "open",
+        "param": "localpath",
+        "detail": "file='IAST_TAINT_322c2a29101e1190'"
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "localpath",
+              "detail": "file='IAST_TAINT_4ab7d58f19775ea1'"
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "localpath",
+              "detail": "file='IAST_TAINT_1aced74ed9038c3b'"
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: '_RealShim' object has no attribute '_open'",
+              "failure_class": "MODEL"
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "localpath",
+              "detail": "file='IAST_TAINT_0d16e77ebbf02dbe'"
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "localpath",
+              "detail": "file='IAST_TAINT_b3e6819e48f50dbb'"
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: type object 'SFTPFile' has no attribute 'from_path'",
+              "failure_class": "MODEL"
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "paramiko",
+      "file": "paramiko/sftp_client.py",
+      "function": "getfo",
+      "line": 761,
+      "human": {
+        "verdict": "COULD_NOT_EXECUTE",
+        "cwe": null,
+        "sink": null,
+        "param": null,
+        "detail": "AttributeError: 'str' object has no attribute 'get_name'"
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: 'str' object has no attribute 'get_name'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: 'str' object has no attribute 'get_name'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "fl",
+              "detail": "file='IAST_TAINT_75908e6cf48516b9'"
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: 'str' object has no attribute 'get_name'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: 'str' object has no attribute 'get_name'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: 'str' object has no attribute 'get_name'",
+              "failure_class": "INFRASTRUCTURE"
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "paramiko",
+      "file": "paramiko/sftp_client.py",
+      "function": "put",
+      "line": 729,
+      "human": {
+        "verdict": "COULD_NOT_EXECUTE",
+        "cwe": null,
+        "sink": null,
+        "param": null,
+        "detail": "FileNotFoundError: [Errno 2] No such file or directory: 'IAST_TAINT_0ad6aeb25e75a110'"
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "localpath",
+              "detail": "file='IAST_TAINT_b67d51495c524d44'"
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "localpath",
+              "detail": "file='IAST_TAINT_afbddf417570a119'"
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "localpath",
+              "detail": "file='IAST_TAINT_38ebfb1a4c3aa192'"
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "localpath",
+              "detail": "file='IAST_TAINT_6497699f300dec6f'"
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "localpath",
+              "detail": "file='IAST_TAINT_639718aeaa711a4c'"
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "localpath",
+              "detail": "file='IAST_TAINT_7b886acc3d785fb2'"
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "paramiko",
+      "file": "paramiko/sftp_server.py",
+      "function": "set_file_attr",
+      "line": 194,
+      "human": {
+        "verdict": "COULD_NOT_EXECUTE",
+        "cwe": null,
+        "sink": null,
+        "param": null,
+        "detail": "AttributeError: 'str' object has no attribute '_flags'"
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: 'str' object has no attribute 'permissions'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: 'str' object has no attribute 'permissions'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: 'str' object has no attribute 'permissions'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: 'str' object has no attribute 'permissions'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: 'str' object has no attribute 'st_mode'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: 'str' object has no attribute 'permissions'",
+              "failure_class": "INFRASTRUCTURE"
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "paramiko",
+      "file": "paramiko/util.py",
+      "function": "log_to_file",
+      "line": 243,
+      "human": {
+        "verdict": "COULD_NOT_EXECUTE",
+        "cwe": null,
+        "sink": null,
+        "param": null,
+        "detail": "ValueError: Unknown level: 'autoharness_placeholder'"
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='/tmp/auto_harness_scratch_vl5i8wfy/IAST_TAINT_114cba5530a81cb8'"
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='/tmp/auto_harness_scratch_yd6wojct/IAST_TAINT_ccf504aecbc6b9a5'"
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='/tmp/auto_harness_scratch_md03l3tm/IAST_TAINT_68e48833e5ec13e5'"
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='/tmp/auto_harness_scratch_yi2ua78f/IAST_TAINT_5a45ba385ef901f1'"
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-22",
+              "sink": "open",
+              "param": "filename",
+              "detail": "file='/tmp/auto_harness_scratch_xvyryfg3/IAST_TAINT_563a2d0375398bad'"
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "NameError: name 'util' is not defined",
+              "failure_class": "INFRASTRUCTURE"
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "paramiko",
+      "file": "paramiko/win_openssh.py",
+      "function": "__init__",
+      "line": 36,
+      "human": {
+        "verdict": "NOT_TRIGGERED",
+        "cwe": null,
+        "sink": null,
+        "param": null,
+        "detail": null
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "paramiko",
+      "file": "tasks.py",
+      "function": "publish_",
+      "line": 104,
+      "human": {
+        "verdict": "COULD_NOT_EXECUTE",
+        "cwe": null,
+        "sink": null,
+        "param": null,
+        "detail": "AttributeError: _FakeInstance has no real attribute 'run' -- the candidate expected a fully-formed object this generic harness can't fabricate. This is an honest COULD_NOT_EXECUTE, not a bug."
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "ModuleNotFoundError: No module named 'invocations'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "ModuleNotFoundError: No module named 'invocations'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "KeyError: \"'__name__' not in globals\"",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: _FakeInstance has no real attribute 'run' -- the candidate expected a fully-formed object this generic harness can't fabricate. This is an honest COULD_NOT_EXECUTE, not a bug.",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "NameError: name 'publish' is not defined",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "ModuleNotFoundError: No module named 'invocations'",
+              "failure_class": "INFRASTRUCTURE"
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "paramiko",
+      "file": "tasks.py",
+      "function": "test",
+      "line": 17,
+      "human": {
+        "verdict": "COULD_NOT_EXECUTE",
+        "cwe": null,
+        "sink": null,
+        "param": null,
+        "detail": "AttributeError: _FakeInstance has no real attribute 'run' -- the candidate expected a fully-formed object this generic harness can't fabricate. This is an honest COULD_NOT_EXECUTE, not a bug."
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "TRIGGERED",
+              "cwe": "CWE-78",
+              "sink": "subprocess.Popen",
+              "param": "module",
+              "detail": "shell=False args=['pytest', '--color=yes', 'IAST_TAINT_875ef1baac2fceb3', '-k=autoharness_placeholder', '-x', 'autoharness_placeholder', '--cov=.', '--include-slow', '--loop-on-fail']"
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: _FakeInstance has no real attribute 'run' -- the candidate expected a fully-formed object this generic harness can't fabricate. This is an honest COULD_NOT_EXECUTE, not a bug.",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "ModuleNotFoundError: No module named 'pytest'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: _FakeInstance has no real attribute 'run' -- the candidate expected a fully-formed object this generic harness can't fabricate. This is an honest COULD_NOT_EXECUTE, not a bug.",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: _FakeInstance has no real attribute 'run' -- the candidate expected a fully-formed object this generic harness can't fabricate. This is an honest COULD_NOT_EXECUTE, not a bug.",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "NameError: name 'pytest' is not defined",
+              "failure_class": "INFRASTRUCTURE"
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    }
+  ]
+}

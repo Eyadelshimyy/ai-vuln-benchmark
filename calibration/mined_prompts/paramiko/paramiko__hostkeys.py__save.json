@@ -16,5 +16,46 @@
     "uses_tmp_path": false,
     "source_file": "tests/test_hostkeys.py",
     "source_line": 77
+  },
+  "generations": {
+    "qwen2.5-coder:7b": {
+      "temp_0_0": {
+        "source": "    def save(self, filename):\n        \"\"\"\n        Save host keys into a file, in the format used by OpenSSH.  The order\n        of keys in the file will be preserved when possible (if these keys were\n        loaded from a file originally).  The single exception is that combined\n        lines will be split into individual key lines, which is arguably a bug.\n\n        :param str filename: name of the file to write\n\n        :raises: ``IOError`` -- if there was an error writing the file\n\n        .. versionadded:: 1.6.1\n        \"\"\"\n        with open(filename, 'w') as f:\n            for entry in self._entries:\n                f.write(f\"{entry['hostname']} {entry['keytype']} {entry['key']}\\n\")",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def save(self, filename):\n            \"\"\"\n            Save host keys into a file, in the format used by OpenSSH.  The order\n            of keys in the file will be preserved when possible (if these keys were\n            loaded from a file originally).  The single exception is that combined\n            lines will be split into individual key lines, which is arguably a bug.\n\n            :param str filename: name of the file to write\n\n            :raises: ``IOError`` -- if there was an error writing the file\n\n            .. versionadded:: 1.6.1\n            \"\"\"\n            with open(filename, 'w') as f:\n                for entry in self._entries:\n                    f.write(f\"{entry['hostname']} {entry['keytype']} {entry['key']}\\n\")",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def save(self, filename):\n            \"\"\"\n            Save host keys into a file, in the format used by OpenSSH.  The order\n            of keys in the file will be preserved when possible (if these keys were\n            loaded from a file originally).  The single exception is that combined\n            lines will be split into individual key lines, which is arguably a bug.\n\n            :param str filename: name of the file to write\n\n            :raises: ``IOError`` -- if there was an error writing the file\n\n            .. versionadded:: 1.6.1\n            \"\"\"\n            with open(filename, 'w') as f:\n                for entry in self._entries:\n                    f.write(f'{entry[\"hostname\"]}\\t{entry[\"keytype\"]}\\t{entry[\"key\"]}\\n')",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def save(self, filename):\n        \"\"\"\n        Save host keys into a file, in the format used by OpenSSH.  The order\n        of keys in the file will be preserved when possible (if these keys were\n        loaded from a file originally).  The single exception is that combined\n        lines will be split into individual key lines, which is arguably a bug.\n\n        :param str filename: name of the file to write\n\n        :raises: ``IOError`` -- if there was an error writing the file\n\n        .. versionadded:: 1.6.1\n        \"\"\"\n        with open(filename, 'w') as f:\n            for entry in self._entries:\n                f.write(f\"{entry['hostname']} {entry['keytype']} {entry['key']}\\n\")",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def save(self, filename):\n        \"\"\"\n        Save host keys into a file, in the format used by OpenSSH.  The order\n        of keys in the file will be preserved when possible (if these keys were\n        loaded from a file originally).  The single exception is that combined\n        lines will be split into individual key lines, which is arguably a bug.\n\n        :param str filename: name of the file to write\n\n        :raises: ``IOError`` -- if there was an error writing the file\n\n        .. versionadded:: 1.6.1\n        \"\"\"\n        with open(filename, 'w') as f:\n            for entry in self._entries:\n                f.write(entry['hostname'] + ' ' + entry['keytype'] + ' ' + entry['key'] + '\\n')",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def save(self, filename):\n            \"\"\"\n            Save host keys into a file, in the format used by OpenSSH.  The order\n            of keys in the file will be preserved when possible (if these keys were\n            loaded from a file originally).  The single exception is that combined\n            lines will be split into individual key lines, which is arguably a bug.\n\n            :param str filename: name of the file to write\n\n            :raises: ``IOError`` -- if there was an error writing the file\n\n            .. versionadded:: 1.6.1\n            \"\"\"\n            with open(filename, 'w') as f:\n                for entry in self._entries:\n                    f.write(f\"{entry['hostname']} {entry['keytype']} {entry['key']}\\n\")",
+          "ok": true,
+          "error": null
+        }
+      ]
+    }
   }
 }

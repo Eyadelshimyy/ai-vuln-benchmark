@@ -16,5 +16,46 @@
     "uses_tmp_path": false,
     "source_file": "tests/test_config.py",
     "source_line": 438
+  },
+  "generations": {
+    "qwen2.5-coder:7b": {
+      "temp_0_0": {
+        "source": "    def _does_match(\n        self, match_list, target_hostname, canonical, final, options\n    ):\n        \"\"\"Implement the `_does_match` function (parameters: match_list, target_hostname, canonical, final, options).\"\"\"\n        for pattern in match_list:\n            if pattern.startswith(\"!\"):\n                if self._match(pattern[1:], target_hostname, canonical, final, options):\n                    return False\n            elif self._match(pattern, target_hostname, canonical, final, options):\n                return True\n        return False\n\n    def _match(self, pattern, target_hostname, canonical, final, options):\n        \"\"\"Helper function to match a pattern against the target hostname.\"\"\"\n        if pattern == \"*\":\n            return True\n        elif pattern.startswith(\"*.\"):\n            return target_hostname.endswith(pattern[2:])\n        elif pattern.startswith(\"+\" if canonical else \"-\"):\n            return pattern[1:] == target_hostname\n        elif pattern == target_hostname:\n            return True\n        return False",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def _does_match(\n        self, match_list, target_hostname, canonical, final, options\n    ):\n        \"\"\"Implement the `_does_match` function (parameters: match_list, target_hostname, canonical, final, options).\"\"\"\n        for pattern in match_list:\n            if isinstance(pattern, str):\n                if pattern == target_hostname or pattern == canonical:\n                    return True\n            elif isinstance(pattern, dict):\n                for key, value in pattern.items():\n                    if key == \"Host\" and (value == target_hostname or value == canonical):\n                        return True\n                    elif key == \"Host\" and value.startswith(\"!\") and (value[1:] == target_hostname or value[1:] == canonical):\n                        return False\n        return final",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def _does_match(\n        self, match_list, target_hostname, canonical, final, options\n    ):\n        \"\"\"Implement the `_does_match` function (parameters: match_list, target_hostname, canonical, final, options).\"\"\"\n        for pattern in match_list:\n            if pattern.startswith(\"!\"):\n                if self._match(pattern[1:], target_hostname, canonical, final):\n                    return False\n            elif self._match(pattern, target_hostname, canonical, final):\n                return True\n        return self._match(\"\", target_hostname, canonical, final)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def _does_match(\n        self, match_list, target_hostname, canonical, final, options\n    ):\n        \"\"\"\n        Check if the given target hostname matches any patterns in the match_list.\n\n        Parameters:\n        match_list (list of str): List of patterns to match against.\n        target_hostname (str): The hostname to check.\n        canonical (str): The canonical hostname.\n        final (bool): Whether this is the final match.\n        options (dict): Additional options.\n\n        Returns:\n        bool: True if the target hostname matches any pattern, False otherwise.\n        \"\"\"\n        for pattern in match_list:\n            if pattern.startswith(\"!\"):\n                if fnmatch.fnmatch(target_hostname, pattern[1:]) or fnmatch.fnmatch(canonical, pattern[1:]):\n                    return False\n            elif fnmatch.fnmatch(target_hostname, pattern) or fnmatch.fnmatch(canonical, pattern):\n                return True\n        return final and len(match_list) > 0",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def _does_match(\n        self, match_list, target_hostname, canonical, final, options\n    ):\n        \"\"\"Implement the `_does_match` function (parameters: match_list, target_hostname, canonical, final, options).\"\"\"\n        for pattern in match_list:\n            if pattern.startswith(\"!\"):\n                if fnmatch.fnmatch(target_hostname, pattern[1:]):\n                    return False\n            elif fnmatch.fnmatch(target_hostname, pattern):\n                return True\n        return False",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def _does_match(\n        self, match_list, target_hostname, canonical, final, options\n    ):\n        \"\"\"Implement the `_does_match` function (parameters: match_list, target_hostname, canonical, final, options).\"\"\"\n        for pattern in match_list:\n            if pattern.startswith(\"!\"):\n                if fnmatch.fnmatch(target_hostname, pattern[1:]):\n                    return False\n            elif fnmatch.fnmatch(target_hostname, pattern):\n                return True\n        return final",
+          "ok": true,
+          "error": null
+        }
+      ]
+    }
   }
 }

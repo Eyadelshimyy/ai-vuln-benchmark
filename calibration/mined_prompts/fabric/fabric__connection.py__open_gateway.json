@@ -16,5 +16,46 @@
     "uses_tmp_path": false,
     "source_file": "tests/connection.py",
     "source_line": 76
+  },
+  "generations": {
+    "qwen2.5-coder:7b": {
+      "temp_0_0": {
+        "source": "    def open_gateway(self):\n            \"\"\"\n            Obtain a socket-like object from `gateway`.\n\n            :returns:\n                A ``direct-tcpip`` `paramiko.channel.Channel`, if `gateway` was a\n                `.Connection`; or a `~paramiko.proxy.ProxyCommand`, if `gateway`\n                was a string.\n\n            .. versionadded:: 2.0\n            \"\"\"\n            if isinstance(self.gateway, Connection):\n                return self.gateway.client.get_transport().open_channel(\n                    \"direct-tcpip\", (self.host, self.port), self.gateway.host\n                )\n            elif isinstance(self.gateway, str):\n                return ProxyCommand(self.gateway)\n            else:\n                return None",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def open_gateway(self):\n        \"\"\"\n        Obtain a socket-like object from `gateway`.\n\n        :returns:\n            A ``direct-tcpip`` `paramiko.channel.Channel`, if `gateway` was a\n            `.Connection`; or a `~paramiko.proxy.ProxyCommand`, if `gateway`\n            was a string.\n\n        .. versionadded:: 2.0\n        \"\"\"\n        if isinstance(self.gateway, Connection):\n            return self.gateway.client.get_transport().open_channel(\n                \"direct-tcpip\", (self.host, self.port), (self.gateway.host, self.gateway.port)\n            )\n        elif isinstance(self.gateway, str):\n            return ProxyCommand(self.gateway)\n        else:\n            return None",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def open_gateway(self):\n        \"\"\"\n        Obtain a socket-like object from `gateway`.\n\n        :returns:\n            A ``direct-tcpip`` `paramiko.channel.Channel`, if `gateway` was a\n            `.Connection`; or a `~paramiko.proxy.ProxyCommand`, if `gateway`\n            was a string.\n\n        .. versionadded:: 2.0\n        \"\"\"\n        if isinstance(self.gateway, Connection):\n            return self.gateway.client.get_transport().open_channel(\n                \"direct-tcpip\", (self.host, self.port), (self.gateway.host, self.gateway.port)\n            )\n        elif isinstance(self.gateway, str):\n            return ProxyCommand(self.gateway, (self.host, self.port))\n        else:\n            raise ValueError(\"Invalid gateway type\")",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def open_gateway(self):\n        \"\"\"\n        Obtain a socket-like object from `gateway`.\n\n        :returns:\n            A ``direct-tcpip`` `paramiko.channel.Channel`, if `gateway` was a\n            `.Connection`; or a `~paramiko.proxy.ProxyCommand`, if `gateway` was a\n            string.\n\n        .. versionadded:: 2.0\n        \"\"\"\n        if isinstance(self.gateway, Connection):\n            return self.gateway.client.get_transport().open_channel(\"direct-tcpip\", (self.host, self.port), (self.gateway.host, self.gateway.port))\n        elif isinstance(self.gateway, str):\n            return ProxyCommand(self.gateway)\n        else:\n            raise ValueError(\"Invalid gateway type\")",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def open_gateway(self):\n            \"\"\"\n            Obtain a socket-like object from `gateway`.\n\n            :returns:\n                A ``direct-tcpip`` `paramiko.channel.Channel`, if `gateway` was a\n                `.Connection`; or a `~paramiko.proxy.ProxyCommand`, if `gateway`\n                was a string.\n\n            .. versionadded:: 2.0\n            \"\"\"\n            if isinstance(self.gateway, Connection):\n                transport = self.gateway.client.get_transport()\n                return transport.open_channel(\n                    \"direct-tcpip\",\n                    (self.host, self.port),\n                    (self.gateway.host, self.gateway.port),\n                )\n            elif isinstance(self.gateway, str):\n                return ProxyCommand(self.gateway)\n            else:\n                raise ValueError(\"Invalid gateway type\")",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def open_gateway(self):\n        \"\"\"\n        Obtain a socket-like object from `gateway`.\n\n        :returns:\n            A ``direct-tcpip`` `paramiko.channel.Channel`, if `gateway` was a\n            `.Connection`; or a `~paramiko.proxy.ProxyCommand`, if `gateway`\n            was a string.\n\n        .. versionadded:: 2.0\n        \"\"\"\n        if isinstance(self.gateway, Connection):\n            return self.gateway.client.get_transport().open_channel(\n                \"direct-tcpip\", (self.host, self.port), (self.gateway.host, self.gateway.port)\n            )\n        elif isinstance(self.gateway, str):\n            return ProxyCommand(self.gateway).run()\n        else:\n            raise ValueError(\"Invalid gateway type\")",
+          "ok": true,
+          "error": null
+        }
+      ]
+    }
   }
 }

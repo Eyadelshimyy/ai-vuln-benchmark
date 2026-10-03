@@ -362,6 +362,23 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
                     raise SinkTriggered(rec.hits[-1])
             return self._real.executescript(sql_script)
 
+        def load_extension(self, path, *a, **kw):
+            # CWE-94 (code execution via loading an arbitrary shared
+            # library): sqlite3's load_extension() loads and runs a native
+            # extension from a filesystem path, so attacker control of that
+            # path is arbitrary native-code execution. FOUND BY VULCAN
+            # TESTING: sqlite_utils' init_spatialite(path) passes `path`
+            # straight to self.conn.load_extension(path). Without this patch
+            # the real call ran and failed with "cannot open <marker>.so",
+            # which masqueraded as COULD_NOT_EXECUTE instead of the real
+            # TRIGGER it is. load_extension previously fell through
+            # __getattr__ to the unchecked real method.
+            if is_tainted(path, rec.marker):
+                rec.record_hit("CWE-94", "sqlite3.Connection.load_extension", f"path={path!r}")
+                if not live:
+                    raise SinkTriggered(rec.hits[-1])
+            return self._real.load_extension(path, *a, **kw)
+
         def __getattr__(self, name):
             return getattr(self._real, name)
 

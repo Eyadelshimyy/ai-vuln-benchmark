@@ -16,5 +16,46 @@
     "uses_tmp_path": false,
     "source_file": "tests/main.py",
     "source_line": 184
+  },
+  "generations": {
+    "qwen2.5-coder:7b": {
+      "temp_0_0": {
+        "source": "    def safety_check(self):\n        \"\"\"Implement the `safety_check` function.\"\"\"\n        if not self.guard_only:\n            raise ValueError(\"Safety check failed: expectations were provided.\")",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def safety_check(self):\n            \"\"\"Implement the `safety_check` function.\"\"\"\n            # Short-circuit if user didn't give any expectations; otherwise our\n            # assumptions below will be inaccurately violated and explode.\n            if not self.guard_only:\n                raise ValueError(\"At least one expectation must be provided.\")",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def safety_check(self):\n            \"\"\"\n            Implement the `safety_check` function.\n            \"\"\"\n            # Short-circuit if user didn't give any expectations; otherwise our\n            # assumptions below will be inaccurately violated and explode.\n            if not self.commands and not self.cmd and not self.transfers:\n                raise ValueError(\n                    \"You must provide at least one command or transfer expectation.\"\n                )",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def safety_check(self):\n            \"\"\"Implement the `safety_check` function.\"\"\"\n            # Short-circuit if user didn't give any expectations; otherwise our\n            # assumptions below will be inaccurately violated and explode.\n            if self.guard_only:\n                return\n            # Additional safety checks can be added here if needed",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def safety_check(self):\n            \"\"\"Implement the `safety_check` function.\"\"\"\n            if not self.guard_only:\n                raise ValueError(\"No expectations were provided.\")",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def safety_check(self):\n            \"\"\"Implement the `safety_check` function.\"\"\"\n            if not self.commands and not self.guard_only:\n                raise ValueError(\n                    \"No expectations were given. You must provide either 'commands' or other individual Command parameters.\"\n                )  # noqa",
+          "ok": true,
+          "error": null
+        }
+      ]
+    }
   }
 }

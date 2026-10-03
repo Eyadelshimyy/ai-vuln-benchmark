@@ -72,6 +72,7 @@ import ast
 import json
 import multiprocessing
 import os
+import re
 import resource
 import subprocess
 import sys
@@ -160,6 +161,23 @@ def _looks_string_shaped(ann: str | None) -> bool:
     ann = ann.strip()
     ruled_out = {"int", "float", "bool", "bytes", "complex"}
     return ann not in ruled_out and not ann.startswith(("List[", "list[", "Dict[", "dict[", "Set[", "set["))
+
+
+def _looks_object_typed(ann: str | None) -> bool:
+    """True if the annotation names a CLASS/object type (e.g. `Runner`,
+    `Context`, `"PKey"`, `Optional[Database]`) rather than a string. Used to
+    keep object-typed parameters OUT of the injection-target set: putting an
+    attacker-string marker into a `runner: Runner` slot tests nothing and
+    just produces a spurious COULD_NOT_EXECUTE. A param annotated with any
+    string-like type stays a valid target."""
+    if not ann:
+        return False
+    toks = [t for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", ann) if t not in _TYPING_WRAPPERS]
+    if not toks:
+        return False
+    if any(t in ("str", "Path", "PathLike", "AnyStr", "Text") for t in toks):
+        return False  # string-like -> a legitimate injection target
+    return toks[-1][:1].isupper()  # a Capitalized bare type name -> a class/object
 
 
 # Mined functions that are actually METHODS (mine_prompts.py takes the raw
@@ -461,6 +479,127 @@ def _construct_from_recipe(cls, recipe: dict | None, scratch_dir: str):
         return None, False
 
 
+# --- STEP C: recursive cheap construction of real framework objects --------
+# The dominant remaining COULD_NOT_EXECUTE cause across invoke/paramiko is a
+# function or method that needs a real framework object the harness cannot
+# fabricate -- a task taking `c: Context`, a method whose `self` is a
+# `Runner`, a parameter typed `PKey`. Diagnosis (this session) showed those
+# objects are mostly cheaply constructible: invoke.Context() builds, and
+# Runner(context) builds once you have a Context. So: resolve an annotation
+# to its real class and build it, recursing to satisfy the class's own
+# required constructor arguments. Purely additive -- it only ever REPLACES a
+# placeholder that would have failed with a real object; on any failure it
+# returns None and the caller falls back exactly as before.
+
+_TYPING_WRAPPERS = {"Optional", "Union", "List", "Dict", "Sequence", "Tuple",
+                    "Set", "Any", "None", "Iterable", "Mapping", "Callable", "Type"}
+
+
+def _resolve_annotation(annotation: str | None, ns: dict):
+    """Resolve an annotation string (e.g. 'Context', '"Runner"',
+    'Optional[Context]') to a real class object found in namespace `ns`
+    (the function's own module globals), or None. Skips typing wrappers and
+    picks the first bare name that names an actual class."""
+    if not annotation or not ns:
+        return None
+    for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", annotation):
+        if tok in _TYPING_WRAPPERS:
+            continue
+        obj = ns.get(tok)
+        if isinstance(obj, type):
+            return obj
+    return None
+
+
+def _build_import_ns(module_source: str | None, file_rel_path: str | None = None) -> dict:
+    """Execute each top-level import statement from the module source
+    INDEPENDENTLY, keeping the ones that succeed. This recovers the real
+    framework classes (invoke's Context, paramiko's PKey, ...) for
+    annotation resolution even when the module as a whole cannot be loaded
+    because of an unrelated missing dependency -- e.g. invoke's own
+    tasks.py does `from invocations import ...` (not installed) right next
+    to `from invoke import Context` (installed); the first failing import
+    must not cost us the second.
+
+    file_rel_path (e.g. "invoke/context.py") lets us set __package__ so the
+    module's own RELATIVE imports (`from .runners import Runner`) resolve
+    against the real installed package -- these are common for the exact
+    framework classes we most need to build (a Context's Runner, etc.)."""
+    pkg = None
+    if file_rel_path:
+        parts = [p for p in file_rel_path.replace("\\", "/").split("/") if p and p != "."]
+        if len(parts) >= 2:  # has at least one package dir above the file
+            pkg = ".".join(parts[:-1])
+    ns: dict = {"__package__": pkg, "__name__": (pkg + ".__mined__") if pkg else "__mined__"}
+    if not module_source:
+        return ns
+    try:
+        tree = ast.parse(module_source)
+    except SyntaxError:
+        return ns
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            try:
+                exec(compile(ast.Module(body=[node], type_ignores=[]), "<imports>", "exec"), ns)  # noqa: S102
+            except Exception:
+                continue  # unrelated missing dep -- keep whatever else imported
+    # Frameworks usually export their main classes at the package top level
+    # (invoke.Runner, paramiko.PKey, ...). Many are referenced in annotations
+    # only as forward refs imported under `if TYPE_CHECKING:` -- i.e. NOT at
+    # runtime -- so merge the top-level package's public classes as a
+    # last-resort resolution source (never overwriting a real import above).
+    if pkg:
+        try:
+            top = __import__(pkg.split(".")[0])
+            for k, v in vars(top).items():
+                if isinstance(v, type):
+                    ns.setdefault(k, v)
+        except Exception:
+            pass
+    return ns
+
+
+def _cheap_construct(cls, scratch_dir: str, ns: dict, depth: int = 0):
+    """Best-effort: build a real instance of `cls`. Try the no-arg
+    constructor first; if that fails, inspect __init__ and recursively build
+    each REQUIRED argument (resolving its annotation to a class and
+    recursing), using a generic placeholder for required args whose type
+    can't be built. Depth-limited and fully guarded -- returns None on any
+    failure. Runs INSIDE patched_sinks (callers ensure this), so any real
+    side effect of a constructor is intercepted/sandboxed like everything
+    else, and a construction call carrying no marker never triggers a
+    sink."""
+    if cls is None or not isinstance(cls, type) or depth > 3:
+        return None
+    try:
+        return cls()
+    except Exception:
+        pass
+    try:
+        import inspect
+        params = list(inspect.signature(cls.__init__).parameters.values())[1:]  # skip self
+        built = []
+        for p in params:
+            if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
+                continue
+            if p.default is not inspect.Parameter.empty:
+                continue  # optional -- leave at its default
+            sub = None
+            ann = p.annotation
+            if isinstance(ann, type):
+                sub = _cheap_construct(ann, scratch_dir, ns, depth + 1)
+            elif isinstance(ann, str):
+                sub_cls = _resolve_annotation(ann, ns)
+                if sub_cls is not None:
+                    sub = _cheap_construct(sub_cls, scratch_dir, ns, depth + 1)
+            if sub is None:
+                sub = _build_arg(p.name, ann if isinstance(ann, str) else None, None)
+            built.append(sub)
+        return cls(*built)
+    except Exception:
+        return None
+
+
 def _child_main(source: str, func_name: str, param_name: str | None, marker: str, scratch_dir: str, conn,
                  module_source: str | None = None, line: int = 0, splice_source: str | None = None,
                  file_rel_path: str | None = None, construction_recipe: dict | None = None,
@@ -707,6 +846,21 @@ def _child_main(source: str, func_name: str, param_name: str | None, marker: str
                     self_instance = recipe_instance
                     recipe_used = True
 
+            # STEP C: if no mined recipe built `self`, try cheap recursive
+            # construction of the real class (e.g. a Runner whose __init__
+            # needs a Context we can also build). Runs here, inside the
+            # patched context, same timing reason as the recipe above.
+            # Resolution namespace for annotation -> class: the function's
+            # own globals, backfilled with whatever the module's import
+            # lines can resolve independently (covers modules that fail to
+            # load wholesale because of an unrelated missing dependency).
+            _resolve_ns = {**_build_import_ns(module_source, file_rel_path), **getattr(func, "__globals__", {})}
+            if not recipe_used and construct_cls is not None and func_name != "__init__":
+                cheap_self = _cheap_construct(construct_cls, scratch_dir, _resolve_ns)
+                if cheap_self is not None:
+                    self_instance = cheap_self
+                    recipe_used = True  # a real self -- skip __init__ priming below
+
             # Best-effort __init__ priming -- see run_candidate's docstring
             # and the module docstring for why this exists: the dominant
             # remaining COULD_NOT_EXECUTE cause is methods needing state
@@ -761,7 +915,17 @@ def _child_main(source: str, func_name: str, param_name: str | None, marker: str
                 if is_method and p["name"] in ("self", "cls"):
                     args.append(self_instance)
                     continue
-                args.append(_build_arg(p["name"], p["annotation"], marker if p["name"] == param_name else None))
+                if p["name"] == param_name:
+                    args.append(_build_arg(p["name"], p["annotation"], marker))
+                    continue
+                # STEP C: for a NON-target parameter whose annotation names a
+                # real class (e.g. `c: Context`, `runner: Runner`), build a
+                # real instance instead of a placeholder string -- this is
+                # what reclaims the task-function / framework-object infra
+                # failures. Falls back to the generic placeholder on failure.
+                _cls = _resolve_annotation(p["annotation"], _resolve_ns)
+                _obj = _cheap_construct(_cls, scratch_dir, _resolve_ns) if _cls is not None else None
+                args.append(_obj if _obj is not None else _build_arg(p["name"], p["annotation"], None))
 
             try:
                 func(*args)
@@ -828,10 +992,26 @@ def _set_child_limits():
     the cost of an accidental resource-exhausting bug, it is not a security
     boundary."""
     try:
-        resource.setrlimit(resource.RLIMIT_CPU, (5, 5))              # 5 CPU-seconds
-        resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024,) * 2)  # 512MB address space
-        resource.setrlimit(resource.RLIMIT_NPROC, (16, 16))          # cap forks/threads
+        resource.setrlimit(resource.RLIMIT_CPU, (10, 10))            # 10 CPU-seconds
+        resource.setrlimit(resource.RLIMIT_AS, (1024 * 1024 * 1024,) * 2)  # 1GB address space
         resource.setrlimit(resource.RLIMIT_FSIZE, (10 * 1024 * 1024,) * 2)  # 10MB max file size
+        # DELIBERATELY NOT setting RLIMIT_NPROC. BUG FOUND BY TESTING (this
+        # session, on a real multi-process WSL desktop vs a near-empty cloud
+        # sandbox): RLIMIT_NPROC is a PER-USER limit, not per-process -- it
+        # caps the TOTAL number of processes/threads the real user already
+        # has running, machine-wide. A small cap like 16 leaves headroom on a
+        # near-empty sandbox, but on any normal machine the user is ALREADY
+        # running far more than 16 processes, so setting it to 16 means the
+        # limit is instantly exceeded and EVERY new thread the code-under-test
+        # spawns fails ("can't start new thread" / BlockingIOError: Resource
+        # temporarily unavailable). That silently turned legitimate,
+        # thread-using library code (invoke's Runner pumps stdout/stderr on
+        # threads; paramiko's transport likewise) into false COULD_NOT_EXECUTE
+        # verdicts -- but only on real machines, which is exactly where the
+        # benchmark actually runs. The CPU-second limit plus the wall-clock
+        # timeout in _run_sandboxed already bound a runaway fork bomb (it
+        # burns CPU/time long before it matters), so dropping the per-user
+        # process cap loses no real safety while fixing the false failures.
     except (ValueError, resource.error):
         pass  # best-effort -- some limits are refused in some environments; never block on this
 
@@ -940,6 +1120,7 @@ def run_candidate(record: dict, use: str = "ground_truth") -> list[CandidateVerd
         if p["name"] not in TRUSTED_PARAM_NAMES
         and not _looks_boolean(p["name"], p["annotation"])
         and _looks_string_shaped(p["annotation"])
+        and not _looks_object_typed(p["annotation"])
     ]
     if not targets:
         # Nothing plausible to taint at all -- still worth one COULD_NOT_EXECUTE-

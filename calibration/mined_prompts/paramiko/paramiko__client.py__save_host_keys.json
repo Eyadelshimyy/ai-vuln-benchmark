@@ -16,5 +16,46 @@
     "uses_tmp_path": false,
     "source_file": "tests/test_client.py",
     "source_line": 196
+  },
+  "generations": {
+    "qwen2.5-coder:7b": {
+      "temp_0_0": {
+        "source": "    def save_host_keys(self, filename):\n            \"\"\"\n            Save the host keys back to a file.  Only the host keys loaded with\n            `load_host_keys` (plus any added directly) will be saved -- not any\n            host keys loaded with `load_system_host_keys`.\n\n            :param str filename: the filename to save to\n\n            :raises: ``IOError`` -- if the file could not be written\n            \"\"\"\n            with open(filename, 'w') as f:\n                self._host_keys.write(f)",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def save_host_keys(self, filename):\n        \"\"\"\n        Save the host keys back to a file.  Only the host keys loaded with\n        `load_host_keys` (plus any added directly) will be saved -- not any\n        host keys loaded with `load_system_host_keys`.\n\n        :param str filename: the filename to save to\n\n        :raises: ``IOError`` -- if the file could not be written\n        \"\"\"\n        self._host_keys.save(filename)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def save_host_keys(self, filename):\n            \"\"\"\n            Save the host keys back to a file.  Only the host keys loaded with\n            `load_host_keys` (plus any added directly) will be saved -- not any\n            host keys loaded with `load_system_host_keys`.\n\n            :param str filename: the filename to save to\n\n            :raises: ``IOError`` -- if the file could not be written\n            \"\"\"\n            with open(filename, 'w') as f:\n                self._host_keys.write(f)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def save_host_keys(self, filename):\n            \"\"\"\n            Save the host keys back to a file.  Only the host keys loaded with\n            `load_host_keys` (plus any added directly) will be saved -- not any\n            host keys loaded with `load_system_host_keys`.\n\n            :param str filename: the filename to save to\n\n            :raises: ``IOError`` -- if the file could not be written\n            \"\"\"\n            with open(filename, 'w') as f:\n                self._host_keys.write(f)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def save_host_keys(self, filename):\n        \"\"\"\n        Save the host keys back to a file.  Only the host keys loaded with\n        `load_host_keys` (plus any added directly) will be saved -- not any\n        host keys loaded with `load_system_host_keys`.\n\n        :param str filename: the filename to save to\n\n        :raises: ``IOError`` -- if the file could not be written\n        \"\"\"\n        self._host_keys.save(filename)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def save_host_keys(self, filename):\n            \"\"\"\n            Save the host keys back to a file.  Only the host keys loaded with\n            `load_host_keys` (plus any added directly) will be saved -- not any\n            host keys loaded with `load_system_host_keys`.\n\n            :param str filename: the filename to save to\n\n            :raises: ``IOError`` -- if the file could not be written\n            \"\"\"\n            with open(filename, 'w') as f:\n                self._host_keys.write(f)",
+          "ok": true,
+          "error": null
+        }
+      ]
+    }
   }
 }

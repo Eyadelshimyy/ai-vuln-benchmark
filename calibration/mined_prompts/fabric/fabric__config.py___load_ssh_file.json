@@ -16,5 +16,46 @@
     "uses_tmp_path": false,
     "source_file": "tests/config.py",
     "source_line": 19
+  },
+  "generations": {
+    "qwen2.5-coder:7b": {
+      "temp_0_0": {
+        "source": "    def _load_ssh_file(self, path):\n            \"\"\"\n            Attempt to open and parse an SSH config file at ``path``.\n\n            Does nothing if ``path`` is not a path to a valid file.\n\n            :returns: ``None``.\n            \"\"\"\n            import os\n            from paramiko.config import SSHConfig\n\n            if os.path.isfile(path):\n                with open(path, 'r') as f:\n                    self._base_ssh_config.parse(f)",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def _load_ssh_file(self, path):\n        \"\"\"\n        Attempt to open and parse an SSH config file at ``path``.\n\n        Does nothing if ``path`` is not a path to a valid file.\n\n        :returns: ``None``.\n        \"\"\"\n        if not os.path.isfile(path):\n            return\n\n        with open(path, 'r') as file:\n            self.base_ssh_config.parse(file)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def _load_ssh_file(self, path):\n            \"\"\"\n            Attempt to open and parse an SSH config file at ``path``.\n\n            Does nothing if ``path`` is not a path to a valid file.\n\n            :returns: ``None``.\n            \"\"\"\n            import os\n            from paramiko.config import SSHConfig\n\n            if os.path.isfile(path):\n                with open(path, 'r') as f:\n                    self._base_ssh_config.parse(f)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def _load_ssh_file(self, path):\n            \"\"\"\n            Attempt to open and parse an SSH config file at ``path``.\n\n            Does nothing if ``path`` is not a path to a valid file.\n\n            :returns: ``None``.\n            \"\"\"\n            import os\n            from paramiko.config import SSHConfig\n\n            if not os.path.isfile(path):\n                return\n\n            with open(path, 'r') as f:\n                self._base_ssh_config.parse(f)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def _load_ssh_file(self, path):\n        \"\"\"\n        Attempt to open and parse an SSH config file at ``path``.\n\n        Does nothing if ``path`` is not a path to a valid file.\n\n        :returns: ``None``.\n        \"\"\"\n        if os.path.exists(path) and os.path.isfile(path):\n            with open(path, 'r') as f:\n                self._base_ssh_config.parse(f)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def _load_ssh_file(self, path):\n        \"\"\"\n        Attempt to open and parse an SSH config file at ``path``.\n\n        Does nothing if ``path`` is not a path to a valid file.\n\n        :returns: ``None``.\n        \"\"\"\n        from paramiko.config import SSHConfig\n        import os\n\n        if not os.path.isfile(path):\n            return\n\n        ssh_config = SSHConfig()\n        with open(path, 'r') as f:\n            ssh_config.parse(f)\n\n        self._set(base_ssh_config=ssh_config)",
+          "ok": true,
+          "error": null
+        }
+      ]
+    }
   }
 }

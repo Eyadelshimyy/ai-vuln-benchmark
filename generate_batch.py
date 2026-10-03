@@ -121,7 +121,21 @@ def extract_and_trim(raw: str, func_name: str, stub: str) -> str:
 
 def make_caller(base_url: str, model: str):
     from openai import OpenAI  # pip install openai
-    client = OpenAI(api_key=os.environ.get("OPENSOURCE_API_KEY", "not-needed"), base_url=base_url)
+    # OpenCode Go (zen) requires an x-opencode-session header for routing;
+    # any stable per-run id satisfies it. Only sent to opencode endpoints so
+    # other OpenAI-compatible providers (Ollama, OpenAI) are unaffected.
+    default_headers = {}
+    if "opencode" in (base_url or ""):
+        import uuid
+        session = os.environ.get("OPENCODE_SESSION") or ("vulcan-" + uuid.uuid4().hex[:24])
+        default_headers["x-opencode-session"] = session
+    client = OpenAI(
+        api_key=os.environ.get("OPENSOURCE_API_KEY", "not-needed"),
+        base_url=base_url,
+        default_headers=default_headers or None,
+        timeout=float(os.environ.get("OPENSOURCE_TIMEOUT", "180")),  # per-call cap so one hang can't freeze the sweep
+        max_retries=2,
+    )
 
     def call(messages: list[dict], temperature: float) -> str:
         resp = client.chat.completions.create(
@@ -135,7 +149,7 @@ def make_caller(base_url: str, model: str):
 # ---- one candidate ----
 
 def generate_for_candidate(record: dict, call, model: str, k: int, do_temp0: bool,
-                           overwrite: bool) -> dict:
+                           overwrite: bool, concurrency: int = 1) -> dict:
     gens = record.setdefault("generations", {})
     if model in gens and not overwrite:
         return record  # already done for this model; skip (resume-friendly)
@@ -143,24 +157,39 @@ def generate_for_candidate(record: dict, call, model: str, k: int, do_temp0: boo
     func_name = record["function"]
     stub = record["prompt_source"]
     messages = build_messages(record)
-    out: dict = {}
 
+    # Build the list of calls to make: (slot, temperature). Hosted models
+    # are slow (30-100s/call), so run the k+1 calls CONCURRENTLY -- the APIs
+    # handle simultaneous requests, cutting per-candidate wall-time ~k-fold.
+    jobs = []
     if do_temp0:
-        try:
-            raw = call(messages, 0.0)
-            out["temp_0_0"] = {"source": extract_and_trim(raw, func_name, stub), "ok": True, "error": None}
-        except Exception as e:  # noqa: BLE001
-            out["temp_0_0"] = {"source": None, "ok": False, "error": f"{type(e).__name__}: {e}"}
-
-    samples = []
+        jobs.append(("t0", 0.0))
     for i in range(k):
-        try:
-            raw = call(messages, 0.7)
-            samples.append({"index": i, "source": extract_and_trim(raw, func_name, stub), "ok": True, "error": None})
-        except Exception as e:  # noqa: BLE001
-            samples.append({"index": i, "source": None, "ok": False, "error": f"{type(e).__name__}: {e}"})
-    out["temp_0_7"] = samples
+        jobs.append((f"s{i}", 0.7))
 
+    def _one(job):
+        slot, temp = job
+        try:
+            raw = call(messages, temp)
+            return slot, {"source": extract_and_trim(raw, func_name, stub), "ok": True, "error": None}
+        except Exception as e:  # noqa: BLE001
+            return slot, {"source": None, "ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    results = {}
+    if concurrency > 1 and len(jobs) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(concurrency, len(jobs))) as ex:
+            for slot, res in ex.map(_one, jobs):
+                results[slot] = res
+    else:
+        for job in jobs:
+            slot, res = _one(job)
+            results[slot] = res
+
+    out: dict = {}
+    if do_temp0:
+        out["temp_0_0"] = results["t0"]
+    out["temp_0_7"] = [dict(index=i, **results[f"s{i}"]) for i in range(k)]
     gens[model] = out
     return record
 
@@ -173,6 +202,8 @@ def main() -> None:
     ap.add_argument("--no-temp0", action="store_true", help="skip the deterministic temperature-0 reference sample")
     ap.add_argument("--base-url", default=os.environ.get("OPENSOURCE_BASE_URL", "http://localhost:11434/v1"))
     ap.add_argument("--overwrite", action="store_true", help="regenerate even if this model already has samples")
+    ap.add_argument("--concurrency", type=int, default=1,
+                    help="parallel API calls per candidate (hosted models are slow; try 6 for the full k+1 at once)")
     args = ap.parse_args()
 
     if args.candidates.is_dir():
@@ -192,9 +223,18 @@ def main() -> None:
         if "prompt_source" not in record:
             print(f"[{n}/{len(files)}] {path.name}  SKIP (no prompt_source)", file=sys.stderr)
             continue
-        print(f"[{n}/{len(files)}] {record['function']} ...", file=sys.stderr, flush=True)
-        record = generate_for_candidate(record, call, args.model, args.k, not args.no_temp0, args.overwrite)
+        print(f"[{n}/{len(files)}] {record['function']} ...", end="", file=sys.stderr, flush=True)
+        c_start = time.time()
+        record = generate_for_candidate(record, call, args.model, args.k, not args.no_temp0,
+                                         args.overwrite, concurrency=args.concurrency)
         path.write_text(json.dumps(record, indent=2))
+        g = record.get("generations", {}).get(args.model, {})
+        if g:
+            n_ok = (1 if g.get("temp_0_0", {}).get("ok") else 0) + sum(1 for s in g.get("temp_0_7", []) if s.get("ok"))
+            n_tot = (1 if "temp_0_0" in g else 0) + len(g.get("temp_0_7", []))
+            print(f" {n_ok}/{n_tot} ok ({time.time()-c_start:.0f}s)", file=sys.stderr, flush=True)
+        else:
+            print(f" (skipped, already done) ({time.time()-c_start:.0f}s)", file=sys.stderr, flush=True)
 
     print(f"\nDone in {time.time()-t0:.0f}s. Wrote generations into {len(files)} file(s) under {args.candidates}.",
           file=sys.stderr)

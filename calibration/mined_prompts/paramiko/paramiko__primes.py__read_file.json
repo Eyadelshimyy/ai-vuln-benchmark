@@ -11,5 +11,46 @@
   "prompt_source": "    def read_file(self, filename):\n        \"\"\"\n        :raises IOError: passed from any file operations that fail.\n        \"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
   "ground_truth_source": "    def read_file(self, filename):\n        \"\"\"\n        :raises IOError: passed from any file operations that fail.\n        \"\"\"\n        self.pack = {}\n        with open(filename, \"r\") as f:\n            for line in f:\n                line = line.strip()\n                if (len(line) == 0) or (line[0] == \"#\"):\n                    continue\n                try:\n                    self._parse_modulus(line)\n                except:\n                    continue",
   "module_source": "# Copyright (C) 2003-2007  Robey Pointer <robeypointer@gmail.com>\n#\n# This file is part of paramiko.\n#\n# Paramiko is free software; you can redistribute it and/or modify it under the\n# terms of the GNU Lesser General Public License as published by the Free\n# Software Foundation; either version 2.1 of the License, or (at your option)\n# any later version.\n#\n# Paramiko is distributed in the hope that it will be useful, but WITHOUT ANY\n# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR\n# A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for more\n# details.\n#\n# You should have received a copy of the GNU Lesser General Public License\n# along with Paramiko; if not, write to the Free Software Foundation, Inc.,\n# 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA.\n\n\"\"\"\nUtility functions for dealing with primes.\n\"\"\"\n\nimport os\n\nfrom paramiko import util\nfrom paramiko.common import byte_mask\nfrom paramiko.ssh_exception import SSHException\n\n\ndef _roll_random(n):\n    \"\"\"returns a random # from 0 to N-1\"\"\"\n    bits = util.bit_length(n - 1)\n    byte_count = (bits + 7) // 8\n    hbyte_mask = pow(2, bits % 8) - 1\n\n    # so here's the plan:\n    # we fetch as many random bits as we'd need to fit N-1, and if the\n    # generated number is >= N, we try again.  in the worst case (N-1 is a\n    # power of 2), we have slightly better than 50% odds of getting one that\n    # fits, so i can't guarantee that this loop will ever finish, but the odds\n    # of it looping forever should be infinitesimal.\n    while True:\n        x = os.urandom(byte_count)\n        if hbyte_mask > 0:\n            x = byte_mask(x[0], hbyte_mask) + x[1:]\n        num = util.inflate_long(x, 1)\n        if num < n:\n            break\n    return num\n\n\nclass ModulusPack:\n    \"\"\"\n    convenience object for holding the contents of the /etc/ssh/moduli file,\n    on systems that have such a file.\n    \"\"\"\n\n    def __init__(self):\n        # pack is a hash of: bits -> [ (generator, modulus) ... ]\n        self.pack = {}\n        self.discarded = []\n\n    def _parse_modulus(self, line):\n        (\n            timestamp,\n            mod_type,\n            tests,\n            tries,\n            size,\n            generator,\n            modulus,\n        ) = line.split()\n        mod_type = int(mod_type)\n        tests = int(tests)\n        tries = int(tries)\n        size = int(size)\n        generator = int(generator)\n        modulus = int(modulus, 16)\n\n        # weed out primes that aren't at least:\n        # type 2 (meets basic structural requirements)\n        # test 4 (more than just a small-prime sieve)\n        # tries < 100 if test & 4 (at least 100 tries of miller-rabin)\n        if (\n            mod_type < 2\n            or tests < 4\n            or (tests & 4 and tests < 8 and tries < 100)\n        ):\n            self.discarded.append(\n                (modulus, \"does not meet basic requirements\")\n            )\n            return\n        if generator == 0:\n            generator = 2\n\n        # there's a bug in the ssh \"moduli\" file (yeah, i know: shock! dismay!\n        # call cnn!) where it understates the bit lengths of these primes by 1.\n        # this is okay.\n        bl = util.bit_length(modulus)\n        if (bl != size) and (bl != size + 1):\n            self.discarded.append(\n                (modulus, \"incorrectly reported bit length {}\".format(size))\n            )\n            return\n        if bl not in self.pack:\n            self.pack[bl] = []\n        self.pack[bl].append((generator, modulus))\n\n    def read_file(self, filename):\n        \"\"\"\n        :raises IOError: passed from any file operations that fail.\n        \"\"\"\n        self.pack = {}\n        with open(filename, \"r\") as f:\n            for line in f:\n                line = line.strip()\n                if (len(line) == 0) or (line[0] == \"#\"):\n                    continue\n                try:\n                    self._parse_modulus(line)\n                except:\n                    continue\n\n    def get_modulus(self, min, prefer, max):\n        bitsizes = sorted(self.pack.keys())\n        if len(bitsizes) == 0:\n            raise SSHException(\"no moduli available\")\n        good = -1\n        # find nearest bitsize >= preferred\n        for b in bitsizes:\n            if (b >= prefer) and (b <= max) and (b < good or good == -1):\n                good = b\n        # if that failed, find greatest bitsize >= min\n        if good == -1:\n            for b in bitsizes:\n                if (b >= min) and (b <= max) and (b > good):\n                    good = b\n        if good == -1:\n            # their entire (min, max) range has no intersection with our range.\n            # if their range is below ours, pick the smallest.  otherwise pick\n            # the largest.  it'll be out of their range requirement either way,\n            # but we'll be sending them the closest one we have.\n            good = bitsizes[0]\n            if min > good:\n                good = bitsizes[-1]\n        # now pick a random modulus of this bitsize\n        n = _roll_random(len(self.pack[good]))\n        return self.pack[good][n]\n",
-  "construction_recipe": null
+  "construction_recipe": null,
+  "generations": {
+    "qwen2.5-coder:7b": {
+      "temp_0_0": {
+        "source": "    def read_file(self, filename):\n        \"\"\"\n        :raises IOError: passed from any file operations that fail.\n        \"\"\"\n        try:\n            with open(filename, 'r') as file:\n                for line in file:\n                    # Process each line as needed\n                    pass\n        except IOError as e:\n            raise e",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def read_file(self, filename):\n        \"\"\"\n        :raises IOError: passed from any file operations that fail.\n        \"\"\"\n        with open(filename, 'r') as file:\n            for line in file:\n                bits, generator, modulus = line.strip().split()\n                bits = int(bits)\n                if bits not in self.pack:\n                    self.pack[bits] = []\n                self.pack[bits].append((int(generator), int(modulus)))",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def read_file(self, filename):\n        \"\"\"\n        :raises IOError: passed from any file operations that fail.\n        \"\"\"\n        try:\n            with open(filename, 'r') as file:\n                data = file.read()\n                # Process the data as needed\n                # For example, you might update self.pack or self.discarded\n                self.pack[data] = []\n        except IOError as e:\n            raise IOError(f\"Failed to read file '{filename}': {e}\")",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def read_file(self, filename):\n        \"\"\"\n        :raises IOError: passed from any file operations that fail.\n        \"\"\"\n        with open(filename, 'r') as file:\n            data = file.read()\n        return data",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def read_file(self, filename):\n            \"\"\"\n            :raises IOError: passed from any file operations that fail.\n            \"\"\"\n            with open(filename, 'rb') as file:\n                data = file.read()\n                for byte in data:\n                    bits = byte * 8\n                    if bits not in self.pack:\n                        self.pack[bits] = []\n                    self.pack[bits].append((self.generate_generator(bits), self.generate_modulus(bits)))",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def read_file(self, filename):\n        \"\"\"\n        :raises IOError: passed from any file operations that fail.\n        \"\"\"\n        with open(filename, 'rb') as file:\n            data = file.read()\n            for bits, entries in self.pack.items():\n                for generator, modulus in entries:\n                    # Process the data with the generator and modulus\n                    processed_data = generator(data, modulus)\n                    # Store or use the processed data as needed\n                    pass",
+          "ok": true,
+          "error": null
+        }
+      ]
+    }
+  }
 }

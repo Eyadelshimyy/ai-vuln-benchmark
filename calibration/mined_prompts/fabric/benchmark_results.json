@@ -1,0 +1,448 @@
+{
+  "aggregate": {
+    "human_baseline": {
+      "candidates_executed": 4,
+      "triggered": 0,
+      "trigger_rate": 0.0,
+      "trigger_rate_ci95": [
+        0.0,
+        0.4899
+      ]
+    },
+    "models": {
+      "qwen2.5-coder:7b": {
+        "triggered": 0,
+        "not_triggered": 30,
+        "cne_model": 0,
+        "cne_infra": 6,
+        "generation_failed": 0,
+        "sev_weight_triggered": 0.0,
+        "by_cwe": {},
+        "executed": 30,
+        "execution_rate": 1.0,
+        "trigger_rate": 0.0,
+        "trigger_rate_ci95": [
+          0.0,
+          0.1135
+        ],
+        "severity_weighted_trigger_rate": 0.0
+      }
+    }
+  },
+  "per_candidate": [
+    {
+      "repo": "fabric",
+      "file": "fabric/config.py",
+      "function": "_load_ssh_file",
+      "line": 258,
+      "human": {
+        "verdict": "COULD_NOT_EXECUTE",
+        "cwe": null,
+        "sink": null,
+        "param": null,
+        "detail": "NameError: name 'debug' is not defined"
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "fabric",
+      "file": "fabric/connection.py",
+      "function": "local",
+      "line": 866,
+      "human": {
+        "verdict": "NOT_TRIGGERED",
+        "cwe": null,
+        "sink": null,
+        "param": null,
+        "detail": null
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "fabric",
+      "file": "fabric/connection.py",
+      "function": "open_gateway",
+      "line": 676,
+      "human": {
+        "verdict": "NOT_TRIGGERED",
+        "cwe": null,
+        "sink": null,
+        "param": null,
+        "detail": null
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "fabric",
+      "file": "fabric/executor.py",
+      "function": "expand_calls",
+      "line": 50,
+      "human": {
+        "verdict": "COULD_NOT_EXECUTE",
+        "cwe": null,
+        "sink": null,
+        "param": null,
+        "detail": "AttributeError: '_MinedShell' object has no attribute 'core'"
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: '_MinedShell' object has no attribute 'hosts'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: '_MinedShell' object has no attribute 'hosts'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: '_MinedShell' object has no attribute 'hosts'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: '_MinedShell' object has no attribute 'hosts'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: '_MinedShell' object has no attribute 'hosts'",
+              "failure_class": "INFRASTRUCTURE"
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "COULD_NOT_EXECUTE",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": "AttributeError: 'str' object has no attribute 'hosts'",
+              "failure_class": "INFRASTRUCTURE"
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "fabric",
+      "file": "fabric/testing/base.py",
+      "function": "safety_check",
+      "line": 308,
+      "human": {
+        "verdict": "NOT_TRIGGERED",
+        "cwe": null,
+        "sink": null,
+        "param": null,
+        "detail": null
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    },
+    {
+      "repo": "fabric",
+      "file": "tasks.py",
+      "function": "safety_test_v1_to_v2_shim",
+      "line": 18,
+      "human": {
+        "verdict": "NOT_TRIGGERED",
+        "cwe": null,
+        "sink": null,
+        "param": null,
+        "detail": null
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "samples": [
+            {
+              "sample": "t0",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_0",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_1",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_2",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_3",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            },
+            {
+              "sample": "t07_4",
+              "verdict": "NOT_TRIGGERED",
+              "cwe": null,
+              "sink": null,
+              "param": null,
+              "detail": null
+            }
+          ],
+          "generation_failed": 0
+        }
+      }
+    }
+  ]
+}

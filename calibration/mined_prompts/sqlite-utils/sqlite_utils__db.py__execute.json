@@ -51,6 +51,48 @@
           "error": null
         }
       ]
+    },
+    "deepseek-v4-pro": {
+      "temp_0_0": {
+        "source": null,
+        "ok": false,
+        "error": "BadRequestError: Error code: 400 - {'error': {'type': 'server_error', 'message': \"Upstream request failed: This Go model requires Global regions. Select Global in your workspace's Privacy settings to use it.\"}}"
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": null,
+          "ok": false,
+          "error": "BadRequestError: Error code: 400 - {'error': {'type': 'server_error', 'message': \"Upstream request failed: This Go model requires Global regions. Select Global in your workspace's Privacy settings to use it.\"}}"
+        },
+        {
+          "index": 1,
+          "source": null,
+          "ok": false,
+          "error": "BadRequestError: Error code: 400 - {'error': {'type': 'server_error', 'message': \"Upstream request failed: This Go model requires Global regions. Select Global in your workspace's Privacy settings to use it.\"}}"
+        }
+      ]
+    },
+    "qwen3.7-plus": {
+      "temp_0_0": {
+        "source": "    def execute(\n            self, sql: str, parameters: Sequence | dict[str, Any] | None = None\n        ) -> sqlite3.Cursor:\n            \"\"\"\n            Execute SQL query and return a ``sqlite3.Cursor``.\n\n            A write statement - ``INSERT``, ``UPDATE``, ``CREATE TABLE`` and so on -\n            is committed automatically, unless a transaction is already open, in\n            which case it becomes part of that transaction. See\n            :ref:`python_api_transactions`.\n\n            :param sql: SQL query to execute\n            :param parameters: Parameters to use in that query - an iterable for ``where id = ?``\n              parameters, or a dictionary for ``where id = :id``\n            \"\"\"\n            if self._tracer:\n                self._tracer(sql, parameters)\n            \n            in_transaction = self.conn.in_transaction\n            cursor = self.conn.execute(sql, parameters or {})\n        \n            if not in_transaction and self.conn.in_transaction:\n                self.conn.commit()\n            \n            return cursor",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def execute(\n            self, sql: str, parameters: Sequence | dict[str, Any] | None = None\n        ) -> sqlite3.Cursor:\n            \"\"\"\n            Execute SQL query and return a ``sqlite3.Cursor``.\n\n            A write statement - ``INSERT``, ``UPDATE``, ``CREATE TABLE`` and so on -\n            is committed automatically, unless a transaction is already open, in\n            which case it becomes part of that transaction. See\n            :ref:`python_api_transactions`.\n\n            :param sql: SQL query to execute\n            :param parameters: Parameters to use in that query - an iterable for ``where id = ?``\n              parameters, or a dictionary for ``where id = :id``\n            \"\"\"\n            if self._tracer:\n                self._tracer(sql, parameters)\n            if parameters is None:\n                return self.conn.execute(sql)\n            return self.conn.execute(sql, parameters)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def execute(\n            self, sql: str, parameters: Sequence | dict[str, Any] | None = None\n        ) -> sqlite3.Cursor:\n            \"\"\"\n            Execute SQL query and return a ``sqlite3.Cursor``.\n\n            A write statement - ``INSERT``, ``UPDATE``, ``CREATE TABLE`` and so on -\n            is committed automatically, unless a transaction is already open, in\n            which case it becomes part of that transaction. See\n            :ref:`python_api_transactions`.\n\n            :param sql: SQL query to execute\n            :param parameters: Parameters to use in that query - an iterable for ``where id = ?``\n              parameters, or a dictionary for ``where id = :id``\n            \"\"\"\n            if self._tracer:\n                self._tracer(sql, parameters)\n            if parameters is None:\n                parameters = []\n            return self.conn.execute(sql, parameters)",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }
