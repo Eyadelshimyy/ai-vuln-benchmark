@@ -1,4 +1,9 @@
-# AI-Generated Vulnerability Benchmark: Detection, Exploit-Confirmation, and Runtime (IAST) Verification
+# VULCAN: A Benchmark for Execution-Verified AI-Generated Vulnerabilities
+
+**VULCAN — VULnerability Confirmation via Actual executioN.** Confirms
+vulnerabilities in AI-generated code by *executing* it and watching the
+real dangerous operation fire at runtime, rather than pattern-matching the
+source.
 
 Companion code for the bachelor's thesis **"An Empirical Evaluation and
 Benchmark of AI-Generated Vulnerabilities in Code"** (Eyad Hassan
