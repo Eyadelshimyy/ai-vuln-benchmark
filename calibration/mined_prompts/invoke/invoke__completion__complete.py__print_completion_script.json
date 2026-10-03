@@ -50,6 +50,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "def print_completion_script(shell: str, names: List[str]) -> None:\n    # Grab all .completion files in invoke/completion/. \n    # These used to have no suffix, but surprise, that's super fragile.\n    \"\"\"Implement the `print_completion_script` function (parameters: shell, names).\"\"\"\n    \n    # Get the list of all files in the directory\n    files = os.listdir('invoke/completion/')\n    \n    # Filter the list to only include files with a .completion extension\n    completion_files = [file for file in files if file.endswith('.completion')]\n    \n    # If names is not empty, filter the completion files to only include those with names\n    if names:\n        completion_files = [file for file in completion_files if any(name in file for name in names)]\n    \n    # Print the content of each completion file\n    for file in completion_files:\n        with open(f'invoke/completion/{file}', 'r') as f:\n            print(f.read())",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "def print_completion_script(shell: str, names: list[str]) -> None:\n    # Grab all .completion files in invoke/completion/. \n    # These used to have no suffix, but surprise, that's super fragile.\n    \"\"\"Implement the `print_completion_script` function (parameters: shell, names).\"\"\"\n    \n    # get the path of the directory\n    dir_path = os.path.dirname(os.path.realpath(__file__)) + \"/invoke/completion\"\n    \n    # check if the shell is supported\n    if shell not in [\"bash\", \"zsh\", \"fish\"]:\n        print(f\"Shell {shell} not supported\")\n        return\n        \n    # iterate over all files in the directory\n    for filename in os.listdir(dir_path):\n        # check if the file is a .completion file\n        if filename.endswith(f\".{shell}.completion\"):\n            # check if the name of the command is in the names list\n            if names and any(name in filename for name in names):\n                print(f\"\\n{filename}:\")\n                with open(os.path.join(dir_path, filename), 'r') as file:\n                    print(file.read())",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "def print_completion_script(shell: str, names: List[str]) -> None:\n    # Grab all .completion files in invoke/completion/. (These used to have no\n    # suffix, but surprise, that's super fragile.\n    \"\"\"Implement the `print_completion_script` function \n    (parameters: shell, names).\"\"\"\n\n    # Get the path to the directory containing the completion files\n    completion_dir = os.path.join('invoke', 'completion')\n\n    # Get the list of .completion files in the directory\n    completion_files = glob.glob(os.path.join(completion_dir, '*.completion'))\n\n    # Iterate over the names and the completion files\n    for name in names:\n        for file in completion_files:\n            # Check if the base name of the file is the same as the name\n            if os.path.basename(file) == f'{name}.completion':\n                # Print the contents of the file\n                with open(file, 'r') as f:\n                    print(f.read())",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "def print_completion_script(shell: str, names: List[str]) -> None:\n    # Grab all .completion files in invoke/completion/. (These used to have no\n    # suffix, but surprise, that's super fragile.)\n    \"\"\"Implement the `print_completion_script` function (parameters: shell, names).\"\"\"\n    \n    # List to hold the content of the .completion files\n    completion_files = []\n\n    # Get the directory of the current script\n    script_dir = os.path.dirname(os.path.realpath(__file__))\n\n    # Find and read all .completion files in invoke/completion\n    for filename in os.listdir(os.path.join(script_dir, 'invoke', 'completion')):\n        if filename.endswith('.completion'):\n            with open(os.path.join(script_dir, 'invoke', 'completion', filename), 'r') as file:\n                completion_files.append(file.read())\n\n    # Print the content of the .completion files\n    for completion_file in completion_files:\n        print(completion_file)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "def print_completion_script(shell: str, names: List[str]) -> None:\n    # Grab all .completion files in invoke/completion/\n    \"\"\"Implement the `print_completion_script` function (parameters: shell, names).\"\"\"\n    dir_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'invoke', 'completion')\n    for file_name in os.listdir(dir_path):\n        if file_name.startswith('.') and file_name.endswith('.completion'):\n            with open(os.path.join(dir_path, file_name), 'r') as file:\n                print(file.read())",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "def print_completion_script(shell: str, names: List[str]) -> None:\n    # Grab all .completion files in invoke/completion/. \n    # These used to have no suffix, but surprise, that's super fragile.\n    \"\"\"Implement the `print_completion_script` function (parameters: shell, names).\"\"\"\n    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), \"invoke\", \"completion\")\n    for filename in os.listdir(path):\n        if filename.endswith(\".completion\"):\n            with open(os.path.join(path, filename), \"r\") as file:\n                content = file.read()\n            if shell in content:\n                for name in names:\n                    if name in content:\n                        print(content)\n                        break",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

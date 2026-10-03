@@ -56,6 +56,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "    def local(self, *args, **kwargs):\n        \"\"\"\n        Execute a shell command on the local system.\n\n        This method is effectively a wrapper of `invoke.run`; see its docs for\n        details and call signature.\n\n        .. versionadded:: 2.0\n        \"\"\"\n        from invoke import run\n        return run(*args, **kwargs)",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def local(self, *args, **kwargs):\n        \"\"\"\n        Execute a shell command on the local system.\n\n        This method is effectively a wrapper of `invoke.run`; see its docs for\n        details and call signature.\n\n        :param args:\n            positional arguments passed verbatim to `invoke.run`.\n\n        :param kwargs:\n            keyword arguments passed verbatim to `invoke.run`.\n\n        .. versionadded:: 2.0\n        \"\"\"\n        from invoke import run\n        return run(*args, **kwargs)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def local(self, command, *args, **kwargs):\n        \"\"\"\n        Execute a shell command on the local system.\n\n        This method is effectively a wrapper of `invoke.run`; see its docs for\n        details and call signature.\n\n        :param str command: The command to execute.\n\n        :returns: A `subprocess.CompletedProcess` instance, with the following \n            attributes:\n\n            - returncode: The exit status of the process. This will be an integer \n              if the process has already terminated and None if the process is still \n              running.\n            - stdout: The standard output of the process.\n            - stderr: The standard error of the process.\n\n        .. versionadded:: 2.0\n        \"\"\"\n        # Use subprocess.run to execute the command\n        return subprocess.run(command, shell=True, text=True, *args, **kwargs)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def local(self, *args, **kwargs):\n        \"\"\"\n        Execute a shell command on the local system.\n\n        This method is effectively a wrapper of `invoke.run`; see its docs for\n        details and call signature.\n\n        .. versionadded:: 2.0\n        \"\"\"\n        # Implement this function\n        from invoke import run\n        return run(*args, **kwargs)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def local(self, *args, **kwargs):\n            \"\"\"\n            Execute a shell command on the local system.\n\n            This method is effectively a wrapper of `invoke.run`; see its docs for\n            details and call signature.\n\n            :param args:\n                Same as `invoke.run`\n\n            :param kwargs:\n                Same as `invoke.run`\n\n            :raises ValueError:\n                If the `show` argument is set to True\n\n            :raises RuntimeError:\n                If the local command fails\n\n            :returns: Result of the `invoke.run`\n\n            .. versionadded:: 2.0\n            \"\"\"\n            if \"show\" in kwargs and kwargs[\"show\"]:\n                raise ValueError(\"The 'show' argument is not supported in LocalContext\")\n\n            from invoke import run\n            try:\n                result = run(*args, **kwargs)\n            except Exception as e:\n                raise RuntimeError(\"Local command failed: {}\".format(e))\n\n            return result",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def local(self, *args, **kwargs):\n        \"\"\"\n        Execute a shell command on the local system.\n\n        This method is effectively a wrapper of `invoke.run`; see its docs for\n        details and call signature.\n\n        .. versionadded:: 2.0\n        \"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

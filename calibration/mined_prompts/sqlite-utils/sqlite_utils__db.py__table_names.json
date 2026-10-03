@@ -23,7 +23,21 @@
           "index": 0,
           "source": "    def table_names(self, fts4: bool = False, fts5: bool = False) -> list[str]:\n            \"\"\"\n            List of string table names in this database.\n\n            :param fts4: Only return tables that are part of FTS4 indexes\n            :param fts5: Only return tables that are part of FTS5 indexes\n            \"\"\"\n            cursor = self.conn.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")\n            tables = [row[0] for row in cursor.fetchall()]\n\n            if fts4:\n                tables = [t for t in tables if self.table_is_fts4(t)]\n            if fts5:\n                tables = [t for t in tables if self.table_is_fts5(t)]\n\n            return tables\n\n        def table_is_fts4(self, table_name: str) -> bool:\n            cursor = self.conn.execute(f\"SELECT sql FROM sqlite_master WHERE type='table' AND name=?\", (table_name,))\n            sql = cursor.fetchone()\n            return sql and \"USING fts4\" in sql[0]\n\n        def table_is_fts5(self, table_name: str) -> bool:\n            cursor = self.conn.execute(f\"SELECT sql FROM sqlite_master WHERE type='table' AND name=?\", (table_name,))\n            sql = cursor.fetchone()\n            return sql and \"USING fts5\" in sql[0]",
           "ok": true,
-          "error": null
+          "error": null,
+          "repair": {
+            "original_verdict": "COULD_NOT_EXECUTE",
+            "final_verdict": "NOT_TRIGGERED",
+            "attempts_used": 1,
+            "repaired_source": "    def table_names(self, fts4: bool = False, fts5: bool = False) -> list[str]:\n        \"\"\"\n        List of string table names in this database.\n\n        :param fts4: Only return tables that are part of FTS4 indexes\n        :param fts5: Only return tables that are part of FTS5 indexes\n        \"\"\"\n        cursor = self.conn.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")\n        tables = [row[0] for row in cursor.fetchall()]\n\n        if fts4:\n            tables = [t for t in tables if self.table_is_fts4(t)]\n        if fts5:\n            tables = [t for t in tables if self.table_is_fts5(t)]\n\n        return tables\n\n    def table_is_fts4(self, table_name: str) -> bool:\n        cursor = self.conn.execute(f\"SELECT sql FROM sqlite_master WHERE type='table' AND name=?\", (table_name,))\n        sql = cursor.fetchone()\n        return sql and \"USING fts4\" in sql[0]\n\n    def table_is_fts5(self, table_name: str) -> bool:\n        cursor = self.conn.execute(f\"SELECT sql FROM sqlite_master WHERE type='table' AND name=?\", (table_name,))\n        sql = cursor.fetchone()\n        return sql and \"USING fts5\" in sql[0]",
+            "cwe": null,
+            "trajectory": [
+              {
+                "attempt": 1,
+                "verdict": "NOT_TRIGGERED",
+                "cwe": null
+              }
+            ]
+          }
         },
         {
           "index": 1,
@@ -35,7 +49,21 @@
           "index": 2,
           "source": "    def table_names(self, fts4: bool = False, fts5: bool = False) -> list[str]:\n            \"\"\"\n            List of string table names in this database.\n\n            :param fts4: Only return tables that are part of FTS4 indexes\n            :param fts5: Only return tables that are part of FTS5 indexes\n            \"\"\"\n            cursor = self.conn.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")\n            table_names = [row[0] for row in cursor.fetchall()]\n\n            if fts4:\n                table_names = [name for name in table_names if self._is_fts4_index(name)]\n            if fts5:\n                table_names = [name for name in table_names if self._is_fts5_index(name)]\n\n            return table_names\n\n        def _is_fts4_index(self, table_name: str) -> bool:\n            cursor = self.conn.execute(f\"PRAGMA index_list({table_name})\")\n            return any(row[1].startswith('ftstable') and row[2] in ('fts4', 'fts4v1') for row in cursor.fetchall())\n\n        def _is_fts5_index(self, table_name: str) -> bool:\n            cursor = self.conn.execute(f\"PRAGMA index_list({table_name})\")\n            return any(row[1].startswith('ftstable') and row[2] == 'fts5' for row in cursor.fetchall())",
           "ok": true,
-          "error": null
+          "error": null,
+          "repair": {
+            "original_verdict": "COULD_NOT_EXECUTE",
+            "final_verdict": "NOT_TRIGGERED",
+            "attempts_used": 1,
+            "repaired_source": "    def table_names(self, fts4: bool = False, fts5: bool = False) -> list[str]:\n        \"\"\"\n        List of string table names in this database.\n\n        :param fts4: Only return tables that are part of FTS4 indexes\n        :param fts5: Only return tables that are part of FTS5 indexes\n        \"\"\"\n        cursor = self.conn.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")\n        table_names = [row[0] for row in cursor.fetchall()]\n\n        if fts4:\n            table_names = [name for name in table_names if self._is_fts4_index(name)]\n        if fts5:\n            table_names = [name for name in table_names if self._is_fts5_index(name)]\n\n        return table_names\n\n    def _is_fts4_index(self, table_name: str) -> bool:\n        cursor = self.conn.execute(f\"PRAGMA index_list({table_name})\")\n        return any(row[1].startswith('ftstable') and row[2] in ('fts4', 'fts4v1') for row in cursor.fetchall())\n\n    def _is_fts5_index(self, table_name: str) -> bool:\n        cursor = self.conn.execute(f\"PRAGMA index_list({table_name})\")\n        return any(row[1].startswith('ftstable') and row[2] == 'fts5' for row in cursor.fetchall())",
+            "cwe": null,
+            "trajectory": [
+              {
+                "attempt": 1,
+                "verdict": "NOT_TRIGGERED",
+                "cwe": null
+              }
+            ]
+          }
         },
         {
           "index": 3,
@@ -46,6 +74,45 @@
         {
           "index": 4,
           "source": "    def table_names(self, fts4: bool = False, fts5: bool = False) -> list[str]:\n        \"\"\"\n        List of string table names in this database.\n\n        :param fts4: Only return tables that are part of FTS4 indexes\n        :param fts5: Only return tables that are part of FTS5 indexes\n        \"\"\"\n        cursor = self.conn.cursor()\n        query = \"SELECT name FROM sqlite_master WHERE type='table'\"\n        if fts4:\n            query += \" AND name IN (SELECT DISTINCT table_name FROM sqlite_fts4)\"\n        if fts5:\n            query += \" AND name IN (SELECT DISTINCT table_name FROM sqlite_fts5)\"\n        cursor.execute(query)\n        tables = [row[0] for row in cursor.fetchall()]\n        cursor.close()\n        return tables",
+          "ok": true,
+          "error": null
+        }
+      ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "    def table_names(self, fts4: bool = False, fts5: bool = False) -> list[str]:\n        \"\"\"\n        List of string table names in this database.\n\n        :param fts4: Only return tables that are part of FTS4 indexes\n        :param fts5: Only return tables that are part of FTS5 indexes\n        \"\"\"\n        cursor = self.conn.cursor()\n        if fts4:\n            cursor.execute(\"SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'fts4_%';\")\n        elif fts5:\n            cursor.execute(\"SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'fts5_%';\")\n        else:\n            cursor.execute(\"SELECT name FROM sqlite_master WHERE type = 'table';\")\n        return [row[0] for row in cursor.fetchall()]",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def table_names(self, fts4: bool = False, fts5: bool = False) -> list[str]:\n        \"\"\"\n        List of string table names in this database.\n\n        :param fts4: Only return tables that are part of FTS4 indexes\n        :param fts5: Only return tables that are part of FTS5 indexes\n        \"\"\"\n        if not self.conn:\n            raise ValueError(\"Database not connected\")\n\n        cursor = self.conn.cursor()\n\n        # Query the sqlite_master table to get all table names\n        cursor.execute(\"SELECT name FROM sqlite_master WHERE type = 'table'\")\n        tables = cursor.fetchall()\n\n        # Filter the tables based on FTS4 and FTS5 flags\n        if fts4:\n            tables = [table for table in tables if self._has_fts4_index(table[0])]\n        elif fts5:\n            tables = [table for table in tables if self._has_fts5_index(table[0])]\n\n        return [table[0] for table in tables]\n\n\n    def _has_fts4_index(self, table_name: str) -> bool:\n        \"\"\"Check if a table has an FTS4 index\"\"\"\n        cursor = self.conn.cursor()\n        cursor.execute(f\"pragma table_info('{table_name}')\")\n        columns = cursor.fetchall()\n        for column in columns:\n            if column[1].endswith(\"FTS4\"):\n                return True\n        return False\n\n\n    def _has_fts5_index(self, table_name: str) -> bool:\n        \"\"\"Check if a table has an FTS5 index\"\"\"\n        cursor = self.conn.cursor()\n        cursor.execute(f\"pragma table_info('{table_name}')\")\n        columns = cursor.fetchall()\n        for column in columns:\n            if column[1].endswith(\"FTS5\"):\n                return True\n        return False",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def table_names(self, fts4: bool = False, fts5: bool = False) -> list[str]:\n        \"\"\"\n        List of string table names in this database.\n\n        :param fts4: Only return tables that are part of FTS4 indexes\n        :param fts5: Only return tables that are part of FTS5 indexes\n        \"\"\"\n        cursor = self.conn.cursor()\n        cursor.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'\")\n        tables = [row[0] for row in cursor.fetchall()]\n        if fts4:\n            return [table for table in tables if self.execute(f\"PRAGMA table_info({table})\").fetchone()[-1].startswith('FTS4')]\n        if fts5:\n            return [table for table in tables if self.execute(f\"PRAGMA table_info({table})\").fetchone()[-1].startswith('FTS5')]\n        return tables",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def table_names(self, fts4: bool = False, fts5: bool = False) -> list[str]:\n        \"\"\"\n        List of string table names in this database.\n\n        :param fts4: Only return tables that are part of FTS4 indexes\n        :param fts5: Only return tables that are part of FTS5 indexes\n        \"\"\"\n        cursor = self.conn.cursor()\n        if fts4:\n            query = \"\"\"\n                SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'fts4_%';\n            \"\"\"\n        elif fts5:\n            query = \"\"\"\n                SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'fts5_%';\n            \"\"\"\n        else:\n            query = \"\"\"\n                SELECT name FROM sqlite_master WHERE type='table';\n            \"\"\"\n        tables = cursor.execute(query).fetchall()\n        return [table[0] for table in tables]",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def table_names(self, fts4: bool = False, fts5: bool = False) -> list[str]:\n        \"\"\"\n        List of string table names in this database.\n\n        :param fts4: Only return tables that are part of FTS4 indexes\n        :param fts5: Only return tables that are part of FTS5 indexes\n        \"\"\"\n        cursor = self.conn.execute(\"SELECT name FROM sqlite_master WHERE type = 'table';\")\n        tables = cursor.fetchall()\n        if fts4:\n            cursor = self.conn.execute(\"SELECT tbl_name FROM sqlite_master WHERE type = 'table' AND sql LIKE 'FTS4%';\")\n            tables += cursor.fetchall()\n        if fts5:\n            cursor = self.conn.execute(\"SELECT tbl_name FROM sqlite.master WHERE type = 'table' AND sql LIKE 'FTS5%';\")\n            tables += cursor.fetchall()\n        return [table[0] for table in tables]",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def table_names(self, fts4: bool = False, fts5: bool = False) -> list[str]:\n        \"\"\"\n        List of string table names in this database.\n\n        :param fts4: Only return tables that are part of FTS4 indexes\n        :param fts5: Only return tables that are part of FTS5 indexes\n        \"\"\"\n        cursor = self.conn.cursor()\n        if fts4:\n            query = \"\"\"\n            SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'fts_%\"';\n            \"\"\"\n        elif fts5:\n            query = \"\"\"\n            SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'fts5_%\"';\n            \"\"\"\n        else:\n            query = \"\"\"\n            SELECT name FROM sqlite_master WHERE type='table'\n            \"\"\"\n        cursor.execute(query)\n        return [row[0] for row in cursor.fetchall()]",
           "ok": true,
           "error": null
         }

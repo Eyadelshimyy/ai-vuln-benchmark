@@ -50,6 +50,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "def integration(\n    c: Context, opts: Optional[str] = None, pty: bool = True\n) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "def integration(c: Context, opts: Optional[str] = None, pty: bool = True) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    # Running the integration test suite\n    cmd = ['pytest', 'tests/integration']\n    if opts:\n        cmd.append(opts)\n    if not pty:\n        subprocess.run(cmd, check=True)\n    else:\n        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "def integration(c: Context, opts: Optional[str] = None, pty: bool = True) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    cmd = [sys.executable, 'manage.py', 'test', 'integration']\n    if opts:\n        cmd.extend(['--settings', opts])\n    try:\n        with redirect_stdout(open('/dev/null', 'w')):\n            subprocess.check_output(cmd, stderr=subprocess.STDOUT, shell=False)\n    except subprocess.CalledProcessError as e:\n        print(f'Error encountered: {e.output.decode()}')",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "def integration(\n    c: Context, opts: Optional[str] = None, pty: bool = True\n) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    cmd = [\"pytest\", \"test_integration.py\"]\n    if opts:\n        cmd.extend(opts.split())\n    subprocess.run(cmd, check=True, text=True, cwd=c.root_dir)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "def integration(\n    c: Context, opts: Optional[str] = None, pty: bool = True\n) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    # Implementing this function\n    print(\"Integration test suite running...\")",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "def integration(\n    c: Context, opts: Optional[str] = None, pty: bool = True\n) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

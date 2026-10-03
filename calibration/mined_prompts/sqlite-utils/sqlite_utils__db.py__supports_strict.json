@@ -50,6 +50,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "    def supports_strict(self) -> bool:\n        \"\"\"\n        Does this database support STRICT mode?\n        \"\"\"\n        # Check if the connection is to memory\n        if self.memory:\n            return False\n\n        # Check if the connection is to a file\n        if isinstance(self.filename_or_conn, (str, pathlib.Path)):\n            return True\n\n        # If the connection is a sqlite3.Connection, we can't determine if it supports strict mode\n        # because it's not a file or memory connection.\n        return False",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def supports_strict(self) -> bool:\n        \"\"\"\n        Does this database support STRICT mode?\n        \"\"\"\n        cursor = self.conn.cursor()\n        cursor.execute(\"PRAGMA strict;\")\n        result = cursor.fetchone()\n        return result[0] == 1",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def supports_strict(self) -> bool:\n        \"\"\"\n        Does this database support STRICT mode?\n        \"\"\"\n        # Check if the connection is open and the database version is >= 3.27.0 (as strict mode was introduced in 3.27.0)\n        cursor = self.conn.cursor()\n        cursor.execute(\"PRAGMA user_version\")\n        user_version = cursor.fetchone()[0]\n        cursor.close()\n\n        return user_version >= 3.27.0",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def supports_strict(self) -> bool:\n        \"\"\"\n        Does this database support STRICT mode?\n        \"\"\"\n        # Execute a dummy query to check if STRICT mode is supported\n        cur = self.conn.execute(\"SELECT STRICT_TRANS_TABLES\")\n        result = cur.fetchone()\n\n        # If the result is not None, it means that STRICT mode is supported\n        return result is not None",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def supports_strict(self) -> bool:\n        \"\"\"Does this database support STRICT mode?\"\"\"\n        return self.strict",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def supports_strict(self) -> bool:\n        \"\"\"\n        Does this database support STRICT mode?\n        \"\"\"\n        # Get the SQLite version\n        sqlite_version = self.conn.execute(\"SELECT sqlite_version()\").fetchone()[0]\n\n        # Split the version and convert to integers\n        version_parts = [int(part) for part in sqlite_version.split('.') if part.isdigit()]\n\n        # Check if the version is 3.25.0 or higher\n        return (\n            len(version_parts) >= 2\n            and version_parts[0] >= 3\n            and version_parts[1] >= 25\n        )",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

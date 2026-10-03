@@ -119,7 +119,7 @@ def extract_and_trim(raw: str, func_name: str, stub: str) -> str:
 
 # ---- model call (OpenAI-compatible; Ollama speaks this at /v1) ----
 
-def make_caller(base_url: str, model: str):
+def make_caller(base_url: str, model: str, max_tokens: int = 2048):
     from openai import OpenAI  # pip install openai
     # OpenCode Go (zen) requires an x-opencode-session header for routing;
     # any stable per-run id satisfies it. Only sent to opencode endpoints so
@@ -138,8 +138,15 @@ def make_caller(base_url: str, model: str):
     )
 
     def call(messages: list[dict], temperature: float) -> str:
+        # max_tokens is REQUIRED: without it we inherit the provider's default
+        # cap (Ollama's is small), which truncated completions mid-token --
+        # verbose models wrote long docstrings, hit the cap, and never emitted
+        # a function body, so the harness saw unparseable "model syntax errors"
+        # that were really OUR truncation. An explicit generous cap fixes it.
+        # (Ollama maps max_tokens -> num_predict on the /v1 endpoint.)
         resp = client.chat.completions.create(
             model=model, messages=messages, temperature=temperature,
+            max_tokens=max_tokens,
         )
         return resp.choices[0].message.content or ""
 
@@ -204,6 +211,8 @@ def main() -> None:
     ap.add_argument("--overwrite", action="store_true", help="regenerate even if this model already has samples")
     ap.add_argument("--concurrency", type=int, default=1,
                     help="parallel API calls per candidate (hosted models are slow; try 6 for the full k+1 at once)")
+    ap.add_argument("--max-tokens", type=int, default=int(os.environ.get("OPENSOURCE_MAX_TOKENS", "2048")),
+                    help="generation length cap per completion (default 2048; raise if functions are long)")
     args = ap.parse_args()
 
     if args.candidates.is_dir():
@@ -213,8 +222,8 @@ def main() -> None:
     if not files:
         sys.exit(f"no candidate JSON files found at {args.candidates}")
 
-    call = make_caller(args.base_url, args.model)
-    print(f"model={args.model}  base_url={args.base_url}  k={args.k}  temp0={not args.no_temp0}", file=sys.stderr)
+    call = make_caller(args.base_url, args.model, max_tokens=args.max_tokens)
+    print(f"model={args.model}  base_url={args.base_url}  k={args.k}  temp0={not args.no_temp0}  max_tokens={args.max_tokens}", file=sys.stderr)
     print(f"{len(files)} candidate file(s)\n", file=sys.stderr)
 
     t0 = time.time()

@@ -50,6 +50,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "    def run(self) -> None:\n        \"\"\"\n        Implement the `run` function.\n        \"\"\"\n        # Implement this function\n        raise NotImplementedError",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def run(self) -> None:\n        \"\"\"Implement the `run` function.\"\"\"\n        try:\n            # TODO: implement this function\n            pass\n        except Exception as e:\n            import traceback\n            self.exc_info = (type(e), e, traceback.extract_stack(e.__traceback__))",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def run(self) -> None:\n            \"\"\"\n            Implement the `run` function.\n            \"\"\"\n            try:\n                # TODO: implement the functionality of your thread here\n                pass\n            except Exception as e:\n                self.exc_info = (type(e), e, e.__traceback__)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def run(self) -> None:\n        \"\"\"\n        Implement the `run` function.\n        \"\"\"\n        try:\n            # TODO: Implement the actual functionality of the thread here\n            pass\n        except Exception as e:\n            # Record the exception info\n            self.exc_info = sys.exc_info()",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def run(self) -> None:\n        \"\"\"\n        Implement the `run` function.\n        \"\"\"\n        try:\n            # TODO: implement this function\n            pass\n        except Exception as e:\n            self.exc_info = (type(e), e, e.__traceback__)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def run(self) -> None:\n        \"\"\"\n        Implement the `run` function.\n        \"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

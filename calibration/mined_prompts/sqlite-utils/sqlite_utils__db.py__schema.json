@@ -50,6 +50,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "    def schema(self) -> str:\n        \"\"\"\n        SQL schema for this database.\n        \"\"\"\n        cursor = self.conn.cursor()\n        cursor.execute(\"SELECT sql FROM sqlite_master WHERE type = 'table' OR type = 'view'\")\n        rows = cursor.fetchall()\n        schema = \"\"\n        for row in rows:\n            schema += row[0] + \";\\n\"\n        return schema",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def schema(self) -> str:\n            \"\"\"SQL schema for this database.\"\"\"\n            cursor = self.conn.cursor()\n            cursor.execute(\"SELECT sql FROM sqlite_master WHERE type='table' OR type='view'\")\n            rows = cursor.fetchall()\n            schema = \"\"\n            for row in rows:\n                schema += row[0] + \";\\n\"\n            return schema",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def schema(self) -> str:\n        \"\"\"\n        SQL schema for this database.\n        \"\"\"\n        cursor = self.conn.cursor()\n        cursor.execute(\"SELECT sql FROM sqlite_master WHERE type='table' OR type='view' ORDER BY name\")\n        rows = cursor.fetchall()\n        return '\\n'.join(row[0] for row in rows)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def schema(self) -> str:\n        \"\"\"\n        SQL schema for this database.\n        \"\"\"\n        cursor = self.conn.execute(\"SELECT * FROM sqlite_master\")\n        rows = cursor.fetchall()\n        return \"\\n\".join([\" \".join(row) for row in rows])",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def schema(self) -> str:\n        \"\"\"SQL schema for this database.\"\"\"\n        cursor = self.conn.cursor()\n        cursor.execute(\"SELECT sql(*) FROM sqlite_master WHERE type = 'table' OR type = 'view' ORDER BY name;\")\n        rows = cursor.fetchall()\n        schema_str = \"\"\n        for row in rows:\n            schema_str += row[0] + \";\"\n        return schema_str",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def schema(self) -> str:\n        \"\"\"\n        SQL schema for this database.\n        \"\"\"\n        cursor = self.conn.cursor()\n        cursor.execute(\"SELECT sql FROM sqlite_master WHERE type = 'table' OR type = 'view'\")\n        rows = cursor.fetchall()\n        return '\\n'.join([row[0] for row in rows])",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

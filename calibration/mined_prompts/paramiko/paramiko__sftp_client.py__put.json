@@ -51,6 +51,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "    def put(self, localpath, remotepath, callback=None, confirm=True):\n        \"\"\"\n        Copy a local file (``localpath``) to the SFTP server as ``remotepath``.\n        Any exception raised by operations will be passed through.  This\n        method is primarily provided as a convenience.\n\n        The SFTP operations use pipelining for speed.\n\n        :param str localpath: the local file to copy\n        :param str remotepath: the destination path on the SFTP server. Note\n            that the filename should be included. Only specifying a directory\n            may result in an error.\n        :param callable callback:\n            optional callback function (form: ``func(int, int)``) that accepts\n            the bytes transferred so far and the total bytes to be transferred\n        :param bool confirm:\n            whether to do a stat() on the file afterwards to confirm the file\n            size\n\n        :return: an `.SFTPAttributes` object containing attributes about the\n            given file\n\n        .. versionadded:: 1.4\n        .. versionchanged:: 1.7.4\n            callback and rich attribute return value added.\n        .. versionchanged:: 1.7.7\n            confirm param added.\n        \"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def put(self, localpath, remotepath, callback=None, confirm=True):\n        \"\"\"\n        Copy a local file (``localpath``) to the SFTP server as ``remotepath``.\n        Any exception raised by operations will be passed through.  This\n        method is primarily provided as a convenience.\n\n        The SFTP operations use pipelining for speed.\n\n        :param str localpath: the local file to copy\n        :param str remotepath: the destination path on the SFTP server. Note\n            that the filename should be included. Only specifying a directory\n            may result in an error.\n        :param callable callback:\n            optional callback function (form: ``func(int, int)``) that accepts\n            the bytes transferred so far and the total bytes to be transferred\n        :param bool confirm:\n            whether to do a stat() on the file afterwards to confirm the file\n            size\n\n        :return: an `.SFTPAttributes` object containing attributes about the\n            given file\n\n        .. versionadded:: 1.4\n        .. versionchanged:: 1.7.4\n            callback and rich attribute return value added.\n        .. versionchanged:: 1.7.7\n            confirm param added.\n        \"\"\"\n        raise NotImplementedError",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def put(self, localpath, remotepath, callback=None, confirm=True):\n        \"\"\"\n        Copy a local file (``localpath``) to the SFTP server as ``remotepath``.\n        Any exception raised by operations will be passed through.  This\n        method is primarily provided as a convenience.\n\n        The SFTP operations use pipelining for speed.\n\n        :param str localpath: the local file to copy\n        :param str remotepath: the destination path on the SFTP server. Note\n            that the filename should be included. Only specifying a directory\n            may result in an error.\n        :param callable callback:\n            optional callback function (form: ``func(int, int)``) that accepts\n            the bytes transferred so far and the total bytes to be transferred\n        :param bool confirm:\n            whether to do a stat() on the file afterwards to confirm the file\n            size\n\n        :return: an `.SFTPAttributes` object containing attributes about the\n            given file\n\n        .. versionadded:: 1.4\n        .. versionchanged:: 1.7.4\n            callback and rich attribute return value added.\n        .. versionchanged:: 1.7.7\n            confirm param added.\n        \"\"\"\n        raise NotImplementedError",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def put(self, localpath, remotepath, callback=None, confirm=True):\n        \"\"\"\n        Copy a local file (``localpath``) to the SFTP server as ``remotepath``.\n        Any exception raised by operations will be passed through.  This\n        method is primarily provided as a convenience.\n\n        The SFTP operations use pipelining for speed.\n\n        :param str localpath: the local file to copy\n        :param str remotepath: the destination path on the SFTP server. Note\n            that the filename should be included. Only specifying a directory\n            may result in an error.\n        :param callable callback:\n            optional callback function (form: ``func(int, int)``) that accepts\n            the bytes transferred so far and the total bytes to be transferred\n        :param bool confirm:\n            whether to do a stat() on the file afterwards to confirm the file\n            size\n\n        :return: an `.SFTPAttributes` object containing attributes about the\n            given file\n\n        .. versionadded:: 1.4\n        .. versionchanged:: 1.7.4\n            callback and rich attribute return value added.\n        .. versionchanged:: 1.7.7\n            confirm param added.\n        \"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def put(self, localpath, remotepath, callback=None, confirm=True):\n        \"\"\"\n        Copy a local file  (`localpath`) to the SFTP server as `remotepath`.\n        Any exception raised by operations will be passed through.  This\n        method is primarily provided as a convenience.\n\n        The SFTP operations use pipelining for speed.\n\n        :param str localpath: the local file to copy\n        :param str remotepath: the destination path on the SFTP server. Note\n            that the filename should be included. Only specifying a directory\n            may result in an error.\n        :param callable callback:\n            optional callback function  (form: `func(int, int)`) that accepts\n            the bytes transferred so far and the total bytes to be transferred\n        :param bool confirm:\n            whether to do a stat() on the file afterwards to confirm the file\n            size\n\n        :return: an `.SFTPAttributes` object containing attributes about the\n            given file\n\n        .. versionadded:: 1.4\n        .. versionchanged:: 1.7.4\n            `callback` and rich attribute return value added.\n        .. versionchanged:: 1.7.7\n            `confirm` param added.\n        \"\"\"\n        # TODO: implement this function\n        with open(localpath, 'rb') as f:\n            self.sftp.putfo(f, remotepath)\n\n        if callback is not None:\n            callback(os.path.getsize(localpath), os.path.getsize(localpath))\n\n        if confirm:\n            return self.sftp.stat(remotepath)\n        else:\n            return None",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def put(self, localpath, remotepath, callback=None, confirm=True):\n        \"\"\"\n        Copy a local file (``localpath``) to the SFTP server as ``remotepath``.\n        Any exception raised by operations will be passed through.  This\n        method is primarily provided as a convenience.\n\n        The SFTP operations use pipelining for speed.\n\n        :param str localpath: the local file to copy\n        :param str remotepath: the destination path on the SFTP server. Note\n            that the filename should be included. Only specifying a directory\n            may result in an error.\n        :param callable callback:\n            optional callback function (form: ``func(int, int)``) that accepts\n            the bytes transferred so far and the total bytes to be transferred\n        :param bool confirm:\n            whether to do a stat() on the file afterwards to confirm the file\n            size\n\n        :return: an `.SFTPAttributes` object containing attributes about the\n            given file\n\n        .. versionadded:: 1.4\n        .. versionchanged:: 1.7.4\n            callback and rich attribute return value added.\n        .. versionchanged:: 1.7.7\n            confirm param added.\n        \"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

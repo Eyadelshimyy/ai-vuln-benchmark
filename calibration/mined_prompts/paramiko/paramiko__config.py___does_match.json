@@ -56,6 +56,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "    def _does_match(\n        self, match_list, target_hostname, canonical, final, options\n    ):\n        \"\"\"\n        Implement the `_does_match` function (parameters: match_list, targettarget_hostname, canonical, final, options).\n        \"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    I'm sorry, but there seems to be some confusion. The method `_does_match` you're asking for doesn't seem to be a part of the provided class. It seems to be a method that should be part of the OpenSSH config object, but it's not provided.\n\n    If you could provide more context or clarify what exactly you're trying to achieve with the `_does_match` method, I would be happy to help you.",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def _does_match(\n        self, match_list, target_hostname, canonical, final, options\n    ):\n        \"\"\"\n        Implement the `_does_match` function (parameters: match_list, targettarget_hostname, canonical, final, options).\n        \"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def _does_match(\n        self, match_list, target_hostname, canonical, final, options\n    ):\n        \"\"\"\n        Implement the `_does_match` function (parameters: match_list, targettarget_hostname, canonical, final, options).\n        \"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def _does_match(self, match_list, target_hostname, canonical, final, options):\n        \"\"\"\n        Implement the `_does_match` function (parameters: match_list, target_hostname, \n        canonical, final, options).\n        \"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def _does_match(\n        self, match_list, target_hostname, canonical, final, options\n    ):\n        \"\"\"Implement the `_does_match` function (parameters: match_list, targettarget_hostname, canonical, final, options).\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

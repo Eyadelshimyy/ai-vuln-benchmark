@@ -50,6 +50,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "def _execute_query(\n    db,\n    sql,\n    param,\n    raw,\n    raw_lines,\n    table,\n    csv,\n    tsv,\n    no_headers,\n    fmt,\n    nl,\n    arrays,\n    json_cols,\n    ascii_,\n):\n    \"\"\"Implement the `_execute_query` function (parameters: db, sql, param, raw, raw_lines, table, csv, tsv, no_headers, fmt, nl, arrays, json_cols, ascii_).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "def _execute_query(\n    db,\n    sql,\n    param,\n    raw,\n    raw_lines,\n    table,\n    csv,\n    tsv,\n    no_headers,\n    fmt,\n    nl,\n    arrays,\n    json_cols,\n    ascii_,\n):\n    \"\"\"Implement the `_execute_query` function (parameters: db, sql, param, raw, raw_lines, table, csv, tsv, no_headers, fmt, nl, arrays, json_cols, ascii_).\"\"\"\n    with psycopg2.connect(dbname=db) as conn:\n        with conn.cursor() as cur:\n            cur.execute(sql, param)\n            rows = cur.fetchall()\n\n    df = pd.DataFrame(rows)\n\n    # You would need to add more logic here to handle various output formats.\n    # This is just a placeholder to show the structure of the function.\n\n    return df",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "def _execute_query(\n    db,\n    sql,\n    param,\n    raw,\n    raw_lines,\n    table,\n    csv,\n    tsv,\n    no_headers,\n    fmt,\n    nl,\n    arrays,\n    json_cols,\n    ascii_,\n):\n    # TODO: implement this function\n    raise NotImplementedError",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "def _execute_query(\n    db,\n    sql,\n    param,\n    raw,\n    raw_lines,\n    table,\n    csv,\n    tsv,\n    no_headers,\n    fmt,\n    nl,\n    arrays,\n    json_cols,\n    ascii_,\n):\n    \"\"\"Implement the `_execute_query` function \n    (parameters: db, sql, param, raw, raw_lines, table, csv, tsv, no_headers, fmt, nl, arrays, json_cols, ascii_).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "def _execute_query(\n    db,\n    sql,\n    param,\n    raw,\n    raw_lines,\n    table,\n    csv,\n    tsv,\n    no_headers,\n    fmt,\n    nl,\n    arrays,\n    json_cols,\n    ascii_,\n):\n    \"\"\"Implement the `_execute_query` function \n    (parameters: db, sql, param, raw, raw_lines, table, csv, tsv, no_headers, fmt, nl, arrays, json_cols, ascii_).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "def _execute_query(\n    db,\n    sql,\n    param,\n    raw,\n    raw_lines,\n    table,\n    csv,\n    tsv,\n    no_headers,\n    fmt,\n    nl,\n    arrays,\n    json_cols,\n    ascii_,\n):\n    \"\"\"Implement the `_execute_query` function (parameters: db, sql, param, raw, raw_lines, table, csv, tsv, no_headers, fmt, nl, arrays, json_cols, ascii_).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

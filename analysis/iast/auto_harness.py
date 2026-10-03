@@ -188,7 +188,50 @@ def _looks_object_typed(ann: str | None) -> bool:
 # whitespace so the snippet parses as if it were top-level, which is exactly
 # how we're about to call it (as a bare function, with a fake `self`) anyway.
 def _normalize_source(source: str) -> str:
-    return textwrap.dedent(source)
+    dedented = textwrap.dedent(source)
+    # Fast path: a clean candidate parses as-is after dedent (the common case).
+    try:
+        ast.parse(dedented)
+        return dedented
+    except SyntaxError:
+        pass
+    # RECOVERY (BUG FOUND BY TESTING, deepseek-coder runs): an LLM sometimes
+    # emits a perfectly valid function and THEN tacks on an English paragraph
+    # ("This implementation works by...") or other trailing junk after the
+    # body. That prose sits at or below the def's own indent, so Python reads
+    # it as stray top-level text and the whole snippet fails to parse -- even
+    # though the function itself is fine. Without this, such samples were
+    # wrongly counted as COULD_NOT_EXECUTE (model-syntax), discarding real
+    # executable (and possibly vulnerable) code. So: keep only the first
+    # function definition and its body -- the def line plus every following
+    # line that is blank or indented deeper than the def -- and stop at the
+    # first non-blank line back at/above the def's level. If the trimmed
+    # version parses, use it; otherwise the failure is GENUINE (a truncated /
+    # unterminated docstring, a bad literal like `3.27.0`, etc.) and we return
+    # the dedented source unchanged so the caller reports an honest
+    # COULD_NOT_EXECUTE. Valid candidates never reach here, so they are never
+    # altered.
+    lines = dedented.split("\n")
+    def_idx = next((i for i, ln in enumerate(lines)
+                    if re.match(r"\s*(async\s+)?def\s+", ln)), None)
+    if def_idx is None:
+        return dedented
+    def_line = lines[def_idx]
+    def_indent = len(def_line) - len(def_line.lstrip())
+    kept = [def_line]
+    for ln in lines[def_idx + 1:]:
+        if not ln.strip():
+            kept.append(ln)
+            continue
+        if (len(ln) - len(ln.lstrip())) <= def_indent:
+            break  # back to/above the def's level -> trailing non-body content
+        kept.append(ln)
+    trimmed = "\n".join(kept)
+    try:
+        ast.parse(trimmed)
+        return trimmed
+    except SyntaxError:
+        return dedented  # genuine syntax failure -- report it honestly
 
 
 # A mined (or later, LLM-generated) function's source is just the function
@@ -388,7 +431,11 @@ def _build_effective_module_source(module_source: str, func_name: str, line: int
         return module_source, class_name
     lines = module_source.splitlines()
     indent = " " * node.col_offset
-    dedented = textwrap.dedent(replacement_source).rstrip("\n")
+    # Use _normalize_source (not a bare dedent) so trailing prose the model
+    # appended after the function body is stripped before we splice it back
+    # into the real module -- otherwise that prose would break the whole
+    # module's compile even though the function itself is valid.
+    dedented = _normalize_source(replacement_source).rstrip("\n")
     reindented = textwrap.indent(dedented, indent)
     new_lines = lines[: node.lineno - 1] + reindented.splitlines() + lines[(node.end_lineno or node.lineno):]
     return "\n".join(new_lines), class_name
@@ -623,9 +670,19 @@ def _child_main(source: str, func_name: str, param_name: str | None, marker: str
         import warnings
         warnings.filterwarnings("ignore")
         # Keep this process's own stdout/stderr from a buggy candidate
-        # (e.g. an infinite print loop) from flooding the real terminal --
-        # it's already wall-clock-limited by the parent, this just keeps
-        # output sane.
+        # (e.g. an infinite print loop, or a generated cached_counts that
+        # hallucinates self.execute_script and prints "Error counting table
+        # X" for every character of the taint marker) from flooding the real
+        # terminal. The verdict travels back over `conn` (a pipe), NOT over
+        # stdout/stderr, and exceptions are captured via traceback.format_exc
+        # and sent the same way -- so silencing the candidate's own output
+        # here changes no verdict, it only keeps the benchmark log clean.
+        # EXCEPT in --live-demo, where the whole point is to SEE the real
+        # side effect, so leave output visible there.
+        if not live:
+            _devnull = open(os.devnull, "w")
+            sys.stdout = _devnull
+            sys.stderr = _devnull
         sys.path.insert(0, str(Path(__file__).parent))
 
         normalized = _normalize_source(source)
@@ -948,7 +1005,7 @@ def _child_main(source: str, func_name: str, param_name: str | None, marker: str
                 triggered, hits, error = True, rec.hits, None
             except Exception as e:
                 triggered, hits = bool(rec.hits), rec.hits
-                error = f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=3)}"
+                error = f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=8)}"
 
             # FORK-BOUNDARY RELAY -- see sinks.py's _relay_hit_across_fork
             # docstring for the full story: a hit recorded by the exec/
@@ -979,11 +1036,16 @@ def _child_main(source: str, func_name: str, param_name: str | None, marker: str
                 "cwe": hit.cwe, "sink": hit.sink, "detail": hit.detail[:300],
             })
         elif error:
-            conn.send({"verdict": "COULD_NOT_EXECUTE", "error": error.splitlines()[0]})
+            # Keep the one-line summary for existing displays, but ALSO ship the
+            # full captured traceback as `detail` so crash-localisation (model's
+            # code vs our harness) is possible downstream. See diagnose_crashes.py.
+            conn.send({"verdict": "COULD_NOT_EXECUTE",
+                       "error": error.splitlines()[0], "detail": error[:4000]})
         else:
             conn.send({"verdict": "NOT_TRIGGERED"})
     except BaseException as e:  # noqa: BLE001 -- a child process, anything escaping must still report, never hang
-        conn.send({"verdict": "COULD_NOT_EXECUTE", "error": f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=3)}"})
+        _tb = f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=8)}"
+        conn.send({"verdict": "COULD_NOT_EXECUTE", "error": _tb.splitlines()[0], "detail": _tb[:4000]})
 
 
 def _set_child_limits():

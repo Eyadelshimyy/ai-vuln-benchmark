@@ -51,6 +51,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "    def from_file(cls, filename):\n        \"\"\"\n        Create a public blob from a ``-cert.pub``-style file on disk.\n        \"\"\"\n        with open(filename, 'r') as file:\n            lines = file.readlines()\n        key_type, key_blob, comment = lines[0].strip(), lines[1].strip().encode(), lines[2].strip()\n        return cls(key_type, key_blob, comment)\n\n    # Usage:\n    # key = MyClass.from_file('filename.pub')\n    # print(key.key_type, key.key_blob, key.comment)",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def from_file(cls, filename):\n        \"\"\"\n        Create a public blob from a ``-cert.pub``-style file on disk.\n        \"\"\"\n        with open(filename, 'r') as f:\n            lines = f.read().splitlines()\n        key_type, key_blob = lines[0][:4], lines[1]\n        comment = lines[2] if len(lines) > 2 else None\n        return cls(key_type, key_blob, comment)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def from_file(cls, filename):\n        \"\"\"\n        Create a public blob from a ``-cert.pub``-style file on disk.\n        \"\"\"\n        with open(filename, 'r') as f:\n            lines = f.readlines()\n\n        key_type = lines[0].strip()\n        key_blob = lines[1].strip().encode()\n        comment = lines[2].strip() if len(lines) > 2 else None\n\n        return cls(key_type, key_blob, comment)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def from_file(cls, filename):\n        \"\"\"\n        Create a public blob from a ``-cert.pub``-style file on disk.\n        \"\"\"\n        with open(filename, 'r') as file:\n            lines = file.readlines()\n        key_type, key_blob = lines[0].strip().split(' ', 1)\n        comment = lines[1].strip() if len(lines) > 1 else None\n        return cls(key_type, key_blob.encode(), comment)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def from_file(cls, filename):\n        \"\"\"\n        Create a public blob from a ``-cert.pub``-style file on disk.\n        \"\"\"\n        with open(filename, 'r') as f:\n            key_type = f.readline().strip()\n            key_blob = base64.b64decode(f.readline().strip())\n        return cls(key_type, key_blob)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def from_file(cls, filename):\n        \"\"\"\n        Create a public blob from a ``-cert.pub``-style file on disk.\n        \"\"\"\n        with open(filename, 'r') as f:\n            lines = f.readlines()\n        key_type, key_blob = lines[0].strip(), ''.join(lines[1:]).strip()\n        return cls(key_type, key_blob.encode())",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

@@ -51,6 +51,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "    def set_file_attr(filename, attr):\n        \"\"\"\n        Change a file's attributes on the local filesystem.  The contents of\n        ``attr`` are used to change the permissions, owner, group ownership,\n        and/or modification & access time of the file, depending on which\n        attributes are present in ``attr``.\n\n        This is meant to be a handy helper function for translating SFTP file\n        requests into local file operations.\n\n        :param str filename:\n            name of the file to alter  (should usually be an absolute path).\n        :param  .SFTPAttributes attr: attributes to change.\n        \"\"\"\n        mode = attr.get('mode')\n        uid = attr.get('uid')\n        gid = attr.get('gid')\n        mtime = attr.get('mtime')\n        atime = attr.get('atime')\n\n        if mode is not None:\n            os.chmod(filename, mode)\n        if uid is not None or gid is not None:\n            os.chown(filename, uid, gid)\n        if mtime is not None:\n            os.utime(filename, (atime, mtime))",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def set_file_attr(self, filename, attr):\n            \"\"\"\n            Change a file's attributes on the local filesystem.  The contents of\n            ``attr`` are used to change the permissions, owner, group ownership,\n            and/or modification & access time of the file, depending on which\n            attributes are present in ``attr``.\n\n            This is meant to be a handy helper function for translating SFTP file\n            requests into local file operations.\n\n            :param str filename:\n                name of the file to alter  (should usually be an absolute path).\n            :param .SFTPAttributes attr: attributes to change.\n            \"\"\"\n            # TODO: implement this function\n            raise NotImplementedError",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def set_file_attr(filename, attr):\n        \"\"\"\n        Change a file's attributes on the local filesystem.  The contents of\n        ``attr`` are used to change the permissions, owner, group ownership,\n        and/or modification & access time of the file, depending on which\n        attributes are present in ``attr``.\n\n        This is meant to be a handy helper function for translating SFTP file\n        requests into local file operations.\n\n        :param str filename:\n            name of the file to alter (should usually be an absolute path).\n        :param  .SFTPAttributes attr: attributes to change.\n        \"\"\"\n        mode = attr.get('mode')\n        uid = attr.get('uid')\n        gid = attr.get('gid')\n        atime = attr.get('atime')\n        mtime = attr.get('mtime')\n\n        if mode is not None:\n            os.chmod(filename, mode)\n        if uid is not None or gid is not None:\n            if uid is not None:\n                pw = pwd.getpwuid(uid)\n                os.chown(filename, uid, -1 if gid is None else gid)\n            if gid is not None:\n                gr = grp.getgrgid(gid)\n                os.chown(filename, -1 if uid is None else uid, gid)\n        if atime is not None or mtime is not None:\n            if atime is not None:\n                os.utime(filename, (atime, mtime))",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def set_file_attr(filename, attr):\n        \"\"\"\n        Change a file's attributes on the local filesystem.  The contents of\n        ``attr`` are used to change the permissions, owner, group ownership,\n        and/or modification & access time of the file, depending on which\n        attributes are present in ``attr``.\n\n        This is meant to be a handy helper function for translating SFTP file\n        requests into local file operations.\n\n        :param str filename:\n            name of the file to alter  (should usually be an absolute path).\n        :param  .SFTPAttributes attr: attributes to change.\n        \"\"\"\n        mode = attr.mode\n        uid = attr.uid\n        gid = attr.gid\n        atime = attr.atime\n        mtime = attr.mtime\n\n        if mode is not None:\n            os.chmod(filename, mode)\n        if uid is not None or gid is not None:\n            os.chown(filename, uid, gid)\n        if atime is not None or mtime is not None:\n            os.utime(filename, (atime, mtime))",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def set_file_attr(filename, attr):\n        \"\"\"\n        Change a file's attributes on the local filesystem.  The contents of\n        ``attr`` are used to change the permissions, owner, group ownership,\n        and/or modification  & access time of the file, depending on which\n        attributes are present in ``attr``.\n\n        This is meant to be a handy helper function for translating SFTP file\n        requests into local file operations.\n\n        :param str filename:\n            name of the file to alter (should usually be an absolute path).\n        :param  .SFTPAttributes attr: attributes to change.\n        \"\"\"\n        mode = 0\n        if attr.permissions is not None:\n            mode |= attr.permissions\n        if attr.uid is not None:\n            os.chown(filename, attr.uid, -1)\n        if attr.gid is not None:\n            os.chown(filename, -1, attr.gid)\n        if attr.atime is not None or attr.mtime is not None:\n            epoch = time.mktime(time.strptime('1970-01-01 00:00:00'))\n            atime = attr.atime.secs + epoch\n            mtime = attr.mtime.secs + epoch\n            os.utime(filename, (atime, mtime))\n        os.chmod(filename, mode)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def set_file_attr(filename, attr):\n        \"\"\"\n        Change a file's attributes on the local filesystem.  The contents of\n        ``attr`` are used to change the permissions, owner, group ownership,\n        and/or modification & access time of the file, depending on which\n        attributes are present in ``attr``.\n\n        This is meant to be a handy helper function for translating SFTP file\n        requests into local file operations.\n\n        :param str filename:\n            name of the file to alter  (should usually be an absolute path).\n        :param  .SFTPAttributes attr: attributes to change.\n        \"\"\"\n    \n        # Change permissions\n        if 'permissions' in attr:\n            os.chmod(filename, attr['permissions'])\n    \n        # Change owner\n        if 'owner' in attr:\n            shutil._set_acl(filename, attr['owner'])\n    \n        # Change group ownership\n        if 'group' in attr:\n            shutil._set_acl(filename, None, attr['group'])\n    \n        # Change modification time\n        if 'mtime' in attr:\n            os.utime(filename, (attr['mtime'], attr['mtime']))\n    \n        # Change access time\n        if 'atime' in attr:\n            os.utime(filename, (attr['atime'], None))",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

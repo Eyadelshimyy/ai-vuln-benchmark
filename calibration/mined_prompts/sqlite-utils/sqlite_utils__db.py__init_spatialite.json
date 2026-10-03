@@ -50,6 +50,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "    def init_spatialite(self, path: str | None = None) -> bool:\n        \"\"\"\n        The ``init_spatialite`` method will load and initialize the SpatiaLite extension.\n        The ``path`` argument should be an absolute path to the compiled extension, which\n        can be found using ``find_spatialite``.\n\n        Returns ``True`` if SpatiaLite was successfully initialized.\n\n        .. code-block:: python\n\n            from sqlite_utils.db import Database\n            from sqlite_utils.utils import find_spatialite\n\n            db = Database(\"mydb.db\")\n            db.init_spatialite(find_spatialite())\n\n        If you've installed SpatiaLite somewhere unexpected \n        (for testing an alternate version, for example) you can pass in an absolute path:\n\n        .. code-block:: python\n\n            from sqlite_utils.db import Database\n            from sqlite_utils.utils import find_spatialite\n\n            db = Database(\"mydb.db\")\n            db.init_spatialite(\"./local/mod_spatialite.dylib\")\n\n        :param path: Path to SpatiaLite module on disk\n        \"\"\"\n        if path is None:\n            self.conn.enable_load_extension(True)\n            self.conn.execute('SELECT load_extension(\"mod_spatialite\")')\n        else:\n            self.conn.enable_load_extension(True)\n            self.conn.execute(f'SELECT load_extension(\"{path}\")')\n        return True",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def init_spatialite(self, path: Optional[str] = None) -> bool:\n        \"\"\"\n        The ``init_spatialite`` method will load and initialize the SpatiaLite extension.\n        The ``path`` argument should be an absolute path to the compiled extension, which\n        can be found using ``find_spatialite``.\n\n        Returns ``True`` if SpatiaLite was successfully initialized.\n\n        .. code-block:: python\n\n            from sqlite_utils.db import Database\n            from sqlite_utils.utils import find_spatialite\n\n            db = Database(\"mydb.db\")\n            db.init_spatialite(find_spatialite())\n\n        If you've installed SpatiaLite somewhere unexpected \n        (for testing an alternate version, for example)\n        you can pass in an absolute path:\n\n        .. code-block:: python\n\n            from sqlite_utils.db import Database\n            from sqlite_utils.utils import find:",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def init_spatialite(self, path: str | None = None) -> bool:\n            \"\"\"\n            The ``init_spatialite`` method will load and initialize the SpatiaLite extension.\n            The ``path`` argument should be an absolute path to the compiled extension, which\n            can be found using ``find_spatialite``.\n\n            Returns ``True`` if SpatiaLite was successfully initialized.\n\n             .. code-block:: python\n\n                from sqlite_utils.db import Database\n                from sqlite_utils.utils import find_spatialite\n\n                db = Database(\"mydb.db\")\n                db.init_spatialite(find_spatialite())\n\n            If you've installed SpatiaLite somewhere unexpected  (for testing an alternate version, for example)\n            you can pass in an absolute path:\n\n             .. code-block:: python\n\n                from sqlite_utils.db import Database\n                from sqlite_utils.utils import find_spatialite\n\n                db = Database(\"mydb.db\")\n                db.init_spatialite(\"./local/mod_spatialite.dylib\")\n\n            :param path: Path to SpatiaLite module on disk\n            \"\"\"\n            if path:\n                self.conn.enable_load_extension(True)\n                self.conn.load_extension(path)\n            else:\n                self.conn.enable_load_extension(True)\n                self.conn.load_extension('mod_spatialite')\n            return True",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def init_spatialite(self, path: str | None = None) -> bool:\n            \"\"\"\n            The ``init_spatialite`` method will load and initialize the SpatiaLite extension.\n            The ``path`` argument should be an absolute path to the compiled extension, which\n            can be found using ``find_spatialite``.\n\n            Returns ``True`` if SpatiaLite was successfully initialized.\n\n             .. code-block:: python\n\n                from sqlite_utils.db import Database\n                from sqlite_utils.utils import find_spatialite\n\n                db = Database(\"mydb.db\")\n                db.init_spatialite(find_spatialite())\n\n            If you've installed SpatiaLite somewhere unexpected (for testing an alternate version, for example)\n            you can pass in an absolute path:\n\n             .. code-block:: python\n\n                from sqlite_utils.db import Database\n                from sqlite_utils.utils import find_spatialite\n\n                db = Database(\"mydb.db\")\n                db.init_spatialite(\"./local/mod_spatialite.dylib\")\n\n            :param path: Path to SpatiaLite module on disk\n            \"\"\"\n            if path is None:\n                self.execute(\"SELECT load_extension('mod_spatialite')\")\n            else:\n                self.execute(f\"SELECT load_extension('{path}')\")\n            return True",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def init_spatialite(self, path: str | None = None) -> bool:\n        \"\"\"\n        The ``init_spatialite`` method will load and initialize the SpatiaLite extension.\n        The ``path`` argument should be an absolute path to the compiled extension, which\n        can be found using ``find_spatialite``.\n\n        Returns ``True`` if SpatiaLite was successfully initialized.\n\n        .. code-block:: python\n\n            from sqlite_utils.db import Database\n            from sqlite_utils.utils import find_spatialite\n\n            db = Database(\"mydb.db\")\n            db.init_spatialite(find_spatialite())\n\n        If you've installed SpatiaLite somewhere unexpected (for testing an alternate version, for example)\n        you can pass in an absolute path:\n\n        .. code-block:: python\n\n            from sqlite_utils.db import Database\n            from sqlite_utils.utils import find_spatialite\n\n            db = Database(\"mydb.db\")\n            db.init_spatialite(\"./local/mod_spatialite.dylib\")\n\n        :param path: Path to SpatiaLite module on disk\n        \"\"\"\n        if path is None:\n            self.conn.enable_load_extension(True)\n            self.conn.load_extension('mod_spatialite')\n        else:\n            self.conn.enable_load_extension(True)\n            self.conn.load_extension(path)\n        return True",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def init_spatialite(self, path: Optional[str] = None) -> bool:\n        \"\"\"\n        The ``init_spatialite`` method will load and initialize the SpatiaLite extension.\n        The ``path`` argument should be an absolute path to the compiled extension, which\n        can be found using ``find_spatialite``.\n\n        Returns ``True`` if SpatiaLite was successfully initialized.\n\n        .. code-block:: python\n\n            from sqlite_utils.db import Database\n            from sqlite_utils.utils import find_spatialite\n\n            db = Database(\"mydb.db\")\n            db.init_spatialite(find_spatialite())\n\n        If you've installed SpatiaLite somewhere unexpected (for testing an alternate version, for example)\n        you can pass in an absolute path:\n\n        .. code-block:: python\n\n            from sqlite_utils.db import Database\n            from sqlite_utils.utils import find_spatialite\n\n            db = Database(\"mydb.db\")\n            db.init_spatialite(\"./local/mod_spatialite.dylib\")\n\n        :param path: Path to SpatiaLite module on disk\n        \"\"\"\n        if path is None:\n            path = \"mod_spatialite\"\n        if os.path.exists(path):\n            spatialite_lib = ctypes.CDLL(path)\n            spatialite_lib.spatialite_init()\n            return True\n        else:\n            print(f\"Could not find SpatiaLite library at {path}\")\n            return False",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

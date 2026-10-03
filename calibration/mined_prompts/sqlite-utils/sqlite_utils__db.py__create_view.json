@@ -50,6 +50,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "    def create_view(\n            self, name: str, sql: str, ignore: bool = False, replace: bool = False\n        ) -> \"Database\":\n        \"\"\"\n        Create a new SQL view with the specified name \u2013 ``sql`` should start with ``SELECT \u2026``.\n\n        :param name: Name of the view\n        :param sql: SQL ``SELECT`` query to use for this view.\n        :param ignore: Set to ``True`` to do nothing if a view with this name already exists\n        :param replace: Set to ``True`` to replace the view if one with this name already exists\n        \"\"\"\n        if ignore:\n            try:\n                self.conn.execute(f\"SELECT name FROM sqlite_master WHERE type='view' AND name=?\", (name,))\n                return self\n            except sqlite3.OperationalError:\n                pass\n        elif replace:\n            self.conn.execute(f\"DROP VIEW IF EXISTS {name}\")\n        self.conn.execute(f\"CREATE VIEW {name} AS {sql}\")\n        return self",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def create_view(\n            self, name: str, sql: str, ignore: bool = False, replace: bool = False\n         ) -> \"Database\":\n            \"\"\"\n            Create a new SQL view with the specified name \u2014 ``sql`` should start with ``SELECT \u2026``.\n\n            :param name: Name of the view\n            :param sql: SQL ``SELECT`` query to use for this view.\n            :param ignore: Set to ``True`` to do nothing if a view with this name already exists\n            :param replace: Set to ``True`` to replace the view if one with this name already exists\n            \"\"\"\n            cursor = self.conn.cursor()\n\n            if ignore:\n                try:\n                    cursor.execute(f\"SELECT name FROM sqlite_master WHERE type='view' AND name=?\", (name,))\n                    result = cursor.fetchone()\n                    if result:\n                        return self\n                except Exception:\n                    return self\n\n            if replace:\n                try:\n                    cursor.execute(f\"DROP VIEW IF EXISTS {name}\")\n                except Exception:\n                    pass\n\n            try:\n                cursor.execute(f\"CREATE VIEW {name} AS {sql}\")\n            except Exception as e:\n                raise ValueError(f\"Failed to create view {name}: {e}\")\n\n            self.conn.commit()\n            return self",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def create_view(\n            self, name: str, sql: str, ignore: bool = False, replace: bool = False\n        ) -> \"Database\":\n        \"\"\"\n        Create a new SQL view with the specified name \u2013 ``sql`` should start with ``SELECT \u2026``.\n\n        :param name: Name of the view\n        :param sql: SQL ``SELECT`` query to use for this view.\n        :param ignore: Set to ``True`` to do nothing if a view with this name already exists\n        :param replace: Set to ``True`` to replace the view if one with this name already exists\n        \"\"\"\n        cursor = self.conn.cursor()\n        views = cursor.execute(\"SELECT name FROM sqlite_master WHERE type='view';\").fetchall()\n        views = [view[0] for view in views]\n\n        if name in views:\n            if ignore:\n                return self\n            elif replace:\n                self.execute(f\"DROP VIEW IF EXISTS {name};\")\n            else:\n                raise ValueError(f\"A view with the name '{name}' already exists.\")\n    \n        cursor.execute(f\"CREATE VIEW {name} AS {sql}\")\n\n        return self",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def create_view(\n        self, name: str, sql: str, ignore: bool = False, replace: bool = False\n    ) -> \"Database\":\n        \"\"\"\n        Create a new SQL view with the specified name - ``sql`` should start with ``SELECT  ...``.\n\n        :param name: Name of the view\n        :param sql: SQL ``SELECT`` query to use for this view.\n        :param ignore: Set to ``True`` to do nothing if a view with this name already exists\n        :param replace: Set to ``True`` to replace the view if one with this name already exists\n        \"\"\"\n        if self.view_exists(name):\n            if ignore:\n                return self\n            if replace:\n                self.drop_view(name)\n            else:\n                raise ValueError(f\"View {name} already exists\")\n        self.conn.execute(f\"CREATE VIEW {name} AS {sql}\")\n        return self",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def create_view(\n            self, name: str, sql: str, ignore: bool = False, replace: bool = False\n        ) -> \"Database\":\n        \"\"\"\n        Create a new SQL view with the specified name \u2013 ``sql`` should start with ``SELECT \u2026``.\n\n        :param name: Name of the view\n        :param sql: SQL ``SELECT`` query to use for this view.\n        :param ignore: Set to ``True`` to do nothing if a view with this name already exists\n        :param replace: Set to ``True`` to replace the view if one with this name already exists\n        \"\"\"\n        if ignore:\n            cursor = self.conn.execute(f\"SELECT name FROM sqlite_master WHERE type='view' AND name=?\", (name,))\n            if cursor.fetchone():\n                return self\n        elif replace:\n            self.execute(f\"DROP VIEW IF EXISTS {name}\")\n\n        self.execute(f\"CREATE VIEW {name} AS {sql}\")\n        return self",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def create_view(\n        self, name: str, sql: str, ignore: bool = False, replace: bool = False\n    ) -> \"Database\":\n        \"\"\"\n        Create a new SQL view with the specified name \u2013 ``sql`` should start with ``SELECT \u2026``.\n\n        :param name: Name of the view\n        :param sql: SQL ``SELECT`` query to use for this view.\n        :param ignore: Set to ``True`` to do nothing if a view with this name already exists\n        :param replace: Set to ``True`` to replace the view if one with this name already exists\n        \"\"\"\n        existing_view = self.conn.execute(f\"SELECT name FROM sqlite_master WHERE type = 'view' AND name = ?;\", (name,)).fetchone()\n\n        if existing_view:\n            if ignore:\n                return self\n            elif replace:\n                self.conn.execute(f\"DROP VIEW IF EXISTS {name};\")\n                self.conn.execute(f\"CREATE VIEW {name} AS {sql}\")\n        else:\n            self.conn.execute(f\"CREATE VIEW {name} AS {sql}\")\n\n        self.conn.commit()\n\n        return self",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

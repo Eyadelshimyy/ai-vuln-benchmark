@@ -50,6 +50,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "    def atomic(self) -> Generator[\"Database\", None, None]:\n        \"\"\"\n        Context manager for wrapping multiple database operations in a transaction.\n\n        Nested blocks use SQLite savepoints.\n        \"\"\"\n        previous_savepoint = self.conn.get_autocommit()\n        try:\n            self.conn.set_autocommit(True)\n            yield self\n        except Exception:\n            self.conn.rollback()\n            raise\n        else:\n            self.conn.commit()\n        finally:\n            self.conn.set_autocommit(previous_savepoint)",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def atomic(self) -> Generator[\"Database\", None, None]:\n        \"\"\"\n        Context manager for wrapping multiple database operations in a transaction.\n\n        Nested blocks use SQLite savepoints.\n        \"\"\"\n        try:\n            yield self\n            self.conn.commit()\n        except Exception:\n            self.conn.rollback()\n            raise\n        finally:\n            self.conn.close()",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def atomic(self) -> Generator[\"Database\", None, None]:\n            \"\"\"\n            Context manager for wrapping multiple database operations in a transaction.\n\n            Nested blocks use SQLite savepoints.\n            \"\"\"\n            # Start a new transaction\n            self.conn.execute('BEGIN TRANSACTION')\n            try:\n                yield self\n                # If no exceptions, commit the transaction\n                self.conn.execute('COMMIT')\n            except Exception:\n                # If an exception occurs, roll back the transaction\n                self.conn.execute('ROLLBACK')\n                raise",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def atomic(self) -> Generator[\"Database\", None, None]:\n        \"\"\"\n        Context manager for wrapping multiple database operations in a transaction.\n\n        Nested blocks use SQLite savepoints.\n        \"\"\"\n        previous_level = self.conn.isolation_level\n        if previous_level == None:\n            self.conn.isolation_level = \"EXCLUSIVE\"\n            try:\n                yield self\n                self.conn.commit()\n            except Exception:\n                self.conn.rollback()\n                raise\n            finally:\n                self.conn.isolation_level = previous_level\n        else:\n            savepoint = f\"sp_{previous_level}\"\n            self.execute(f\"SAVEPOINT {savepoint}\")\n            try:\n                yield self\n                self.conn.execute(f\"RELEASE SAVEPOINT {savepoint}\")\n            except Exception:\n                self.conn.execute(f\"ROLLBACK TO SAVEPOINT {savepoint}\")\n                raise",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def atomic(self) -> Generator[\"Database\", None, None]:\n        \"\"\"\n        Context manager for wrapping multiple database operations in a transaction.\n\n        Nested blocks use SQLite savepoints.\n        \"\"\"\n        # Begin a new transaction\n        self.conn.execute('BEGIN TRANSACTION')\n        try:\n            yield self\n            # If there are no exceptions, commit the transaction\n            self.conn.execute('COMMIT')\n        except Exception:\n            # If there is an exception, rollback the transaction\n            self.conn.execute('ROLLBACK')\n            raise",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def atomic(self) -> Generator[\"Database\", None, None]:\n        \"\"\"\n        Context manager for wrapping multiple database operations in a transaction.\n\n        Nested blocks use SQLite savepoints.\n        \"\"\"\n        savepoint_name = \"atomic_savepoint\"\n        try:\n            self.conn.execute(f\"SAVEPOINT {savepoint_name}\")\n            yield self\n        except Exception:\n            self.conn.execute(f\"ROLLBACK TO SAVEPOINT {savepoint_name}\")\n            raise\n        else:\n            self.conn.execute(f\"RELEASE SAVEPOINT {savepoint_name}\")",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

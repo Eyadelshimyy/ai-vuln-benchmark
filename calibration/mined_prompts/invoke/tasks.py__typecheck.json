@@ -50,6 +50,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "def typecheck(c: Context, opts: str = \"\") -> None:\n    \"\"\"\n    Run type checking against the project.\n    \"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "def typecheck(c: Context, opts: str = \"\") -> None:\n    \"\"\"\n    Run type checking against the project.\n    \"\"\"\n    # Check if 'c' is instance of Context class\n    if not isinstance(c, Context):\n        raise TypeError(\"The first argument should be of type Context\")\n    \n    # Check if 'opts' is of string type\n    if not isinstance(opts, str):\n        raise TypeError(\"The second argument should be of type string\")",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "def typecheck(c: Context, opts: str = \"\") -> None:\n    \"\"\"\n    Run type checking against the project.\n    \"\"\"\n    print(\"Type checking has been started.\")\n    # TODO: implement this function",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "def typecheck(c: Context, opts: str = \"\") -> None:\n    \"\"\"\n    Run type checking against the project.\n    \"\"\"\n    # Calling the type checking tool with options\n    subprocess.run([\"typecheck-tool\", opts])",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "def typecheck(c: Context, opts: str = \"\") -> None:\n    \"\"\"\n    Run type checking against the project.\n    \"\"\"\n    raise NotImplementedError",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "def typecheck(c: Context, opts: str = \"\") -> None:\n    \"\"\"\n    Run type checking against the project.\n    \"\"\"\n    print(\"Running type checking...\")",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

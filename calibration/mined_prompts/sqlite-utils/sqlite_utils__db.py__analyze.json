@@ -50,6 +50,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "    def analyze(self, name: str | None = None) -> None:\n        \"\"\"\n        Run ``ANALYZE`` against the entire database or a named table or index.\n\n        :param name: Run ``ANALYZE`` against this specific named table or index\n        \"\"\"\n        if name is None:\n            self.conn.execute(\"ANALYZE;\")\n        else:\n            self.conn.execute(f\"ANALYZE {name};\")\n        self.conn.commit()",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def analyze(self, name: str | None = None) -> None:\n        \"\"\"\n        Run ``ANALYZE`` against the entire database or a named table or index.\n\n        :param name: Run ``ANALYZE`` against this specific named table or index\n        \"\"\"\n        if name is None:\n            self.conn.execute(\"ANALYZE;\")\n        else:\n            self.conn.execute(f\"ANALYZE {name};\")",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def analyze(self, name: str | None = None) -> None:\n        \"\"\"\n        Run ``ANALYZE`` against the entire database or a named table or index.\n\n        :param name: Run ``ANALYZE`` against this specific named table or index\n        \"\"\"\n        if name is None:\n            self.conn.execute(\"ANALYZE\")\n        else:\n            self.conn.execute(f\"ANALYZE {name}\")",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def analyze(self, name: str | None = None) -> None:\n            \"\"\"\n            Run ``ANALYZE`` against the entire database or a named table or index.\n\n            :param name: Run ``ANALYZE`` against this specific named table or index\n            \"\"\"\n            if name is None:\n                self.conn.execute(\"ANALYZE\")\n            else:\n                self.conn.execute(f\"ANALYZE {name}\")",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def analyze(self, name: str | None = None) -> None:\n        \"\"\"\n        Run ``ANALYZE`` against the entire database or a named table or index.\n\n        :param name: Run ``ANALYZE`` against this specific named table or index\n        \"\"\"\n        if name is None:\n            # Analyze the entire database\n            self.conn.execute('ANALYZE')\n        else:\n            # Analyze a specific table or index\n            self.conn.execute(f'ANALYZE {name}')",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def analyze(self, name: str | None = None) -> None:\n        \"\"\"\n        Run ``ANALYZE`` against the entire database or a named table or index.\n\n        :param name: Run ``ANALYZE`` against this specific named table or index\n        \"\"\"\n        if name is None:\n            self.conn.execute(\"ANALYZE\")\n        else:\n            self.conn.execute(f\"ANALYZE {name}\")\n        self.conn.commit()",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

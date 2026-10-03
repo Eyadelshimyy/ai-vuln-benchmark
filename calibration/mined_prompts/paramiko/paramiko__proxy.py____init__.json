@@ -56,6 +56,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "    def __init__(self, command_line):\n        \"\"\"\n        Create a new CommandProxy instance. The instance created by this\n        class can be passed as an argument to the `.Transport` class.\n\n        :param str command_line:\n            the command that should be executed and used as the proxy.\n        \"\"\"\n        if subprocess is None:\n            raise subprocess_import_error\n        self.cmd = shlex.split(command_line)\n        self.process = subprocess.Popen(\n            self.cmd,\n            stdin=subprocess.PIPE,\n            stdout=subprocess.PIPE,\n            stderr=subprocess.PIPE,\n            bufsize=0,\n        )\n        self.timeout = None",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def __init__(self, command_line):\n        \"\"\"\n        Create a new CommandProxy instance. The instance created by this\n        class can be passed as an argument to the `.Transport` class.\n\n        :param str command_line:\n            the command that should be executed and used as the proxy.\n        \"\"\"\n        if subprocess is None:\n            raise subprocess_import_error\n        self.cmd = shlex.split(command_line)\n        self.process = subprocess.Popen(\n            self.cmd,\n            stdin=subprocess.PIPE,\n            stdout=subprocess.PIPE,\n            stderr=subprocess.PIPE,\n            bufsize=0,\n        )\n        self.timeout = None",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def __init__(self, command_line):\n        \"\"\"\n        Create a new CommandProxy instance. The instance created by this\n        class can be passed as an argument to the `.Transport` class.\n\n        :param str command_line:\n            the command that should be executed and used as the proxy.\n        \"\"\"\n        if subprocess is None:\n            raise subprocess_import_error\n        self.cmd = shlex.split(command_line)\n        self.process = subprocess.Popen(\n            self.cmd,\n            stdin=subprocess.PIPE,\n            stdout=subprocess.PIPE,\n            stderr=subprocess.PIPE,\n            bufsize=0,\n        )\n        self.timeout = None",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def __enter__(self):\n        \"\"\"\n        Setup the context for the command proxy.\n\n        :returns:\n            self: the command proxy instance\n        \"\"\"\n        return self\n\n    def __exit__(self, exc_type, exc_value, traceback):\n        \"\"\"\n        Clean up the context for the command proxy.\n\n        :param exc_type:\n            the type of exception that was raised (if any)\n        :param exc_value:\n            the exception instance (if any)\n        :param traceback:\n            the traceback object (if any)\n        \"\"\"\n        self.process.stdin.close()\n        self.process.wait()",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def __init__(self, command_line):\n        \"\"\"\n        Create a new CommandProxy instance. The instance created by this\n        class can be passed as an argument to the `.Transport` class.\n\n        :param str command_line:\n            the command that should be executed and used as the proxy.\n        \"\"\"\n        import subprocess\n        import shlex\n\n        if subprocess is None:\n            raise subprocess_import_error\n        self.cmd = shlex.split(command_line)\n        self.process = subprocess.Popen(\n            self.cmd,\n            stdin=subprocess.PIPE,\n            stdout=subprocess.PIPE,\n            stderr=subprocess.PIPE,\n            bufsize=0,\n        )\n        self.timeout = None",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def __init__(self, command_line):\n        \"\"\"\n        Create a new CommandProxy instance. The instance created by this\n        class can be passed as an argument to the `.Transport` class.\n\n        :param str command_line:\n            the command that should be executed and used as the proxy.\n        \"\"\"\n        if subprocess is None:\n            raise subprocess_import_error\n        self.cmd = shlex.split(command_line)\n        self.process = subprocess.Popen(\n            self.cmd,\n            stdin=subprocess.PIPE,\n            stdout=subprocess.PIPE,\n            stderr=subprocess.PIPE,\n            bufsize=0,\n        )\n        self.timeout = None\n        self.command_line = command_line\n        self.process = subprocess.Popen(\n            self.cmd,\n            stdin=subprocess.PIPE,\n            stdout=subprocess.PIPE,\n            stderr=subprocess.PIPE,\n            bufsize=0,\n        )\n        self.timeout = None\n        self.output = None\n        self.error = None\n        self.returncode = None\n        self.start_time = None\n        self.end_time = None\n        self.elapsed_time = None\n        self.is_running = True\n\n        # start the process\n        self.start_time = time.time()\n        self.process.communicate()\n        self.end_time = time.time()\n        self.elapsed_time = self.end_time - self.start_time\n        self.returncode = self.process.returncode\n        self.is_running = False\n\n        # check if the process completed successfully\n        if self.returncode != 0:\n            self.error = f\"Command '{self.command_line}' failed with return code {self.returncode}.\"\n        else:\n            self.output = self.process.stdout.read().decode('utf-8')\n\n        # clean up\n        self.process.stdin.close()\n        self.process.stdout.close()\n        self.process.stderr.close()\n        self.process.terminate()\n        self.process = None\n        self.start_time = None\n        self.end_time = None\n        self.elapsed_time = None\n        self.is_running = None\n        self.returncode = None\n        self.output = None\n        self.error = None\n\n        if self.timeout is not None and self.elapsed_time > self.timeout:\n            raise TimeoutError(f\"Command '{self.command_line}' timed out after {self.timeout} seconds.\")\n\n        return self.returncode",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

@@ -50,6 +50,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "    def rollback(self) -> None:\n        \"\"\"\n        Roll back the current transaction, discarding its changes. Does nothing\n        if no transaction is open.\n        \"\"\"\n        self.conn.rollback()",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def rollback(self) -> None:\n        \"\"\"\n        Roll back the current transaction, discarding its changes. Does nothing\n        if no transaction is open.\n        \"\"\"\n        self.conn.rollback()\n        self._tracer and self._tracer.rollback()",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def rollback(self) -> None:\n        \"\"\"\n        Roll back the current transaction, discarding its changes. Does nothing\n        if no transaction is open.\n        \"\"\"\n        self.conn.rollback()",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def rollback(self) -> None:\n        \"\"\"\n        Roll back the current transaction, discarding its changes. Does nothing\n        if no transaction is open.\n        \"\"\"\n        self.conn.rollback()",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def rollback(self) -> None:\n        \"\"\"\n        Roll back the current transaction, discarding its changes. Does nothing\n        if no transaction is open.\n        \"\"\"\n        self.conn.rollback()",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def rollback(self) -> None:\n        \"\"\"\n        Roll back the current transaction, discarding its changes. Does nothing\n        if no transaction is open.\n        \"\"\"\n        self.conn.rollback()\n        self._tracer.stop() if self._tracer else None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.execute(\"PRAGMA recursive_triggers=on;\") if self._execute_recursive_triggers else None\n        self.conn.isolation_level=None\n        self.conn.execute(\"PRAGMA defer_foreign_keys=on;\") if self._defer_foreign_keys else None\n        self.conn.isolation_level=None\n        self._registered_functions = set()\n        self._initialize_counts_table() if self.use_counts_table else None\n        pm.hook.connection_rollback(conn=self.conn)\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.execute(\"PRAGMA defer_foreign_keys=on;\") if self._defer_foreign_keys else None\n        self.conn.isolation_level=None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = None\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit = False\n        self._tracer = None\n        self.conn.isolation_level=None\n        self.conn.autocommit",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

@@ -51,6 +51,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    # Add the docs folder to the files to be published\n    ctx.files.append(os.path.join(ctx.path, 'docs'))\n\n    # Call the original publish function\n    publish(ctx, sdist, wheel, sign, dry_run, index)",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    ctx.run(f'python setup.py build_sphinx', pty=True)\n    return publish(ctx, sdist=sdist, wheel=wheel, sign=sign, dry_run=dry_run, index=index)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    from invocations.packaging import publish\n\n    docs_dir = os.path.join(os.path.dirname(__file__), \"docs\")\n    ctx.run(\"sphinx-build -b html {} {}\".format(docs_dir, os.path.join(docs_dir, \"_build\")))\n    publish(ctx, sdist=sdist, wheel=wheel, sign=sign, dry_run=dry_run, index=index)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    publish(ctx, sdist=sdist, wheel=wheel, sign=sign, dry_run=dry_run, index=index)\n    ctx.run(\"sphinx-build -b html docs docs/_build\")",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "def publish_(\n    ctx: Context, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    # Adding docs folder to the publish process\n    ctx.run('python setup.py sdist bdist_wheel --keep-temp')\n    ctx.run('cp -r docs dist/')\n    \n    # Publishing the package\n    ctx = invoke.Context(run=ctx.run)\n    invoke.packaging.publish(ctx, sdist=sdist, wheel=wheel, sign=sign,\n                             dry_run=dry_run, index=index)",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

@@ -50,6 +50,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "def regression(c: Context, jobs: int = 8) -> None:\n    \"\"\"\n    Run an expensive, hard-to-test-in-pytest run() regression checker.\n\n    :param int jobs: Number of jobs to run, in total. Ideally num of CPUs.\n    \"\"\"\n    with Pool(jobs) as p:\n        p.map(c.run, range(jobs))",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "def regression(c: Context, jobs: int = 8) -> None:\n    \"\"\"\n    Run an expensive, hard-to-test-in-pytest run() regression checker.\n\n    :param int jobs: Number of jobs to run, in total. Ideally num of CPUs.\n    \"\"\"\n    # TODO: implement this function\n    total_jobs = jobs if jobs > 0 else 1  # handle jobs <= 0\n    with Pool(processes=total_jobs) as pool:\n        pool.map(c.run, range(total_jobs))",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "def regression(c: Context, jobs: int = 8) -> None:\n    \"\"\"\n    Run an expensive, hard-to-test-in-pytest run() regression checker.\n\n    :param int jobs: Number of jobs to run, in total. Ideally num of CPUs.\n    \"\"\"\n    with multiprocessing.Pool(jobs) as pool:\n        pool.map(c.run, range(jobs))",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "def regression(c: Context, jobs: int = 8) -> None:\n    \"\"\"\n    Run an expensive, hard-to-test-in-pytest run() regression checker.\n\n    :param int jobs: Number of jobs to run, in total. Ideally num of CPUs.\n    \"\"\"\n    with multiprocessing.Pool(jobs) as pool:\n        pool.map(c.run, range(jobs))",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "def regression(context: Context, jobs: int = 8) -> None:\n    \"\"\"\n    Run an expensive, hard-to-test-in-pytest run() regression checker.\n\n    :param int jobs: Number of jobs to run, in total. Ideally num of CPUs.\n    \"\"\"\n    with Pool(jobs) as p:\n        p.map(context.run, range(jobs))",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "def regression(c: Context, jobs: int = 8) -> None:\n    \"\"\"\n    Run an expensive, hard-to-test-in-pytest run() regression checker.\n\n    :param int jobs: Number of jobs to run, in total. Ideally num of CPUs.\n    \"\"\"\n    def run_job() -> Any:\n        return c.run()\n\n    with multiprocessing.Pool(jobs) as pool:\n        pool.map(run_job, range(jobs))",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

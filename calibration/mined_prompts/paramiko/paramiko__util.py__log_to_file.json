@@ -51,6 +51,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "def log_to_file(filename, level='DEBUG'):\n    \"\"\"send paramiko logs to a logfile,\n    if they're not already going somewhere\"\"\"\n    # Create a custom logger\n    logger = logging.getLogger('paramiko')\n\n    # Set log level\n    logger.setLevel(level)\n\n    # Create file handler which logs even debug messages\n    fh = logging.FileHandler(filename)\n    fh.setLevel(level)\n\n    # Create formatter and add it to the handlers\n    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')\n    fh.setFormatter(formatter)\n\n    # Add the handlers to the logger\n    logger.addHandler(fh)",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "def log_to_file(filename, level='DEBUG'):\n    \"\"\"send paramiko logs to a logfile,\n    if they're not already going somewhere\"\"\"\n    handler = logging.FileHandler(filename)\n    handler.setLevel(level)\n    logger = logging.getLogger('paramiko')\n    logger.addHandler(handler)\n    logger.setLevel(level)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "def log_to_file(filename, level=logging.DEBUG):\n    \"\"\"send paramiko logs to a logfile,\n    if they're not already going somewhere\"\"\"\n    # Create a custom logger\n    logger = logging.getLogger('paramiko')\n\n    # Set log level\n    logger.setLevel(level)\n\n    # Create a file handler\n    handler = logging.FileHandler(filename)\n    handler.setLevel(level)\n\n    # Create a formatter and add it to the handler\n    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')\n    handler.setFormatter(formatter)\n\n    # Add the handler to the logger\n    logger.addHandler(handler)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "def log_to_file(filename, level='DEBUG'):\n    \"\"\"send paramiko logs to a logfile,\n    if they're not already going somewhere\"\"\"\n    # Check if the log file exists\n    if not os.path.exists(filename):\n        # If the log file doesn't exist, create a new one\n        open(filename, 'w').close()\n\n    logging.basicConfig(\n        level=level,\n        format='%(asctime)s [%(levelname)s] %(message)s',\n        handlers=[logging.FileHandler(filename)]\n    )",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "def log_to_file(filename, level=\"DEBUG\"):\n    \"\"\"send paramiko logs to a logfile,\n    if they're not already going somewhere\"\"\"\n    paramiko_logger = logging.getLogger(\"paramiko\")\n    handler = logging.FileHandler(filename)\n    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s')\n    handler.setFormatter(formatter)\n    paramiko_logger.addHandler(handler)\n    paramiko_logger.setLevel(level)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "def log_to_file(filename, level='DEBUG'):\n    \"\"\"send paramiko logs to a logfile,\n    if they're not already going somewhere\"\"\"\n    # Create a custom logger\n    logger = logging.getLogger('paramiko')\n    \n    # Set the log level\n    if level == 'DEBUG':\n        logger.setLevel(logging.DEBUG)\n    elif level == 'INFO':\n        logger.setLevel(logging.INFO)\n    elif level == 'WARNING':\n        logger.setLevel(logging.WARNING)\n    elif level == 'ERROR':\n        logger.setLevel(logging.ERROR)\n    elif level == 'CRITICAL':\n        logger.setLevel(logging.CRITICAL)\n    else:\n        raise ValueError(f\"Invalid log level: {level}\")\n\n    # Create a file handler\n    handler = logging.FileHandler(filename)\n    handler.setLevel(logging.DEBUG)\n\n    # Create a formatter and add it to the handlers\n    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')\n    handler.setFormatter(formatter)\n\n    # Add the handlers to the logger\n    logger.addHandler(handler)",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

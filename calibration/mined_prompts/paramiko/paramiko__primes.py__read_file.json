@@ -51,6 +51,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "    def read_file(self, filename):\n        \"\"\"\n        :raises IOError: passed from any file operations that fail.\n        \"\"\"\n        with open(filename, 'r') as file:\n            for line in file:\n                line = line.strip()\n                if line.startswith('#'):\n                    continue\n                if ':' in line:\n                    key, value = line.split(':', 1)\n                    key = key.strip()\n                    value = value.strip()\n                    if key in self.pack:\n                        self.pack[key].append(value)\n                    else:\n                        self.pack[key] = [value]\n                else:\n                    self.discarded.append(line)\n        return self",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def read_file(self, filename):\n        \"\"\"\n        :raises IOError: passed from any file operations that fail.\n        \"\"\"\n        try:\n            with open(filename, \"r\") as file:\n                for line in file:\n                    # Each line should be a valid Python expression.\n                    # We need to evaluate it to get its value.\n                    self.pack = eval(line)\n        except IOError:\n            raise IOError",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def read_file(self, filename):\n        \"\"\"\n        :raises IOError: passed from any file operations that fail.\n        \"\"\"\n        with open(filename, 'rb') as file:\n            content = file.read()\n            self.pack = eval(content)\n        return self.pack",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def read_file(self, filename):\n        \"\"\"\n        :raises IOError: passed from any file operations that fail.\n        \"\"\"\n        with open(filename, 'r') as file:\n            for line in file:\n                line = line.strip()\n                if line.startswith('#') or line == '':\n                    continue\n                key, value = line.split(':', 1)\n                key = key.strip()\n                value = value.strip()\n                self.pack[key] = value\n        file.close()\n        return self.pack",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def read_file(self, filename):\n        \"\"\"\n        Reads a file and processes its contents.\n\n        :param filename: The name of the file to read.\n        :raises IOError: passed from any file operations that fail.\n        \"\"\"\n        try:\n            with open(filename, 'r') as file:\n                for line in file:\n                    # Process the line as needed\n                    pass  # remove this line once you implement the logic\n        except IOError as e:\n            print(f\"An error occurred while reading the file: {e}\")\n            raise",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def read_file(self, filename):\n        \"\"\"\n        :raises IOError: passed from any file operations that fail.\n        \"\"\"\n        try:\n            with open(filename, 'r') as file:\n                for line in file:\n                    # Assuming the file contains lines with two space-separated values:\n                    # the first being the bit and the second being the generator and modulus\n                    bit, generator_modulus = line.split(' ', 1)\n                    self.pack[int(bit)] = eval(generator_modulus)\n        except IOError:\n            raise IOError(\"An error occurred while reading the file.\")",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

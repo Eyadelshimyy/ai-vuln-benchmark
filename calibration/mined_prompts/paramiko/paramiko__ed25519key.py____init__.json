@@ -51,6 +51,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "    def __init__(\n            self, msg=None, data=None, filename=None, password=None, file_obj=None\n        ):\n            \"\"\"Implement the `__init__` function (parameters: msg, data, filename, password, file_obj).\"\"\"\n            self.public_blob = None\n            self._verifying_key, self._signing_key = None, None\n            if msg is None and data is not None:\n                msg = Message(data)\n            if msg is not None:\n                self._check_type_and_load_cert(\n                    msg=msg,\n                    key_type=self.name,\n                    cert_type=\"ssh-ed25519-cert-v01@openssh.com\",\n                )\n                self._verifying_key = nacl.signing.VerifyKey(msg.get_binary())\n            elif filename is not None:\n                with open(filename, \"r\") as f:\n                    pkformat, data = self._read_private_key(\"OPENSSH\", f)\n            elif file_obj is not None:\n                pkformat, data = self._read_read_private_key(\"OPENSSH\", file_obj)\n\n            if filename or file_obj:\n                self._signing_key = self._parse_signing_key_data(data, password)\n\n            if self._signing_key is None and self._verifying_key is None:\n                raise ValueError(\"need a key\")",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def __init__(\n            self, msg=None, data=None, filename=None, password=None, file_obj=None\n        ):\n            \"\"\"Implement the `__init__` function  (parameters: msg, data, filename, password, file_obj).\"\"\"\n            # TODO: implement this function\n            raise NotImplementedError",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def __init__(\n            self, msg=None, data=None, filename=None, password=None, file_obj=None\n        ):\n            \"\"\"Implement the `__init__` function (parameters: msg, data, filename, password, file_obj).\"\"\"\n            # Initialize attributes\n            self.public_blob = None\n            self._verifying_key, self._signing_key = None, None\n\n            # If a message is provided, load the corresponding key\n            if msg is not None:\n                self._check_type_and_load_cert(\n                    msg=msg,\n                    key_type=self.name,\n                    cert_type=\"ssh-ed25519-cert-v01@openssh.com\",\n                )\n                self._verifying_key = nacl.signing.VerifyKey(msg.get_binary())\n\n            # If a filename is provided, read the corresponding key\n            elif filename is not None:\n                with open(filename, \"r\") as f:\n                    pkformat, data = self._read_private_key(\"OPENSSH\", f)\n                    self._signing_key = self._parse_signing_key_data(data, password)\n\n            # If a file object is provided, read the corresponding key\n            elif file_obj is not None:\n                pkformat, data = self._read_private_key(\"OPENSSH\", file_obj)\n                self._signing_key = self._parse_signing_key_data(data, password)\n\n            # If no key is provided, raise an error\n            if self._signing_key is None and self._verifying_key is None:\n                raise ValueError(\"need a key\")",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def __init__(\n            self, msg=None, data=None, filename=None, password=None, file_obj=None\n        ):\n            \"\"\"Implement the `__init__` function (parameters: msg, data, filename, password, file_obj).\"\"\"\n            self.public_blob = None\n            self._verifying_key, self._signing_key = None, None\n            if msg is None and data is not None:\n                msg = Message(data)\n            if msg is not None:\n                self._check_type_and_load_cert(\n                    msg=msg,\n                    key_type=self.name,\n                    cert_type=\"ssh-ed25519-cert-v01@openssh.com\",\n                )\n                self._verifying_key = nacl.signing.VerifyKey(msg.get_binary())\n            elif filename is not None:\n                with open(filename, \"r\") as f:\n                    pkformat, data = self._read_private_key(\"OPENSSH\", f)\n            elif file_obj is not None:\n                pkformat, data = self._read_read_private_key(\"OPENSSH\", file_obj)\n\n            if filename or file_obj:\n                self._signing_key = self._parse_signing_key_data(data, password)\n\n            if self._signing_key is None and self._verifying_key is None:\n                raise ValueError(\"need a key\")",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def __init__(\n            self, msg=None, data=None, filename=None, password=None, file_obj=None\n        ):\n        \"\"\"Implement the `__init__` function (parameters: msg, data, filename, password, file_obj).\"\"\"\n        if msg is None and data is not None:\n            msg = Message(data)\n        if msg is not None:\n            self._check_type_and_load_cert(\n                msg=msg,\n                key_type=self.name,\n                cert_type=\"ssh-ed25519-cert-v01@openssh.com\",\n            )\n            self._verifying_key = nacl.signing.VerifyKey(msg.get_binary())\n        elif filename is not None:\n            with open(filename, \"r\") as f:\n                pkformat, data = self._read_private_key(\"OPENSSH\", f)\n        elif file_obj is not None:\n            pkformat, data = self._readread_private_key(\"OPENSSH\", file_obj)\n\n        if filename or file_obj:\n            self._signing_key = self._parse_signing_key_data(data, password)\n\n        if self._signing_key is None and self._verifying_key is None:\n            raise ValueError(\"need a key\")",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def __init__(\n            self, msg=None, data=None, filename=None, password=None, file_obj=None\n         ):\n            \"\"\"Implement the `__init__` function (parameters: msg, data, filename, password, file_obj).\"\"\"\n            # TODO: implement this function\n            raise NotImplementedError",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

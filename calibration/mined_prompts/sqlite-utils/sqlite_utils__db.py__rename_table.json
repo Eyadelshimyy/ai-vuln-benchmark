@@ -50,6 +50,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "    def rename_table(self, name: str, new_name: str) -> None:\n        \"\"\"\n        Rename a table.\n\n        :param name: Current table name\n        :param new_name: Name to rename it to\n        \"\"\"\n        self.conn.execute(f\"ALTER TABLE {name} RENAME TO {new_name}\")\n        self.conn.commit()",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def rename_table(self, name: str, new_name: str) -> None:\n        \"\"\"\n        Rename a table.\n\n        :param name: Current table name\n        :param new_name: Name to rename it to\n        \"\"\"\n        rename_table_query = f\"ALTER TABLE {name} RENAME TO {new_name}\"\n        self.conn.execute(rename_table_query)\n        self.conn.commit()",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def rename_table(self, name: str, new_name: str) -> None:\n        \"\"\"\n        Rename a table.\n\n        :param name: Current table name\n        :param new_name: Name to rename it to\n        \"\"\"\n        self.conn.execute(f\"ALTER TABLE {name} RENAME TO {new_name}\")\n        self.conn.commit()",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def rename_table(self, name: str, new_name: str) -> None:\n        \"\"\"\n        Rename a table.\n\n        :param name: Current table name\n        :param new_name: Name to rename it to\n        \"\"\"\n        self.conn.execute(f\"ALTER TABLE {name} RENAME TO {new_name}\")",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def rename_table(self, name: str, new_name: str) -> None:\n        \"\"\"\n        Rename a table.\n\n        :param name: Current table name\n        :param new_name: Name to rename it to\n        \"\"\"\n        self.conn.execute(f\"ALTER TABLE {name} RENAME TO {new_name}\")\n        self.conn.commit()",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def rename_table(self, name: str, new_name: str) -> None:\n        \"\"\"\n        Rename a table.\n\n        :param name: Current table name\n        :param new_name: Name to rename it to\n        \"\"\"\n        self.conn.execute(f\"ALTER TABLE {name} RENAME TO {new_name}\")\n        self.conn.commit()",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

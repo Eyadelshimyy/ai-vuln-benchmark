@@ -50,6 +50,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "    def supports_on_conflict(self) -> bool:\n        \"\"\"Implement the `supports_on_conflict` function.\"\"\"\n        # SQLite's upsert is implemented as INSERT INTO  ... ON CONFLICT DO ...\n        # So, we can check if the version of SQLite is 3.24.0 or higher\n        # as this is when the ON CONFLICT clause was introduced.\n        version = self.conn.execute(\"SELECT sqlite_version()\").fetchone()[0]\n        version = tuple(map(int, version.split('.')))\n        return version >= (3, 24, 0)",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def supports_on_conflict(self) -> bool:\n        \"\"\"Implement the `supports_on_conflict` function.\"\"\"\n        # SQLite's upsert is implemented as INSERT INTO  ... ON CONFLICT DO ...\n        # We can check the version of sqlite3 to determine if the 'conflict_clause' exists\n        cursor = self.conn.cursor()\n        result = cursor.execute(\"SELECT sqlite_version()\")\n        version = result.fetchone()[0]\n        if int(version.split('.')[0]) >= 3 and int(version.split('.')[1]) >= 29:\n            # Starting from SQLite version 3.29, there is a 'conflict_clause'\n            return True\n        else:\n            return False",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def supports_on_conflict(self) -> bool:\n        \"\"\"Implement the `supports_on_conflict` function.\"\"\"\n        # Check the SQLite version and return True if it supports on conflict\n        # If the version is not supported, return False\n        try:\n            version_info = self.conn.execute('SELECT sqlite_version()').fetchone()\n            version = int(version_info[0].split('.')[0])\n            return version >= 3 and version <= 3\n        except Exception:\n            return False",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def supports_on_conflict(self) -> bool:\n        \"\"\"Implement the `supports_on_conflict` function.\"\"\"\n        # Check if the SQLite version supports ON CONFLICT clause\n        cursor = self.conn.execute(\"SELECT sqlite_version()\")\n        version = cursor.fetchone()[0]\n        major_version = int(version.split('.')[0])\n        if major_version >= 3 and major_version <= 3:\n            return True\n        else:\n            return False",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def supports_on_conflict(self) -> bool:\n        \"\"\"Implement the `supports_on_conflict` function.\"\"\"\n        # Check if the connection is in memory\n        if self.memory:\n            return False\n\n        # Check if the connection is a File-based connection\n        if isinstance(self.conn, sqlite3.Connection):\n            # SQLite 3.22.0 and later versions support ON CONFLICT clause\n            cursor = self.conn.execute(\"SELECT sqlite_version()\")\n            version = cursor.fetchone()[0]\n            cursor.close()\n            return Decimal(version) >= Decimal(\"3.22.0\")\n\n        # For other types of connections, we assume it supports ON CONFLICT\n        return True",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def supports_on_conflict(self) -> bool:\n        \"\"\"Implement the `supports_on_conflict` function.\"\"\"\n        # Get the SQLite version\n        version = self.conn.execute(\"SELECT sqlite_version()\").fetchone()[0]\n        # Check if the version is 3.25.0 or later\n        if version.startswith(\"3.25\"):\n            return True\n        return False",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

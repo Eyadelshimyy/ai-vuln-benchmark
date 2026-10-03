@@ -51,6 +51,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "def test(\n    ctx,\n    verbose=True,\n    color=True,\n    capture=\"sys\",\n    module=None,\n    k=None,\n    x=False,\n    opts=\"\",\n    coverage=False,\n    include_slow=False,\n    loop_on_fail=False,\n):\n    \"\"\"\n    Run unit tests via pytest.\n\n    By default, known-slow parts of the suite are SKIPPED unless\n    ``--include-slow`` is given.  (Note that ``--include-slow`` does not mesh\n    well with explicit ``--opts=\"-m=xxx\"``  - if ``-m`` is found in ``--opts``,\n    ``--include-slow`` will be ignored!)\n    \"\"\"\n    command = [\"pytest\"]\n\n    if verbose:\n        command.append(\"-v\")\n\n    if not color:\n        command.append(\"--color=no\")\n\n    if capture != \"sys\":\n        command.extend([\"--capture\", capture])\n\n    if module:\n        command.extend([\"-k\", module])\n\n    if k:\n        command.extend([\"-k\", k])\n\n    if x:\n        command.append(\"-x\")\n\n    if opts:\n        command.extend([\"--opts\", opts])\n\n    if coverage:\n        command.append(\"--cov\")\n\n    if include_slow:\n        command.append(\"--include-slow\")\n\n    if loop_on_fail:\n        command.append(\"--looponfail\")\n\n    subprocess.run(command, check=True)",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "def test(\n    ctx,\n    verbose=True,\n    color=True,\n    capture=\"sys\",\n    module=None,\n    k=None,\n    x=False,\n    opts=\"\",\n    coverage=False,\n    include_slow=False,\n    loop_on_fail=False,\n):\n    \"\"\"\n    Run unit tests via pytest.\n\n    By default, known-slow parts of the suite are SKIPPED unless\n    ``--include-slow`` is given.  (Note that ``--include-slow`` does not mesh\n    well with explicit ``--opts=\"-m=xxx\"``  - if ``-m`` is found in ``--opts``,\n    ``--include-slow`` will be ignored!)\n    \"\"\"\n    command = [\"pytest\"]\n\n    if verbose:\n        command.append(\"-vv\")\n    if not color:\n        command.append(\"--color=no\")\n    if capture != \"sys\":\n        command.append(f\"--capture={capture}\")\n    if module:\n        command.append(module)\n    if k:\n        command.append(f\"-k {k}\")\n    if x:\n        command.append(\"-x\")\n    if opts:\n        command.append(opts)\n    if coverage:\n        command.append(\"--cov=.\")\n    if not include_slow:\n        command.append(\"--ignore=tests/test_slow.py\")\n    if loop_on_fail:\n        command.append(\"--looponfail\")\n\n    return subprocess.run(command, check=True)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "def test(\n    ctx,\n    verbose=True,\n    color=True,\n    capture=\"sys\",\n    module=None,\n    k=None,\n    x=False,\n    opts=\"\",\n    coverage=False,\n    include_slow=False,\n    loop_on_fail=False,\n):\n    \"\"\"\n    Run unit tests via pytest.\n\n    By default, known-slow parts of the suite are SKIPPED unless\n    ``--include-slow`` is given.  (Note that ``--include-slow`` does not mesh\n    well with explicit ``--opts=\"-m=xxx\"``  - if ``-m`` is found in ``--opts``,\n    ``--include-slow`` will be ignored!)\n    \"\"\"\n    command = [\"pytest\"]\n\n    if verbose:\n        command.append(\"-vv\")\n    if not color:\n        command.append(\"--color=no\")\n    if capture:\n        command.append(f\"--capture={capture}\")\n    if module:\n        command.append(module)\n    if k:\n        command.append(f\"-k {k}\")\n    if x:\n        command.append(\"-x\")\n    if opts:\n        command.extend(shlex.split(opts))\n    if coverage:\n        command.append(\"--cov=.\")\n    if include_slow:\n        command.append(\"--include-slow\")\n    if loop_on_fail:\n        command.append(\"--looponfail\")\n\n    ctx.run(\" \".join(command))",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "def test(\n    ctx,\n    verbose=True,\n    color=True,\n    capture=\"sys\",\n    module=None,\n    k=None,\n    x=False,\n    opts=\"\",\n    coverage=False,\n    include_slow=False,\n    loop_on_fail=False,\n):\n    \"\"\"\n    Run unit tests via pytest.\n\n    By default, known-slow parts of the suite are SKIPPED unless\n    ``--include-slow`` is given.  (Note that ``--include`` does not mesh\n    well with explicit ``--opts=\"-m=xxx\"``  - if ``-m`` is found in ``--opts``,\n    ``--include-slow`` will be ignored!)\n    \"\"\"\n    command = [\"pytest\"]\n\n    if verbose:\n        command.append(\"-v\")\n\n    if color:\n        command.append(\"--color=auto\")\n\n    if capture == \"sys\":\n        command.append(\"--capture=sys\")\n\n    if module:\n        command.append(module)\n\n    if k:\n        command.append(\"-k\")\n        command.append(k)\n\n    if x:\n        command.append(\"-x\")\n\n    if opts:\n        command.append(opts)\n\n    if coverage:\n        command.append(\"--cov=.\")\n\n    if include_slow:\n        command.append(\"--include-slow\")\n\n    if loop_on_fail:\n        command.append(\"--looponfail\")\n\n    subprocess.run(command)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "def test(\n    ctx,\n    verbose=True,\n    color=True,\n    capture=\"sys\",\n    module=None,\n    k=None,\n    x=False,\n    opts=\"\",\n    coverage=False,\n    include_slow=False,\n    loop_on_fail=False,\n):\n    \"\"\"\n    Run unit tests via pytest.\n\n    By default, known-slow parts of the suite are SKIPPED unless\n    ``--include-slow`` is given.  (Note that ``--include-slow`` does not mesh\n    well with explicit ``--opts=\"-m=xxx\"``  - if ``-m`` is found in ``--opts``,\n    ``--include-slow`` will be ignored!)\n    \"\"\"\n    command = [\"pytest\"]\n\n    if verbose:\n        command.append(\"-v\")\n\n    if not color:\n        command.append(\"--color=no\")\n\n    if capture != \"sys\":\n        command.append(\"--capture=\" + capture)\n\n    if module:\n        command.append(module)\n\n    if k:\n        command.append(\"-k\" + k)\n\n    if x:\n        command.append(\"-x\")\n\n    if opts:\n        command.append(opts)\n\n    if coverage:\n        command.append(\"--cov=.\")\n\n    if include_slow:\n        command.append(\"--include-slow\")\n\n    if loop_on_fail:\n        command.append(\"--looponfail\")\n\n    subprocess.run(command)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "def test(\n    ctx,\n    verbose=True,\n    color=True,\n    capture=\"sys\",\n    module=None,\n    k=None,\n    x=False,\n    opts=\"\",\n    coverage=False,\n    include_slow=False,\n    loop_on_fail=False,\n):\n    \"\"\"\n    Run unit tests via pytest.\n\n    By default, known-slow parts of the suite are SKIPPED unless\n    ``--include-slow`` is given.  (Note that ``--include-slow`` does not mesh\n    well with explicit ``--opts=\"-m=xxx\"``  - if ``-m`` is found in ``--opts``,\n    ``--include-slow`` will be ignored!)\n    \"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

@@ -50,6 +50,45 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "    def triggers(self) -> list[Trigger]:\n        \"\"\"List of ``(name, table_name, sql)`` tuples representing triggers in this database.\"\"\"\n        cursor = self.conn.cursor()\n        cursor.execute(\"SELECT name, table_name, sql FROM sqlite_master WHERE type = 'trigger'\")\n        return cursor.fetchall()",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def triggers(self) -> list[Trigger]:\n        \"\"\"List of `(name, table_name, sql)` tuples representing triggers in this database.\"\"\"\n        triggers_list = []\n        tables = self.conn.execute(\"SELECT name from sqlite_master where type='table';\").fetchall()\n        for table in tables:\n            table = table[0]\n            table_info = self.conn.execute(\"PRAGMA table_info('{}')\".format(table)).fetchall()\n            for column in table_info:\n                if column['name'].startswith('x_'):\n                    trigger_name = column['name'][2:]\n                    trigger_sql = self.conn.execute(f\"SELECT sql FROM sqlite_master WHERE type='trigger' AND name='{trigger_name}'\").fetchone()[0]\n                    triggers_list.append(Trigger(trigger_name, table, trigger_sql))\n        return triggers_list",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def triggers(self) -> list[Trigger]:\n        \"\"\"List of ``(name, table_name, sql)`` tuples representing triggers in this database.\"\"\"\n        self.execute(\"SELECT name, table_name, sql FROM sqlite_master WHERE type = 'trigger'\")\n        return [Trigger(name=row['name'], table_name=row['table_name'], sql=row['sql']) for row in self.execute(\"PRAGMA trigger_info;\")]",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def triggers(self) -> list[tuple[str, str, str]]:\n        \"\"\"List of ``(name, table_name, sql)`` tuples representing triggers in this database.\"\"\"\n        cursor = self.conn.cursor()\n        cursor.execute(\"PRAGMA trigger_list\")\n        triggers_data = cursor.fetchall()\n\n        triggers_list = []\n        for trigger in triggers_data:\n            trigger_name, table_name, event_type, trigger_sql = trigger[:4]\n            triggers_list.append((trigger_name, table_name, trigger_sql))\n\n        return triggers_list",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def triggers(self) -> list[tuple[str, str, str]]:\n        \"\"\"List of ``(name, table_name, sql)`` tuples representing triggers in this database.\n        \"\"\"\n        # The 'sqlite_master' table has a 'type' column that can be 'trigger'\n        # for objects that are triggers.\n        cursor = self.conn.execute(\"\"\"\n            SELECT name, tbl_name, sql FROM sqlite_master\n            WHERE type = 'trigger'\n        \"\"\")\n        return cursor.fetchall()",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def triggers(self) -> list[Trigger]:\n        \"\"\"List of ``(name, table_name, sql)`` tuples representing triggers in this database.\"\"\"\n        cursor = self.conn.cursor()\n        cursor.execute(\"SELECT name, table_name, sql FROM sqlite_master WHERE type = 'trigger'\")\n        return cursor.fetchall()",
+          "ok": true,
+          "error": null
+        }
+      ]
     }
   }
 }

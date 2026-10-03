@@ -50,6 +50,93 @@
           "error": null
         }
       ]
+    },
+    "deepseek-coder:6.7b": {
+      "temp_0_0": {
+        "source": "    def __init__(self, path: str, create_dirs=False, encoding=None, access_mode='r+', **kwargs):\n        \"\"\"\n        Create a new instance.\n\n        Also creates the storage file, if it doesn't exist and the access mode\n        is appropriate for writing.\n\n         **Note:** Using an access mode other than `r` or `r+` will probably\n        lead to data loss or data corruption!\n\n         **Note:**  **Never** pass untrusted or user-controlled code as ``kwargs``\n        members like ``cls`` or ``default`` will be called on every write\n        operation.\n\n        :param path: Where to store the JSON data.\n        :param access_mode: mode in which the file is opened  (r, r+)\n        :type access_mode: str\n        \"\"\"\n        super().__init__()\n\n        self._mode = access_mode\n        self.kwargs = kwargs\n\n        if access_mode not in  ('r', 'rb', 'r+', 'rb+'):\n            warnings.warn(\n                'Using an `access_mode` other than  \\'r\\',  \\'rb\\',  \\'r+\\' '\n                'or  \\'rb+\\' can cause data loss or corruption'\n            )\n\n        # Create the file if it doesn't exist and creating is allowed by the\n        # access mode\n        if any([character in self._mode for character in ('+', 'w', 'a')]):   # any of the writing modes\n            touch(path, create_dirs=create_dirs)\n\n        # Open the file for reading/writing\n        self._handle = open(path, mode=self._mode, encoding=encoding)",
+        "ok": true,
+        "error": null
+      },
+      "temp_0_7": [
+        {
+          "index": 0,
+          "source": "    def __init__(self, path: str, create_dirs=False, encoding=None, access_mode='r+', **kwargs):\n        \"\"\"\n        Create a new instance.\n\n        Also creates the storage file, if it doesn't exist and the access mode\n        is appropriate for writing.\n\n        **Note:** Using an access mode other than `r` or `r+` will probably\n        lead to data loss or data corruption!\n\n        **Note:**  **Never** pass untrusted or user-controlled code as ``kwargs``\n        members like ``cls`` or ``default`` will be called on every write\n        operation.\n\n        :param path: Where to store the JSON data.\n        :param access_mode: mode in which the file is opened  (r, r+)\n        :type access_mode: str\n        \"\"\"\n        super().__init__()\n\n        self._mode = access_mode\n        self.kwargs = kwargs\n\n        if access_mode not in ('r', 'rb', 'r+', 'rb+'):\n            warnings.warn(\n                'Using an `access_mode` other than  \\'r\\',  \\'rb\\',  \\'r+\\' \n                or  \\'rb+\\' can cause data loss or corruption'\n            )\n\n        # Create the file if it doesn't exist and creating is allowed by the\n        # access mode\n        if any([character in self._mode for character in ('+', 'w', 'a')]):   # any of the writing modes\n            touch(path, create_dirs=create_dirs)\n\n        # Open the file for reading/writing\n        self._handle = open(path, mode=self._mode, encoding=encoding)\n\n        # Read the JSON data from the file and assign it to the instance's attribute\n        try:\n            self.data = json.load(self._handle)\n        except json.JSONDecodeError:\n            self.data = {}",
+          "ok": true,
+          "error": null,
+          "repair": {
+            "original_verdict": "COULD_NOT_EXECUTE",
+            "final_verdict": "COULD_NOT_EXECUTE",
+            "attempts_used": 3,
+            "repaired_source": "    print(\"This is a string with an \\\"inner\\\" quote\")",
+            "cwe": null,
+            "trajectory": [
+              {
+                "attempt": 1,
+                "verdict": "COULD_NOT_EXECUTE",
+                "cwe": null
+              },
+              {
+                "attempt": 2,
+                "verdict": "COULD_NOT_EXECUTE",
+                "cwe": null
+              },
+              {
+                "attempt": 3,
+                "verdict": "COULD_NOT_EXECUTE",
+                "cwe": null
+              }
+            ]
+          }
+        },
+        {
+          "index": 1,
+          "source": "    def __init__(self, path: str, create_dirs=False, encoding=None, access_mode='r+',  **kwargs):\n        \"\"\"\n        Create a new instance.\n\n        Also creates the storage file, if it doesn't exist and the access mode\n        is appropriate for writing.\n\n        **Note:** Using an access mode other than `r` or `r+` will probably\n        lead to data loss or data corruption!\n\n        **Note:**  **Never** pass untrusted or user-controlled code as ``kwargs``\n        members like ``cls`` or ``default`` will be called on every write\n        operation.\n\n        :param path: Where to store the JSON data.\n        :param access_mode: mode in which the file is opened  (r, r+)\n        :type access_mode: str\n        \"\"\"\n\n        super().__init__()\n\n        self._mode = access_mode\n        self.kwargs = kwargs\n\n        if access_mode not in  ('r', 'rb', 'r+', 'rb+'):\n            warnings.warn(\n                'Using an `access_mode` other than  \\'r\\', \\'rb\\', \\'r+\\' '\n                'or \\'rb+\\' can cause data loss or corruption'\n            )\n\n        # Create the file if it doesn't exist and creating is allowed by the\n        # access mode\n        if any([character in self._mode for character in ('+', 'w', 'a')]):   # any of the writing modes\n            touch(path, create_dirs=create_dirs)\n\n        # Open the file for reading/writing\n        self._handle = open(path, mode=self._mode, encoding=encoding)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def __init__(self, path: str, create_dirs=False, encoding=None, access_mode='r+', **kwargs):\n        \"\"\"\n        Create a new instance.\n\n        Also creates the storage file, if it doesn't exist and the access mode\n        is appropriate for writing.\n\n        **Note:** Using an access mode other than `r` or `r+` will probably\n        lead to data loss or data corruption!\n\n        **Note:**  **Never** pass untrusted or user-controlled code as ``kwargs``\n        members like ``cls`` or ``default`` will be called on every write\n        operation.\n\n        :param path: Where to store the JSON data.\n        :param access_mode: mode in which the file is opened  (r, r+)\n        :type access_mode: str\n        \"\"\"\n\n        super().__init__()\n\n        self._mode = access_mode\n        self.kwargs = kwargs\n\n        if access_mode not in  ('r', 'rb', 'r+', 'rb+'):\n            warnings.warn(\n                'Using an `access_mode` other than  \\'r\\',  \\'rb\\',  \\'r+\\' '\n                'or  \\'rb+\\' can cause data loss or corruption'\n            )\n\n        # Create the file if it doesn't exist and creating is allowed by the\n        # access mode\n        if any([character in self._mode for character in ('+', 'w', 'a')]):   # any of the writing modes\n            touch(path, create_dirs=create_dirs)\n\n        # Open the file for reading/writing\n        self._handle = open(path, mode=self._mode, encoding=encoding)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def __init__(self, path: str, create_dirs=False, encoding=None, access_mode='r+', **kwargs):\n        \"\"\"\n        Create a new instance.\n\n        Also creates the storage file, if it doesn't exist and the access mode\n        is appropriate for writing.\n\n        **Note:** Using an access mode other than `r` or `r+` will probably\n        lead to data loss or data corruption!\n\n        **Note:**  **Never** pass untrusted or user-controlled code as ``kwargs``\n        members like ``cls`` or ``default`` will be called on every write\n        operation.\n\n        :param path: Where to store the JSON data.\n        :param access_mode: mode in which the file is opened  (r, r+)\n        :type access_mode: str\n        \"\"\"\n\n        super().__init__()\n\n        self._mode = access_mode\n        self.kwargs = kwargs\n\n        if access_mode not in  ('r', 'rb', 'r+', 'rb+'):\n            warnings.warn(\n                'Using an `access_mode` other than  \\'r\\', \\'rb\\', \\'r+\\' '\n                'or \\'rb+\\' can cause data loss or corruption'\n            )\n\n        # Create the file if it doesn't exist and creating is allowed by the\n        # access mode\n        if any([character in self._mode for character in ('+', 'w', 'a')]):   # any of the writing modes\n            touch(path, create_dirs=create_dirs)\n\n        # Open the file for reading/writing\n        self._handle = open(path, mode=self._mode, encoding=encoding)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    import json\n\n    def write_json(self, data):\n        \"\"\"\n        Write JSON data to the file.\n\n        :param data: The data to be written to the file.\n        \"\"\"\n        # Check if the file is open for writing\n        if 'w' not in self._mode and 'a' not in self._mode:\n            raise ValueError(\"File is not open for writing\")\n\n        # Write the data to the file\n        json.dump(data, self._handle, **self.kwargs)",
+          "ok": true,
+          "error": null,
+          "repair": {
+            "original_verdict": "COULD_NOT_EXECUTE",
+            "final_verdict": "COULD_NOT_EXECUTE",
+            "attempts_used": 3,
+            "repaired_source": "    import json\n\n    def write_json(self, data):\n        \"\"\"\n        Write JSON data to the file.\n\n        :param data: The data to be written to the file.\n        \"\"\"\n        # Check if the file is open for writing\n        if 'w' not in self._mode and 'a' not in self._mode:\n            raise ValueError(\"File is not open for writing\")\n\n        # Write the data to the file\n        json.dump(data, self._handle, **self.kwargs)",
+            "cwe": null,
+            "trajectory": [
+              {
+                "attempt": 1,
+                "verdict": "COULD_NOT_EXECUTE",
+                "cwe": null
+              },
+              {
+                "attempt": 2,
+                "verdict": "COULD_NOT_EXECUTE",
+                "cwe": null
+              },
+              {
+                "attempt": 3,
+                "verdict": "COULD_NOT_EXECUTE",
+                "cwe": null
+              }
+            ]
+          }
+        }
+      ]
     }
   }
 }
