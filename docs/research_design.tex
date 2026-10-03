@@ -1,0 +1,292 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=2.2cm]{geometry}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\usepackage{hyperref}
+\hypersetup{hidelinks}
+
+\newcolumntype{P}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+\titleformat{\section}{\large\bfseries}{\thesection.}{0.6em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.6em}{}
+\setlength{\parskip}{4pt}
+\setlength{\parindent}{0pt}
+
+\title{\vspace{-1.2cm}\textbf{Research Design Specification}\\[4pt]
+\large An Empirical Evaluation and Benchmark of\\AI-Generated Vulnerabilities in Code}
+\author{Eyad Hassan Abdelfatah \\
+\small German International University (GIU), Cairo --- Cybersecurity B.Sc. \\
+\small Supervisors: Dr.\ Marwa Zamzam \textbar{} Dr.\ Ahmed Maghawry}
+\date{\small Working design document --- revised after related-work survey}
+
+\begin{document}
+\maketitle
+\vspace{-0.6cm}
+
+\hrule
+\vspace{8pt}
+
+\section{Purpose of this document}
+
+This is a living design specification, not a results chapter. It records
+the research questions, the measurement methodology, the exact scope, and
+the honesty boundaries that the benchmark must respect, so that the design
+can be reviewed and signed off before large-scale data collection begins.
+It supersedes earlier informal plans and reflects the related-work survey
+summarised in the Literature Review Sheet (notably CWEval, ``Broken by
+Default,'' the ASU application-level benchmark, and the iterative-degradation
+study), which narrowed and sharpened the contribution claimed here.
+
+\section{Thesis statement and research questions}
+
+\textbf{Central question.} What vulnerabilities do AI code-generation models
+produce when asked to implement real-world function tasks, how reliably can
+this be measured by \emph{executing} the generated code rather than
+pattern-matching it, and how do execution failures and limited runtime
+feedback affect the observed results?
+
+\textbf{Primary research question (RQ1).} Across models, CWEs, and tasks,
+at what rate does one-shot AI-generated code, when executed, cause a real
+dangerous operation (SQL execution, process execution, filesystem access)
+to run with attacker-shaped data reaching it?
+
+\textbf{Secondary research questions.}
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt,topsep=2pt]
+  \item \textbf{RQ2 (measurement validity).} What fraction of
+  ``could-not-evaluate'' outcomes are caused by the model generating
+  broken code, versus by the test harness being unable to construct the
+  execution environment? (Answered via the ground-truth control, \S6.)
+  \item \textbf{RQ3 (execution-guided repair).} When the model is given
+  only a runtime crash traceback and allowed a bounded number of repair
+  attempts --- with no security signal of any kind --- does the observed
+  vulnerability rate change relative to one-shot generation?
+  \item \textbf{RQ4 (exploitability anchor).} For a curated subset, can the
+  runtime-triggered signal be promoted to a full, end-to-end exploit through
+  a real or realistically-constructed entry point?
+\end{itemize}
+
+\section{Contribution and positioning (corrected)}
+
+Execution-based security evaluation of LLM code already exists (CWEval, Jan
+2025) and rigorous exploitability confirmation already exists for
+memory-safety bugs in C/C++ (``Broken by Default''). The contribution of
+this thesis is therefore \emph{not} ``execution verification is new.'' It is
+a specific, defensible \emph{combination} that no single reviewed work
+provides:
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=1pt,topsep=2pt]
+  \item Outcome-driven, execution-verified detection applied to
+  \textbf{automatically-mined real-world library functions}, rather than to
+  hand-authored self-contained tasks (CWEval's 119 tasks) or synthetic
+  prompts.
+  \item A \textbf{generic sink-interception oracle} that requires no
+  per-task hand-authoring: the same instrumentation confirms a dangerous
+  operation for \emph{any} mined function, which is what makes the approach
+  scale where hand-built oracles cannot.
+  \item A \textbf{ground-truth execution control}: each task's real,
+  human-written implementation is run through the identical harness, which
+  lets ``could-not-evaluate'' be split into harness-caused and model-caused
+  --- a validity lever not present in the reviewed benchmarks.
+  \item \textbf{Functional injection-class} exploitation (CWE-89/78/22 and
+  related), as opposed to memory-corruption formal proofs, with a curated
+  set of fully-confirmed end-to-end exploits as anchors.
+\end{enumerate}
+
+\textbf{Relationship to application-level work.} The ASU application-level
+benchmark deploys whole AI-generated web apps and attacks them over HTTP,
+achieving high ecological validity at small N. This thesis occupies the
+complementary point on the validity--scale trade-off: function granularity,
+a generic oracle, and a ground-truth control give higher statistical power
+and precise sink-level attribution, at the cost of assuming deployment-time
+attacker control for the automatic tier (addressed by Tier~2, \S5).
+
+\section{Honesty boundary (non-negotiable)}
+
+The word ``vulnerable'' denotes a property of a \emph{reachable path}, not
+of an isolated function. Accordingly:
+
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt,topsep=2pt]
+  \item The automatic benchmark (Tier~1) reports \textbf{``the real
+  dangerous sink executed with attacker-shaped data, under a stated
+  attacker-controllability assumption''} --- not ``exploitable,'' and not
+  ``full attacker-controlled exploit path.''
+  \item The phrase ``confirmed exploitable / full exploit path'' is reserved
+  strictly for Tier~2 cases, where a real or realistically-constructed entry
+  point is demonstrated end to end, and for the six disclosed-CVE cases
+  whose real-world attacker control was independently established by the
+  original reporters.
+\end{itemize}
+
+\section{Two-tier claim structure}
+
+Both tiers are built; they are layers of one pipeline, not alternatives.
+
+\textbf{Tier 1 --- Automatic benchmark (large N).} Every mined/generated
+candidate is executed in the instrumented harness. Output is a per-candidate
+verdict (\S6) and aggregate rates with confidence intervals. This is the
+bulk of the quantitative result. Claim level: runtime-triggered sink
+execution under the attacker-controllability assumption.
+
+\textbf{Tier 2 --- Exploit case studies (small, curated N).} A fixed,
+small set (target 8--12) of already-triggered candidates is promoted to a
+full end-to-end exploit by supplying a real entry point (traced from the
+library's own CLI/API surface) or a minimal, explicitly-labelled realistic
+caller, and demonstrating a concrete side effect. Claim level: confirmed
+exploitable. Tier~2 validates that the Tier~1 signal corresponds to real
+exploitation; four such demonstrations already exist (sqlite-utils SQLi,
+invoke command injection, tinydb path traversal, paramiko ProxyCommand).
+
+\textbf{``Manual'' clarified.} Tier~2 is bounded and short: each case is a
+small script of the kind already produced this project, not an open-ended
+effort and not hundreds of exploits.
+
+\section{Methodology}
+
+\subsection{Mining (task source)}
+Real functions are mined from real open-source libraries and reduced to an
+``implement this'' prompt (signature + docstring, body stripped), keeping
+only functions whose bodies reach a known CWE sink taxonomy. A
+\emph{construction recipe} for the enclosing class is additionally mined
+from the repository's own test suite (e.g.\ \texttt{Database(memory=True)}
+found in the project's \texttt{conftest.py}), restricted to calls whose
+arguments are literals or substitutable test fixtures, so the harness can
+build a real instance via the real constructor.
+
+\subsection{Instrumented execution harness (the oracle)}
+The harness patches the real standard-library sink implementations at their
+lowest common point (e.g.\ \texttt{subprocess.Popen.\_\_init\_\_},
+\texttt{sqlite3} execution, \texttt{open}), plus a lower-level process-exec
+audit hook, and tracks a unique per-run marker by \emph{value content}
+(surviving f-strings and formatting). A candidate is run in a disposable,
+resource-limited child process with a scratch working directory. Three
+honest outcomes are possible: \textsc{triggered}, \textsc{not\_triggered},
+\textsc{could\_not\_execute}. Stated limitations (reported, not hidden):
+same-kernel sandbox (not a security boundary against adversarial payloads);
+taint-by-value misses transformed inputs (a false-negative mode distinct
+from static analysis).
+
+\subsection{Generation (the subject under test)}
+For each mined prompt, the model receives the signature, docstring, and the
+enclosing class's \texttt{\_\_init\_\_} as ordinary code context (never any
+security instruction, so default behaviour is measured). Sampling:
+$k$ generations at temperature~0.7 for a rate-with-variance estimate, plus
+one temperature-0 deterministic reference for reproducibility.
+
+\subsection{RQ2 --- the ground-truth classifier (``D'')}
+Each candidate's real implementation is run through the identical harness as
+a control. Classification of a generated \textsc{could\_not\_execute}:
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt,topsep=2pt]
+  \item real function executes, generated does not $\Rightarrow$
+  \textbf{model-caused} failure;
+  \item real function also does not execute $\Rightarrow$
+  \textbf{infrastructure-caused} failure (excluded from the model's
+  denominator).
+\end{itemize}
+This automatic, control-based split is what makes the reported denominators
+defensible.
+
+\subsection{RQ2 --- parameter construction recipes (``C'')}
+To shrink the infrastructure-caused bucket that D exposes, construction-recipe
+mining is extended beyond the enclosing class to \emph{other} complex-typed
+parameters, mining safe constructor calls for them from the repository's own
+tests. This improves both the control and the generated runs equally.
+
+\subsection{RQ3 --- bounded execution-repair (``A'')}
+A second experimental arm. On a \textsc{could\_not\_execute} crash, the model
+is given \textbf{only the runtime traceback} and asked to make the code run
+without changing behaviour, for at most three attempts. The security verdict
+is never exposed to the model at any point (information boundary below). This
+arm is reported separately from the one-shot baseline and additionally yields
+a vulnerability-transition analysis (one-shot vs repaired).
+
+\begin{center}
+\fbox{\parbox{0.92\linewidth}{\centering
+\textbf{Information boundary (RQ3).}\\
+Into the repair loop: runtime exception + traceback \emph{only}.\\
+Never into the loop: sink result, CWE, taint verdict, any security signal.\\
+Rationale: otherwise the experiment measures detector-evasion, not default
+behaviour.}}
+\end{center}
+
+\section{Metrics}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt,topsep=2pt]
+  \item \textbf{Execution rate} --- fraction of generations that run
+  (itself a reported model-quality metric, not a discarded precondition).
+  \item \textbf{Trigger rate ($\approx$ vuln@$k$)} --- fraction of
+  \emph{executable} generations that trigger a sink, with the denominator
+  stated explicitly and confidence intervals from the $k$ samples.
+  \item \textbf{Functional-vs-secure gap} --- where functional test
+  oracles are available, the drop from ``runs correctly'' to ``runs
+  correctly and does not trigger.''
+  \item \textbf{Repair deltas (RQ3)} --- change in execution rate and in
+  trigger rate after bounded repair, plus the vulnerability-transition
+  matrix (safe$\to$vuln, vuln$\to$safe, vuln$\to$vuln, etc.).
+\end{itemize}
+
+\section{Scope}
+
+\textbf{CWEs.} Core (built, validated): CWE-89 SQL Injection, CWE-78 OS
+Command Injection, CWE-22 Path Traversal. Planned additions, chosen because
+they fit the existing taint$\to$single-sink architecture with only new sink
+patches (not new machinery): CWE-94/95 code injection (\texttt{eval}/
+\texttt{exec}), CWE-502 insecure deserialization, CWE-918 SSRF, CWE-611 XXE.
+Deliberately excluded (require a different verification model): XSS, auth/
+session logic, memory-safety.
+
+\textbf{Languages.} Python is the deep, finished core (the instrumentation
+is Python-runtime-specific). Java is a stretch second language (requires a
+separately-built bytecode-instrumentation harness) if time permits.
+JavaScript is explicit future work. The gap statement claims only languages
+for which a harness is actually built.
+
+\textbf{Models.} Local open-source first (Qwen2.5-Coder, DeepSeek-Coder via
+Ollama) for free, high-volume runs; then one GPT and one Claude model for
+the cross-model table. Exact model versions and access dates are pinned in
+the methodology for reproducibility.
+
+\section{Threats to validity}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt,topsep=2pt]
+  \item \textbf{Construct.} ``Sink triggered with marker data'' is a proxy
+  for ``vulnerable.'' Justified for Tier~1 under a stated assumption;
+  anchored to real exploitation by Tier~2.
+  \item \textbf{Internal.} Harness-caused failures could bias rates ---
+  mitigated by the ground-truth control (D) and construction recipes (C).
+  \item \textbf{External.} Mined libraries and chosen models may not
+  generalise --- mitigated by multiple repositories, multiple models, and
+  honest reporting of the corpus.
+  \item \textbf{Reproducibility.} Stochastic generation --- mitigated by
+  $k$-sampling with CIs plus a temperature-0 reference, pinned versions,
+  and released harness + corpus + raw generations.
+\end{itemize}
+
+\section{Build order}
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=1pt,topsep=2pt]
+  \item Multi-sample generation layer over the already-mined prompts
+  (the subject: AI code). \emph{(next step)}
+  \item D: ground-truth-control classifier (model vs infrastructure).
+  \item C: parameter-level construction recipes (shrink infrastructure
+  failures).
+  \item A: bounded execution-repair arm (RQ3) + transition analysis.
+  \item Scale across repositories, CWEs, and models; assemble Tier~2
+  exploit case studies; statistical analysis and write-up.
+\end{enumerate}
+
+\vspace{6pt}
+\hrule
+\vspace{4pt}
+{\small This design keeps vulnerability benchmarking as the centre of
+gravity: a scalable, honestly-scoped automatic measurement (Tier~1),
+validated by a small set of fully-confirmed exploits (Tier~2), with
+measurement validity (RQ2) and execution-guided repair (RQ3) as controlled
+secondary experiments. Full agentic / application-level generation is
+recorded as future work, not undertaken here.}
+
+\end{document}

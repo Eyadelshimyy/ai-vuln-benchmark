@@ -1,0 +1,15 @@
+{
+  "repo": "paramiko",
+  "file": "paramiko/win_openssh.py",
+  "function": "__init__",
+  "line": 36,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `__init__` function.",
+  "prompt_source": "    def __init__(self):\n        \"\"\"Implement the `__init__` function.\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    def __init__(self):\n        while True:\n            try:\n                self._pipe = os.open(PIPE_NAME, os.O_RDWR | os.O_BINARY)\n            except OSError as e:\n                # retry when errno 22 which means that the server has not\n                # called DisconnectNamedPipe() yet.\n                if e.errno != 22:\n                    raise\n            else:\n                break\n            time.sleep(0.1)",
+  "module_source": "# Copyright (C) 2021 Lew Gordon <lew.gordon@genesys.com>\n# Copyright (C) 2022 Patrick Spendrin <ps_ml@gmx.de>\n#\n# This file is part of paramiko.\n#\n# Paramiko is free software; you can redistribute it and/or modify it under the\n# terms of the GNU Lesser General Public License as published by the Free\n# Software Foundation; either version 2.1 of the License, or (at your option)\n# any later version.\n#\n# Paramiko is distributed in the hope that it will be useful, but WITHOUT ANY\n# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR\n# A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for more\n# details.\n#\n# You should have received a copy of the GNU Lesser General Public License\n# along with Paramiko; if not, write to the Free Software Foundation, Inc.,\n# 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA.\n\nimport os.path\nimport time\n\nPIPE_NAME = r\"\\\\.\\pipe\\openssh-ssh-agent\"\n\n\ndef can_talk_to_agent():\n    # use os.listdir() instead of os.path.exists(), because os.path.exists()\n    # uses CreateFileW() API and the pipe cannot be reopen unless the server\n    # calls DisconnectNamedPipe().\n    dir_, name = os.path.split(PIPE_NAME)\n    name = name.lower()\n    return any(name == n.lower() for n in os.listdir(dir_))\n\n\nclass OpenSSHAgentConnection:\n    def __init__(self):\n        while True:\n            try:\n                self._pipe = os.open(PIPE_NAME, os.O_RDWR | os.O_BINARY)\n            except OSError as e:\n                # retry when errno 22 which means that the server has not\n                # called DisconnectNamedPipe() yet.\n                if e.errno != 22:\n                    raise\n            else:\n                break\n            time.sleep(0.1)\n\n    def send(self, data):\n        return os.write(self._pipe, data)\n\n    def recv(self, n):\n        return os.read(self._pipe, n)\n\n    def close(self):\n        return os.close(self._pipe)\n",
+  "construction_recipe": null
+}

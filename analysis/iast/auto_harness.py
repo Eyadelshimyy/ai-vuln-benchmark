@@ -851,7 +851,18 @@ def _run_sandboxed(source: str, func_name: str, param_name: str | None, marker: 
     is left on disk and its path is returned in the result for main() to
     print, instead of being cleaned up here."""
     scratch_dir = tempfile.mkdtemp(prefix="auto_harness_scratch_")
-    parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
+    # Force 'fork' explicitly rather than relying on the platform default.
+    # Python 3.14 changed Linux's DEFAULT start method from 'fork' to
+    # 'forkserver' -- forkserver has to PICKLE the target callable to hand
+    # it to a separate server process, and _target below is a local nested
+    # closure, which cannot be pickled at all ("Can't pickle local object
+    # ... _target"). 'fork' just duplicates the running process in place,
+    # no pickling involved, and is still fully available on Linux -- it's
+    # only the default that changed, not availability. Verified directly:
+    # this crashed under forkserver (Python 3.14, Ubuntu/WSL2) and runs
+    # clean once forced to fork.
+    ctx = multiprocessing.get_context("fork")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
 
     def _target():
         _set_child_limits()
@@ -859,7 +870,7 @@ def _run_sandboxed(source: str, func_name: str, param_name: str | None, marker: 
                     module_source=module_source, line=line, splice_source=splice_source,
                     file_rel_path=file_rel_path, construction_recipe=construction_recipe, live=live)
 
-    proc = multiprocessing.Process(target=_target)
+    proc = ctx.Process(target=_target)
     proc.start()
     proc.join(timeout=timeout)
 
