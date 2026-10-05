@@ -21,31 +21,31 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "    def view_names(self) -> list[str]:\n        \"List of string view names in this database.\"\n        cursor = self.conn.cursor()\n        cursor.execute(\"SELECT name FROM sqlite_master WHERE type='view';\")\n        return [row[0] for row in cursor.fetchall()]",
+          "source": "    def view_names(self) -> list[str]:\n            \"List of string view names in this database.\"\n            cursor = self.conn.execute(\"SELECT name FROM sqlite_master WHERE type='view';\")\n            return [row[0] for row in cursor.fetchall()]",
           "ok": true,
           "error": null
         },
         {
           "index": 1,
-          "source": "    def view_names(self) -> list[str]:\n            \"List of string view names in this database.\"\n            with self.conn:\n                cursor = self.conn.execute(\"SELECT name FROM sqlite_master WHERE type='view';\")\n                return [row[0] for row in cursor.fetchall()]",
+          "source": "    def view_names(self) -> list[str]:\n        \"List of string view names in this database.\"\n        return self.execute(\"SELECT name FROM sqlite_master WHERE type='view';\").fetchall()",
           "ok": true,
           "error": null
         },
         {
           "index": 2,
-          "source": "    def view_names(self) -> list[str]:\n            \"List of string view names in this database.\"\n            with self.conn:\n                rows = self.conn.execute(\"SELECT name FROM sqlite_master WHERE type='view';\")\n                return [row[0] for row in rows]",
+          "source": "    def view_names(self) -> list[str]:\n        \"List of string view names in this database.\"\n        cursor = self.conn.execute(\"SELECT name FROM sqlite_master WHERE type='view';\")\n        return [row[0] for row in cursor.fetchall()]",
           "ok": true,
           "error": null
         },
         {
           "index": 3,
-          "source": "    def view_names(self) -> list[str]:\n            \"List of string view names in this database.\"\n            cursor = self.conn.cursor()\n            cursor.execute(\"SELECT name FROM sqlite_master WHERE type='view';\")\n            return [row[0] for row in cursor.fetchall()]",
+          "source": "    def view_names(self) -> list[str]:\n        \"List of string view names in this database.\"\n        cursor = self.conn.execute(\"SELECT name FROM sqlite_master WHERE type='view';\")\n        return [row[0] for row in cursor.fetchall()]",
           "ok": true,
           "error": null
         },
         {
           "index": 4,
-          "source": "    def view_names(self) -> list[str]:\n            \"List of string view names in this database.\"\n            with self.conn:\n                cursor = self.conn.execute(\"SELECT name FROM sqlite_master WHERE type='view';\")\n                return [row[0] for row in cursor.fetchall()]",
+          "source": "    def view_names(self) -> list[str]:\n        \"\"\"List of string view names in this database.\"\"\"\n        cursor = self.conn.cursor()\n        cursor.execute(\"SELECT name FROM sqlite_master WHERE type='view';\")\n        views = cursor.fetchall()\n        cursor.close()\n        return [view[0] for view in views]",
           "ok": true,
           "error": null
         }
@@ -60,13 +60,13 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "    def view_names(self) -> list[str]:\n        \"\"\"List of string view names in this database.\"\"\"\n        cursor = self.conn.execute(\"SELECT name FROM sqlite_master WHERE type = 'view';\")\n        return [row[0] for row in cursor.fetchall()]",
+          "source": "    def view_names(self) -> list[str]:\n        \"\"\"List of string view names in this database.\"\"\"\n        cursor = self.conn.cursor()\n        cursor.execute(\"SELECT name FROM sqlite_master WHERE type = 'view';\")\n        return [row[0] for row in cursor.fetchall()]",
           "ok": true,
           "error": null
         },
         {
           "index": 1,
-          "source": "    def view_names(self) -> list[str]:\n        \"\"\"List of string view names in this database.\"\"\"\n        cursor = self.conn.execute(\"SELECT name FROM sqlite_master WHERE type = 'view';\")\n        return [row[0] for row in cursor.fetchall()]",
+          "source": "    def view_names(self) -> list[str]:\n        \"\"\"List of string view names in this database.\"\"\"\n        cursor = self.conn.cursor()\n        cursor.execute(\"SELECT name FROM sqlite_master WHERE type = 'view';\")\n        return [row[0] for row in cursor.fetchall()]",
           "ok": true,
           "error": null
         },

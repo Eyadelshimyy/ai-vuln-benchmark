@@ -1,0 +1,16 @@
+model=deepseek-coder:6.7b  base_url=http://localhost:11434/v1  k=5  temp0=True  max_tokens=2048
+10 candidate file(s)
+
+[1/10] benchmark_results.json  SKIP (no prompt_source)
+[2/10] run ... 6/6 ok (35s)
+[3/10] print_completion_script ... 6/6 ok (36s)
+[4/10] _sudo ... 6/6 ok (16s)
+[5/10] execute ... 6/6 ok (23s)
+[6/10] start ... 6/6 ok (19s)
+[7/10] run ... 6/6 ok (14s)
+[8/10] integration ... 6/6 ok (21s)
+[9/10] regression ... 6/6 ok (23s)
+[10/10] typecheck ... 6/6 ok (13s)
+
+Done in 200s. Wrote generations into 10 file(s) under calibration/mined_prompts/invoke.
+Next: run the harness over these samples (Step 2).

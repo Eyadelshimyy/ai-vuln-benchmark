@@ -21,7 +21,7 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "    def schema(self) -> str:\n            \"SQL schema for this database.\"\n            return self.conn.execute(\"SELECT sql FROM sqlite_master WHERE type='table';\").fetchall()",
+          "source": "    def schema(self) -> str:\n        \"SQL schema for this database.\"\n        return self.conn.execute(\"SELECT sql FROM sqlite_master WHERE type='table';\").fetchall()",
           "ok": true,
           "error": null
         },
@@ -33,19 +33,19 @@
         },
         {
           "index": 2,
-          "source": "    def schema(self) -> str:\n            \"SQL schema for this database.\"\n            return self.conn.execute(\"SELECT sql FROM sqlite_master WHERE type='table';\").fetchall()",
+          "source": "    def schema(self) -> str:\n        \"SQL schema for this database.\"\n        return self.conn.execute(\"SELECT sql FROM sqlite_master WHERE type='table';\").fetchall()",
           "ok": true,
           "error": null
         },
         {
           "index": 3,
-          "source": "    def schema(self) -> str:\n            \"SQL schema for this database.\"\n            return self.conn.execute(\"SELECT sql FROM sqlite_master WHERE type='table' OR type='index'\").fetchall()",
+          "source": "    def schema(self) -> str:\n            \"SQL schema for this database.\"\n            return self.conn.execute(\"SELECT sql FROM sqlite_master WHERE type='table';\").fetchall()",
           "ok": true,
           "error": null
         },
         {
           "index": 4,
-          "source": "    def schema(self) -> str:\n        \"SQL schema for this database.\"\n        return self.conn.execute(\"SELECT sql FROM sqlite_master WHERE type='table';\").fetchall()",
+          "source": "    def schema(self) -> str:\n        \"SQL schema for this database.\"\n        with self.conn:\n            cursor = self.conn.execute(\"SELECT sql FROM sqlite_master WHERE type='table';\")\n            return '\\n'.join(row[0] for row in cursor.fetchall())",
           "ok": true,
           "error": null
         }
@@ -60,31 +60,31 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "    def schema(self) -> str:\n            \"\"\"SQL schema for this database.\"\"\"\n            cursor = self.conn.cursor()\n            cursor.execute(\"SELECT sql FROM sqlite_master WHERE type='table' OR type='view'\")\n            rows = cursor.fetchall()\n            schema = \"\"\n            for row in rows:\n                schema += row[0] + \";\\n\"\n            return schema",
+          "source": "    def schema(self) -> str:\n        \"\"\"\n        SQL schema for this database.\n        \"\"\"\n        cursor = self.conn.cursor()\n        cursor.execute(\"SELECT sql FROM sqlite_master WHERE type = 'table'\")\n        tables = cursor.fetchall()\n        schema_sql = \"\"\n        for table in tables:\n            table_name = table[0]\n            cursor.execute(f\"PRAGMA table_info({table_name})\")\n            columns = cursor.fetchall()\n            schema_sql += f\"CREATE TABLE {table_name} (\\n\"\n            for column in columns:\n                column_name = column[1]\n                column_type = column[2]\n                schema_sql += f\"    {column_name} {column_type}\"\n                if column[3] == \"1\":  # column[3] is not null, 1 means it is\n                    schema_sql += \" NOT NULL\"\n                schema_sql += \",\\n\"\n            schema_sql = schema_sql[:-2]  # Remove the last comma and newline\n            schema_sql += \"\\n);\\n\"\n        return schema_sql",
           "ok": true,
           "error": null
         },
         {
           "index": 1,
-          "source": "    def schema(self) -> str:\n        \"\"\"\n        SQL schema for this database.\n        \"\"\"\n        cursor = self.conn.cursor()\n        cursor.execute(\"SELECT sql FROM sqlite_master WHERE type='table' OR type='view' ORDER BY name\")\n        rows = cursor.fetchall()\n        return '\\n'.join(row[0] for row in rows)",
+          "source": "    def schema(self) -> str:\n        \"\"\"SQL schema for this database.\"\"\"\n        cursor = self.conn.execute(\"SELECT sql FROM sqlite_master WHERE type = 'table' OR type = 'view' ORDER BY name;\")\n        rows = cursor.fetchall()\n        schema = \"\\n\".join(row[0] for row in rows)\n        cursor.close()\n        return schema",
           "ok": true,
           "error": null
         },
         {
           "index": 2,
-          "source": "    def schema(self) -> str:\n        \"\"\"\n        SQL schema for this database.\n        \"\"\"\n        cursor = self.conn.execute(\"SELECT * FROM sqlite_master\")\n        rows = cursor.fetchall()\n        return \"\\n\".join([\" \".join(row) for row in rows])",
+          "source": "    def schema(self) -> str:\n        \"\"\"\n        SQL schema for this database.\n        \"\"\"\n        # We execute PRAGMA table_info(table_name) for all tables in the database\n        # and concatenate the results. This should give us a representation of the\n        # schema.\n        cursor = self.conn.cursor()\n        cursor.execute(\"SELECT name FROM sqlite_schema WHERE type = 'table'\")\n        tables = cursor.fetchall()\n\n        schema_string = \"\"\n\n        for table_name in tables:\n            table_name = table_name[0]\n            schema_string += f\"\\nTable: {table_name}\\n\"\n            schema_string += \"---------------------------\\n\"\n\n            # PRAGMA table_info returns a tuple of (cid, name, type, notnull, dflt_value, pk)\n            cursor.execute(f\"PRAGMA table_info({table_name})\")\n            columns = cursor.fetchall()\n\n            for column in columns:\n                cid, name, type, notnull, dflt_value, pk = column\n                schema_string += f\"{name}: {type}\\n\"\n\n        return schema_string",
           "ok": true,
           "error": null
         },
         {
           "index": 3,
-          "source": "    def schema(self) -> str:\n        \"\"\"SQL schema for this database.\"\"\"\n        cursor = self.conn.cursor()\n        cursor.execute(\"SELECT sql(*) FROM sqlite_master WHERE type = 'table' OR type = 'view' ORDER BY name;\")\n        rows = cursor.fetchall()\n        schema_str = \"\"\n        for row in rows:\n            schema_str += row[0] + \";\"\n        return schema_str",
+          "source": "    def schema(self) -> str:\n        \"\"\"SQL schema for this database.\"\"\"\n        schema_str = \"\"\n        tables = self.conn.execute(\"SELECT name FROM sqlite_schema WHERE type = 'table'\").fetchall()\n        for table in tables:\n            schema_str += f\"CREATE TABLE {table[0]} (\\n\"\n            schema_str += \",\\n\".join(\n                [f\"    {col[1]} {col[2]}\" for col in self.conn.execute(f'PRAGMA table_info({table[0]})').fetchall()]\n            )\n            schema_str += \"\\n);\\n\"\n        return schema_str",
           "ok": true,
           "error": null
         },
         {
           "index": 4,
-          "source": "    def schema(self) -> str:\n        \"\"\"\n        SQL schema for this database.\n        \"\"\"\n        cursor = self.conn.cursor()\n        cursor.execute(\"SELECT sql FROM sqlite_master WHERE type = 'table' OR type = 'view'\")\n        rows = cursor.fetchall()\n        return '\\n'.join([row[0] for row in rows])",
+          "source": "    def schema(self) -> str:\n        \"\"\"\n        SQL schema for this database.\n        \"\"\"\n        cursor = self.conn.cursor()\n        cursor.execute(\"SELECT sql FROM sqlite_master WHERE type='table' ORDER BY name;\")\n        tables = cursor.fetchall()\n        schema_str = \"\"\n        for table in tables:\n            schema_str += f\"{table[0]};\\n\"\n        return schema_str",
           "ok": true,
           "error": null
         }

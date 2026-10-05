@@ -21,31 +21,31 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "    def execute(self) -> None:\n            \"\"\"\n            Hand off data & tasks-to-execute specification to an `.Executor`.\n\n            .. note::\n                Client code just wanting a different `.Executor` subclass can just\n                set ``executor_class`` in `.__init__`, or override\n                ``tasks.executor_class`` anywhere in the :ref:`config system\n                <default-values>` (which may allow you to avoid using a custom\n                Program entirely).\n\n            .. versionadded:: 1.0\n            \"\"\"\n            if self.namespace is None:\n                raise ValueError(\"Namespace is required to execute tasks\")\n\n            executor = self.executor_class(self)\n            executor.execute()",
+          "source": "    def execute(self) -> None:\n            \"\"\"\n            Hand off data & tasks-to-execute specification to an `.Executor`.\n\n            .. note::\n                Client code just wanting a different `.Executor` subclass can just\n                set ``executor_class`` in `.__init__`, or override\n                ``tasks.executor_class`` anywhere in the :ref:`config system\n                <default-values>` (which may allow you to avoid using a custom\n                Program entirely).\n\n            .. versionadded:: 1.0\n            \"\"\"\n            if self.executor_class:\n                executor = self.executor_class(self)\n                executor.execute()",
           "ok": true,
           "error": null
         },
         {
           "index": 1,
-          "source": "    def execute(self) -> None:\n            \"\"\"\n            Hand off data & tasks-to-execute specification to an `.Executor`.\n\n            .. note::\n                Client code just wanting a different `.Executor` subclass can just\n                set ``executor_class`` in `.__init__`, or override\n                ``tasks.executor_class`` anywhere in the :ref:`config system\n                <default-values>` (which may allow you to avoid using a custom\n                Program entirely).\n\n            .. versionadded:: 1.0\n            \"\"\"\n            if self.namespace is None:\n                raise ValueError(\"No task namespace provided to execute\")\n\n            executor = self.executor_class(self)\n            executor.execute(self.namespace)",
+          "source": "    def execute(self) -> None:\n        \"\"\"\n        Hand off data & tasks-to-execute specification to an `.Executor`.\n\n        .. note::\n            Client code just wanting a different `.Executor` subclass can just\n            set ``executor_class`` in `.__init__`, or override\n            ``tasks.executor_class`` anywhere in the :ref:`config system\n            <default-values>` (which may allow you to avoid using a custom\n            Program entirely).\n\n        .. versionadded:: 1.0\n        \"\"\"\n        executor = self.executor_class(namespace=self.namespace, config=self.config_class())\n        executor.execute()",
           "ok": true,
           "error": null
         },
         {
           "index": 2,
-          "source": "    def execute(self) -> None:\n        \"\"\"\n        Hand off data & tasks-to-execute specification to an `.Executor`.\n\n        .. note::\n            Client code just wanting a different `.Executor` subclass can just\n            set ``executor_class`` in `.__init__`, or override\n            ``tasks.executor_class`` anywhere in the :ref:`config system\n            <default-values>` (which may allow you to avoid using a custom\n            Program entirely).\n\n        .. versionadded:: 1.0\n        \"\"\"\n        executor = self.executor_class(\n            namespace=self.namespace,\n            loader=self.loader_class(),\n            config=self.config_class(),\n            binary=self._binary,\n            binary_names=self._binary_names,\n        )\n        executor.execute(self.argv)",
+          "source": "    def execute(self) -> None:\n            \"\"\"\n            Hand off data & tasks-to-execute specification to an `.Executor`.\n\n            .. note::\n                Client code just wanting a different `.Executor` subclass can just\n                set ``executor_class`` in `.__init__`, or override\n                ``tasks.executor_class`` anywhere in the :ref:`config system\n                <default-values>` (which may allow you to avoid using a custom\n                Program entirely).\n\n            .. versionadded:: 1.0\n            \"\"\"\n            executor = self.executor_class(self)\n            executor.execute()",
           "ok": true,
           "error": null
         },
         {
           "index": 3,
-          "source": "    def execute(self) -> None:\n            \"\"\"\n            Hand off data & tasks-to-execute specification to an `.Executor`.\n\n            .. note::\n                Client code just wanting a different `.Executor` subclass can just\n                set ``executor_class`` in `.__init__`, or override\n                ``tasks.executor_class`` anywhere in the :ref:`config system\n                <default-values>` (which may allow you to avoid using a custom\n                Program entirely).\n\n            .. versionadded:: 1.0\n            \"\"\"\n            executor = self.executor_class(self)\n            executor.execute()",
+          "source": "    def execute(self) -> None:\n            \"\"\"\n            Hand off data & tasks-to-execute specification to an `.Executor`.\n\n            .. note::\n                Client code just wanting a different `.Executor` subclass can just\n                set ``executor_class`` in `.__init__`, or override\n                ``tasks.executor_class`` anywhere in the :ref:`config system\n                <default-values>` (which may allow you to avoid using a custom\n                Program entirely).\n\n            .. versionadded:: 1.0\n            \"\"\"\n            executor = self.executor_class()\n            executor.execute(self.namespace, self.argv)",
           "ok": true,
           "error": null
         },
         {
           "index": 4,
-          "source": "    def execute(self) -> None:\n            \"\"\"\n            Hand off data & tasks-to-execute specification to an `.Executor`.\n\n            .. note::\n                Client code just wanting a different `.Executor` subclass can just\n                set ``executor_class`` in `.__init__`, or override\n                ``tasks.executor_class`` anywhere in the :ref:`config system\n                <default-values>` (which may allow you to avoid using a custom\n                Program entirely).\n\n            .. versionadded:: 1.0\n            \"\"\"\n            executor = self.executor_class(self)\n            executor.execute()",
+          "source": "    def execute(self) -> None:\n            \"\"\"\n            Hand off data & tasks-to-execute specification to an `.Executor`.\n\n            .. note::\n                Client code just wanting a different `.Executor` subclass can just\n                set ``executor_class`` in `.__init__`, or override\n                ``tasks.executor_class`` anywhere in the :ref:`config system\n                <default-values>` (which may allow you to avoid using a custom\n                Program entirely).\n\n            .. versionadded:: 1.0\n            \"\"\"\n            executor = self.executor_class()\n            executor.execute(self.namespace, self.argv)",
           "ok": true,
           "error": null
         }
@@ -60,7 +60,31 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "    def execute(self) -> None:\n            \"\"\"\n            Hand off data & tasks-to-execute specification to an `.Executor`.\n\n            .. note::\n                Client code just wanting a different `.Executor` subclass can just\n                set ``executor_class`` in `.__init__`, or override\n               ``tasks.executor",
+          "source": "    def execute(self) -> None:\n        \"\"\"\n        Hand off data & tasks-to-execute specification to an `.Executor`.\n\n        .. note::\n            Client code just wanting a different `.Executor` subclass can just\n            set ``executor_class`` in `.__init__`, or override\n           ``tasks.executoror_class`` anywhere in the :ref:`config system\n            <default-values>`` (which may allow you to avoid using a custom\n            Program entirely).\n\n        .. versionadded:: 1.0\n        \"\"\"\n        # Create an instance of the configured executor class\n        executor = self.executor_class(self)\n\n        # Execute the tasks\n        executor.execute()",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 1,
+          "source": "    def execute(self) -> None:\n        \"\"\"\n        Hand off data & tasks-to-execute specification to an `.Executor`.\n\n        .. note::\n            Client code just wanting a different `.Executor` subclass can just\n            set ``executor_class`` in `.__init__`, or override\n           ``tasks.executor_class` anywhere in the :ref:`config system\n            <default-values>. (which may allow you to avoid using a custom\n            Program entirely).\n\n        .. versionadded:: 1.0\n        \"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def execute(self) -> None:\n        \"\"\"\n        Hand off data & tasks-to-execute specification to an `.Executor`.\n\n        .. note::\n            Client code just wanting a different `.Executor` subclass can just\n            set ``executor_class`` in `.__init__`, or override\n           ``tasks.executoror_class`` anywhere in the :ref:`config system\n           <default-values>. (which may allow you to avoid using a custom\n           Program entirely).\n\n        .. versionadded:: 1.0\n        \"\"\"\n        executor = self.executor_class(self)\n        executor.execute()",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def execute(self) -> None:\n        \"\"\"\n        Hand off data & tasks-to-execute specification to an `.Executor`.\n\n        .. note::\n            Client code just wanting a different `.Executor` subclass can just\n            set ``executor_class`` in `.__init__`, or override\n           ``tasks.executor_class` anywhere in the :ref:`config system\n            <default-values>. (which may allow you to avoid using a custom\n            Program entirely).\n\n        .. versionadded:: 1.0\n        \"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 4,
+          "source": "    def execute(self) -> None:\n        \"\"\"\n        Hand off data & tasks-to-execute specification to an `.Executor`.\n\n        .. note::\n            Client code just wanting a different `.Executor` subclass can just\n            set ``executor_class`` in `.__init__`, or override\n           ``tasks.executor",
           "ok": true,
           "error": null,
           "repair": {
@@ -77,30 +101,6 @@
               }
             ]
           }
-        },
-        {
-          "index": 1,
-          "source": "    def execute(self) -> None:\n        \"\"\"\n        Hand off data & tasks-to-execute specification to an `.Executor`.\n\n        .. note::\n            Client code just wanting a different `.Executor` subclass can just\n            set ``executor_class`` in `.__init__`, or override\n           ``tasks.executor_class`` anywhere in the :ref:`config system\n           <default-values>. (which may allow you to avoid using a custom\n           Program entirely).\n\n        .. versionadded:: 1.0\n        \"\"\"\n        executor = self.executor_class(self.config_class(self))\n        executor.execute(self.namespace)",
-          "ok": true,
-          "error": null
-        },
-        {
-          "index": 2,
-          "source": "    def execute(self) -> None:\n        \"\"\"\n        Hand off data & tasks-to-execute specification to an `.Executor`.\n\n        .. note::\n            Client code just wanting a different `.Executor` subclass can just\n            set ``executor_class`` in `.__init__`, or override\n           ``tasks.executor.<Executor name>`` anywhere in the \n            :ref:`config system <default-values>.\n\n        .. versionadded:: 1.0\n        \"\"\"\n        executor = self.executor_class(config=self.config)\n        executor.execute(self.namespace)",
-          "ok": true,
-          "error": null
-        },
-        {
-          "index": 3,
-          "source": "    def execute(self) -> None:\n        \"\"\"\n        Hand off data & tasks-to-execute specification to an `.Executor`.\n\n        .. note::\n            Client code just wanting a different `.Executor` subclass can just\n            set ``executor_class`` in `.__init__`, or override\n           ``tasks.executor.execute()`\n\n        .. versionadded:: 1.0\n        \"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
-          "ok": true,
-          "error": null
-        },
-        {
-          "index": 4,
-          "source": "    def execute(self) -> None:\n        \"\"\"\n        Hand off data & tasks-to-execute specification to an `.Executor`.\n\n        .. note::\n            Client code just wanting a different `.Executor` subclass can just\n            set ``executor_class`` in `.__init__`, or override\n            'tasks.executoror_class`` anywhere in the :ref:`config system\n            <default-values>\n            (which may allow you to avoid using a custom Program entirely).\n\n        .. versionadded:: 1.0\n        \"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
-          "ok": true,
-          "error": null
         }
       ]
     }

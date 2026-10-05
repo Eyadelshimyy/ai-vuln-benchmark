@@ -21,7 +21,7 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "    def count_where(\n        self,\n        where: str | None = None,\n        where_args: Sequence | dict[str, Any] | None = None,\n    ) -> int:\n        \"\"\"\n        Executes ``SELECT count(*) FROM table WHERE ...`` and returns a count.\n\n        :param where: SQL where fragment to use, for example ``id > ?``\n        :param where_args: Parameters to use with that fragment - an iterable for ``id > ?``\n          parameters, or a dictionary for ``id > :id``\n        \"\"\"\n        query = f\"SELECT count(*) FROM {self.name}\"\n        if where:\n            query += f\" WHERE {where}\"\n        return self.db.execute(query, where_args).fetchone()[0]",
+          "source": "    def count_where(\n        self,\n        where: str | None = None,\n        where_args: Sequence | dict[str, Any] | None = None,\n    ) -> int:\n        \"\"\"\n        Executes ``SELECT count(*) FROM table WHERE ...`` and returns a count.\n\n        :param where: SQL where fragment to use, for example ``id > ?``\n        :param where_args: Parameters to use with that fragment - an iterable for ``id > ?``\n          parameters, or a dictionary for ``id > :id``\n        \"\"\"\n        query = f\"SELECT count(*) FROM {self.name}\"\n        if where:\n            query += \" WHERE \" + where\n        return self.db.execute(query, where_args).fetchone()[0]",
           "ok": true,
           "error": null
         },
@@ -33,19 +33,19 @@
         },
         {
           "index": 2,
-          "source": "    def count_where(\n            self,\n            where: str | None = None,\n            where_args: Sequence | dict[str, Any] | None = None,\n        ) -> int:\n            \"\"\"\n            Executes ``SELECT count(*) FROM table WHERE ...`` and returns a count.\n\n            :param where: SQL where fragment to use, for example ``id > ?``\n            :param where_args: Parameters to use with that fragment - an iterable for ``id > ?``\n              parameters, or a dictionary for ``id > :id``\n            \"\"\"\n            sql = f\"SELECT count(*) FROM {self.name}\"\n            if where:\n                sql += f\" WHERE {where}\"\n            return self.db.execute(sql, where_args).fetchone()[0]",
+          "source": "    def count_where(\n            self,\n            where: str | None = None,\n            where_args: Sequence | dict[str, Any] | None = None,\n        ) -> int:\n            \"\"\"\n            Executes ``SELECT count(*) FROM table WHERE ...`` and returns a count.\n\n            :param where: SQL where fragment to use, for example ``id > ?``\n            :param where_args: Parameters to use with that fragment - an iterable for ``id > ?``\n              parameters, or a dictionary for ``id > :id``\n            \"\"\"\n            query = f\"SELECT count(*) FROM {self.name}\"\n            if where:\n                query += \" WHERE \" + where\n            return self.db.execute(query, where_args).fetchone()[0]",
           "ok": true,
           "error": null
         },
         {
           "index": 3,
-          "source": "    def count_where(\n        self,\n        where: str | None = None,\n        where_args: Sequence | dict[str, Any] | None = None,\n    ) -> int:\n        \"\"\"\n        Executes ``SELECT count(*) FROM table WHERE ...`` and returns a count.\n\n        :param where: SQL where fragment to use, for example ``id > ?``\n        :param where_args: Parameters to use with that fragment - an iterable for ``id > ?``\n          parameters, or a dictionary for ``id > :id``\n        \"\"\"\n        query = f\"SELECT count(*) FROM {self.name}\"\n        if where:\n            query += f\" WHERE {where}\"\n        return self.db.execute(query, where_args).fetchone()[0]",
+          "source": "    def count_where(\n        self,\n        where: str | None = None,\n        where_args: Sequence | dict[str, Any] | None = None,\n    ) -> int:\n        \"\"\"\n        Executes ``SELECT count(*) FROM table WHERE ...`` and returns a count.\n\n        :param where: SQL where fragment to use, for example ``id > ?``\n        :param where_args: Parameters to use with that fragment - an iterable for ``id > ?``\n          parameters, or a dictionary for ``id > :id``\n        \"\"\"\n        query = \"SELECT count(*) FROM table\"\n        if where:\n            query += \" WHERE \" + where\n        return self.db.execute(query, where_args).fetchone()[0]",
           "ok": true,
           "error": null
         },
         {
           "index": 4,
-          "source": "    def count_where(\n            self,\n            where: str | None = None,\n            where_args: Sequence | dict[str, Any] | None = None,\n        ) -> int:\n            \"\"\"\n            Executes ``SELECT count(*) FROM table WHERE ...`` and returns a count.\n\n            :param where: SQL where fragment to use, for example ``id > ?``\n            :param where_args: Parameters to use with that fragment - an iterable for ``id > ?``\n              parameters, or a dictionary for ``id > :id``\n            \"\"\"\n            query = f\"SELECT count(*) FROM {self.name}\"\n            if where:\n                query += f\" WHERE {where}\"\n            return self.db.execute(query, where_args).fetchone()[0]",
+          "source": "    def count_where(\n        self,\n        where: str | None = None,\n        where_args: Sequence | dict[str, Any] | None = None,\n    ) -> int:\n        \"\"\"\n        Executes ``SELECT count(*) FROM table WHERE ...`` and returns a count.\n\n        :param where: SQL where fragment to use, for example ``id > ?``\n        :param where_args: Parameters to use with that fragment - an iterable for ``id > ?``\n          parameters, or a dictionary for ``id > :id``\n        \"\"\"\n        sql = f\"SELECT count(*) FROM {self.name}\"\n        if where:\n            sql += f\" WHERE {where}\"\n        return self.db.execute(sql, where_args).fetchone()[0]",
           "ok": true,
           "error": null
         }
@@ -60,31 +60,31 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "    def count_where(\n        self,\n        where: str | None = None,\n        where_args: Sequence | dict[str, Any] | None = None,\n    ) -> int:\n        \"\"\"\n        Executes ``SELECT count(*) FROM table WHERE ...`` and returns a count.\n\n        :param where: SQL where fragment to use, for example ``id > ?``\n        :param where_args: Parameters to use with that fragment \n        \"\"\"\n        if where:\n            return self.db.count(table=self.name, where=where, where_args=where_args)\n        else:\n            return self.db.count(table=self.name)",
+          "source": "    def count_where(\n        self,\n        where: str | None = None,\n        where_args: Sequence | dict[str, Any] | None = None,\n    ) -> int:\n        \"\"\"\n        Executes ``SELECT count(*) FROM table WHERE ...`` and returns a count.\n\n        :param where: SQL where fragment to use, for example ``id \u5927\u65bc ?``\n        :param where_args: Parameters to use with that fragment \u2014 an iterable for ``id \u5927\u65bc ?``\n          parameters, or a dictionary for ``id \u5927\u65bc :id``\n        \"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
           "ok": true,
           "error": null
         },
         {
           "index": 1,
-          "source": "    def count_where(\n            self,\n            where: str | None = None,\n            where_args: Sequence | dict[str, Any] | None = None,\n         ) -> int:\n            \"\"\"\n            Executes ``SELECT count(*) FROM table WHERE ...`` and returns a count.\n\n            :param where: SQL where fragment to use, for example ``id \n            \"\"\"\n            # TODO: implement this function\n            raise NotImplementedError",
+          "source": "    def count_where(\n            self,\n            where: str | None = None,\n            where_args: Sequence | dict[str, Any] | None = None,\n        ) -> int:\n        \"\"\"\n        Executes ``SELECT count(*) FROM table WHERE ...`` and returns a count.\n\n        :param where: SQL where fragment to use, for example ``id > ?``\n        :param where_args: Parameters to use with that fragment \n        \"\"\"\n        # Prepare SQL query\n        sql = f\"SELECT COUNT(*) FROM {self.name}\"\n        if where:\n            sql += f\" WHERE {where}\"\n\n        # Execute SQL query\n        result = self.db.execute(sql, where_args)\n\n        # Return count\n        return result.fetchone()[0]",
           "ok": true,
           "error": null
         },
         {
           "index": 2,
-          "source": "    def count_where(\n        self,\n        where: str | None = None,\n        where_args: Sequence | dict[str, Any] | None = None,\n    ) -> int:\n        \"\"\"\n        Executes ``SELECT count(*) FROM table WHERE ...`` and returns a count.\n\n        :param where: SQL where fragment to use, for example ``id > :id``\n        :param where_args: Parameters to use with that fragment \n        \"\"\"\n        query = f\"SELECT COUNT(*) FROM {self.name}\"\n        if where is not None:\n            query += f\" WHERE {where}\"\n            if where_args is not None:\n                if isinstance(where_args, dict):\n                    where_args = tuple(where_args.values())\n                query = query.replace(\":\", \"?\")\n        return self.db.execute(query, where_args)",
+          "source": "    def count_where(\n        self,\n        where: str | None = None,\n        where_args: Sequence | dict[str, Any] | None = None,\n    ) -> int:\n        \"\"\"\n        Executes ``SELECT count(*) FROM table WHERE ...`` and returns a count.\n\n        :param where: SQL where fragment to use, for example ``id \n        eren > \uff1f``\n        :param where_args: Parameters to use with that fragment \u2014 an iterable for ``id > \uff1f``\n        parameters, or a dictionary for ``id > \uff1aid``\n        \"\"\"\n        # TODO: Implement this function\n        if where is None:\n            return self.db.execute_sql(f\"SELECT COUNT(*) FROM {self.name}\").fetchone()[0]\n        else:\n            return self.db.execute_sql(f\"SELECT COUNT(*) FROM {self.name} WHERE {where}\", where_args).fetchone()[0]",
           "ok": true,
           "error": null
         },
         {
           "index": 3,
-          "source": "    def count_where(\n        self,\n        where: str | None = None,\n        where_args: Sequence | dict[str, Any] | None = None,,\n    ) -> int:\n        \"\"\"\n        Executes ``SELECT count(*) FROM table WHERE ...`` and returns a count.\n\n        :param where: SQL where fragment to use, for example ``id > ?``\n        :param where_args: Parameters to use with that fragment \n        \"\"\"\n        # Construct the SQL query\n        sql = f\"SELECT COUNT(*) FROM {self.name}\"\n        if where:\n            sql += f\" WHERE {where}\"\n\n        # Execute the query\n        result = self.db.execute(sql, where_args)\n\n        # Return the count\n        return result.fetchone()[0]",
+          "source": "    def count_where(\n        self,\n        where: str | None = None,\n        where_args: Sequence | dict[str, Any] | None = None,\n    ) -> int:\n        \"\"\"\n        Executes ``SELECT count(*) FROM table WHERE ...`` and returns a count.\n\n        :param where: SQL where fragment to use, for example ``id > ?``\n        :param where_args: Parameters to use with that fragment \u2013 an iterable for ``id > ?``\n          parameters, or a dictionary for ``id > :id``\n        \"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
           "ok": true,
           "error": null
         },
         {
           "index": 4,
-          "source": "    def count_where(\n        self,\n        where: str | None = None,\n        where_args: Sequence | dict[str, Any] | None = None,\n    ) -> int:\n        \"\"\"\n        Executes ``SELECT count(*) FROM table WHERE ...`` and returns a count.\n\n        :param where: SQL where fragment to use, for example ``id \n        > ?``\n        :param where_args: Parameters to use with that fragment - an \n        iterable for ``id > ?`` parameters, or a dictionary for \n        ``id > :id``\n        \"\"\"\n        # Construct the query string\n        query = f\"SELECT count(*) FROM {self.name}\"\n        if where:\n            query += f\" WHERE {where}\"\n\n        # Execute the query\n        result = self.db.execute(query, where_args)\n        count = result.fetchone()[0]\n\n        return count",
+          "source": "    def count_where(\n        self,\n        where: str | None = None,\n        where_args: Sequence | dict[str, Any] | None = None,\n    ) -> int:\n        \"\"\"\n        Executes ``SELECT count(*) FROM table WHERE ...`` and returns a count.\n\n        :param where: SQL where fragment to use, for example ``id >< 3``\n        :param where_args: Parameters to use with that fragment  - an iterable for ``id > ?``\n          parameters, or a dictionary for ``id > :id``\n        \"\"\"\n        # Construct the SQL query\n        query = f\"SELECT COUNT(*) FROM {self.name}\"\n        if where:\n            query += f\" WHERE {where}\"\n\n        # Execute the query\n        result = self.db.execute(query, where_args)\n\n        # Return the count\n        return result.fetchone()[0]",
           "ok": true,
           "error": null
         }

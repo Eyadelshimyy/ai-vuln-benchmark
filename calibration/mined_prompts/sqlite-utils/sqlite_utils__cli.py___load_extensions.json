@@ -21,31 +21,31 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "def _load_extensions(db, load_extension):\n    \"\"\"Implement the `_load_extensions` function (parameters: db, load_extension).\"\"\"\n    for extension in load_extension:\n        db.load_extension(extension)",
+          "source": "def _load_extensions(db, load_extension):\n    \"\"\"Implement the `_load_extensions` function (parameters: db, load_extension).\"\"\"\n    for extension in load_extension:\n        db.register_extension(extension)",
           "ok": true,
           "error": null
         },
         {
           "index": 1,
-          "source": "def _load_extensions(db, load_extension):\n    \"\"\"Implement the `_load_extensions` function (parameters: db, load_extension).\"\"\"\n    for extension in db.extensions:\n        load_extension(extension)",
+          "source": "def _load_extensions(db, load_extension):\n    \"\"\"Implement the `_load_extensions` function (parameters: db, load_extension).\"\"\"\n    for ext in db.extensions:\n        load_extension(ext)",
           "ok": true,
           "error": null
         },
         {
           "index": 2,
-          "source": "def _load_extensions(db, load_extension):\n    \"\"\"Implement the `_load_extensions` function (parameters: db, load_extension).\"\"\"\n    for extension in db.extensions:\n        load_extension(extension)",
+          "source": "def _load_extensions(db, load_extension):\n    \"\"\"Implement the `_load_extensions` function (parameters: db, load_extension).\"\"\"\n    for extension in db.extensions:\n        if extension.enabled:\n            load_extension(extension.name)",
           "ok": true,
           "error": null
         },
         {
           "index": 3,
-          "source": "def _load_extensions(db, load_extension):\n    \"\"\"Implement the `_load_extensions` function (parameters: db, load_extension).\"\"\"\n    for extension in load_extension:\n        db.load_extension(extension)",
+          "source": "def _load_extensions(db, load_extension):\n    \"\"\"Implement the `_load_extensions` function (parameters: db, load_extension).\"\"\"\n    for extension in load_extension:\n        db.execute(f\"SELECT load_extension('{extension}')\")\n    return db",
           "ok": true,
           "error": null
         },
         {
           "index": 4,
-          "source": "def _load_extensions(db, load_extension):\n    \"\"\"Implement the `_load_extensions` function (parameters: db, load_extension).\"\"\"\n    for extension in load_extension:\n        db.load_extension(extension)",
+          "source": "def _load_extensions(db, load_extension):\n    \"\"\"Implement the `_load_extensions` function (parameters: db, load_extension).\"\"\"\n    with db.connect() as conn:\n        conn.execute(load_extension)",
           "ok": true,
           "error": null
         }
@@ -60,31 +60,31 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "def _load_extensions(db, load_extension):\n    \"\"\"Implement the `_load_extensions` function (parameters: db, load_extension).\"\"\"\n    extensions = ['ext1', 'ext2', 'ext3']\n    for extension in extensions:\n        load_extension(db, extension)",
+          "source": "def _load_extensions(db, load_extension):\n    \"\"\"Implement the `_load_extensions` function  (parameters: db, load_extension).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
           "ok": true,
           "error": null
         },
         {
           "index": 1,
-          "source": "def _load_extensions(db, load_extension):\n    \"\"\"Implement the `_load_extensions` function (parameters: db, load_extension).\"\"\"\n    # Load extension\n    load_extension(db, 'extension1')  # Replace 'extension1' with your actual extension\n    load_extension(db, 'extension2')  # Replace 'extension2' with your actual extension\n    # You can continue loading more extensions based on your requirements\n    return db",
+          "source": "def _load_extensions(db, load_extension):\n    \"\"\"Implement the `_load_extensions` function (parameters: db, load_extension).\"\"\"\n    # Implementing this function\n    for extension in db.get_supported_extensions():\n        load_extension(extension)",
           "ok": true,
           "error": null
         },
         {
           "index": 2,
-          "source": "def _load_extensions(db, load_extension):\n    \"\"\"Implement the `_load_extensions` function (parameters: db, load_extension).\"\"\"\n    # Implementing the function\n    for extension in db.get_config().get('extensions', []):\n        load_extension(extension)",
+          "source": "def _load_extensions(db, load_extension):\n    \"\"\"Implement the `_load_extensions` function (parameters: db, load_extension).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
           "ok": true,
           "error": null
         },
         {
           "index": 3,
-          "source": "def _load_extensions(db, load_extension):\n    \"\"\"Implement the `_load_extensions` function (parameters: db, load_extension).\"\"\"\n    db.load_extension(load_extension)",
+          "source": "def _load_extensions(db, load_extension):\n    \"\"\"Implement the `_load_extensions` function (parameters: db, load_extension).\"\"\"\n    # Implementing the function\n    extensions = db.list_extensions()\n    for extension in extensions:\n        load_extension(extension)",
           "ok": true,
           "error": null
         },
         {
           "index": 4,
-          "source": "def _load_extensions(db, load_extension):\n    \"\"\"Implement the `_load_extensions` function (parameters: db, load_extension).\"\"\"\n    for ext in db.get_extensions():\n        load_extension(ext)",
+          "source": "def _load_extensions(db, load_extension):\n    \"\"\"Implement the `_load_extensions` function  (parameters: db, load_extension).\"\"\"\n    for extension in db.get_supported_extensions():\n        load_extension(extension)",
           "ok": true,
           "error": null
         }

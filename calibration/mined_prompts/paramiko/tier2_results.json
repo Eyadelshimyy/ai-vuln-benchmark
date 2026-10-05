@@ -1,0 +1,498 @@
+{
+  "model": "qwen2.5-coder:7b",
+  "results": [
+    {
+      "func": "save_host_keys",
+      "cwe": "CWE-22",
+      "param": "filename",
+      "confirmed": true,
+      "samples_attempted": 5,
+      "samples_proved": 5,
+      "sample_results": [
+        {
+          "slot": "temp_0_0",
+          "confirmed": true,
+          "payload": "/tmp/tier2_proof_s3rpaico/pwned_37f58a9e1b19",
+          "proof": "traversal write escaped to /tmp/tier2_proof_s3rpaico/pwned_37f58a9e1b19",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[1]",
+          "confirmed": true,
+          "payload": "/tmp/tier2_proof_uaysnpsj/pwned_b47ec91d1f5d",
+          "proof": "traversal write escaped to /tmp/tier2_proof_uaysnpsj/pwned_b47ec91d1f5d",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[2]",
+          "confirmed": true,
+          "payload": "/tmp/tier2_proof_exinajse/pwned_0f2310db3f03",
+          "proof": "traversal write escaped to /tmp/tier2_proof_exinajse/pwned_0f2310db3f03",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[3]",
+          "confirmed": true,
+          "payload": "/tmp/tier2_proof_mv0670vi/pwned_0697433c7d3c",
+          "proof": "traversal write escaped to /tmp/tier2_proof_mv0670vi/pwned_0697433c7d3c",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[4]",
+          "confirmed": true,
+          "payload": "/tmp/tier2_proof_8bsxfsjh/pwned_723513f65e2b",
+          "proof": "traversal write escaped to /tmp/tier2_proof_8bsxfsjh/pwned_723513f65e2b",
+          "via": "bank"
+        }
+      ],
+      "slot": "temp_0_0",
+      "payload": "/tmp/tier2_proof_s3rpaico/pwned_37f58a9e1b19",
+      "proof": "traversal write escaped to /tmp/tier2_proof_s3rpaico/pwned_37f58a9e1b19",
+      "via": "bank",
+      "sink": "open"
+    },
+    {
+      "func": "from_path",
+      "cwe": "CWE-22",
+      "param": "path",
+      "confirmed": false,
+      "samples_attempted": 5,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "temp_0_0",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[0]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[1]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[3]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[4]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        }
+      ]
+    },
+    {
+      "func": "load",
+      "cwe": "CWE-22",
+      "param": "filename",
+      "confirmed": false,
+      "samples_attempted": 6,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "temp_0_0",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[0]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[1]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[2]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[3]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[4]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        }
+      ]
+    },
+    {
+      "func": "save",
+      "cwe": "CWE-22",
+      "param": "filename",
+      "confirmed": true,
+      "samples_attempted": 6,
+      "samples_proved": 6,
+      "sample_results": [
+        {
+          "slot": "temp_0_0",
+          "confirmed": true,
+          "payload": "/tmp/tier2_proof__2tt6iew/pwned_933259cb531f",
+          "proof": "traversal write escaped to /tmp/tier2_proof__2tt6iew/pwned_933259cb531f",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[0]",
+          "confirmed": true,
+          "payload": "/tmp/tier2_proof_h2345e58/pwned_86556fce7835",
+          "proof": "traversal write escaped to /tmp/tier2_proof_h2345e58/pwned_86556fce7835",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[1]",
+          "confirmed": true,
+          "payload": "/tmp/tier2_proof_cgyq76qj/pwned_e3f7a09781f6",
+          "proof": "traversal write escaped to /tmp/tier2_proof_cgyq76qj/pwned_e3f7a09781f6",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[2]",
+          "confirmed": true,
+          "payload": "/tmp/tier2_proof_n9liefhx/pwned_6838a9a39a5f",
+          "proof": "traversal write escaped to /tmp/tier2_proof_n9liefhx/pwned_6838a9a39a5f",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[3]",
+          "confirmed": true,
+          "payload": "/tmp/tier2_proof_wff5913y/pwned_6d1af2729e77",
+          "proof": "traversal write escaped to /tmp/tier2_proof_wff5913y/pwned_6d1af2729e77",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[4]",
+          "confirmed": true,
+          "payload": "/tmp/tier2_proof_2fhmjjs3/pwned_8191c5ebbcb9",
+          "proof": "traversal write escaped to /tmp/tier2_proof_2fhmjjs3/pwned_8191c5ebbcb9",
+          "via": "bank"
+        }
+      ],
+      "slot": "temp_0_0",
+      "payload": "/tmp/tier2_proof__2tt6iew/pwned_933259cb531f",
+      "proof": "traversal write escaped to /tmp/tier2_proof__2tt6iew/pwned_933259cb531f",
+      "via": "bank",
+      "sink": "open"
+    },
+    {
+      "func": "_read_private_key_file",
+      "cwe": "CWE-22",
+      "param": "filename",
+      "confirmed": false,
+      "samples_attempted": 2,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "temp_0_7[3]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[4]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        }
+      ]
+    },
+    {
+      "func": "_write_private_key_file",
+      "cwe": "CWE-22",
+      "param": "filename",
+      "confirmed": true,
+      "samples_attempted": 2,
+      "samples_proved": 2,
+      "sample_results": [
+        {
+          "slot": "temp_0_7[0]",
+          "confirmed": true,
+          "payload": "/tmp/tier2_proof_31khbq54/pwned_d1dd6bfbf359",
+          "proof": "traversal write escaped to /tmp/tier2_proof_31khbq54/pwned_d1dd6bfbf359",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[3]",
+          "confirmed": true,
+          "payload": "/tmp/tier2_proof_i5mnmulr/pwned_a5290b3139c1",
+          "proof": "traversal write escaped to /tmp/tier2_proof_i5mnmulr/pwned_a5290b3139c1",
+          "via": "bank"
+        }
+      ],
+      "slot": "temp_0_7[0]",
+      "payload": "/tmp/tier2_proof_31khbq54/pwned_d1dd6bfbf359",
+      "proof": "traversal write escaped to /tmp/tier2_proof_31khbq54/pwned_d1dd6bfbf359",
+      "via": "bank",
+      "sink": "open"
+    },
+    {
+      "func": "from_file",
+      "cwe": "CWE-22",
+      "param": "filename",
+      "confirmed": false,
+      "samples_attempted": 6,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "temp_0_0",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[0]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[1]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[2]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[3]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[4]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        }
+      ]
+    },
+    {
+      "func": "read_file",
+      "cwe": "CWE-22",
+      "param": "filename",
+      "confirmed": false,
+      "samples_attempted": 6,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "temp_0_0",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[0]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[1]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[2]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[3]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[4]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        }
+      ]
+    },
+    {
+      "func": "__init__",
+      "cwe": "CWE-78",
+      "param": "command_line",
+      "confirmed": true,
+      "samples_attempted": 6,
+      "samples_proved": 5,
+      "sample_results": [
+        {
+          "slot": "temp_0_0",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        },
+        {
+          "slot": "temp_0_7[0]",
+          "confirmed": true,
+          "payload": "\ntouch /tmp/tier2_proof_h44p00er/pwned_8f8a39ee1b63\n",
+          "proof": "injected shell command created /tmp/tier2_proof_h44p00er/pwned_8f8a39ee1b63",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[1]",
+          "confirmed": true,
+          "payload": "\ntouch /tmp/tier2_proof_zgr631l4/pwned_6dd707487f9c\n",
+          "proof": "injected shell command created /tmp/tier2_proof_zgr631l4/pwned_6dd707487f9c",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[2]",
+          "confirmed": true,
+          "payload": "\ntouch /tmp/tier2_proof__eqtxij1/pwned_33b0c05b2082\n",
+          "proof": "injected shell command created /tmp/tier2_proof__eqtxij1/pwned_33b0c05b2082",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[3]",
+          "confirmed": true,
+          "payload": "\ntouch /tmp/tier2_proof_y1idvm9p/pwned_4b7f21219d06\n",
+          "proof": "injected shell command created /tmp/tier2_proof_y1idvm9p/pwned_4b7f21219d06",
+          "via": "bank"
+        },
+        {
+          "slot": "temp_0_7[4]",
+          "confirmed": true,
+          "payload": "\ntouch /tmp/tier2_proof_q4swcqqq/pwned_94f07637774b\n",
+          "proof": "injected shell command created /tmp/tier2_proof_q4swcqqq/pwned_94f07637774b",
+          "via": "bank"
+        }
+      ],
+      "slot": "temp_0_7[0]",
+      "payload": "\ntouch /tmp/tier2_proof_h44p00er/pwned_8f8a39ee1b63\n",
+      "proof": "injected shell command created /tmp/tier2_proof_h44p00er/pwned_8f8a39ee1b63",
+      "via": "bank",
+      "sink": null
+    },
+    {
+      "func": "get",
+      "cwe": "CWE-22",
+      "param": "localpath",
+      "confirmed": true,
+      "samples_attempted": 1,
+      "samples_proved": 1,
+      "sample_results": [
+        {
+          "slot": "temp_0_0",
+          "confirmed": true,
+          "payload": "/tmp/tier2_proof_ro5vbzn1/pwned_ebfb7194ad5c",
+          "proof": "traversal write escaped to /tmp/tier2_proof_ro5vbzn1/pwned_ebfb7194ad5c",
+          "via": "bank"
+        }
+      ],
+      "slot": "temp_0_0",
+      "payload": "/tmp/tier2_proof_ro5vbzn1/pwned_ebfb7194ad5c",
+      "proof": "traversal write escaped to /tmp/tier2_proof_ro5vbzn1/pwned_ebfb7194ad5c",
+      "via": "bank",
+      "sink": "open"
+    },
+    {
+      "func": "getfo",
+      "cwe": "CWE-22",
+      "param": "fl",
+      "confirmed": true,
+      "samples_attempted": 1,
+      "samples_proved": 1,
+      "sample_results": [
+        {
+          "slot": "temp_0_7[1]",
+          "confirmed": true,
+          "payload": "/tmp/tier2_proof__ri0_gqk/pwned_3b960a2c1bc9",
+          "proof": "traversal write escaped to /tmp/tier2_proof__ri0_gqk/pwned_3b960a2c1bc9",
+          "via": "bank"
+        }
+      ],
+      "slot": "temp_0_7[1]",
+      "payload": "/tmp/tier2_proof__ri0_gqk/pwned_3b960a2c1bc9",
+      "proof": "traversal write escaped to /tmp/tier2_proof__ri0_gqk/pwned_3b960a2c1bc9",
+      "via": "bank",
+      "sink": "open"
+    },
+    {
+      "func": "test",
+      "cwe": "CWE-78",
+      "param": "module",
+      "confirmed": false,
+      "samples_attempted": 1,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "temp_0_0",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null
+        }
+      ]
+    }
+  ],
+  "by_cwe": {
+    "CWE-22": {
+      "fn_attempted": 10,
+      "fn_confirmed": 5,
+      "samples_attempted": 40,
+      "samples_proved": 15
+    },
+    "CWE-78": {
+      "fn_attempted": 2,
+      "fn_confirmed": 1,
+      "samples_attempted": 7,
+      "samples_proved": 5
+    }
+  }
+}

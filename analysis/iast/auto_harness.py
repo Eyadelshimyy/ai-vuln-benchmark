@@ -984,8 +984,34 @@ def _child_main(source: str, func_name: str, param_name: str | None, marker: str
                 _obj = _cheap_construct(_cls, scratch_dir, _resolve_ns) if _cls is not None else None
                 args.append(_obj if _obj is not None else _build_arg(p["name"], p["annotation"], None))
 
+            # OUTPUT CAPTURE (live/Tier-2 only): record the function's return
+            # value and stdout so exploitation strategies can confirm attacks
+            # that *return* stolen data (read-only path traversal, UNION-style
+            # SQL injection) rather than leaving a side effect on disk. Batch/
+            # detection mode is unchanged -- there stdout is suppressed and the
+            # return value is irrelevant.
+            _retval = None
+            _stdout_cap = ""
             try:
-                func(*args)
+                if live:
+                    import io as _io, contextlib as _ctxlib
+                    _buf = _io.StringIO()
+                    with _ctxlib.redirect_stdout(_buf):
+                        _retval = func(*args)
+                    _stdout_cap = _buf.getvalue()
+                    # A function may return a lazy DB cursor rather than rows
+                    # (e.g. `return self.conn.execute(sql)`), so the raw repr
+                    # shows no data. Drain it -- exactly as an attacker would --
+                    # so SELECT/UNION exfil through an unfetched cursor is
+                    # observable. Restricted to objects exposing fetchall() so
+                    # we never consume arbitrary (possibly infinite) iterators.
+                    try:
+                        if hasattr(_retval, "fetchall") and not isinstance(_retval, (str, bytes)):
+                            _retval = (_retval, _retval.fetchall())
+                    except Exception:  # noqa: BLE001 -- draining is best-effort
+                        pass
+                else:
+                    func(*args)
                 # BUG FOUND BY TESTING (first --live-demo run): this used to
                 # hardcode triggered=False here, which was always correct
                 # for the batch path (a confirmed hit there ALWAYS raises
@@ -1031,10 +1057,11 @@ def _child_main(source: str, func_name: str, param_name: str | None, marker: str
 
         if triggered and hits:
             hit = hits[0]
-            conn.send({
-                "verdict": "TRIGGERED",
-                "cwe": hit.cwe, "sink": hit.sink, "detail": hit.detail[:300],
-            })
+            _msg = {"verdict": "TRIGGERED", "cwe": hit.cwe, "sink": hit.sink, "detail": hit.detail[:300]}
+            if live:
+                _msg["return_repr"] = repr(_retval)[:4000]
+                _msg["stdout"] = _stdout_cap[:4000]
+            conn.send(_msg)
         elif error:
             # Keep the one-line summary for existing displays, but ALSO ship the
             # full captured traceback as `detail` so crash-localisation (model's
@@ -1042,7 +1069,11 @@ def _child_main(source: str, func_name: str, param_name: str | None, marker: str
             conn.send({"verdict": "COULD_NOT_EXECUTE",
                        "error": error.splitlines()[0], "detail": error[:4000]})
         else:
-            conn.send({"verdict": "NOT_TRIGGERED"})
+            _msg = {"verdict": "NOT_TRIGGERED"}
+            if live:
+                _msg["return_repr"] = repr(_retval)[:4000]
+                _msg["stdout"] = _stdout_cap[:4000]
+            conn.send(_msg)
     except BaseException as e:  # noqa: BLE001 -- a child process, anything escaping must still report, never hang
         _tb = f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=8)}"
         conn.send({"verdict": "COULD_NOT_EXECUTE", "error": _tb.splitlines()[0], "detail": _tb[:4000]})

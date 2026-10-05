@@ -22,31 +22,31 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    import os\n    from invocations.packaging import publish\n\n    # Assuming the docs folder is named 'docs' and is in the current directory\n    docs_folder = 'docs'\n    if os.path.exists(docs_folder):\n        # Add the docs folder to the distribution\n        ctx.run(f\"cp -r {docs_folder} dist/\")\n\n    # Call the original publish function with the provided arguments\n    publish(ctx, sdist=sdist, wheel=wheel, sign=sign, dry_run=dry_run, index=index)",
+          "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    from invocations.packaging import publish\n    from invocations.docs import build_docs\n\n    # Build the docs folder\n    build_docs(ctx)\n\n    # Call the original publish function with the provided arguments\n    publish(ctx, sdist=sdist, wheel=wheel, sign=sign, dry_run=dry_run, index=index)",
           "ok": true,
           "error": null
         },
         {
           "index": 1,
-          "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    from . import packaging\n\n    packages = []\n    if sdist:\n        packages.append(\"sdist\")\n    if wheel:\n        packages.append(\"wheel\")\n\n    if packages:\n        packaging.publish(\n            ctx,\n            packages=packages,\n            sign=sign,\n            dry_run=dry_run,\n            index=index,\n            additional_files=[\"docs\"],\n        )",
+          "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    # Add the docs folder to the packaging process\n    ctx.run(\"make docs\")\n    ctx.run(\"cp -r docs dist/\")\n    \n    # Call the original publish function with the provided arguments\n    ctx.run(\"inv packaging.publish\", env={\"SDIST\": str(sdist), \"WHEEL\": str(wheel), \"SIGN\": str(sign), \"DRY_RUN\": str(dry_run), \"INDEX\": str(index)})",
           "ok": true,
           "error": null
         },
         {
           "index": 2,
-          "source": "def publish_(ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    # Add baked-in docs folder to distribution\n    ctx.run(\"cp -r docs dist/\")\n\n    # Call original publish function\n    inv_publish.publish(\n        distribution=[\"dist/*.tar.gz\", \"dist/*.whl\"],\n        index=index,\n        sign=sign,\n        dry_run=dry_run,\n    )",
+          "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    # Add the docs folder to the package\n    docs_dir = os.path.join(ctx.root, 'docs')\n    if os.path.exists(docs_dir):\n        ctx.run(f'cp -r {docs_dir} dist/')\n\n    # Publish the package\n    args = []\n    if sdist:\n        args.append('--format=sdist')\n    if wheel:\n        args.append('--format=wheel')\n    if sign:\n        args.append('--sign')\n    if index:\n        args.append(f'--index-url={index}')\n\n    publish.publish(\n        ctx.root,\n        dry_run=dry_run,\n        *args\n    )",
           "ok": true,
           "error": null
         },
         {
           "index": 3,
-          "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    docs_dir = \"docs\"\n    if os.path.exists(docs_dir):\n        build_dir = \"build\"\n        if not os.path.exists(build_dir):\n            os.makedirs(build_dir)\n        shutil.copytree(docs_dir, os.path.join(build_dir, \"docs\"))\n    publish(\n        ctx, sdist=sdist, wheel=wheel, sign=sign, dry_run=dry_run, index=index\n    )",
+          "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    docs_path = 'docs'\n    if not os.path.exists(docs_path):\n        raise FileNotFoundError(\"Docs folder not found\")\n\n    with ctx.cd('.'):\n        if dry_run:\n            ctx.run('echo \"Dry run: Would publish package with docs\"')\n        else:\n            ctx.run('python setup.py sdist bdist_wheel')\n            shutil.copytree(docs_path, 'dist/docs')\n            ctx.run(f'python -m twine upload {\"--sign\" if sign else \"\"} {\"--repository\" + index if index else \"\"} dist/*' if not dry_run else 'echo \"Dry run: Would upload package\"')",
           "ok": true,
           "error": null
         },
         {
           "index": 4,
-          "source": "def publish_(ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    # Add the docs folder to the distribution\n    docs_folder = \"docs\"\n    if os.path.exists(docs_folder):\n        dist_folder = ctx.path(\"dist\")\n        if not dist_folder.exists():\n            dist_folder.mkdir()\n        for item in os.listdir(docs_folder):\n            s = os.path.join(docs_folder, item)\n            d = os.path.join(dist_folder, item)\n            if os.path.isdir(s):\n                shutil.copytree(s, d)\n            else:\n                shutil.copy2(s, d)\n\n    # Call the original publish function\n    # Assuming the original publish function is named 'original_publish'\n    # and is imported from 'invocations.packaging'\n    from invocations.packaging import publish as original_publish\n    return original_publish(ctx, sdist=sdist, wheel=wheel, sign=sign, dry_run=dry_run, index=index)",
+          "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    # Add docs folder to the package\n    setup(\n        packages=find_packages(),\n        include_package_data=True,\n    )\n\n    # Run the actual publish command\n    ctx.run(\n        f\"inv packaging.publish --sdist={sdist} --wheel={wheel} --sign={sign} --dry-run={dry_run} --index={index}\",\n        env={\"PYTHONUNBUFFERED\": \"1\"},\n    )",
           "ok": true,
           "error": null
         }
@@ -54,38 +54,38 @@
     },
     "deepseek-coder:6.7b": {
       "temp_0_0": {
-        "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    # Add the docs folder to the files to be published\n    ctx.files.append(os.path.join(ctx.path, 'docs'))\n\n    # Call the original publish function\n    publish(ctx, sdist, wheel, sign, dry_run, index)",
+        "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    # Add the docs folder to the files to be published\n    ctx.files.append('docs')\n\n    # Call the original publish function\n    publish(ctx, sdist, wheel, sign, dry_run, index)",
         "ok": true,
         "error": null
       },
       "temp_0_7": [
         {
           "index": 0,
-          "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+          "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    # Publish docs first\n    docs(ctx, watch=False, verbosity=0) \n    # Then publish the package\n    publish(ctx, sdist, wheel, sign, dry_run, index)",
           "ok": true,
           "error": null
         },
         {
           "index": 1,
-          "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    ctx.run(f'python setup.py build_sphinx', pty=True)\n    return publish(ctx, sdist=sdist, wheel=wheel, sign=sign, dry_run=dry_run, index=index)",
+          "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    publish(\n        ctx, sdist=sdist, wheel=wheel, sign=sign,\n        dry_run=dry_run, index=index\n    )\n    ctx.run('inv docs', pty=True)\n    ctx.run('git add docs', pty=True)\n    ctx.run('git commit -m \"docs: regenerated from source\"', pty=True)",
           "ok": true,
           "error": null
         },
         {
           "index": 2,
-          "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    from invocations.packaging import publish\n\n    docs_dir = os.path.join(os.path.dirname(__file__), \"docs\")\n    ctx.run(\"sphinx-build -b html {} {}\".format(docs_dir, os.path.join(docs_dir, \"_build\")))\n    publish(ctx, sdist=sdist, wheel=wheel, sign=sign, dry_run=dry_run, index=index)",
+          "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    # Add baked-in docs folder to the files to be published\n    ctx.files.extend(ctx.baked_files(\"docs\"))\n    # Invoke the original publish function\n    return packaging.publish.publish(ctx, sdist=sdist, wheel=wheel, sign=sign, dry_run=dry_run, index=index)",
           "ok": true,
           "error": null
         },
         {
           "index": 3,
-          "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    publish(ctx, sdist=sdist, wheel=wheel, sign=sign, dry_run=dry_run, index=index)\n    ctx.run(\"sphinx-build -b html docs docs/_build\")",
+          "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    # Add the docs folder to the publish process\n    ctx.run(\"cp -R docs dist/\")\n\n    # Call the original publish function\n    invoke.packaging.publish(\n        ctx, sdist=sdist, wheel=wheel, sign=sign, dry_run=dry_run, index=index\n    )",
           "ok": true,
           "error": null
         },
         {
           "index": 4,
-          "source": "def publish_(\n    ctx: Context, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    # Adding docs folder to the publish process\n    ctx.run('python setup.py sdist bdist_wheel --keep-temp')\n    ctx.run('cp -r docs dist/')\n    \n    # Publishing the package\n    ctx = invoke.Context(run=ctx.run)\n    invoke.packaging.publish(ctx, sdist=sdist, wheel=wheel, sign=sign,\n                             dry_run=dry_run, index=index)",
+          "source": "def publish_(\n    ctx, sdist=True, wheel=True, sign=False, dry_run=False, index=None\n):\n    \"\"\"\n    Wraps invocations.packaging.publish to add baked-in docs folder.\n    \"\"\"\n    # Add baked-in docs folder to the file list\n    ctx.file_list.append('docs')\n\n    # Call the original publish function\n    publish(ctx, sdist, wheel, sign, dry_run, index)",
           "ok": true,
           "error": null
         }

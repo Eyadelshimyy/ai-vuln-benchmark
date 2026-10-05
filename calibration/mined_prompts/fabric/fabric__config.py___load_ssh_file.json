@@ -27,31 +27,31 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "    def _load_ssh_file(self, path):\n        \"\"\"\n        Attempt to open and parse an SSH config file at ``path``.\n\n        Does nothing if ``path`` is not a path to a valid file.\n\n        :returns: ``None``.\n        \"\"\"\n        if not os.path.isfile(path):\n            return\n\n        with open(path, 'r') as file:\n            self.base_ssh_config.parse(file)",
+          "source": "    def _load_ssh_file(self, path):\n            \"\"\"\n            Attempt to open and parse an SSH config file at ``path``.\n\n            Does nothing if ``path`` is not a path to a valid file.\n\n            :returns: ``None``.\n            \"\"\"\n            if not os.path.isfile(path):\n                return\n\n            ssh_config = paramiko.config.SSHConfig()\n            with open(path, 'r') as f:\n                ssh_config.parse(f)\n\n            self._set(base_ssh_config=ssh_config)",
           "ok": true,
           "error": null
         },
         {
           "index": 1,
-          "source": "    def _load_ssh_file(self, path):\n            \"\"\"\n            Attempt to open and parse an SSH config file at ``path``.\n\n            Does nothing if ``path`` is not a path to a valid file.\n\n            :returns: ``None``.\n            \"\"\"\n            import os\n            from paramiko.config import SSHConfig\n\n            if os.path.isfile(path):\n                with open(path, 'r') as f:\n                    self._base_ssh_config.parse(f)",
+          "source": "    def _load_ssh_file(self, path):\n            \"\"\"\n            Attempt to open and parse an SSH config file at ``path``.\n\n            Does nothing if ``path`` is not a path to a valid file.\n\n            :returns: ``None``.\n            \"\"\"\n            import os\n            from paramiko.config import SSHConfig\n\n            if os.path.isfile(path):\n                with open(path, 'r') as f:\n                    ssh_config = SSHConfig()\n                    ssh_config.parse(f)\n                    self._set(base_ssh_config=ssh_config)",
           "ok": true,
           "error": null
         },
         {
           "index": 2,
-          "source": "    def _load_ssh_file(self, path):\n            \"\"\"\n            Attempt to open and parse an SSH config file at ``path``.\n\n            Does nothing if ``path`` is not a path to a valid file.\n\n            :returns: ``None``.\n            \"\"\"\n            import os\n            from paramiko.config import SSHConfig\n\n            if not os.path.isfile(path):\n                return\n\n            with open(path, 'r') as f:\n                self._base_ssh_config.parse(f)",
+          "source": "    def _load_ssh_file(self, path):\n            \"\"\"\n            Attempt to open and parse an SSH config file at ``path``.\n\n            Does nothing if ``path`` is not a path to a valid file.\n\n            :returns: ``None``.\n            \"\"\"\n            import os\n            from paramiko.config import SSHConfig\n\n            if not os.path.isfile(path):\n                return\n\n            with open(path, 'r') as file:\n                config = SSHConfig()\n                config.parse(file)\n                self._set(ssh_config=config)",
           "ok": true,
           "error": null
         },
         {
           "index": 3,
-          "source": "    def _load_ssh_file(self, path):\n        \"\"\"\n        Attempt to open and parse an SSH config file at ``path``.\n\n        Does nothing if ``path`` is not a path to a valid file.\n\n        :returns: ``None``.\n        \"\"\"\n        if os.path.exists(path) and os.path.isfile(path):\n            with open(path, 'r') as f:\n                self._base_ssh_config.parse(f)",
+          "source": "    def _load_ssh_file(self, path):\n        \"\"\"\n        Attempt to open and parse an SSH config file at ``path``.\n\n        Does nothing if ``path`` is not a path to a valid file.\n\n        :returns: ``None``.\n        \"\"\"\n        if not os.path.isfile(path):\n            return\n\n        ssh_config = self._get_base_ssh_config()\n        with open(path, 'r') as f:\n            ssh_config.parse(f)",
           "ok": true,
           "error": null
         },
         {
           "index": 4,
-          "source": "    def _load_ssh_file(self, path):\n        \"\"\"\n        Attempt to open and parse an SSH config file at ``path``.\n\n        Does nothing if ``path`` is not a path to a valid file.\n\n        :returns: ``None``.\n        \"\"\"\n        from paramiko.config import SSHConfig\n        import os\n\n        if not os.path.isfile(path):\n            return\n\n        ssh_config = SSHConfig()\n        with open(path, 'r') as f:\n            ssh_config.parse(f)\n\n        self._set(base_ssh_config=ssh_config)",
+          "source": "    def _load_ssh_file(self, path):\n            \"\"\"\n            Attempt to open and parse an SSH config file at ``path``.\n\n            Does nothing if ``path`` is not a path to a valid file.\n\n            :returns: ``None``.\n            \"\"\"\n            import os\n            from paramiko.config import SSHConfig\n\n            if not os.path.isfile(path):\n                return\n\n            with open(path, 'r') as f:\n                self._base_ssh_config.parse(f)",
           "ok": true,
           "error": null
         }
@@ -66,31 +66,31 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "    def _load_ssh_file(self, path):\n        \"\"\"\n        Attempt to open and parse an SSH config file at ``path``.\n\n        Does nothing if ``path`` is not a path to a valid file.\n\n        :param str path: The path to the SSH config file.\n        :returns: ``None``.\n        \"\"\"\n        if os.path.exists(path) and oself.base_ssh_config.parse(open(path)) is None:\n            self.log.info(\"Successfully loaded SSH config file at %s\", path)\n        else:\n            self.log.info(\"Could not load SSH config file at %s\", path)",
+          "source": "    def _load_ssh_file(self, path):\n        \"\"\"\n        Attempt to open and parse an SSH config file at ``path``.\n\n        Does nothing if ``path`` is not a path to a valid file.\n\n        :returns: ``None``.\n        \"\"\"\n        if os.path.isfile(path):\n            with open(path, 'r') as file:\n                self.base_ssh_config.parse(file)\n        else:\n            pass\n        return None",
           "ok": true,
           "error": null
         },
         {
           "index": 1,
-          "source": "    def _load_ssh_file(self, path):\n        \"\"\"\n        Attempt to open and parse an SSH config file at ``path``.\n\n        Does nothing if ``path`` is not a path to a valid file.\n\n        :returns: ``None``.\n        \"\"\"\n        if os.path.exists(path) and os.path.isfile(path):\n            with open(path, 'r') as file:\n                self.base_ssh_config.parse(file)",
+          "source": "    def _load_ssh_file(self, path):\n        \"\"\"\n        Attempt to open and parse an SSH config file at ``path``.\n\n        Does nothing if ``path`` is not a path to a valid file.\n\n        :returns: ``None``.\n        \"\"\"\n        if os.path.exists(path) and os.isfile(path):\n            with open(path, 'r') as file:\n                self.base_ssh_config.parse(file)\n        # else: do nothing or raise an exception based on your requirements\n        else:\n            pass\n        return None",
           "ok": true,
           "error": null
         },
         {
           "index": 2,
-          "source": "    def _load_ssh_file(self, path):\n        \"\"\"\n        Attempt to open and parse an SSH config file at ``path``.\n\n        Does nothing if ``path`` is not a path to a valid file.\n\n        :returns: ``None``.\n        \"\"\"\n        if os.path.isfile(path):\n            with open(path, \"r\") as f:\n                self.base_ssh_config.parse(f)",
+          "source": "    def _load_ssh_file(self, path):\n        \"\"\"\n        Attempt to open and parse an SSH config file at ``path``.\n\n        Does nothing if ``path`` is not a path to a valid file.\n\n        :returns: ``None``.\n        \"\"\"\n        if os.path.exists(path) and os.path.isfile(path):\n            with open(path, 'r') as ssh_file:\n                self.base_ssh_config.parse(ssh_file)",
           "ok": true,
           "error": null
         },
         {
           "index": 3,
-          "source": "    def _load_ssh_file(self, path):\n        \"\"\"\n        Attempt to open and parse an SSH config file at ``path``.\n\n        Does nothing if ``path`` is not a path to a valid file.\n\n        :returns: ``None``.\n        \"\"\"\n        # TODO: implement this function\n        if os.path.exists(path) and os.path.isfile(path):\n            with open(path, 'r') as file:\n                data = file.read()\n            self.base_ssh_config.parse(data)",
+          "source": "    def _load_ssh_file(self, path):\n        \"\"\"\n        Attempt to open and parse an SSH config file at ``path``.\n\n        Does nothing if ``path`` is not a path to a valid file.\n\n        :returns: ``None``.\n        \"\"\"\n        if os.path.exists(path):\n            with open(path, 'r') as f:\n                self.base_ssh_config.parse(f)\n        else:\n            pass",
           "ok": true,
           "error": null
         },
         {
           "index": 4,
-          "source": "    def _load_ssh_file(self, path):\n        \"\"\"\n        Attempt to open and parse an SSH config file at ``path``.\n\n        Does nothing if ``path`` is not a path to a valid file.\n\n        :returns: ``None``.\n        \"\"\"\n        if os.path.isfile(path):\n            with open(path, 'r') as file:\n                self.base_ssh_config.parse(file)",
+          "source": "    def _load_ssh_file(self, path):\n        \"\"\"\n        Attempt to open and parse an SSH config file at ``path``.\n\n        Does nothing if ``path`` is not a path to a valid file.\n\n        :returns: ``None``.\n        \"\"\"\n        if os.path.exists(path):\n            with open(path, 'r') as f:\n                self.base_ssh_config.parse(f)",
           "ok": true,
           "error": null
         }

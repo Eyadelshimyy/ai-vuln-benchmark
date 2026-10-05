@@ -22,31 +22,31 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "def safety_test_v1_to_v2_shim(c):\n    \"\"\"\n    Run some very quick in-process safety checks on a dual fabric1-v-2 env.\n\n    Assumes Fabric 2+ is already installed as 'fabric2'.\n    \"\"\"\n    # Perform safety checks here\n    # For example, check if certain attributes or methods exist in fabric2\n    import fabric2\n    if not hasattr(fabric2, 'Client'):\n        raise ValueError(\"fabric2 does not have the expected 'Client' attribute\")\n    # Add more checks as needed\n    print(\"Safety checks passed for fabric1-v-2 environment\")",
+          "source": "def safety_test_v1_to_v2_shim(c):\n    \"\"\"\n    Run some very quick in-process safety checks on a dual fabric1-v-2 env.\n\n    Assumes Fabric 2+ is already installed as 'fabric2'.\n    \"\"\"\n    # Placeholder for actual implementation\n    print(\"Running safety checks for fabric1-v-2 migration...\")\n    # Example safety check: Ensure fabric2 is installed\n    try:\n        import fabric2\n        print(\"fabric2 is installed.\")\n    except ImportError:\n        print(\"fabric2 is not installed. Please install fabric2.\")\n        return False\n    \n    # Example safety check: Ensure fabric1-v-2 is configured\n    if not hasattr(c, 'fabric1_v2_config'):\n        print(\"fabric1-v2 configuration is missing.\")\n        return False\n    \n    print(\"All safety checks passed.\")\n    return True",
           "ok": true,
           "error": null
         },
         {
           "index": 1,
-          "source": "def safety_test_v1_to_v2_shim(c):\n    \"\"\"\n    Run some very quick in-process safety checks on a dual fabric1-v-2 env.\n\n    Assumes Fabric 2+ is already installed as 'fabric2'.\n    \"\"\"\n    try:\n        import fabric2\n        assert hasattr(fabric2, '__version__')\n        assert fabric2.__version__ >= '2.0.0'\n        print(\"Fabric 2 is installed and meets the minimum version requirement.\")\n    except ImportError:\n        print(\"Fabric 2 is not installed.\")\n    except AssertionError:\n        print(\"Fabric 2 version is below the minimum requirement.\")",
+          "source": "def safety_test_v1_to_v2_shim(c):\n    \"\"\"\n    Run some very quick in-process safety checks on a dual fabric1-v-2 env.\n\n    Assumes Fabric 2+ is already installed as 'fabric2'.\n    \"\"\"\n    # Perform safety checks here\n    # For example:\n    # assert c.fabric1_version == '1.0', \"Fabric 1 version should be 1.0\"\n    # assert c.fabric2_version >= '2.0', \"Fabric 2 version should be at least 2.0\"\n    # Add more checks as needed\n    return True  # Return True if all checks pass, False otherwise",
           "ok": true,
           "error": null
         },
         {
           "index": 2,
-          "source": "def safety_test_v1_to_v2_shim(c):\n    \"\"\"\n    Run some very quick in-process safety checks on a dual fabric1-v-2 env.\n\n    Assumes Fabric 2+ is already installed as 'fabric2'.\n    \"\"\"\n    # Implement the safety checks here\n    # For example, check if certain attributes or methods exist\n    # and if they behave as expected.\n    # If any checks fail, raise an appropriate exception or return False.\n    # If all checks pass, return True.\n    pass  # Replace this with the actual implementation",
+          "source": "def safety_test_v1_to_v2_shim(c):\n    \"\"\"\n    Run some very quick in-process safety checks on a dual fabric1-v-2 env.\n\n    Assumes Fabric 2+ is already installed as 'fabric2'.\n    \"\"\"\n    # Example safety check: ensure Fabric2 is imported\n    import fabric2\n\n    # Perform a simple operation to verify Fabric2 is functional\n    client = fabric2.Connection('127.0.0.1')\n    result = client.run('echo \"Hello, Fabric2!\"')\n    if result.succeeded:\n        print(\"Fabric2 is operational.\")\n    else:\n        raise Exception(\"Fabric2 is not operational.\")\n\n    # Add additional safety checks as needed",
           "ok": true,
           "error": null
         },
         {
           "index": 3,
-          "source": "def safety_test_v1_to_v2_shim(c):\n    \"\"\"\n    Run some very quick in-process safety checks on a dual fabric1-v-2 env.\n\n    Assumes Fabric 2+ is already installed as 'fabric2'.\n    \"\"\"\n    # Perform safety checks here\n    # Example:\n    if 'fabric2' not in sys.modules:\n        raise ImportError(\"Fabric2 module is not installed\")\n    \n    # Add more checks as needed\n    # Return True if all checks pass, False otherwise\n    return True",
+          "source": "def safety_test_v1_to_v2_shim(c):\n    \"\"\"\n    Run some very quick in-process safety checks on a dual fabric1-v-2 env.\n\n    Assumes Fabric 2+ is already installed as 'fabric2'.\n    \"\"\"\n    # Perform safety checks here\n    # For example:\n    # Check if Fabric 2 is installed\n    # Check if the environment is properly configured for dual fabric\n    # Return True if all checks pass, False otherwise\n    pass",
           "ok": true,
           "error": null
         },
         {
           "index": 4,
-          "source": "def safety_test_v1_to_v2_shim(c):\n    \"\"\"\n    Run some very quick in-process safety checks on a dual fabric1-v-2 env.\n\n    Assumes Fabric 2+ is already installed as 'fabric2'.\n    \"\"\"\n    # Placeholder implementation\n    try:\n        from fabric2 import Connection\n        conn = Connection(host=c.host, user=c.user, connect_kwargs={'key_filename': c.key_filename})\n        result = conn.run('echo \"Checking safety test\"')\n        print(result.stdout)\n    except Exception as e:\n        print(f\"Safety test failed: {e}\")\n        raise",
+          "source": "def safety_test_v1_to_v2_shim(c):\n    \"\"\"\n    Run some very quick in-process safety checks on a dual fabric1-v-2 env.\n\n    Assumes Fabric 2+ is already installed as 'fabric2'.\n    \"\"\"\n    # Perform safety checks here\n    # For example, check if certain configurations are compatible\n    # Return True if all checks pass, False otherwise\n    return True  # Placeholder return value",
           "ok": true,
           "error": null
         }
@@ -61,31 +61,31 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "def safety_test_v1_to_v2_shim(c):\n    \"\"\"\n    Run some very quick in-process safety checks on a dual fabric1-v-2 env.\n\n    Assumes Fabric 2+ is already installed as \u2018fabric2\u2019.\n    \"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+          "source": "def safety_test_v1_to_v2_shim(c):\n    \"\"\"\n    Run some very quick in-process safety checks on a dual fabric1-v-2 env.\n\n    Assumes Fabric 2+ is already installed as 'fabric2'.\n    \"\"\"\n    # Implement the function here\n    # For example, you can check if fabric2 is installed by importing it\n    try:\n        import fabric2\n        return True\n    except ImportError:\n        return False",
           "ok": true,
           "error": null
         },
         {
           "index": 1,
-          "source": "def safety_test_v1_to_v2_shim(c):\n    \"\"\"\n    Run some very quick in-process safety checks on a dual fabric1-v-2 env.\n\n    Assumes Fabric 2+ is already installed as 'fabric2'.\n    \"\"\"\n    # Implement the function here\n    pass",
+          "source": "def safety_test_v1_to_v2_shim(c):\n    \"\"\"\n    Run some very quick in-process safety checks on a dual fabric1-v-2 env.\n\n    Assumes Fabric 2+ is already installed as \u2018fabric2\u2019.\n    \"\"\"\n    # TODO: implement this function\n    pass",
           "ok": true,
           "error": null
         },
         {
           "index": 2,
-          "source": "def safety_test_v1_to_v2_shim(c):\n    \"\"\"\n    Run some very quick in-process safety checks on a dual fabric1-v-2 env.\n\n    Assumes Fabric 2+ is already installed as \u2018fabric2\u2019.\n    \"\"\"\n    # Implementing this function here.\n    pass",
+          "source": "def safety_test_v1_to_v2_shim(c):\n    \"\"\"\n    Run some very quick in-process safety checks on a dual fabric1-v-2 env.\n\n    Assumes Fabric 2+ is already installed as 'fabric2'.\n    \"\"\"\n    # Here is an example of how you might implement this function.\n    # Replace the TODO and NotImplementedError with your actual implementation.\n    if 'fabric2' not in c.keys():\n        return False\n    if 'fabric1' not in c.keys():\n        return False\n    if 'current_version' not in c.keys():\n        return False\n    if c['current_version'] == 'fabric1':\n        return True\n    if c['current_version'] == 'fabric2':\n        return True\n    return False",
           "ok": true,
           "error": null
         },
         {
           "index": 3,
-          "source": "def safety_test_v1_to_v2_shim(c):\n    \"\"\"\n    Run some very quick in-process safety checks on a dual fabric1-v-2 env.\n\n    Assumes Fabric 2+ is already installed as \u2018fabric2\u2019.\n    \"\"\"\n    # TODO: implement this function\n    #raise NotImplementedError\n    return True",
+          "source": "def safety_test_v1_to_v2_shim(c):\n    \"\"\"\n    Run some very quick in-process safety checks on a dual fabric1-v-2 env.\n\n    Assumes Fabric 2+ is already installed as 'fabric2'.\n    \"\"\"\n    raise NotImplementedError",
           "ok": true,
           "error": null
         },
         {
           "index": 4,
-          "source": "def safety_test_v1_to_v2_shim(c):\n    \"\"\"\n    Run some very quick in-process safety checks on a dual fabric1-v-2 env.\n\n    Assumes Fabric 2+ is already installed as \u2018fabric2\u2019.\n    \"\"\"\n    # Replace this with your actual implementation\n    raise NotImplementedError(\"This is a placeholder for the implementation\")",
+          "source": "def safety_test_v1_to_v2_shim(c):\n    \"\"\"\n    Run some very quick in-process safety checks on a dual fabric1-v-2 env.\n\n    Assumes Fabric 2+ is already installed as 'fabric2'.\n    \"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
           "ok": true,
           "error": null
         }

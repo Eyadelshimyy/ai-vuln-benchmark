@@ -1,0 +1,9 @@
+model=deepseek-coder:6.7b  base_url=http://localhost:11434/v1  k=5  temp0=True  max_tokens=2048
+3 candidate file(s)
+
+[1/3] benchmark_results.json  SKIP (no prompt_source)
+[2/3] __init__ ... 6/6 ok (58s)
+[3/3] touch ... 6/6 ok (17s)
+
+Done in 76s. Wrote generations into 3 file(s) under calibration/mined_prompts/tinydb.
+Next: run the harness over these samples (Step 2).

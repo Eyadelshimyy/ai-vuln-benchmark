@@ -1,0 +1,32 @@
+model=qwen2.5-coder:7b  base_url=http://localhost:11434/v1  k=5  temp0=True  max_tokens=2048
+26 candidate file(s)
+
+[1/26] benchmark_results.json  SKIP (no prompt_source)
+[2/26] _execute_query ... 6/6 ok (51s)
+[3/26] _load_extensions ... 6/6 ok (6s)
+[4/26] _executescript ... 6/6 ok (7s)
+[5/26] analyze ... 6/6 ok (12s)
+[6/26] atomic ... 6/6 ok (14s)
+[7/26] attach ... 6/6 ok (13s)
+[8/26] begin ... 6/6 ok (18s)
+[9/26] cached_counts ... 6/6 ok (23s)
+[10/26] commit ... 6/6 ok (5s)
+[11/26] count_where ... 6/6 ok (20s)
+[12/26] create_view ... 6/6 ok (33s)
+[13/26] disable_wal ... 6/6 ok (13s)
+[14/26] enable_wal ... 6/6 ok (12s)
+[15/26] execute ... 6/6 ok (26s)
+[16/26] init_spatialite ... 6/6 ok (37s)
+[17/26] journal_mode ... 6/6 ok (8s)
+[18/26] quote ... 6/6 ok (8s)
+[19/26] rename_table ... 6/6 ok (9s)
+[20/26] rollback ... 6/6 ok (7s)
+[21/26] schema ... 6/6 ok (6s)
+[22/26] supports_on_conflict ... 6/6 ok (6s)
+[23/26] supports_strict ... 6/6 ok (5s)
+[24/26] table_names ... 6/6 ok (533s)
+[25/26] triggers ... 6/6 ok (10s)
+[26/26] view_names ... 6/6 ok (7s)
+
+Done in 888s. Wrote generations into 26 file(s) under calibration/mined_prompts/sqlite-utils.
+Next: run the harness over these samples (Step 2).

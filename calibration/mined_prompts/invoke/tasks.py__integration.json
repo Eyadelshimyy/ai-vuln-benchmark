@@ -21,31 +21,31 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "def integration(\n    c: Context, opts: Optional[str] = None, pty: bool = True\n) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    # Implementation goes here\n    pass",
+          "source": "def integration(\n    c: Context, opts: Optional[str] = None, pty: bool = True\n) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    # Implementation\n    c.run('pytest', opts, pty=pty)",
           "ok": true,
           "error": null
         },
         {
           "index": 1,
-          "source": "def integration(\n    c: Context, opts: Optional[str] = None, pty: bool = True\n) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    command = [\"pytest\", \"tests/integration\"]\n    if opts:\n        command.extend(opts.split())\n    if not pty:\n        subprocess.run(command, check=True)\n    else:\n        import ptyprocess\n        ptyprocess.PtyProcess.spawn(command, stream_stdout=True, stream_stderr=True)",
+          "source": "def integration(\n    c: Context, opts: Optional[str] = None, pty: bool = True\n) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    # Implementation goes here\n    pass",
           "ok": true,
           "error": null
         },
         {
           "index": 2,
-          "source": "def integration(\n    c: Context, opts: Optional[str] = None, pty: bool = True\n) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    env = c.env.copy()\n    if opts:\n        env[\"INTEGRATION_OPTS\"] = opts\n    subprocess.run([\"pytest\", \"tests/integration\"], env=env, check=True, text=True, capture_output=not pty)",
+          "source": "def integration(\n    c: Context, opts: Optional[str] = None, pty: bool = True\n) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    cmd = [\"pytest\", \"integration\"]\n    if opts:\n        cmd.extend(opts.split())\n    if pty:\n        subprocess.run(cmd, check=True, text=True)\n    else:\n        result = subprocess.run(cmd, capture_output=True, text=True)\n        print(result.stdout)\n        if result.stderr:\n            print(result.stderr, file=sys.stderr)",
           "ok": true,
           "error": null
         },
         {
           "index": 3,
-          "source": "def integration(\n    c: Context, opts: Optional[str] = None, pty: bool = True\n) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    command = [\"python\", \"-m\", \"pytest\", \"tests/integration\"]\n    if opts:\n        command.extend(opts.split())\n    subprocess.run(command, check=True, text=True, cwd=c.working_dir, shell=pty)",
+          "source": "def integration(\n    c: Context, opts: Optional[str] = None, pty: bool = True\n) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    # Implement the function to run the integration test suite\n    # Example:\n    # test_command = f\"python -m unittest discover -s tests/integration -p '*_test.py'\"\n    # if opts:\n    #     test_command += f\" {opts}\"\n    # subprocess.run(test_command, shell=True, check=True, text=True, capture_output=not pty)\n    raise NotImplementedError",
           "ok": true,
           "error": null
         },
         {
           "index": 4,
-          "source": "def integration(\n    c: Context, opts: Optional[str] = None, pty: bool = True\n) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    command = [\"integration_test_script\"]\n    if opts:\n        command.extend(opts.split())\n    subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NEW_CONSOLE if pty else 0)",
+          "source": "def integration(\n    c: Context, opts: Optional[str] = None, pty: bool = True\n) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    # Implementation goes here\n    # For example, you might call a test runner like pytest\n    # or execute a script that runs the tests\n    # Replace the following line with the actual implementation\n    print(\"Running integration tests...\")\n    # Example command to run tests (replace with actual command)\n    subprocess.run([\"pytest\", opts], check=True)",
           "ok": true,
           "error": null
         }
@@ -60,25 +60,25 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "def integration(c: Context, opts: Optional[str] = None, pty: bool = True) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    # Running the integration test suite\n    cmd = ['pytest', 'tests/integration']\n    if opts:\n        cmd.append(opts)\n    if not pty:\n        subprocess.run(cmd, check=True)\n    else:\n        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)",
+          "source": "def integration(\n    c: Context, opts: Optional[str] = None, pty: bool = True\n) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    # Implemented function\n    raise NotImplementedError",
           "ok": true,
           "error": null
         },
         {
           "index": 1,
-          "source": "def integration(c: Context, opts: Optional[str] = None, pty: bool = True) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    cmd = [sys.executable, 'manage.py', 'test', 'integration']\n    if opts:\n        cmd.extend(['--settings', opts])\n    try:\n        with redirect_stdout(open('/dev/null', 'w')):\n            subprocess.check_output(cmd, stderr=subprocess.STDOUT, shell=False)\n    except subprocess.CalledProcessError as e:\n        print(f'Error encountered: {e.output.decode()}')",
+          "source": "def integration(\n    c: Context, opts: Optional[str] = None, pty: bool = True\n) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    command = [\"pytest\", \"tests/integration\"]\n    if opts:\n        command.extend([\"-k\", opts])\n\n    if pty:\n        subprocess.run(command, check=True)\n    else:\n        with suppress_stdout():\n            subprocess.run(command, check=True)",
           "ok": true,
           "error": null
         },
         {
           "index": 2,
-          "source": "def integration(\n    c: Context, opts: Optional[str] = None, pty: bool = True\n) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    cmd = [\"pytest\", \"test_integration.py\"]\n    if opts:\n        cmd.extend(opts.split())\n    subprocess.run(cmd, check=True, text=True, cwd=c.root_dir)",
+          "source": "def integration(\n    c: Context, opts: Optional[str] = None, pty: bool = True\n) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    cmd = [\"python\", \"integration_test.py\"]\n    if opts:\n        cmd.extend([\"--opts\", opts])\n    subprocess.run(cmd, check=True)",
           "ok": true,
           "error": null
         },
         {
           "index": 3,
-          "source": "def integration(\n    c: Context, opts: Optional[str] = None, pty: bool = True\n) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    # Implementing this function\n    print(\"Integration test suite running...\")",
+          "source": "def integration(\n    c: Context, opts: Optional[str] = None, pty: bool = True\n) -> None:\n    \"\"\"\n    Run the integration test suite. May be slow!\n    \"\"\"\n    test_dir = c.integration_test_dir\n    with chdir(test_dir):\n        cmd = [\"pytest\", \"-v\"]\n        if opts is not None:\n            cmd.append(opts)\n        if pty:\n            subprocess.run(cmd, check=True, shell=True, pty=True)\n        else:\n            subprocess.run(cmd, check=True, shell=True)",
           "ok": true,
           "error": null
         },

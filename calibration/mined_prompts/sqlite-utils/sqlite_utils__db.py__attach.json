@@ -21,79 +21,31 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "    def attach(self, alias: str, filepath: str | pathlib.Path) -> None:\n        \"\"\"\n        Attach another SQLite database file to this connection with the specified alias, equivalent to::\n\n            ATTACH DATABASE 'filepath.db' AS alias\n\n        :param alias: Alias name to use\n        :param filepath: Path to SQLite database file on disk\n        \"\"\"\n        filepath = str(filepath)\n        self.conn.execute(f\"ATTACH DATABASE '{filepath}' AS {alias};\")",
+          "source": "    def attach(self, alias: str, filepath: str | pathlib.Path) -> None:\n            \"\"\"\n            Attach another SQLite database file to this connection with the specified alias, equivalent to::\n\n                ATTACH DATABASE 'filepath.db' AS alias\n\n            :param alias: Alias name to use\n            :param filepath: Path to SQLite database file on disk\n            \"\"\"\n            self.conn.execute(f\"ATTACH DATABASE '{filepath}' AS {alias};\")",
           "ok": true,
           "error": null
         },
         {
           "index": 1,
-          "source": "    def attach(self, alias: str, filepath: str | pathlib.Path) -> None:\n        \"\"\"\n        Attach another SQLite database file to this connection with the specified alias, equivalent to::\n\n            ATTACH DATABASE 'filepath.db' AS alias\n\n        :param alias: Alias name to use\n        :param filepath: Path to SQLite database file on disk\n        \"\"\"\n        filepath_str = str(filepath)\n        self.execute(f\"ATTACH DATABASE {sql_quote(filepath_str)} AS {sql_quote(alias)}\")",
+          "source": "    def attach(self, alias: str, filepath: str | pathlib.Path) -> None:\n            \"\"\"\n            Attach another SQLite database file to this connection with the specified alias, equivalent to::\n\n                ATTACH DATABASE 'filepath.db' AS alias\n\n            :param alias: Alias name to use\n            :param filepath: Path to SQLite database file on disk\n            \"\"\"\n            if not isinstance(filepath, (str, pathlib.Path)):\n                raise ValueError(\"filepath must be a string or pathlib.Path\")\n            filepath = str(filepath)\n            self.execute(f\"ATTACH DATABASE '{filepath}' AS {alias};\")",
           "ok": true,
-          "error": null,
-          "repair": {
-            "original_verdict": "COULD_NOT_EXECUTE",
-            "final_verdict": "COULD_NOT_EXECUTE",
-            "attempts_used": 3,
-            "repaired_source": "    def attach(self, alias: str, filepath: Union[str, pathlib.Path]) -> None:\n        \"\"\"\n        Attach another SQLite database file to this connection with the specified alias, equivalent to::\n\n            ATTACH DATABASE 'filepath.db' AS alias\n\n        :param alias: Alias name to use\n        :param filepath: Path to SQLite database file on disk\n        \"\"\"\n        filepath_str = str(filepath)\n        self.execute(f\"ATTACH DATABASE {sqlite3.quote_identifier(filepath_str)} AS {sqlite3.quote_identifier(alias)}\")",
-            "cwe": null,
-            "trajectory": [
-              {
-                "attempt": 1,
-                "verdict": "COULD_NOT_EXECUTE",
-                "cwe": null
-              },
-              {
-                "attempt": 2,
-                "verdict": "COULD_NOT_EXECUTE",
-                "cwe": null
-              },
-              {
-                "attempt": 3,
-                "verdict": "COULD_NOT_EXECUTE",
-                "cwe": null
-              }
-            ]
-          }
+          "error": null
         },
         {
           "index": 2,
-          "source": "    def attach(self, alias: str, filepath: str | pathlib.Path) -> None:\n            \"\"\"\n            Attach another SQLite database file to this connection with the specified alias, equivalent to::\n\n                ATTACH DATABASE 'filepath.db' AS alias\n\n            :param alias: Alias name to use\n            :param filepath: Path to SQLite database file on disk\n            \"\"\"\n            if not isinstance(filepath, (str, pathlib.Path)):\n                raise TypeError(\"filepath must be a string or pathlib.Path\")\n            filepath = str(filepath)\n            self.execute(f\"ATTACH DATABASE '{filepath}' AS {alias};\")",
+          "source": "    def attach(self, alias: str, filepath: str | pathlib.Path) -> None:\n        \"\"\"\n        Attach another SQLite database file to this connection with the specified alias, equivalent to::\n\n            ATTACH DATABASE 'filepath.db' AS alias\n\n        :param alias: Alias name to use\n        :param filepath: Path to SQLite database file on disk\n        \"\"\"\n        self.execute(f\"ATTACH DATABASE '{filepath}' AS {alias};\")",
           "ok": true,
           "error": null
         },
         {
           "index": 3,
-          "source": "    def attach(self, alias: str, filepath: str | pathlib.Path) -> None:\n        \"\"\"\n        Attach another SQLite database file to this connection with the specified alias, equivalent to::\n\n            ATTACH DATABASE 'filepath.db' AS alias\n\n        :param alias: Alias name to use\n        :param filepath: Path to SQLite database file on disk\n        \"\"\"\n        self.execute(f\"ATTACH DATABASE {self._quote_identifier(filepath)} AS {self._quote_identifier(alias)}\")",
+          "source": "    def attach(self, alias: str, filepath: str | pathlib.Path) -> None:\n        \"\"\"\n        Attach another SQLite database file to this connection with the specified alias, equivalent to::\n\n            ATTACH DATABASE 'filepath.db' AS alias\n\n        :param alias: Alias name to use\n        :param filepath: Path to SQLite database file on disk\n        \"\"\"\n        filepath = str(filepath)\n        self.execute(f\"ATTACH DATABASE '{filepath}' AS {alias};\")",
           "ok": true,
-          "error": null,
-          "repair": {
-            "original_verdict": "COULD_NOT_EXECUTE",
-            "final_verdict": "COULD_NOT_EXECUTE",
-            "attempts_used": 3,
-            "repaired_source": "    def attach(self, alias: str, filepath: str | pathlib.Path) -> None:\n        \"\"\"\n        Attach another SQLite database file to this connection with the specified alias, equivalent to::\n\n            ATTACH DATABASE 'filepath.db' AS alias\n\n        :param alias: Alias name to use\n        :param filepath: Path to SQLite database file on disk\n        \"\"\"\n        self.execute(f\"ATTACH DATABASE {self._quote_identifier(str(filepath))} AS {self._quote_identifier(alias)}\")",
-            "cwe": null,
-            "trajectory": [
-              {
-                "attempt": 1,
-                "verdict": "COULD_NOT_EXECUTE",
-                "cwe": null
-              },
-              {
-                "attempt": 2,
-                "verdict": "COULD_NOT_EXECUTE",
-                "cwe": null
-              },
-              {
-                "attempt": 3,
-                "verdict": "COULD_NOT_EXECUTE",
-                "cwe": null
-              }
-            ]
-          }
+          "error": null
         },
         {
           "index": 4,
-          "source": "    def attach(self, alias: str, filepath: str | pathlib.Path) -> None:\n        \"\"\"\n        Attach another SQLite database file to this connection with the specified alias, equivalent to::\n\n            ATTACH DATABASE 'filepath.db' AS alias\n\n        :param alias: Alias name to use\n        :param filepath: Path to SQLite database file on disk\n        \"\"\"\n        filepath_str = str(filepath)\n        self.execute(f\"ATTACH DATABASE '{filepath_str}' AS {alias};\")",
+          "source": "    def attach(self, alias: str, filepath: str | pathlib.Path) -> None:\n        \"\"\"\n        Attach another SQLite database file to this connection with the specified alias, equivalent to::\n\n            ATTACH DATABASE 'filepath.db' AS alias\n\n        :param alias: Alias name to use\n        :param filepath: Path to SQLite database file on disk\n        \"\"\"\n        self.conn.execute(f\"ATTACH DATABASE '{str(filepath)}' AS {alias};\")",
           "ok": true,
           "error": null
         }
@@ -114,25 +66,49 @@
         },
         {
           "index": 1,
-          "source": "    def attach(self, alias: str, filepath: str | pathlib.Path) -> None:\n            \"\"\"\n            Attach another SQLite database file to this connection with the specified alias, equivalent to::\n\n                ATTACH DATABASE 'filepath.db' AS alias\n\n            :param alias: Alias name to use\n            :param filepath: Path to SQLite database file on disk\n            \"\"\"\n            if not alias:\n                raise ValueError(\"Alias cannot be empty\")\n            if not filepath:\n                raise ValueError(\"Filepath cannot be empty\")\n\n            self.conn.execute(f\"ATTACH DATABASE '{filepath}' AS '{alias}'\")\n            self.conn.commit()",
-          "ok": true,
-          "error": null
-        },
-        {
-          "index": 2,
-          "source": "    def attach(self, alias: str, filepath: str | pathlib.Path) -> None:\n        \"\"\"\n        Attach another SQLite database file to this connection with the specified alias, equivalent to::\n\n            ATTACH DATABASE 'filepath.db' AS alias\n\n        :param alias: Alias name to use\n        :param filepath: Path to SQLite database file on disk\n        \"\"\"\n        if isinstance(filepath, pathlib.Path):\n            filepath = str(filepath)\n        self.conn.execute(f\"ATTACH DATABASE '{filepath}' AS '{alias}'\")\n        # commit changes to the connection\n        self.conn.commit()",
-          "ok": true,
-          "error": null
-        },
-        {
-          "index": 3,
           "source": "    def attach(self, alias: str, filepath: str | pathlib.Path) -> None:\n        \"\"\"\n        Attach another SQLite database file to this connection with the specified alias, equivalent to::\n\n            ATTACH DATABASE 'filepath.db' AS alias\n\n        :param alias: Alias name to use\n        :param filepath: Path to SQLite database file on disk\n        \"\"\"\n        self.conn.execute(f\"ATTACH DATABASE ? AS ?\", (str(filepath), alias))\n        self.conn.commit()",
           "ok": true,
           "error": null
         },
         {
+          "index": 2,
+          "source": "    def attach(self, alias: str, filepath: str | pathlib.Path) -> None:\n        \"\"\"\n        Attach another SQLite database file to this connection with the specified alias, equivalent to::\n\n            ATTACH DATABASE  'filepath.db' AS alias\n\n        :param alias: Alias name to use\n        :param filepath: Path to SQLite database file on disk\n        \"\"\"\n        self.conn.execute(f\"ATTACH DATABASE ? AS ?\", (str(filepath), alias))\n        self.conn.commit()",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def attach(self, alias: str, filepath: str | pathlib.Path) -> None:\n        \"\"\"\n        Attach another SQLite database file to this connection with the specified alias, equivalent to::\n\n            ATTACH DATABASE  'filepath.db' AS alias\n\n        :param alias: Alias name to use\n        :param filepath: Path to SQLite database file on disk\n        \"\"\"\n        # Check if the filepath exists\n        if not os.path.exists(filepath):\n            raise FileNotFoundError(f\"The file {filepath} does not exist\")\n    \n        # Prepare the SQL query\n        sql_query = f\"ATTACH DATABASE '{filepath}' AS {alias};\"\n    \n        # Execute the query\n        self.conn.execute(sql_query)\n        self.conn.commit()",
+          "ok": true,
+          "error": null,
+          "repair": {
+            "original_verdict": "COULD_NOT_EXECUTE",
+            "final_verdict": "COULD_NOT_EXECUTE",
+            "attempts_used": 3,
+            "repaired_source": "    def attach(self, alias: str, filepath: str | pathlib.Path) -> None:\n        \"\"\"\n        Attach another SQLite database file to this connection with the specified alias, equivalent to::\n\n            ATTACH DATABASE     'filepath.db' AS alias\n\n        :param alias: Alias name to use\n        :param filepath: Path to SQLite database file on disk\n        \"\"\"\n        # Check if the filepath exists\n        if not os.path.exists(filepath):\n            raise FileNotFoundError(f\"The file {filepath} does not exist\")\n\n        # Prepare the SQL query\n        sql_query = f\"ATTACH DATABASE '{filepath}' AS {alias};\"\n\n        # Execute the query\n        self.conn.execute(sql_query)\n        self.conn.commit()",
+            "cwe": null,
+            "trajectory": [
+              {
+                "attempt": 1,
+                "verdict": "COULD_NOT_EXECUTE",
+                "cwe": null
+              },
+              {
+                "attempt": 2,
+                "verdict": "COULD_NOT_EXECUTE",
+                "cwe": null
+              },
+              {
+                "attempt": 3,
+                "verdict": "COULD_NOT_EXECUTE",
+                "cwe": null
+              }
+            ]
+          }
+        },
+        {
           "index": 4,
-          "source": "    def attach(self, alias: str, filepath: str | pathlib.Path) -> None:\n        \"\"\"\n        Attach another SQLite database file to this connection with the specified alias, equivalent to::\n\n            ATTACH DATABASE 'filepath.db' AS alias\n\n        :param alias: Alias name to use\n        :param filepath: Path to SQLite database file on disk\n        \"\"\"\n        self.conn.execute(f\"ATTACH DATABASE '{filepath}' AS '{alias}'\")\n        self.conn.commit()\n        self.conn.execute(f\"PRAGMA database_list;\")\n        self.conn.commit()\n        return None",
+          "source": "    def attach(self, alias: str, filepath: str | pathlib.Path) -> None:\n            \"\"\"\n            Attach another SQLite database file to this connection with the specified alias, equivalent to::\n\n                ATTACH DATABASE 'filepath.db' AS alias\n\n            :param alias: Alias name to use\n            :param filepath: Path to SQLite database file on disk\n            \"\"\"\n            self.conn.execute(f\"ATTACH DATABASE ? AS ?\", (filepath, alias))\n            self.conn.commit()",
           "ok": true,
           "error": null
         }

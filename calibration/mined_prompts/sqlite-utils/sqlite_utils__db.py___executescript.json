@@ -21,19 +21,19 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "    def _executescript(self, sql: str) -> sqlite3.Cursor:\n            \"\"\"Implement the `_executescript` function (parameters: sql).\"\"\"\n            return self.conn.executescript(sql)",
+          "source": "    def _executescript(self, sql: str) -> sqlite3.Cursor:\n            \"\"\"Implement the `_executescript` function (parameters: sql).\"\"\"\n            cursor = self.conn.cursor()\n            cursor.executescript(sql)\n            return cursor",
           "ok": true,
           "error": null
         },
         {
           "index": 1,
-          "source": "    def _executescript(self, sql: str) -> sqlite3.Cursor:\n            \"\"\"Implement the `_executescript` function (parameters: sql).\"\"\"\n            return self.conn.executescript(sql)",
+          "source": "    def _executescript(self, sql: str) -> sqlite3.Cursor:\n        \"\"\"Implement the `_executescript` function (parameters: sql).\"\"\"\n        cursor = self.conn.cursor()\n        cursor.executescript(sql)\n        return cursor",
           "ok": true,
           "error": null
         },
         {
           "index": 2,
-          "source": "    def _executescript(self, sql: str) -> sqlite3.Cursor:\n            \"\"\"Implement the `_executescript` function (parameters: sql).\"\"\"\n            cursor = self.conn.cursor()\n            cursor.executescript(sql)\n            return cursor",
+          "source": "    def _executescript(self, sql: str) -> sqlite3.Cursor:\n        \"\"\"Implement the `_executescript` function (parameters: sql).\"\"\"\n        cursor = self.conn.cursor()\n        try:\n            cursor.executescript(sql)\n        except sqlite3.Error as e:\n            cursor.close()\n            raise e\n        return cursor",
           "ok": true,
           "error": null
         },
@@ -66,19 +66,19 @@
         },
         {
           "index": 1,
-          "source": "    def _executescript(self, sql: str) -> sqlite3.Cursor:\n            \"\"\"Implement the `_executescript` function (parameters: sql).\"\"\"\n            return self.conn.executescript(sql)",
+          "source": "    def _executescript(self, sql: str) -> sqlite3.Cursor:\n        \"\"\"Implement the `_executescript` function (parameters: sql).\"\"\"\n        return self.conn.executescript(sql)",
           "ok": true,
           "error": null
         },
         {
           "index": 2,
-          "source": "    def _executescript(self, sql: str) -> sqlite3.Cursor:\n        \"\"\"Implement the `_executescript` function.\"\"\"\n        return self.conn.executescript(sql)",
+          "source": "    def _executescript(self, sql: str) -> sqlite3.Cursor:\n        \"\"\"Implement the `_executescript` function (parameters: sql).\"\"\"\n        return self.conn.executescript(sql)",
           "ok": true,
           "error": null
         },
         {
           "index": 3,
-          "source": "    def _executescript(self, sql: str) -> sqlite3.Cursor:\n        \"\"\"Implement the `_executescript` function (parameters: sql).\"\"\"\n        return self.conn.executescript(sql)",
+          "source": "    def _executescript(self, sql: str) -> sqlite3.Cursor:\n        \"\"\"\n        Implement the `_executescript` function (parameters: sql).\n        \"\"\"\n        cur = self.conn.cursor()\n        cur.executescript(sql)\n        return cur",
           "ok": true,
           "error": null
         },

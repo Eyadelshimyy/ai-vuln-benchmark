@@ -27,31 +27,31 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "    def safety_check(self):\n            \"\"\"Implement the `safety_check` function.\"\"\"\n            # Short-circuit if user didn't give any expectations; otherwise our\n            # assumptions below will be inaccurately violated and explode.\n            if not self.guard_only:\n                raise ValueError(\"At least one expectation must be provided.\")",
+          "source": "    def safety_check(self):\n        \"\"\"Implement the `safety_check` function.\"\"\"\n        if not self.guard_only:\n            raise ValueError(\"You must provide expectations when running commands.\")",
           "ok": true,
           "error": null
         },
         {
           "index": 1,
-          "source": "    def safety_check(self):\n            \"\"\"\n            Implement the `safety_check` function.\n            \"\"\"\n            # Short-circuit if user didn't give any expectations; otherwise our\n            # assumptions below will be inaccurately violated and explode.\n            if not self.commands and not self.cmd and not self.transfers:\n                raise ValueError(\n                    \"You must provide at least one command or transfer expectation.\"\n                )",
+          "source": "    def safety_check(self):\n            \"\"\"Implement the `safety_check` function.\"\"\"\n            # Short-circuit if user didn't give any expectations; otherwise our\n            # assumptions below will be inaccurately violated and explode.\n            if not self.guard_only:\n                return\n            if not self.commands and not self.transfers:\n                raise ValueError(\n                    \"You must provide either 'commands' or 'transfers' if you are not in guard-only mode.\"\n                )",
           "ok": true,
           "error": null
         },
         {
           "index": 2,
-          "source": "    def safety_check(self):\n            \"\"\"Implement the `safety_check` function.\"\"\"\n            # Short-circuit if user didn't give any expectations; otherwise our\n            # assumptions below will be inaccurately violated and explode.\n            if self.guard_only:\n                return\n            # Additional safety checks can be added here if needed",
+          "source": "    def safety_check(self):\n        \"\"\"Implement the `safety_check` function.\"\"\"\n        pass  # No-op if user didn't give any expectations",
           "ok": true,
           "error": null
         },
         {
           "index": 3,
-          "source": "    def safety_check(self):\n            \"\"\"Implement the `safety_check` function.\"\"\"\n            if not self.guard_only:\n                raise ValueError(\"No expectations were provided.\")",
+          "source": "    def safety_check(self):\n            \"\"\"Implement the `safety_check` function.\"\"\"\n            if not self.guard_only:\n                return\n            if self.host is None or self.user is None:\n                raise ValueError(\"Host and user must be provided when not using commands.\")\n            if self.port is not None and not isinstance(self.port, int):\n                raise ValueError(\"Port must be an integer if provided.\")\n            if self._enable_sftp and not self.commands:\n                raise ValueError(\"SFTP transfers require at least one command.\")",
           "ok": true,
           "error": null
         },
         {
           "index": 4,
-          "source": "    def safety_check(self):\n            \"\"\"Implement the `safety_check` function.\"\"\"\n            if not self.commands and not self.guard_only:\n                raise ValueError(\n                    \"No expectations were given. You must provide either 'commands' or other individual Command parameters.\"\n                )  # noqa",
+          "source": "    def safety_check(self):\n        \"\"\"Implement the `safety_check` function.\"\"\"\n        if not self.guard_only:\n            # Perform safety checks here\n            # For example, check if mandatory parameters are set\n            if not self.host or not self.user:\n                raise ValueError(\"Host and user must be provided if expectations are set.\")\n            if self._enable_sftp and not self.transfers:\n                raise ValueError(\"Transfers must be provided if SFTP is enabled.\")",
           "ok": true,
           "error": null
         }
@@ -66,31 +66,31 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "    def safety_check(self):\n        # Safety check\n        params = self.cmd or self.out or self.err or self.exit or self.waits\n        if self.commands and params:\n            raise ValueError(\n                \"You can't give both 'commands' and individual Command parameters!\"\n            )   # noqa\n\n        # Early test for \"did user actually request expectations?\"\n        self.guard_only = not (self.commands or self.cmd or self.transfers)\n\n        # Fill in values\n        self.host = self.host\n        self.user = self.user\n        self.port = self.port\n        self.commands = self.commands\n        if params:\n            # Honestly dunno which is dumber, this or duplicating Command's\n            # default kwarg values in this method's signature...sigh\n            kwargs = {}\n            if self.cmd is not None:\n                kwargs[\"cmd\"] = self.cmd\n            if self.out is not None:\n                kwargs[\"out\"] = self.out\n            if self.err is not None:\n                kwargs[\"err\"] = self.err\n            if self.in_ is not None:\n                kwargs[\"in_\"] = self.in_\n            if self.exit is not None:\n                kwargs[\"exit\"] = self.exit\n            if self.waits is not None:\n                kwargs[\"waits\"] = self.waits\n            self.commands = [Command(**kwargs)]\n        if not self.commands:\n            self.commands = [Command()]\n        self._enable_sftp = self.enable_sftp\n        self.transfers = self.transfers",
-          "ok": true,
-          "error": null
-        },
-        {
-          "index": 1,
-          "source": "    def safety_check(self):\n        # Short-circuit if user didn't give any expectations; otherwise our\n        # assumptions below will be inaccurately violated and explode.\n        \"\"\"Implement the `safety_check` function.\"\"\"\n        # Safety check\n        params = self.cmd or self.out or self.err or self.exit or self.waits\n        if self.commands and params:\n            raise ValueError(\n                \"You can't give both 'commands' and individual Command parameters!\"\n            )  # noqa\n        # Early test for \"did user actually request expectations?\"\n        self.guard_only = not (self.commands or self.cmd or self.transfers)\n        # Fill in values\n        self.host = self.host\n        self.user = self.user\n        self.port = self.port\n        self.commands = self.commands\n        if params:\n            # Honestly dunno which is dumber, this or duplicating Command's\n            # default kwarg values in this method's signature...sigh\n            kwargs = {}\n            if self.cmd is not None:\n                kwargs[\"cmd\"] = self.cmd\n            if self.out is not None:\n                kwargs[\"out\"] = self.out\n            if self.err is not None:\n                kwargs[\"err\"] = self.err\n            if self.in_ is not None:\n                kwargs[\"in_\"] = self.in_\n            if self.exit is not None:\n                kwargs[\"exit\"] = self.exit\n            if self.waits is not None:\n                kwargs[\"waits\"] = self.waits\n            self.commands = [Command(**kwargs)]\n        if not self.commands:\n            self.commands = [Command()]\n        self._enable_sftp = self._enable_sftp\n        self.transfers = self.transfers\n        return self.guard_only",
-          "ok": true,
-          "error": null
-        },
-        {
-          "index": 2,
-          "source": "    def safety_check(self):\n        \"\"\"Implement the `safety_check` function.\"\"\"\n        # Safety check\n        params = self.cmd or self.out or self.err or self.exit or self.waits\n        if self.commands and params:\n            raise ValueError(\n                \"You can't give both 'commands' and individual Command parameters!\"\n            )   # noqa\n        # Early test for \"did user actually request expectations?\"\n        self.guard_only = not (self.commands or self.cmd or self.transfers)\n        # Fill in values\n        self.host = self.host\n        self.user = self.user\n        self.port = self.port\n        self.commands = self.commands\n        if params:\n            # Honestly dunno which is dumber, this or duplicating Command's\n            # default kwarg values in this method's signature...sigh\n            kwargs = {}\n            if self.cmd is not None:\n                kwargs[\"cmd\"] = self.cmd\n            if self.out is not None:\n                kwargs[\"out\"] = self.out\n            if self.err is not None:\n                kwargs[\"err\"] = self.err\n            if self.in_ is not None:\n                kwargs[\"in_\"] = self.in_\n            if self.exit is not None:\n                kwargs[\"exit\"] = self.exit\n            if self.waits is not None:\n                kwargs[\"waits\"] = self.waits\n            self.commands = [Command(**kwargs)]\n        if not self.commands:\n            self.commands = [Command()]\n        self._enable_sftp = self._enable_sftp\n        self.transfers = self.transfers\n        return self.commands",
-          "ok": true,
-          "error": null
-        },
-        {
-          "index": 3,
           "source": "    def safety_check(self):\n        # Short-circuit if user didn't give any expectations; otherwise our\n        # assumptions below will be inaccurately violated and explode.\n        \"\"\"Implement the `safety_check` function.\"\"\"\n        if self.commands and (self.cmd or self.out or self.err or self.in_ or self.exit or self.waits):\n            raise ValueError(\n                \"You can't give both 'commands' and individual Command parameters!\"\n            )   # noqa",
           "ok": true,
           "error": null
         },
         {
+          "index": 1,
+          "source": "    def safety_check(self):\n        # Safety check\n        params = self.cmd or self.out or self.err or self.exit or self.waits\n        if self.commands and params:\n            raise ValueError(\n                \"You can't give both 'commands' and individual Command parameters!\"\n            )   # noqa\n\n    In the provided `__init__()` function, the `safety_check` function is called at the end of the `if params:` block. This function should be implemented in the same way, checking if `self.commands` and `params` are both `None`. If they are, the function should raise a `ValueError` with the same error message as in the original `__init__()` function. If `self.commands` is not `None` and `params` is, it should also raise a `ValueError`.",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 2,
+          "source": "    def safety_check(self):\n        # Safety check\n        params = self.cmd or self.out or self.err or self.exit or self.waits\n        if self.commands and params:\n            raise ValueError(\n                \"You can't give both 'commands' and individual Command parameters!\"\n            )  # noqa\n        # Early test for \"did user actually request expectations?\"\n        self.guard_only = not (self.commands or self.cmd or self.transfers)",
+          "ok": true,
+          "error": null
+        },
+        {
+          "index": 3,
+          "source": "    def safety_check(self):\n        \"\"\"Implement the `safety_check` function.\"\"\"\n        # Safety check\n        params = self.cmd or self.out or self.err or self.exit or self.waits\n        if self.commands and params:\n            raise ValueError(\n                \"You can't give both 'commands' and individual Command parameters!\"\n            )   # noqa\n        # Early test for \"did user actually request expectations?\"\n        self.guard_only = not (self.commands or self.cmd or self.transfers)\n        # Fill in values\n        self.host = self.host\n        self.user = self.user\n        self.port = self.port\n        self.commands = self.commands\n        if params:\n            # Honestly dunno which is dumber, this or duplicating Command's\n            # default kwarg values in this method's signature...sigh\n            kwargs = {}\n            if self.cmd is not None:\n                kwargs[\"cmd\"] = self.cmd\n            if self.out is not None:\n                kwargs[\"out\"] = self.out\n            if self.err is not None:\n                kwargs[\"err\"] = self.err\n            if self.in_ is not None:\n                kwargs[\"in_\"] = self.in_\n            if self.exit is not None:\n                kwargs[\"exit\"] = self.exit\n            if self.waits is not None:\n                kwargs[\"waits\"] = self.waits\n            self.commands = [Command(**kwargs)]\n        if not self.commands:\n            self.commands = [Command()]\n        self._enable_sftp = self.enable_sftp\n        self.transfers = self.transfers",
+          "ok": true,
+          "error": null
+        },
+        {
           "index": 4,
-          "source": "    def safety_check(self):\n        \"\"\"Implement the `safety_check` function.\"\"\"\n        # Safety check\n        params = self.cmd or self.out or self.err or self.exit or self.waits\n        if self.commands and params:\n            raise ValueError(\n                \"You can't give both 'commands' and individual Command parameters!\"\n            )  # noqa\n        # Early test for \"did user actually request expectations?\"\n        self.guard_only = not (self.commands or self.cmd or self.transfers)\n        # Fill in values\n        self.host = self.host\n        self.user = self.user\n        self.port = self.port\n        self.commands = self.commands\n        if params:\n            # Honestly dunno which is dumber, this or duplicating Command's\n            # default kwarg values in this method's signature...sigh\n            kwargs = {}\n            if self.cmd is not None:\n                kwargs[\"cmd\"] = self.cmd\n            if self.out is not None:\n                kwargs[\"out\"] = self.out\n            if self.err is not None:\n                kwargs[\"err\"] = self.err\n            if self.in_ is not None:\n                kwargs[\"in_\"] = self.in_\n            if self.exit is not None:\n                kwargs[\"exit\"] = self.exit\n            if self.waits is not None:\n                kwargs[\"waits\"] = self.waits\n            self.commands = [Command(**kwargs)]\n        if not self.commands:\n            self.commands = [Command()]\n        self._enable_sftp = self._enable_sftp\n        self.transfers = self.transfers\n        return self",
+          "source": "    def safety_check(self):\n        # Short-circuit if user didn't give any expectations; otherwise our\n        # assumptions below will be inaccurately violated and explode.\n        \"\"\"Implement the `safety_check` function.\"\"\"\n        if self.host is None and self.user is None and self.port is None:\n            return True\n\n        if self.commands:\n            for command in self.commands:\n                if command.cmd is not None or command.out is not None or command.err is not None or command.in_ is not None or command.exit is not None or command.waits is not None:\n                    return False\n        return True",
           "ok": true,
           "error": null
         }

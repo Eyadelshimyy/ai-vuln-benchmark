@@ -1,0 +1,26 @@
+model=qwen2.5-coder:7b  base_url=http://localhost:11434/v1  k=5  temp0=True  max_tokens=2048
+20 candidate file(s)
+
+[1/20] benchmark_results.json  SKIP (no prompt_source)
+[2/20] save_host_keys ... 6/6 ok (14s)
+[3/20] _does_match ... 6/6 ok (21s)
+[4/20] from_path ... 6/6 ok (9s)
+[5/20] __init__ ... 6/6 ok (34s)
+[6/20] load ... 6/6 ok (29s)
+[7/20] save ... 6/6 ok (22s)
+[8/20] _read_private_key_file ... 6/6 ok (68s)
+[9/20] _write_private_key_file ... 6/6 ok (19s)
+[10/20] from_file ... 6/6 ok (15s)
+[11/20] read_file ... 6/6 ok (12s)
+[12/20] __init__ ... 6/6 ok (16s)
+[13/20] get ... 6/6 ok (61s)
+[14/20] getfo ... 6/6 ok (55s)
+[15/20] put ... 6/6 ok (56s)
+[16/20] set_file_attr ... 6/6 ok (29s)
+[17/20] log_to_file ... 6/6 ok (14s)
+[18/20] __init__ ... 6/6 ok (13s)
+[19/20] publish_ ... 6/6 ok (19s)
+[20/20] test ... 6/6 ok (38s)
+
+Done in 543s. Wrote generations into 20 file(s) under calibration/mined_prompts/paramiko.
+Next: run the harness over these samples (Step 2).

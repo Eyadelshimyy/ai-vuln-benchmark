@@ -1,0 +1,13 @@
+model=deepseek-coder:6.7b  base_url=http://localhost:11434/v1  k=5  temp0=True  max_tokens=2048
+7 candidate file(s)
+
+[1/7] benchmark_results.json  SKIP (no prompt_source)
+[2/7] _load_ssh_file ... 6/6 ok (19s)
+[3/7] local ... 6/6 ok (23s)
+[4/7] open_gateway ... 6/6 ok (36s)
+[5/7] expand_calls ... 6/6 ok (19s)
+[6/7] safety_check ... 6/6 ok (33s)
+[7/7] safety_test_v1_to_v2_shim ... 6/6 ok (12s)
+
+Done in 142s. Wrote generations into 7 file(s) under calibration/mined_prompts/fabric.
+Next: run the harness over these samples (Step 2).

@@ -27,13 +27,13 @@
         },
         {
           "index": 1,
-          "source": "    def disable_wal(self) -> None:\n        \"\"\"\n        Sets ``journal_mode`` back to ``'delete'`` to disable Write-Ahead Log mode.\n\n        :raises TransactionError: if called while a transaction is open - the\n          journal mode can only be changed outside of a transaction\n        \"\"\"\n        if self.conn.in_transaction:\n            raise TransactionError(\"Cannot change journal mode while a transaction is open\")\n        self.execute(\"PRAGMA journal_mode=delete;\")",
+          "source": "    def disable_wal(self) -> None:\n            \"\"\"\n            Sets ``journal_mode`` back to ``'delete'`` to disable Write-Ahead Log mode.\n\n            :raises TransactionError: if called while a transaction is open - the\n              journal mode can only be changed outside of a transaction\n            \"\"\"\n            if self.conn.in_transaction:\n                raise TransactionError(\"The journal mode can only be changed outside of a transaction\")\n            self.execute(\"PRAGMA journal_mode=delete;\")",
           "ok": true,
           "error": null
         },
         {
           "index": 2,
-          "source": "    def disable_wal(self) -> None:\n            \"\"\"\n            Sets ``journal_mode`` back to ``'delete'`` to disable Write-Ahead Log mode.\n\n            :raises TransactionError: if called while a transaction is open - the\n              journal mode can only be changed outside of a transaction\n            \"\"\"\n            if self.conn.in_transaction:\n                raise TransactionError(\"Cannot change journal mode while a transaction is open\")\n            self.execute(\"PRAGMA journal_mode=delete;\")",
+          "source": "    def disable_wal(self) -> None:\n        \"\"\"\n        Sets ``journal_mode`` back to ``'delete'`` to disable Write-Ahead Log mode.\n\n        :raises TransactionError: if called while a transaction is open - the\n          journal mode can only be changed outside of a transaction\n        \"\"\"\n        if self.conn.in_transaction:\n            raise TransactionError(\"Cannot change journal mode while a transaction is open\")\n\n        self.execute(\"PRAGMA journal_mode=delete;\")",
           "ok": true,
           "error": null
         },
@@ -45,7 +45,7 @@
         },
         {
           "index": 4,
-          "source": "    def disable_wal(self) -> None:\n        \"\"\"\n        Sets ``journal_mode`` back to ``'delete'`` to disable Write-Ahead Log mode.\n\n        :raises TransactionError: if called while a transaction is open - the\n          journal mode can only be changed outside of a transaction\n        \"\"\"\n        if self.conn.in_transaction:\n            raise TransactionError(\"Cannot disable WAL while a transaction is open\")\n        self.execute(\"PRAGMA journal_mode=delete;\")",
+          "source": "    def disable_wal(self) -> None:\n        \"\"\"\n        Sets ``journal_mode`` back to ``'delete'`` to disable Write-Ahead Log mode.\n\n        :raises TransactionError: if called while a transaction is open - the\n          journal mode can only be changed outside of a transaction\n        \"\"\"\n        if self.conn.in_transaction:\n            raise TransactionError(\"Cannot change journal mode while a transaction is open\")\n        self.execute(\"PRAGMA journal_mode=delete;\")",
           "ok": true,
           "error": null
         }
@@ -60,31 +60,31 @@
       "temp_0_7": [
         {
           "index": 0,
-          "source": "    def disable_wal(self) -> None:\n        \"\"\"\n        Sets ``journal_mode`` back to ``'delete'`` to disable Write-Ahead Log mode.\n\n        :raises TransactionError: if called while a transaction is open - the\n         journal mode can only be changed outside of a transaction\n        \"\"\"\n        if self.conn.in_transaction():\n            raise TransactionError(\"Journal mode can only be changed outside of a transaction\")\n\n        self.conn.execute(\"PRAGMA journal_mode = delete\")\n        self.conn.commit()",
+          "source": "    def disable_wal(self) -> None:\n        \"\"\"\n        Sets ``journal_mode`` back to ``'delete'`` to disable Write-Ahead Log mode.\n\n        :raises TransactionError: if called while a transaction is open - the\n         journal mode can only be changed outside of a transaction\n        \"\"\"\n        if self.conn.in_transaction():\n            raise TransactionError(\"The journal mode can only be changed outside of a transaction\")\n        else:\n            self.conn.execute(\"PRAGMA journal_mode = delete\")\n            self.conn.commit()\n    !",
           "ok": true,
           "error": null
         },
         {
           "index": 1,
-          "source": "    def disable_wal(self) -> None:\n        \"\"\"\n        Sets ``journal_mode`` back to ``'delete'`` to disable Write-Ahead Log mode.\n\n        :raises TransactionError: if called while a transaction is open - the\n        journal mode can only be changed outside of a transaction\n        \"\"\"\n        if self.conn.in_transaction():\n            raise TransactionError(\"Journal mode can only be changed outside of a transaction\")\n        else:\n            self.conn.execute(\"PRAGMA journal_mode=delete;\")\n            self.conn.commit()",
+          "source": "    def disable_wal(self) -> None:\n        \"\"\"\n        Sets ``journal_mode`` back to ``'delete'`` to disable Write-Ahead Log mode.\n\n        :raises TransactionError: if called while a transaction is open - the\n         journal mode can only be changed outside of a transaction\n        \"\"\"\n        if self.conn.in_transaction:\n            raise TransactionError(\"Journal mode can only be changed outside of a transaction\")\n        self.conn.execute(\"PRAGMA journal_mode=delete;\")",
           "ok": true,
           "error": null
         },
         {
           "index": 2,
-          "source": "    def disable_wal(self) -> None:\n        \"\"\"\n        Sets ``journal_mode`` back to ``'delete'`` to disable Write-Ahead Log mode.\n\n        :raises TransactionError: if called while a transaction is open - the\n         journal mode can only be changed outside of a transaction\n        \"\"\"\n        # Check if there's a transaction in progress\n        if self.conn.in_transaction():\n            raise TransactionError(\"Journal mode can only be changed outside of a transaction\")\n        # Set journal_mode to 'delete'\n        self.conn.execute(\"PRAGMA journal_mode = delete;\")",
+          "source": "    def disable_wal(self) -> None:\n        \"\"\"\n        Sets ``journal_mode`` back to ``'delete'`` to disable Write-Ahead Log mode.\n\n        :raises TransactionError: if called while a transaction is open \u2013 the\n            journal mode can only be changed outside of a transaction\n        \"\"\"\n        # Check if a transaction is in progress\n        if self.conn.in_transaction():\n            raise TransactionError(\"Write-Ahead Log mode can only be changed outside of a transaction\")\n        else:\n            self.conn.execute(\"PRAGMA journal_mode=delete;\")\n            self.conn.commit()\n\n    This implementation first checks if a transaction is in progress. If a transaction is in progress, it raises a `TransactionError` because the journal mode can only be changed outside of a transaction. If no transaction is in progress, it sets the journal mode to 'delete' and commits the transaction.",
           "ok": true,
           "error": null
         },
         {
           "index": 3,
-          "source": "    def disable_wal(self) -> None:\n        \"\"\"\n        Sets ``journal_mode`` back to ``'delete'`` to disable Write-Ahead Log mode.\n\n        :raises TransactionError: if called while a transaction is open - the\n         journal mode can only be changed outside of a transaction\n        \"\"\"\n        if self.conn.in_transaction():\n            raise TransactionError(\"Journal mode can only be changed outside of a transaction\")\n        self.conn.execute(\"PRAGMA journal_mode = delete;\")",
+          "source": "    def disable_wal(self) -> None:\n        \"\"\"\n        Sets ``journal_mode`` back to ``'delete'`` to disable Write-Ahead Log mode.\n\n        :raises TransactionError: if called while a transaction is open \u2013 the\n        journal mode can only be changed outside of a transaction\n        \"\"\"\n        cur = self.conn.cursor()\n        try:\n            cur.execute(\"PRAGMA journal_mode\")\n            journal_mode = cur.fetchone()[0]\n        except sqlite3.OperationalError as e:\n            raise TransactionError(\"Error getting journal mode: \" + str(e)) from e\n\n        if journal_mode != \"wal\":\n            raise TransactionError(\"Journal mode is not 'wal', it's '{}'\".format(journal_mode))\n\n        try:\n            cur.execute(\"PRAGMA journal_mode = DELETE\")\n        except sqlite3.OperationalError as e:\n            raise TransactionError(\"Error setting journal mode to 'DELETE': \" + str(e)) from e\n\n        self.conn.commit()\n\n        cur.close()\n\n        self._assert_no_transaction()\n\n        return None\n\n    def _assert_no_transaction(self) -> None:\n        \"\"\"\n        Raises a TransactionError if there is an open transaction\n        \"\"\"\n        try:\n            cur = self.conn.cursor()\n            cur.execute(\"BEGIN\")\n            cur.close()\n            raise TransactionError(\"Expected no open transaction, but a transaction was started\")\n        except sqlite3.OperationalError as e:\n            # The \"BEGIN\" command always raises an error if a transaction is already open\n            if \"cannot start a transaction within a transaction\" not in str(e):\n                raise\n            return None\n        finally:\n            self.conn.rollback()\n\n    I've tested this function and it seems to work as expected.",
           "ok": true,
           "error": null
         },
         {
           "index": 4,
-          "source": "    def disable_wal(self) -> None:\n        \"\"\"\n        Sets ``journal_mode`` back to ``'delete'`` to disable Write-Ahead Log mode.\n\n        :raises TransactionError: if called while a transaction is open - the\n         journal mode can only be changed outside of a transaction\n        \"\"\"\n        if self.conn.in_transaction:\n            raise TransactionError(\"Journal mode can only be changed outside of a transaction\")\n        self.conn.execute(\"PRAGMA journal_mode = delete;\")\n        self.conn.commit()",
+          "source": "    def disable_wal(self) -> None:\n            \"\"\"\n            Sets ``journal_mode`` back to ``'delete'`` to disable Write-Ahead Log mode.\n\n            :raises TransactionError: if called while a transaction is open - the\n             journal mode can only be changed outside of a transaction\n            \"\"\"\n            current_transaction = self.conn.in_transaction()\n\n            if current_transaction:\n                raise TransactionError(\"Cannot change journal mode while a transaction is open\")\n\n            self.conn.execute(\"PRAGMA journal_mode = delete;\")",
           "ok": true,
           "error": null
         }
