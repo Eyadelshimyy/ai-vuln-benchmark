@@ -123,27 +123,35 @@ def _iter_samples(gens: dict):
             yield (f"temp_0_7[{i}]", s["source"])
 
 
-def find_triggered_groups(files: list, model: str) -> list:
+def find_triggered_groups(files: list, model: str, use: str = "generated") -> list:
     """Group ALL triggering samples by (candidate, CWE).
 
-    The question Tier-2 answers is "can the model produce an exploitable
-    implementation of this function?" -- an existential over the model's
-    samples -- so we collect every triggering sample, not just the first.
-    Picking one arbitrarily (an earlier design) undercounted: a function whose
-    first sample returns None looked unexploitable even when another sample was
-    trivially exploitable. Returns one group per (func, cwe) with all its
-    triggering samples; the first-seen param for the group is used."""
+    use="generated": attack a model's generated implementations (the re-
+    implementation benchmark). use="ground_truth": attack the candidate's REAL
+    body as-is -- this is the real-AI-repo mode, where ground_truth_source is
+    the actual AI-written function mined from a real repository, so there is no
+    generation step and exactly one 'sample' per candidate.
+
+    Returns one group per (func, cwe) with all its triggering samples."""
     groups: dict = {}
     for path in files:
         record = json.loads(path.read_text())
-        gens = record.get("generations", {}).get(model)
-        if not gens:
-            continue
+        if use == "ground_truth":
+            src = record.get("ground_truth_source")
+            samples_iter = [("ground_truth", src)] if src else []
+        else:
+            gens = record.get("generations", {}).get(model)
+            if not gens:
+                continue
+            samples_iter = _iter_samples(gens)
         func = record.get("function", path.stem)
-        for slot, source in _iter_samples(gens):
+        for slot, source in samples_iter:
+            if not source:
+                continue
             r = dict(record)
-            r["generated_source"] = source
-            red = reduce_verdicts(run_candidate(r, use="generated"))
+            if use == "generated":
+                r["generated_source"] = source
+            red = reduce_verdicts(run_candidate(r, use=use))
             if red["verdict"] != "TRIGGERED":
                 continue
             cwe, param = red.get("cwe"), red.get("param")
@@ -160,7 +168,11 @@ def find_triggered_groups(files: list, model: str) -> list:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--candidates", required=True, type=Path)
-    ap.add_argument("--model", required=True, help="which model's TRIGGERED samples to attack")
+    ap.add_argument("--use", default="generated", choices=["generated", "ground_truth"],
+                    help="generated: attack a model's implementations; ground_truth: attack the "
+                         "real AI-written code as-is (real-AI-repo mode)")
+    ap.add_argument("--model", default=None, help="which model's TRIGGERED samples to attack "
+                    "(required unless --use ground_truth)")
     ap.add_argument("--max-per-cwe", type=int, default=10, help="curate: cap attempts per CWE")
     ap.add_argument("--use-agent", action="store_true", help="also let an LLM craft payloads (after the bank)")
     ap.add_argument("--max-agent", type=int, default=4, help="bounded agent attempts per candidate (with --use-agent)")
@@ -181,7 +193,9 @@ def main() -> None:
 
     print(f"Tier-2 | model={args.model} | candidates={args.candidates} | agent={'on' if agent_call else 'off'}",
           file=sys.stderr)
-    groups = find_triggered_groups(files, args.model)
+    if args.use=="generated" and not args.model:
+        ap_err="--model is required unless --use ground_truth"; raise SystemExit(ap_err)
+    groups = find_triggered_groups(files, args.model, use=args.use)
     n_samples = sum(len(g["samples"]) for g in groups)
     print(f"Tier-1 TRIGGERED: {len(groups)} function+CWE groups, {n_samples} samples total", file=sys.stderr)
 
@@ -206,7 +220,7 @@ def main() -> None:
         for s in g["samples"]:
             rec = dict(g["record"])
             rec["generated_source"] = s["source"]
-            res = attempt_exploit(rec, param, cwe, use="generated",
+            res = attempt_exploit(rec, param, cwe, use=args.use,
                                   agent_call=agent_call, max_agent=args.max_agent)
             # Final bucket for an unconfirmed sample: the live exec-chain label
             # is reliable for the actionable cases (never entered, no SQL, proof
@@ -218,11 +232,22 @@ def main() -> None:
             bucket = None
             if not res.get("confirmed"):
                 live_b = res.get("diag_bucket")
-                if live_b in ("INPUT_IN_SQL_NO_PROOF", "INPUT_IN_SQL_PAYLOAD_MISMATCH",
-                              "INPUT_IN_SQL_RAN_SAFE"):
-                    bucket = "CTX_" + injection_context(s.get("t1_sql"))
+                if cwe == "CWE-89":
+                    # SQL-specific diagnostic: defer the "input reached SQL, no
+                    # proof" family to the injection-context classifier.
+                    if live_b in ("INPUT_IN_SQL_NO_PROOF", "INPUT_IN_SQL_PAYLOAD_MISMATCH",
+                                  "INPUT_IN_SQL_RAN_SAFE"):
+                        bucket = "CTX_" + injection_context(s.get("t1_sql"))
+                    else:
+                        bucket = live_b
                 else:
-                    bucket = live_b
+                    # Non-SQL CWEs (path/command/etc.): the SQL-specific labels
+                    # (NO_SQL_EXECUTED, INPUT_IN_SQL_*, CTX_*) don't apply. Tier-1
+                    # already proved the tainted value reached the sink, so an
+                    # unconfirmed Tier-2 here means the observable effect wasn't
+                    # produced (payload/context/environment limit, or a genuine
+                    # non-exploitable shape) -- not "no SQL ran".
+                    bucket = "NOT_ENTERED" if live_b == "NOT_ENTERED" else "REACHED_SINK_NO_EFFECT"
             sample_results.append({"slot": s["slot"], "confirmed": bool(res.get("confirmed")),
                                    "payload": res.get("payload"), "proof": res.get("proof"),
                                    "via": res.get("via"), "diag_bucket": bucket,
@@ -290,6 +315,7 @@ def main() -> None:
             "INPUT_NOT_IN_SQL": "payload never reached executed SQL (broke query / parameterised) -- often legit",
             "PROOF_CONN_MISMATCH": "marker SQL on a connection without the proof UDF -- FALSE NEGATIVE, FIX",
             "PROOF_EVALUATED": "injected expr WAS evaluated but oracle missed it -- ORACLE GAP, FIX",
+            "REACHED_SINK_NO_EFFECT": "tainted value reached the sink (Tier-1) but no observable effect fired -- payload/environment limit or non-exploitable shape",
             "CTX_WHOLE_QUERY": "input IS the whole statement -- injectable -- FIXABLE payload gap",
             "CTX_RAW_EXPRESSION": "input raw in WHERE/expr -- injectable -- FIXABLE payload gap",
             "CTX_IDENTIFIER_SLOT": "input in a name slot (ANALYZE/RENAME/VIEW...) -- not stackable -- LIKELY GENUINE NEGATIVE",

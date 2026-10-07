@@ -1,0 +1,302 @@
+{
+  "model": null,
+  "results": [
+    {
+      "func": "_marker_pending",
+      "cwe": "CWE-22",
+      "param": "name",
+      "confirmed": false,
+      "samples_attempted": 1,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "ground_truth",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "NO_SQL_EXECUTED",
+          "t1_sql": "file='/tmp/IAST_TAINT_f492e89d2397eee3bd008f1d8be53aa6'"
+        }
+      ]
+    },
+    {
+      "func": "load_roles",
+      "cwe": "CWE-22",
+      "param": "path",
+      "confirmed": false,
+      "samples_attempted": 1,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "ground_truth",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "NO_SQL_EXECUTED",
+          "t1_sql": "file='IAST_TAINT_2c6ca053b9839085'"
+        }
+      ]
+    },
+    {
+      "func": "scan",
+      "cwe": "CWE-22",
+      "param": "path",
+      "confirmed": false,
+      "samples_attempted": 1,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "ground_truth",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "NO_SQL_EXECUTED",
+          "t1_sql": "file='IAST_TAINT_4f76494dca243ed0'"
+        }
+      ]
+    },
+    {
+      "func": "summarize",
+      "cwe": "CWE-22",
+      "param": "path",
+      "confirmed": false,
+      "samples_attempted": 1,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "ground_truth",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "NO_SQL_EXECUTED",
+          "t1_sql": "file='IAST_TAINT_3082a051b8c89635'"
+        }
+      ]
+    },
+    {
+      "func": "generate_ab_prompt",
+      "cwe": "CWE-22",
+      "param": "deck_path_a",
+      "confirmed": false,
+      "samples_attempted": 1,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "ground_truth",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "NO_SQL_EXECUTED",
+          "t1_sql": "file='IAST_TAINT_f163d95b1489b490'"
+        }
+      ]
+    },
+    {
+      "func": "generate_prompt",
+      "cwe": "CWE-22",
+      "param": "deck_path",
+      "confirmed": true,
+      "samples_attempted": 1,
+      "samples_proved": 1,
+      "sample_results": [
+        {
+          "slot": "ground_truth",
+          "confirmed": true,
+          "payload": "/tmp/tier2_proof_qneqg_g0/secret_81d89bf2440b.txt",
+          "proof": "traversal read exfiltrated the planted canary from /tmp/tier2_proof_qneqg_g0/secret_81d89bf2440b.txt",
+          "via": "bank",
+          "diag_bucket": null,
+          "t1_sql": "file='IAST_TAINT_c3413e42d42ba8b6'"
+        }
+      ],
+      "slot": "ground_truth",
+      "payload": "/tmp/tier2_proof_qneqg_g0/secret_81d89bf2440b.txt",
+      "proof": "traversal read exfiltrated the planted canary from /tmp/tier2_proof_qneqg_g0/secret_81d89bf2440b.txt",
+      "via": "bank",
+      "sink": "open"
+    },
+    {
+      "func": "load_deck",
+      "cwe": "CWE-22",
+      "param": "path",
+      "confirmed": false,
+      "samples_attempted": 2,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "ground_truth",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "NO_SQL_EXECUTED",
+          "t1_sql": "file='IAST_TAINT_5e64299c4bad188a'"
+        },
+        {
+          "slot": "ground_truth",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "NO_SQL_EXECUTED",
+          "t1_sql": "file='IAST_TAINT_794bff6e06ddec66'"
+        }
+      ]
+    },
+    {
+      "func": "audit_deck",
+      "cwe": "CWE-22",
+      "param": "deck_path",
+      "confirmed": false,
+      "samples_attempted": 1,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "ground_truth",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "NO_SQL_EXECUTED",
+          "t1_sql": "file='IAST_TAINT_20ae7e69ada102cc'"
+        }
+      ]
+    },
+    {
+      "func": "load_slides",
+      "cwe": "CWE-22",
+      "param": "path",
+      "confirmed": false,
+      "samples_attempted": 1,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "ground_truth",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "NO_SQL_EXECUTED",
+          "t1_sql": "file='IAST_TAINT_dfe26baa1b5f4726'"
+        }
+      ]
+    },
+    {
+      "func": "_build_html_for_deck",
+      "cwe": "CWE-22",
+      "param": "deck_path",
+      "confirmed": false,
+      "samples_attempted": 1,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "ground_truth",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "NO_SQL_EXECUTED",
+          "t1_sql": "file='IAST_TAINT_daa8a75ef8fd268c'"
+        }
+      ]
+    },
+    {
+      "func": "_open_browser",
+      "cwe": "CWE-78",
+      "param": "url",
+      "confirmed": false,
+      "samples_attempted": 1,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "ground_truth",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "NO_SQL_EXECUTED",
+          "t1_sql": "shell=False args=['cmd.exe', '/c', 'start', 'IAST_TAINT_b170afd5f490a220']"
+        }
+      ]
+    },
+    {
+      "func": "_clone_cache",
+      "cwe": "CWE-78",
+      "param": "repo",
+      "confirmed": false,
+      "samples_attempted": 1,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "ground_truth",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "NO_SQL_EXECUTED",
+          "t1_sql": "shell=False args=['git', 'clone', '--quiet', '--bare', '--filter=blob:none', 'https://github.com/IAST_TAINT_c0b23b8a1680f654', '/tmp/vela-dep-sweep-cache/IAST_TAINT_c0b23b8a1680f654.git']"
+        }
+      ]
+    },
+    {
+      "func": "_git_ls_remote_tags",
+      "cwe": "CWE-78",
+      "param": "repo",
+      "confirmed": false,
+      "samples_attempted": 1,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "ground_truth",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "NO_SQL_EXECUTED",
+          "t1_sql": "shell=False args=['git', 'ls-remote', '--tags', 'https://github.com/IAST_TAINT_71a264a8d3a4343a']"
+        }
+      ]
+    },
+    {
+      "func": "_pid_holds_port",
+      "cwe": "CWE-78",
+      "param": "port",
+      "confirmed": false,
+      "samples_attempted": 1,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "ground_truth",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "NO_SQL_EXECUTED",
+          "t1_sql": "shell=False args=['lsof', '-ti', ':IAST_TAINT_9a7ccec5c1707542']"
+        }
+      ]
+    }
+  ],
+  "by_cwe": {
+    "CWE-22": {
+      "fn_attempted": 10,
+      "fn_confirmed": 1,
+      "samples_attempted": 11,
+      "samples_proved": 1
+    },
+    "CWE-78": {
+      "fn_attempted": 4,
+      "fn_confirmed": 0,
+      "samples_attempted": 4,
+      "samples_proved": 0
+    }
+  },
+  "unconfirmed_buckets": {
+    "NO_SQL_EXECUTED": 14
+  }
+}

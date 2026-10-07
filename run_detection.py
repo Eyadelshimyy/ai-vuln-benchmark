@@ -42,10 +42,11 @@ from detection.llm_detector import detect, detect_panel  # noqa: E402
 _TRUTH = {"TRIGGERED": "VULN", "NOT_TRIGGERED": "SAFE", "COULD_NOT_EXECUTE": "UNRESOLVED"}
 
 
-def exec_truth(record: dict, source: str) -> dict:
+def exec_truth(record: dict, source: str, use: str = "generated") -> dict:
     tmp = dict(record)
-    tmp["generated_source"] = source
-    red = reduce_verdicts(run_candidate(tmp, use="generated"))
+    if use == "generated":
+        tmp["generated_source"] = source
+    red = reduce_verdicts(run_candidate(tmp, use=use))
     return {"truth": _TRUTH.get(red["verdict"], "UNRESOLVED"),
             "cwe": red.get("cwe"), "tier1": red["verdict"]}
 
@@ -70,7 +71,12 @@ def _matrix(pairs):
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--candidates", required=True, type=Path)
-    ap.add_argument("--generator", required=True, help="whose generated code is judged")
+    ap.add_argument("--use", default="generated", choices=["generated", "ground_truth"],
+                    help="generated: judge a model's implementations; ground_truth: judge the "
+                         "real AI-written code as-is (real-AI-repo mode)")
+    ap.add_argument("--generator", default=None, help="whose generated code is judged "
+                    "(required unless --use ground_truth; in ground_truth mode this is just a "
+                    "provenance label for the source repo's model, e.g. 'claude')")
     ap.add_argument("--detectors", required=True, help="comma-separated judge model(s)")
     ap.add_argument("--samples", type=int, default=5, help="judgments per model (majority vote)")
     ap.add_argument("--temperature", type=float, default=0.2)
@@ -91,20 +97,31 @@ def main() -> None:
                                            "tier2_results.json", "detection_results.json")))
     files = [p for p in files if "prompt_source" in json.loads(p.read_text())]
 
-    print(f"Axis-B | generator={args.generator} | detectors={detector_names} "
+    print(f"Axis-B | generator={args.generator or 'repo-provenance'} | detectors={detector_names} | use={args.use} "
           f"| rule={'single' if not is_panel else args.rule}", file=sys.stderr)
+
+    if args.use == "generated" and not args.generator:
+        raise SystemExit("--generator is required unless --use ground_truth")
+    gen_label = args.generator or "repo-provenance"
 
     records = []
     for path in files:
         rec = json.loads(path.read_text())
-        gens = rec.get("generations", {}).get(args.generator)
-        if not gens:
-            continue
-        for slot, source in iter_samples(gens):
-            gt = exec_truth(rec, source)
+        if args.use == "ground_truth":
+            src = rec.get("ground_truth_source")
+            samples_iter = [("ground_truth", src)] if src else []
+        else:
+            gens = rec.get("generations", {}).get(args.generator)
+            if not gens:
+                continue
+            samples_iter = iter_samples(gens)
+        for slot, source in samples_iter:
+            if not source:
+                continue
+            gt = exec_truth(rec, source, use=args.use)
             row = {
                 "library_id": rec.get("repo"), "function_id": rec.get("function"),
-                "generator_model": args.generator, "sample_id": slot,
+                "generator_model": gen_label, "sample_id": slot,
                 "exec_truth": gt["truth"], "exec_cwe": gt["cwe"], "tier1": gt["tier1"],
             }
             if is_panel:
@@ -132,7 +149,7 @@ def main() -> None:
 
     print("\n" + "=" * 70)
     print(f"VULCAN AXIS-B (LLM detection vs execution ground truth)")
-    print(f"generator={args.generator}")
+    print(f"generator={gen_label}")
     print("=" * 70)
     print(f"samples: {len(records)} total | {len(scored)} scored (VULN/SAFE) "
           f"| {unresolved} UNRESOLVED excluded")
@@ -140,7 +157,7 @@ def main() -> None:
     print(f"ground truth: {gt_v} vulnerable, {len(scored)-gt_v} safe")
     print("-" * 70)
 
-    report = {"generator": args.generator, "detectors": detector_names,
+    report = {"generator": gen_label, "detectors": detector_names,
               "rule": args.rule if is_panel else "single",
               "n_total": len(records), "n_scored": len(scored), "unresolved": unresolved,
               "records": records}
