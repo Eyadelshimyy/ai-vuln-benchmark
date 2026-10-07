@@ -1,5 +1,5 @@
 {
-  "model": "qwen2.5-coder:7b",
+  "model": "deepseek-coder:6.7b",
   "results": [
     {
       "func": "_executescript",
@@ -12,49 +12,61 @@
         {
           "slot": "temp_0_0",
           "confirmed": true,
-          "payload": "; ATTACH DATABASE '/tmp/tier2_proof_sz52tnr6/pwn_c92a6c74d4ce.db' AS pwn; CREATE TABLE pwn.pwned(x); --",
-          "proof": "injected SQL ATTACHed /tmp/tier2_proof_sz52tnr6/pwn_c92a6c74d4ce.db and CREATEd table 'pwned'",
-          "via": "bank"
+          "payload": "; ATTACH DATABASE '/tmp/tier2_proof_thhwzvs9/pwn_b418b07969f7.db' AS pwn; CREATE TABLE pwn.pwned(x); --",
+          "proof": "injected SQL ATTACHed /tmp/tier2_proof_thhwzvs9/pwn_b418b07969f7.db and CREATEd table 'pwned'",
+          "via": "bank",
+          "diag_bucket": null,
+          "t1_sql": "sql='IAST_TAINT_bec73e5647f277a2'"
         },
         {
           "slot": "temp_0_7[0]",
           "confirmed": true,
-          "payload": "; ATTACH DATABASE '/tmp/tier2_proof_l1rdscb0/pwn_3d1b5b389304.db' AS pwn; CREATE TABLE pwn.pwned(x); --",
-          "proof": "injected SQL ATTACHed /tmp/tier2_proof_l1rdscb0/pwn_3d1b5b389304.db and CREATEd table 'pwned'",
-          "via": "bank"
+          "payload": "; ATTACH DATABASE '/tmp/tier2_proof_q6g8t_zs/pwn_7b0bbbdeac33.db' AS pwn; CREATE TABLE pwn.pwned(x); --",
+          "proof": "injected SQL ATTACHed /tmp/tier2_proof_q6g8t_zs/pwn_7b0bbbdeac33.db and CREATEd table 'pwned'",
+          "via": "bank",
+          "diag_bucket": null,
+          "t1_sql": "sql='IAST_TAINT_7ca16aa95a515d76'"
         },
         {
           "slot": "temp_0_7[1]",
           "confirmed": true,
-          "payload": "; ATTACH DATABASE '/tmp/tier2_proof_g63pfk7o/pwn_aa5e6687c280.db' AS pwn; CREATE TABLE pwn.pwned(x); --",
-          "proof": "injected SQL ATTACHed /tmp/tier2_proof_g63pfk7o/pwn_aa5e6687c280.db and CREATEd table 'pwned'",
-          "via": "bank"
+          "payload": "; ATTACH DATABASE '/tmp/tier2_proof_1rj7tli5/pwn_824cbef60110.db' AS pwn; CREATE TABLE pwn.pwned(x); --",
+          "proof": "injected SQL ATTACHed /tmp/tier2_proof_1rj7tli5/pwn_824cbef60110.db and CREATEd table 'pwned'",
+          "via": "bank",
+          "diag_bucket": null,
+          "t1_sql": "sql='IAST_TAINT_172979c024a566e8'"
         },
         {
           "slot": "temp_0_7[2]",
           "confirmed": true,
-          "payload": "; ATTACH DATABASE '/tmp/tier2_proof_ec9gvn6_/pwn_330c71a2aa07.db' AS pwn; CREATE TABLE pwn.pwned(x); --",
-          "proof": "injected SQL ATTACHed /tmp/tier2_proof_ec9gvn6_/pwn_330c71a2aa07.db and CREATEd table 'pwned'",
-          "via": "bank"
+          "payload": "; ATTACH DATABASE '/tmp/tier2_proof_31q9z9i4/pwn_b23eb19bbe2a.db' AS pwn; CREATE TABLE pwn.pwned(x); --",
+          "proof": "injected SQL ATTACHed /tmp/tier2_proof_31q9z9i4/pwn_b23eb19bbe2a.db and CREATEd table 'pwned'",
+          "via": "bank",
+          "diag_bucket": null,
+          "t1_sql": "sql='IAST_TAINT_cf5f9df63861d30a'"
         },
         {
           "slot": "temp_0_7[3]",
           "confirmed": true,
-          "payload": "; ATTACH DATABASE '/tmp/tier2_proof_mbrvtmax/pwn_a17f3e237762.db' AS pwn; CREATE TABLE pwn.pwned(x); --",
-          "proof": "injected SQL ATTACHed /tmp/tier2_proof_mbrvtmax/pwn_a17f3e237762.db and CREATEd table 'pwned'",
-          "via": "bank"
+          "payload": "; ATTACH DATABASE '/tmp/tier2_proof_i2xwbqu0/pwn_c3ea8ed31d6b.db' AS pwn; CREATE TABLE pwn.pwned(x); --",
+          "proof": "injected SQL ATTACHed /tmp/tier2_proof_i2xwbqu0/pwn_c3ea8ed31d6b.db and CREATEd table 'pwned'",
+          "via": "bank",
+          "diag_bucket": null,
+          "t1_sql": "sql='IAST_TAINT_e5fa2714638128ad'"
         },
         {
           "slot": "temp_0_7[4]",
           "confirmed": true,
-          "payload": "; ATTACH DATABASE '/tmp/tier2_proof_iervbxa5/pwn_91d933c90ad3.db' AS pwn; CREATE TABLE pwn.pwned(x); --",
-          "proof": "injected SQL ATTACHed /tmp/tier2_proof_iervbxa5/pwn_91d933c90ad3.db and CREATEd table 'pwned'",
-          "via": "bank"
+          "payload": "; ATTACH DATABASE '/tmp/tier2_proof_06reb_yq/pwn_2b7fca3a94c0.db' AS pwn; CREATE TABLE pwn.pwned(x); --",
+          "proof": "injected SQL ATTACHed /tmp/tier2_proof_06reb_yq/pwn_2b7fca3a94c0.db and CREATEd table 'pwned'",
+          "via": "bank",
+          "diag_bucket": null,
+          "t1_sql": "sql='IAST_TAINT_75449cd6f5f61d0d'"
         }
       ],
       "slot": "temp_0_0",
-      "payload": "; ATTACH DATABASE '/tmp/tier2_proof_sz52tnr6/pwn_c92a6c74d4ce.db' AS pwn; CREATE TABLE pwn.pwned(x); --",
-      "proof": "injected SQL ATTACHed /tmp/tier2_proof_sz52tnr6/pwn_c92a6c74d4ce.db and CREATEd table 'pwned'",
+      "payload": "; ATTACH DATABASE '/tmp/tier2_proof_thhwzvs9/pwn_b418b07969f7.db' AS pwn; CREATE TABLE pwn.pwned(x); --",
+      "proof": "injected SQL ATTACHed /tmp/tier2_proof_thhwzvs9/pwn_b418b07969f7.db and CREATEd table 'pwned'",
       "via": "bank",
       "sink": "sqlite3.Connection.executescript"
     },
@@ -71,94 +83,82 @@
           "confirmed": false,
           "payload": null,
           "proof": null,
-          "via": null
+          "via": null,
+          "diag_bucket": "CTX_IDENTIFIER_SLOT",
+          "t1_sql": "sql='ANALYZE IAST_TAINT_a6e58f902b918e32;'"
         },
         {
           "slot": "temp_0_7[0]",
           "confirmed": false,
           "payload": null,
           "proof": null,
-          "via": null
+          "via": null,
+          "diag_bucket": "CTX_IDENTIFIER_SLOT",
+          "t1_sql": "sql='ANALYZE IAST_TAINT_e3a71e4a0f0203d5;'"
         },
         {
           "slot": "temp_0_7[1]",
           "confirmed": false,
           "payload": null,
           "proof": null,
-          "via": null
+          "via": null,
+          "diag_bucket": "CTX_IDENTIFIER_SLOT",
+          "t1_sql": "sql='ANALYZE IAST_TAINT_afc5536fff870ff8;'"
         },
         {
           "slot": "temp_0_7[2]",
           "confirmed": false,
           "payload": null,
           "proof": null,
-          "via": null
+          "via": null,
+          "diag_bucket": "CTX_IDENTIFIER_SLOT",
+          "t1_sql": "sql='ANALYZE IAST_TAINT_321a86ce9b2eb4c8;'"
         },
         {
           "slot": "temp_0_7[3]",
           "confirmed": false,
           "payload": null,
           "proof": null,
-          "via": null
+          "via": null,
+          "diag_bucket": "CTX_IDENTIFIER_SLOT",
+          "t1_sql": "sql='ANALYZE IAST_TAINT_1cc3975780eac8da'"
         },
         {
           "slot": "temp_0_7[4]",
           "confirmed": false,
           "payload": null,
           "proof": null,
-          "via": null
+          "via": null,
+          "diag_bucket": "CTX_IDENTIFIER_SLOT",
+          "t1_sql": "sql='ANALYZE IAST_TAINT_6784e06dcc46983a'"
         }
       ]
     },
     {
-      "func": "attach",
+      "func": "count_where",
       "cwe": "CWE-89",
-      "param": "alias",
+      "param": "where",
       "confirmed": false,
-      "samples_attempted": 6,
+      "samples_attempted": 2,
       "samples_proved": 0,
       "sample_results": [
-        {
-          "slot": "temp_0_0",
-          "confirmed": false,
-          "payload": null,
-          "proof": null,
-          "via": null
-        },
-        {
-          "slot": "temp_0_7[0]",
-          "confirmed": false,
-          "payload": null,
-          "proof": null,
-          "via": null
-        },
         {
           "slot": "temp_0_7[1]",
           "confirmed": false,
           "payload": null,
           "proof": null,
-          "via": null
-        },
-        {
-          "slot": "temp_0_7[2]",
-          "confirmed": false,
-          "payload": null,
-          "proof": null,
-          "via": null
-        },
-        {
-          "slot": "temp_0_7[3]",
-          "confirmed": false,
-          "payload": null,
-          "proof": null,
-          "via": null
+          "via": null,
+          "diag_bucket": "CTX_RAW_EXPRESSION",
+          "t1_sql": "sql='SELECT COUNT(*) FROM  WHERE IAST_TAINT_aec4f013700b3048'"
         },
         {
           "slot": "temp_0_7[4]",
           "confirmed": false,
           "payload": null,
           "proof": null,
-          "via": null
+          "via": null,
+          "diag_bucket": "CTX_RAW_EXPRESSION",
+          "t1_sql": "sql='SELECT COUNT(*) FROM  WHERE IAST_TAINT_bbf56c1314c311bf'"
         }
       ]
     },
@@ -167,44 +167,6 @@
       "cwe": "CWE-89",
       "param": "name",
       "confirmed": false,
-      "samples_attempted": 4,
-      "samples_proved": 0,
-      "sample_results": [
-        {
-          "slot": "temp_0_0",
-          "confirmed": false,
-          "payload": null,
-          "proof": null,
-          "via": null
-        },
-        {
-          "slot": "temp_0_7[1]",
-          "confirmed": false,
-          "payload": null,
-          "proof": null,
-          "via": null
-        },
-        {
-          "slot": "temp_0_7[2]",
-          "confirmed": false,
-          "payload": null,
-          "proof": null,
-          "via": null
-        },
-        {
-          "slot": "temp_0_7[4]",
-          "confirmed": false,
-          "payload": null,
-          "proof": null,
-          "via": null
-        }
-      ]
-    },
-    {
-      "func": "execute",
-      "cwe": "CWE-89",
-      "param": "sql",
-      "confirmed": false,
       "samples_attempted": 6,
       "samples_proved": 0,
       "sample_results": [
@@ -213,42 +175,178 @@
           "confirmed": false,
           "payload": null,
           "proof": null,
-          "via": null
+          "via": null,
+          "diag_bucket": "CTX_IDENTIFIER_SLOT",
+          "t1_sql": "sql='CREATE VIEW IAST_TAINT_bc706a9c6ecb5fa2 AS autoharness_placeholder'"
         },
         {
           "slot": "temp_0_7[0]",
           "confirmed": false,
           "payload": null,
           "proof": null,
-          "via": null
+          "via": null,
+          "diag_bucket": "CTX_IDENTIFIER_SLOT",
+          "t1_sql": "sql='CREATE VIEW IAST_TAINT_7850c22867a9f6e5 AS autoharness_placeholder'"
         },
         {
           "slot": "temp_0_7[1]",
           "confirmed": false,
           "payload": null,
           "proof": null,
-          "via": null
+          "via": null,
+          "diag_bucket": "CTX_IDENTIFIER_SLOT",
+          "t1_sql": "sql='CREATE VIEW IAST_TAINT_c298ad58b4fbe4f7 AS autoharness_placeholder'"
         },
         {
           "slot": "temp_0_7[2]",
           "confirmed": false,
           "payload": null,
           "proof": null,
-          "via": null
+          "via": null,
+          "diag_bucket": "CTX_IDENTIFIER_SLOT",
+          "t1_sql": "sql='CREATE VIEW IAST_TAINT_38712796f6bcc3e8 AS autoharness_placeholder'"
         },
         {
           "slot": "temp_0_7[3]",
           "confirmed": false,
           "payload": null,
           "proof": null,
-          "via": null
+          "via": null,
+          "diag_bucket": "CTX_IDENTIFIER_SLOT",
+          "t1_sql": "sql='CREATE VIEW IAST_TAINT_62cda946177c1dd4 AS autoharness_placeholder'"
         },
         {
           "slot": "temp_0_7[4]",
           "confirmed": false,
           "payload": null,
           "proof": null,
-          "via": null
+          "via": null,
+          "diag_bucket": "CTX_IDENTIFIER_SLOT",
+          "t1_sql": "sql='CREATE VIEW IAST_TAINT_2d3c068552ae9494 AS autoharness_placeholder'"
+        }
+      ]
+    },
+    {
+      "func": "execute",
+      "cwe": "CWE-89",
+      "param": "sql",
+      "confirmed": true,
+      "samples_attempted": 6,
+      "samples_proved": 1,
+      "sample_results": [
+        {
+          "slot": "temp_0_0",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "CTX_WHOLE_QUERY",
+          "t1_sql": "sql='IAST_TAINT_0a081024bad8d6d3'"
+        },
+        {
+          "slot": "temp_0_7[0]",
+          "confirmed": true,
+          "payload": "INSERT INTO vulcan_seed(secret) SELECT vulcan_proof()",
+          "proof": "injected SQL invoked attacker-reachable function vulcan_proof() (sentinel written)",
+          "via": "bank",
+          "diag_bucket": null,
+          "t1_sql": "sql='IAST_TAINT_515e753b2dc1b60d'"
+        },
+        {
+          "slot": "temp_0_7[1]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "CTX_WHOLE_QUERY",
+          "t1_sql": "sql='IAST_TAINT_ff6ee2c0318c5a4a'"
+        },
+        {
+          "slot": "temp_0_7[2]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "CTX_WHOLE_QUERY",
+          "t1_sql": "sql='IAST_TAINT_ba05df56e36a4278'"
+        },
+        {
+          "slot": "temp_0_7[3]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "CTX_WHOLE_QUERY",
+          "t1_sql": "sql='IAST_TAINT_44ab930d567ade10'"
+        },
+        {
+          "slot": "temp_0_7[4]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "CTX_WHOLE_QUERY",
+          "t1_sql": "sql='IAST_TAINT_2882efa2998a31b2'"
+        }
+      ],
+      "slot": "temp_0_7[0]",
+      "payload": "INSERT INTO vulcan_seed(secret) SELECT vulcan_proof()",
+      "proof": "injected SQL invoked attacker-reachable function vulcan_proof() (sentinel written)",
+      "via": "bank",
+      "sink": "sqlite3.Cursor.execute"
+    },
+    {
+      "func": "init_spatialite",
+      "cwe": "CWE-89",
+      "param": "path",
+      "confirmed": false,
+      "samples_attempted": 5,
+      "samples_proved": 0,
+      "sample_results": [
+        {
+          "slot": "temp_0_0",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "CTX_QUOTED_STRING",
+          "t1_sql": "sql='SELECT load_extension(\"IAST_TAINT_30c6644ea8bef7b4\")'"
+        },
+        {
+          "slot": "temp_0_7[0]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "CTX_RAW_EXPRESSION",
+          "t1_sql": "sql='SELECT InitSpatiaLite(IAST_TAINT_ef2304b19555152a, 1000);'"
+        },
+        {
+          "slot": "temp_0_7[1]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "CTX_QUOTED_STRING",
+          "t1_sql": "sql=\"SELECT load_extension('IAST_TAINT_3bd5725d32349033')\""
+        },
+        {
+          "slot": "temp_0_7[2]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "CTX_QUOTED_STRING",
+          "t1_sql": "sql=\"SELECT load_extension('IAST_TAINT_20b685dfb1ed7ed6')\""
+        },
+        {
+          "slot": "temp_0_7[4]",
+          "confirmed": false,
+          "payload": null,
+          "proof": null,
+          "via": null,
+          "diag_bucket": "CTX_RAW_EXPRESSION",
+          "t1_sql": "sql='SELECT InitSpatiaLite(IAST_TAINT_5f099d51e813a9b7);'"
         }
       ]
     },
@@ -257,48 +355,22 @@
       "cwe": "CWE-94",
       "param": "path",
       "confirmed": true,
-      "samples_attempted": 5,
-      "samples_proved": 5,
+      "samples_attempted": 1,
+      "samples_proved": 1,
       "sample_results": [
-        {
-          "slot": "temp_0_0",
-          "confirmed": true,
-          "payload": "/tmp/vulcan_tier2_ext/proofext.so",
-          "proof": "attacker-controlled code execution created /tmp/tier2_proof_8bo8rhnh/pwned_9dfd1dac7217",
-          "via": "bank"
-        },
-        {
-          "slot": "temp_0_7[1]",
-          "confirmed": true,
-          "payload": "/tmp/vulcan_tier2_ext/proofext.so",
-          "proof": "attacker-controlled code execution created /tmp/tier2_proof_m8ml9bje/pwned_2ffab8646da2",
-          "via": "bank"
-        },
-        {
-          "slot": "temp_0_7[2]",
-          "confirmed": true,
-          "payload": "/tmp/vulcan_tier2_ext/proofext.so",
-          "proof": "attacker-controlled code execution created /tmp/tier2_proof_kf3rahx3/pwned_df45127e1ac6",
-          "via": "bank"
-        },
         {
           "slot": "temp_0_7[3]",
           "confirmed": true,
           "payload": "/tmp/vulcan_tier2_ext/proofext.so",
-          "proof": "attacker-controlled code execution created /tmp/tier2_proof_vv32m36u/pwned_d1375f801c51",
-          "via": "bank"
-        },
-        {
-          "slot": "temp_0_7[4]",
-          "confirmed": true,
-          "payload": "/tmp/vulcan_tier2_ext/proofext.so",
-          "proof": "attacker-controlled code execution created /tmp/tier2_proof_oj9lll32/pwned_ea7390a1103e",
-          "via": "bank"
+          "proof": "attacker-controlled code execution created /tmp/tier2_proof_wlmqgb4k/pwned_293b4593e5cc",
+          "via": "bank",
+          "diag_bucket": null,
+          "t1_sql": "path='IAST_TAINT_c1e8e10b4a7457da'"
         }
       ],
-      "slot": "temp_0_0",
+      "slot": "temp_0_7[3]",
       "payload": "/tmp/vulcan_tier2_ext/proofext.so",
-      "proof": "attacker-controlled code execution created /tmp/tier2_proof_8bo8rhnh/pwned_9dfd1dac7217",
+      "proof": "attacker-controlled code execution created /tmp/tier2_proof_wlmqgb4k/pwned_293b4593e5cc",
       "via": "bank",
       "sink": "sqlite3.Connection.load_extension"
     },
@@ -307,7 +379,7 @@
       "cwe": "CWE-89",
       "param": "name",
       "confirmed": false,
-      "samples_attempted": 6,
+      "samples_attempted": 5,
       "samples_proved": 0,
       "sample_results": [
         {
@@ -315,58 +387,67 @@
           "confirmed": false,
           "payload": null,
           "proof": null,
-          "via": null
+          "via": null,
+          "diag_bucket": "CTX_IDENTIFIER_SLOT",
+          "t1_sql": "sql='ALTER TABLE IAST_TAINT_022d331f62ae92ec RENAME TO autoharness_placeholder'"
         },
         {
           "slot": "temp_0_7[0]",
           "confirmed": false,
           "payload": null,
           "proof": null,
-          "via": null
+          "via": null,
+          "diag_bucket": "CTX_IDENTIFIER_SLOT",
+          "t1_sql": "sql='ALTER TABLE IAST_TAINT_4002c896931a6c53 RENAME TO autoharness_placeholder'"
         },
         {
           "slot": "temp_0_7[1]",
           "confirmed": false,
           "payload": null,
           "proof": null,
-          "via": null
+          "via": null,
+          "diag_bucket": "CTX_IDENTIFIER_SLOT",
+          "t1_sql": "sql='ALTER TABLE IAST_TAINT_e516d375a60565e1 RENAME TO autoharness_placeholder;'"
         },
         {
           "slot": "temp_0_7[2]",
           "confirmed": false,
           "payload": null,
           "proof": null,
-          "via": null
+          "via": null,
+          "diag_bucket": "CTX_IDENTIFIER_SLOT",
+          "t1_sql": "sql='ALTER TABLE IAST_TAINT_ac0993d7c1cd8538 RENAME TO autoharness_placeholder'"
         },
         {
           "slot": "temp_0_7[3]",
           "confirmed": false,
           "payload": null,
           "proof": null,
-          "via": null
-        },
-        {
-          "slot": "temp_0_7[4]",
-          "confirmed": false,
-          "payload": null,
-          "proof": null,
-          "via": null
+          "via": null,
+          "diag_bucket": "CTX_IDENTIFIER_SLOT",
+          "t1_sql": "sql='ALTER TABLE IAST_TAINT_afca1f7195b9751e RENAME TO autoharness_placeholder'"
         }
       ]
     }
   ],
   "by_cwe": {
     "CWE-89": {
-      "fn_attempted": 6,
-      "fn_confirmed": 1,
-      "samples_attempted": 34,
-      "samples_proved": 6
+      "fn_attempted": 7,
+      "fn_confirmed": 2,
+      "samples_attempted": 36,
+      "samples_proved": 7
     },
     "CWE-94": {
       "fn_attempted": 1,
       "fn_confirmed": 1,
-      "samples_attempted": 5,
-      "samples_proved": 5
+      "samples_attempted": 1,
+      "samples_proved": 1
     }
+  },
+  "unconfirmed_buckets": {
+    "CTX_IDENTIFIER_SLOT": 17,
+    "CTX_RAW_EXPRESSION": 4,
+    "CTX_WHOLE_QUERY": 5,
+    "CTX_QUOTED_STRING": 3
   }
 }

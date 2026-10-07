@@ -47,6 +47,35 @@ try:
 except ImportError:
     _CassandraSession = None
 
+# --- CWE-502 (insecure deserialization): PyYAML's unsafe loaders + pickle.
+# pickle is stdlib (always present); PyYAML is optional. yaml.safe_load uses
+# SafeLoader and is the fix, so patching yaml.load (and checking the loader)
+# naturally distinguishes vulnerable (yaml.load / UnsafeLoader) from safe
+# (yaml.safe_load / SafeLoader). ---
+import pickle as _pickle
+try:
+    import yaml as _yaml
+except ImportError:
+    _yaml = None
+
+# --- CWE-611 (XML external entity): lxml's parser, when installed. lxml.etree
+# is a C extension but its module-level functions ARE reassignable (verified),
+# so we patch fromstring/XML/parse the same way. Detection flags tainted XML
+# reaching a parser; whether an external entity actually resolves (the real
+# exploit) depends on the parser config and is confirmed at Tier-2. ---
+try:
+    from lxml import etree as _lxml_etree
+except ImportError:
+    _lxml_etree = None
+
+# --- CWE-918 (SSRF): an HTTP request to an attacker-controlled URL. urllib is
+# stdlib; requests is optional. ---
+import urllib.request as _urllib_request
+try:
+    import requests as _requests
+except ImportError:
+    _requests = None
+
 
 @dataclass
 class Hit:
@@ -74,6 +103,15 @@ class _Recorder:
     # doing anything interesting" apart from "it ran, touched a sink, and
     # that sink just happened to be safe this time."
     reached: list = field(default_factory=list)
+    # TIER-2 (live) execution-chain trace -- decomposes a NOT_CONFIRMED into a
+    # precise failure point. sql_trace: every SQL string actually executed, with
+    # the connection id that ran it and whether our proof UDF is registered on
+    # it (catches the "proof on the wrong connection" false-negative).
+    # proof_evaluated: set True iff the seeded vulcan_proof() function was
+    # actually invoked by the SQL engine (the strongest "injected expression
+    # was evaluated" signal).
+    sql_trace: list = field(default_factory=list)
+    proof_evaluated: bool = False
 
     def record_hit(self, cwe: str, sink: str, detail: str) -> Hit:
         hit = Hit(cwe=cwe, sink=sink, marker=self.marker, detail=detail)
@@ -307,15 +345,54 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
     # executescript() and forwards everything else straight through via
     # __getattr__, so code under test can't tell the difference except at
     # the sink methods we actually care about.
+    def _autocreate_retry(ddl_conn, thunk, _depth=0):
+        # TIER-2 (live) ONLY. A WHERE-clause / FROM injection runs against a
+        # table the candidate assumes exists, but our Tier-2 DB starts empty,
+        # so the base query dies with "no such table" BEFORE the injected SQL
+        # ever executes -- making a genuinely-exploitable injection look
+        # unexploitable (a measurement UNDER-count). Here we reconstruct the
+        # minimal realistic deployment the attacker would face: on first
+        # reference to a missing table, create it (generic columns) seeded with
+        # one canary row, then retry. This does NOT fabricate a vulnerability --
+        # only TRIGGERED samples (attacker input provably in the SQL text) ever
+        # reach Tier-2, and the injected payload must still do something
+        # observable to be CONFIRMED. Bounded so a pathological query can't loop.
+        import re as _re
+        try:
+            return thunk()
+        except sqlite3.OperationalError as e:
+            m = _re.search(r"no such table:?\s+([A-Za-z0-9_.\"\[\]`]+)", str(e))
+            if m is None or _depth >= 8:
+                raise
+            tbl = m.group(1).strip('"[]`').split(".")[-1]
+            canary = os.environ.get("TIER2_SQL_CANARY")
+            try:
+                ddl_conn.execute(
+                    f'CREATE TABLE IF NOT EXISTS "{tbl}"'
+                    "(id INTEGER, name TEXT, value TEXT, secret TEXT, data TEXT)")
+                ddl_conn.execute(
+                    f'INSERT INTO "{tbl}"(id, name, value, secret, data) VALUES (1, ?, ?, ?, ?)',
+                    ("x", "x", canary or "x", "x"))
+            except sqlite3.Error:
+                raise e
+            return _autocreate_retry(ddl_conn, thunk, _depth + 1)
+
     class _TaintCheckingCursor:
-        def __init__(self, real_cursor):
+        def __init__(self, real_cursor, real_conn=None):
             self._real = real_cursor
+            self._conn_for_ddl = real_conn
 
         def execute(self, sql, parameters=(), /, **kw):
             if is_tainted(sql, rec.marker):
                 rec.record_hit("CWE-89", "sqlite3.Cursor.execute", f"sql={sql!r}")
                 if not live:
                     raise SinkTriggered(rec.hits[-1])
+            if live:
+                _entry = _trace_sql(self._conn_for_ddl, sql)
+                if self._conn_for_ddl is not None:
+                    return _exec_traced(_entry, lambda: _autocreate_retry(
+                        self._conn_for_ddl, lambda: self._real.execute(sql, parameters, **kw)))
+                return _exec_traced(_entry, lambda: self._real.execute(sql, parameters, **kw))
             return self._real.execute(sql, parameters, **kw)
 
         def executescript(self, sql_script):
@@ -333,7 +410,7 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
             self._real = real_conn
 
         def cursor(self, *a, **kw):
-            return _TaintCheckingCursor(self._real.cursor(*a, **kw))
+            return _TaintCheckingCursor(self._real.cursor(*a, **kw), real_conn=self._real)
 
         def execute(self, sql, parameters=(), /, **kw):
             # Connection itself also has a convenience .execute() shortcut.
@@ -341,6 +418,10 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
                 rec.record_hit("CWE-89", "sqlite3.Connection.execute", f"sql={sql!r}")
                 if not live:
                     raise SinkTriggered(rec.hits[-1])
+            if live:
+                _entry = _trace_sql(self._real, sql)
+                return _exec_traced(_entry, lambda: _autocreate_retry(
+                    self._real, lambda: self._real.execute(sql, parameters, **kw)))
             return self._real.execute(sql, parameters, **kw)
 
         # BUG FOUND BY TESTING (real sqlite-utils run, auto_harness.py):
@@ -390,9 +471,93 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
             return self._real.__exit__(*exc)
 
     real_connect = sqlite3.connect
+    _seeded_conn_ids = set()
+
+    def _trace_sql(real_conn, sql):
+        # Live-mode execution-chain trace: record every SQL string actually
+        # executed, the connection that ran it, and whether our proof UDF is
+        # registered there -- so a NOT_CONFIRMED can be localised (did the SQL
+        # run at all? did the attacker marker reach it? was it a connection our
+        # proof mechanism never touched?). Returns the entry so the caller can
+        # stamp the execution OUTCOME (ok vs syntax error) onto it -- that split
+        # separates "input ran as data -> likely safe" from "payload didn't fit
+        # the context -> syntax error -> fixable". Best-effort; never raises.
+        try:
+            entry = {
+                "sql": str(sql)[:500],
+                "conn_id": id(real_conn),
+                "proof_registered": id(real_conn) in _seeded_conn_ids,
+                "marker_in_sql": is_tainted(sql, rec.marker),
+                "exec_ok": None,  # stamped by the caller after execution
+            }
+            rec.sql_trace.append(entry)
+            return entry
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _exec_traced(entry, thunk):
+        # Run the real execution, stamping the trace entry with whether it
+        # completed or raised an OperationalError (syntax/parse failure = the
+        # injected payload didn't fit this syntactic context). Never swallows:
+        # the exception still propagates to the candidate exactly as before.
+        try:
+            out = thunk()
+            if entry is not None:
+                entry["exec_ok"] = True
+            return out
+        except sqlite3.OperationalError as e:
+            if entry is not None:
+                entry["exec_ok"] = False
+                entry["exec_error"] = str(e)[:200]
+            raise
+
+    def _tier2_seed_live_connection(conn):
+        # TIER-2 (live/exploitation) ONLY. Give every real sqlite connection a
+        # fixed target for read-exfil + a side-effect primitive, so a
+        # single-statement CWE-89 injection can be PROVEN without depending on
+        # the candidate returning its query result:
+        #   * table  vulcan_seed(secret)  holds the canary -> a UNION/SELECT
+        #     read-exfil has a real row to steal.
+        #   * function vulcan_proof()      writes a sentinel file (env
+        #     TIER2_SQL_PROOF) and returns the canary -> an injected
+        #     `INSERT INTO vulcan_seed SELECT vulcan_proof()` executes EAGERLY
+        #     on execute() (DML needs no fetch), leaving an observable file even
+        #     when the function discards its result.
+        # Env-var driven so this module stays independent of tier2/. Entirely
+        # best-effort: any failure here must never break a run. This seeds only
+        # in live mode -- strict (detection) connections are never touched, so
+        # no verdict can be affected.
+        canary = os.environ.get("TIER2_SQL_CANARY")
+        proof_path = os.environ.get("TIER2_SQL_PROOF")
+        if not canary:
+            return
+        def _proof(*_args):
+            # Fired by the SQL engine only if the injected expression is
+            # actually EVALUATED -- the strongest signal in the execution chain.
+            rec.proof_evaluated = True
+            if proof_path:
+                try:
+                    with open(proof_path, "a"):
+                        pass
+                except OSError:
+                    pass
+            return canary
+        try:
+            conn.create_function("vulcan_proof", -1, _proof)
+            _seeded_conn_ids.add(id(conn))
+        except Exception:  # noqa: BLE001 -- some builds restrict create_function
+            pass
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS vulcan_seed(secret TEXT)")
+            conn.execute("INSERT INTO vulcan_seed(secret) VALUES (?)", (canary,))
+        except sqlite3.Error:
+            pass
 
     def patched_connect(*a, **kw):
-        return _TaintCheckingConnection(real_connect(*a, **kw))
+        real = real_connect(*a, **kw)
+        if live:
+            _tier2_seed_live_connection(real)
+        return _TaintCheckingConnection(real)
 
     # --- CWE-89 continued: the REAL cassandra-driver, when installed.
     # Unlike sqlite3.Cursor/Connection, cassandra.cluster.Session is a
@@ -450,6 +615,76 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
                 raise SinkTriggered(rec.hits[-1])
         return real_write_bytes(self, data)
 
+    # --- CWE-502: insecure deserialization. Unsafe yaml.load (non-Safe
+    # loader) and pickle.loads on tainted data. yaml.safe_load routes through
+    # yaml.load with SafeLoader, so the loader check below leaves it alone. ---
+    real_yaml_load = _yaml.load if _yaml is not None else None
+    if real_yaml_load is not None:
+        _safe_loaders = tuple(L for L in (getattr(_yaml, n, None)
+                              for n in ("SafeLoader", "CSafeLoader")) if isinstance(L, type))
+
+        def patched_yaml_load(stream, *a, **kw):
+            loader = kw.get("Loader", a[0] if a else None)
+            is_safe = (isinstance(loader, type) and _safe_loaders
+                       and issubclass(loader, _safe_loaders))
+            if not is_safe and is_tainted(stream, rec.marker):
+                rec.record_hit("CWE-502", "yaml.load", f"stream={str(stream)[:120]!r}")
+                if not live:
+                    raise SinkTriggered(rec.hits[-1])
+            return real_yaml_load(stream, *a, **kw)
+
+    real_pickle_loads = _pickle.loads
+
+    def patched_pickle_loads(data, *a, **kw):
+        if is_tainted(data, rec.marker):
+            rec.record_hit("CWE-502", "pickle.loads", f"data={str(data)[:120]!r}")
+            if not live:
+                raise SinkTriggered(rec.hits[-1])
+        return real_pickle_loads(data, *a, **kw)
+
+    # --- CWE-611: XML external entity. Tainted XML reaching an lxml parser. ---
+    real_lxml_fromstring = real_lxml_XML = real_lxml_parse = None
+    if _lxml_etree is not None:
+        real_lxml_fromstring = _lxml_etree.fromstring
+        real_lxml_XML = _lxml_etree.XML
+        real_lxml_parse = _lxml_etree.parse
+
+        def _make_xxe_patch(fn_name, real):
+            def wrapper(src, *a, **kw):
+                if is_tainted(src, rec.marker):
+                    rec.record_hit("CWE-611", f"lxml.etree.{fn_name}", f"src={str(src)[:120]!r}")
+                    if not live:
+                        raise SinkTriggered(rec.hits[-1])
+                return real(src, *a, **kw)
+            return wrapper
+
+        patched_lxml_fromstring = _make_xxe_patch("fromstring", real_lxml_fromstring)
+        patched_lxml_XML = _make_xxe_patch("XML", real_lxml_XML)
+        patched_lxml_parse = _make_xxe_patch("parse", real_lxml_parse)
+
+    # --- CWE-918: SSRF -- a request whose URL is tainted. ---
+    real_urlopen = _urllib_request.urlopen
+
+    def patched_urlopen(url, *a, **kw):
+        target = getattr(url, "full_url", url)  # url may be a Request object
+        if is_tainted(target, rec.marker):
+            rec.record_hit("CWE-918", "urllib.request.urlopen", f"url={str(target)[:120]!r}")
+            if not live:
+                raise SinkTriggered(rec.hits[-1])
+        return real_urlopen(url, *a, **kw)
+
+    real_requests_request = None
+    if _requests is not None:
+        real_requests_request = _requests.sessions.Session.request
+
+        def patched_requests_request(self, method, url, *a, **kw):
+            if is_tainted(url, rec.marker):
+                rec.record_hit("CWE-918", "requests.Session.request",
+                               f"method={method!r} url={str(url)[:120]!r}")
+                if not live:
+                    raise SinkTriggered(rec.hits[-1])
+            return real_requests_request(self, method, url, *a, **kw)
+
     # Apply all patches, yield control to the caller, then ALWAYS restore
     # the real functions afterward (the try/finally), even if the code
     # under test raises an exception.
@@ -463,6 +698,16 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
     builtins.open = patched_open
     pathlib.Path.write_text = patched_write_text
     pathlib.Path.write_bytes = patched_write_bytes
+    if real_yaml_load is not None:
+        _yaml.load = patched_yaml_load
+    _pickle.loads = patched_pickle_loads
+    if _lxml_etree is not None:
+        _lxml_etree.fromstring = patched_lxml_fromstring
+        _lxml_etree.XML = patched_lxml_XML
+        _lxml_etree.parse = patched_lxml_parse
+    _urllib_request.urlopen = patched_urlopen
+    if _requests is not None:
+        _requests.sessions.Session.request = patched_requests_request
     try:
         yield rec
     finally:
@@ -476,3 +721,13 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
         builtins.open = real_open
         pathlib.Path.write_text = real_write_text
         pathlib.Path.write_bytes = real_write_bytes
+        if real_yaml_load is not None:
+            _yaml.load = real_yaml_load
+        _pickle.loads = real_pickle_loads
+        if _lxml_etree is not None:
+            _lxml_etree.fromstring = real_lxml_fromstring
+            _lxml_etree.XML = real_lxml_XML
+            _lxml_etree.parse = real_lxml_parse
+        _urllib_request.urlopen = real_urlopen
+        if _requests is not None:
+            _requests.sessions.Session.request = real_requests_request

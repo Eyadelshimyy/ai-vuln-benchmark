@@ -1,0 +1,3359 @@
+{
+  "generator": "qwen2.5-coder:7b",
+  "detectors": [
+    "qwen2.5-coder:7b",
+    "deepseek-coder:6.7b"
+  ],
+  "rule": "majority",
+  "n_total": 150,
+  "n_scored": 132,
+  "unresolved": 18,
+  "records": [
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "_execute_query",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "_execute_query",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "UNRESOLVED",
+      "exec_cwe": null,
+      "tier1": "COULD_NOT_EXECUTE",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "_execute_query",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "_execute_query",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "_execute_query",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "_execute_query",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "_load_extensions",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "UNRESOLVED",
+      "exec_cwe": null,
+      "tier1": "COULD_NOT_EXECUTE",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-94",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-94"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "_load_extensions",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "UNRESOLVED",
+      "exec_cwe": null,
+      "tier1": "COULD_NOT_EXECUTE",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "_load_extensions",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "UNRESOLVED",
+      "exec_cwe": null,
+      "tier1": "COULD_NOT_EXECUTE",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "_load_extensions",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "UNRESOLVED",
+      "exec_cwe": null,
+      "tier1": "COULD_NOT_EXECUTE",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "_load_extensions",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "UNRESOLVED",
+      "exec_cwe": null,
+      "tier1": "COULD_NOT_EXECUTE",
+      "panel_verdict": "vulnerable",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "_load_extensions",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "UNRESOLVED",
+      "exec_cwe": null,
+      "tier1": "COULD_NOT_EXECUTE",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "_executescript",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "_executescript",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "_executescript",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "_executescript",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "_executescript",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "_executescript",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "analyze",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "analyze",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "analyze",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "analyze",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "analyze",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "analyze",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "atomic",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "atomic",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "atomic",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "atomic",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "atomic",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "atomic",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "attach",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "attach",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "attach",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "attach",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "attach",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "attach",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "begin",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "begin",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "begin",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "begin",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "begin",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "begin",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "cached_counts",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "UNRESOLVED",
+      "exec_cwe": null,
+      "tier1": "COULD_NOT_EXECUTE",
+      "panel_verdict": "vulnerable",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "cached_counts",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "UNRESOLVED",
+      "exec_cwe": null,
+      "tier1": "COULD_NOT_EXECUTE",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "cached_counts",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "UNRESOLVED",
+      "exec_cwe": null,
+      "tier1": "COULD_NOT_EXECUTE",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "cached_counts",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "UNRESOLVED",
+      "exec_cwe": null,
+      "tier1": "COULD_NOT_EXECUTE",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "cached_counts",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "UNRESOLVED",
+      "exec_cwe": null,
+      "tier1": "COULD_NOT_EXECUTE",
+      "panel_verdict": "vulnerable",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "cached_counts",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "UNRESOLVED",
+      "exec_cwe": null,
+      "tier1": "COULD_NOT_EXECUTE",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "commit",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "commit",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "commit",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "commit",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "commit",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "commit",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "count_where",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "vulnerable",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "count_where",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "vulnerable",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "count_where",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "vulnerable",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "count_where",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "vulnerable",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "count_where",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "vulnerable",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "count_where",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "vulnerable",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "create_view",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "create_view",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "UNRESOLVED",
+      "exec_cwe": null,
+      "tier1": "COULD_NOT_EXECUTE",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "create_view",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "create_view",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "create_view",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "UNRESOLVED",
+      "exec_cwe": null,
+      "tier1": "COULD_NOT_EXECUTE",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "create_view",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "disable_wal",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "disable_wal",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "disable_wal",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "disable_wal",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "disable_wal",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "disable_wal",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "enable_wal",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "enable_wal",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "enable_wal",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "enable_wal",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "enable_wal",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "enable_wal",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "execute",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "vulnerable",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "execute",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "execute",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "execute",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "execute",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "execute",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "init_spatialite",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-94",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-22",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-22"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "init_spatialite",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "UNRESOLVED",
+      "exec_cwe": null,
+      "tier1": "COULD_NOT_EXECUTE",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "init_spatialite",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-94",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "init_spatialite",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-94",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-22",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-22"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "init_spatialite",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-94",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-22",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-22"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "init_spatialite",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-94",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-22",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-22"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "journal_mode",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "journal_mode",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "journal_mode",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "journal_mode",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "journal_mode",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "journal_mode",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "quote",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "quote",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "UNRESOLVED",
+      "exec_cwe": null,
+      "tier1": "COULD_NOT_EXECUTE",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "quote",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "vulnerable",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "quote",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "UNRESOLVED",
+      "exec_cwe": null,
+      "tier1": "COULD_NOT_EXECUTE",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "quote",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "vulnerable",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "quote",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "rename_table",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "rename_table",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "rename_table",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "rename_table",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "rename_table",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "rename_table",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "VULN",
+      "exec_cwe": "CWE-89",
+      "tier1": "TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "rollback",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "rollback",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "rollback",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "rollback",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "rollback",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "rollback",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "schema",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "vulnerable",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "schema",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "vulnerable",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "schema",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "vulnerable",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "schema",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "vulnerable",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "schema",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "vulnerable",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "schema",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "vulnerable",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "supports_on_conflict",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "supports_on_conflict",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "supports_on_conflict",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "supports_on_conflict",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "supports_on_conflict",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "supports_on_conflict",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "supports_strict",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "supports_strict",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "supports_strict",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "supports_strict",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "supports_strict",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "supports_strict",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "table_names",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "table_names",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "table_names",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "table_names",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "table_names",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "table_names",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "triggers",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "vulnerable",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "triggers",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "triggers",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "triggers",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "vulnerable",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "triggers",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "vulnerable",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "triggers",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "vulnerable",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "view_names",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "view_names",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_0",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "view_names",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_1",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": "CWE-89",
+      "all_members_safe": false,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "vulnerable",
+          "cwe": "CWE-89"
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "view_names",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_2",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "view_names",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_3",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    },
+    {
+      "library_id": "sqlite-utils",
+      "function_id": "view_names",
+      "generator_model": "qwen2.5-coder:7b",
+      "sample_id": "t07_4",
+      "exec_truth": "SAFE",
+      "exec_cwe": null,
+      "tier1": "NOT_TRIGGERED",
+      "panel_verdict": "safe",
+      "panel_cwe": null,
+      "all_members_safe": true,
+      "members": {
+        "qwen2.5-coder:7b": {
+          "verdict": "safe",
+          "cwe": null
+        },
+        "deepseek-coder:6.7b": {
+          "verdict": "safe",
+          "cwe": null
+        }
+      }
+    }
+  ],
+  "matrices": {
+    "qwen2.5-coder:7b": {
+      "TP": 49,
+      "FN": 1,
+      "FP": 14,
+      "TN": 68,
+      "n": 132,
+      "precision": 0.778,
+      "recall": 0.98,
+      "FNR": 0.02,
+      "FPR": 0.171,
+      "accuracy": 0.886
+    },
+    "deepseek-coder:6.7b": {
+      "TP": 7,
+      "FN": 43,
+      "FP": 14,
+      "TN": 68,
+      "n": 132,
+      "precision": 0.333,
+      "recall": 0.14,
+      "FNR": 0.86,
+      "FPR": 0.171,
+      "accuracy": 0.568
+    },
+    "CONSORTIUM (majority)": {
+      "TP": 7,
+      "FN": 43,
+      "FP": 11,
+      "TN": 71,
+      "n": 132,
+      "precision": 0.389,
+      "recall": 0.14,
+      "FNR": 0.86,
+      "FPR": 0.134,
+      "accuracy": 0.591
+    }
+  },
+  "panel_wide_misses": [
+    {
+      "library": "sqlite-utils",
+      "function": "init_spatialite",
+      "sample": "t07_1",
+      "exec_cwe": "CWE-94"
+    }
+  ]
+}
