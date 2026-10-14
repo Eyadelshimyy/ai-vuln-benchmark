@@ -1,0 +1,13 @@
+.
+evals/agent
+scripts
+site
+tracebi
+tracebi/connectors
+tracebi/model
+tracebi/pipeline
+tracebi/reports
+tracebi/web
+tracebi/web/api
+tracebi/web/api/routers
+tracebi/web/demo_app

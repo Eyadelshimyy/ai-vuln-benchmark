@@ -1,0 +1,28 @@
+{
+  "repo": "scaryrawr__homebrew-formulae",
+  "file": "scripts/update-smahtutils.py",
+  "function": "get_latest_release",
+  "line": 31,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Get the latest release tag from GitHub using gh CLI.",
+  "prompt_source": "def get_latest_release(repo):\n    \"\"\"Get the latest release tag from GitHub using gh CLI.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def get_latest_release(repo):\n    \"\"\"Get the latest release tag from GitHub using gh CLI.\"\"\"\n    try:\n        result = subprocess.run(\n            [\"gh\", \"api\", f\"repos/{repo}/releases/latest\", \"--jq\", \".tag_name\"],\n            capture_output=True,\n            text=True,\n            check=True,\n        )\n        return result.stdout.strip()\n    except subprocess.CalledProcessError as e:\n        detail = e.stderr.strip() or e.stdout.strip() or str(e)\n        if \"404\" in detail or \"Not Found\" in detail:\n            return None\n        raise Exception(f\"Failed to get latest release for {repo}: {detail}\")",
+  "module_source": "#!/usr/bin/env python3\n\nimport hashlib\nimport re\nimport subprocess\nimport tempfile\n\n\ndef get_sha256(url):\n    \"\"\"Download file and calculate SHA256 checksum using curl.\"\"\"\n    with tempfile.NamedTemporaryFile() as temp_file:\n        try:\n            subprocess.run(\n                [\"curl\", \"-fsSL\", url, \"-o\", temp_file.name],\n                capture_output=True,\n                text=True,\n                check=True,\n            )\n\n            sha256_hash = hashlib.sha256()\n            with open(temp_file.name, \"rb\") as f:\n                for chunk in iter(lambda: f.read(8192), b\"\"):\n                    sha256_hash.update(chunk)\n\n            return sha256_hash.hexdigest()\n        except subprocess.CalledProcessError as e:\n            detail = e.stderr.strip() or str(e)\n            raise Exception(f\"Failed to download {url}: {detail}\")\n\n\ndef get_latest_release(repo):\n    \"\"\"Get the latest release tag from GitHub using gh CLI.\"\"\"\n    try:\n        result = subprocess.run(\n            [\"gh\", \"api\", f\"repos/{repo}/releases/latest\", \"--jq\", \".tag_name\"],\n            capture_output=True,\n            text=True,\n            check=True,\n        )\n        return result.stdout.strip()\n    except subprocess.CalledProcessError as e:\n        detail = e.stderr.strip() or e.stdout.strip() or str(e)\n        if \"404\" in detail or \"Not Found\" in detail:\n            return None\n        raise Exception(f\"Failed to get latest release for {repo}: {detail}\")\n\n\ndef get_latest_tag(repo):\n    \"\"\"Get the latest tag from GitHub using gh CLI.\"\"\"\n    try:\n        result = subprocess.run(\n            [\"gh\", \"api\", f\"repos/{repo}/tags\", \"--jq\", \".[0].name\"],\n            capture_output=True,\n            text=True,\n            check=True,\n        )\n        return result.stdout.strip()\n    except subprocess.CalledProcessError as e:\n        detail = e.stderr.strip() or e.stdout.strip() or str(e)\n        raise Exception(f\"Failed to get latest tag for {repo}: {detail}\")\n\n\ndef get_latest_version_tag(repo):\n    \"\"\"Prefer the latest release tag, falling back to tags for repos without releases.\"\"\"\n    return get_latest_release(repo) or get_latest_tag(repo)\n\n\ndef update_smahtutils_formula():\n    \"\"\"Update the smahtutils formula with latest tag.\"\"\"\n    repo = \"scaryrawr/smahtutils\"\n    formula_path = \"Formula/smahtutils.rb\"\n\n    try:\n        latest_tag = get_latest_version_tag(repo)\n\n        with open(formula_path, \"r\") as f:\n            content = f.read()\n\n        url_match = re.search(\n            r'url \"https://github\\.com/scaryrawr/smahtutils/archive/refs/tags/([^\"]+)\\.tar\\.gz\"',\n            content,\n        )\n        if not url_match:\n            print(\"Could not find URL in smahtutils.rb\")\n            return False\n\n        current_tag = url_match.group(1)\n\n        if current_tag == latest_tag:\n            print(f\"smahtutils is already up to date at {latest_tag}\")\n            return False\n\n        new_url = f\"https://github.com/scaryrawr/smahtutils/archive/refs/tags/{latest_tag}.tar.gz\"\n        new_sha256 = get_sha256(new_url)\n\n        new_content = re.sub(\n            r'url \"https://github\\.com/scaryrawr/smahtutils/archive/refs/tags/[^\"]+\\.tar\\.gz\"',\n            f'url \"{new_url}\"',\n            content,\n        )\n        new_content = re.sub(r'sha256 \"[^\"]+\"', f'sha256 \"{new_sha256}\"', new_content)\n\n        with open(formula_path, \"w\") as f:\n            f.write(new_content)\n\n        print(f\"Updated smahtutils from {current_tag} to {latest_tag}\")\n        return True\n\n    except Exception as e:\n        print(f\"Error updating smahtutils: {e}\")\n        return False\n\n\nif __name__ == \"__main__\":\n    update_smahtutils_formula()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "github-copilot": 15
+    },
+    "ai_commit": "b43412f8ccd0",
+    "evidence": "Co-authored-by: Copilot <",
+    "ai_line_fraction": 1.0,
+    "span": [
+      31,
+      45
+    ]
+  }
+}

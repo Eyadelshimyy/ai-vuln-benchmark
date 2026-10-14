@@ -1,0 +1,173 @@
+"""JSON reporter for gremlin mutation testing results.
+
+Produces machine-readable JSON output for CI integration
+and automated analysis of mutation testing results.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from pytest_gremlins.reporting.results import GremlinResult
+    from pytest_gremlins.reporting.score import MutationScore
+    from pytest_gremlins.reporting.types import (
+        JsonFileStats,
+        JsonReport,
+        JsonResultEntry,
+        JsonSummary,
+    )
+
+
+class JsonReporter:
+    """Reporter that produces JSON output for CI integration.
+
+    JSON structure:
+        {
+            "summary": {
+                "total": 10,
+                "zapped": 8,
+                "survived": 2,
+                "timeout": 0,
+                "error": 0,
+                "percentage": 80.0
+            },
+            "files": {
+                "auth.py": {"total": 5, "zapped": 4, "survived": 1, "percentage": 80.0},
+                "utils.py": {"total": 5, "zapped": 4, "survived": 1, "percentage": 80.0}
+            },
+            "skipped_files": {"src/broken.py": "<reason>"},  # omitted when empty
+            "results": [
+                {
+                    "gremlin_id": "g001",
+                    "file_path": "auth.py",
+                    "line_number": 42,
+                    "status": "zapped",
+                    "operator": "comparison",
+                    "description": ">= to >",
+                    "killing_test": "test_auth"
+                },
+                ...
+            ]
+        }
+    """
+
+    def to_json(self, score: MutationScore, *, skipped_files: dict[str, str] | None = None) -> str:
+        """Convert mutation score to JSON string.
+
+        Args:
+            score: The MutationScore to convert.
+            skipped_files: Paths and reasons for files that could not be instrumented.
+
+        Returns:
+            Pretty-printed JSON string.
+        """
+        data = self._build_report_data(score)
+        if skipped_files:
+            data['skipped_files'] = skipped_files
+        return json.dumps(data, indent=2)
+
+    def write_report(
+        self, score: MutationScore, output_path: Path, *, skipped_files: dict[str, str] | None = None
+    ) -> None:
+        """Write mutation report to a JSON file.
+
+        Args:
+            score: The MutationScore to write.
+            output_path: Path to the output JSON file.
+            skipped_files: Paths and reasons for files that could not be instrumented.
+        """
+        output_path.write_text(self.to_json(score, skipped_files=skipped_files))
+
+    def _build_report_data(self, score: MutationScore) -> JsonReport:
+        """Build the complete report data structure.
+
+        Args:
+            score: The MutationScore to convert.
+
+        Returns:
+            Dictionary suitable for JSON serialization.
+        """
+        report: JsonReport = {
+            'summary': self._build_summary(score),
+            'files': self._build_file_breakdown(score),
+            'results': [self._build_result(r) for r in score.results],
+        }
+        timeout_warning = score.timeout_warning
+        if timeout_warning is not None:
+            report['timeout_warning'] = {
+                'downgraded': score.downgraded_timeouts,
+                'mutant_timeout': score.mutant_timeout,
+                'message': timeout_warning,
+            }
+        return report
+
+    def _build_summary(self, score: MutationScore) -> JsonSummary:
+        """Build the summary section.
+
+        Args:
+            score: The MutationScore to summarize.
+
+        Returns:
+            Summary dictionary.
+        """
+        return {
+            'total': score.total,
+            'zapped': score.zapped,
+            'survived': score.survived,
+            'timeout': score.timeout,
+            'error': score.error,
+            'pardoned': score.pardoned,
+            'percentage': score.percentage,
+        }
+
+    def _build_file_breakdown(self, score: MutationScore) -> dict[str, JsonFileStats]:
+        """Build per-file breakdown section.
+
+        Args:
+            score: The MutationScore to break down.
+
+        Returns:
+            Dictionary mapping file paths to their stats.
+        """
+        file_scores = score.by_file()
+        return {
+            file_path: {
+                'total': file_score.total,
+                'zapped': file_score.zapped,
+                'survived': file_score.survived,
+                'percentage': file_score.percentage,
+            }
+            for file_path, file_score in file_scores.items()
+        }
+
+    def _build_result(self, result: GremlinResult) -> JsonResultEntry:
+        """Build a single result entry.
+
+        Args:
+            result: The GremlinResult to convert.
+
+        Returns:
+            Dictionary representing this result.
+        """
+        gremlin = result.gremlin
+        entry: JsonResultEntry = {
+            'gremlin_id': gremlin.gremlin_id,
+            'file_path': gremlin.file_path,
+            'line_number': gremlin.line_number,
+            'status': result.status.value,
+            'operator': gremlin.operator_name,
+            'description': gremlin.description,
+        }
+        if result.killing_test is not None:
+            entry['killing_test'] = result.killing_test
+        if result.error_output:
+            entry['error_output'] = result.error_output
+        if result.execution_time_ms is not None:
+            entry['execution_time_ms'] = result.execution_time_ms
+        if result.selected_tests:
+            entry['selected_tests'] = result.selected_tests
+        return entry

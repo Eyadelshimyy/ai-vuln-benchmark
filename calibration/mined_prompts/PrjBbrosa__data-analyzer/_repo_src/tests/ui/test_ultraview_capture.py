@@ -1,0 +1,4337 @@
+"""UltraView presentation digest, stable capture, and PreviewStore publish."""
+from __future__ import annotations
+
+import ast
+import gc
+import json
+import logging
+import pytest
+from collections import OrderedDict
+from contextlib import nullcontext
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+from PyQt5 import sip
+from PyQt5.QtCore import QCoreApplication, QObject, QPoint, Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QImage, QPixmap
+from PyQt5.QtTest import QTest
+from PyQt5.QtWidgets import QWidget
+
+from mf4_analyzer import diagnostics
+from mf4_analyzer.ui.analysis_cache import FrfCacheKey
+from mf4_analyzer.ui.analysis_view_state import AnalysisViewState, PaneState
+from mf4_analyzer.ui.chart_stack.ultraview.preview_store import (
+    MAX_PREVIEW_RAW_EDGE,
+    RESIDENCY_TIER_ACTIVE_PLACED,
+    RESIDENCY_TIER_FOCUS,
+    PreviewStore,
+    ResidencyRequest,
+)
+from mf4_analyzer.ui.chart_stack.ultraview.page import UltraViewPage
+from mf4_analyzer.ui.main_window._state_holders import AnalysisPinBook
+from mf4_analyzer.ui.main_window._view_mixin import ViewMixin
+from mf4_analyzer.ui.main_window.ultraview_capture_coordinator import (
+    RESOLUTION_STALE_RATIO,
+    RESOLUTION_STALE_TOAST,
+    UltraViewCaptureCoordinator,
+    needs_resolution_recapture,
+    resolution_grab_scale,
+)
+from mf4_analyzer.ui.main_window.ultraview_coordinator import (
+    UltraViewCoordinator,
+    _DIGEST_RETRY_LIMIT,
+    _IDLE_CAPTURE_MS,
+    hide_transient_overlays,
+    read_markup_revision,
+)
+from mf4_analyzer.ui.ultraview_state import (
+    PreviewMeta,
+    UltraViewRef,
+    add_ref,
+    create_board,
+    presentation_digest,
+    set_active_board,
+)
+from mf4_analyzer.ui.view_state import ViewManager, ViewState
+
+_COORDINATOR_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "mf4_analyzer"
+    / "ui"
+    / "main_window"
+    / "ultraview_coordinator.py"
+)
+_CAPTURE_COORDINATOR_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "mf4_analyzer"
+    / "ui"
+    / "main_window"
+    / "ultraview_capture_coordinator.py"
+)
+_CAPTURE_FACTS_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "mf4_analyzer"
+    / "ui"
+    / "ultraview_capture_facts.py"
+)
+_COORDINATOR_LOGGER = "mf4_analyzer.ui.main_window.ultraview_coordinator"
+_CAPTURE_LOGGER = "mf4_analyzer.ui.main_window.ultraview_capture_coordinator"
+_HOST_PRIVATE_CAPTURE_ATTRS = frozenset(
+    {
+        "_interaction_state",
+        "_dense_raster",
+        "_aa_idle_timer",
+        "_refresh_pending",
+        "_cursor",
+        "_cursor_line_items",
+        "_cursor_lines",
+        "_channel_lines",
+        "_cursor_a_frequency",
+        "_cursor_b_frequency",
+        "_annotations",
+        "_pill",
+        "_pill_for_canvas",
+        "_detail",
+    }
+)
+_FORBIDDEN_SOURCE_NAMES = (
+    "do_fft",
+    "do_fft_time",
+    "do_frf",
+    "do_order_time",
+    "_render_analysis_view_from_cache",
+    "_apply_active_analysis_context",
+    "_plot_time_on_canvas",
+    "_analysis_restore_pending",
+    "time.sleep",
+    "sleep(",
+)
+
+
+def _flush(turns: int = 4) -> None:
+    for _ in range(turns):
+        QCoreApplication.processEvents()
+
+
+def _ref(view_id: str = "view-a", section: str = "time") -> UltraViewRef:
+    return UltraViewRef(section, view_id)
+
+
+class _VisItem:
+    def __init__(self, visible: bool = True, value: float | None = None) -> None:
+        self._visible = visible
+        self._value = value
+
+    def isVisible(self) -> bool:
+        return self._visible
+
+    def hide(self) -> None:
+        self._visible = False
+
+    def show(self) -> None:
+        self._visible = True
+
+    def value(self):
+        return self._value
+
+
+class FakeCanvas(QWidget):
+    cursor_info = pyqtSignal(str)
+    dual_cursor_info = pyqtSignal(str)
+    visible_range_changed = pyqtSignal()
+    markup_revision_changed = pyqtSignal()
+    manual_zoom_changed = pyqtSignal(bool)
+
+    def __init__(self, color: str = "#123456") -> None:
+        super().__init__()
+        self.resize(64, 48)
+        self.show()
+        self._interaction_state = "idle"
+        self._refresh_pending = False
+        self._quality_state = "green"
+        self.markup_revision = 0
+        # Session fingerprint input. None until a test publishes a real range.
+        self.visible_range = None
+        self.grab_calls = 0
+        self.settle_calls = 0
+        self._fill = QColor(color)
+        self._cursor_item = _VisItem(True, value=0.25)
+        self._armed_item = _VisItem(True, value=1.0)
+        self._remark_item = _VisItem(True)
+        self._scale_box = _VisItem(True)
+        self._pin_line = _VisItem(True)
+        self._cursor = SimpleNamespace(
+            dual=False,
+            ax=None,
+            bx=None,
+            _cursor_line_items=[self._cursor_item],
+            _cursor_a_items=[self._armed_item],
+        )
+        self._plot = SimpleNamespace(vb=SimpleNamespace(rbScaleBox=self._scale_box))
+        self.cursor_visible_at_grab = None
+        self.armed_visible_at_grab = None
+        self.remark_visible_at_grab = None
+        self.scale_box_visible_at_grab = None
+        self._has_result = True
+
+    def has_result(self) -> bool:
+        return bool(self._has_result)
+
+    def quality_status(self):
+        count = getattr(self, "_curve_count", None)
+        if count is None:
+            count = 1 if self._has_result else 0
+        status = {"state": self._quality_state, "curve_count": int(count)}
+        path = getattr(self, "_render_path", None)
+        if path:
+            status["render_path"] = path
+        raster_count = getattr(self, "_high_raster_curve_count", None)
+        if raster_count is not None:
+            status["high_raster_curve_count"] = int(raster_count)
+        return status
+
+    def grab_pixmap(self, scale: float = 1.0) -> QPixmap:
+        self.grab_calls += 1
+        self.cursor_visible_at_grab = self._cursor_item.isVisible()
+        self.armed_visible_at_grab = self._armed_item.isVisible()
+        self.remark_visible_at_grab = self._remark_item.isVisible()
+        self.scale_box_visible_at_grab = self._scale_box.isVisible()
+        factor = max(1.0, float(scale or 1.0))
+        pix = QPixmap(
+            max(int(round(self.width() * factor)), 16),
+            max(int(round(self.height() * factor)), 16),
+        )
+        pix.fill(self._fill)
+        return pix
+
+    def restore_visible_xlim(self, xlim, *, flush=True) -> None:
+        return None
+
+    def restore_visible_ylims(self, ylims, native_axis_ranges=None, **kwargs):
+        # Match TimeDomainCanvasPG: this double has no persisted/initial Y
+        # range, so restore leaves the nice-reframe path enabled.
+        return set()
+
+    def set_tick_density(self, x, y, *, reframe_overlay_y=True) -> None:
+        return None
+
+    def settle_view_restore(self) -> None:
+        # Closes the View-restore transaction on the real canvas; the double
+        # only has to accept it (see canvas.settle_view_restore).
+        self.settle_calls += 1
+
+    def has_plotted_result(self) -> bool:
+        from mf4_analyzer.ui.ultraview_capture_facts import (
+            mapping_has_items,
+            quality_plotted_from_status,
+        )
+
+        getter = getattr(self, "has_result", None)
+        if callable(getter):
+            return bool(getter())
+        if mapping_has_items(getattr(self, "_channel_lines", None)) or mapping_has_items(
+            getattr(self, "channel_data", None)
+        ):
+            return True
+        status = self.quality_status() if callable(getattr(self, "quality_status", None)) else {}
+        return quality_plotted_from_status(status or {})
+
+    def capture_quality_settled(self) -> bool:
+        from mf4_analyzer.ui.ultraview_capture_facts import quality_settled_from_status
+
+        status = self.quality_status() if callable(getattr(self, "quality_status", None)) else {}
+        if not quality_settled_from_status(status or {}):
+            return False
+        dense = getattr(self, "_dense_raster", None)
+        if dense is not None and callable(getattr(dense, "quality_status", None)):
+            dense_status = dense.quality_status() or {}
+            if dense_status.get("has_dense") and dense_status.get("state") == "yellow":
+                return False
+        return True
+
+    def capture_interaction_idle(self) -> bool:
+        from mf4_analyzer.ui.ultraview_capture_facts import analysis_idle_timer_is_busy
+
+        if getattr(self, "_interaction_state", "idle") != "idle":
+            return False
+        if bool(getattr(self, "_refresh_pending", False)):
+            return False
+        if analysis_idle_timer_is_busy(getattr(self, "_aa_idle_timer", None)):
+            return False
+        return True
+
+    def capture_cursor_facts(self):
+        from mf4_analyzer.ui.ultraview_capture_facts import dual_cursor_geometry
+
+        cursor = getattr(self, "_cursor", None)
+        dual = bool(getattr(cursor, "dual", False)) if cursor is not None else False
+        if not dual:
+            getter = getattr(self, "cursor_mode", None)
+            if callable(getter):
+                dual = getter() == "dual"
+        if cursor is not None:
+            geometry = dual_cursor_geometry(
+                dual=dual,
+                ax=getattr(cursor, "ax", None),
+                bx=getattr(cursor, "bx", None),
+            )
+        else:
+            geometry = dual_cursor_geometry(
+                dual=dual,
+                ax=getattr(self, "_cursor_a_frequency", None),
+                bx=getattr(self, "_cursor_b_frequency", None),
+            )
+        return dual, geometry
+
+    def _capture_expects_viewbox(self) -> bool:
+        if getattr(self, "axes_list", None) or getattr(self, "plots", None):
+            return True
+        return any(
+            name.startswith("_plot") and getattr(self, name, None) is not None
+            for name in dir(self)
+        )
+
+    def iter_transient_overlay_items(self, *, section: str = "unknown"):
+        from mf4_analyzer.ui.ultraview_capture_facts import (
+            iter_axes_rubberband_items,
+            warn_missing_viewbox,
+        )
+
+        cursor = getattr(self, "_cursor", None)
+        items = getattr(cursor, "_cursor_line_items", None) if cursor is not None else None
+        if items:
+            yield from items
+        yielded = False
+        for item in iter_axes_rubberband_items(self):
+            yielded = True
+            yield item
+        plot = getattr(self, "_plot", None)
+        vb = getattr(plot, "vb", None) if plot is not None else None
+        box = getattr(vb, "rbScaleBox", None) if vb is not None else None
+        if box is not None:
+            yielded = True
+            yield box
+        if not yielded and self._capture_expects_viewbox():
+            warn_missing_viewbox(self, section)
+
+    def presentation_capture_facts(self):
+        from mf4_analyzer.ui.ultraview_capture_facts import (
+            build_capture_facts,
+            widget_visible_and_sized,
+        )
+
+        dual, geometry = self.capture_cursor_facts()
+        return build_capture_facts(
+            host_kind="fake",
+            visible_and_sized=widget_visible_and_sized(self),
+            has_real_result=self.has_plotted_result(),
+            quality_settled=self.capture_quality_settled(),
+            interaction_idle=self.capture_interaction_idle(),
+            cursor_dual=dual,
+            cursor_geometry=geometry,
+            markup_revision=int(self.markup_revision or 0),
+        )
+
+
+class FakePage(QWidget):
+    def __init__(self, panes: list[FakeCanvas]) -> None:
+        super().__init__()
+        self._panes = list(panes)
+        self.combined_calls = 0
+        self.resize(96, 48)
+        self.show()
+
+    def pane_count(self) -> int:
+        return len(self._panes)
+
+    def pane_canvas(self, idx: int):
+        return self._panes[idx]
+
+    def grab_combined_pixmap(self, scale: float = 1.0) -> QPixmap:
+        self.combined_calls += 1
+        pix = QPixmap(48, 24)
+        pix.fill(QColor("#334455"))
+        return pix
+
+
+class FakeWindow(QObject):
+    def __init__(self) -> None:
+        super().__init__()
+        self.view_manager = ViewManager()
+        self.files = {}
+        self.analysis_managers = {}
+        self._analysis_pins = AnalysisPinBook()
+        self.pages = {}
+        self.canvas_time = None
+        self.chart_stack = None
+        self._analysis_jobs = None
+        self._filter = {
+            "enabled": False,
+            "spec": {},
+            "show_original": True,
+            "show_filtered": False,
+        }
+        self.restore_calls = 0
+        self.plot_time_calls = 0
+
+    def _project_filter_payload(self):
+        return dict(self._filter)
+
+    def _analysis_page(self, section):
+        return self.pages.get(section)
+
+    def _render_analysis_view_from_cache(self, *args, **kwargs):
+        self.restore_calls += 1
+
+    def _plot_time_on_canvas(self, *args, **kwargs):
+        self.plot_time_calls += 1
+        return True
+
+    def do_fft(self, *args, **kwargs):
+        raise AssertionError("preview path must not compute FFT")
+
+    def do_fft_time(self, *args, **kwargs):
+        raise AssertionError("preview path must not compute FFT-vs-Time")
+
+    def do_frf(self, *args, **kwargs):
+        raise AssertionError("preview path must not compute FRF")
+
+    def do_order_time(self, *args, **kwargs):
+        raise AssertionError("preview path must not compute Order")
+
+
+class _FakeBridge:
+    def apply_controls_from_state(self, state, host, canvas) -> None:
+        return None
+
+
+class _FakeStack:
+    def __init__(self, mode: str = "time") -> None:
+        self._mode = mode
+        self._split = False
+        self._secondary = None
+
+    def cursor_pill_snapshot(self):
+        return None
+
+    def restore_cursor_pill_snapshot(self, snapshot) -> None:
+        return None
+
+    def clear_cursor_pill(self) -> None:
+        return None
+
+    def current_mode(self) -> str:
+        return self._mode
+
+    def split_active(self) -> bool:
+        return self._split
+
+    def secondary_canvas(self):
+        return self._secondary
+
+    def focused_canvas(self):
+        return None
+
+
+class _TimeHost(ViewMixin):
+    def __init__(self, coord, manager, canvas, stack) -> None:
+        self._ultraview = coord
+        self.view_manager = manager
+        self.canvas_time = canvas
+        self.chart_stack = stack
+        self._view_bridge = _FakeBridge()
+        self._focused_view_idx = None
+        self._applying_view = False
+        self.defer_flags = []
+        self.plot_calls = 0
+
+    def _plot_time_on_canvas(
+        self,
+        canvas,
+        *,
+        update_primary_ui,
+        defer_first_frame,
+        defer_axis_finalize=False,
+    ):
+        self.plot_calls += 1
+        self.defer_flags.append(bool(defer_first_frame))
+        if defer_first_frame:
+            canvas._quality_state = "red"
+            canvas._refresh_pending = True
+        return True
+
+    def _project_view_controls(self, idx) -> None:
+        return None
+
+    def _render_analysis_view_from_cache(self, *args, **kwargs):
+        raise AssertionError("time render must not restore analysis cache")
+
+
+class _Column:
+    def __init__(self, values) -> None:
+        self.values = values
+
+
+class _Table:
+    def __init__(self, columns: dict) -> None:
+        self.columns = list(columns)
+        self._columns = columns
+
+    def __getitem__(self, key):
+        return _Column(self._columns[key])
+
+
+def _file_data(time_axis, channels: dict):
+    return SimpleNamespace(data=_Table(channels), time_array=time_axis)
+
+
+def _make_coord(window=None):
+    host = window if window is not None else FakeWindow()
+    coord = UltraViewCoordinator(host, parent=host)
+    return host, coord
+
+
+def test_presentation_digest_pixel_affecting_field_matrix(qapp):
+    window, coord = _make_coord()
+    manager = window.view_manager
+    state = manager.get(0)
+    state.view_id = "view-a"
+    state.name = "Alpha"
+    state.tab_color = "#111111"
+    state.cursor_mode = "single"
+    state.attached_file_ids = ["f1"]
+    state.checked = [("f1", "torque")]
+    state.hidden_channels = []
+    state.colors = {("f1", "torque"): "#1769e0"}
+    state.plot_mode = "subplot"
+    state.xlim = (0.0, 1.0)
+    state.ylims = {"torque": (-1.0, 1.0)}
+    state.axis_opts = {"tick_density": {"x": 6, "y": 6}}
+    time_axis = np.linspace(0.0, 1.0, 16)
+    values = np.arange(16, dtype=np.float64)
+    window.files["f1"] = _file_data(time_axis, {"torque": values})
+    ref = _ref("view-a")
+
+    baseline = coord.current_digest_for(ref)
+    assert baseline is not None
+
+    state.name = "Renamed"
+    state.tab_color = "#abcdef"
+    assert coord.current_digest_for(ref) == baseline
+    state.cursor_mode = "dual"
+    assert coord.current_digest_for(ref) != baseline
+    state.cursor_mode = "single"
+    assert coord.current_digest_for(ref) == baseline
+
+    state.plot_mode = "overlay"
+    assert coord.current_digest_for(ref) != baseline
+    state.plot_mode = "subplot"
+    assert coord.current_digest_for(ref) == baseline
+
+    state.xlim = (0.0, 2.0)
+    assert coord.current_digest_for(ref) != baseline
+    state.xlim = (0.0, 1.0)
+
+    state.time_filter = {
+        "enabled": True,
+        "spec": {
+            "kind": "low",
+            "order": 4,
+            "cutoff": 40.0,
+            "cutoff_lo": 100.0,
+            "cutoff_hi": 2000.0,
+        },
+        "show_original": True,
+        "show_filtered": True,
+    }
+    assert coord.current_digest_for(ref) != baseline
+    from mf4_analyzer.ui.view_state import default_time_filter
+
+    state.time_filter = default_time_filter()
+
+    from mf4_analyzer.ui.view_state import default_chart_appearance
+
+    state.chart_appearance = {
+        **default_chart_appearance(),
+        "x_scale": "log",
+    }
+    assert coord.current_digest_for(ref) != baseline
+    state.chart_appearance = default_chart_appearance()
+    assert coord.current_digest_for(ref) == baseline
+
+    from dataclasses import replace as _replace
+    from mf4_analyzer.ui.pinned_cursor_state import (
+        PinnedCursorAnchor,
+        empty_collection,
+        next_record,
+    )
+
+    collection, _intent = next_record(
+        empty_collection(),
+        {
+            "mode": "single",
+            "domain": "time",
+            "x": 0.25,
+            "x_unit": "s",
+            "bindings": [{"fid": "f1", "channel": "torque"}],
+        },
+    )
+    state.pinned_cursors = collection
+    pinned = coord.current_digest_for(ref)
+    assert pinned != baseline
+    mini = _replace(collection.records[0], presentation="mini")
+    state.pinned_cursors = _replace(collection, records=(mini,))
+    assert coord.current_digest_for(ref) != pinned
+    moved = _replace(
+        mini,
+        anchor=PinnedCursorAnchor(h_edge="left", v_edge="top", nx=0.2, ny=0.4),
+    )
+    state.pinned_cursors = _replace(collection, records=(moved,))
+    moved_digest = coord.current_digest_for(ref)
+    assert moved_digest != pinned
+    state.pinned_cursors = empty_collection()
+    assert coord.current_digest_for(ref) == baseline
+
+    canvas = FakeCanvas()
+    coord.bind_canvas(canvas, ref)
+    canvas.markup_revision = 3
+    assert coord.current_digest_for(ref) != baseline
+    canvas.markup_revision = 0
+    assert coord.current_digest_for(ref) == baseline
+
+    reread = coord.current_digest_for(ref)
+    assert reread == baseline
+
+    derived = values * 2.0
+    window.files["f1"] = _file_data(time_axis, {"torque": values, "derived": derived})
+    state.checked = [("f1", "torque"), ("f1", "derived")]
+    added = coord.current_digest_for(ref)
+    assert added != baseline
+
+    replaced = np.arange(16, dtype=np.float64) + 8.0
+    window.files["f1"] = _file_data(time_axis, {"torque": replaced, "derived": derived})
+    state.checked = [("f1", "torque")]
+    assert coord.current_digest_for(ref) != baseline
+
+    window.files["f1"] = _file_data(time_axis, {"torque": values})
+    deleted = coord.current_digest_for(ref)
+    assert deleted == baseline
+
+    fft_manager = ViewManager(state_factory=AnalysisViewState)
+    window.analysis_managers["fft"] = fft_manager
+    fft_state = fft_manager.get(0)
+    fft_state.view_id = "fft-a"
+    fft_state.params = {"nfft": 1024, "window": "hann"}
+    fft_state.compare = {"x_linked": True, "levels_locked": True}
+    fft_state.panes = [PaneState(sources=[("f1", "torque")], xlim=(0.0, 200.0))]
+    key = ("fft", "k1")
+    window._analysis_pins.add("fft", "fft-a", 0, key)
+    page = FakePage([FakeCanvas()])
+    window.pages["fft"] = page
+    fft_ref = _ref("fft-a", "fft")
+    result = object()
+    coord.notify_result_stored("fft", "fft-a", 0, key, result)
+    fft_baseline = coord.current_digest_for(fft_ref)
+    assert fft_baseline is not None
+    coord.notify_result_stored("fft", "fft-a", 0, key, result)
+    assert coord.current_digest_for(fft_ref) == fft_baseline
+    coord.notify_result_stored("fft", "fft-a", 0, key, object())
+    assert coord.current_digest_for(fft_ref) != fft_baseline
+    fft_state.params = {"nfft": 2048, "window": "hann"}
+    assert coord.current_digest_for(fft_ref) != fft_baseline
+    canvas.deleteLater()
+    page.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_time_switch_captures_old_binding_before_deferred_render(qapp):
+    window, coord = _make_coord()
+    manager = window.view_manager
+    state_a = manager.get(0)
+    state_a.view_id = "view-a"
+    idx_b = manager.new_view()
+    state_b = manager.get(idx_b)
+    state_b.view_id = "view-b"
+    state_b.xlim = (0.2, 0.8)
+
+    canvas = FakeCanvas("#112233")
+    stack = _FakeStack()
+    host = _TimeHost(coord, manager, canvas, stack)
+    ref_a = _ref("view-a")
+    ref_b = _ref("view-b")
+    coord.bind_canvas(canvas, ref_a)
+
+    host._render_view_to_canvas(idx_b, canvas, update_primary_ui=True)
+    _flush()
+
+    assert host.defer_flags == [True]
+    record_a = coord.store.get(ref_a)
+    assert record_a is not None
+    assert record_a.image is not None
+    assert coord.store.get(ref_b) is None
+    assert coord.bound_ref_for(canvas) == ref_b
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_leaving_unstable_canvas_keeps_preview_and_logs_debug(qapp, monkeypatch, caplog):
+    monkeypatch.setattr(diagnostics, "_THROTTLE_STATE", OrderedDict())
+    window, coord = _make_coord()
+    manager = window.view_manager
+    manager.get(0).view_id = "view-a"
+    idx_b = manager.new_view()
+    manager.get(idx_b).view_id = "view-b"
+    canvas = FakeCanvas()
+    ref_a = _ref("view-a")
+    ref_b = _ref("view-b")
+    coord.bind_canvas(canvas, ref_a)
+    coord.request_capture(ref_a, canvas, "seed")
+    _flush()
+    old_digest = coord.store.get(ref_a).captured_digest
+    old_image = coord.store.get(ref_a).image.copy()
+    grabs = canvas.grab_calls
+    canvas.markup_revision += 1
+    canvas._refresh_pending = True
+
+    with caplog.at_level(logging.DEBUG, logger=_CAPTURE_LOGGER):
+        coord.offer_capture_bound_canvas(canvas, incoming_ref=ref_b)
+    skips = [r for r in caplog.records if "leaving-bound-canvas/unstable" in r.getMessage()]
+    assert [r.levelno for r in skips] == [logging.DEBUG]
+    assert canvas.grab_calls == grabs
+    assert coord.store.get(ref_a).captured_digest == old_digest
+    assert coord.store.get(ref_a).image == old_image
+    # The synchronous offer does not schedule a retry of the outgoing scene.
+    assert not coord._capture._unstable
+    coord.bind_canvas(canvas, ref_b)
+    canvas._refresh_pending = False
+    _flush()
+    assert canvas.grab_calls == grabs
+    assert coord.store.get(ref_b) is None
+
+    coord.request_capture(ref_b, canvas, "new-view-stable")
+    _flush()
+    assert coord.store.get(ref_b).captured_digest == coord.current_digest_for(ref_b)
+    assert coord.store.get(ref_a).captured_digest == old_digest
+    assert coord.store.get(ref_a).image == old_image
+
+    coord.bind_canvas(canvas, ref_a)
+    coord.request_capture(ref_a, canvas, "reopened-view-stable")
+    _flush()
+    assert coord.store.get(ref_a).captured_digest == coord.current_digest_for(ref_a)
+    assert coord.store.get(ref_a).captured_digest != old_digest
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_leaving_capture_fault_and_other_unstable_reason_keep_warning(qapp, monkeypatch, caplog):
+    monkeypatch.setattr(diagnostics, "_THROTTLE_STATE", OrderedDict())
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    canvas._refresh_pending = True
+    with caplog.at_level(logging.DEBUG, logger=_CAPTURE_LOGGER):
+        for _ in range(diagnostics.BURST):
+            coord.offer_capture_bound_canvas(canvas)
+        assert coord._try_publish_now(ref, canvas, "explicit-probe") is False
+        monkeypatch.setattr(coord._capture, "current_digest_for", lambda _ref: None)
+        coord.offer_capture_bound_canvas(canvas)
+    records = [
+        r for r in caplog.records
+        if r.name == _CAPTURE_LOGGER and r.levelno >= logging.WARNING
+    ]
+    assert [r.levelno for r in records] == [logging.WARNING, logging.WARNING]
+    assert "explicit-probe/unstable" in records[0].getMessage()
+    assert "leaving-bound-canvas/digest-unavailable" in records[1].getMessage()
+    assert canvas.grab_calls == 0
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_replot_same_view_does_not_publish_under_another_ref(qapp):
+    window, coord = _make_coord()
+    manager = window.view_manager
+    state_a = manager.get(0)
+    state_a.view_id = "view-a"
+    idx_b = manager.new_view()
+    manager.get(idx_b).view_id = "view-b"
+
+    canvas = FakeCanvas("#abcdef")
+    stack = _FakeStack()
+    host = _TimeHost(coord, manager, canvas, stack)
+    ref_a = _ref("view-a")
+    ref_b = _ref("view-b")
+    coord.bind_canvas(canvas, ref_a)
+    coord.request_capture(ref_a, canvas, "seed")
+    _flush()
+    grabs_after_seed = canvas.grab_calls
+    assert coord.store.get(ref_a) is not None
+
+    host._render_view_to_canvas(0, canvas, update_primary_ui=True)
+    _flush()
+
+    assert coord.store.get(ref_b) is None
+    assert coord.bound_ref_for(canvas) == ref_a
+    assert canvas.grab_calls == grabs_after_seed
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_time_split_is_two_refs_and_analysis_split_is_one_composite(qapp):
+    window, coord = _make_coord()
+    manager = window.view_manager
+    manager.get(0).view_id = "view-a"
+    idx_b = manager.new_view()
+    manager.get(idx_b).view_id = "view-b"
+    primary = FakeCanvas("#111111")
+    secondary = FakeCanvas("#222222")
+    ref_a = _ref("view-a")
+    ref_b = _ref("view-b")
+    coord.bind_canvas(primary, ref_a)
+    coord.bind_canvas(secondary, ref_b)
+    coord.request_capture(ref_a, primary, "split-primary")
+    coord.request_capture(ref_b, secondary, "split-secondary")
+    _flush()
+    assert coord.store.get(ref_a) is not None
+    assert coord.store.get(ref_b) is not None
+
+    secondary.hide()
+    secondary.markup_revision += 1
+    coord.request_capture(ref_b, secondary, "hidden-secondary")
+    _flush()
+    assert coord.store.get(ref_b).captured_digest != coord.current_digest_for(ref_b)
+
+    pane_a = FakeCanvas("#010101")
+    pane_b = FakeCanvas("#020202")
+    page = FakePage([pane_a, pane_b])
+    fft_manager = ViewManager(state_factory=AnalysisViewState)
+    window.analysis_managers["fft"] = fft_manager
+    fft_manager.get(0).view_id = "fft-a"
+    window.pages["fft"] = page
+    fft_ref = _ref("fft-a", "fft")
+    coord.request_visible_section_capture("fft", "analysis-split")
+    _flush()
+    assert page.combined_calls == 1
+    assert pane_a.grab_calls == 0
+    assert pane_b.grab_calls == 0
+    assert coord.store.get(fft_ref) is not None
+
+    hidden_page = FakePage([FakeCanvas("#030303")])
+    hidden_page.hide()
+    window.pages["fft"] = hidden_page
+    hidden_page.markup_revision = 4
+    coord.request_visible_section_capture("fft", "hidden-page")
+    _flush()
+    assert hidden_page.combined_calls == 0
+
+    primary.deleteLater()
+    secondary.deleteLater()
+    page.deleteLater()
+    hidden_page.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_each_capture_trigger_obeys_canvas_stability_contract(qapp):
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "seed")
+    _flush()
+    record = coord.store.get(ref)
+    assert record is not None
+    first_digest = record.captured_digest
+
+    canvas.markup_revision += 1
+    changed = coord.current_digest_for(ref)
+    assert changed != first_digest
+
+    for attr, value in (
+        ("_quality_state", "yellow"),
+        ("_interaction_state", "interactive"),
+        ("_refresh_pending", True),
+    ):
+        canvas._quality_state = "green"
+        canvas._interaction_state = "idle"
+        canvas._refresh_pending = False
+        setattr(canvas, attr, value)
+        grabs = canvas.grab_calls
+        coord.request_capture(ref, canvas, f"unstable-{attr}")
+        _flush()
+        assert canvas.grab_calls == grabs
+        kept = coord.store.get(ref)
+        assert kept is not None
+        assert kept.captured_digest == first_digest
+
+    canvas._quality_state = "green"
+    canvas._interaction_state = "idle"
+    canvas._refresh_pending = False
+    coord.request_capture(ref, canvas, "stable-retry")
+    _flush()
+    updated = coord.store.get(ref)
+    assert updated is not None
+    assert updated.captured_digest == changed
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_transient_overlays_hidden_but_markup_revision_is_captured(qapp):
+    window, coord = _make_coord()
+    state = window.view_manager.get(0)
+    state.view_id = "view-a"
+    state.cursor_mode = "single"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    without_markup = coord.current_digest_for(ref)
+    canvas.markup_revision = 2
+    with_markup = coord.current_digest_for(ref)
+    assert with_markup != without_markup
+    state.name = "ignored"
+    state.tab_color = "#ffffff"
+    assert coord.current_digest_for(ref) == with_markup
+    state.cursor_mode = "dual"
+    assert coord.current_digest_for(ref) != with_markup
+    state.cursor_mode = "single"
+    assert coord.current_digest_for(ref) == with_markup
+
+    canvas._cursor_item._value = 0.1
+    hover_a = coord.current_digest_for(ref)
+    canvas._cursor_item._value = 9.9
+    assert coord.current_digest_for(ref) == hover_a
+
+    canvas._cursor.dual = True
+    canvas._cursor.ax = 1.0
+    canvas._cursor.bx = 2.0
+    with hide_transient_overlays(canvas):
+        assert canvas._cursor_item.isVisible() is False
+        assert canvas._armed_item.isVisible() is True
+        assert canvas._scale_box.isVisible() is False
+        assert canvas._remark_item.isVisible() is True
+        assert canvas._pin_line.isVisible() is True
+    canvas._cursor.dual = False
+    with hide_transient_overlays(canvas):
+        assert canvas._cursor_item.isVisible() is False
+        assert canvas._armed_item.isVisible() is True
+        assert canvas._scale_box.isVisible() is False
+        assert canvas._remark_item.isVisible() is True
+        assert canvas._pin_line.isVisible() is True
+    assert canvas._cursor_item.isVisible() is True
+    assert canvas._scale_box.isVisible() is True
+    assert canvas._pin_line.isVisible() is True
+
+    coord.request_capture(ref, canvas, "overlay")
+    _flush()
+    assert canvas.cursor_visible_at_grab is False
+    assert canvas.armed_visible_at_grab is True
+    assert canvas.remark_visible_at_grab is True
+    assert canvas.scale_box_visible_at_grab is False
+    assert canvas._cursor_item.isVisible() is True
+    assert canvas._remark_item.isVisible() is True
+    assert canvas._scale_box.isVisible() is True
+    assert read_markup_revision(canvas) == 2
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_missing_viewbox_logs_warning_without_disabling_capture(qapp, caplog):
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+
+    coord.request_capture(ref, canvas, "normal-viewbox")
+    _flush()
+    assert not [record for record in caplog.records if "no viewbox found" in record.message]
+
+    canvas._plotx = canvas._plot
+    del canvas._plot
+    caplog.clear()
+    canvas.markup_revision += 1
+    coord.request_capture(ref, canvas, "missing-viewbox")
+    _flush()
+
+    warnings = [record.message for record in caplog.records if "no viewbox found" in record.message]
+    assert warnings == ["ultraview: no viewbox found on time (FakeCanvas)"]
+    assert coord.store.get(ref) is not None
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_empty_canvas_without_plot_surface_does_not_warn_about_viewbox(qapp, caplog):
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    del canvas._plot
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    caplog.clear()
+    coord.request_capture(ref, canvas, "empty-canvas")
+    _flush()
+    assert not [record for record in caplog.records if "no viewbox found" in record.message]
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+class _FakeReadoutPill:
+    def __init__(self) -> None:
+        self._visible = True
+        self._primary = "A 12.0"
+        self._detail_text = "B 24.0"
+
+    def isVisible(self) -> bool:
+        return self._visible
+
+    def primary_text(self) -> str:
+        return self._primary
+
+    def detail_text(self) -> str:
+        return self._detail_text
+
+    def has_detail(self) -> bool:
+        return True
+
+
+class _PillStack:
+    def __init__(self) -> None:
+        self._pill = _FakeReadoutPill()
+        self.pins = []
+        self.highlight = None
+
+    def cursor_pill_fingerprint(self, canvas=None):
+        pill = self._pill
+        if pill is None or not pill.isVisible():
+            return None
+        detail = pill.detail_text() if pill.has_detail() else ""
+        return (pill.primary_text(), detail)
+
+    def pinned_cursor_fingerprint(self, canvas=None):
+        return list(self.pins)
+
+
+def test_dual_cursor_geometry_survives_canvas_rebind(qapp):
+    """UVL-A11: rebound canvas must not empty the old ref's armed geometry."""
+    from mf4_analyzer.ui.ultraview_state import STATUS_FRESH, derive_preview_status
+
+    window, coord = _make_coord()
+    manager = window.view_manager
+    state_a = manager.get(0)
+    state_a.view_id = "view-a"
+    state_a.cursor_mode = "dual"
+    idx_b = manager.new_view()
+    state_b = manager.get(idx_b)
+    state_b.view_id = "view-b"
+    state_b.cursor_mode = "off"
+    canvas = FakeCanvas()
+    canvas._cursor.dual = True
+    canvas._cursor.ax = 1.5
+    canvas._cursor.bx = 3.5
+    ref_a = _ref("view-a")
+    ref_b = _ref("view-b")
+    coord.bind_canvas(canvas, ref_a)
+    coord.request_capture(ref_a, canvas, "dual-armed")
+    _flush()
+    record = coord.store.get(ref_a)
+    assert record is not None
+    captured = record.captured_digest
+    assert captured == coord.current_digest_for(ref_a)
+
+    coord.bind_canvas(canvas, ref_b)
+    current = coord.current_digest_for(ref_a)
+    assert current == captured
+    assert derive_preview_status(
+        True, True, captured, current
+    ) == STATUS_FRESH
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_pill_fingerprint_survives_hidden_source_page(qapp):
+    """UVL-A17: hiding the source page must not flip a captured card to stale."""
+    from mf4_analyzer.ui.ultraview_state import STATUS_FRESH, derive_preview_status
+
+    window, coord = _make_coord()
+    stack = _PillStack()
+    window.chart_stack = stack
+    state = window.view_manager.get(0)
+    state.view_id = "view-a"
+    state.cursor_mode = "dual"
+    canvas = FakeCanvas()
+    canvas._cursor.dual = True
+    canvas._cursor.ax = 1.0
+    canvas._cursor.bx = 2.0
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "pill-visible")
+    _flush()
+    record = coord.store.get(ref)
+    assert record is not None
+    captured = record.captured_digest
+    assert captured == coord.current_digest_for(ref)
+
+    stack._pill._visible = False
+    canvas.hide()
+    current = coord.current_digest_for(ref)
+    assert current == captured
+    assert derive_preview_status(
+        True, True, captured, current
+    ) == STATUS_FRESH
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_pin_digest_changes_on_add_full_mini_move_not_hover(qapp):
+    window, coord = _make_coord()
+    stack = _PillStack()
+    window.chart_stack = stack
+    state = window.view_manager.get(0)
+    state.view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    baseline = coord.current_digest_for(ref)
+    row = [
+        "pin-1", 1, "single", "time", 0.4, None, None, "full",
+        False, "right", "top", 1.0, 0.0, 2,
+    ]
+    stack.pins = [list(row)]
+    added = coord.current_digest_for(ref)
+    assert added != baseline
+
+    mini = list(row)
+    mini[7] = "mini"
+    stack.pins = [mini]
+    assert coord.current_digest_for(ref) != added
+
+    moved = list(mini)
+    moved[11] = 0.15
+    moved[12] = 0.55
+    stack.pins = [moved]
+    moved_digest = coord.current_digest_for(ref)
+    assert moved_digest != added
+
+    revised = list(moved)
+    revised[13] = 9
+    stack.pins = [revised]
+    assert coord.current_digest_for(ref) != moved_digest
+
+    highlighted = coord.current_digest_for(ref)
+    stack.highlight = "pin-1"
+    assert coord.current_digest_for(ref) == highlighted
+    stack.highlight = None
+    assert coord.current_digest_for(ref) == highlighted
+
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_pin_state_fallback_tracks_strict_committed_panel_expansion(qapp):
+    from mf4_analyzer.ui.pinned_cursor_state import empty_collection, next_record
+
+    window, coord = _make_coord()
+    state = window.view_manager.get(0)
+    state.view_id = "view-a"
+    collection, _ = next_record(
+        empty_collection(),
+        {
+            "mode": "single",
+            "domain": "time",
+            "x": 0.4,
+            "x_unit": "s",
+            "bindings": [{"fid": "fid-a", "channel": "speed"}],
+        },
+    )
+    record = collection.records[0]
+    state.pinned_cursors = replace(
+        collection,
+        records=(replace(record, presentation="mini", panel_expanded=True),),
+    )
+    ref = _ref("view-a")
+    payload = coord.presentation_payload_for(ref)
+    assert payload["pins"][0][7:9] == ["mini", True]
+    expanded_digest = coord.current_digest_for(ref)
+
+    state.pinned_cursors = replace(
+        collection,
+        records=(replace(record, presentation="mini", panel_expanded="true"),),
+    )
+    payload = coord.presentation_payload_for(ref)
+    assert payload["pins"][0][8] is False
+    assert coord.current_digest_for(ref) != expanded_digest
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_capture_waits_for_axis_edit_then_grabs_once(qapp):
+    class _AxisEditController(QObject):
+        axis_edit_state_changed = pyqtSignal(object, bool)
+
+        def __init__(self):
+            super().__init__()
+            self._active = set()
+
+        def axis_edit_is_settled(self, canvas) -> bool:
+            return id(canvas) not in self._active
+
+        def set_active(self, canvas, active: bool) -> None:
+            if active:
+                self._active.add(id(canvas))
+            else:
+                self._active.discard(id(canvas))
+            self.axis_edit_state_changed.emit(canvas, active)
+
+    window, coord = _make_coord()
+    stack = _PillStack()
+    editor = _AxisEditController()
+    stack._pinned_cursors = editor
+    stack.pins = [[
+        "pin-1", 1, "single", "time", 0.4, None, None, "full",
+        False, "right", "top", 1.0, 0.0, 2,
+    ]]
+    window.chart_stack = stack
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+
+    editor.set_active(canvas, True)
+    coord.request_capture(ref, canvas, "pinned-cursor")
+    _flush()
+    assert canvas.grab_calls == 0
+
+    editor.set_active(canvas, False)
+    _flush()
+    assert canvas.grab_calls == 1
+    assert coord.store.get(ref).captured_digest == coord.current_digest_for(ref)
+
+    editor.axis_edit_state_changed.emit(canvas, False)
+    _flush()
+    assert canvas.grab_calls == 1
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_pin_intent_change_marks_project_once_then_requests_ultraview_capture():
+    from mf4_analyzer.ui.main_window._project_io_mixin import ProjectIOMixin
+
+    class _Dirty:
+        def __init__(self) -> None:
+            self.tokens = []
+
+        def mark_user_mutation(self, token=None) -> bool:
+            self.tokens.append(token)
+            return True
+
+    class _UltraView:
+        def __init__(self) -> None:
+            self.capture_requests = 0
+
+        def request_pinned_cursor_capture(self) -> None:
+            self.capture_requests += 1
+
+    class _Host(ProjectIOMixin):
+        def __init__(self) -> None:
+            self._project_dirty = _Dirty()
+            self._ultraview = _UltraView()
+
+    host = _Host()
+    host._on_pinned_cursor_intent_changed()
+    assert host._project_dirty.tokens == ["pinned_cursor"]
+    assert host._ultraview.capture_requests == 1
+
+
+def test_pinned_cursor_capture_facade_isolates_time_partner_and_analysis_page(qapp):
+    window, coord = _make_coord()
+    primary, secondary = FakeCanvas("#112233"), FakeCanvas("#334455")
+    stack = _FakeStack("time")
+    stack.canvas_time = primary
+    stack._split = True
+    stack._secondary = secondary
+    window.chart_stack = stack
+    manager = window.view_manager
+    manager.get(0).view_id = "time-primary"
+    partner_idx = manager.new_view(activate=False)
+    manager.get(partner_idx).view_id = "time-secondary"
+    manager.set_split(partner_idx)
+
+    coord.request_pinned_cursor_capture()
+    _flush()
+    primary_ref = _ref("time-primary")
+    secondary_ref = _ref("time-secondary")
+    assert primary.grab_calls == 1
+    assert secondary.grab_calls == 1
+    assert coord.store.get(primary_ref) is not None
+    assert coord.store.get(secondary_ref) is not None
+
+    fft_manager = ViewManager(state_factory=AnalysisViewState)
+    window.analysis_managers["fft"] = fft_manager
+    fft_state = fft_manager.get(0)
+    fft_state.view_id = "fft-active"
+    fft_state.panes = [PaneState(sources=[("fid-a", "force")])]
+    page = FakePage([FakeCanvas("#556677")])
+    window.pages["fft"] = page
+    stack._mode = "fft"
+
+    coord.request_pinned_cursor_capture()
+    _flush()
+    assert page.combined_calls == 1
+    assert coord.store.get(_ref("fft-active", "fft")) is not None
+    assert primary.grab_calls == 1
+    assert secondary.grab_calls == 1
+    page.deleteLater()
+    primary.deleteLater()
+    secondary.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_pin_fingerprint_survives_hidden_and_rebind(qapp):
+    from mf4_analyzer.ui.ultraview_state import STATUS_FRESH, derive_preview_status
+
+    window, coord = _make_coord()
+    stack = _PillStack()
+    stack.pins = [[
+        "pin-1", 1, "single", "time", 0.4, None, None, "full",
+        False, "right", "top", 1.0, 0.0, 2,
+    ]]
+    window.chart_stack = stack
+    manager = window.view_manager
+    state_a = manager.get(0)
+    state_a.view_id = "view-a"
+    idx_b = manager.new_view()
+    state_b = manager.get(idx_b)
+    state_b.view_id = "view-b"
+    canvas = FakeCanvas()
+    ref_a = _ref("view-a")
+    ref_b = _ref("view-b")
+    coord.bind_canvas(canvas, ref_a)
+    coord.request_capture(ref_a, canvas, "pin-visible")
+    _flush()
+    record = coord.store.get(ref_a)
+    assert record is not None
+    captured = record.captured_digest
+    assert captured == coord.current_digest_for(ref_a)
+
+    canvas.hide()
+    assert coord.current_digest_for(ref_a) == captured
+    stack.pins = []
+    coord.bind_canvas(canvas, ref_b)
+    current = coord.current_digest_for(ref_a)
+    assert current == captured
+    assert derive_preview_status(True, True, captured, current) == STATUS_FRESH
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_capture_dedupes_and_rejects_late_binding_or_digest(qapp):
+    window, coord = _make_coord()
+    manager = window.view_manager
+    manager.get(0).view_id = "view-a"
+    idx_b = manager.new_view()
+    manager.get(idx_b).view_id = "view-b"
+    canvas = FakeCanvas()
+    ref_a = _ref("view-a")
+    ref_b = _ref("view-b")
+    coord.bind_canvas(canvas, ref_a)
+    coord.request_capture(ref_a, canvas, "first")
+    coord.request_capture(ref_a, canvas, "second")
+    assert canvas.grab_calls == 0
+    _flush()
+    assert canvas.grab_calls == 1
+    first_digest = coord.store.get(ref_a).captured_digest
+
+    coord.request_capture(ref_a, canvas, "repeat")
+    _flush()
+    assert canvas.grab_calls == 1
+    assert coord.store.get(ref_a).captured_digest == first_digest
+
+    canvas.markup_revision += 1
+    coord.request_capture(ref_a, canvas, "late-digest")
+    canvas.markup_revision += 1
+    live = coord.current_digest_for(ref_a)
+    _flush()
+    assert coord.store.get(ref_a).captured_digest == live
+    assert canvas.grab_calls == 2
+
+    canvas.markup_revision += 1
+    coord.request_capture(ref_a, canvas, "late-bind")
+    coord.bind_canvas(canvas, ref_b)
+    _flush()
+    assert coord.store.get(ref_a).captured_digest == live
+    assert coord.store.get(ref_b) is None
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_refresh_page_updates_card_chrome_when_preview_record_unchanged(qapp):
+    window, coord = _make_coord()
+    page = UltraViewPage()
+    page.resize(320, 240)
+    page.show()
+    window.chart_stack = SimpleNamespace(
+        page_ultraview=page,
+        current_mode=lambda: "time",
+        cursor_pill_snapshot=lambda: None,
+        restore_cursor_pill_snapshot=lambda *_a, **_k: None,
+        clear_cursor_pill=lambda: None,
+        split_active=lambda: False,
+        secondary_canvas=lambda: None,
+        focused_canvas=lambda: None,
+    )
+    state = window.view_manager.get(0)
+    state.view_id = "view-a"
+    state.name = "Alpha"
+    state.tab_color = "#111111"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    add_ref(coord.board, ref)
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "open")
+    _flush()
+    coord.refresh_page()
+    card = page.card_widget("time", "view-a")
+    assert card is not None
+    assert card.model().title == "Alpha"
+    assert card.model().tab_color == "#111111"
+    window.view_manager.rename(0, "转向力矩")
+    window.view_manager.set_color(0, "#ff3366")
+    coord.refresh_page()
+    card = page.card_widget("time", "view-a")
+    assert card.model().title == "转向力矩"
+    assert card.model().tab_color == "#ff3366"
+    page.deleteLater()
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_refresh_page_batches_active_board_projection(qapp):
+    window, coord = _make_coord()
+    page = UltraViewPage()
+    page.resize(320, 240)
+    page.show()
+    window.chart_stack = SimpleNamespace(
+        page_ultraview=page,
+        current_mode=lambda: "time",
+        cursor_pill_snapshot=lambda: None,
+        restore_cursor_pill_snapshot=lambda *_a, **_k: None,
+        clear_cursor_pill=lambda: None,
+        split_active=lambda: False,
+        secondary_canvas=lambda: None,
+        focused_canvas=lambda: None,
+    )
+    window.view_manager.get(0).view_id = "view-0"
+    for index in range(6):
+        add_ref(coord.board, _ref(f"view-{index}"))
+
+    calls = []
+    original = page._refresh_free_grid_projection
+
+    def counted():
+        calls.append(1)
+        original()
+
+    page._refresh_free_grid_projection = counted
+    coord.refresh_page()
+
+    assert calls == [1]
+    page.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_refresh_page_pushes_previews_only_for_active_board(qapp):
+    window, coord = _make_coord()
+    page = UltraViewPage()
+    page.resize(320, 240)
+    page.show()
+    window.chart_stack = SimpleNamespace(
+        page_ultraview=page,
+        current_mode=lambda: "time",
+        cursor_pill_snapshot=lambda: None,
+        restore_cursor_pill_snapshot=lambda *_a, **_k: None,
+        clear_cursor_pill=lambda: None,
+        split_active=lambda: False,
+        secondary_canvas=lambda: None,
+        focused_canvas=lambda: None,
+    )
+    active = coord.board
+    active_ref = _ref("active")
+    other_ref = _ref("inactive")
+    add_ref(active, active_ref)
+    other = create_board(coord.workspace, name="另一块板")
+    assert other is not None
+    add_ref(other, other_ref)
+    assert set_active_board(coord.workspace, active.board_id) == []
+
+    pushed = []
+    coord._push_preview = pushed.append
+    coord.refresh_page()
+
+    assert pushed == [active_ref]
+    page.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_preview_path_never_calls_restore_or_source_replot(qapp):
+    for path in (_COORDINATOR_PATH, _CAPTURE_COORDINATOR_PATH):
+        source = path.read_text(encoding="utf-8")
+        for name in _FORBIDDEN_SOURCE_NAMES:
+            assert name not in source, f"{name} in {path.name}"
+
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "preview")
+    _flush()
+    assert window.restore_calls == 0
+    assert window.plot_time_calls == 0
+    assert coord.store.get(ref) is not None
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_markup_revision_add_move_remove_clear(qapp, monkeypatch):
+    from mf4_analyzer.ui.pg_canvases import TimeDomainCanvasPG
+
+    canvas = TimeDomainCanvasPG()
+    canvas.resize(640, 360)
+    canvas.show()
+    QCoreApplication.processEvents()
+    t = np.linspace(0.0, 1.0, 32)
+    y = np.sin(2.0 * np.pi * t)
+    canvas.plot_channels(
+        [("speed", True, t, y, "#1769e0", "rpm", "fid-1")],
+        mode="subplot",
+    )
+    manager = canvas._annotations
+    assert manager.markup_revision == 0
+    monkeypatch.setattr(
+        manager,
+        "_nearest_data_point",
+        lambda _pos: ("speed", 0.25, 0.5, "#1769e0", "rpm"),
+    )
+    manager._add_remark(QPoint(120, 100))
+    assert manager.markup_revision == 1
+    text = manager.remarks[0]["text"]
+    text.setPos(text.pos().x() + 6.0, text.pos().y() + 6.0)
+    QCoreApplication.processEvents()
+    assert manager.markup_revision == 2
+    manager._remove_remark_by_index(0)
+    assert manager.markup_revision == 3
+    manager.clear_remarks()
+    assert manager.markup_revision == 3
+    manager._add_remark(QPoint(120, 100))
+    assert manager.markup_revision == 4
+    manager.clear_remarks()
+    assert manager.markup_revision == 5
+    manager.clear_remarks()
+    assert manager.markup_revision == 5
+    canvas.deleteLater()
+
+
+def _payload_fn_dump(name: str) -> str:
+    for path in (_CAPTURE_COORDINATOR_PATH, _COORDINATOR_PATH):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return ast.dump(node)
+    raise AssertionError(f"missing function {name}")
+
+
+def test_payload_builders_do_not_read_active_page_or_canvas_fallback():
+    analysis = _payload_fn_dump("_analysis_payload")
+    time_fn = _payload_fn_dump("_time_payload")
+    assert "_analysis_page" not in analysis
+    assert "canvas_time" not in analysis
+    assert "canvas_time" not in time_fn
+    widget = _payload_fn_dump("_widget_for_ref")
+    assert "canvas_time" not in widget
+    assert "_analysis_page" not in widget
+
+
+def test_inactive_analysis_digest_ignores_active_page_runtime(qapp):
+    window, coord = _make_coord()
+    fft_manager = ViewManager(state_factory=AnalysisViewState)
+    window.analysis_managers["fft"] = fft_manager
+    state_a = fft_manager.get(0)
+    state_a.view_id = "fft-a"
+    state_a.panes = [PaneState(sources=[("f1", "torque")])]
+    idx_b = fft_manager.new_view()
+    state_b = fft_manager.get(idx_b)
+    state_b.view_id = "fft-b"
+    state_b.panes = [PaneState(sources=[("f1", "torque")])]
+    pane = FakeCanvas()
+    page = FakePage([pane])
+    window.pages["fft"] = page
+    ref_a = _ref("fft-a", "fft")
+    ref_b = _ref("fft-b", "fft")
+    coord.bind_canvas(page, ref_a)
+    digest_a = coord.current_digest_for(ref_a)
+    assert digest_a is not None
+
+    coord.bind_canvas(page, ref_b)
+    page._panes.append(FakeCanvas())
+    pane.markup_revision = 7
+    digest_a_inactive = coord.current_digest_for(ref_a)
+    digest_b = coord.current_digest_for(ref_b)
+    assert digest_a_inactive == digest_a
+    assert digest_b != digest_a
+
+    coord.bind_canvas(page, ref_a)
+    pane.markup_revision = 8
+    assert coord.current_digest_for(ref_a) != digest_a
+    page.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_time_ref_does_not_fallback_to_active_canvas(qapp):
+    window, coord = _make_coord()
+    manager = window.view_manager
+    manager.get(0).view_id = "view-a"
+    idx_b = manager.new_view()
+    manager.get(idx_b).view_id = "view-b"
+    canvas_a = FakeCanvas("#111111")
+    canvas_b = FakeCanvas("#222222")
+    window.canvas_time = canvas_b
+    ref_a = _ref("view-a")
+    ref_b = _ref("view-b")
+    coord.bind_canvas(canvas_b, ref_b)
+    canvas_b.markup_revision = 9
+    unbound = coord.current_digest_for(ref_a)
+    coord.bind_canvas(canvas_a, ref_a)
+    canvas_a.markup_revision = 0
+    baseline = coord.current_digest_for(ref_a)
+    assert unbound == baseline
+    canvas_a.markup_revision = 3
+    changed = coord.current_digest_for(ref_a)
+    assert changed != baseline
+    coord.bind_canvas(canvas_a, None)
+    canvas_b.markup_revision = 99
+    assert coord.current_digest_for(ref_a) == changed
+    canvas_a.deleteLater()
+    canvas_b.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_same_cache_key_different_view_ids_isolate_generation(qapp):
+    window, coord = _make_coord()
+    fft_manager = ViewManager(state_factory=AnalysisViewState)
+    window.analysis_managers["fft"] = fft_manager
+    fft_manager.get(0).view_id = "fft-a"
+    idx_b = fft_manager.new_view()
+    fft_manager.get(idx_b).view_id = "fft-b"
+    key = ("fft", "shared")
+    window._analysis_pins.add("fft", "fft-a", 0, key)
+    window._analysis_pins.add("fft", "fft-b", 0, key)
+    ref_a = _ref("fft-a", "fft")
+    ref_b = _ref("fft-b", "fft")
+    result = object()
+    coord.notify_result_stored("fft", "fft-a", 0, key, result)
+    digest_a = coord.current_digest_for(ref_a)
+    digest_b_before = coord.current_digest_for(ref_b)
+    coord.notify_result_stored("fft", "fft-b", 0, key, object())
+    assert coord.current_digest_for(ref_a) == digest_a
+    assert coord.current_digest_for(ref_b) != digest_b_before
+    coord.notify_result_stored("fft", "fft-a", 0, key, object())
+    assert coord.current_digest_for(ref_a) != digest_a
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_inactive_result_bumps_generation_without_grabbing_active_canvas(qapp):
+    window, coord = _make_coord()
+    fft_manager = ViewManager(state_factory=AnalysisViewState)
+    window.analysis_managers["fft"] = fft_manager
+    fft_manager.get(0).view_id = "fft-a"
+    idx_b = fft_manager.new_view()
+    fft_manager.get(idx_b).view_id = "fft-b"
+    key = ("fft", "k")
+    window._analysis_pins.add("fft", "fft-a", 0, key)
+    window._analysis_pins.add("fft", "fft-b", 0, key)
+    page = FakePage([FakeCanvas()])
+    window.pages["fft"] = page
+    ref_a = _ref("fft-a", "fft")
+    ref_b = _ref("fft-b", "fft")
+    coord.bind_canvas(page, ref_b)
+    coord.request_capture(ref_b, page, "active")
+    _flush()
+    grabs = page.combined_calls
+    digest_b = coord.current_digest_for(ref_b)
+    coord.notify_result_stored("fft", "fft-a", 0, key, object())
+    assert page.combined_calls == grabs
+    assert coord.result_generation_for("fft", "fft-a", 0, key) == 1
+    assert coord.current_digest_for(ref_b) == digest_b
+    assert coord.current_digest_for(ref_a) is not None
+    page.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_result_generation_uses_weakref_identity_not_recycled_id(qapp):
+    """UVL-A12: generation tracks live object identity, not integer ``id()``.
+
+    Policy: bump unless the previous identity token still points at this
+    result (``is``). Weakref when the object supports it; after the first
+    object is deleted and collected, a new object must bump even if
+    CPython reused the address. Values that cannot be weakly referenced
+    (``object()``, tuples) keep a strong token — same live object must not
+    bump, a replacement must.
+    """
+    class _Probe:
+        pass
+
+    window, coord = _make_coord()
+    key = ("fft", "uvl-a12")
+    first = _Probe()
+    coord.notify_result_stored("fft", "fft-a", 0, key, first)
+    assert coord.result_generation_for("fft", "fft-a", 0, key) == 1
+    coord.notify_result_stored("fft", "fft-a", 0, key, first)
+    assert coord.result_generation_for("fft", "fft-a", 0, key) == 1
+
+    del first
+    gc.collect()
+    second = _Probe()
+    identity = getattr(coord, "_result_identity", None)
+    if isinstance(identity, dict):
+        slot = coord._generation_slot("fft", "fft-a", 0, key)
+        identity[slot] = id(second)
+    coord.notify_result_stored("fft", "fft-a", 0, key, second)
+    assert coord.result_generation_for("fft", "fft-a", 0, key) == 2
+
+    bare = ("fft", "no-weakref")
+    token = object()
+    coord.notify_result_stored("fft", "fft-a", 0, bare, token)
+    assert coord.result_generation_for("fft", "fft-a", 0, bare) == 1
+    coord.notify_result_stored("fft", "fft-a", 0, bare, token)
+    assert coord.result_generation_for("fft", "fft-a", 0, bare) == 1
+    coord.notify_result_stored("fft", "fft-a", 0, bare, object())
+    assert coord.result_generation_for("fft", "fft-a", 0, bare) == 2
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_reset_restore_shutdown_clear_runtime_ledger(qapp):
+    window, coord = _make_coord()
+    manager = window.view_manager
+    manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    canvas.markup_revision = 4
+    changed = coord.current_digest_for(ref)
+    runtime = coord._capture._runtime
+    assert runtime.get(ref) is not None
+    coord.reset_project_state()
+    assert runtime.get(ref) is None
+    coord.bind_canvas(canvas, ref)
+    canvas.markup_revision = 5
+    coord.current_digest_for(ref)
+    assert runtime.get(ref) is not None
+    coord.restore_project_state(None)
+    assert runtime.get(ref) is None
+    coord.bind_canvas(canvas, ref)
+    coord.current_digest_for(ref)
+    coord.shutdown()
+    assert runtime.get(ref) is None
+    canvas.deleteLater()
+    coord.deleteLater()
+    assert changed is not None
+
+
+def test_capture_runtime_counts_are_read_only_and_clear_symmetrically(qapp):
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    capture = coord._capture
+
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "lifecycle-counts")
+    armed = capture.runtime_counts()
+    assert armed.bindings == 1
+    assert armed.queued_grabs == 1
+    assert armed.hooked_widgets == 1
+    assert armed.hook_connections >= 1
+    assert armed.destroy_watches == 1
+    assert armed.active_timers >= 1
+    assert capture.has_pending_capture(ref) is True
+
+    capture.reset_capture_state()
+    reset = capture.runtime_counts()
+    assert reset.bindings == 0
+    assert reset.queued_grabs == 0
+    assert reset.unstable_widgets == 0
+    assert reset.hook_connections == 0
+    assert reset.hooked_widgets == 0
+    assert reset.idle_pending == 0
+    assert reset.sidecar_pending == 0
+    assert reset.active_timers == 0
+    # A destroy watch is retained across project reset so the same live Qt
+    # wrapper cannot be watched twice; final shutdown owns its release.
+    assert reset.destroy_watches == 1
+    assert capture.has_pending_capture(ref) is False
+
+    capture.shutdown_capture()
+    assert capture.runtime_counts().destroy_watches == 0
+    canvas.deleteLater()
+    coord.deleteLater()
+
+
+def test_digest_unavailable_keeps_old_image_stale(qapp):
+    from mf4_analyzer.ui.ultraview_state import STATUS_MISSING, STATUS_STALE
+
+    window, coord = _make_coord()
+    manager = window.view_manager
+    manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "seed")
+    _flush()
+    record = coord.store.get(ref)
+    assert record is not None and record.image is not None
+    manager.views[:] = []
+    assert coord.current_digest_for(ref) is None
+    exists = coord._ref_exists(ref)
+    assert exists is False
+    from mf4_analyzer.ui.chart_stack.ultraview.preview_store import PreviewStore
+    from mf4_analyzer.ui.ultraview_state import derive_preview_status
+
+    assert derive_preview_status(
+        True,
+        PreviewStore.image_valid(record.image),
+        record.captured_digest,
+        None,
+    ) == STATUS_STALE
+    assert derive_preview_status(True, False, None, None) == STATUS_MISSING
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_user_sync_recaptures_stale_preview_without_recompute(qapp):
+    from mf4_analyzer.ui.chart_stack.ultraview.preview_store import PreviewStore
+    from mf4_analyzer.ui.ultraview_state import STATUS_STALE, derive_preview_status
+
+    window, coord = _make_coord()
+    state = window.view_manager.get(0)
+    state.view_id = "view-a"
+    state.xlim = (0.0, 1.0)
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    add_ref(coord.board, ref)
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "seed")
+    _flush()
+    first = coord.store.get(ref)
+    assert first is not None
+    first_digest = first.captured_digest
+    state.xlim = (0.0, 4.0)
+    current = coord.current_digest_for(ref)
+    assert current is not None and current != first_digest
+    assert derive_preview_status(
+        True,
+        PreviewStore.image_valid(first.image),
+        first_digest,
+        current,
+    ) == STATUS_STALE
+
+    grabs_before = canvas.grab_calls
+    coord.sync_preview("time", "view-a")
+    _flush()
+    second = coord.store.get(ref)
+    assert canvas.grab_calls > grabs_before
+    assert second is not None
+    assert second.captured_digest == current
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_user_sync_hidden_canvas_toasts_without_navigate(qapp):
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    canvas.hide()
+    toasts: list[tuple[str, str]] = []
+    window.toast = lambda msg, level: toasts.append((msg, level))
+    coord.sync_preview("time", "view-a")
+    assert toasts == [("请先打开原 View 再同步", "warning")]
+    assert canvas.grab_calls == 0
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_user_sync_navigates_hidden_source_then_captures(qapp):
+    window, coord = _make_coord()
+    state = window.view_manager.get(0)
+    state.view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    add_ref(coord.board, ref)
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "seed")
+    _flush()
+    state.xlim = (0.0, 3.0)
+    canvas.hide()
+    navigated: list[tuple[str, str]] = []
+
+    def navigate(section, view_id):
+        navigated.append((section, view_id))
+        canvas.show()
+        return True
+
+    window.navigate_to_view = navigate
+    raised: list[bool] = []
+    window._ultraview_sheet = SimpleNamespace(
+        isVisible=lambda: True,
+        raise_=lambda: raised.append(True),
+        activateWindow=lambda: None,
+    )
+    grabs_before = canvas.grab_calls
+    coord.sync_preview("time", "view-a")
+    assert navigated == [("time", "view-a")]
+    _flush()
+    assert canvas.grab_calls > grabs_before
+    assert raised == [True]
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_user_sync_navigates_without_raising_the_analyzer(qapp):
+    window, coord = _make_coord()
+    state = window.view_manager.get(0)
+    state.view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    add_ref(coord.board, ref)
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "seed")
+    _flush()
+    state.xlim = (0.0, 3.0)
+    canvas.hide()
+    navigated: list[bool] = []
+    window_raises: list[str] = []
+
+    def navigate(section, view_id, *, raise_window=True):
+        navigated.append(raise_window)
+        canvas.show()
+        return True
+
+    window.navigate_to_view = navigate
+    window.raise_ = lambda: window_raises.append("raise")
+    window.activateWindow = lambda: window_raises.append("activate")
+    window._ultraview_sheet = SimpleNamespace(
+        isVisible=lambda: True,
+        raise_=lambda: None,
+        activateWindow=lambda: None,
+    )
+    coord.sync_preview("time", "view-a")
+    assert navigated == [False]
+    _flush()
+    assert window_raises == []
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_user_sync_serializes_hidden_sources_instead_of_last_wins(qapp):
+    window, coord = _make_coord()
+    manager = window.view_manager
+    state_a = manager.get(0)
+    state_a.view_id = "view-a"
+    state_a.xlim = (0.0, 1.0)
+    idx_b = manager.new_view()
+    state_b = manager.get(idx_b)
+    state_b.view_id = "view-b"
+    state_b.xlim = (0.0, 2.0)
+    canvas_a = FakeCanvas("#111111")
+    canvas_b = FakeCanvas("#222222")
+    ref_a = _ref("view-a")
+    ref_b = _ref("view-b")
+    add_ref(coord.board, ref_a)
+    add_ref(coord.board, ref_b)
+    coord.bind_canvas(canvas_a, ref_a)
+    coord.bind_canvas(canvas_b, ref_b)
+    coord.request_capture(ref_a, canvas_a, "seed")
+    coord.request_capture(ref_b, canvas_b, "seed")
+    _flush()
+    state_a.xlim = (0.0, 3.0)
+    state_b.xlim = (0.0, 4.0)
+    canvas_a.hide()
+    canvas_b.hide()
+    navigated: list[tuple[str, str]] = []
+    canvases = {"view-a": canvas_a, "view-b": canvas_b}
+
+    def navigate(section, view_id):
+        navigated.append((section, view_id))
+        for key, canvas in canvases.items():
+            if key == view_id:
+                canvas.show()
+            else:
+                canvas.hide()
+        manager.set_active(0 if view_id == "view-a" else idx_b)
+        return True
+
+    window.navigate_to_view = navigate
+    raised: list[tuple[tuple[str, str], ...]] = []
+    window._ultraview_sheet = SimpleNamespace(
+        isVisible=lambda: True,
+        raise_=lambda: raised.append(tuple(navigated)),
+        activateWindow=lambda: None,
+    )
+    grabs_a = canvas_a.grab_calls
+    grabs_b = canvas_b.grab_calls
+    coord.sync_preview("time", "view-a")
+    coord.sync_preview("time", "view-b")
+    assert navigated == [("time", "view-a")]
+    assert canvas_b.grab_calls == grabs_b
+    _flush(12)
+    assert navigated == [("time", "view-a"), ("time", "view-b")]
+    assert canvas_a.grab_calls > grabs_a
+    assert canvas_b.grab_calls > grabs_b
+    assert raised == [(("time", "view-a"), ("time", "view-b"))]
+    canvas_a.deleteLater()
+    canvas_b.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def _analysis_capture_setup(window, section, panes, view_id="view-a"):
+    manager = ViewManager(state_factory=AnalysisViewState)
+    window.analysis_managers[section] = manager
+    state = manager.get(0)
+    state.view_id = view_id
+    state.panes = [PaneState(sources=[("f1", "ch")]) for _ in panes]
+    page = FakePage(panes)
+    window.pages[section] = page
+    return page, _ref(view_id, section)
+
+
+def test_capture_skips_publish_when_all_panes_have_no_result(qapp):
+    from mf4_analyzer.ui.ultraview_state import (
+        STATUS_MISSING,
+        derive_preview_status,
+    )
+
+    window, coord = _make_coord()
+    for section in ("fft", "fft_time", "frf", "order"):
+        pane_a = FakeCanvas("#010101")
+        pane_b = FakeCanvas("#020202")
+        pane_a._has_result = False
+        pane_b._has_result = False
+        page, ref = _analysis_capture_setup(
+            window, section, [pane_a, pane_b], view_id=f"{section}-empty"
+        )
+        coord.bind_canvas(page, ref)
+        coord.request_capture(ref, page, "empty-all-panes")
+        _flush()
+        assert page.combined_calls == 0, section
+        assert pane_a.grab_calls == 0, section
+        assert pane_b.grab_calls == 0, section
+        assert coord.store.get(ref) is None, section
+        assert derive_preview_status(
+            True, False, None, coord.current_digest_for(ref)
+        ) == STATUS_MISSING
+        page.deleteLater()
+        pane_a.deleteLater()
+        pane_b.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_capture_no_result_preserves_existing_preview_as_stale(qapp):
+    from mf4_analyzer.ui.chart_stack.ultraview.preview_store import PreviewStore
+    from mf4_analyzer.ui.ultraview_state import STATUS_STALE, derive_preview_status
+
+    window, coord = _make_coord()
+    pane = FakeCanvas("#445566")
+    page, ref = _analysis_capture_setup(
+        window, "fft_time", [pane], view_id="fft-time-stale"
+    )
+    coord.bind_canvas(page, ref)
+    coord.request_capture(ref, page, "seed")
+    _flush()
+    record = coord.store.get(ref)
+    assert record is not None and PreviewStore.image_valid(record.image)
+    seeded_digest = record.captured_digest
+    seeded_image = record.image
+
+    pane._has_result = False
+    pane.markup_revision += 1
+    coord.request_capture(ref, page, "cleared-result")
+    _flush()
+    kept = coord.store.get(ref)
+    assert kept is not None
+    assert kept.image is seeded_image
+    assert kept.captured_digest == seeded_digest
+    assert page.combined_calls == 1
+    assert derive_preview_status(
+        True,
+        PreviewStore.image_valid(kept.image),
+        kept.captured_digest,
+        coord.current_digest_for(ref),
+    ) == STATUS_STALE
+    page.deleteLater()
+    pane.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_capture_no_result_without_prior_image_stays_missing(qapp):
+    window, coord = _make_coord()
+    pane = FakeCanvas()
+    pane._has_result = False
+    page, ref = _analysis_capture_setup(window, "frf", [pane], view_id="frf-missing")
+    coord.bind_canvas(page, ref)
+    coord.request_capture(ref, page, "never-computed")
+    _flush()
+    assert coord.store.get(ref) is None
+    assert page.combined_calls == 0
+    page.deleteLater()
+    pane.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_capture_allows_composite_when_one_pane_has_result(qapp):
+    window, coord = _make_coord()
+    live = FakeCanvas("#101010")
+    empty = FakeCanvas("#202020")
+    empty._has_result = False
+    page, ref = _analysis_capture_setup(
+        window, "order", [live, empty], view_id="order-partial"
+    )
+    coord.bind_canvas(page, ref)
+    coord.request_capture(ref, page, "partial-split")
+    _flush()
+    assert page.combined_calls == 1
+    assert coord.store.get(ref) is not None
+    page.deleteLater()
+    live.deleteLater()
+    empty.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_time_capture_skips_when_canvas_has_no_curves(qapp):
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    canvas.has_result = None
+    canvas._quality_state = "red"
+    canvas._curve_count = 0
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "empty-time")
+    _flush()
+    assert canvas.grab_calls == 0
+    assert coord.store.get(ref) is None
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_time_digest_stable_when_numpy_wrappers_churn(qapp):
+    """Presentation digest must not include ndarray ids from to_numpy wrappers."""
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    window.view_manager.get(0).checked = [("fid-1", "rpm")]
+    samples = np.linspace(0.0, 1.0, 32)
+
+    class _Column:
+        def __init__(self, values):
+            self._values = np.asarray(values, dtype=np.float64)
+
+        def to_numpy(self, copy=False):
+            return self._values.copy()
+
+    class _Frame:
+        columns = ("rpm",)
+
+        def __init__(self, values):
+            self._col = _Column(values)
+
+        def __getitem__(self, key):
+            return self._col
+
+    window.files = {
+        "fid-1": SimpleNamespace(
+            data=_Frame(samples),
+            time_array=np.linspace(0.0, 1.0, 32),
+        )
+    }
+    ref = _ref("view-a")
+    first = coord.current_digest_for(ref)
+    second = coord.current_digest_for(ref)
+    assert first is not None
+    assert first == second
+    window.files["fid-1"].data._col._values[:] = 7.0
+    assert coord.current_digest_for(ref) != first
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_time_canvas_dense_raster_captures_when_native_curve_count_is_zero(qapp):
+    """Ready raster covers native PlotCurveItems; curve_count is then 0."""
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    canvas.has_result = None
+    canvas._quality_state = "green"
+    canvas._curve_count = 0
+    canvas._render_path = "dense-raster"
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "dense-raster")
+    _flush()
+    assert canvas.grab_calls == 1
+    record = coord.store.get(ref)
+    assert record is not None
+    assert record.image is not None
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_time_canvas_channel_lines_capture_when_quality_curve_count_is_zero(qapp):
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    canvas.has_result = None
+    canvas._quality_state = "red"
+    canvas._curve_count = 0
+    canvas._channel_lines = {"torque": object()}
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "channel-lines")
+    _flush()
+    assert canvas.grab_calls == 1
+    assert coord.store.get(ref) is not None
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_time_canvas_with_curves_captures_when_aa_stays_red(qapp):
+    """AA red means native non-AA plot, not an empty canvas (dense EPS traces)."""
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    canvas.has_result = None
+    canvas._quality_state = "red"
+    canvas._curve_count = 6
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "dense-non-aa")
+    _flush()
+    assert canvas.grab_calls == 1
+    record = coord.store.get(ref)
+    assert record is not None
+    assert record.image is not None
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_time_canvas_yellow_aa_waits_then_captures(qapp):
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    canvas.has_result = None
+    canvas._quality_state = "yellow"
+    canvas._curve_count = 4
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "aa-pending")
+    _flush()
+    assert canvas.grab_calls == 0
+    assert coord.store.get(ref) is None
+    canvas._quality_state = "green"
+    coord.request_capture(ref, canvas, "aa-settled")
+    _flush()
+    assert canvas.grab_calls == 1
+    assert coord.store.get(ref) is not None
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_lru_cleared_image_recaptures_same_digest(qapp):
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "first")
+    _flush()
+    assert canvas.grab_calls == 1
+    record = coord.store.get(ref)
+    assert record is not None
+    digest = record.captured_digest
+    record.image = None
+    coord.request_capture(ref, canvas, "after-lru")
+    _flush()
+    assert canvas.grab_calls == 2
+    restored = coord.store.get(ref)
+    assert restored is not None
+    assert restored.captured_digest == digest
+    assert restored.image is not None
+    assert restored.image.isNull() is False
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_capture_ignores_destroyed_canvas_without_stale_publish(qapp):
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "first")
+    _flush()
+    assert canvas.grab_calls == 1
+    old_digest = coord.store.get(ref).captured_digest
+    canvas.markup_revision += 1
+    coord.request_capture(ref, canvas, "queued")
+    sip.delete(canvas)
+    _flush()
+    record = coord.store.get(ref)
+    assert record is not None
+    assert record.captured_digest == old_digest
+    coord.clear()
+    coord.deleteLater()
+
+
+def _visible_sheet(window):
+    sheet = QWidget()
+    sheet.resize(120, 80)
+    sheet.show()
+    window._ultraview_sheet = sheet
+    return sheet
+
+
+def test_idle_capture_coalesces_range_signals(qapp):
+    window, coord = _make_coord()
+    sheet = _visible_sheet(window)
+    window.view_manager.get(0).view_id = "view-a"
+    state = window.view_manager.get(0)
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "open")
+    _flush()
+    assert canvas.grab_calls == 1
+    first = coord.store.get(ref).captured_digest
+
+    # E1: repeating the same visible range does not bump presentation_revision.
+    # cursor_info is not a pixel-fact signal; it still coalesces onto one idle grab.
+    revision = coord.presentation_revision_for(ref)
+    for _ in range(5):
+        canvas.visible_range_changed.emit()
+        canvas.cursor_info.emit("t=0.1s")
+    assert canvas.grab_calls == 1
+    assert coord.presentation_revision_for(ref) == revision
+    state.xlim = (0.2, 0.8)
+    canvas.visible_range = (0.2, 0.8)
+    canvas.visible_range_changed.emit()
+    assert coord.presentation_revision_for(ref) == revision + 1
+    assert canvas.grab_calls == 1
+    QTest.qWait(_IDLE_CAPTURE_MS + 80)
+    _flush()
+    assert canvas.grab_calls == 2
+    updated = coord.store.get(ref)
+    assert updated is not None
+    assert updated.captured_digest != first
+    pan_digest = updated.captured_digest
+    canvas.markup_revision += 1
+    canvas.markup_revision_changed.emit()
+    QTest.qWait(_IDLE_CAPTURE_MS + 80)
+    _flush()
+    assert canvas.grab_calls == 3
+    marked = coord.store.get(ref)
+    assert marked is not None
+    assert marked.captured_digest != pan_digest
+    sheet.deleteLater()
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_idle_cursor_info_does_not_project_each_signal(qapp):
+    window, coord = _make_coord()
+    sheet = _visible_sheet(window)
+    page = UltraViewPage()
+    page.resize(240, 180)
+    page.show()
+    window.chart_stack = SimpleNamespace(
+        page_ultraview=page,
+        current_mode=lambda: "time",
+        cursor_pill_snapshot=lambda: None,
+        restore_cursor_pill_snapshot=lambda *_a, **_k: None,
+        clear_cursor_pill=lambda: None,
+        split_active=lambda: False,
+        secondary_canvas=lambda: None,
+        focused_canvas=lambda: None,
+    )
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    add_ref(coord.board, ref)
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "open")
+    _flush()
+    coord._push_preview(ref)
+
+    refreshes = []
+    orig_refresh = page._refresh_projection
+
+    def counted_refresh():
+        refreshes.append(1)
+        orig_refresh()
+
+    page._refresh_projection = counted_refresh
+    digest_calls = []
+    orig_digest = coord.current_digest_for
+
+    def counted_digest(target):
+        digest_calls.append(target)
+        return orig_digest(target)
+
+    coord.current_digest_for = counted_digest
+    canvas.markup_revision += 1
+
+    for _ in range(20):
+        canvas.cursor_info.emit("t=0")
+        qapp.processEvents()
+    assert refreshes == []
+    assert digest_calls == []
+
+    QTest.qWait(_IDLE_CAPTURE_MS + 80)
+    _flush()
+    assert 1 <= len(refreshes) <= 4
+    assert digest_calls
+    sheet.deleteLater()
+    page.deleteLater()
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_digest_changed_requeues_and_publishes(qapp, monkeypatch, caplog):
+    monkeypatch.setattr(diagnostics, "_THROTTLE_STATE", OrderedDict())
+    caplog.set_level(logging.DEBUG, logger=_CAPTURE_LOGGER)
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "first")
+    _flush()
+    first = coord.store.get(ref).captured_digest
+    grabs = canvas.grab_calls
+
+    canvas.markup_revision += 1
+    coord.request_capture(ref, canvas, "stale-queue")
+    canvas.markup_revision += 1
+    live = coord.current_digest_for(ref)
+    assert live != first
+    _flush()
+    record = coord.store.get(ref)
+    assert record is not None
+    assert record.captured_digest == live
+    assert canvas.grab_calls == grabs + 1
+    skips = [r for r in caplog.records if "digest-changed" in r.getMessage()]
+    assert [r.levelno for r in skips] == [logging.DEBUG]
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_digest_changed_retry_is_capped(qapp, monkeypatch, caplog):
+    monkeypatch.setattr(diagnostics, "_THROTTLE_STATE", OrderedDict())
+    caplog.set_level(logging.DEBUG, logger=_CAPTURE_LOGGER)
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "first")
+    _flush()
+
+    details = []
+    orig_warn = coord._capture._warn_capture
+
+    def spy_warn(target, widget, reason, detail):
+        details.append(detail)
+        return orig_warn(target, widget, reason, detail)
+
+    coord._capture._warn_capture = spy_warn
+    n = {"i": 0}
+
+    def moving(_target):
+        n["i"] += 1
+        return f"moving-{n['i']}"
+
+    coord._capture.current_digest_for = moving
+    coord.request_capture(ref, canvas, "oscillate")
+    _flush(24)
+    assert details.count("digest-changed") == _DIGEST_RETRY_LIMIT + 1
+    assert "digest-retry-exhausted" in details
+    warnings = [
+        r for r in caplog.records
+        if r.name == _CAPTURE_LOGGER and r.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert "digest-retry-exhausted" in warnings[0].getMessage()
+    assert warnings[0].levelno == logging.WARNING
+    after = list(details)
+    _flush(12)
+    assert details == after
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_idle_pending_per_ref_not_starved_by_other_canvas(qapp):
+    window, coord = _make_coord()
+    sheet = _visible_sheet(window)
+    manager = window.view_manager
+    manager.get(0).view_id = "view-a"
+    idx_b = manager.new_view()
+    manager.get(idx_b).view_id = "view-b"
+    canvas_a = FakeCanvas("#111111")
+    canvas_b = FakeCanvas("#222222")
+    ref_a = _ref("view-a")
+    ref_b = _ref("view-b")
+    coord.bind_canvas(canvas_a, ref_a)
+    coord.bind_canvas(canvas_b, ref_b)
+    coord.request_capture(ref_a, canvas_a, "open")
+    coord.request_capture(ref_b, canvas_b, "open")
+    _flush()
+    grabs_b = canvas_b.grab_calls
+
+    canvas_b.markup_revision += 1
+    canvas_b.markup_revision_changed.emit()
+    for _ in range(8):
+        canvas_a.cursor_info.emit("hover")
+        QTest.qWait(30)
+    _flush()
+    assert canvas_b.grab_calls == grabs_b + 1
+    sheet.deleteLater()
+    canvas_a.deleteLater()
+    canvas_b.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_idle_does_not_schedule_when_sheet_hidden(qapp):
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "open")
+    _flush()
+    grabs = canvas.grab_calls
+    revision = coord.presentation_revision_for(ref)
+    window.view_manager.get(0).xlim = (0.1, 0.4)
+    canvas.visible_range = (0.1, 0.4)
+    canvas.visible_range_changed.emit()
+    QTest.qWait(_IDLE_CAPTURE_MS + 80)
+    _flush()
+    assert canvas.grab_calls == grabs
+    assert coord.presentation_revision_for(ref) == revision + 1
+    assert ref in coord._capture._deferred_preview_refs
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_grab_image_prefers_presentation_pixmap(qapp):
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    calls = []
+
+    class _Stack:
+        def grab_presentation_pixmap(self, target, *, scale=1.0):
+            calls.append((target, scale))
+            pix = QPixmap(32, 24)
+            pix.fill(QColor("#ff00ff"))
+            return pix
+
+    window.chart_stack = _Stack()
+    canvas = FakeCanvas("#000000")
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "pill")
+    _flush()
+    assert calls == [(canvas, 1.0)]
+    record = coord.store.get(ref)
+    assert record is not None
+    assert record.image is not None
+    pixel = record.image.pixelColor(2, 2)
+    assert pixel.red() > 200 and pixel.blue() > 200 and pixel.green() < 80
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_grab_image_reuses_matching_page_transition_source(qapp):
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    calls = []
+
+    class _Stack:
+        def transition_source_pixmap_for(
+            self, section, view_id, target, *, scale=1.0,
+        ):
+            calls.append(("source", section, view_id, target, scale))
+            pix = QPixmap(32, 24)
+            pix.fill(QColor("#00cc88"))
+            return pix
+
+        def grab_presentation_pixmap(self, *args, **kwargs):
+            raise AssertionError("reused source must not run a second capture")
+
+    window.chart_stack = _Stack()
+    canvas = FakeCanvas("#000000")
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "leaving-bound-canvas")
+    _flush()
+
+    assert calls == [("source", "time", "view-a", canvas, 1.0)]
+    record = coord.store.get(ref)
+    assert record is not None and record.image is not None
+    pixel = record.image.pixelColor(2, 2)
+    assert pixel.green() > 150 and pixel.blue() > 80 and pixel.red() < 20
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def _page_stack(page, **extra):
+    fields = dict(
+        page_ultraview=page,
+        current_mode=lambda: "time",
+        cursor_pill_snapshot=lambda: None,
+        restore_cursor_pill_snapshot=lambda *_a, **_k: None,
+        clear_cursor_pill=lambda: None,
+        split_active=lambda: False,
+        secondary_canvas=lambda: None,
+        focused_canvas=lambda: None,
+        canvas_time=None,
+    )
+    fields.update(extra)
+    return SimpleNamespace(**fields)
+
+
+def test_add_from_tab_binds_primary_when_focus_is_secondary(qapp):
+    window, coord = _make_coord()
+    manager = window.view_manager
+    manager.get(0).view_id = "view-a"
+    idx_b = manager.new_view()
+    manager.get(idx_b).view_id = "view-b"
+    manager.set_active(0)
+    manager.set_split(idx_b)
+    primary = FakeCanvas("#cc1111")
+    secondary = FakeCanvas("#11cc44")
+    window.chart_stack = _page_stack(
+        None,
+        canvas_time=primary,
+        split_active=lambda: True,
+        secondary_canvas=lambda: secondary,
+        focused_canvas=lambda: secondary,
+    )
+    ref_a = _ref("view-a")
+    ref_b = _ref("view-b")
+    coord.bind_canvas(secondary, ref_b)
+    coord.request_capture(ref_b, secondary, "partner")
+    _flush()
+    partner_grabs = secondary.grab_calls
+    partner_digest = coord.store.get(ref_b).captured_digest
+
+    coord.add_from_source_tab("time", "view-a")
+    _flush()
+    assert coord.bound_ref_for(primary) == ref_a
+    assert coord.bound_ref_for(secondary) == ref_b
+    assert primary.grab_calls >= 1
+    assert secondary.grab_calls == partner_grabs
+    record_a = coord.store.get(ref_a)
+    assert record_a is not None
+    pixel = record_a.image.pixelColor(2, 2)
+    assert pixel.red() > 150 and pixel.green() < 80
+    assert coord.store.get(ref_b).captured_digest == partner_digest
+    primary.deleteLater()
+    secondary.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_add_from_tab_binds_partner_when_focus_is_primary(qapp):
+    window, coord = _make_coord()
+    manager = window.view_manager
+    manager.get(0).view_id = "view-a"
+    idx_b = manager.new_view()
+    manager.get(idx_b).view_id = "view-b"
+    manager.set_active(0)
+    manager.set_split(idx_b)
+    primary = FakeCanvas("#cc1111")
+    secondary = FakeCanvas("#11cc44")
+    window.chart_stack = _page_stack(
+        None,
+        canvas_time=primary,
+        split_active=lambda: True,
+        secondary_canvas=lambda: secondary,
+        focused_canvas=lambda: primary,
+    )
+    ref_a = _ref("view-a")
+    ref_b = _ref("view-b")
+    coord.bind_canvas(primary, ref_a)
+    coord.request_capture(ref_a, primary, "active")
+    _flush()
+    primary_grabs = primary.grab_calls
+
+    coord.add_from_source_tab("time", "view-b")
+    _flush()
+    assert coord.bound_ref_for(secondary) == ref_b
+    assert coord.bound_ref_for(primary) == ref_a
+    assert secondary.grab_calls >= 1
+    assert primary.grab_calls == primary_grabs
+    record_b = coord.store.get(ref_b)
+    assert record_b is not None
+    pixel = record_b.image.pixelColor(2, 2)
+    assert pixel.green() > 150 and pixel.red() < 80
+    primary.deleteLater()
+    secondary.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_reset_clears_page_preview_caches(qapp):
+    window, coord = _make_coord()
+    page = UltraViewPage()
+    page.resize(320, 240)
+    page.show()
+    window.chart_stack = _page_stack(page)
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    add_ref(coord.board, ref)
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "open")
+    _flush()
+    coord.refresh_page()
+    assert page._previews
+    coord.reset_project_state()
+    assert page._previews == {}
+    assert page._statuses == {}
+    assert page._ref_exists == {}
+    page.deleteLater()
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_restore_resets_sheet_session(qapp):
+    window, coord = _make_coord()
+    page = UltraViewPage()
+    page.resize(320, 240)
+    page.show()
+    window.chart_stack = _page_stack(page)
+    window.view_manager.get(0).view_id = "view-a"
+    add_ref(coord.board, _ref("view-a"))
+    coord.refresh_page()
+    page.show_focus("time", "view-a")
+    page.arm_replacement("time", "view-a")
+    page.set_presentation_active(True)
+    assert page.focus_layer().isVisible()
+    coord.restore_project_state(None)
+    assert page.focus_layer().isVisible() is False
+    assert page.replacement_ref() is None
+    assert page.is_presentation_active() is False
+    assert page._previews == {}
+    page.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_destroyed_canvas_drops_binding_and_allows_rehook(qapp):
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    ident = id(canvas)
+    capture = coord._capture
+    assert ident in capture._bindings
+    assert ident in capture._hooked_ids
+    sip.delete(canvas)
+    _flush()
+    assert ident not in capture._bindings
+    assert ident not in capture._hooked_ids
+    assert ident not in capture._destroy_watched
+    replacement = FakeCanvas()
+    coord.bind_canvas(replacement, ref)
+    assert id(replacement) in capture._hooked_ids
+    replacement.cursor_info.emit("t=0")
+    replacement.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_repeated_project_reset_does_not_stack_destroyed_receivers(qapp, monkeypatch):
+    from mf4_analyzer.ui.main_window.ultraview_capture_coordinator import (
+        UltraViewCaptureCoordinator,
+    )
+
+    calls = {"n": 0}
+    original = UltraViewCaptureCoordinator._on_canvas_destroyed
+
+    def wrapped(self, *args, **kwargs):
+        calls["n"] += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(UltraViewCaptureCoordinator, "_on_canvas_destroyed", wrapped)
+    window, coord = _make_coord()
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    payload = coord.to_project_payload()
+    for _ in range(8):
+        coord.reset_project_state()
+        coord.restore_project_state(payload)
+        coord.bind_canvas(canvas, ref)
+    sip.delete(canvas)
+    _flush()
+    assert calls["n"] == 1
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_focus_residency_when_display_exceeds_preview(qapp):
+    window, coord = _make_coord()
+    ref = _ref("view-a")
+    add_ref(coord.board, ref)
+    image = QImage(64, 48, QImage.Format_ARGB32)
+    image.fill(QColor("#123456"))
+    assert coord.store.publish(ref, image, digest="snap", meta=PreviewMeta(ref=ref))
+    sizes = {ref: (400, 300)}
+
+    class _Page:
+        def __init__(self):
+            self.reset_calls = []
+            self.cache_clears = []
+
+        def card_display_sizes(self):
+            return sizes
+
+        def card_widget(self, section, view_id):
+            return None
+
+        def board_scroll_area(self):
+            return None
+
+        def set_library_rows(self, rows):
+            return None
+
+        def set_workspace(self, workspace):
+            return None
+
+        def set_board(self, board):
+            return None
+
+        def reset_sheet_session(self, *, emit_presentation=True):
+            self.reset_calls.append(emit_presentation)
+
+        def clear_runtime_caches(self):
+            self.cache_clears.append(1)
+
+        def projection_batch(self):
+            return nullcontext()
+
+        def apply_preview_and_status(self, ref, record, status, exists):
+            return None
+
+        def focus_layer(self):
+            return SimpleNamespace(isVisible=lambda: False)
+
+    page = _Page()
+    window.chart_stack = SimpleNamespace(page_ultraview=page)
+    coord.set_pinned_from_board(coord.board)
+    request = coord.store.residency_request(ref)
+    assert request is not None
+    assert request.tier == RESIDENCY_TIER_FOCUS
+    assert request.target_size == (400, 300)
+
+    sizes[ref] = (40, 30)
+    coord.set_pinned_from_board(coord.board)
+    request = coord.store.residency_request(ref)
+    assert request is not None
+    assert request.tier != RESIDENCY_TIER_FOCUS
+    coord.clear()
+    assert page.reset_calls == [True]
+    assert page.cache_clears == [1]
+    coord.deleteLater()
+
+
+def test_focus_grab_scale_grows_toward_target_and_idle_stays_1x(qapp):
+    window, coord = _make_coord()
+    ref = _ref("view-a")
+    coord.store.set_residency_requests(
+        [ResidencyRequest(ref, tier=RESIDENCY_TIER_FOCUS, target_size=(800, 400))]
+    )
+    widget = QWidget()
+    widget.resize(100, 50)
+    dpr = float(widget.devicePixelRatioF())
+    from mf4_analyzer.ui.chart_stack.ultraview.viewport import focus_grab_scale
+
+    expected = focus_grab_scale(
+        (100 * dpr, 50 * dpr), (800, 400), max_edge=MAX_PREVIEW_RAW_EDGE
+    )
+    assert abs(coord._grab_scale(widget, ref) - expected) < 1e-6
+    coord.store.set_residency_requests(
+        [
+            ResidencyRequest(
+                ref, tier=RESIDENCY_TIER_ACTIVE_PLACED, target_size=(800, 400)
+            )
+        ]
+    )
+    assert coord._grab_scale(widget, ref) == 1.0
+    coord.store.set_residency_requests(
+        [
+            ResidencyRequest(
+                ref,
+                tier=RESIDENCY_TIER_FOCUS,
+                target_size=(MAX_PREVIEW_RAW_EDGE, MAX_PREVIEW_RAW_EDGE),
+            )
+        ]
+    )
+    widget.resize(10, 10)
+    scaled = coord._grab_scale(widget, ref)
+    assert 10 * dpr * scaled <= MAX_PREVIEW_RAW_EDGE + 1e-6
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_place_free_grid_from_unplaced_toasts_when_grid_is_full(qapp):
+    from mf4_analyzer.ui.ultraview_state import (
+        LAYOUT_MODE_FREE_GRID,
+        MAX_PLACED_CARDS,
+        FreeGridPlacement,
+        GridRect,
+        make_ref,
+    )
+
+    window, coord = _make_coord()
+    toasts = []
+    window.toast = lambda message, level: toasts.append((message, level))
+    board = coord.board
+    board.layout_mode = LAYOUT_MODE_FREE_GRID
+    board.free_grid = [
+        FreeGridPlacement(make_ref("time", f"full-{index}"), GridRect(0, 0, 2, 2))
+        for index in range(MAX_PLACED_CARDS)
+    ]
+    extra = make_ref("time", "extra")
+    board.unplaced.append(extra)
+    coord._on_place_free_grid_from_unplaced("time", "extra")
+    assert extra in board.unplaced
+    from mf4_analyzer.ui.chart_stack.ultraview.feedback import (
+        PLACED_CAP_STILL_UNPLACED,
+        text_for_key,
+    )
+
+    assert toasts == [(text_for_key(PLACED_CAP_STILL_UNPLACED), "info")]
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_board_viewport_does_not_enter_presentation_digest(qapp):
+    window, coord = _make_coord()
+    ref = _ref(str(window.view_manager.get(0).view_id))
+    digest = coord.current_digest_for(ref)
+    payload = coord.to_project_payload()
+    assert "viewport" not in json.dumps(payload)
+    assert coord.current_digest_for(ref) == digest
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_focus_inspect_recaptures_when_presentation_revision_bumps(qapp, qtbot):
+    window, coord = _make_coord()
+    page = UltraViewPage()
+    qtbot.addWidget(page)
+    page.resize(320, 240)
+    page.show()
+    sheet = _visible_sheet(window)
+    window.chart_stack = _page_stack(page)
+    coord.attach()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas("#112233")
+    canvas.resize(400, 300)
+    ref = _ref("view-a")
+    add_ref(coord.board, ref)
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "open")
+    _flush()
+    coord.refresh_page()
+    page._on_focus("time", "view-a")
+    _flush()
+    assert page.focus_layer().isVisible()
+    qtbot.waitUntil(lambda: not page.focus_layer()._sync_badge.isVisible(), timeout=1500)
+    first_grabs = canvas.grab_calls
+    page.focus_layer().close_layer()
+
+    canvas._fill = QColor("#abcdef")
+    coord.bump_presentation_revision(ref)
+    page._on_focus("time", "view-a")
+    assert page.focus_layer()._sync_badge.isVisible()
+    qtbot.waitUntil(lambda: canvas.grab_calls > first_grabs, timeout=1500)
+    qtbot.waitUntil(lambda: not page.focus_layer()._sync_badge.isVisible(), timeout=1500)
+    record = coord.store.get(ref)
+    assert record is not None
+    assert record.captured_revision == coord.presentation_revision_for(ref)
+
+    grabs = canvas.grab_calls
+    page.focus_layer().close_layer()
+    page._on_focus("time", "view-a")
+    _flush()
+    QTest.qWait(80)
+    _flush()
+    assert canvas.grab_calls == grabs
+    assert page.focus_layer()._sync_badge.isVisible() is False
+
+    revision = coord.presentation_revision_for(ref)
+    page.focus_layer().close_layer()
+    assert coord.presentation_revision_for(ref) == revision
+    sheet.deleteLater()
+    canvas.deleteLater()
+    page.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_hidden_sheet_same_range_redraw_does_not_bump_revision(qapp):
+    """E1: a cache redraw of the same range does not bump presentation_revision.
+
+    ``visible_range_changed`` used to increment on every emission, so preview
+    dedup never hit. A real range change still increments. The digest is
+    unchanged here because the ViewState was not edited, and a hidden sheet
+    still does not idle-grab.
+    """
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    canvas.visible_range = (0.0, 1.0)
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "open")
+    _flush()
+    grabs = canvas.grab_calls
+    before = coord.presentation_revision_for(ref)
+    digest = coord.current_digest_for(ref)
+    canvas.visible_range_changed.emit()
+    assert coord.presentation_revision_for(ref) == before
+    canvas.visible_range = (0.2, 0.9)
+    canvas.visible_range_changed.emit()
+    assert coord.presentation_revision_for(ref) == before + 1
+    assert canvas.grab_calls == grabs
+    assert coord.current_digest_for(ref) == digest
+    assert ref in coord._capture._deferred_preview_refs
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+
+def test_frf_dataclass_cache_key_still_yields_a_digest(qapp, monkeypatch, caplog):
+    """FRF pins are frozen dataclasses, not tuples — the digest must survive.
+
+    ``FrfCacheKey`` used to fall through ``_digest_leaf`` unchanged and reach
+    ``presentation_digest`` as an unserializable leaf, so every FRF View that
+    had actually computed a result reported no digest at all — and a ref with
+    no digest never captures. Cover the shape, not just the exception.
+    """
+    monkeypatch.setattr(diagnostics, "_THROTTLE_STATE", OrderedDict())
+    window, coord = _make_coord()
+    manager = ViewManager(state_factory=AnalysisViewState)
+    window.analysis_managers["frf"] = manager
+    state = manager.get(0)
+    state.view_id = "frf-a"
+    state.params = {"estimator": "H1", "window": "hann", "nfft": 4096}
+    state.panes = [
+        PaneState(
+            input_source=("f1", "torque"),
+            output_source=("f1", "motor_speed"),
+            effective_time_range=(0.0, 10.0),
+            xlim=(0.0, 500.0),
+        )
+    ]
+    window.pages["frf"] = FakePage([FakeCanvas()])
+    ref = _ref("frf-a", "frf")
+
+    key = FrfCacheKey(
+        input_fid="f1",
+        input_channel="torque",
+        output_fid="f1",
+        output_channel="motor_speed",
+        effective_time_range=(0.0, 10.0),
+        compute_params_blob='{"nfft": 4096}',
+    )
+    window._analysis_pins.add("frf", "frf-a", 0, key)
+
+    with caplog.at_level(logging.WARNING, logger=_CAPTURE_LOGGER):
+        pinned = coord.current_digest_for(ref)
+    assert pinned is not None
+    assert "digest failed" not in caplog.text
+
+    # A different compute key is a different presentation.
+    window._analysis_pins.replace(
+        "frf",
+        "frf-a",
+        0,
+        (
+            FrfCacheKey(
+                input_fid="f1",
+                input_channel="torque",
+                output_fid="f1",
+                output_channel="motor_speed",
+                effective_time_range=(0.0, 10.0),
+                compute_params_blob='{"nfft": 8192}',
+            ),
+        ),
+    )
+    assert coord.current_digest_for(ref) != pinned
+
+    # ...and the same key is the same digest, across independent encodings.
+    window._analysis_pins.replace("frf", "frf-a", 0, (key,))
+    assert coord.current_digest_for(ref) == pinned
+
+    # The digest is not the deliverable — the preview is. ``request_capture``
+    # returns early on a ``None`` digest, so an FRF View that had computed a
+    # result could never publish a card at all. Close that loop here rather
+    # than inferring it from the digest being computable.
+    # E2 defers ``frf-plot`` while UltraView is closed; this is the visible path.
+    sheet = _visible_sheet(window)
+    canvas = window.pages["frf"].pane_canvas(0)
+    coord.bind_canvas(canvas, ref)
+    with caplog.at_level(logging.WARNING, logger=_CAPTURE_LOGGER):
+        coord.request_capture(ref, canvas, "frf-plot")
+        _flush()
+    assert canvas.grab_calls == 1
+    record = coord.store.get(ref)
+    assert record is not None
+    assert record.captured_digest == pinned
+    assert PreviewStore.image_valid(record.image)
+    assert "capture skipped" not in caplog.text
+
+    sheet.deleteLater()
+    window.pages["frf"].deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_dataclass_leaf_does_not_collide_with_a_plain_mapping(qapp):
+    """The class name is part of the encoding, so shapes cannot alias."""
+    key = FrfCacheKey(
+        input_fid="f1",
+        input_channel="in",
+        output_fid="f1",
+        output_channel="out",
+        effective_time_range=(0.0, 1.0),
+        compute_params_blob="{}",
+    )
+    plain = {
+        "input_fid": "f1",
+        "input_channel": "in",
+        "output_fid": "f1",
+        "output_channel": "out",
+        "effective_time_range": (0.0, 1.0),
+        "compute_params_blob": "{}",
+    }
+    encoded = UltraViewCoordinator._digest_key(key)
+    assert encoded["__dataclass__"] == "FrfCacheKey"
+    assert presentation_digest({"k": encoded}) != presentation_digest(
+        {"k": UltraViewCoordinator._digest_key(plain)}
+    )
+
+
+def test_digest_failure_names_the_offending_value(qapp, monkeypatch, caplog):
+    """Swallowing the exception text left 'digest failed' undiagnosable."""
+    monkeypatch.setattr(diagnostics, "_THROTTLE_STATE", OrderedDict())
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    ref = _ref("view-a")
+
+    class _Unserializable:
+        pass
+
+    monkeypatch.setattr(coord._capture, "presentation_payload_for", lambda _ref: {"leaf": _Unserializable()})
+    with caplog.at_level(logging.WARNING, logger=_CAPTURE_LOGGER):
+        assert coord.current_digest_for(ref) is None
+    assert "digest failed" in caplog.text
+    assert "_Unserializable" in caplog.text
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_no_result_skip_is_not_logged_as_a_warning(qapp, monkeypatch, caplog):
+    """An uncomputed View is an expected state; the card already shows it.
+
+    Faults keep their warning level — only the expected-state details are
+    demoted, so a real capture failure still stands out in the log.
+    """
+    monkeypatch.setattr(diagnostics, "_THROTTLE_STATE", OrderedDict())
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    canvas._has_result = False
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+
+    with caplog.at_level(logging.DEBUG, logger=_CAPTURE_LOGGER):
+        coord.request_capture(ref, canvas, "probe-empty")
+    records = [r for r in caplog.records if "capture skipped" in r.getMessage()]
+    assert records, "the skip must still be observable at DEBUG"
+    assert [r.levelno for r in records] == [logging.DEBUG]
+    assert canvas.grab_calls == 0
+
+    caplog.clear()
+    canvas._has_result = True
+    monkeypatch.setattr(coord._capture, "current_digest_for", lambda _ref: None)
+    with caplog.at_level(logging.DEBUG, logger=_CAPTURE_LOGGER):
+        coord.request_capture(ref, canvas, "probe-fault")
+    faults = [r for r in caplog.records if "digest-unavailable" in r.getMessage()]
+    assert [r.levelno for r in faults] == [logging.WARNING]
+
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_multi_source_pane_digest_is_stable_against_pin_set_order(qapp):
+    """Pin slots are sets; the digest must not inherit their hash order.
+
+    Preview digests are persisted and compared after a restart, so a pane
+    whose ``cache_keys`` ordering follows per-process string hashing would
+    make every multi-channel FFT card read STALE on relaunch.
+    """
+    window, coord = _make_coord()
+    manager = ViewManager(state_factory=AnalysisViewState)
+    window.analysis_managers["fft"] = manager
+    state = manager.get(0)
+    state.view_id = "fft-a"
+    state.params = {"nfft": 1024}
+    state.panes = [
+        PaneState(sources=[("f1", "torque"), ("f1", "motor_speed")], xlim=(0.0, 500.0))
+    ]
+    window.pages["fft"] = FakePage([FakeCanvas()])
+    ref = _ref("fft-a", "fft")
+    keys = [("f1", "torque", "{}"), ("f1", "motor_speed", "{}")]
+
+    # A real ``AnalysisPinBook`` hands back a set, whose iteration order is
+    # decided by per-run string hashing — it cannot be steered from a test.
+    # This double replays the two orders that a set can legitimately produce,
+    # so the guard holds under any PYTHONHASHSEED instead of the one in play.
+    class _ScrambledPins:
+        def __init__(self, slot, order):
+            self._slot = slot
+            self._order = list(order)
+
+        def __contains__(self, slot):
+            return slot == self._slot
+
+        def __getitem__(self, slot):
+            if slot != self._slot:
+                raise KeyError(slot)
+            return list(self._order)
+
+    slot = ("fft", "fft-a", 0)
+    window._analysis_pins = _ScrambledPins(slot, keys)
+    forward = coord.current_digest_for(ref)
+    assert forward is not None
+    assert coord._pane_cache_keys(window, *slot) == sorted(keys, key=repr)
+
+    window._analysis_pins = _ScrambledPins(slot, list(reversed(keys)))
+    assert coord._pane_cache_keys(window, *slot) == sorted(keys, key=repr)
+    assert coord.current_digest_for(ref) == forward
+    window.pages["fft"].deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def _getattr_host_private_probes(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Name) or func.id != "getattr":
+            continue
+        if len(node.args) < 2:
+            continue
+        target, attr = node.args[0], node.args[1]
+        if not isinstance(target, ast.Name) or target.id not in {
+            "host",
+            "owner",
+            "widget",
+        }:
+            continue
+        if not isinstance(attr, ast.Constant) or not isinstance(attr.value, str):
+            continue
+        if attr.value in _HOST_PRIVATE_CAPTURE_ATTRS:
+            found.add(attr.value)
+    return found
+
+
+def _getattr_private_attr_names(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Name) or func.id != "getattr":
+            continue
+        if len(node.args) < 2:
+            continue
+        attr = node.args[1]
+        if not isinstance(attr, ast.Constant) or not isinstance(attr.value, str):
+            continue
+        if attr.value in _HOST_PRIVATE_CAPTURE_ATTRS:
+            found.add(attr.value)
+    return found
+
+
+def test_coordinator_and_collector_do_not_getattr_host_capture_privates():
+    assert _getattr_host_private_probes(_COORDINATOR_PATH) == set()
+    assert _getattr_host_private_probes(_CAPTURE_COORDINATOR_PATH) == set()
+    assert _getattr_host_private_probes(_CAPTURE_FACTS_PATH) == set()
+    assert _getattr_private_attr_names(_CAPTURE_COORDINATOR_PATH) == set()
+    capture_source = _CAPTURE_COORDINATOR_PATH.read_text(encoding="utf-8")
+    assert "_annotations" not in capture_source
+    assert "_pill_for_canvas" not in capture_source
+    assert "pill._detail" not in capture_source
+    for path in (_COORDINATOR_PATH, _CAPTURE_COORDINATOR_PATH):
+        source = path.read_text(encoding="utf-8")
+        assert "_HOVER_CURSOR_LISTS" not in source
+        assert "_host_is_stable" not in source
+        assert "_time_host_has_plotted_data" not in source
+        for name in (
+            "_interaction_state",
+            "_dense_raster",
+            "_aa_idle_timer",
+            "_refresh_pending",
+            "_annotations",
+            "_pill",
+            "_pill_for_canvas",
+            "_detail",
+        ):
+            assert f'getattr(host, "{name}"' not in source
+            assert f"getattr(host, '{name}'" not in source
+            assert f'getattr(widget, "{name}"' not in source
+            assert f"getattr(widget, '{name}'" not in source
+            assert f'getattr(stack, "{name}"' not in source
+            assert f"getattr(stack, '{name}'" not in source
+            assert f'getattr(pill, "{name}"' not in source
+            assert f"getattr(pill, '{name}'" not in source
+
+
+class _LogicalDprCanvas(FakeCanvas):
+    """QWidget.devicePixelRatioF is C++; subclass so tests pin logical geometry."""
+
+    def __init__(self, dpr: float = 1.0, color: str = "#123456") -> None:
+        super().__init__(color)
+        self._forced_dpr = float(dpr)
+
+    def devicePixelRatioF(self) -> float:
+        return self._forced_dpr
+
+
+def _pin_capture_dpr(monkeypatch, coord, dpr: float) -> None:
+    monkeypatch.setattr(coord._capture, "_device_pixel_ratio", lambda: float(dpr))
+
+
+def _pin_reading_box(monkeypatch, coord, size: tuple[int, int]) -> None:
+    monkeypatch.setattr(
+        coord._capture, "_inner_reading_box_logical", lambda _ref: size
+    )
+
+
+def test_needs_resolution_recapture_strict_1_25_ratio():
+    assert RESOLUTION_STALE_RATIO == 1.25
+    cache = (100, 80)
+    assert needs_resolution_recapture((126, 80), cache) is True
+    assert needs_resolution_recapture((100, 101), cache) is True
+    assert needs_resolution_recapture((126, 101), cache) is True
+    assert needs_resolution_recapture((125, 100), cache) is False
+    assert needs_resolution_recapture((100, 100), cache) is False
+    assert needs_resolution_recapture((100, 80), cache) is False
+    assert needs_resolution_recapture((80, 70), cache) is False
+    assert needs_resolution_recapture((0, 200), cache) is False
+    assert needs_resolution_recapture((200, 0), cache) is False
+    assert needs_resolution_recapture((200, 200), (0, 80)) is False
+    assert needs_resolution_recapture("nope", cache) is False
+
+
+def test_needs_resolution_recapture_is_logical_and_dpr_independent():
+    """Same logical pair is stale or not regardless of which screen DPR produced it."""
+    reading = (200, 100)
+    cache_logical = (100, 80)
+    assert needs_resolution_recapture(reading, cache_logical) is True
+    raw_dpr1 = cache_logical
+    raw_dpr2 = (cache_logical[0] * 2, cache_logical[1] * 2)
+    logical_from_dpr1 = (raw_dpr1[0] // 1, raw_dpr1[1] // 1)
+    logical_from_dpr2 = (raw_dpr2[0] // 2, raw_dpr2[1] // 2)
+    assert logical_from_dpr1 == logical_from_dpr2 == cache_logical
+    assert needs_resolution_recapture(reading, logical_from_dpr1) is True
+    assert needs_resolution_recapture(reading, logical_from_dpr2) is True
+    equal_reading = (125, 100)
+    assert needs_resolution_recapture(equal_reading, cache_logical) is False
+    assert needs_resolution_recapture(equal_reading, logical_from_dpr2) is False
+
+
+def test_refresh_resolution_state_marks_stale_above_ratio(qapp, monkeypatch):
+    window, coord = _make_coord()
+    ref = _ref("view-a")
+    image = QImage(100, 80, QImage.Format_ARGB32)
+    image.fill(QColor("#123456"))
+    assert coord.store.publish(ref, image, digest="snap", meta=PreviewMeta(ref=ref))
+    _pin_capture_dpr(monkeypatch, coord, 1.0)
+    _pin_reading_box(monkeypatch, coord, (126, 80))
+    coord._capture._refresh_resolution_state(ref)
+    assert coord.store.is_resolution_stale(ref) is True
+    _pin_reading_box(monkeypatch, coord, (125, 100))
+    coord._capture._refresh_resolution_state(ref)
+    assert coord.store.is_resolution_stale(ref) is False
+    _pin_reading_box(monkeypatch, coord, (100, 101))
+    coord._capture._refresh_resolution_state(ref)
+    assert coord.store.is_resolution_stale(ref) is True
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_resolution_stale_compares_logical_pixels_across_dpr(qapp, monkeypatch):
+    window, coord = _make_coord()
+    ref = _ref("view-a")
+    image = QImage(200, 100, QImage.Format_ARGB32)
+    image.fill(QColor("#123456"))
+    assert coord.store.publish(ref, image, digest="snap", meta=PreviewMeta(ref=ref))
+    reading = (140, 70)
+    _pin_reading_box(monkeypatch, coord, reading)
+
+    _pin_capture_dpr(monkeypatch, coord, 1.0)
+    assert coord._capture._preview_logical_size(ref) == (200, 100)
+    coord._capture._refresh_resolution_state(ref)
+    assert coord.store.is_resolution_stale(ref) is False
+    assert needs_resolution_recapture(reading, (200, 100)) is False
+
+    _pin_capture_dpr(monkeypatch, coord, 2.0)
+    assert coord._capture._preview_logical_size(ref) == (100, 50)
+    coord._capture._refresh_resolution_state(ref)
+    assert coord.store.is_resolution_stale(ref) is True
+    assert needs_resolution_recapture(reading, (100, 50)) is True
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_resolution_recapture_updates_preview_without_layout(qapp, monkeypatch):
+    def _layout_boom(*_args, **_kwargs):
+        raise AssertionError("resolution recapture must not mutate layout")
+
+    monkeypatch.setattr(
+        "mf4_analyzer.ultraview_core.smart_layout.solve_smart_layout",
+        _layout_boom,
+    )
+    window, coord = _make_coord()
+    monkeypatch.setattr(
+        coord._workspace_controller,
+        "_zoom_fit_after_smart_layout_settle",
+        _layout_boom,
+    )
+    monkeypatch.setattr(
+        coord._workspace_controller, "_bump_layout_revision", _layout_boom
+    )
+    monkeypatch.setattr(
+        coord._workspace_controller, "_push_history_undo", _layout_boom
+    )
+    source = _CAPTURE_COORDINATOR_PATH.read_text(encoding="utf-8")
+    assert "solve_smart_layout" not in source
+    assert "zoom_fit" not in source
+    assert "layout_revision" not in source
+
+    window.view_manager.get(0).view_id = "view-a"
+    ref = _ref("view-a")
+    add_ref(coord.board, ref)
+    rects_before = tuple((item.ref, item.rect) for item in coord.board.free_grid)
+    revision_before = dict(coord._workspace_controller.layout_revision)
+    history = coord._workspace_controller._grid_history(coord.board)
+    undo_before = list(history.undo)
+
+    canvas = _LogicalDprCanvas(dpr=1.0)
+    _pin_capture_dpr(monkeypatch, coord, 1.0)
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "open")
+    _flush()
+    assert canvas.grab_calls == 1
+    first = coord.store.get(ref)
+    assert first is not None
+    first_w, first_h = first.image.width(), first.image.height()
+
+    _pin_reading_box(monkeypatch, coord, (200, 150))
+    coord._capture._refresh_resolution_state(ref)
+    assert coord.store.is_resolution_stale(ref) is True
+
+    reasons = []
+    orig_request = coord._capture.request_capture
+
+    def _tracked(captured_ref, widget, reason):
+        reasons.append(str(reason))
+        return orig_request(captured_ref, widget, reason)
+
+    monkeypatch.setattr(coord._capture, "request_capture", _tracked)
+    toasts: list[tuple[str, str]] = []
+    window.toast = lambda msg, level: toasts.append((msg, level))
+    coord.set_pinned_from_board(coord.board)
+    _flush()
+    assert "resolution" in reasons
+    assert canvas.grab_calls == 2
+    updated = coord.store.get(ref)
+    assert updated is not None
+    assert updated.image is not None
+    assert updated.image.width() > first_w or updated.image.height() > first_h
+    assert coord.store.is_resolution_stale(ref) is False
+    assert toasts == []
+    assert tuple((item.ref, item.rect) for item in coord.board.free_grid) == rects_before
+    assert dict(coord._workspace_controller.layout_revision) == revision_before
+    assert list(history.undo) == undo_before
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_resolution_request_updates_preview_without_layout(qapp, monkeypatch):
+    def _layout_boom(*_args, **_kwargs):
+        raise AssertionError("resolution recapture must not mutate layout")
+
+    monkeypatch.setattr(
+        "mf4_analyzer.ultraview_core.smart_layout.solve_smart_layout",
+        _layout_boom,
+    )
+    window, coord = _make_coord()
+    monkeypatch.setattr(
+        coord._workspace_controller,
+        "_zoom_fit_after_smart_layout_settle",
+        _layout_boom,
+    )
+    window.view_manager.get(0).view_id = "view-a"
+    ref = _ref("view-a")
+    add_ref(coord.board, ref)
+    canvas = _LogicalDprCanvas(dpr=1.0)
+    _pin_capture_dpr(monkeypatch, coord, 1.0)
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "open")
+    _flush()
+    first = coord.store.get(ref)
+    assert first is not None
+    first_w = first.image.width()
+    _pin_reading_box(monkeypatch, coord, (200, 150))
+    coord.request_capture(ref, canvas, "resolution")
+    _flush()
+    assert canvas.grab_calls == 2
+    updated = coord.store.get(ref)
+    assert updated is not None
+    assert updated.image.width() > first_w
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_resolution_recapture_ignores_destroyed_canvas(qapp, monkeypatch):
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    ref = _ref("view-a")
+    add_ref(coord.board, ref)
+    canvas = _LogicalDprCanvas(dpr=1.0)
+    _pin_capture_dpr(monkeypatch, coord, 1.0)
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "open")
+    _flush()
+    record = coord.store.get(ref)
+    assert record is not None
+    old_digest = record.captured_digest
+    old_w, old_h = record.image.width(), record.image.height()
+    _pin_reading_box(monkeypatch, coord, (200, 150))
+    coord.request_capture(ref, canvas, "resolution")
+    sip.delete(canvas)
+    _flush()
+    kept = coord.store.get(ref)
+    assert kept is not None
+    assert kept.captured_digest == old_digest
+    assert kept.image is not None
+    assert kept.image.width() == old_w
+    assert kept.image.height() == old_h
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_resolution_recapture_drops_when_view_digest_is_gone(qapp, monkeypatch):
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    ref = _ref("view-a")
+    add_ref(coord.board, ref)
+    canvas = _LogicalDprCanvas(dpr=1.0)
+    _pin_capture_dpr(monkeypatch, coord, 1.0)
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "open")
+    _flush()
+    record = coord.store.get(ref)
+    assert record is not None
+    old_digest = record.captured_digest
+    old_w = record.image.width()
+    _pin_reading_box(monkeypatch, coord, (200, 150))
+    coord.request_capture(ref, canvas, "resolution")
+    window.view_manager.views.clear()
+    _flush()
+    kept = coord.store.get(ref)
+    assert kept is not None
+    assert kept.captured_digest == old_digest
+    assert kept.image.width() == old_w
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_resolution_grab_scale_targets_logical_times_dpr():
+    scale = resolution_grab_scale((64.0, 48.0), (200.0, 150.0), max_edge=1600)
+    assert abs(scale - 200.0 / 64.0) < 1e-9
+    capped = resolution_grab_scale((10.0, 10.0), (4000.0, 4000.0), max_edge=1600)
+    assert 10.0 * capped <= 1600 + 1e-6
+    assert capped >= 1.0
+
+
+def test_resolution_stale_toasts_when_view_is_not_resident(qapp, monkeypatch, caplog):
+    window, coord = _make_coord()
+    toasts: list[tuple[str, str]] = []
+    window.toast = lambda msg, level: toasts.append((msg, level))
+    ref = _ref("view-a")
+    add_ref(coord.board, ref)
+    image = QImage(100, 80, QImage.Format_ARGB32)
+    image.fill(QColor("#123456"))
+    assert coord.store.publish(ref, image, digest="snap", meta=PreviewMeta(ref=ref))
+    _pin_capture_dpr(monkeypatch, coord, 1.0)
+    _pin_reading_box(monkeypatch, coord, (200, 150))
+    with caplog.at_level(logging.DEBUG, logger=_CAPTURE_LOGGER):
+        coord.set_pinned_from_board(coord.board)
+    assert coord.store.is_resolution_stale(ref) is True
+    assert toasts == [(RESOLUTION_STALE_TOAST, "info")]
+    assert any("resolution_stale view not resident" in rec.message for rec in caplog.records)
+    coord.set_pinned_from_board(coord.board)
+    assert toasts == [(RESOLUTION_STALE_TOAST, "info")]
+    assert "search_visits" not in RESOLUTION_STALE_TOAST
+    assert "solve_smart_layout" not in _CAPTURE_COORDINATOR_PATH.read_text(encoding="utf-8")
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_layout_and_resolution_toasts_stay_human_without_solver_internals():
+    workspace = (
+        Path(__file__).resolve().parents[2]
+        / "mf4_analyzer"
+        / "ui"
+        / "main_window"
+        / "ultraview_workspace_controller.py"
+    ).read_text(encoding="utf-8")
+    capture = _CAPTURE_COORDINATOR_PATH.read_text(encoding="utf-8")
+    assert 'self._toast("锁定卡片占用空间，布局未改变"' in workspace
+    assert 'self._toast("已使用等大网格完成降级排版"' in workspace
+    assert RESOLUTION_STALE_TOAST in capture
+    assert "_toast(RESOLUTION_STALE_TOAST" in capture
+    for source in (workspace, capture):
+        for line in source.splitlines():
+            if "_toast(" not in line:
+                continue
+            for banned in ("search_visits", "used_fallback", "solver_reason"):
+                assert banned not in line, line
+
+
+def test_presentation_revision_bumps_only_when_facts_change(qapp):
+    """E1: revision tracks the session fingerprint, not each signal emission."""
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    canvas.visible_range = (0.0, 1.0)
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    payload_before = coord.to_project_payload()
+    digest = coord.current_digest_for(ref)
+    revision = coord.presentation_revision_for(ref)
+
+    canvas.visible_range_changed.emit()
+    canvas.markup_revision_changed.emit()
+    assert coord.presentation_revision_for(ref) == revision
+
+    canvas.visible_range = (0.25, 0.75)
+    canvas.visible_range_changed.emit()
+    assert coord.presentation_revision_for(ref) == revision + 1
+    canvas.visible_range_changed.emit()
+    assert coord.presentation_revision_for(ref) == revision + 1
+    # Canvas range and the session fingerprint are not digest fields.
+    assert coord.current_digest_for(ref) == digest
+    assert coord.to_project_payload() == payload_before
+
+    canvas.markup_revision += 1
+    canvas.markup_revision_changed.emit()
+    assert coord.presentation_revision_for(ref) == revision + 2
+    canvas.markup_revision_changed.emit()
+    assert coord.presentation_revision_for(ref) == revision + 2
+
+    canvas._cursor.dual = True
+    canvas._cursor.ax = 0.2
+    canvas._cursor.bx = 0.8
+    canvas.dual_cursor_info.emit("delta")
+    assert coord.presentation_revision_for(ref) == revision + 3
+    canvas.dual_cursor_info.emit("delta")
+    assert coord.presentation_revision_for(ref) == revision + 3
+    # Markup and armed cursor geometry were already digest fields. Cursor
+    # text and manual zoom are fingerprint-only, so they must not move it.
+    digest_after_geometry = coord.current_digest_for(ref)
+    assert digest_after_geometry != digest
+    canvas.dual_cursor_info.emit("delta-moved")
+    assert coord.presentation_revision_for(ref) == revision + 4
+
+    canvas.manual_zoom_changed.emit(True)
+    assert coord.presentation_revision_for(ref) == revision + 5
+    canvas.manual_zoom_changed.emit(True)
+    assert coord.presentation_revision_for(ref) == revision + 5
+    canvas.manual_zoom_changed.emit(False)
+    assert coord.presentation_revision_for(ref) == revision + 6
+    assert coord.current_digest_for(ref) == digest_after_geometry
+    dumped = json.dumps(coord.to_project_payload())
+    assert "presentation_fingerprint" not in dumped
+    assert "_presentation_fingerprints" not in dumped
+
+    coord._capture.invalidate_preview(ref)
+    assert ref not in coord._capture._presentation_fingerprints
+    assert ref not in coord._capture._deferred_preview_refs
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_cross_view_restore_does_not_bump_outgoing_revision(qapp):
+    """Signals emitted while a time View is being applied belong to the restore."""
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    canvas.visible_range = (0.0, 1.0)
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    before = coord.presentation_revision_for(ref)
+    window._applying_view = True
+    canvas.visible_range = (0.3, 0.7)
+    canvas.visible_range_changed.emit()
+    assert coord.presentation_revision_for(ref) == before
+    window._applying_view = False
+    canvas.visible_range_changed.emit()
+    assert coord.presentation_revision_for(ref) == before + 1
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_hidden_automatic_switch_defers_until_ultraview_is_visible(qapp):
+    """E2: a closed Board marks the ref stale and grabs only after it is shown."""
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "time-render")
+    _flush()
+    assert canvas.grab_calls == 0
+    assert coord.store.get(ref) is None
+    assert ref in coord._capture._deferred_preview_refs
+
+    sheet = _visible_sheet(window)
+    coord._capture.consume_deferred_previews()
+    QTest.qWait(_IDLE_CAPTURE_MS + 80)
+    _flush()
+    assert canvas.grab_calls == 1
+    assert coord.store.get(ref) is not None
+    assert ref not in coord._capture._deferred_preview_refs
+    sheet.deleteLater()
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_deferred_recapture_orders_visible_thumbnails_first(qapp):
+    from mf4_analyzer.ultraview_core.model import FreeGridPlacement, GridRect
+
+    window, coord = _make_coord()
+    ref_off = _ref("view-off")
+    ref_low = _ref("view-low")
+    ref_high = _ref("view-high")
+    ref_unplaced = _ref("view-unplaced")
+    board = coord.board
+    board.free_grid.append(FreeGridPlacement(ref_off, GridRect(0, 0, 4, 4)))
+    board.free_grid.append(FreeGridPlacement(ref_low, GridRect(4, 0, 4, 4)))
+    board.free_grid.append(FreeGridPlacement(ref_high, GridRect(8, 0, 4, 4)))
+
+    class _Point:
+        def __init__(self, x: int, y: int) -> None:
+            self._x = x
+            self._y = y
+
+        def x(self) -> int:
+            return self._x
+
+        def y(self) -> int:
+            return self._y
+
+    class _Rect:
+        def __init__(self, x: int, y: int, width: int, height: int) -> None:
+            self._x = x
+            self._y = y
+            self._width = width
+            self._height = height
+
+        def topLeft(self):
+            return _Point(self._x, self._y)
+
+        def center(self):
+            return _Point(self._x + self._width // 2, self._y + self._height // 2)
+
+        def contains(self, point) -> bool:
+            return 0 <= point.x() < self._width and 0 <= point.y() < self._height
+
+    class _Card:
+        def __init__(self, x: int, y: int) -> None:
+            self._origin = (x, y)
+
+        def rect(self):
+            return _Rect(0, 0, 40, 30)
+
+        def mapTo(self, _viewport, point):
+            return _Point(self._origin[0] + point.x(), self._origin[1] + point.y())
+
+    class _Scroll:
+        def viewport(self):
+            return SimpleNamespace(rect=lambda: _Rect(0, 0, 200, 100))
+
+    cards = {
+        "view-off": _Card(0, 500),
+        "view-low": _Card(80, 40),
+        "view-high": _Card(10, 10),
+    }
+
+    class _Page:
+        def card_widget(self, _section, view_id):
+            return cards.get(view_id)
+
+        def board_scroll_area(self):
+            return _Scroll()
+
+    window.chart_stack = SimpleNamespace(page_ultraview=_Page())
+    capture = coord._capture
+    capture._deferred_preview_refs.clear()
+    for ref in (ref_off, ref_low, ref_high, ref_unplaced):
+        capture._deferred_preview_refs.add(ref)
+    assert capture._deferred_recapture_order() == [
+        ref_high,
+        ref_low,
+        ref_off,
+        ref_unplaced,
+    ]
+    window.chart_stack = None
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_project_save_publishes_deferred_preview(qapp, tmp_path):
+    """E2: a closed Board still fills a deferred preview before the sidecar write."""
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    add_ref(coord.board, ref)
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "time-render")
+    _flush()
+    assert canvas.grab_calls == 0
+    assert ref in coord._capture._deferred_preview_refs
+    coord.save_preview_sidecar(tmp_path / "p.tlproj")
+    assert canvas.grab_calls == 1
+    assert coord.store.get(ref) is not None
+    assert ref not in coord._capture._deferred_preview_refs
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_leaving_page_sync_capture_still_grabs_while_sheet_hidden(qapp):
+    """UV-A18 stays synchronous and does not wait for the Board to open."""
+    window, coord = _make_coord()
+    manager = window.view_manager
+    manager.get(0).view_id = "view-a"
+    idx_b = manager.new_view()
+    manager.get(idx_b).view_id = "view-b"
+    canvas = FakeCanvas()
+    ref_a = _ref("view-a")
+    ref_b = _ref("view-b")
+    coord.bind_canvas(canvas, ref_a)
+    assert coord._capture._sheet_visible() is False
+    coord.offer_capture_bound_canvas(canvas, incoming_ref=ref_b)
+    _flush()
+    assert canvas.grab_calls == 1
+    record = coord.store.get(ref_a)
+    assert record is not None and record.image is not None
+    assert ref_a not in coord._capture._deferred_preview_refs
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_auto_preview_grab_keeps_screen_aa_and_explicit_export_forces_it(qapp):
+    """E3: automatic preview uses the curves' current AA; explicit grab forces it."""
+    from contextlib import contextmanager
+
+    from mf4_analyzer.ui.pg_canvas.renderer import Renderer, auto_preview_grab_scope
+
+    class _Curve:
+        def __init__(self) -> None:
+            self.opts = {"antialias": False}
+
+    curve = _Curve()
+    entered: list[bool] = []
+
+    class _Quality:
+        def _export_aa_affordable(self) -> bool:
+            return True
+
+        @contextmanager
+        def _curves_antialiased(self):
+            entered.append(True)
+            curve.opts["antialias"] = True
+            try:
+                yield
+            finally:
+                curve.opts["antialias"] = False
+
+    host = QWidget()
+    host.resize(40, 30)
+    host._quality = _Quality()
+    seen: list[bool] = []
+    targets: list[object] = []
+
+    def _grab(widget, _scale):
+        targets.append(widget)
+        seen.append(bool(curve.opts["antialias"]))
+        pix = QPixmap(16, 16)
+        pix.fill(QColor("#112233"))
+        return pix
+
+    host._grab_widget_scaled = _grab
+    renderer = Renderer(host)
+
+    preview = renderer.grab_pixmap(auto_preview=True)
+    assert preview.isNull() is False
+    assert seen == [False]
+    assert entered == []
+    assert targets == [host]
+    assert curve.opts["antialias"] is False
+
+    with auto_preview_grab_scope():
+        scoped = renderer.grab_pixmap()
+    assert scoped.isNull() is False
+    assert seen == [False, False]
+    assert entered == []
+
+    explicit = renderer.grab_pixmap()
+    assert explicit.isNull() is False
+    assert seen == [False, False, True]
+    assert entered == [True]
+    assert curve.opts["antialias"] is False
+    assert targets == [host, host, host]
+    host.deleteLater()
+
+
+def test_automatic_preview_requests_screen_aa_grab(qapp):
+    window, coord = _make_coord()
+    window.view_manager.get(0).view_id = "view-a"
+    calls = []
+
+    class _Stack:
+        def grab_presentation_pixmap(
+            self, target, *, scale=1.0, cancel_page_transition=True, auto_preview=False,
+        ):
+            calls.append((target, scale, cancel_page_transition, auto_preview))
+            pix = QPixmap(32, 24)
+            pix.fill(QColor("#ff00ff"))
+            return pix
+
+    window.chart_stack = _Stack()
+    canvas = FakeCanvas()
+    ref = _ref("view-a")
+    coord.bind_canvas(canvas, ref)
+    coord.request_capture(ref, canvas, "open")
+    _flush()
+    assert calls == [(canvas, 1.0, False, True)]
+    canvas.deleteLater()
+    coord.clear()
+    coord.deleteLater()
+
+
+def test_chart_stack_auto_preview_scope_wraps_only_that_grab(qapp, monkeypatch):
+    from contextlib import contextmanager
+
+    from mf4_analyzer.ui.chart_stack import stack as stack_mod
+    from mf4_analyzer.ui.pg_canvas import renderer as renderer_mod
+
+    flags: list[str] = []
+
+    @contextmanager
+    def _scope():
+        flags.append("scope")
+        yield
+
+    monkeypatch.setattr(renderer_mod, "auto_preview_grab_scope", _scope)
+    host = SimpleNamespace(calls=[])
+
+    def _body(target, *, scale=1.0, cancel_page_transition=True):
+        host.calls.append((target, scale, cancel_page_transition, list(flags)))
+        pix = QPixmap(16, 16)
+        pix.fill(QColor("#111111"))
+        return pix
+
+    host._grab_presentation_pixmap = _body
+    target = object()
+    preview = stack_mod.ChartStack.grab_presentation_pixmap(
+        host, target, scale=2.0, cancel_page_transition=False, auto_preview=True,
+    )
+    assert preview.isNull() is False
+    assert host.calls == [(target, 2.0, False, ["scope"])]
+
+    flags.clear()
+    host.calls.clear()
+    explicit = stack_mod.ChartStack.grab_presentation_pixmap(host, target, auto_preview=False)
+    assert explicit.isNull() is False
+    assert flags == []
+    assert host.calls == [(target, 1.0, True, [])]
+
+
+def _frf_plot_result():
+    return SimpleNamespace(
+        frequencies=np.array([0.0, 1.0, 2.0, 3.0, 4.0]),
+        transfer=np.array([1.0 + 0j, 2.0 + 0j, 1.0 + 1j, -1j, -2.0 + 0j]),
+        coherence=np.array([1.0, 0.9, 0.8, 0.7, 0.6]),
+        effective=SimpleNamespace(fs=100.0, df=1.0, segments=4),
+        warnings=(),
+    )
+
+
+def _shown_frf_window(qtbot):
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.resize(1100, 800)
+    window.show()
+    qtbot.waitExposed(window)
+    window.toolbar._set_mode("frf")
+    QCoreApplication.processEvents()
+    page = window._analysis_page("frf")
+    canvas = page.pane_canvas(0)
+    canvas.set_result(_frf_plot_result(), {"frequency_scale": "linear"}, {})
+    QCoreApplication.processEvents()
+    qtbot.wait(40)
+    manager = window.analysis_managers["frf"]
+    state = manager.get(manager.active)
+    state.attached_file_ids = ["src-rack"]
+    window.files["src-rack"] = SimpleNamespace(
+        short_name="rack.csv", filename="rack.csv",
+    )
+    ref = UltraViewRef("frf", state.view_id)
+    capture = window._ultraview._capture
+    capture.bind_canvas(page, ref)
+    return window, page, canvas, capture, ref, state
+
+
+def _image_bytes(image) -> bytes:
+    converted = image.convertToFormat(QImage.Format_ARGB32).copy()
+    pointer = converted.bits()
+    pointer.setsize(converted.byteCount())
+    return bytes(pointer)
+
+
+def _wait_frf_interaction_idle(canvas, qtbot) -> None:
+    timer = canvas._aa_idle_timer
+    if timer.isActive():
+        qtbot.wait(timer.interval() + 80)
+    QCoreApplication.processEvents()
+
+
+def test_frf_successive_xy_zooms_publish_new_preview_pixels(qapp, qtbot):
+    """Ctrl then Shift zooms must retire the previous FRF preview pixels."""
+    _window, page, canvas, capture, ref, state = _shown_frf_window(qtbot)
+    assert capture.current_digest_for(ref) is not None
+    grabs = []
+    real_grab = capture._grab_image
+
+    def _grab(*args, **kwargs):
+        image = real_grab(*args, **kwargs)
+        grabs.append(0 if image is None else 1)
+        return image
+
+    capture._grab_image = _grab
+
+    def _publish(reason: str):
+        _wait_frf_interaction_idle(canvas, qtbot)
+        assert capture._try_publish_now(ref, page, reason)
+        QCoreApplication.processEvents()
+        record = capture.store.get(ref)
+        assert record is not None and PreviewStore.image_valid(record.image)
+        assert record.ref == ref
+        assert record.ref.section == "frf"
+        assert record.ref.view_id == state.view_id
+        assert record.x_unit == "Hz"
+        assert record.source_summary == "rack.csv"
+        assert capture.bound_ref_for(page) == ref
+        assert record.captured_revision == capture.presentation_revision_for(ref)
+        assert capture._has_current_preview(ref, capture.current_digest_for(ref))
+        return record, _image_bytes(record.image)
+
+    before = capture.presentation_revision_for(ref)
+    x_before = canvas.get_visible_xlim()
+    assert canvas._handle_wheel_dispatch(
+        delta=120, modifiers=Qt.ControlModifier, x_pos=2.0, y_pos=0.0,
+        view_box=canvas._plot_magnitude.vb,
+    ) is True
+    assert canvas.get_visible_xlim() != pytest.approx(x_before)
+    assert capture.presentation_revision_for(ref) > before
+    first, first_bytes = _publish("user-sync")
+    assert grabs == [1]
+    assert len(first_bytes) > 0
+
+    x_mid = canvas.get_visible_xlim()
+    assert canvas._handle_wheel_dispatch(
+        delta=120, modifiers=Qt.ControlModifier, x_pos=2.0, y_pos=0.0,
+        view_box=canvas._plot_magnitude.vb,
+    ) is True
+    assert canvas.get_visible_xlim() != pytest.approx(x_mid)
+    _wait_frf_interaction_idle(canvas, qtbot)
+    assert capture._has_current_preview(ref, capture.current_digest_for(ref)) is False
+    assert capture.store.get(ref) is first
+    capture.request_capture(ref, page, "focus-inspect")
+    qtbot.wait(50)
+    QCoreApplication.processEvents()
+    second = capture.store.get(ref)
+    assert second is not first
+    assert second.captured_revision == capture.presentation_revision_for(ref)
+    assert second.ref == ref and second.source_summary == "rack.csv"
+    second_bytes = _image_bytes(second.image)
+    assert second_bytes != first_bytes
+    assert grabs == [1, 1]
+
+    y_before = canvas.get_visible_ylims()["magnitude"]
+    assert canvas._handle_wheel_dispatch(
+        delta=120, modifiers=Qt.ShiftModifier, x_pos=2.0, y_pos=0.0,
+        view_box=canvas._plot_magnitude.vb,
+    ) is True
+    assert canvas.get_visible_ylims()["magnitude"] != pytest.approx(y_before)
+    _wait_frf_interaction_idle(canvas, qtbot)
+    assert capture._has_current_preview(ref, capture.current_digest_for(ref)) is False
+    capture.request_capture(ref, page, "focus-inspect")
+    qtbot.wait(50)
+    QCoreApplication.processEvents()
+    third = capture.store.get(ref)
+    assert third.ref == ref
+    assert third.captured_revision == capture.presentation_revision_for(ref)
+    third_bytes = _image_bytes(third.image)
+    assert third_bytes != second_bytes
+    assert grabs == [1, 1, 1]
+
+    held = capture.presentation_revision_for(ref)
+    canvas.visible_range_changed.emit()
+    canvas.repaint()
+    QCoreApplication.processEvents()
+    assert capture.presentation_revision_for(ref) == held
+    capture.request_capture(ref, page, "focus-inspect")
+    qtbot.wait(50)
+    QCoreApplication.processEvents()
+    assert grabs == [1, 1, 1]
+    assert capture.store.get(ref) is third
+    assert _image_bytes(capture.store.get(ref).image) == third_bytes
+    assert capture.store.get(UltraViewRef("frf", "other-view")) is None
+
+
+def test_frf_range_paths_bump_revision_without_same_range_or_restore_grabs(
+    qapp, qtbot,
+):
+    """Pan, Y zoom, Home, axis edit, paint, cross-view restore, hidden source."""
+    window, page, canvas, capture, ref, state = _shown_frf_window(qtbot)
+
+    def revision():
+        return capture.presentation_revision_for(ref)
+
+    # Hidden Board: a real X edit is deferred and does not grab.
+    grabs = []
+    real_grab = capture._grab_image
+
+    def _grab(*args, **kwargs):
+        image = real_grab(*args, **kwargs)
+        grabs.append(image)
+        return image
+
+    capture._grab_image = _grab
+    assert capture._sheet_visible() is False
+    rev = revision()
+    canvas.set_xlim(0.4, 3.2)
+    assert canvas.get_visible_xlim() == pytest.approx((0.4, 3.2))
+    assert revision() == rev + 1
+    assert ref in capture._deferred_preview_refs
+    assert capture.store.get(ref) is None
+    assert grabs == []
+    canvas.visible_range_changed.emit()
+    canvas.repaint()
+    QCoreApplication.processEvents()
+    assert revision() == rev + 1
+    assert grabs == []
+
+    _wait_frf_interaction_idle(canvas, qtbot)
+    capture.capture_before_section_hidden("frf")
+    assert grabs and PreviewStore.image_valid(capture.store.get(ref).image)
+    assert ref not in capture._deferred_preview_refs
+    hidden_bytes = _image_bytes(capture.store.get(ref).image)
+    assert capture.store.get(ref).source_summary == "rack.csv"
+    assert capture.store.get(ref).ref.view_id == state.view_id
+
+    page.hide()
+    QCoreApplication.processEvents()
+    rev = revision()
+    canvas.set_xlim(0.8, 2.4)
+    assert revision() == rev + 1
+    assert ref in capture._deferred_preview_refs
+    assert _image_bytes(capture.store.get(ref).image) == hidden_bytes
+    capture.capture_before_section_hidden("frf")
+    assert len(grabs) == 1
+    assert capture._has_current_preview(ref, capture.current_digest_for(ref)) is False
+    page.show()
+    QCoreApplication.processEvents()
+    qtbot.wait(40)
+    capture.capture_before_section_hidden("frf")
+    QCoreApplication.processEvents()
+    assert len(grabs) == 2
+    shown = capture.store.get(ref)
+    assert _image_bytes(shown.image) != hidden_bytes
+    assert shown.ref == ref
+    assert capture._has_current_preview(ref, capture.current_digest_for(ref))
+
+    # Further gestures on the visible source.
+    rev = revision()
+    x_before = canvas.get_visible_xlim()
+    view_box = canvas._plot_magnitude.vb
+    view_box.translateBy(x=0.25)
+    view_box.sigRangeChangedManually.emit(view_box.state["mouseEnabled"])
+    assert canvas.get_visible_xlim()[0] != pytest.approx(x_before[0])
+    assert revision() == rev + 1
+    rev = revision()
+    view_box.translateBy(x=0.2)
+    view_box.sigRangeChangedManually.emit(view_box.state["mouseEnabled"])
+    assert revision() == rev + 1
+
+    rev = revision()
+    y_before = canvas.get_visible_ylims()["phase"]
+    assert canvas._handle_wheel_dispatch(
+        delta=-120, modifiers=Qt.ShiftModifier, x_pos=1.5, y_pos=0.0,
+        view_box=canvas._plot_phase.vb,
+    ) is True
+    assert canvas.get_visible_ylims()["phase"] != pytest.approx(y_before)
+    assert revision() == rev + 1
+    rev = revision()
+    assert canvas._handle_wheel_dispatch(
+        delta=-120, modifiers=Qt.ShiftModifier, x_pos=1.5, y_pos=0.0,
+        view_box=canvas._plot_phase.vb,
+    ) is True
+    assert revision() == rev + 1
+
+    rev = revision()
+    zoomed = canvas.get_visible_xlim()
+    canvas.reset_view_to_data_extents()
+    assert canvas.get_visible_xlim() != pytest.approx(zoomed)
+    assert revision() == rev + 1
+    rev = revision()
+    canvas.reset_view_to_data_extents()
+    assert revision() == rev
+
+    rev = revision()
+    canvas.set_xlim(1.0, 3.0)
+    assert revision() == rev + 1
+    rev = revision()
+    canvas.set_xlim(1.0, 3.0)
+    assert revision() == rev
+    rev = revision()
+    canvas.set_ylim("magnitude", -8.0, 8.0)
+    assert canvas.get_visible_ylims()["magnitude"] == pytest.approx((-8.0, 8.0))
+    assert revision() == rev + 1
+    canvas.set_display_params({"frequency_scale": "log"})
+    canvas.set_xlim(1.0, 3.0)
+    assert canvas.get_visible_xlim() == pytest.approx((1.0, 3.0))
+    assert canvas._plot_magnitude.vb.viewRange()[0] == pytest.approx(
+        (np.log10(1.0), np.log10(3.0))
+    )
+
+    rev = revision()
+    canvas.repaint()
+    QCoreApplication.processEvents()
+    assert revision() == rev
+
+    # A signal while another analysis View is active belongs to that restore.
+    x_live = canvas.get_visible_xlim()
+    other = window.analysis_managers["frf"].new_view(activate=False)
+    window.analysis_managers["frf"].active = other
+    rev = revision()
+    canvas.set_xlim(1.2, 2.5)
+    assert canvas.get_visible_xlim() == pytest.approx((1.2, 2.5))
+    assert revision() == rev
+    window.analysis_managers["frf"].active = 0
+    canvas.visible_range_changed.emit()
+    assert revision() == rev + 1
+    assert canvas.get_visible_xlim() != pytest.approx(x_live)

@@ -1,0 +1,28 @@
+{
+  "repo": "kamoras__civitas",
+  "file": "backend/migrations/versions/0022_member_trade_undated.py",
+  "function": "downgrade",
+  "line": 32,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `downgrade` function.",
+  "prompt_source": "def downgrade() -> None:\n    \"\"\"Implement the `downgrade` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def downgrade() -> None:\n    for table in _TABLES:\n        op.execute(f\"DELETE FROM {table} WHERE transaction_date IS NULL\")\n        with op.batch_alter_table(table, schema=None) as batch_op:\n            batch_op.alter_column(\"transaction_date\", existing_type=sa.String(), nullable=False)",
+  "module_source": "\"\"\"stock_trades, rep_stock_trades: a transaction date may be unknown\n\nA scanned PTR row whose date isn't legible is kept with its asset, type,\namount and filing date (ptr_common.ocr_extract_rows, keep_undated), as the\npresident's already are (0019).\n\nRelaxes a NOT NULL only, so the previous image runs unchanged against the\nmigrated schema (it never writes a NULL there).\n\nRevision ID: 0022\nRevises: 0021\nCreate Date: 2026-09-29\n\"\"\"\nfrom alembic import op\nimport sqlalchemy as sa\n\n\nrevision = \"0022\"\ndown_revision = \"0021\"\nbranch_labels = None\ndepends_on = None\n\n_TABLES = (\"stock_trades\", \"rep_stock_trades\")\n\n\ndef upgrade() -> None:\n    for table in _TABLES:\n        with op.batch_alter_table(table, schema=None) as batch_op:\n            batch_op.alter_column(\"transaction_date\", existing_type=sa.String(), nullable=True)\n\n\ndef downgrade() -> None:\n    for table in _TABLES:\n        op.execute(f\"DELETE FROM {table} WHERE transaction_date IS NULL\")\n        with op.batch_alter_table(table, schema=None) as batch_op:\n            batch_op.alter_column(\"transaction_date\", existing_type=sa.String(), nullable=False)\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 5
+    },
+    "ai_commit": "46258228967f",
+    "evidence": "Generated with [Claude Code]",
+    "ai_line_fraction": 1.0,
+    "span": [
+      32,
+      36
+    ]
+  }
+}

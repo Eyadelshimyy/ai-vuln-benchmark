@@ -1,0 +1,426 @@
+"""
+Refresco del snapshot `prestamo_candidatos_drive` desde la tabla `drive` (post sync CONCILIACIÓN).
+
+Criterio de filas en snapshot (columna E, misma normalización que carga masiva / check-cédulas):
+- **V** o **E**: sin préstamo **APROBADO** previo con esa cédula.
+- **V** (solo): si hay préstamo(s) en cartera, todos deben estar en **Liquidado / Terminado**
+  (`estado=LIQUIDADO` y `estado_gestion_finiquito=TERMINADO`); si alguno está en REVISION u
+  otra fase de finiquito, la cédula **no entra al snapshot**.
+- **J** (jurídico): puede haber ya uno o más préstamos; el candidato puede seguir figurando (dos o más créditos permitidos).
+- Otras letras: sin préstamo previo con esa cédula normalizada (mismo criterio que antes para no J).
+- **DESISTIMIENTO** (DESESTIMADO/DESISTIDO): la cédula **no entra al snapshot** ni se puede
+  guardar desde Drive (regla absoluta; aplica a V/E/J).
+- **Re-importe LIQUIDADO**: si la huella operativa (cédula V/E, fechas, monto, cuotas, modalidad) ya existe en un
+  préstamo LIQUIDADO, la fila **no entra al snapshot** (no es alta nueva; evita cientos de «no guardables» en pantalla).
+
+Validadores en cada payload:
+1) formato (`validate_cedula` / `cedula_valida`);
+2) cédula tipo **V** o **E**: a lo sumo un préstamo **APROBADO** en BD;
+   **J** puede tener varios;
+3) cédula **V**: cartera solo Liquidado / Terminado (o sin préstamos);
+4) sin préstamo en **DESISTIMIENTO** para esa cédula.
+   `duplicada_en_hoja` informa repetición en hoja; el auto-guardar
+   además evita una 2.ª alta V/E en el mismo lote por la misma clave comparable.
+
+Job programado: todos los días 02:00 America/Caracas (sync CONCILIACIÓN A:S hasta cola real + snapshot); 04:45 solo recalcula desde `drive` sin sync.
+"""
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+from typing import Any, Dict, List
+
+from sqlalchemy import delete, func, select
+from sqlalchemy.orm import Session
+
+from app.services.conciliacion_sheet_meta_access import get_conciliacion_sheet_meta
+from app.models.drive import DriveRow
+from app.models.prestamo_candidato_drive import PrestamoCandidatoDrive
+from app.services.prestamo_candidatos_drive_kpis import conteos_listo_guardar_y_map_por_id
+from app.services.prestamo_candidatos_drive_normalizacion import (
+    normalizar_cedula_cmp_drive,
+    normalizar_modalidad_drive,
+    parse_decimal_monto_drive,
+    parse_fecha_q_iso_y_ambigua,
+    parse_numero_cuotas_drive,
+)
+from app.services.prestamo_candidatos_drive_validadores import (
+    cedula_cmp_es_tipo_j,
+    cedula_cmp_es_tipo_v_o_e,
+    cedula_cmp_es_tipo_venezolano_v,
+    cedula_bloqueada_por_desistimiento_drive,
+    cedula_v_bloqueada_por_no_liquidado_terminado,
+    conteo_prestamos_aprobados_por_cedula_norm,
+    conteo_prestamos_desistimiento_por_cedula_norm,
+    conteo_prestamos_liquidados_por_cedula_norm,
+    conteo_prestamos_no_liquidado_terminado_por_cedula_norm,
+    conteo_prestamos_por_cedula_norm,
+    cupo_ve_permite_nuevo_prestamo,
+    enriquecer_payload_conteos_cupo_bd,
+)
+
+logger = logging.getLogger(__name__)
+
+# Producto fijo acordado para propuesta desde Drive (submódulo préstamos / CONCILIACIÓN).
+PRODUCTO_PROPUESTO_DRIVE = "FINANCIAMIENTO"
+
+
+def _cell(v: Any) -> str:
+    if v is None:
+        return ""
+    return str(v).strip()
+
+
+def ejecutar_refresh_prestamo_candidatos_drive(
+    db: Session,
+    *,
+    forzar: bool = False,
+) -> Dict[str, Any]:
+    """
+    Borra el snapshot anterior e inserta las filas candidatas actuales.
+    Hace commit al finalizar (o rollback si falla).
+
+    Si la tabla `drive` está vacía: por defecto no modifica el snapshot (omitido=True).
+    Con forzar=True (solo uso manual vía API): vacía el snapshot y deja 0 filas.
+    """
+    # Import diferido: evita ciclo api.v1 -> este módulo -> clientes -> api.v1
+    from app.api.v1.endpoints.clientes import _normalizar_cedula_carga_masiva
+    from app.api.v1.endpoints.validadores import validate_cedula
+
+    meta = get_conciliacion_sheet_meta(db)
+    drive_synced_at = meta.synced_at if meta else None
+
+    prestamo_counts_total = conteo_prestamos_por_cedula_norm(db)
+    prestamo_counts_aprob = conteo_prestamos_aprobados_por_cedula_norm(db)
+    prestamo_counts_liq = conteo_prestamos_liquidados_por_cedula_norm(db)
+    prestamo_counts_desist = conteo_prestamos_desistimiento_por_cedula_norm(db)
+    prestamo_counts_no_liq_term = conteo_prestamos_no_liquidado_terminado_por_cedula_norm(db)
+
+    drive_rows: List[DriveRow] = list(
+        db.execute(select(DriveRow).order_by(DriveRow.sheet_row_number.asc())).scalars().all()
+        or []
+    )
+
+    if not drive_rows:
+        if not forzar:
+            logger.warning(
+                "[prestamo_candidatos_drive] refresh omitido: tabla drive sin filas "
+                "(se conserva el snapshot anterior si existía)."
+            )
+            return {
+                "filas_en_drive": 0,
+                "candidatos_insertados": 0,
+                "drive_synced_at": drive_synced_at.isoformat() if drive_synced_at else None,
+                "computed_at": None,
+                "omitido": True,
+                "motivo": "tabla_drive_sin_filas",
+            }
+        now_clear = datetime.now(timezone.utc)
+        try:
+            db.execute(delete(PrestamoCandidatoDrive))
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        logger.warning(
+            "[prestamo_candidatos_drive] refresh forzado: drive vacío; snapshot limpiado."
+        )
+        return {
+            "filas_en_drive": 0,
+            "candidatos_insertados": 0,
+            "drive_synced_at": drive_synced_at.isoformat() if drive_synced_at else None,
+            "computed_at": now_clear.isoformat(),
+            "omitido": False,
+            "motivo": "forzar_con_drive_vacio",
+        }
+
+    conteos: Dict[str, int] = {}
+    tmp: List[tuple[DriveRow, str]] = []
+    for r in drive_rows:
+        raw_e = _cell(getattr(r, "col_e", None))
+        # Siempre clave con V antepuesta si solo hay dígitos (nunca fallback sin letra).
+        from app.api.v1.endpoints.clientes import _cedula_clave_comparacion_clientes
+
+        cmp_e = normalizar_cedula_cmp_drive(raw_e) or _cedula_clave_comparacion_clientes(raw_e)
+        if not cmp_e:
+            continue
+        conteos[cmp_e] = conteos.get(cmp_e, 0) + 1
+        tmp.append((r, cmp_e))
+
+    now = datetime.now(timezone.utc)
+    to_insert: List[PrestamoCandidatoDrive] = []
+    omitidos_reimporte_liquidado = 0
+
+    from app.services.drive_candidatos_eliminados_pasivos import (
+        ORIGEN_PRESTAMO,
+        cedulas_eliminadas_pasivas,
+    )
+
+    pasivos = cedulas_eliminadas_pasivas(db, ORIGEN_PRESTAMO)
+    omitidos_pasivo = 0
+
+    for r, cmp_e in tmp:
+        if cmp_e in pasivos:
+            omitidos_pasivo += 1
+            continue
+        n_prest_total = int(prestamo_counts_total.get(cmp_e, 0) or 0)
+        n_prest_aprob = int(prestamo_counts_aprob.get(cmp_e, 0) or 0)
+        n_prest_desist = int(prestamo_counts_desist.get(cmp_e, 0) or 0)
+        n_prest_no_liq_term = int(prestamo_counts_no_liq_term.get(cmp_e, 0) or 0)
+        es_v = cedula_cmp_es_tipo_venezolano_v(cmp_e)
+        es_ve = cedula_cmp_es_tipo_v_o_e(cmp_e)
+        es_e = bool(es_ve and not es_v)
+        es_j = cedula_cmp_es_tipo_j(cmp_e)
+        # Regla absoluta: DESISTIMIENTO en cartera → no entra al snapshot / no alta Drive.
+        if cedula_bloqueada_por_desistimiento_drive(n_prest_desist):
+            continue
+        # V: si hay crédito que no está Liquidado / Terminado → no entra al snapshot.
+        if cedula_v_bloqueada_por_no_liquidado_terminado(
+            es_v=es_v, n_no_liquidado_terminado=n_prest_no_liq_term
+        ):
+            continue
+        # V/E: solo bloquea si ya hay un APROBADO.
+        if es_ve and n_prest_aprob >= 1:
+            continue
+        if not es_ve and not es_j and n_prest_aprob >= 1:
+            continue
+        raw_e = _cell(getattr(r, "col_e", None))
+        dup_sheet = conteos.get(cmp_e, 0) > 1
+        vced = validate_cedula(raw_e)
+        cedula_valida = bool(vced.get("valido"))
+        cedula_error = None if cedula_valida else (vced.get("error") or "Cédula inválida")
+        # V y E: máximo un APROBADO; J puede tener varios (validador siempre true en UI).
+        validador_ve_max_un_prestamo_ok = cupo_ve_permite_nuevo_prestamo(
+            es_ve=es_ve, es_j=es_j, n_aprob=n_prest_aprob
+        )
+        validador_v_liquidado_terminado_ok = not cedula_v_bloqueada_por_no_liquidado_terminado(
+            es_v=es_v, n_no_liquidado_terminado=n_prest_no_liq_term
+        )
+        validador_ve_max_un_prestamo_ok = (
+            validador_ve_max_un_prestamo_ok and validador_v_liquidado_terminado_ok
+        )
+        validador_v_max_un_prestamo_ok = validador_ve_max_un_prestamo_ok
+        n_prest_liq = int(prestamo_counts_liq.get(cmp_e, 0) or 0)
+
+        q_raw = _cell(getattr(r, "col_q", None)) or None
+        q_date, q_ambigua = parse_fecha_q_iso_y_ambigua(q_raw or "")
+        monto_norm = parse_decimal_monto_drive(_cell(getattr(r, "col_n", None)))
+        cuotas_norm = parse_numero_cuotas_drive(_cell(getattr(r, "col_r", None)))
+        modalidad_norm = normalizar_modalidad_drive(_cell(getattr(r, "col_s", None)))
+        huella_no_comparable = (
+            monto_norm is None or cuotas_norm is None or modalidad_norm is None or q_date is None
+        )
+        reimporte_liquidado_huella = False
+        if (
+            es_ve
+            and not huella_no_comparable
+            and q_date is not None
+            and monto_norm is not None
+            and cuotas_norm is not None
+            and modalidad_norm
+        ):
+            from datetime import timedelta
+
+            from app.services.prestamos.prestamo_reimporte_liquidado import (
+                existe_liquidado_misma_huella_operativa,
+            )
+
+            req_q = q_date - timedelta(days=1)
+            reimporte_liquidado_huella = existe_liquidado_misma_huella_operativa(
+                db,
+                cedula=cmp_e,
+                fecha_aprobacion=q_date,
+                fecha_requerimiento=req_q,
+                total_financiamiento=monto_norm,
+                numero_cuotas=int(cuotas_norm),
+                modalidad_pago=modalidad_norm,
+            )
+
+        if reimporte_liquidado_huella:
+            omitidos_reimporte_liquidado += 1
+            continue
+
+        payload: Dict[str, Any] = {
+            "col_e_cedula": raw_e or None,
+            "col_i_modelo_vehiculo": _cell(getattr(r, "col_i", None)) or None,
+            "col_j_analista": _cell(getattr(r, "col_j", None)) or None,
+            "col_k_concesionario": _cell(getattr(r, "col_k", None)) or None,
+            "col_n_total_financiamiento": _cell(getattr(r, "col_n", None)) or None,
+            "col_q_fecha": q_raw,
+            "col_r_numero_cuotas": _cell(getattr(r, "col_r", None)) or None,
+            "col_s_modalidad_pago": _cell(getattr(r, "col_s", None)) or None,
+            "producto": PRODUCTO_PROPUESTO_DRIVE,
+            "cedula_cmp": cmp_e,
+            "col_n_total_financiamiento_norm": str(monto_norm) if monto_norm is not None else None,
+            "col_r_numero_cuotas_norm": cuotas_norm,
+            "col_s_modalidad_pago_norm": modalidad_norm,
+            "col_q_fecha_iso": q_date.isoformat() if q_date is not None else None,
+            "col_q_fecha_ambigua": q_ambigua,
+            "huella_no_comparable": huella_no_comparable,
+            "reimporte_liquidado_huella": reimporte_liquidado_huella,
+            "cedula_valida": cedula_valida,
+            "cedula_error": cedula_error,
+            "duplicada_en_hoja": dup_sheet,
+            "prestamos_misma_cedula_norm_count": n_prest_total,
+            "prestamos_aprobados_misma_cedula_norm_count": n_prest_aprob,
+            "prestamos_liquidados_misma_cedula_norm_count": n_prest_liq,
+            "prestamos_desistimiento_misma_cedula_norm_count": n_prest_desist,
+            "prestamos_no_liquidado_terminado_misma_cedula_norm_count": n_prest_no_liq_term,
+            "cedula_es_tipo_v_venezolano": es_v,
+            "cedula_es_tipo_e": es_e,
+            "cedula_es_tipo_ve": es_ve,
+            "cedula_es_tipo_j": es_j,
+            "validador_formato_cedula_ok": cedula_valida,
+            "validador_ve_max_un_prestamo_ok": validador_ve_max_un_prestamo_ok,
+            "validador_v_max_un_prestamo_ok": validador_v_max_un_prestamo_ok,
+            "validador_sin_desistimiento_ok": True,
+            "validador_v_liquidado_terminado_ok": validador_v_liquidado_terminado_ok,
+            "validador_sin_duplicado_en_hoja_ok": not dup_sheet,
+            "drive_synced_at": drive_synced_at.isoformat() if drive_synced_at else None,
+        }
+
+        to_insert.append(
+            PrestamoCandidatoDrive(
+                sheet_row_number=int(r.sheet_row_number),
+                cedula_cmp=cmp_e[:32],
+                payload=payload,
+                computed_at=now,
+            )
+        )
+
+    try:
+        db.execute(delete(PrestamoCandidatoDrive))
+        if to_insert:
+            db.add_all(to_insert)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    logger.info(
+        "[prestamo_candidatos_drive] refresh filas_drive=%s candidatos=%s "
+        "omitidos_reimporte_liquidado=%s omitidos_pasivo=%s drive_synced_at=%s",
+        len(drive_rows),
+        len(to_insert),
+        omitidos_reimporte_liquidado,
+        omitidos_pasivo,
+        drive_synced_at,
+    )
+    return {
+        "filas_en_drive": len(drive_rows),
+        "candidatos_insertados": len(to_insert),
+        "omitidos_reimporte_liquidado": omitidos_reimporte_liquidado,
+        "omitidos_pasivo": omitidos_pasivo,
+        "drive_synced_at": drive_synced_at.isoformat() if drive_synced_at else None,
+        "computed_at": now.isoformat(),
+        "omitido": False,
+        "motivo": None,
+    }
+
+
+def listar_prestamo_candidatos_drive_snapshot(
+    db: Session,
+    *,
+    limit: int = 500,
+    offset: int = 0,
+    cedula_q: str | None = None,
+    solo_huella_no_comparable: bool = False,
+) -> Dict[str, Any]:
+    """Último snapshot ordenado por fila de hoja; paginado y filtro opcional por cédula (normalizada)."""
+    from app.api.v1.endpoints.clientes import _normalizar_cedula_carga_masiva
+
+    meta = get_conciliacion_sheet_meta(db)
+    drive_synced_at = meta.synced_at.isoformat() if meta and meta.synced_at else None
+
+    filt_norm = ""
+    if cedula_q is not None and str(cedula_q).strip():
+        filt_norm = _normalizar_cedula_carga_masiva(str(cedula_q).strip())
+
+    # JSON genérico (columna SQLAlchemy JSON, no JSONB PG): .astext no existe.
+    # En payload se guarda bool Python (insert ~L172); filtrar como boolean JSON, no cadena "true".
+    huella_no_comparable_sql = PrestamoCandidatoDrive.payload["huella_no_comparable"].as_boolean().is_(
+        True
+    )
+
+    base_filter = []
+    if filt_norm:
+        base_filter.append(PrestamoCandidatoDrive.cedula_cmp.contains(filt_norm))
+    if solo_huella_no_comparable:
+        base_filter.append(huella_no_comparable_sql)
+
+    cnt_stmt = select(func.count(PrestamoCandidatoDrive.id))
+    if base_filter:
+        cnt_stmt = cnt_stmt.where(*base_filter)
+    total = int(db.scalar(cnt_stmt) or 0)
+
+    lim = max(1, min(int(limit), 2000))
+    off = max(0, int(offset))
+
+    aprueban, no_aprueban, listo_por_id, motivos_por_id = (
+        conteos_listo_guardar_y_map_por_id(
+            db, cedula_cmp_contains=filt_norm or None
+        )
+    )
+
+    stmt = select(PrestamoCandidatoDrive).order_by(PrestamoCandidatoDrive.sheet_row_number.asc())
+    if base_filter:
+        stmt = stmt.where(*base_filter)
+    stmt = stmt.offset(off).limit(lim)
+
+    rows = list(db.execute(stmt).scalars().all() or [])
+    prestamo_counts_total = conteo_prestamos_por_cedula_norm(db)
+    prestamo_counts_aprob_live = conteo_prestamos_aprobados_por_cedula_norm(db)
+    prestamo_counts_liq_live = conteo_prestamos_liquidados_por_cedula_norm(db)
+    prestamo_counts_desist_live = conteo_prestamos_desistimiento_por_cedula_norm(db)
+    prestamo_counts_no_liq_term_live = conteo_prestamos_no_liquidado_terminado_por_cedula_norm(
+        db
+    )
+    computed_at = None
+    if total > 0:
+        max_stmt = select(func.max(PrestamoCandidatoDrive.computed_at))
+        if base_filter:
+            max_stmt = max_stmt.where(*base_filter)
+        last_ts = db.scalar(max_stmt)
+        computed_at = last_ts.isoformat() if last_ts else None
+
+    return {
+        "drive_synced_at": drive_synced_at,
+        "computed_at": computed_at,
+        "kpis_aprueban": aprueban,
+        "kpis_no_aprueban": no_aprueban,
+        "kpis_huella_no_comparable": int(
+            db.scalar(
+                select(func.count(PrestamoCandidatoDrive.id)).where(huella_no_comparable_sql)
+            )
+            or 0
+        ),
+        "total": total,
+        "total_sin_filtro": (
+            int(db.scalar(select(func.count(PrestamoCandidatoDrive.id))) or 0)
+            if filt_norm
+            else total
+        ),
+        "filtro_cedula": filt_norm or None,
+        "limit": lim,
+        "offset": off,
+        "filas": [
+            {
+                "id": r.id,
+                "sheet_row_number": r.sheet_row_number,
+                "cedula_cmp": r.cedula_cmp,
+                "payload": enriquecer_payload_conteos_cupo_bd(
+                    r.payload if isinstance(r.payload, dict) else {},
+                    r.cedula_cmp,
+                    prestamo_counts_total=prestamo_counts_total,
+                    prestamo_counts_aprob=prestamo_counts_aprob_live,
+                    prestamo_counts_liq=prestamo_counts_liq_live,
+                    prestamo_counts_desist=prestamo_counts_desist_live,
+                    prestamo_counts_no_liq_term=prestamo_counts_no_liq_term_live,
+                ),
+                "computed_at": r.computed_at.isoformat() if r.computed_at else None,
+                "listo_para_guardar": bool(listo_por_id.get(int(r.id), False)),
+                "motivos_no_guardable": list(motivos_por_id.get(int(r.id), []) or []),
+            }
+            for r in rows
+        ],
+    }

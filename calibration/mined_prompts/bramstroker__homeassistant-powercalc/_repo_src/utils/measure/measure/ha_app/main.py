@@ -1,0 +1,102 @@
+import argparse
+from copy import deepcopy
+import json
+import logging
+from pathlib import Path
+
+import uvicorn
+from uvicorn.config import LOGGING_CONFIG
+
+from measure.ha_app.access import is_loopback_address, trusted_ingress_only_enabled
+from measure.ha_app.api import create_app
+
+
+class _HealthCheckAccessFilter(logging.Filter):
+    """Keep failed health checks visible without logging every successful probe."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Uvicorn access records contain client, method, path, HTTP version, and status.
+        if not isinstance(record.args, tuple) or len(record.args) != 5:
+            return True
+        _, method, path, _, status = record.args
+        return not (method == "GET" and path == "/health" and isinstance(status, int) and 200 <= status < 300)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Powercalc Measure Home Assistant app")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8099)
+    parser.add_argument("--data-root", type=Path, default=Path("/data"))
+    parser.add_argument(
+        "--hass-url",
+        default="ws://supervisor/core/websocket",
+        help="Home Assistant Core WebSocket API URL. Override for local development.",
+    )
+    parser.add_argument(
+        "--hass-token",
+        default=None,
+        help="Home Assistant access token. Defaults to the SUPERVISOR_TOKEN environment variable.",
+    )
+    parser.add_argument(
+        "--allow-local-access",
+        action="store_true",
+        help="Allow unauthenticated local development access. Requires a loopback bind address.",
+    )
+    parser.add_argument(
+        "--developer-mode",
+        action="store_true",
+        help="Show developer testing options in the app, such as virtual (dummy) device controllers.",
+    )
+    args = parser.parse_args()
+    trusted_ingress_only = not args.allow_local_access and trusted_ingress_only_enabled()
+    if not trusted_ingress_only and not is_loopback_address(args.host):
+        parser.error("Local access requires a loopback IP address for --host (127.0.0.1 or ::1)")
+    options = _read_options(args.data_root)
+    debug = bool(options.get("debug_logging", False))
+    _configure_logging(debug)
+    app = create_app(
+        data_root=args.data_root,
+        hass_url=args.hass_url,
+        hass_token=args.hass_token,
+        trusted_ingress_only=trusted_ingress_only,
+        developer_mode=args.developer_mode or bool(options.get("developer_mode", False)),
+    )
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        workers=1,
+        proxy_headers=False,
+        log_level="debug" if debug else "info",
+        log_config=_create_uvicorn_log_config(),
+    )
+
+
+def _create_uvicorn_log_config() -> dict[str, object]:
+    config = deepcopy(LOGGING_CONFIG)
+    for formatter in config["formatters"].values():
+        formatter["fmt"] = "%(asctime)s " + formatter["fmt"]
+    config["filters"] = {"health_check": {"()": _HealthCheckAccessFilter}}
+    config["handlers"]["access"]["filters"] = ["health_check"]
+    return config
+
+
+def _read_options(data_root: Path) -> dict[str, object]:
+    """Read the add-on options written to ``options.json`` by the Home Assistant supervisor."""
+    try:
+        options = json.loads((data_root / "options.json").read_text())
+    except OSError, ValueError:
+        return {}
+    return options if isinstance(options, dict) else {}
+
+
+def _configure_logging(debug: bool) -> None:
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logging.getLogger("measure").setLevel(level)
+    # homeassistant_api logs every websocket exchange at INFO; only surface those when debugging.
+    logging.getLogger("homeassistant_api").setLevel(logging.DEBUG if debug else logging.WARNING)
+
+
+if __name__ == "__main__":  # pragma: no cover - entry-point behaviour is tested through main
+    main()

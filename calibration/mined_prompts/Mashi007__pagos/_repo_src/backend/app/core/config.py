@@ -1,0 +1,1169 @@
+"""
+Configuración del sistema usando Pydantic Settings
+"""
+import json
+import os
+from typing import Optional, List
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator, model_validator
+
+
+class Settings(BaseSettings):
+    """Configuración de la aplicación"""
+    
+    # ============================================
+    # Configuración General
+    # ============================================
+    PROJECT_NAME: str = "Sistema de Pagos"
+    VERSION: str = "1.0.0"
+    API_V1_STR: str = "/api/v1"
+    DEBUG: bool = False
+
+    # Si True, expone /docs, /redoc y /openapi.json. En produccion dejar False salvo necesidad explicita.
+    ENABLE_OPENAPI_DOCS: bool = Field(
+        default=False,
+        description="Expone documentacion OpenAPI en /docs y /redoc. Produccion: False. Desarrollo: True o DEBUG=True.",
+    )
+    # Por defecto False: ningun job programado al arrancar (APScheduler, liquidado 21:00, cache dashboard).
+    # Poner True en .env solo si se desean tareas automaticas en segundo plano (no disparadas al guardar Configuracion).
+    ENABLE_AUTOMATIC_SCHEDULED_JOBS: bool = Field(
+        default=False,
+        description=(
+            "Si True, el proceso lider puede iniciar APScheduler (auditoria cartera, limpieza codigos, "
+            "Clientes (Drive) diario 01:00 Caracas (sync CONCILIACIÓN A:S hasta última fila con dato + caché), "
+            "Préstamos Drive diario 02:00 Caracas (mismo sync + snapshot candidatos), "
+            "recalculo respaldo caché clientes 04:05 y snapshot préstamos 04:45, "
+            "Gmail programado si aplica), liquidado diario 00:40 Caracas, refresco programado de cache del dashboard, "
+            "watcher de lider y, al arrancar, marcar syncs Gmail 'running' como error (desbloqueo tras deploy). "
+            "Los envíos masivos por pestaña de Notificaciones son manuales salvo crons opcionales "
+            "«2 días antes» (ENABLE_CRON_NOTIFICACIONES_2_DIAS_ANTES), PREJUDICIAL/a-2-cuotas "
+            "(ENABLE_CRON_NOTIFICACIONES_PREJUDICIAL), atraso-10-dias "
+            "(ENABLE_CRON_NOTIFICACIONES_ATRASO_10_DIAS), día siguiente "
+            "(ENABLE_CRON_NOTIFICACIONES_DIA_SIGUIENTE), Estado de cuenta "
+            "(ENABLE_CRON_NOTIFICACIONES_ESTADO_CUENTA) y Recibos conciliación "
+            "(ENABLE_RECIBOS_CONCILIACION_EMAIL_JOBS + RECIBOS_CRON_SLOTS). "
+            "Finiquito no tiene cron (refresh manual / al liquidar). "
+            "Por defecto False: ejecucion manual desde la aplicacion; sin limpieza automatica de Gmail al startup."
+        ),
+    )
+    # Cron diario ESTADO_CUENTA (America/Caracas). Requiere ENABLE_AUTOMATIC_SCHEDULED_JOBS=True.
+    # Tope 600/día y cursor round-robin (mismo motor que Enviar en /notificaciones/estado-cuenta).
+    ENABLE_CRON_NOTIFICACIONES_ESTADO_CUENTA: bool = Field(
+        default=True,
+        description=(
+            "Si True y ENABLE_AUTOMATIC_SCHEDULED_JOBS=True (líder), dispara envío automático de "
+            "ESTADO_CUENTA (PDF) según CRON_ESTADO_CUENTA_SLOTS Caracas "
+            "(defecto 03:28 y 04:12; cupo 600/día)."
+        ),
+    )
+    CRON_ESTADO_CUENTA_SLOTS: str = Field(
+        default="3:28,4:12",
+        description=(
+            "Horarios Caracas H:MM separados por coma para cron ESTADO_CUENTA "
+            "(defecto madrugada 03:28 y 04:12)."
+        ),
+    )
+    CRON_ESTADO_CUENTA_HOUR: int = Field(
+        default=3,
+        ge=0,
+        le=23,
+        description="Compat: hora única si CRON_ESTADO_CUENTA_SLOTS está vacío.",
+    )
+    CRON_ESTADO_CUENTA_MINUTE: int = Field(
+        default=28,
+        ge=0,
+        le=59,
+        description="Compat: minuto si CRON_ESTADO_CUENTA_SLOTS está vacío.",
+    )
+    CRON_ESTADO_CUENTA_CATCHUP_HOUR_END: int = Field(
+        default=4,
+        ge=0,
+        le=23,
+        description=(
+            "Compat legacy catch-up horario (preferir CRON_ESTADO_CUENTA_SLOTS)."
+        ),
+    )
+    # Cron diario solo PAGO_2_DIAS_ANTES_PENDIENTE (America/Caracas). Requiere ENABLE_AUTOMATIC_SCHEDULED_JOBS=True
+    # y proceso líder de scheduler; idempotencia en BD (configuracion notificaciones_cron_2_dias_antes_estado).
+    ENABLE_CRON_NOTIFICACIONES_2_DIAS_ANTES: bool = Field(
+        default=True,
+        description=(
+            "Si True y ENABLE_AUTOMATIC_SCHEDULED_JOBS=True (líder), dispara envío automático "
+            "PAGO_2_DIAS_ANTES_PENDIENTE según CRON_2_DIAS_ANTES_SLOTS Caracas "
+            "(defecto 00:48 madrugada y 18:15 tarde), todos los días."
+        ),
+    )
+    CRON_2_DIAS_ANTES_SLOTS: str = Field(
+        default="0:48,18:15",
+        description=(
+            "Horarios Caracas H:MM separados por coma para cron d-2-antes "
+            "(madrugada + tarde)."
+        ),
+    )
+    CRON_2_DIAS_ANTES_HOURS: str = Field(
+        default="0,18",
+        description=(
+            "Horas Caracas (0-23) separadas por coma para el cron d-2-antes. "
+            "Default '7,18' → 07:MM y 18:MM."
+        ),
+    )
+    CRON_2_DIAS_ANTES_HOUR: int = Field(
+        default=7,
+        ge=0,
+        le=23,
+        description=(
+            "Compat: hora única si CRON_2_DIAS_ANTES_HOURS está vacío. "
+            "Preferir CRON_2_DIAS_ANTES_HOURS."
+        ),
+    )
+    CRON_2_DIAS_ANTES_MINUTE: int = Field(
+        default=15,
+        ge=0,
+        le=59,
+        description="Minuto Caracas compartido por todas las horas del cron d-2-antes (defecto 15).",
+    )
+    CRON_2_DIAS_ANTES_INTENTOS_JOB: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Reintentos ante excepción (p. ej. BD) antes de marcar error del día.",
+    )
+    CRON_2_DIAS_ANTES_SLEEP_ENTRE_INTENTOS_SEG: int = Field(
+        default=60,
+        ge=5,
+        le=600,
+        description="Segundos de espera entre reintentos del cron «2 días antes».",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_cron_2_dias_antes_hour_vs_hours(cls, data: object) -> object:
+        """
+        En Render a veces se pone CRON_2_DIAS_ANTES_HOUR=7,18 (lista).
+        Eso debe ir a HOURS; HOUR queda como el primer entero.
+        """
+        if not isinstance(data, dict):
+            return data
+        hour_raw = data.get("CRON_2_DIAS_ANTES_HOUR")
+        if not isinstance(hour_raw, str):
+            return data
+        s = hour_raw.strip()
+        if "," not in s:
+            return data
+        hours_env = data.get("CRON_2_DIAS_ANTES_HOURS")
+        hours_empty = hours_env is None or (
+            isinstance(hours_env, str) and not str(hours_env).strip()
+        )
+        # Si HOURS no vino en env, o solo trae default implícito vacío, usa la lista de HOUR.
+        if hours_empty:
+            data["CRON_2_DIAS_ANTES_HOURS"] = ",".join(
+                p.strip() for p in s.split(",") if p.strip()
+            )
+        first = s.split(",")[0].strip()
+        data["CRON_2_DIAS_ANTES_HOUR"] = first if first else "7"
+        return data
+
+    @field_validator("CRON_2_DIAS_ANTES_HOUR", mode="before")
+    @classmethod
+    def _coerce_cron_2_dias_antes_hour(cls, v: object) -> object:
+        if v is None or v == "":
+            return 7
+        if isinstance(v, str):
+            s = v.strip()
+            if "," in s:
+                s = s.split(",")[0].strip()
+            if not s:
+                return 7
+            return int(s)
+        return v
+
+    # Cron diario PREJUDICIAL / a-2-cuotas (America/Caracas). Lun–dom.
+    ENABLE_CRON_NOTIFICACIONES_PREJUDICIAL: bool = Field(
+        default=True,
+        description=(
+            "Si True y ENABLE_AUTOMATIC_SCHEDULED_JOBS=True (líder), dispara envío automático "
+            "PREJUDICIAL (módulo a-2-cuotas / 2 cuotas o más) a "
+            "CRON_PREJUDICIAL_HOUR:CRON_PREJUDICIAL_MINUTE Caracas (defecto 00:20), todos los días. "
+            "Respeta habilitado=false en Configuración > Notificaciones > Envíos para PREJUDICIAL."
+        ),
+    )
+    CRON_PREJUDICIAL_HOUR: int = Field(
+        default=2,
+        ge=0,
+        le=23,
+        description="Hora Caracas (0-23) del cron PREJUDICIAL / a-2-cuotas (defecto 2 = 02h).",
+    )
+    CRON_PREJUDICIAL_MINUTE: int = Field(
+        default=22,
+        ge=0,
+        le=59,
+        description="Minuto Caracas del cron PREJUDICIAL (defecto 22 → 02:22).",
+    )
+    CRON_PREJUDICIAL_INTENTOS_JOB: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Reintentos ante excepción del cron PREJUDICIAL antes de marcar error del día.",
+    )
+    CRON_PREJUDICIAL_SLEEP_ENTRE_INTENTOS_SEG: int = Field(
+        default=60,
+        ge=5,
+        le=600,
+        description="Segundos de espera entre reintentos del cron PREJUDICIAL.",
+    )
+    # Cron diario PAGO_10_DIAS_ATRASADO / atraso-10-dias (America/Caracas). Lun–dom.
+    ENABLE_CRON_NOTIFICACIONES_ATRASO_10_DIAS: bool = Field(
+        default=True,
+        description=(
+            "Si True y ENABLE_AUTOMATIC_SCHEDULED_JOBS=True (líder), dispara envío automático "
+            "PAGO_10_DIAS_ATRASADO (módulo atraso-10-dias / menor a 60) a "
+            "CRON_ATRASO_10_DIAS_HOUR:CRON_ATRASO_10_DIAS_MINUTE Caracas (defecto 13:15), todos los días. "
+            "Respeta habilitado=false en Configuración > Notificaciones > Envíos para PAGO_10_DIAS_ATRASADO."
+        ),
+    )
+    CRON_ATRASO_10_DIAS_HOUR: int = Field(
+        default=2,
+        ge=0,
+        le=23,
+        description="Hora Caracas (0-23) del cron atraso-10-dias (defecto 2).",
+    )
+    CRON_ATRASO_10_DIAS_MINUTE: int = Field(
+        default=40,
+        ge=0,
+        le=59,
+        description="Minuto Caracas del cron atraso-10-dias (defecto 40 → 02:40).",
+    )
+    CRON_ATRASO_10_DIAS_INTENTOS_JOB: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Reintentos ante excepción del cron atraso-10-dias antes de marcar error del día.",
+    )
+    CRON_ATRASO_10_DIAS_SLEEP_ENTRE_INTENTOS_SEG: int = Field(
+        default=60,
+        ge=5,
+        le=600,
+        description="Segundos de espera entre reintentos del cron atraso-10-dias.",
+    )
+    # Cron diario PAGO_1_DIA_ATRASADO / día siguiente (/notificaciones). Lun–dom 09:15 y 17:15.
+    ENABLE_CRON_NOTIFICACIONES_DIA_SIGUIENTE: bool = Field(
+        default=True,
+        description=(
+            "Si True y ENABLE_AUTOMATIC_SCHEDULED_JOBS=True (líder), dispara envío automático "
+            "PAGO_1_DIA_ATRASADO según CRON_DIA_SIGUIENTE_SLOTS Caracas "
+            "(defecto 02:08 madrugada y 17:15 tarde), todos los días."
+        ),
+    )
+    CRON_DIA_SIGUIENTE_SLOTS: str = Field(
+        default="2:08,17:15",
+        description=(
+            "Horarios Caracas H:MM separados por coma para cron día siguiente "
+            "(madrugada + tarde)."
+        ),
+    )
+    CRON_DIA_SIGUIENTE_HOURS: str = Field(
+        default="2,17",
+        description=(
+            "Horas Caracas (0-23) separadas por coma para el cron día siguiente. "
+            "Default '9,17' → 09:MM y 17:MM."
+        ),
+    )
+    CRON_DIA_SIGUIENTE_MINUTE: int = Field(
+        default=15,
+        ge=0,
+        le=59,
+        description="Minuto Caracas compartido por todas las horas del cron día siguiente (defecto 15).",
+    )
+    CRON_DIA_SIGUIENTE_INTENTOS_JOB: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Reintentos ante excepción del cron día siguiente antes de marcar error del slot.",
+    )
+    CRON_DIA_SIGUIENTE_SLEEP_ENTRE_INTENTOS_SEG: int = Field(
+        default=60,
+        ge=5,
+        le=600,
+        description="Segundos de espera entre reintentos del cron día siguiente.",
+    )
+    # Clientes (Drive): sync nocturno + caché lista (UI /notificaciones/clientes-drive).
+    ENABLE_DRIVE_CLIENTES_NIGHTLY_0100: bool = Field(
+        default=True,
+        description=(
+            "Si True y ENABLE_AUTOMATIC_SCHEDULED_JOBS=True, cada día a las 01:00 America/Caracas: "
+            "sincroniza CONCILIACIÓN (A:S) hasta la última fila con dato en cualquier columna del rango "
+            "y refresca drive_clientes_candidatos_cache."
+        ),
+    )
+    ENABLE_DRIVE_CLIENTES_AUTO_GUARDAR_NIGHTLY: bool = Field(
+        default=True,
+        description=(
+            "Tras el job 01:00, importa automáticamente solo filas `seleccionable` (misma regla que importación "
+            "manual en Clientes Drive). Las que no cumplen permanecen en pantalla."
+        ),
+    )
+    SCHEDULER_SYSTEM_USER_EMAIL: str = Field(
+        default="itmaster@rapicreditca.com",
+        description="Email del usuario registrado en altas/préstamos creados por jobs nocturnos Drive.",
+    )
+    # Snapshot candidatos préstamo nuevo desde tabla `drive` (tras sync CONCILIACIÓN).
+    ENABLE_PRESTAMO_CANDIDATOS_DRIVE_NIGHTLY: bool = Field(
+        default=True,
+        description=(
+            "Si True y ENABLE_AUTOMATIC_SCHEDULED_JOBS=True, cada día a las 02:00 America/Caracas: "
+            "mismo sync A:S + prestamo_candidatos_drive "
+            "(UI /actualizaciones/prestamos). A las 04:45 solo recalcula snapshot sin volver a Sheets."
+        ),
+    )
+    ENABLE_PRESTAMO_CANDIDATOS_AUTO_GUARDAR_NIGHTLY: bool = Field(
+        default=True,
+        description=(
+            "Tras el job 02:00, ejecuta el mismo guardado que «Guardar préstamos validados» "
+            "(`_motivos_no_100`). Las filas que no cumplen siguen en el snapshot para revisión."
+        ),
+    )
+    # Finiquito: sin cron automático (refresh manual / al liquidar por pago).
+
+    # ============================================
+    # Base de Datos
+    # ============================================
+    DATABASE_URL: str = Field(
+        ...,
+        description="URL de conexión a PostgreSQL"
+    )
+    # Pool por proceso (cada worker de Gunicorn tiene su propio engine). Subir si el dashboard
+    # dispara muchas peticiones lentas en paralelo y aparece: QueuePool limit ... overflow ... reached.
+    # Respetar max_connections de Postgres (ej. 2 workers × (15+25) = 80; ajuste con env si el plan DB es bajo).
+    DATABASE_POOL_SIZE: int = Field(
+        default=15,
+        ge=1,
+        le=80,
+        description="Conexiones persistentes del pool SQLAlchemy por worker",
+    )
+    DATABASE_MAX_OVERFLOW: int = Field(
+        default=25,
+        ge=0,
+        le=80,
+        description="Conexiones extra bajo pico (máx por worker ≈ pool_size + max_overflow)",
+    )
+    DATABASE_POOL_TIMEOUT: int = Field(
+        default=60,
+        ge=5,
+        le=300,
+        description="Segundos esperando conexión libre antes de sqlalchemy.exc.TimeoutError",
+    )
+
+    # ============================================
+    # Seguridad
+    # ============================================
+    SECRET_KEY: str = Field(
+        ...,
+        description="Clave secreta para JWT"
+    )
+    ALGORITHM: str = "HS256"
+    # Access token: duración en minutos. Override con ACCESS_TOKEN_EXPIRE_MINUTES en .env (ej. 240 = 4 horas).
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(
+        default=240,
+        description="Minutos hasta que expire el access token (default 4h). El refresh token sigue 7 días."
+    )
+    # Portal Finiquito (scope=finiquito): JWT más corto que el de personal; configurable por .env.
+    FINIQUITO_ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(
+        default=180,
+        ge=15,
+        le=1440,
+        description="Minutos de validez del access token solo para portal Finiquito (OTP). Default 3h.",
+    )
+    # Refresh token: duración en días (solo para renovar access token; no obliga a login hasta que expire).
+    REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=7, description="Días hasta que expire el refresh token")
+    REMEMBER_ME_ACCESS_TOKEN_EXPIRE_DAYS: int = Field(default=30, description="Dias del access token cuando Recordarme esta activo")
+    REMEMBER_ME_REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=90, description="Dias del refresh token cuando Recordarme esta activo")
+
+    # Usuario admin único (auth sin tabla users). Opcional.
+    ADMIN_EMAIL: Optional[str] = Field(None, description="Email del usuario admin para login")
+    ADMIN_PASSWORD: Optional[str] = Field(None, description="Contraseña del usuario admin para login")
+    # Secreto para endpoint interno de restablecer contraseña (sincronizar usuario BD con ADMIN_PASSWORD).
+    RESET_PASSWORD_SECRET: Optional[str] = Field(None, description="Secreto para POST /api/v1/auth/admin/reset-password (header X-Admin-Secret)")
+    # Secreto para ejecutar migración auditoria FK (POST /admin/run-migration-auditoria-fk con header X-Migration-Secret)
+    MIGRATION_AUDITORIA_SECRET: Optional[str] = Field(None, description="Secreto para ejecutar migración auditoria FK (una sola vez)")
+    # Email al que se envía la notificación cuando un usuario solicita "Olvidé mi contraseña" (para envío de nueva).
+    FORGOT_PASSWORD_NOTIFY_EMAIL: str = Field(
+        default="notificaciones@rapicreditca.com",
+        description="Destino del correo de solicitud de restablecimiento de contraseña",
+    )
+    # False = exige JWT cobros_public (OTP por correo) en validar-cedula y enviar-reporte publicos.
+    COBROS_PUBLICO_OTP_DISABLED: bool = Field(
+        default=True,
+        description=(
+            "Por defecto True: reporte de pago rapicredit-cobros sin OTP "
+            "(estado de cuenta usa su propio flujo con verificacion). "
+            "Poner False para exigir OTP tambien en cobros publico."
+        ),
+    )
+    COBROS_FANTASMA_STARTUP_MAX_LOOPS: int = Field(
+        default=1,
+        ge=0,
+        le=5,
+        description=(
+            "Tras deploy (solo worker con startup lock): lotes de importado-fantasma al arrancar. "
+            "0=omitir; 1=un lote post-deploy (opción C); valores mayores solo para pruebas."
+        ),
+    )
+    COBROS_FANTASMA_NIGHTLY_MAX_LOOPS: int = Field(
+        default=80,
+        ge=1,
+        le=200,
+        description=(
+            "Barrido nocturno importado-fantasma (03:30 Caracas, scheduler líder): "
+            "máximo de lotes × COBROS_FANTASMA_BATCH_SIZE."
+        ),
+    )
+    COBROS_FANTASMA_BATCH_SIZE: int = Field(
+        default=300,
+        ge=50,
+        le=500,
+        description="Tamaño de lote para sanear importados sin cartera aplicada.",
+    )
+    COBROS_EXPORT_PEAK_LIMIT_ENABLED: bool = Field(
+        default=True,
+        description=(
+            "Si True, en horario pico Caracas limita filas del GET exportar-aprobados-correccion (429)."
+        ),
+    )
+    COBROS_EXPORT_PEAK_HOUR_START: int = Field(
+        default=7,
+        ge=0,
+        le=23,
+        description="Hora inclusive (Caracas) inicio pico export Excel cobros.",
+    )
+    COBROS_EXPORT_PEAK_HOUR_END: int = Field(
+        default=22,
+        ge=0,
+        le=23,
+        description="Hora inclusive (Caracas) fin pico export Excel cobros.",
+    )
+    COBROS_EXPORT_PEAK_MAX_ROWS: int = Field(
+        default=400,
+        ge=50,
+        le=5000,
+        description="Máximo filas por descarga Excel corrección en horario pico.",
+    )
+    RATE_LIMIT_TRUST_X_FORWARDED_FOR: bool = Field(
+        default=True,
+        description=(
+            "Si True, los endpoints publicos pueden usar la primera IP valida de X-Forwarded-For "
+            "para rate limit cuando la peticion llega detras de proxy confiable."
+        ),
+    )
+    @field_validator("SECRET_KEY")
+    @classmethod
+    def validate_secret_key(cls, v: str) -> str:
+        """Validar que SECRET_KEY tenga longitud y complejidad adecuadas"""
+        if len(v) < 32:
+            raise ValueError('SECRET_KEY debe tener al menos 32 caracteres para seguridad adecuada')
+        # Validar que no sea un valor común o débil
+        weak_keys = ['secret', 'password', '123456', 'admin', 'test', 'dev', 'development']
+        if v.lower() in weak_keys or len(set(v)) < 8:
+            raise ValueError('SECRET_KEY debe ser una cadena aleatoria y segura, no un valor común')
+        return v
+    
+    # ============================================
+    # Encriptación (API keys, contraseñas en BD)
+    # ============================================
+    ENCRYPTION_KEY: Optional[str] = Field(
+        None,
+        description="Clave de encriptación Fernet para valores sensibles en BD (API keys, contraseñas). Generar con: from cryptography.fernet import Fernet; Fernet.generate_key().decode()"
+    )
+    
+    # ============================================
+    # WhatsApp / Meta API
+    # ============================================
+    # False por defecto: sin llamadas a Meta (notificaciones WhatsApp, prueba, bot saliente, test conexión).
+    # Poner WHATSAPP_SEND_ENABLED=true solo si usan Cloud API con token e ID válidos. Email y demás sin cambios.
+    WHATSAPP_SEND_ENABLED: bool = Field(
+        default=False,
+        description=(
+            "False (defecto): no se llama a graph.facebook.com (envío, descarga de media en flujo cobranza, test Meta). "
+            "True: habilita integración; requiere token y phone_number_id en BD o env."
+        ),
+    )
+    WHATSAPP_VERIFY_TOKEN: Optional[str] = Field(
+        None,
+        description="Token de verificación del webhook de WhatsApp (Meta)"
+    )
+    WHATSAPP_ACCESS_TOKEN: Optional[str] = Field(
+        None,
+        description="Access Token de WhatsApp Business API (Meta)"
+    )
+    WHATSAPP_PHONE_NUMBER_ID: Optional[str] = Field(
+        None,
+        description="Phone Number ID de WhatsApp Business"
+    )
+    WHATSAPP_BUSINESS_ACCOUNT_ID: Optional[str] = Field(
+        None,
+        description="Business Account ID de WhatsApp"
+    )
+    WHATSAPP_APP_SECRET: Optional[str] = Field(
+        None,
+        description="App Secret de Meta para verificar firma de webhooks (recomendado)"
+    )
+
+    # AutoResponder (app Android): POST JSON → solicitar código de estado de cuenta (misma lógica que /solicitar-codigo).
+    # Defina AMBOS en el entorno (Render) para activar POST .../webhook-autoresponder y Basic Auth en la app.
+    AUTORESPONDER_WEBHOOK_USER: Optional[str] = Field(
+        None,
+        description="Usuario HTTP Basic para POST /api/v1/estado-cuenta/public/webhook-autoresponder (AutoResponder).",
+    )
+    AUTORESPONDER_WEBHOOK_PASSWORD: Optional[str] = Field(
+        None,
+        description="Contraseña HTTP Basic para el webhook AutoResponder. No exponer al frontend.",
+    )
+
+    # URL para aviso cuando el webhook de WhatsApp falla (ej. Slack Incoming Webhook).
+    # Si está configurada, se envía un POST con el mensaje de error.
+    ALERT_WEBHOOK_URL: Optional[str] = Field(
+        None,
+        description="URL (ej. Slack Incoming Webhook) para alertas cuando falla el procesamiento del webhook de WhatsApp"
+    )
+    # Teléfono de soporte mostrado cuando el usuario supera máx intentos (cédula inválida, etc.).
+    SUPPORT_PHONE: str = Field(
+        default="0424-4359435",
+        description="Teléfono de soporte para estado ERROR_MAX_INTENTOS del bot de cobranza",
+    )
+    # Segundos de espera entre mensajes del bot (humanización: simular "escribiendo"). Spec: 2.
+    MESSAGE_DELAY_SECONDS: float = Field(
+        default=2.0,
+        description="Delay en segundos entre mensajes consecutivos del bot (bienvenida en varios mensajes)",
+    )
+    
+    # ============================================
+    # Email
+    # ============================================
+    SMTP_HOST: Optional[str] = None
+    SMTP_PORT: Optional[int] = 587
+    SMTP_USER: Optional[str] = None
+    SMTP_PASSWORD: Optional[str] = None
+    SMTP_FROM_EMAIL: Optional[str] = None
+    # Remitente forzado para el servicio "notificaciones" (rechazos, notificaciones a clientes). Si está definido, se usa como From al enviar con servicio=notificaciones.
+    NOTIFICACIONES_FROM_EMAIL: Optional[str] = Field(
+        default="notificaciones@rapicreditca.com",
+        description=(
+            "Remitente From forzado para servicio SMTP notificaciones "
+            "(mora, prejudicial/60+, rechazos, etc.). Canonico: notificaciones@rapicreditca.com. "
+            "El holder ignora otros valores y usa siempre ese remitente (salvo 2 dias antes)."
+        ),
+    )
+    # Solo PAGO_2_DIAS_ANTES / tipo_tab d_2_antes_vencimiento (tiene prioridad sobre NOTIFICACIONES_FROM_EMAIL).
+    NOTIFICACIONES_FROM_EMAIL_2_DIAS_ANTES: str = Field(
+        default="",
+        description=(
+            "Remitente From opcional para d_2_antes_vencimiento. "
+            "Vacío = From de la cuenta SMTP asignada en configuracion."
+        ),
+    )
+    NOTIFICACIONES_BCC_GLOBAL: str = Field(
+        default="itmaster@rapicreditca.com",
+        description=(
+            "Correos en CCO/BCC que se agregan siempre a todos los envios del "
+            "servicio notificaciones, ademas de la CCO configurada por tipo. "
+            "Separar por coma."
+        ),
+    )
+    # Submódulo Recibos: envío manual (UI / POST) y cron en RECIBOS_CRON_SLOTS (lotes).
+    ENABLE_RECIBOS_CONCILIACION_EMAIL_JOBS: bool = Field(
+        default=True,
+        description=(
+            "Si True y ENABLE_AUTOMATIC_SCHEDULED_JOBS=True (proceso líder), registra jobs APScheduler "
+            "America/Caracas lun-dom SOLO en RECIBOS_CRON_SLOTS "
+            "(defecto 05:00, 11:50, 17:00, 21:00). Cada slot envía todas las cédulas "
+            "pendientes del día (sin tope; excluye LIQUIDADO/DESISTIMIENTO y ya enviadas). "
+            "Mismo envío que POST /notificaciones/recibos/ejecutar."
+        ),
+    )
+    ENABLE_RECIBOS_ENVIO_INMEDIATO_CARTERA: bool = Field(
+        default=False,
+        description=(
+            "Si True, cada alta/edición en cartera dispara Recibos en hilo (riesgo de sobrecarga SMTP). "
+            "Si False (defecto), envío automático solo por lotes RECIBOS_CRON_SLOTS y ejecución manual admin."
+        ),
+    )
+    RECIBOS_CRON_SLOTS: str = Field(
+        default="5:0,11:50,17:0,21:0",
+        description=(
+            "Únicos horarios Caracas (H:MM, coma) de lotes automáticos Recibos. "
+            "Defecto: 5:0,11:50,17:0,21:0 (= 05:00, 11:50, 17:00, 21:00) todos los días."
+        ),
+    )
+    RECIBOS_BATCH_MAX: int = Field(
+        default=100,
+        ge=1,
+        le=500,
+        description=(
+            "Tope opcional solo para ejecución manual admin (POST/UI); los crons RECIBOS_CRON_SLOTS "
+            "no aplican tope (todos los pendientes del día en cada horario)."
+        ),
+    )
+    RECIBOS_CRON_HOUR_START: int = Field(
+        default=6,
+        ge=0,
+        le=23,
+        description="LEGACY no usado por scheduler.py; usar RECIBOS_CRON_SLOTS.",
+    )
+    RECIBOS_CRON_HOUR_END: int = Field(
+        default=10,
+        ge=0,
+        le=23,
+        description="LEGACY no usado por scheduler.py; usar RECIBOS_CRON_SLOTS.",
+    )
+    RECIBOS_CRON_WEEKEND_HOUR_START: int = Field(
+        default=8,
+        ge=0,
+        le=23,
+        description="LEGACY no usado por scheduler.py; usar RECIBOS_CRON_SLOTS.",
+    )
+    RECIBOS_CRON_WEEKEND_HOUR_END: int = Field(
+        default=20,
+        ge=0,
+        le=23,
+        description="LEGACY no usado por scheduler.py; usar RECIBOS_CRON_SLOTS.",
+    )
+    RECIBOS_CRON_MINUTE: int = Field(
+        default=30,
+        ge=0,
+        le=59,
+        description="LEGACY no usado por scheduler.py; usar RECIBOS_CRON_SLOTS.",
+    )
+    ENABLE_COBRANZA_GESTORES_EMAIL_JOB: bool = Field(
+        default=True,
+        description=(
+            "Si True y ENABLE_AUTOMATIC_SCHEDULED_JOBS=True, cada dia a las 18:00 America/Caracas "
+            "envia las 9 listas Excel de gestores (recien regeneradas) a operaciones@rapicreditca.com "
+            "(BCC itmaster@rapicreditca.com) y guarda snapshot diario para el dashboard."
+        ),
+    )
+    COBRANZA_GESTORES_CATCHUP_DELAY_SEC: int = Field(
+        default=300,
+        ge=0,
+        le=3600,
+        description=(
+            "Segundos tras arrancar el scheduler antes del catch-up de email gestores (deploy/restart). "
+            "Evita competir con warm de caché dashboard y otros SMTP al inicio. 0 = inmediato (tests)."
+        ),
+    )
+    RECIBOS_FROM_EMAIL: str = Field(
+        default="",
+        description=(
+            'Remitente From opcional para Recibos. Vacio = From de la cuenta SMTP asignada (pagos@). '
+            'Solo definir si necesitas override explicito.'
+        ),
+    )
+    # Correo(s) para notificaciones de tickets CRM (varios separados por coma). Incluye tickets automáticos por recibo no claro (3 intentos).
+    TICKETS_NOTIFY_EMAIL: Optional[str] = Field(
+        default="notificaciones@rapicreditca.com",
+        description="Email(s) para notificar cuando se crea o actualiza un ticket (separados por coma). Por defecto notificaciones@rapicreditca.com."
+    )
+    # URL pública del frontend (para enlaces y logo en emails de cobranza). Ej: https://rapicredit.onrender.com/pagos
+    # Ruta al logo PNG para generar el PDF de carta de cobranza (adjunto al email). Opcional; si no existe se omite el logo en el PDF.
+    LOGO_PDF_COBRANZA_PATH: Optional[str] = Field(
+        None,
+        description="Ruta absoluta al archivo PNG del logo para el PDF de carta de cobranza.",
+    )
+    # Directorio base para el PDF fijo de cobranza. Si está definido, la ruta guardada en configuracion se resuelve dentro de este directorio (evita path traversal).
+    ADJUNTO_FIJO_COBRANZA_BASE_DIR: Optional[str] = Field(
+        None,
+        description="Directorio base donde se buscan los PDFs fijos de cobranza. La ruta en BD se interpreta como relativa a este directorio. Ej: /var/app/adjuntos_cobranza",
+    )
+    # Si True (defecto), no se envia correo de notificacion por cuota sin: plantilla email activa, PDF Carta_Cobranza valido y al menos un PDF fijo. Poner False solo en emergencia (.env).
+    NOTIFICACIONES_PAQUETE_ESTRICTO: bool = Field(
+        default=True,
+        description="Exige plantilla + PDF variable (carta) + PDF fijo antes de enviar notificaciones por pestaña",
+    )
+    # Si True: solo con destinos forzados (prueba de paquete) permite enviar aunque falte PDF fijo.
+    NOTIFICACIONES_PAQUETE_RELAX_SOLO_PRUEBA_DESTINO: bool = Field(
+        default=False,
+        description=(
+            'Relaja validacion de paquete solo para POST /enviar-prueba-paquete (destinos forzados). '
+            'Los envios masivos reales siguen sujetos a NOTIFICACIONES_PAQUETE_ESTRICTO.'
+        ),
+    )
+    NOTIF_SMTP_INTER_MESSAGE_SLEEP: float = Field(
+        default=1.25,
+        ge=0.25,
+        le=10.0,
+        description=(
+            "Segundos de espera entre correos en lote masivo de notificaciones "
+            "(reduce cierres SMTP de Gmail por rafagas de login)."
+        ),
+    )
+    # Cartera / liquidacion: si True, no marcar LIQUIDADO hasta cuadrar suma pagos operativos vs cuota_pagos (tol 0.02 USD, mismo criterio que auditoria).
+    LIQUIDACION_REQUIERE_CUADRE_PAGOS_VS_CUOTAS: bool = Field(
+        default=False,
+        description=(
+            "Si True: no marcar prestamo LIQUIDADO hasta que suma pagos operativos y suma aplicada en "
+            "cuota_pagos cuadren (0.02 USD). Por defecto False: basta cobertura de cuotas."
+        ),
+    )
+    # Pagos BS: si monto_pagado (en Bs.) >= este valor, no se exige cedula en cedulas_reportar_bs.
+    # Alinear operativamente con la heuristica de carga masiva (monto alto en Excel tratado como Bs.).
+    PAGOS_BS_MONTO_EXENTO_LISTA_CEDULA: int = Field(
+        default=10000,
+        ge=1,
+        le=999_999_999,
+        description=(
+            "Umbral en bolivares: pagos en BS con monto >= este valor omiten validacion de lista "
+            "cedulas_reportar_bs (sigue exigiendo cliente en BD y tasa)."
+        ),
+    )
+
+    # ============================================
+    # AI / OpenRouter (clave solo en backend, nunca en frontend)
+    # ============================================
+    OPENROUTER_API_KEY: Optional[str] = Field(
+        None,
+        description="API Key de OpenRouter. Configurar en variables de entorno del dashboard (Render, etc.). Nunca se expone al frontend."
+    )
+    OPENROUTER_MODEL: Optional[str] = Field(
+        default="openai/gpt-4o-mini",
+        description="Modelo por defecto para chat/completions. Ej: openai/gpt-4o-mini, google/gemini-2.0-flash-001, anthropic/claude-3-5-haiku"
+    )
+
+    # ============================================
+    # Redis (Cache)
+    # ============================================
+    REDIS_URL: Optional[str] = Field(
+        None,
+        description="URL de conexión a Redis (opcional)"
+    )
+    
+    # ============================================
+    # Sentry (Monitoreo)
+    # ============================================
+    SENTRY_DSN: Optional[str] = Field(
+        None,
+        description="DSN de Sentry para monitoreo (opcional)"
+    )
+    
+    # ============================================
+    # Google OAuth (Drive/Sheets cuando no hay cuenta de servicio)
+    # ============================================
+    BACKEND_PUBLIC_URL: Optional[str] = Field(
+        None,
+        description=(
+            "URL pública del backend para OAuth redirect_uri (ej. https://rapicredit.onrender.com). "
+            "También se usa para armar enlaces absolutos al comprobante guardado en BD tras el pipeline Gmail (columna Link en Excel)."
+        ),
+    )
+    FRONTEND_PUBLIC_URL: Optional[str] = Field(
+        None,
+        description=(
+            "URL pública única del frontend (SPA). Se usa para redirección OAuth Google "
+            "y para construir recursos públicos en correos/reportes. "
+            "Si no se define, se usa BACKEND_PUBLIC_URL (mismo origen)."
+        ),
+    )
+
+    # ============================================
+
+    # ============================================
+    # Gmail / Drive / Sheets / Gemini (pagos desde correo)
+    # ============================================
+    GOOGLE_CLIENT_ID: Optional[str] = Field(None, description="OAuth 2.0 Client ID para Gmail/Drive/Sheets")
+    GOOGLE_CLIENT_SECRET: Optional[str] = Field(None, description="OAuth 2.0 Client Secret")
+    GOOGLE_REDIRECT_URI: Optional[str] = Field(None, description="Redirect URI tras autorizar Gmail (ej. https://tu-backend/api/v1/pagos/gmail/callback)")
+    GMAIL_TOKENS_PATH: str = Field(default="gmail_tokens.json", description="Ruta al JSON con access/refresh tokens")
+    PERSISTENT_DATA_DIR: str = Field(
+        default="",
+        description=(
+            "Directorio persistente (p. ej. disco Render montado en /var/data). "
+            "Si está vacío y existe /var/data, se usa automáticamente. "
+            "Las rutas relativas de tokens cobranza@ se resuelven bajo este directorio."
+        ),
+    )
+    GMAIL_TOKENS_PATH_COBRANZA: str = Field(
+        default="gmail_tokens_cobranza.json",
+        description=(
+            "Tokens OAuth del buzón cobranza@ (Auditoría → Email). Separado de GMAIL_TOKENS_PATH "
+            "para poder correr en paralelo con Pagos Gmail. En Render use ruta absoluta en disco "
+            "(p. ej. /var/data/gmail_tokens_cobranza.json) o deje relativa + PERSISTENT_DATA_DIR."
+        ),
+    )
+    GMAIL_MAILBOX: str = Field(
+        default="cobranza@rapicreditca.com",
+        description="Buzón objetivo Auditoría → Email (perfil OAuth debe coincidir tras consent).",
+    )
+    AUDITORIA_EMAIL_GOOGLE_CLIENT_ID: Optional[str] = Field(
+        default=None,
+        description=(
+            "OAuth Client ID para cobranza@ (Auditoría → Email). Recomendado en Render "
+            "(cliente Web cobranzas …bitt…). Si falta, se usa el de Informe de pagos (BD) "
+            "cuando esté configurado."
+        ),
+    )
+    AUDITORIA_EMAIL_GOOGLE_CLIENT_SECRET: Optional[str] = Field(
+        default=None,
+        description=(
+            "OAuth Client Secret opcional en Render para cobranza@. Si el Client ID coincide "
+            "con Informe de pagos (BD), el secret de BD prevalece (Opción A: una sola fuente)."
+        ),
+    )
+    AUDITORIA_EMAIL_LABEL_ANALIZADOS: str = Field(
+        default="ANALIZADOS",
+        description="Etiqueta Gmail aplicada al terminar el proceso de cada mensaje re-escaneado.",
+    )
+    AUDITORIA_EMAIL_AUTO_ADVANCE_ENABLED: bool = Field(
+        default=True,
+        description=(
+            "Si True y ENABLE_AUTOMATIC_SCHEDULED_JOBS=True, el scheduler reanuda escaneos "
+            "Auditoría Email en paused con pageToken (sin depender del navegador)."
+        ),
+    )
+    AUDITORIA_EMAIL_AUTO_ADVANCE_INTERVAL_MINUTES: int = Field(
+        default=5,
+        ge=1,
+        le=60,
+        description="Minutos entre intentos de auto-avance de escaneos paused (Auditoría Email).",
+    )
+    AUDITORIA_EMAIL_AUTO_ADVANCE_MAX_LOTS: int = Field(
+        default=2,
+        ge=1,
+        le=3,
+        description="Lotes por corrida de auto-avance (mismo tope que advance_scan).",
+    )
+    GEMINI_API_KEY: Optional[str] = Field(None, description="API Key de Google AI Studio para Gemini")
+    GEMINI_MODEL: str = Field(
+        default="gemini-2.5-flash",
+        description="Modelo Gemini para extracción de datos. gemini-2.5-flash es la versión estable recomendada. Ver https://ai.google.dev/gemini-api/docs/models",
+    )
+    PAGOS_GMAIL_GEMINI_IMG_TRIM_WHITE: int = Field(
+        default=245,
+        ge=200,
+        le=254,
+        description=(
+            "Heurística PIL antes de Gemini (solo imágenes en pipeline Gmail): en escala de grises, píxeles con L "
+            "mayor o igual a este valor se tratan como 'margen claro' para el bbox de recorte suave. "
+            "Más alto = recorte más agresivo (riesgo de cortar papel tenue)."
+        ),
+    )
+    PAGOS_GMAIL_GEMINI_IMG_MIN_LONG_EDGE: int = Field(
+        default=1920,
+        ge=800,
+        le=4096,
+        description=(
+            "Si el lado largo del JPEG enviado a Gemini es menor, escala en subida (LANCZOS) hasta este borde largo "
+            "para mejorar OCR en modelos tipo flash/mini. Ajustar vía .env sin cambiar código."
+        ),
+    )
+    PAGOS_GMAIL_GEMINI_IMG_MAX_LONG_EDGE: int = Field(
+        default=3072,
+        ge=1024,
+        le=8192,
+        description=(
+            "Si el lado largo supera este valor, escala en bajada para limitar latencia y coste de API. "
+            "Si MIN_LONG_EDGE > MAX_LONG_EDGE en runtime, el código intercambia valores de forma defensiva."
+        ),
+    )
+    PAGOS_GMAIL_GEMINI_JPEG_QUALITY: int = Field(
+        default=92,
+        ge=75,
+        le=98,
+        description=(
+            "Calidad JPEG al normalizar imágenes antes de Gemini (pipeline Gmail y rutas que usan el mismo helper). "
+            "Valores más bajos reducen bytes y latencia; valores altos preservan detalle OCR. El código acota al rango 75–98."
+        ),
+    )
+    PAGOS_GMAIL_DOWNLOAD_EXCEL_MAX_ITEMS: int = Field(
+        default=0,
+        description="Máximo de filas al descargar Excel sin fecha (evita memoria/timeout). Con ?fecha= no aplica límite por día.",
+    )
+    PAGOS_GMAIL_SCHEDULED_SCAN_ENABLED: bool = Field(
+        default=True,
+        description=(
+            "Si True y ENABLE_AUTOMATIC_SCHEDULED_JOBS=True, el scheduler ejecuta el pipeline Gmail "
+            "America/Caracas en horarios fijos PAGOS_GMAIL_SCAN_SLOTS "
+            "(defecto 04:30, 08:00, 11:00, 16:30, 20:30); "
+            "solo correos inbox+media sin etiqueta de usuario (scan_filter=pending_identification). "
+            "Por defecto True junto al scheduler automatico; False: solo «Procesar manualmente»."
+        ),
+    )
+    PAGOS_GMAIL_SCAN_SLOTS: str = Field(
+        default="4:30,8:0,11:0,16:30,20:30",
+        description=(
+            "Horarios Caracas H:MM separados por coma para escaneo Gmail programado."
+        ),
+    )
+    ENABLE_BCV_WIDGET_TASA_JOB: bool = Field(
+        default=True,
+        description=(
+            "Si True y ENABLE_AUTOMATIC_SCHEDULED_JOBS=True, un bot lee el recuadro "
+            "EUR+USD de la portada BCV (GET lun-vie America/Caracas 05:00 y 05:30) "
+            "y guarda tasa_oficial (Euro) + tasa_bcv para HOY Caracas "
+            "(no usa la fecha valor futura del recuadro). "
+            "Si ese día ya tiene Euro y BCV, no vuelve a consultar. No usa proxies ni desactiva TLS; "
+            "si el WAF bloquea, el job falla y queda la carga manual."
+        ),
+    )
+    BCV_WIDGET_URL: str = Field(
+        default="https://www.bcv.org.ve/",
+        description="URL pública del recuadro de tasas BCV (un GET por corrida).",
+    )
+    BCV_WIDGET_TIMEOUT_SECONDS: int = Field(
+        default=25,
+        ge=5,
+        le=60,
+        description="Timeout en segundos del GET al recuadro BCV.",
+    )
+    PAGOS_GMAIL_UNREAD_MAX_PASSES: int = Field(
+        default=30,
+        ge=1,
+        le=100,
+        description=(
+            "Obsoleto: el pipeline ya no hace pasadas multiples por no leidos (unread/read/all listan inbox completo). "
+            "Se conserva por compatibilidad en .env; el codigo no lo usa."
+        ),
+    )
+    PAGOS_GMAIL_METADATA_BATCH_CHUNK: int = Field(
+        default=8,
+        ge=1,
+        le=50,
+        description=(
+            "Cantidad de messages.get (metadata) por BatchHttpRequest al listar Gmail. "
+            "Valores altos (p. ej. 50) provocan 429 «Too many concurrent requests for user»."
+        ),
+    )
+    PAGOS_GMAIL_METADATA_INTER_CHUNK_SLEEP_SEC: float = Field(
+        default=0.12,
+        ge=0.0,
+        le=2.0,
+        description="Pausa en segundos entre lotes consecutivos de metadata Gmail (amortigua concurrencia).",
+    )
+
+    # Google Sheet CONCILIACIÓN → BD (snapshot dom/mié 01:20; caché Clientes Drive lun-sab 04:05 si jobs automáticos)
+    CONCILIACION_SHEET_SPREADSHEET_ID: Optional[str] = Field(
+        default=None,
+        description="ID del documento (segmento entre /d/ e /edit en la URL de Google Sheets).",
+    )
+    CONCILIACION_SHEET_TAB_NAME: str = Field(
+        default="CONCILIACIÓN",
+        description="Nombre exacto de la pestaña a sincronizar.",
+    )
+    CONCILIACION_SHEET_HEADER_MARKER: str = Field(
+        default="LOTE",
+        description=(
+            "Texto exacto (sin distinguir mayúsculas) de la celda de título que marca la fila de cabecera. "
+            "Se busca en las primeras 26 columnas del rango leído y en las primeras 80 filas (p. ej. LOTE en B si A es numerador)."
+        ),
+    )
+    CONCILIACION_SHEET_SYNC_SECRET: Optional[str] = Field(
+        default=None,
+        description=(
+            "Secreto para POST /api/v1/conciliacion-sheet/sync (header X-Conciliacion-Sheet-Sync-Secret). "
+            "Cron externo (Render, etc.) alineado a jobs 01:00/02:00 America/Caracas, "
+            "o omitir si ENABLE_AUTOMATIC_SCHEDULED_JOBS=true."
+        ),
+    )
+    CONCILIACION_SHEET_COLUMNS_RANGE: str = Field(
+        default="A:S",
+        description=(
+            "Solo letras de columnas (ej. A:S). La lectura se ancla a fila 1 del sheet (A1:S en la API) "
+            "para no omitir filas iniciales vacías y alinear la fila del marcador LOTE."
+        ),
+    )
+    GMAIL_HTTP_TIMEOUT_SECONDS: int = Field(
+        default=120,
+        ge=10,
+        le=600,
+        description=(
+            "Timeout de socket (segundos) para la API de Gmail. Sin él una conexión "
+            "estancada cuelga el hilo del escaneo indefinidamente: conserva su candado, "
+            "deja de latir y ya no hay forma de reanudarlo sin reiniciar el proceso."
+        ),
+    )
+    CONCILIACION_SHEET_GOOGLE_HTTP_TIMEOUT_SECONDS: int = Field(
+        default=300,
+        ge=10,
+        le=600,
+        description=(
+            "Timeout de socket (segundos) para llamadas a Google Sheets API en sync/diagnóstico de conciliación. "
+            "Hojas grandes (muchas filas A:S en una sola values.get) pueden superar 120 s; subir con env si aún corta. "
+            "Evita workers colgados si Google no responde; si faltan httplib2/google_auth_httplib2, se usa el cliente por defecto."
+        ),
+    )
+    # Informe Aseguradora: Google Sheet de cedulas (misma logica CxC filtrada)
+    ASEGURADORA_SHEET_SPREADSHEET_ID: Optional[str] = Field(
+        default="1FEh7gMhCh4UD6_W5e5VnsWNsrOfGuILpxJ0CpWwDKVM",
+        description="ID Google Sheet con cedulas del universo Aseguradora.",
+    )
+    ASEGURADORA_SHEET_TAB_NAME: str = Field(
+        default="",
+        description="Pestana exacta; vacio = primera pestana del documento.",
+    )
+    ASEGURADORA_SHEET_COLUMNS_RANGE: str = Field(
+        default="A:B",
+        description="Rango de columnas a leer (solo se usa la columna Cedula).",
+    )
+
+    # Hoja Drive: actualizar Cuotas por cedula segun periodo (junio/julio, etc.)
+    CUOTAS_HOJA_PERIODO_SHEET_ID: Optional[str] = Field(
+        default="1Xu8RINcL1abpnjppeDIYhmb1wL60zmYYhJU2voP27d8",
+        description="ID Google Sheet Cedula/Cuotas a actualizar por periodo.",
+    )
+    CUOTAS_HOJA_PERIODO_TAB_NAME: str = Field(
+        default="",
+        description="Pestana exacta; vacio = primera pestana.",
+    )
+
+    # REPORTE cuotas jun-ago (Drive estatico D/E)
+    REPORTE_CUOTAS_JUN_AGO_SHEET_ID: Optional[str] = Field(
+        default="1_Qean5MoSc1vWy6hMAAqOcMJeZzn9iUspJTqsOqZEqs",
+        description="Google Sheet del REPORTE cuotas jun-ago (escribe D/E).",
+    )
+    REPORTE_CUOTAS_JUN_AGO_TAB_NAME: str = Field(
+        default="",
+        description="Pestana; vacio = primera pestana.",
+    )
+
+    # Tasa USD/Bs Venezuela (reporte contable)
+
+    # ============================================
+    TASA_USD_BS_DEFAULT: Optional[float] = Field(
+        None,
+        description="Tasa USD a Bolívares (Venezuela) por defecto cuando la API externa no responde. Si no se configura, se usa la tasa actual de exchangerate-api.com."
+    )
+    EXCHANGERATE_API_URL: str = Field(
+        default="https://api.exchangerate-api.com/v4/latest/USD",
+        description="URL para obtener tasa USD actual (gratuita, sin API key). Para tasas históricas por fecha, configurar BCV_API_KEY."
+    )
+
+    # ============================================
+    # CORS
+    # ============================================
+    CORS_ORIGINS: Optional[str] = Field(
+        default='["http://localhost:3000", "http://localhost:5173", "https://pagos-f2qf.onrender.com", "https://rapicredit.onrender.com"]',
+        description=(
+            "Orígenes permitidos CORS: JSON array o lista separada por comas (sin barra final; sin path). "
+            "Si el SPA y la API están en hosts distintos (ej. rapicredit.onrender.com/pagos → API pagos-f2qf.onrender.com), "
+            "debe figurar el origen del SPA. Si FRONTEND_PUBLIC_URL / BACKEND_PUBLIC_URL están definidos, su scheme+host "
+            "se añaden automáticamente a esta lista para reducir olvidos en Render."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _resolve_persistent_token_paths(self) -> "Settings":
+        """
+        En Render el FS es efímero: si hay disco en /var/data (o PERSISTENT_DATA_DIR),
+        las rutas relativas de tokens cobranza@ se anclan ahí para sobrevivir deploys.
+        """
+        root = (self.PERSISTENT_DATA_DIR or "").strip()
+        if not root:
+            for cand in ("/var/data",):
+                if os.path.isdir(cand):
+                    root = cand
+                    object.__setattr__(self, "PERSISTENT_DATA_DIR", root)
+                    break
+        path = (self.GMAIL_TOKENS_PATH_COBRANZA or "").strip() or "gmail_tokens_cobranza.json"
+        if root and not os.path.isabs(path):
+            object.__setattr__(
+                self,
+                "GMAIL_TOKENS_PATH_COBRANZA",
+                os.path.join(root, os.path.basename(path)),
+            )
+        return self
+
+    @property
+    def cors_origins_list(self) -> List[str]:
+        """Retorna CORS_ORIGINS como lista; añade orígenes deducidos de FRONTEND_PUBLIC_URL y BACKEND_PUBLIC_URL."""
+        from urllib.parse import urlparse
+
+        if not self.CORS_ORIGINS or self.CORS_ORIGINS.strip() == "":
+            base = [
+                "http://localhost:3000",
+                "http://localhost:5173",
+                "https://pagos-f2qf.onrender.com",
+                "https://rapicredit.onrender.com",
+            ]
+        else:
+            try:
+                parsed = json.loads(self.CORS_ORIGINS)
+                if isinstance(parsed, list):
+                    base = [str(x).strip() for x in parsed if str(x).strip()]
+                else:
+                    base = []
+            except json.JSONDecodeError:
+                base = [
+                    origin.strip()
+                    for origin in self.CORS_ORIGINS.split(",")
+                    if origin.strip()
+                ]
+
+        def _origin_from_public_url(raw: Optional[str]) -> Optional[str]:
+            s = (raw or "").strip()
+            if not s or "://" not in s:
+                return None
+            try:
+                p = urlparse(s)
+                if p.scheme and p.netloc:
+                    return f"{p.scheme}://{p.netloc}".rstrip("/")
+            except Exception:
+                return None
+            return None
+
+        seen: set = set()
+        out: List[str] = []
+        for o in base:
+            o = o.rstrip("/")
+            if o and o not in seen:
+                seen.add(o)
+                out.append(o)
+        for extra in (
+            _origin_from_public_url(getattr(self, "FRONTEND_PUBLIC_URL", None)),
+            _origin_from_public_url(getattr(self, "BACKEND_PUBLIC_URL", None)),
+        ):
+            if extra and extra not in seen:
+                seen.add(extra)
+                out.append(extra)
+        return out
+    
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=True,
+        extra="ignore",  # Ignorar variables extra del .env no definidas en Settings
+    )
+
+
+# Instancia global de settings
+settings = Settings()
+
+
+def get_effective_api_public_base_url() -> str:
+    """
+    URL pública del API sin barra final (p. ej. https://servicio.onrender.com), para enlaces en PDF
+    y columnas Excel cuando no hay objeto Request.
+
+    Orden: ``BACKEND_PUBLIC_URL``; si falta, el origen (scheme + host) de ``FRONTEND_PUBLIC_URL``;
+    si falta, el de ``GOOGLE_REDIRECT_URI`` (suele apuntar al mismo host en Render).
+
+    Si el front y el back viven en hosts distintos, defina siempre ``BACKEND_PUBLIC_URL``.
+    """
+    from urllib.parse import urlparse
+
+    bu = (getattr(settings, "BACKEND_PUBLIC_URL", None) or "").strip().rstrip("/")
+    if bu:
+        return bu
+
+    for raw in (
+        getattr(settings, "FRONTEND_PUBLIC_URL", None) or "",
+        getattr(settings, "GOOGLE_REDIRECT_URI", None) or "",
+    ):
+        s = raw.strip()
+        if not s:
+            continue
+        if "://" not in s:
+            s = "https://" + s.lstrip("/")
+        try:
+            p = urlparse(s)
+            if p.scheme and p.netloc:
+                return f"{p.scheme}://{p.netloc}".rstrip("/")
+        except Exception:
+            continue
+
+    return ""

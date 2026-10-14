@@ -1,0 +1,1788 @@
+"""Parsing shared by every confirmed-nominee adapter (see
+state_candidates.py). Each state vendor publishes a different envelope —
+Clarity's JSON, a bulk delimited results export, Civix's REST API — but
+once a contest is reduced to (label, choices, votes) the questions are
+identical: which federal office is this, which party's primary, who won,
+and is it safe to say so.
+
+Keeping these here is what stops "one adapter per vendor" from decaying
+into "one parser per state": a new state on a known vendor is a config
+entry, and a new VENDOR only has to supply the envelope, not re-derive how
+a district number or a runoff threshold works.
+
+Every label pattern below is taken from a real, live-fetched feed, never
+invented:
+  Clarity/CO  "Representative to the 120th United States Congress - District 1 - Democratic Party"
+  Clarity/CO  "United States Senator - Democratic Party"
+  NCSBE/NC    "US HOUSE OF REPRESENTATIVES DISTRICT 01 (REP)"
+  NCSBE/NC    "US SENATE (DEM)"
+"""
+
+import json
+import logging
+import pathlib
+import re
+from collections.abc import Callable
+from datetime import date, timedelta
+from urllib.parse import urljoin
+
+from app.pipeline.fetch.fec import general_election_day
+from app.pipeline.fetch.http_utils import fetch_text_with_retry
+from app.time_utils import utcnow
+
+logger = logging.getLogger(__name__)
+
+# Chamber wording varies ("United States Congress", "US HOUSE OF
+# REPRESENTATIVES", "U.S. Representative", Tennessee's certified list's
+# "United States House of Representatives District 1", Arkansas's real "U.S. Congress
+# District 02", Vermont's real bare "REPRESENTATIVE TO CONGRESS" — no
+# "U.S."/"United States" prefix, "to" not "in"); the ordinal in Colorado's
+# label advances every Congress, so nothing cycle-specific is matched.
+# The word "Congress" is itself decisive — no state legislature is called
+# one, so "Representative in/to Congress" (Florida/Vermont), "1ST
+# CONGRESS" (Illinois) and the bare abbreviated "U.S. Congress" (Arkansas)
+# are safe to recognise, while a bare "House of Representatives" is NOT
+# and must keep being refused (it is a state chamber's name in most
+# states; see office_from_columns for how a state that publishes only
+# that label is handled). Every "Congress" alternative carries its own
+# \b: without it, "Congress" matches as a substring of "Congressional"/
+# "Congressman" too (a common county-export convention groups a LOCAL
+# race under its containing congressional district, e.g. "U.S.
+# Congressional District 3 County Commissioner"), which would misread
+# that county race as a real federal contest.
+_CHAMBER_HOUSE = (
+    r"(?:United\s+States\s+(?:Congress\b|Representative|House\b)"
+    r"|U\.?\s*S\.?\s*(?:House|Representative|Congress\b)"
+    r"|(?:Representative\s+(?:in|to)\s+|\d+(?:st|nd|rd|th)\s+)Congress\b)"
+)
+# Both orders occur live: "District 5" (most states) and "5th District"
+# / "1ST CONGRESS" (Florida's and Illinois' own labels). Arizona's own
+# canvass export inserts "No." ("District No.  1", double space and all).
+_HOUSE_DISTRICT_RE = re.compile(
+    rf"{_CHAMBER_HOUSE}.*?District\s+(?:No\.?\s*)?0*(\d+)", re.IGNORECASE | re.DOTALL,
+)
+_HOUSE_ORDINAL_RE = re.compile(
+    rf"(?:0*(\d+)(?:st|nd|rd|th)\s+(?:District|Congress)|{_CHAMBER_HOUSE}[^\d]*0*(\d+)(?:st|nd|rd|th))",
+    re.IGNORECASE | re.DOTALL,
+)
+_HOUSE_RE = re.compile(_CHAMBER_HOUSE, re.IGNORECASE)
+# Hawaii numbers its congressional districts in Roman numerals ("U.S.
+# Representative, Dist I"). Bounded to I-XX: a state has no more than 52
+# districts and nothing beyond that is worth guessing at.
+_ROMAN = {
+    "I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7, "VIII": 8,
+    "IX": 9, "X": 10, "XI": 11, "XII": 12, "XIII": 13, "XIV": 14, "XV": 15,
+    "XVI": 16, "XVII": 17, "XVIII": 18, "XIX": 19, "XX": 20,
+}
+_HOUSE_ROMAN_RE = re.compile(
+    r"Dist(?:rict)?\.?\s+([IVX]{1,5})\b", re.IGNORECASE,
+)
+# "Senator" (Colorado) and "Senate" (North Carolina) both appear live.
+# "Senator in Congress" (Rhode Island's own label) carries no "U.S."
+# prefix at all, so it needs its own arm -- the mirror of the
+# "Representative in/to Congress" arm _CHAMBER_HOUSE already has, and
+# safe for the same reason: no STATE chamber is named "Congress", so
+# "in Congress" is only ever federal. This must stay narrow: a bare
+# "Senator, District 5" is a state-senate seat in most states and must
+# keep parsing as None (Rhode Island's own ballot proves the risk --
+# its legislature is literally the "General Assembly", whose seats are
+# labelled "Senator in General Assembly District 5").
+_SENATE_RE = re.compile(
+    r"(?:(?:United\s+States|U\.?\s*S\.?)\s*Senat(?:e|or)"
+    r"|Senator\s+(?:in|to)\s+Congress\b)", re.IGNORECASE,
+)
+
+# Spelled-out names and the states' own abbreviations both occur; the
+# shared matcher in state_candidates.py speaks single-letter codes.
+_PARTY_PATTERNS = [
+    # Two states don't call their Democrats Democrats on the ballot:
+    # Minnesota's party is the Democratic-Farmer-Labor (DFL) and North
+    # Dakota's the Democratic-NPL. Both are the state Democratic party. FEC
+    # files some of their candidates as DEM and some under the state code
+    # (DFL, DNL: members of one state's delegation are filed both ways),
+    # so FEC's side is read through fec_party (FEC_PARTY_ALIASES).
+    (re.compile(r"\b(?:democratic|democrat|dem|dfl|d-npl|dnl|npl)\b", re.IGNORECASE), "D"),
+    (re.compile(r"\b(?:republican|rep|gop)\b", re.IGNORECASE), "R"),
+    # Arizona's own 3-letter codes ("LBT", "GRN") and Wyoming's "LBR" don't
+    # share a root with "lib"/"gre" — verified live off each state's export.
+    # Florida's Division of Elections codes its state affiliates LPF
+    # (Libertarian Party of Florida) and CPF (Constitution Party of
+    # Florida) -- its 2026 general candidate list, read live 2026-09-28.
+    (re.compile(r"\b(?:libertarian|lib|lbt|lbr|lpf)\b", re.IGNORECASE), "L"),
+    (re.compile(r"\b(?:green|gre|grn)\b", re.IGNORECASE), "G"),
+    (re.compile(r"\b(?:constitution|con|cst|cpf)\b", re.IGNORECASE), "C"),
+    # South Carolina's United Citizens Party, which fields statewide and
+    # legislative nominees on its 2026 general ballot. Spelled out only:
+    # no abbreviation of it is safe inside a longer label.
+    (re.compile(r"\bunited\s+citizens?\b", re.IGNORECASE), "U"),
+]
+
+# Codes read only as a party column's WHOLE value (see normalize_party).
+# Wyoming writes Constitution as "CT", which inside a longer label would be
+# Connecticut.
+_WHOLE_VALUE_PARTIES = {"D": "D", "R": "R", "L": "L", "G": "G", "C": "C", "CT": "C"}
+
+# Generational suffixes must not be mistaken for a surname.
+_NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
+
+# Ballot annotations that are never part of a legal name: a parenthetical
+# (Georgia's "(I)" incumbency marker), a bare asterisk (Rhode Island's
+# party-endorsement marker) or the word itself (Alaska's "Sullivan, Dan S.
+# Incumbent", Florida's "*Incumbent"). See surname().
+_ANNOTATION_RE = re.compile(r"\([^)]*\)|\*|(?i:\bincumbent\b)")
+# The same, for a name shown as printed: a parenthetical with more of the
+# name after it is the nickname the ballot prints ("Tobias (Toby) Doe" --
+# North Carolina's and Colorado's lists), not a marker beside the name, so
+# only a trailing one is an annotation. surname() still drops both. A
+# withdrawal is the one marker kept: "Jane Doe (Withdrawn)" is a candidate
+# who left the race too late to leave the ballot, and shown as plain "Jane
+# Doe" a live count read as an active candidate's -- leading, if they led.
+_DISPLAY_ANNOTATION_RE = re.compile(r"\((?!\s*(?i:withdr))[^)]*\)(?!\s*[^\W\d_])|\*|(?i:\bincumbent\b)")
+WITHDRAWN_MARK_RE = re.compile(r"\(\s*withdr[a-z]*\s*\)", re.IGNORECASE)
+
+
+def parse_office(contest_name: str) -> tuple[str, int | None] | None:
+    """("S", None) / ("H", 3) / ("H", None) for an at-large seat, or None
+    for anything not positively recognised as a federal contest — a state
+    legislative or judicial race must never be guessed into a federal one.
+
+    A House label carrying no district number is an at-large seat (AK, DE,
+    MT, ND, SD, VT, WY); FEC models those as district 0, which
+    state_candidates._race_id_for already falls back to.
+    """
+    name = contest_name or ""
+    if _SENATE_RE.search(name):
+        return "S", None
+    if _HOUSE_RE.search(name):
+        roman = _HOUSE_ROMAN_RE.search(name)
+        if roman and roman.group(1).upper() in _ROMAN:
+            return "H", _ROMAN[roman.group(1).upper()]
+        # An ordinal district only counts once the label is already known
+        # to be federal — "5th District" alone says nothing about which
+        # chamber it belongs to.
+        m = _HOUSE_ORDINAL_RE.search(name)
+        if m:
+            return "H", int(m.group(1) or m.group(2))
+    m = _HOUSE_DISTRICT_RE.search(name)
+    if m:
+        return "H", int(m.group(1))
+    if _HOUSE_RE.search(name):
+        return "H", None
+    return None
+
+
+# ── Statewide executive offices ──────────────────────────────────────
+#
+# A deliberately SHORT list of offices whose names are unambiguous
+# statewide once a locality qualifier is ruled out. These have no FEC
+# counterpart (no federal filing, no campaign-finance rows, no
+# Representation Score), so they are stored and rendered separately from
+# Race/Candidate — see models.StatewideNominee.
+#
+# The risk here is the mirror of parse_office's: where that must not read
+# a STATE legislative seat as federal, this must not read a COUNTY or
+# MUNICIPAL office as statewide. "County Treasurer" and "District
+# Attorney" both contain a statewide office's words, and the colon form
+# is this vendor's own real convention for a one-town contest -- Rhode
+# Island's live ballot carries "DEM Cranston: City Council Ward 1",
+# "DEM Providence: Mayor" and "Woonsocket: Non-Partisan Mayor".
+# _LOCAL_QUALIFIER_RE refuses all of them outright rather than trying to
+# rank which reading is more likely.
+_STATEWIDE_OFFICES = [
+    ("governor", re.compile(r"\bgovernor\b", re.IGNORECASE)),
+    ("attorney_general", re.compile(r"\battorney\s+general\b", re.IGNORECASE)),
+    # Connecticut's officer is the Secretary "of the State".
+    ("secretary_of_state", re.compile(r"\bsecretary\s+of\s+(?:the\s+)?state\b", re.IGNORECASE)),
+    # Bare "Treasurer" is a county/city office in most states; only the
+    # qualified statewide forms count.
+    ("treasurer", re.compile(r"\b(?:general|state)\s+treasurer\b", re.IGNORECASE)),
+    # Same rule, same reason: Minnesota's own ballot carries both "State
+    # Auditor" (statewide, elected) and "County Auditor/Treasurer" (not).
+    # The locality gate already refuses the county one; requiring the
+    # qualifier means a state that prints a bare "Auditor" for a county
+    # office cannot slip through either.
+    # Nebraska's own name for the office is "Auditor of Public
+    # Accounts" -- specific enough to stand without a "state" qualifier,
+    # since no county calls its auditor that. Vermont's is the "Auditor of
+    # Accounts" (its 2026 primary and general reports), on the same terms:
+    # a Vermont town's auditors are "Town Auditor", and the locality gate
+    # refuses those first. Massachusetts's results archive prints a bare
+    # "Auditor" and states its scope in its own District column,
+    # "Statewide" -- the qualifier the adapter carries into the label
+    # (state_candidates_ma).
+    ("auditor", re.compile(
+        r"\b(?:state|statewide|general)\s+auditor\b"
+        r"|\bAuditor\s+of\s+(?:(?:Public\s+)?Accounts|State|the\s+Commonwealth)\b",
+        re.IGNORECASE)),
+    # Pennsylvania's title, word order reversed ("Auditor General"); on
+    # its 2028 ballot, not 2026's, but its adapter reads every office.
+    ("auditor", re.compile(r"\bAuditor\s+General\b", re.IGNORECASE)),
+    # Idaho's own constitutional officer. Qualified like the two above,
+    # because a county can have a controller too.
+    ("controller", re.compile(r"\bstate\s+controller\b", re.IGNORECASE)),
+    # The same role under the name most other states give it.
+    ("comptroller", re.compile(r"\b(?:state\s+)?comptroller\b", re.IGNORECASE)),
+    # LAST RESORT, and only ever reached by a label the locality gate
+    # already cleared. California prints its statewide officers as a
+    # bare "Treasurer" and "Controller" with nothing else in the label;
+    # a county or municipal one carries its locality ("County
+    # Treasurer", "Cranston: Treasurer") and was refused well before
+    # this point. The qualified arms above still match first, so a state
+    # that spells the office out is unaffected.
+    ("treasurer", re.compile(r"\btreasurer\b", re.IGNORECASE)),
+    ("controller", re.compile(r"\bcontroller\b", re.IGNORECASE)),
+]
+
+_LT_GOVERNOR_RE = re.compile(r"\b(?:lieutenant|lt\.?)\s+governor\b", re.IGNORECASE)
+
+# Offices whose FULL PHRASE is statewide by construction, checked BEFORE
+# the locality gate because that gate would otherwise refuse them on a
+# word it is right to distrust in general.
+#
+# "Commissioner of Insurance" is refused by _LOCAL_QUALIFIER_RE on
+# "commissioner", which exists to stop Minnesota's "County Commissioner
+# District 1"; "State School Superintendent" is refused on "school",
+# which exists to stop Rhode Island's "School Committee". Both of those
+# gates are correct and both must stay — so these phrases get their own
+# pass, and are still refused when the label carries a real locality
+# marker, since a "County School Superintendent" is a county office.
+#
+# Every phrase here is a real label off Georgia's 2026 primary, where
+# four genuine statewide constitutional offices were being missed.
+_STATEWIDE_PHRASES = [
+    ("insurance_commissioner", re.compile(
+        r"\bCommissioner\s+of\s+Insurance\b|\bInsurance\s+Commissioner\b", re.IGNORECASE)),
+    # Iowa calls its agriculture officer a Secretary, not a Commissioner.
+    ("agriculture_commissioner", re.compile(
+        r"\bCommissioner\s+of\s+Agriculture\b|\bAgriculture\s+Commissioner\b"
+        r"|\bSecretary\s+of\s+Agriculture\b", re.IGNORECASE)),
+    # Oregon's is "Commissioner of the Bureau of Labor and Industries"
+    # (BOLI), off its 2026 primary Abstract of Votes.
+    ("labor_commissioner", re.compile(
+        r"\bCommissioner\s+of\s+Labor\b|\bLabor\s+Commissioner\b"
+        r"|\bCommissioner\s+of\s+the\s+Bureau\s+of\s+Labor\b", re.IGNORECASE)),
+    ("school_superintendent", re.compile(
+        r"\bState\s+School\s+Superintendent\b"
+        r"|\bSuperintendent\s+of\s+Public\s+Instruction\b", re.IGNORECASE)),
+    # Georgia prints the bare initialism; spelled out elsewhere.
+    ("public_service_commission", re.compile(
+        r"\bPSC\b|\bPublic\s+Service\s+Commission(?:er)?\b", re.IGNORECASE)),
+    # Florida's fourth cabinet officer.
+    ("chief_financial_officer", re.compile(
+        r"\bChief\s+Financial\s+Officer\b", re.IGNORECASE)),
+    # Both of these carry a district and would otherwise be refused by
+    # the general locality gate, same as the PSC.
+    ("board_of_equalization", re.compile(
+        r"\bBoard\s+of\s+Equalization\b", re.IGNORECASE)),
+    # "State" is required: a COUNTY board of education is a local office,
+    # and North Carolina's export is full of them.
+    ("state_board_of_education", re.compile(
+        r"\bState\s+Board\s+of\s+Education\b", re.IGNORECASE)),
+    # Nebraska's list prints its elected regents as "University of
+    # Nebraska Board of Regents" (seated by district, like Colorado's).
+    ("university_regent", re.compile(
+        r"\bRegent\s+of\s+the\s+University\b|\bUniversity\s+Regent\b"
+        r"|\bUniversity\s+of\s+[A-Za-z]+\s+Board\s+of\s+Regents\b", re.IGNORECASE)),
+    # North Dakota's own constitutional officer.
+    ("tax_commissioner", re.compile(
+        r"\bTax\s+Commissioner\b|\bCommissioner\s+of\s+Taxation\b", re.IGNORECASE)),
+    # Arkansas's, which it abbreviates as "Comm. of State Lands".
+    ("state_lands_commissioner", re.compile(
+        r"\bComm(?:issioner)?\.?\s+of\s+State\s+Lands\b"
+        r"|\bState\s+Lands\s+Commissioner\b", re.IGNORECASE)),
+    # South Dakota's two, off its 2026 certified candidate list.
+    ("school_public_lands_commissioner", re.compile(
+        r"\bCommissioner\s+of\s+School\s+and\s+Public\s+Lands\b", re.IGNORECASE)),
+    ("public_utilities_commission", re.compile(
+        r"\bPublic\s+Utilities\s+Commission(?:er)?\b", re.IGNORECASE)),
+    # South Carolina's name for its schools chief, off its 2026 VREMS
+    # candidate list. A separate entry rather than a third arm on the one
+    # above, so the two states' wordings stay independently legible.
+    ("school_superintendent", re.compile(
+        r"\bState\s+Superintendent\s+of\s+Education\b", re.IGNORECASE)),
+    # Texas's two, off its 2026 Civix general-election list. Both are
+    # refused by the locality gate on "commissioner" otherwise.
+    ("railroad_commissioner", re.compile(
+        r"\bRailroad\s+Commission(?:er)?\b", re.IGNORECASE)),
+    # Oklahoma's Corporation Commission (its utilities and oil-and-gas
+    # regulator), off its 2026 November List of Elections: three
+    # commissioners elected statewide to staggered six-year terms (Okla.
+    # Const. art. IX sec. 15). Refused by the locality gate on
+    # "commissioner" otherwise.
+    ("corporation_commissioner", re.compile(
+        r"\bCorporation\s+Commission(?:er)?\b", re.IGNORECASE)),
+    ("land_office_commissioner", re.compile(
+        r"\bCommissioner\s+of\s+the\s+General\s+Land\s+Office\b", re.IGNORECASE)),
+    # New Mexico's land office, off its 2026 general candidate list. Not
+    # South Dakota's "Commissioner of School and Public Lands" above, which
+    # this cannot match ("School and" sits between the words).
+    ("public_lands_commissioner", re.compile(
+        r"\bCommissioner\s+of\s+Public\s+Lands\b", re.IGNORECASE)),
+    # Massachusetts's two, off its 2026 PD43+ primary archive. The
+    # Commonwealth's Secretary is its secretary of state under the name
+    # the state uses (so is Pennsylvania's, Kentucky's and Virginia's);
+    # the Governor's Council is an eight-member elected body seated by
+    # district (Mass. Const. amend. art. 16), and names the governor
+    # without being the governor's race -- which is why it is a phrase
+    # here, matched before the bare "governor" arm can see it.
+    ("secretary_of_commonwealth", re.compile(
+        r"\bSecretary\s+of\s+the\s+Commonwealth\b", re.IGNORECASE)),
+    ("governors_council", re.compile(
+        r"\bGovernor(?:'|\u2019)?s\s+Council\b", re.IGNORECASE)),
+    # New Hampshire's Executive Council, five councillors, one per
+    # district (N.H. Const. Pt. II Art. 60), off its 2026 primary pages
+    # ("Executive Council District 1"). Only with the district that seats
+    # it: a party's own "executive council" is a committee, not an office.
+    ("executive_council", re.compile(
+        r"\bExecutive\s+Council(?:l?or)?\b(?=[\s,\u2013-]*District\b)", re.IGNORECASE)),
+    # New Mexico's Public Education Commission, ten commissioners, one
+    # per district (N.M. Const. art. XII sec. 6), off its 2026 general
+    # candidate list ("Public Education Commissioner", "DISTRICT 3").
+    ("public_education_commission", re.compile(
+        r"\bPublic\s+Education\s+Commission(?:er)?\b", re.IGNORECASE)),
+]
+
+# The locality markers that stay decisive even beside one of the phrases
+# above — deliberately much narrower than _LOCAL_QUALIFIER_RE, which
+# also distrusts office words like "commissioner" and "school".
+# A handful of statewide bodies seat their members BY DISTRICT while
+# electing them statewide — Georgia's Public Service Commission is
+# elected by the whole state, but a commissioner must reside in the
+# district whose seat they hold. They are statewide offices with a seat
+# number, which is why StatewideNominee carries an optional district:
+# without it, "PSC - District 3" and "PSC - District 5" are one office
+# and the second overwrites the first.
+_STATEWIDE_DISTRICT_SEATS = {
+    "public_service_commission",
+    # California seats its Board of Equalization by district, and
+    # Utah its State Board of Education, exactly as Georgia does
+    # the PSC: elected statewide, held for a district.
+    "board_of_equalization",
+    "state_board_of_education",
+    # Colorado elects its university regents statewide, one per
+    # CONGRESSIONAL district — a seat number that has nothing to do with
+    # any legislative map.
+    "university_regent",
+    # Massachusetts's Governor's Council, eight councillors, one per
+    # council district (each elected by that district's voters).
+    "governors_council",
+    # Likewise New Hampshire's Executive Council (five districts) and New
+    # Mexico's Public Education Commission (ten).
+    "executive_council",
+    "public_education_commission",
+}
+
+# Massachusetts puts the ordinal first: "Governor's Council 3rd District".
+_STATEWIDE_SEAT_RE = re.compile(
+    r"\bDistrict\s+(?:No\.?\s*)?0*(\d+)\b|\b0*(\d+)(?:st|nd|rd|th)\s+District\b", re.IGNORECASE)
+
+# Alabama numbers its two associate Public Service Commission seats as
+# PLACES ("PUBLIC SERVICE COMMISSION, PLACE 1"), not districts: both are
+# elected statewide with no residency district at all. The seat is kept
+# with its own word ("Place 1") so the page never labels it a district.
+_STATEWIDE_PLACE_RE = re.compile(r"\bPlace\s+(?:No\.?\s*)?0*(\d+)\b", re.IGNORECASE)
+
+# Ballot-question vocabulary in a contest label: New Mexico's
+# "Constitutional Amendment 1" and Louisiana's "CA No. 4" both mention the
+# governor.
+_BALLOT_QUESTION_RE = re.compile(
+    r"\b(?:amendment|proposition|referendum|initiative|question|measure|bond\s+issue)\b"
+    r"|\bC\.?\s?A\.?\s+No\b",
+    re.IGNORECASE,
+)
+
+# "Public Service District" is a special-purpose LOCAL district (South
+# Carolina, West Virginia) — and South Carolina's 2026 list names one
+# "Public Service District, Fripp Island Public Service Commission", which
+# the statewide PSC phrase would otherwise read as Georgia's PSC.
+_STRICT_LOCAL_RE = re.compile(
+    r"\b(?:county|city|town|township|ward|borough|parish|village|precinct|municipal)\b"
+    r"|\bpublic\s+service\s+district\b|:",
+    re.IGNORECASE,
+)
+
+# Special-purpose local bodies, which elect commissions under the same
+# words the phrases above look for: "Sanitary District Public Utilities
+# Commission", "Hospital District Board of Equalization", a port or
+# transit "Authority". A "District" followed by a number is a seat and
+# stays readable ("PSC - District 3"); a district that is itself the
+# body -- named by what it provides -- is local wherever it appears.
+_SPECIAL_DISTRICT_RE = re.compile(
+    r"\b(?:sanitary|sanitation|water|sewer|fire|hospital|utility|school|park|library|port"
+    r"|irrigation|drainage|conservation|transit|improvement|cemetery|levee|metropolitan"
+    r"|special|service)\s+district\b|\bauthority\b",
+    re.IGNORECASE,
+)
+
+# The only words that may come BEFORE one of the phrases above. A phrase
+# is statewide by construction only as the name of the office itself; a
+# word in front of it names whose office it is -- "Hibbing Public
+# Utilities Commissioner" (a Minnesota city utility), "Fulton Tax
+# Commissioner" (a Georgia county office), "Fripp Island Public Service
+# Commission" -- and no list of localities could name every town. So
+# the prefix is refused unless it is made only of these, a party (the
+# "REP State Board of Education District 3" form), or numbers and
+# punctuation. Every prefix on a real label read so far is here:
+# California's "Member, State Board of Equalization", Massachusetts's
+# "Statewide" scope carried in by its adapter.
+_PHRASE_PREFIX_WORDS = frozenset({"member", "state", "statewide", "for", "of", "the", "office"})
+
+
+def _phrase_leads(name: str, start: int) -> bool:
+    """Whether the words before a statewide phrase (at `start` in `name`)
+    leave it naming the state's own office: see _PHRASE_PREFIX_WORDS."""
+    if _SPECIAL_DISTRICT_RE.search(name):
+        return False
+    for word in re.findall(r"[A-Za-z]+", name[:start]):
+        if word.lower() in _PHRASE_PREFIX_WORDS or normalize_party(word) is not None:
+            continue
+        return False
+    return True
+
+
+_LOCAL_QUALIFIER_RE = re.compile(
+    r"\b(?:county|city|town|township|ward|borough|parish|village|precinct|district|"
+    r"municipal|school|council|mayor|alderman|commissioner|judge|justice|court|"
+    r"assembly|senate|house|representative|senator|committee|delegate|"
+    # A university's own board, whatever it calls its members: Michigan
+    # elects "Governor of Wayne State University" and "Trustee of
+    # Michigan State University" statewide, and neither is the governor.
+    # (Regents are read by their own phrase, which runs first.)
+    r"university|college|trustees?)\b"
+    r"|:",  # "Cranston: ..." -- a real vendor prefix marking one town's race
+    re.IGNORECASE,
+)
+
+# A state's own party lettering (mostly single-letter) doesn't match FEC's
+# 3-letter codes. Used two ways, and it has to be the same map for both:
+# as a tiebreaker among same-surname candidates in one federal race, and
+# to render a statewide nominee's party through the very same
+# majorPartyOf() the frontend already applies to every federal candidate.
+PARTY_CODE_MAP = {
+    "R": "REP", "D": "DEM", "L": "LIB", "G": "GRE", "I": "IND", "C": "CON",
+    # FEC's own code for the United Citizen party (party-code table).
+    "U": "UC",
+    # FEC's PRO, "Progressive Party" -- Vermont's Progressive Party, which
+    # fields statewide nominees on its 2026 general ballot. Read only from
+    # a certified ballot list (_BALLOT_LIST_PARTY_PATTERNS): Vermont's
+    # Progressive PRIMARY is write-in noise that must stay unread.
+    "P": "PRO",
+}
+
+# The code a certified ballot list's party is stored under when the list
+# prints a party this vocabulary cannot name -- Vermont's "FREEDOM AND
+# UNITY", South Carolina's "Workers", neither of which has an FEC code
+# either. Deliberately NOT in PARTY_CODE_MAP: it names no party, so it
+# must never take part in matching a federal candidate by party, and
+# every row stored under it carries the party as the state printed it
+# (`party_label`) -- that label, not this code, is what the page shows.
+# Distinct from "" (no party printed at all, as on a non-partisan
+# legislative seat), so the two cannot be confused in the unique keys.
+OTHER_PARTY = "O"
+# FEC's own code for "Other", sent to the page for OTHER_PARTY rows so
+# its party vocabulary stays FEC's (see state_nominee_party).
+OTHER_PARTY_FEC = "OTH"
+# A state-office candidate the list itself calls non-partisan (North
+# Dakota's Superintendent of Public Instruction, elected on the no-party
+# ballot; Alaska's and Hawaii's "Nonpartisan" candidates). NOT an
+# independent: "IND" beside a non-partisan contest's candidates is a wrong
+# fact on a ballot page. Stored with the list's own word as party_label,
+# and sent as FEC's own code for "Nonpartisan", N. Like OTHER_PARTY it is
+# deliberately not in PARTY_CODE_MAP, so federal matching never sees it
+# (a federal row still reads "Nonpartisan" as independent, as it always
+# has).
+NONPARTISAN = "N"
+NONPARTISAN_FEC = "N"
+# The codes whose rows carry the printed party as their label.
+LABELLED_PARTIES = frozenset({OTHER_PARTY, NONPARTISAN})
+
+
+def state_nominee_party(code: str | None) -> str:
+    """The party a state-office nominee's stored code is sent to the page
+    as: FEC's 3-letter code, OTH for OTHER_PARTY and N for NONPARTISAN
+    (whose printed label goes beside them), and a code the map does not
+    know as itself."""
+    if code == OTHER_PARTY:
+        return OTHER_PARTY_FEC
+    if code == NONPARTISAN:
+        return NONPARTISAN_FEC
+    return PARTY_CODE_MAP.get(code or "", code or "")
+
+# FEC's own party codes that name one of PARTY_CODE_MAP's parties under
+# another code — a data-format translation of FEC's published party-code
+# table (https://www.fec.gov/campaign-finance-data/party-code-descriptions/),
+# not a classification. DFL and DNL are the Minnesota and North Dakota
+# Democratic parties. NPA ("No Party Affiliation"), UN ("Unaffiliated"),
+# NNE ("None"), NOP ("No Party Preference", CA and WA) and NON
+# ("Non-Party") are no-party codes, which a state's list prints as
+# independent. UST is the U.S. Taxpayers Party, the Constitution Party's
+# former name and still some state affiliates' label. Not CRV: that is the
+# Conservative Party, a different party from CON (Constitution).
+# The single source of this list: the elections API sends each
+# candidate's translated party as `partyGroup`, and the page reads that.
+FEC_PARTY_ALIASES = {
+    "DFL": "DEM", "DNL": "DEM",
+    "NPA": "IND", "UN": "IND", "NNE": "IND", "NOP": "IND", "NON": "IND",
+    "UST": "CON",
+}
+
+
+def fec_party(code: str | None) -> str | None:
+    """An FEC party code as the party PARTY_CODE_MAP names — so a
+    Minnesota DFL nominee reads as the Democrat the state's list says."""
+    return FEC_PARTY_ALIASES.get(code or "", code) if code else code
+
+
+_FEC_PARTY_CODES_PATH = pathlib.Path(__file__).resolve().parents[2] / "data" / "fec_party_codes.json"
+_fec_party_codes: dict[str, str] | None = None
+
+
+def fec_party_label(code: str | None) -> str | None:
+    """What an FEC party code names, from the FEC's own table
+    (app/data/fec_party_codes.json, scripts/fetch_fec_party_codes.py): "TX"
+    is the Taxpayers party. None for a code the table doesn't define —
+    one a filer typed ("08", "GOP"), shown as filed."""
+    global _fec_party_codes
+    if _fec_party_codes is None:
+        _fec_party_codes = json.loads(_FEC_PARTY_CODES_PATH.read_text())["codes"]
+    return _fec_party_codes.get(code or "")
+
+
+def ballot_party(record: dict) -> str | None:
+    """The party a state's list prints for a candidate: its FEC code when
+    the vocabulary names it, else the printed label (Vermont's "Freedom
+    and Unity"), None when the list prints none."""
+    code = PARTY_CODE_MAP.get(record.get("party") or "")
+    label = " ".join(str(record.get("party_label") or "").split()).upper()
+    return code or label[:80] or None
+
+# Where the pipeline records that it checked a state's statewide-executive
+# contests, and the API reads that back. Shared here rather than in
+# state_candidates.py so the API doesn't import the whole strategy
+# registry (and its two dozen adapter modules) to read one cache key.
+STATEWIDE_MARKER_TIER = "statewide"
+
+# Deliberately long: this marker is a coverage RECORD, not an HTTP cache
+# entry. Its staleness is shown to the reader as a "last checked" date the
+# way MeasureCoverage.checked_at is, and a pipeline that stops running is
+# an operator concern ops_alerts' staleness watchdog already owns. At the
+# default 72h TTL every state page would instead revert to "not yet
+# covered" after three quiet days.
+STATEWIDE_MARKER_TTL_HOURS = 24 * 400
+
+
+def statewide_marker_key(state: str, cycle: int) -> str:
+    return f"synced-{state}-{cycle}"
+
+
+# Which source last answered for a state's federal ballot, and whether that
+# source was its complete certified ballot. A state's config says what its
+# PRIMARY source is; a `fallback` can answer instead (a certified list not
+# posted yet), and then the page must not claim a complete ballot.
+BALLOT_BASIS_TIER = "ballot-basis"
+
+
+def ballot_basis_key(state: str, cycle: int) -> str:
+    return f"{state}-{cycle}"
+
+
+# Judicial gets its OWN marker rather than sharing the statewide one.
+# The statewide marker covers the executive offices and the legislature
+# together because they are one claim — same ballot, same response,
+# labels checked. Judicial is a separate and STRONGER claim: that this
+# state's own statute on what a judicial majority means has been read
+# (see JUDICIAL_MAJORITY_* — Washington and Idaho mean opposite things
+# by it). A state can be checked for one and not the other, and sharing
+# a marker would let it claim coverage it does not have.
+JUDICIAL_MARKER_TIER = "judicial"
+JUDICIAL_MARKER_TTL_HOURS = STATEWIDE_MARKER_TTL_HOURS
+
+
+def judicial_marker_key(state: str, cycle: int) -> str:
+    return f"judicial-synced-{state}-{cycle}"
+
+
+# The coverage records above describe the ballot rows beside them, and are
+# written by the same syncs — which stand down once election day has passed
+# (election_pipeline's election_is_held). A data reset in the results window
+# keeps those rows (database.RESET_KEEPS_WHILE_RESULTS), so it keeps these
+# too: wiped, a state page would say "not yet covered" (and list the §7
+# omission) above sections whose rows still show, and nothing could write
+# them again until the window closed.
+HELD_BALLOT_MARKER_TIERS = (STATEWIDE_MARKER_TIER, JUDICIAL_MARKER_TIER, BALLOT_BASIS_TIER)
+
+
+STATEWIDE_OFFICE_LABELS = {
+    "governor": "Governor",
+    "lt_governor": "Lieutenant Governor",
+    "attorney_general": "Attorney General",
+    "secretary_of_state": "Secretary of State",
+    "secretary_of_commonwealth": "Secretary of the Commonwealth",
+    "treasurer": "State Treasurer",
+    "auditor": "State Auditor",
+    "controller": "State Controller",
+    "comptroller": "State Comptroller",
+    "insurance_commissioner": "Insurance Commissioner",
+    "agriculture_commissioner": "Agriculture Commissioner",
+    "labor_commissioner": "Labor Commissioner",
+    "school_superintendent": "State School Superintendent",
+    "public_service_commission": "Public Service Commission",
+    "chief_financial_officer": "Chief Financial Officer",
+    "board_of_equalization": "Board of Equalization",
+    "state_board_of_education": "State Board of Education",
+    "university_regent": "University Regent",
+    "tax_commissioner": "Tax Commissioner",
+    "state_lands_commissioner": "Commissioner of State Lands",
+    "school_public_lands_commissioner": "Commissioner of School and Public Lands",
+    "public_utilities_commission": "Public Utilities Commission",
+    "railroad_commissioner": "Railroad Commissioner",
+    "corporation_commissioner": "Corporation Commissioner",
+    "land_office_commissioner": "Commissioner of the General Land Office",
+    "public_lands_commissioner": "Commissioner of Public Lands",
+    "governors_council": "Governor's Council",
+    "executive_council": "Executive Council",
+    "public_education_commission": "Public Education Commission",
+}
+
+
+# The federal floor for when a November ballot is printed and final: UOCAVA
+# requires absentee ballots to be TRANSMITTED to military and overseas
+# voters no later than 45 days before a federal election (52 U.S.C.
+# 20302(a)(8)(A)). A statute, not a calibration -- and the ballot a state
+# has already mailed is the ballot. Vermont's reader switches from primary
+# winners to its general report at this point; every certified list uses
+# it to tell "not published yet" from "broken" (not_yet).
+BALLOT_FINAL_DAYS_BEFORE = 45
+
+
+def ballot_final(held: str, today: date | None = None) -> bool:
+    """True once the general election on `held` is within the UOCAVA
+    transmission window (BALLOT_FINAL_DAYS_BEFORE), i.e. the ballot has
+    been mailed and is what voters will see. An unparseable date is never
+    final. (Not election_phase.election_is_held, the day after the
+    election, from which nothing re-reads the ballot at all.)"""
+    try:
+        election_day = date.fromisoformat(str(held or "")[:10])
+    except ValueError:
+        return False
+    today = today or utcnow().date()
+    return today >= election_day - timedelta(days=BALLOT_FINAL_DAYS_BEFORE)
+
+
+def in_ballot_window(year: int, today: date | None = None) -> bool:
+    """True from the day `year`'s general-election ballot must be final
+    (BALLOT_FINAL_DAYS_BEFORE out) THROUGH election day itself. After the
+    election a state's list pages move on to the next cycle, which says
+    nothing about this one being broken."""
+    election_day = general_election_day(year)
+    today = today or utcnow().date()
+    return ballot_final(election_day.isoformat(), today) and today <= election_day
+
+
+def not_yet(year: int, state: str, why: str, today: date | None = None) -> list | None:
+    """The answer for a certified list that is not the November ballot yet
+    (its page names another election, it still holds primary filers): []
+    -- healthy, "not published yet" -- except inside the ballot window
+    (in_ballot_window), when every state has mailed its ballot and a list
+    still not answering is broken (a moved page, a changed layout): None
+    there is what reports fetch_failed and raises the alarm, where [] all
+    cycle long would be indistinguishable from "not yet" forever. After
+    election day the pages move to the next cycle, and that is not a
+    failure either."""
+    if in_ballot_window(year, today):
+        logger.warning("%s %d certified list is still not the ballot %d days before the election: %s",
+                       state, year, BALLOT_FINAL_DAYS_BEFORE, why)
+        return None
+    logger.info("%s %d certified list is not the ballot (yet, or any more): %s", state, year, why)
+    return []
+
+
+class SourceRecords(list):
+    """A strategy's records, plus two facts about them that the rows alone
+    cannot carry. Returned only where an adapter knows one; a plain list
+    means neither.
+
+    `state_offices_incomplete`: the federal rows are good (every stage
+    they come from has settled), but the STATE-office read is partial --
+    one party's primary or a runoff is still settling -- so the sync must
+    not treat its statewide, legislative or judicial rows (or their
+    absence) as the ballot. The adapter leaves those rows out entirely.
+    None for the whole read would throw the settled federal nominees away
+    too, report the state as a failed fetch, and send the sync to the
+    crawler's spare source.
+
+    `ballot_list`: whether the state-office rows come from the state's
+    list of who is on the November ballot (True) or from primary results
+    (False), for an adapter that can read either (Vermont's, which reads
+    the general report once it is final). None leaves the answer to the
+    strategy (state_candidates.BALLOT_LIST_STRATEGIES)."""
+
+    def __init__(self, items=(), *, state_offices_incomplete: bool = False, ballot_list: bool | None = None):
+        super().__init__(items)
+        self.state_offices_incomplete = state_offices_incomplete
+        self.ballot_list = ballot_list
+
+
+def federal_only(records: list[dict]) -> SourceRecords:
+    """`records` cut to their federal rows and marked state-office
+    incomplete (see SourceRecords)."""
+    return SourceRecords(
+        (r for r in records if r["office"] in ("S", "H")), state_offices_incomplete=True,
+    )
+
+
+def join_governor_tickets(records: list[dict]) -> list[dict]:
+    """`records` with each lieutenant governor joined to their governor as
+    one ticket ("Phil Weiser and Lesley Dahlkemper"), for a state that
+    elects the two jointly on one vote in November (the entry's
+    joint_governor_ticket). There, the lieutenant governor is not a
+    contest of its own on the ballot, and listing one would show the
+    reader a choice they do not have -- the shape Maryland's, Nebraska's
+    and New Mexico's lists already print.
+
+    A running mate is paired with the governor of the same party (and
+    printed party label), and only while exactly one governor of that
+    party is waiting for a mate. That covers a list that prints each
+    ticket's two rows together even when a party has several tickets
+    (Colorado's certified list puts each "Lt. Governor" row right under
+    its "Governor" row, so every earlier ticket is already joined), and a
+    list that groups the offices with one ticket per party (Iowa's). Two
+    governors of one party waiting at once -- two unaffiliated slates
+    printed as two groups -- cannot say who runs with whom, so neither
+    mate is joined. A mate with no governor to join is dropped rather
+    than shown as a contest the ballot does not have; a governor with no
+    mate (a primary file that itemised only one of the two nominations)
+    stands alone."""
+    out: list[dict] = []
+    open_governors: dict[tuple, list[int]] = {}
+    early: list[dict] = []  # a mate listed before any governor of their party
+
+    def join(record: dict) -> bool:
+        waiting = open_governors.get((record.get("party"), record.get("party_label"))) or []
+        if len(waiting) != 1:
+            return False
+        governor = out[waiting.pop()]
+        governor["last_name"] = f"{governor['last_name']} and {record['last_name']}"
+        return True
+
+    for record in records:
+        key = (record.get("party"), record.get("party_label"))
+        if record["office"] == "governor":
+            open_governors.setdefault(key, []).append(len(out))
+            out.append(dict(record))
+        elif record["office"] == "lt_governor":
+            if not open_governors.get(key):
+                early.append(record)  # a results file may list the deputy first
+            elif not join(record):
+                logger.info("A %s running mate (%s) has no single governor to join", key[0], record["last_name"])
+        else:
+            out.append(record)
+    for record in early:
+        if not join(record):
+            logger.info("A %s running mate (%s) has no single governor to join",
+                        record.get("party"), record["last_name"])
+    return out
+
+
+def _statewide_seat(code: str, name: str) -> tuple[str, str | None]:
+    """Attach a seat number to the offices that have one. A district on
+    any other statewide office would be a misread — "Secretary of State"
+    beside a district number is not a thing — so it is dropped rather
+    than stored."""
+    if code not in _STATEWIDE_DISTRICT_SEATS:
+        return code, None
+    match = _STATEWIDE_SEAT_RE.search(name)
+    if match:
+        return code, next(g for g in match.groups() if g)
+    place = _STATEWIDE_PLACE_RE.search(name)
+    return code, (f"Place {place.group(1)}" if place else None)
+
+
+def parse_statewide_office(contest_name: str) -> tuple[str, str | None] | None:
+    """(office code, seat) for a statewide executive contest, or None.
+
+    The seat is None for all but the handful of statewide bodies that
+    seat members by district (see _STATEWIDE_DISTRICT_SEATS). None for
+    every federal contest too: this is the complement of parse_office,
+    not a superset of it, and a caller asks whichever question it means.
+    """
+    name = contest_name or ""
+    # A ballot question naming an office ("Constitutional Amendment 1 ...
+    # the governor shall ...") is not a contest for it. They were only
+    # dropped before because no party could be attributed to them.
+    if _BALLOT_QUESTION_RE.search(name):
+        return None
+    # Checked first — see _STATEWIDE_PHRASES for why these cannot go
+    # through the general locality gate below.
+    for code, pattern in _STATEWIDE_PHRASES:
+        found = pattern.search(name)
+        if found and not _STRICT_LOCAL_RE.search(name) and _phrase_leads(name, found.start()):
+            return _statewide_seat(code, name)
+    if _LOCAL_QUALIFIER_RE.search(name):
+        return None
+    # A JOINT TICKET ("Governor and Lieutenant Governor", how several
+    # states print it) is the GOVERNOR's contest, not the deputy's. Strip
+    # the lieutenant phrase: if a bare "Governor" survives, both offices
+    # are named and this is the top of the ticket.
+    if _LT_GOVERNOR_RE.search(name):
+        without_lt = _LT_GOVERNOR_RE.sub(" ", name)
+        if not re.search(r"\bgovernor\b", without_lt, re.IGNORECASE):
+            return _statewide_seat("lt_governor", name)
+    for code, pattern in _STATEWIDE_OFFICES:
+        if pattern.search(name):
+            return _statewide_seat(code, name)
+    return None
+
+
+# ── State legislative seats ──────────────────────────────────────────
+#
+# The third gate, and the hardest of the three. parse_office must not
+# read a state chamber as federal; parse_statewide_office must not read a
+# county office as statewide; this one must not read a PARTY COMMITTEE or
+# a municipal seat as a legislative seat — and on a real ballot those
+# collide word-for-word with the thing being matched.
+#
+# Every rejection below is a real label off Rhode Island's live 2026
+# primary, not a hypothetical:
+#
+#   Senatorial District Committee District 13   <- "Senatorial", "District"
+#   Representative District Committee District 5 <- "Representative", "District"
+#   State Committeewoman District 1             <- "State", "District"
+#   Ward Committee Cranston Ward 5
+#   Pawtucket: City Council Pawtucket District 1 <- "District"
+#
+# The first three are the dangerous ones: each contains the exact words a
+# loose chamber pattern keys on, so a party-committee race would be
+# published as a legislative nominee. "Committee" is what actually
+# separates them, matched WITHOUT a trailing \b so that
+# "Committeewoman"/"Committeeman" are caught by the same rule.
+_NON_LEGISLATIVE_RE = re.compile(
+    r"\bcommittee"                      # ... and Committeeman/Committeewoman
+    r"|\b(?:council|mayor|alderman|school|ward|precinct|municipal"
+    r"|county|city|town|township|borough|parish|village"
+    r"|judge|justice|court|sheriff|clerk|register)\b"
+    r"|:",                              # "Pawtucket: ..." -- one town's race
+    re.IGNORECASE,
+)
+
+# Chamber patterns, each taken from a real fetched feed. A state whose
+# wording is not here yet simply yields None (no legislative nominee
+# published) rather than being guessed at — the same refuse-by-default
+# stance parse_office takes. Adding a verified state is one entry plus
+# the provenance note saying where its wording was read.
+#
+#   Rhode Island: its legislature is the "General Assembly", so its seats
+#   read "Senator in General Assembly District 5" and "Representative in
+#   General Assembly District 13" (verified live, 2026 primary: 43 upper
+#   and 90 lower contests).
+#   Minnesota: the plain "State Senator District 10" / "State
+#   Representative District 10A" forms, read off its real 2026 primary
+#   export (57 office names, of which these two shapes are the seats).
+#   The "State" qualifier is what makes them safe — a bare "Senator,
+#   District 5" stays refused, because in a state that prints its federal
+#   seats that way it would be a congressional race.
+_STATE_LEG_CHAMBERS = [
+    #   Pennsylvania writes the same chambers with an article: "Senator in
+    #   the General Assembly 2nd Senatorial District", "Representative in
+    #   the General Assembly 4th Legislative District" (its 2026 primary).
+    ("upper", re.compile(r"\bSenator\s+in\s+(?:the\s+)?General\s+Assembly\b", re.IGNORECASE)),
+    ("lower", re.compile(r"\bRepresentative\s+in\s+(?:the\s+)?General\s+Assembly\b", re.IGNORECASE)),
+    ("upper", re.compile(r"\bState\s+Senat(?:e|or)\b", re.IGNORECASE)),
+    ("lower", re.compile(r"\bState\s+(?:House|Representative)\b", re.IGNORECASE)),
+    #   North Carolina: "NC HOUSE OF REPRESENTATIVES DISTRICT 1", with no
+    #   "State" in it. A BARE "House of Representatives" is exactly what
+    #   parse_office must always refuse — it is a state chamber's name in
+    #   most of the country — which is what makes it safe to claim here:
+    #   this function refuses anything parse_office recognises before it
+    #   looks at a single pattern, so a label reaching this arm is one
+    #   that carries no federal marker at all.
+    ("lower", re.compile(r"\bHouse\s+of\s+Representatives\b", re.IGNORECASE)),
+    #   California: "State Assembly Member District 1" — its lower
+    #   chamber. "State" is required so Rhode Island's "General
+    #   Assembly", which names the WHOLE legislature and is matched by
+    #   the arms above, cannot reach this one.
+    ("lower", re.compile(r"\bState\s+Assembly\b", re.IGNORECASE)),
+    #   Maryland and West Virginia call their lower chamber the House of
+    #   Delegates; Virginia does too. No federal chamber is called that,
+    #   so the bare form is unambiguous.
+    ("lower", re.compile(r"\bHouse\s+of\s+Delegates\b", re.IGNORECASE)),
+    #   Alaska: "Senate District A" / "House District 1" — the chamber
+    #   named with no qualifier at all, the shortest form any state uses.
+    #   Safe for the same reason the bare "House of Representatives" arm
+    #   above is: nothing federal reaches these patterns, because this
+    #   gate refuses whatever parse_office claims before testing any of
+    #   them. And a districted SENATE seat cannot be federal in any case
+    #   — U.S. Senate seats are elected statewide, never by district.
+    ("upper", re.compile(r"\bSenate\s+District\b", re.IGNORECASE)),
+    ("lower", re.compile(r"\bHouse\s+District\b", re.IGNORECASE)),
+    #   Wisconsin: "REPRESENTATIVE TO THE ASSEMBLY DISTRICT 20", beside
+    #   "STATE SENATOR DISTRICT 7", off its certified 2026 primary canvass
+    #   (99 Assembly contests). No federal office is called that.
+    ("lower", re.compile(r"\bRepresentative\s+to\s+the\s+Assembly\b", re.IGNORECASE)),
+    #   Michigan: "1st District Representative in State Legislature", beside
+    #   "1st District State Senator", off its 2026 Official Candidate
+    #   Listing (110 House districts).
+    ("lower", re.compile(r"\bRepresentative\s+in\s+State\s+Legislature\b", re.IGNORECASE)),
+]
+
+# Some districts elect SEVERAL members from a single contest, with no
+# seat designator to tell the winners apart — Maryland prints "House of
+# Delegates District 10 ... Vote for up to 3", and all three of that
+# party's top finishers are its nominees.
+#
+# This is the third multi-member shape after Idaho's "Seat A"/"Seat B"
+# and Washington's "Pos. 1"/"Pos. 2", and the only one where the number
+# is a property of the CONTEST rather than of the state, so it cannot
+# come from config the way advance_count does.
+_VOTE_FOR_RE = re.compile(r"\bVote\s+for\s+(?:up\s+to\s+)?(\d+)\b", re.IGNORECASE)
+
+
+def vote_for_count(contest_name: str) -> int | None:
+    """How many seats this contest fills, when its own label says so.
+
+    None when the label is silent, which is most states — the caller
+    then keeps whatever its own configuration says.
+    """
+    match = _VOTE_FOR_RE.search(contest_name or "")
+    if not match:
+        return None
+    count = int(match.group(1))
+    # A zero or an absurd count is a label this does not understand, and
+    # guessing from it would either drop every candidate or advance the
+    # whole field.
+    return count if 1 <= count <= 10 else None
+
+# Districts are identified per chamber, and the identifier is the whole
+# point — a seat without one is not publishable, because it cannot be
+# told apart from the other 74.
+#
+# The trailing letter is not optional decoration: Minnesota names its
+# house districts "10A" and "10B" (two per senate district), so dropping
+# it would merge two different seats into one. Leading zeros are stripped
+# so "District 05" and "District 5" are the same seat, but the letter is
+# kept and upper-cased.
+# Arkansas abbreviates it on 15 of its own House contests ("REP State
+# Representative Dist. 42") while spelling it out on the rest, so both
+# spellings have to read the same seat.
+_STATE_LEG_DISTRICT_RE = re.compile(
+    r"\bDist(?:rict)?\.?\s+(?:No\.?\s*)?0*(\d+)([A-Za-z]?)\b", re.IGNORECASE,
+)
+
+# West Virginia puts the number FIRST: "HOUSE OF DELEGATES, 1st District"
+# and "STATE SENATOR, 3rd Senatorial District". One optional word is
+# allowed between the ordinal and "District" to carry that "Senatorial".
+_STATE_LEG_ORDINAL_DISTRICT_RE = re.compile(
+    r"\b0*(\d+)(?:st|nd|rd|th)\s+(?:\w+\s+)?District\b", re.IGNORECASE,
+)
+
+# Alaska identifies its senate districts by a LETTER, not a number —
+# "Senate District A" through "Senate District T" — pairing each with the
+# two numbered house districts it contains. Every other state's district
+# identifier is numeric, which is why this is a separate pattern tried
+# only after the numeric and ordinal ones fail rather than a relaxation
+# of them: "District 10A" must keep parsing as district "10A", not as
+# the letter "A".
+#
+# The single-letter group is anchored on both sides by \b, so it matches
+# a letter standing alone as its own word and nothing else. That is what
+# keeps "District Attorney" out — the "A" there is followed by "ttorney",
+# so there is no word boundary after it (and _NON_LEGISLATIVE_RE already
+# refuses that label anyway; this pattern does not rely on it).
+_STATE_LEG_LETTER_DISTRICT_RE = re.compile(
+    r"\bDist(?:rict)?\.?\s+([A-Za-z])\b", re.IGNORECASE,
+)
+
+# Wyoming prints the number with no "District" at all: "STATE SENATOR 11",
+# "STATE REPRESENTATIVE 01" (its 2026 general candidate roster). Anchored
+# to the WHOLE label, so a number anywhere else in a longer contest name
+# is never read as a seat.
+_STATE_LEG_BARE_NUMBER_RE = re.compile(
+    r"^\s*State\s+(?:Senator|Representative)\s+0*(\d+)\s*$", re.IGNORECASE,
+)
+
+# SOME STATES ELECT SEVERAL MEMBERS FROM ONE DISTRICT, and the seat is
+# what tells their contests apart. Idaho runs "District 1 Seat A" and
+# "Seat B"; Washington runs "Pos. 1" and "Pos. 2" of a Legislative
+# District. Both are TWO seats in ONE geography.
+#
+# That is a different thing from Minnesota's "10A"/"10B", which are two
+# separate districts with their own boundaries — Census confirms it:
+# Minnesota has 134 lower-chamber polygons named 10A, 10B, ..., while
+# Idaho has 35 and Washington 49, numbered plainly. So the seat is
+# stored beside the district rather than folded into it, and the
+# district keeps pointing at the one real polygon both seats share.
+_STATE_LEG_SEAT_RE = re.compile(
+    r"\bSeat\s+([A-Za-z])\b|\bPos(?:ition|\.)?\s*(\d+)\b", re.IGNORECASE,
+)
+
+# A special election for the rest of a vacated term, held beside the
+# seat's regular contest on the same ballot (Arkansas, 2026: House District
+# 8's unexpired term and its next full term, two contests with different
+# candidates). Stored as the seat, so the two contests stay two rows.
+_STATE_LEG_UNEXPIRED_RE = re.compile(r"\b(?:unexpired|special)\b", re.IGNORECASE)
+UNEXPIRED_SEAT = "UNEX"  # fits StateLegNominee.seat (String(4))
+
+STATE_LEG_CHAMBER_LABELS = {"upper": "State Senate", "lower": "State House"}
+
+# ── judicial ─────────────────────────────────────────────────────
+#
+# The fourth gate, and the same refuse-by-default stance as the other
+# three: a court whose wording is not here yields None rather than being
+# guessed at.
+#
+# Surveyed live 2026-09-21 across every tabular state's own real export:
+# 191 judgeships in five states (GA 92, ID 49, NC 23, FL 23, WA 4), and
+# EVERY ONE names a specific seat — "SEAT 2", "Group 4", "Position #1",
+# "Seat Bonner A", or the sitting judge's own surname in parentheses.
+# Judgeships are single-seat by construction, which is why they escape
+# the per-contest seat-count problem that still blocks county and
+# municipal offices (a town council electing 5 of 17).
+#
+# Only NORTH CAROLINA's are partisan, and only those are read today —
+# see parse_judicial_office's docstring for why the other 168 need a
+# piece of per-state statute this codebase does not have.
+JUDICIAL_COURT_LABELS = {
+    "supreme": "Supreme Court",
+    "appeals": "Court of Appeals",
+    "superior": "Superior Court",
+    "district": "District Court",
+    "circuit": "Circuit Court",
+}
+
+_JUDICIAL_COURTS = [
+    # Longest/most specific first: "Court of Appeals" must win before a
+    # bare "Court", and "Supreme Court" before "Superior Court" — they
+    # share no prefix but the ordering rule is what keeps it that way.
+    ("supreme", re.compile(r"\bSupreme\s+Court\b", re.IGNORECASE)),
+    ("appeals", re.compile(r"\bCourt\s+of\s+Appeals\b", re.IGNORECASE)),
+    ("superior", re.compile(r"\bSuperior\s+Court\b", re.IGNORECASE)),
+    ("district", re.compile(r"\bDistrict\s+Court\b", re.IGNORECASE)),
+    # LAST on purpose. Georgia writes "Judge - Superior Court - Alcovy
+    # Judicial Circuit", where the circuit is the GEOGRAPHY of a superior
+    # court seat, not the court itself — the superior arm above has to
+    # win there. Florida's "Circuit Judge, 9th Judicial Circuit, Group 1"
+    # names the court itself and reaches this arm only because nothing
+    # above claimed it.
+    ("circuit", re.compile(r"\bCircuit\s+(?:Court|Judge)\b", re.IGNORECASE)),
+]
+
+# The office must be the JUDGESHIP itself.
+_JUDICIAL_TITLE_RE = re.compile(r"\b(?:judge|justice)\b", re.IGNORECASE)
+
+# Every other office that names a court. A clerk of superior court and a
+# district attorney both sit squarely inside a court's name and are not
+# judgeships — North Carolina's own export carries 26 clerk contests and
+# Georgia's 10 district-attorney ones, all of which must be refused.
+_NON_JUDGESHIP_RE = re.compile(
+    r"\b(?:clerk|attorney|solicitor|sheriff|magistrate|register|"
+    r"reporter|marshal|constable)\b",
+    re.IGNORECASE,
+)
+
+# A trial court's geography is a numbered CIRCUIT in some states rather
+# than a numbered district — Florida's "9th Judicial Circuit". Written
+# as an ordinal, which is why neither the plain district pattern ("Dist.
+# 3") nor the legislative ordinal one (which requires the word
+# "District") sees it.
+_JUDICIAL_CIRCUIT_RE = re.compile(
+    r"\b0*(\d+)(?:st|nd|rd|th)\s+Judicial\s+Circuit\b", re.IGNORECASE,
+)
+
+# NC writes "SEAT 2"; the state-legislative seat pattern only accepts a
+# single letter (Idaho's "Seat A"), so judicial needs its own.
+_JUDICIAL_SEAT_RE = re.compile(
+    r"\bSeat\s+(\w+)\b|\bGroup\s+(\w+)\b|\bPos(?:ition|\.)?\s*#?\s*(\w+)\b",
+    re.IGNORECASE,
+)
+
+
+def parse_judicial_office(
+    contest_name: str,
+) -> tuple[str, str | None, str | None] | None:
+    """(court, district, seat) for an elected judgeship, or None.
+
+    ("district", "3", "2") for North Carolina's "NC DISTRICT COURT JUDGE
+    DISTRICT 3 SEAT 2 (REP)", and ("appeals", None, "4") for a statewide
+    appellate seat, which has no district.
+
+    None for everything the other three gates answer, and None for every
+    other office that merely names a court — a clerk of superior court
+    is not a judge, and neither is a district attorney.
+
+    WHY ONLY PARTISAN JUDICIAL CONTESTS ARE READ. In a party primary the
+    winner becomes that party's nominee and appears on the November
+    ballot, which is what this whole pipeline already models. A
+    NON-partisan judicial election inverts it: in most states a
+    candidate who clears a majority is ELECTED OUTRIGHT rather than
+    nominated, and only a field that fails to produce one sends two
+    candidates on to November. Reading those the same way would publish
+    a judge who has already won as though they were still standing —
+    the confidently-wrong failure this system refuses everywhere else.
+    Which of the two a state does is its own statute and appears in no
+    feed, so the 168 non-partisan judgeships surveyed stay omitted until
+    that rule is hand-verified per state, exactly as
+    `runoff_threshold_pct` already is.
+    """
+    name = contest_name or ""
+    if not _JUDICIAL_TITLE_RE.search(name):
+        return None
+    if _NON_JUDGESHIP_RE.search(name):
+        return None
+    # Never claim what an earlier gate answers. Federal judges are
+    # appointed, so nothing federal is a judgeship, but the check keeps
+    # this gate self-contained rather than order-dependent — the same
+    # reason parse_state_leg_office refuses federal labels itself.
+    if parse_office(name) is not None:
+        return None
+
+    for court, pattern in _JUDICIAL_COURTS:
+        if not pattern.search(name):
+            continue
+        district = None
+        match = _STATE_LEG_DISTRICT_RE.search(name)
+        if match:
+            district = match.group(1) + match.group(2).upper()
+        else:
+            # A numbered CIRCUIT is the same thing by another name, and
+            # is what Florida's trial seats are keyed by.
+            circuit = _JUDICIAL_CIRCUIT_RE.search(name)
+            if circuit:
+                district = circuit.group(1)
+        seat_match = _JUDICIAL_SEAT_RE.search(name)
+        seat = None
+        if seat_match:
+            seat = next((g for g in seat_match.groups() if g), None)
+            if seat:
+                # "SEAT 01" is seat 1. Stripped for the same reason the
+                # district pattern strips its own zeros: the state pads
+                # inconsistently within one file, and an unpadded "SEAT 3"
+                # and a padded "SEAT 03" are the same bench.
+                seat = seat.lstrip("0") or "0" if seat.isdigit() else seat.upper()
+        return court, district, seat
+    return None
+
+
+def district_sort_key(district: str) -> tuple[int, str]:
+    """Natural order for a district identifier: 9 before 10, and 10A
+    before 10B. Lexical order would put "10" before "9" and scatter
+    Minnesota's A/B pairs across the list."""
+    match = re.match(r"(\d+)([A-Za-z]*)$", str(district))
+    return (int(match.group(1)), match.group(2)) if match else (10**9, str(district))
+
+
+def parse_state_leg_office(contest_name: str) -> tuple[str, str, str | None] | None:
+    """(chamber, district, seat) for a state legislative seat, or None.
+
+    ("upper", "5", None) for Rhode Island's Senate District 5,
+    ("lower", "10A", None) for one of Minnesota's two real districts,
+    ("lower", "1", "A") for Idaho's Seat A of District 1, and
+    ("lower", "5", "2") for Washington's Position 2 of District 5, and
+    ("lower", "8", UNEXPIRED_SEAT) for a special election to the rest of a
+    vacated term, held beside the district's regular contest.
+
+    The seat is None wherever a district elects a single member, which
+    is most of the country. Where it is set, the district still names
+    the one geography both seats share — see _STATE_LEG_SEAT_RE.
+
+    None for federal and statewide-executive contests too: like its two
+    siblings this answers one question, and a caller asks whichever it
+    means. In particular no pattern here can match a federal label —
+    Rhode Island's own "Senator in Congress" and "Senator in General
+    Assembly" sit on the same ballot, and only the second is ours.
+    """
+    name = contest_name or ""
+    if _NON_LEGISLATIVE_RE.search(name):
+        return None
+    # Refused here rather than relying on the caller having asked
+    # parse_office first. The bare "House of Representatives" arm below
+    # is only safe because nothing federal reaches it, and a contract
+    # that depends on call order is one that breaks the first time
+    # somebody calls this function on its own.
+    if parse_office(name) is not None:
+        return None
+    for chamber, pattern in _STATE_LEG_CHAMBERS:
+        if pattern.search(name):
+            district = _STATE_LEG_DISTRICT_RE.search(name)
+            if district:
+                number = district.group(1) + district.group(2).upper()
+            else:
+                ordinal = _STATE_LEG_ORDINAL_DISTRICT_RE.search(name)
+                bare = _STATE_LEG_BARE_NUMBER_RE.search(name)
+                if ordinal:
+                    number = ordinal.group(1)
+                elif bare:
+                    number = bare.group(1)
+                else:
+                    # Last, so a numeric district is never read as a letter.
+                    letter = _STATE_LEG_LETTER_DISTRICT_RE.search(name)
+                    if not letter:
+                        return None
+                    number = letter.group(1).upper()
+            seat_match = _STATE_LEG_SEAT_RE.search(name)
+            seat = None
+            if seat_match:
+                seat = (seat_match.group(1) or seat_match.group(2) or "").upper() or None
+            elif _STATE_LEG_UNEXPIRED_RE.search(name):
+                seat = UNEXPIRED_SEAT
+            return chamber, number, seat
+    return None
+
+
+def district_label(district: str, seat: str | None) -> str:
+    """How a seat is written on the page. "1A" for a lettered seat, the
+    way Idaho itself writes it; "5-2" for a numbered position, which no
+    state prints exactly but which stays compact, unambiguous and
+    obviously two seats of one district when both rows sit together."""
+    if not seat:
+        return district
+    if seat == UNEXPIRED_SEAT:
+        return f"{district} (unexpired term)"
+    return f"{district}{seat}" if seat.isalpha() else f"{district}-{seat}"
+
+
+def office_from_columns(row: dict, spec: dict | None) -> tuple[str, int | None] | None:
+    """The same ("H", 3) answer as parse_office, taken from a results row's
+    OWN columns instead of its label, or None when `spec` is unset or the
+    row isn't the federal office it describes.
+
+    Some states name the office in a way that is only unambiguous next to
+    another column — Virginia's is "Member, House of Representatives (2nd
+    District)", with no "U.S." prefix (which parse_office must keep
+    refusing, since that is a STATE chamber's name in many states) and an
+    ordinal it doesn't read. Those states carry their own district-type
+    column, and it says plainly what the label can't.
+
+    Every value here comes from the state's entry in
+    state_candidate_sources.json, never from code: the discriminating
+    column, the value that marks a congressional seat, and the column
+    holding the district number. A state that publishes a column with some
+    other name and some other marker is still a config entry.
+    """
+    if not spec:
+        return None
+    marker = (row.get(spec.get("type_column")) or "").strip().casefold()
+    if not marker or marker != str(spec.get("type_value") or "").strip().casefold():
+        return None
+    # Zero-padded ("05") in Virginia's export; an at-large seat has no
+    # number at all, which parse_office already models as district None.
+    digits = re.search(r"\d+", row.get(spec.get("district_column")) or "")
+    return "H", int(digits.group()) if digits else None
+
+
+# "Independent"/"Unaffiliated", spelled the ways a ballot list writes
+# them. Read only when a caller says it is looking at a BALLOT, never at
+# primary results — see normalize_party.
+# Abbreviations are matched only as the WHOLE value (a party column),
+# never inside a longer label, for the same reason a stray "R" in a
+# contest name must not become a Republican.
+# NOPTY is Louisiana's "No Party"; PETITION is South Carolina's label for
+# a candidate who reached the ballot by petition rather than a party, and
+# Nebraska writes the same thing out as "By Petition". DTS is New Mexico's
+# "Declined to Select". "Unenrolled" is Maine's word for a voter in no
+# party (its 2026 General Candidate List prints it beside "Independent").
+# NPP is Nevada's "No Political Party" (Clark County's candidate list
+# legend: "indicated for partisan offices only").
+# Minor parties with an FEC code of their own, recognised ONLY on a
+# certified general-election list (normalize_party's ballot_list). On
+# primary results the same word is refused, deliberately: Vermont's
+# Progressive primary carried no declared candidate in 2026, only
+# scattered write-ins, and reading it would confirm a write-in fusion
+# nomination nobody verified (see state_candidates_vt). Checked AFTER
+# the major parties, so a fusion line ("Democratic/Progressive") keeps
+# the party it names first.
+_BALLOT_LIST_PARTY_PATTERNS = [
+    # Vermont prints both "PROGRESSIVE" and, on a fusion line, "PROG".
+    (re.compile(r"\b(?:progressive|prog)\b", re.IGNORECASE), "P"),
+]
+
+_INDEPENDENT_ABBR = frozenset({"IND", "INDEPENDENT", "UNA", "NPA", "NOP", "NP", "NOPTY", "PETITION", "DTS", "NPP"})
+_INDEPENDENT_RE = re.compile(
+    r"\b(independent|unaffiliated|unenrolled|undeclared|no\s+(?:political\s+)?party(\s+affiliation)?"
+    r"|non[\s-]?partisan|by\s+petition)\b",
+    re.IGNORECASE,
+)
+# "Independent" is not independent when it names a PARTY: the Independent
+# Party of Florida (the Division of Elections' IND, read live 2026-09-28
+# from its political-parties page) and of Delaware (FEC's IDE) are parties
+# with nominees, and Connecticut's Independent Party cross-endorses. That
+# distinction is drawn only for a STATE-office row (ballot_list_party),
+# which renders the party as printed. The federal matcher keeps reading it
+# as "I", as it always has: its codes have no slot for a named minor
+# party, and None there would drop the candidate from the ballot outright.
+# California's American Independent Party and Nevada's Independent American
+# Party are parties too, named so: "Independent" as part of a party's name.
+_INDEPENDENT_PARTY_RE = re.compile(
+    r"\b(?:independent\s+(?:party|pty|american)|american\s+independent)\b", re.IGNORECASE,
+)
+_NONPARTISAN_RE = re.compile(r"\bnon[\s-]?partisan\b", re.IGNORECASE)
+
+
+def normalize_party(text: str, ballot_list: bool = False) -> str | None:
+    """Single-letter party code for `text` (a contest label or a party
+    column), or None when no party is positively recognised. Never defaults
+    to a major party: an unattributable contest is skipped instead.
+
+    "Unaffiliated"/"Independent" yield None by default — those candidates
+    don't run in a party primary, so a party-PRIMARY contest that appears
+    to be theirs is a label this doesn't understand, not a race to confirm.
+
+    `ballot_list` says the caller is reading a certified GENERAL-election
+    ballot rather than primary results, where that reasoning inverts: an
+    independent is a perfectly ordinary entry, and dropping them loses
+    exactly the candidate a ballot list exists to show. South Dakota's
+    Senate race is the live case: an independent is on the November
+    ballot and no primary-results source can ever see him. PARTY_CODE_MAP
+    already carries "I" -> "IND", so nothing downstream needed changing;
+    only this refused to produce it.
+    """
+    value = (text or "").strip()
+    if ballot_list and (
+        value.upper() in _INDEPENDENT_ABBR or _INDEPENDENT_RE.search(value)
+    ):
+        return "I"
+    # A dedicated party column sometimes holds nothing but the letter
+    # ("R", "D" — Minnesota's results file). That is only safe to read
+    # when the WHOLE value is the code: a contest label containing a
+    # stray "R" must never become a Republican.
+    if value.upper() in _WHOLE_VALUE_PARTIES:
+        return _WHOLE_VALUE_PARTIES[value.upper()]
+    for pattern, code in _PARTY_PATTERNS:
+        if pattern.search(value):
+            return code
+    if ballot_list:
+        for pattern, code in _BALLOT_LIST_PARTY_PATTERNS:
+            if pattern.search(value):
+                return code
+    return None
+
+
+def ballot_list_party(text: str) -> tuple[str, str | None] | None:
+    """(code, printed label) for the party column of a certified GENERAL
+    list's state-office row, or None when the column prints no party.
+
+    A certified list's party column is the party by construction, so a
+    party the shared vocabulary cannot name is still a party: it is kept
+    as OTHER_PARTY with the label exactly as the state printed it
+    ("FREEDOM AND UNITY", "Workers") rather than the row being dropped --
+    dropping it removes a real November ballot line from the page. A
+    non-partisan entry ("Nonpartisan") is NONPARTISAN with its printed
+    word, never an independent. The label is returned only for those two;
+    a recognised party renders through its FEC code like every other
+    nominee.
+
+    Never for primary results, and never for text that is not purely a
+    party column (a section heading such as Missouri's "JUDICIAL
+    CANDIDATES" names no party at all). A value with no two-letter word
+    in it (blank, a dash, a lone code letter like Texas's "W" for
+    write-in) prints no party and yields None."""
+    value = " ".join((text or "").split())
+    if _NONPARTISAN_RE.search(value):
+        # Before normalize_party, which reads it as independent for the
+        # federal matcher's sake: on a state row it renders as printed.
+        return NONPARTISAN, value
+    if _INDEPENDENT_PARTY_RE.search(value):
+        # A party named "Independent", likewise before normalize_party
+        # (see _INDEPENDENT_PARTY_RE): its own name, not "no party".
+        return OTHER_PARTY, value
+    code = normalize_party(value, ballot_list=True)
+    if code is not None:
+        return code, None
+    if not re.search(r"[A-Za-z]{2}", value):
+        return None
+    return OTHER_PARTY, value
+
+
+async def discover_certification_link(
+    client, rate_limiter, page_url: str, link_regex: str, year: int, label: str,
+) -> str | None:
+    """The one link on `page_url` matching `link_regex` (with `{year}`
+    filled in), resolved against the page, or None.
+
+    For the certified-ballot strategies: a state posts the certification
+    on a landing page that stays put while the file name changes every
+    cycle, so the link is found, never pinned. None for both "not posted
+    yet" and "more than one match" — guessing which of two
+    certifications is current would be the one wrong answer."""
+    page_url = page_url.replace("{year}", str(year))
+    page = await fetch_text_with_retry(client, rate_limiter, page_url, f"{label} certification page")
+    if page is None:
+        return None
+    # {yy}: Alaska names its elections "26genr".
+    link_regex = link_regex.replace("{year}", str(year)).replace("{yy}", f"{year % 100:02d}")
+    links = {m.group(1) for m in re.finditer(link_regex, page)}
+    if len(links) != 1:
+        logger.info("%s certification page links %d %d certifications", label, len(links), year)
+        return None
+    return urljoin(page_url, links.pop())
+
+
+# What a results file prints IN PLACE OF a candidate's name: the aggregate
+# rows every vendor's results carry beside the real choices. The WHOLE
+# label has to be one of these (fullmatch, see is_not_a_person) -- never a
+# word found inside a label. A search for "blank" drops a real candidate
+# surnamed Blank, and a search for "withdrawn" drops "Jane Doe
+# (Withdrawn)", a candidate who left the race too late to leave the ballot
+# and whose votes are still votes; both were live bugs in the live-count
+# readers before this was anchored. Each arm is a vendor's own printed
+# convention (Washington/Idaho's "Write-in: Not Certified", Vermont's
+# "OTHER WRITE-INS", Maine's "BLANK", Louisiana's "Write-In Scattering"),
+# a data-format vocabulary like FEC's "SELF-EMPLOYED", not a guess about
+# who a person is.
+NOT_A_PERSON_RE = re.compile(
+    r"""
+    (?:(?:other|total|unresolved|unassigned|unqualified|uncertified|non[\s-]*certified|qualified|certified)\s+)?
+        write[\s-]*ins?
+        (?:\s+(?:votes?|totals?|scatter(?:ing|ed)))?
+        (?:\s*[:(\-]\s*(?:not\s+(?:assigned|certified|qualified)|unassigned|unresolved|unqualified
+                          |uncertified|scatter(?:ing|ed))\s*\)?)?
+    | scatter(?:ing|ed)
+    | (?:over|under)\s*-?\s*votes?
+    | blank(?:\s+(?:votes?|ballots?))?
+    | none\s+of\s+(?:these|the\s+above)(?:\s+candidates)?
+    | uncommitted
+    | withdrawn
+    | total\s+votes(?:\s+cast)?
+    | ballots\s+cast
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def is_not_a_person(label: str) -> bool:
+    """True when the whole of `label` is an aggregate row (NOT_A_PERSON_RE),
+    not a candidate. Surrounding whitespace and a trailing period are the
+    only slack: "Write-In " and "Blank." are the row, "John Blank" and
+    "Jane Doe (Withdrawn)" are people."""
+    return bool(NOT_A_PERSON_RE.fullmatch((label or "").strip().rstrip(".").strip()))
+
+
+def last_name_matches(last_name: str, full_name: str) -> bool:
+    """True if `last_name` (FEC's — possibly multi-word, e.g. "van
+    hollen") exactly matches the TRAILING tokens of `full_name`.
+    Deliberately token-exact rather than a raw substring check: a
+    substring match would let "lee" match "leeman" by coincidence,
+    which is exactly the kind of wrong-person attribution
+    api/elections._incumbent_link's docstring warns against. Token-trailing (not
+    single-last-token) so multi-word surnames like "Van Doren" still
+    match against a full name of "Mary Van Doren". Shared by that
+    scorecard link and the live-results sync's seat-holder lookup."""
+    cand_tokens = last_name.split()
+    name_tokens = full_name.lower().split()
+    return bool(cand_tokens) and name_tokens[-len(cand_tokens):] == cand_tokens
+
+
+def federal_record(
+    office: str, district: int | None, party: str | None, name: str,
+    *, last_first: bool = False,
+) -> dict | None:
+    """The record every strategy returns for a federal candidate, built
+    from the name as the state printed it, or None when that name yields
+    no surname.
+
+    `last_name` is what the matcher compares with FEC's surname.
+    `display_name` is the printed name, kept for the two things a surname
+    cannot do: tell apart two same-party candidates who share a surname
+    (two same-party siblings in one district), and show a candidate who is on the
+    ballot but never filed with the FEC, who has no FEC row to show
+    instead. A strategy that reduces names to surnames before picking a
+    winner loses the second one silently, which is why this takes the
+    full name and does the reduction itself.
+    """
+    last = surname(name, last_first=last_first)
+    if not last:
+        return None
+    return {
+        "office": office, "district": district, "party": party,
+        "last_name": last, "display_name": clean_display_name(name),
+    }
+
+
+def clean_display_name(display_name: str) -> str:
+    """A ballot name with its annotations removed, kept otherwise
+    verbatim — "Aaron C. Guckian*" -> "Aaron C. Guckian". A nickname the
+    ballot prints inside the name is kept: "Jane (Jj) Doe" stays.
+
+    The same annotations surname() strips, stripped for the same reason:
+    they are markers the state prints beside a name, not part of it.
+    Rhode Island's bare asterisk means the party ENDORSED that candidate
+    (and the endorsee does not always win), Georgia's "(I)" means
+    incumbent. Rendered as-is, both read as a typo in a person's name,
+    or worse as a footnote marker pointing at a footnote that does not
+    exist on the page.
+    """
+    return re.sub(r"\s+", " ", re.sub(_DISPLAY_ANNOTATION_RE, " ", display_name or "")).strip()
+
+
+def surname(display_name: str, last_first: bool = False) -> str | None:
+    """Trailing token of a "First [Middle] Last" display name, which is
+    what the shared matcher compares against the surname FEC stores before
+    the comma. "Robert Cruz Jr." -> "Cruz".
+
+    Ballot annotations are stripped first, since no legal name carries
+    one: Georgia's names carry a parenthetical incumbency marker, and
+    "Jane L. Doe (I)" would otherwise yield a surname of "(I)" for
+    every sitting member in the state; Rhode Island appends a bare
+    asterisk to its party-ENDORSED candidates (verified live against its
+    2026 primary: "Jane Q. Doe*", and the endorsee does not always win),
+    which would otherwise yield "Doe*" and match no FEC row at all.
+    """
+    # Some states print the ballot name the way FEC files it — "DOE, Jane",
+    # "Roe, John Thomas Lee" — where the surname is everything
+    # BEFORE the comma and the trailing token is a middle name. Taking the
+    # last token there is not a near miss, it is a different person's name.
+    if last_first and "," in (display_name or ""):
+        head = (display_name or "").split(",")[0].strip()
+        return re.sub(r"\s+", " ", re.sub(_ANNOTATION_RE, " ", head)).strip() or None
+    cleaned = re.sub(_ANNOTATION_RE, " ", display_name or "")
+    tokens = [t for t in re.split(r"\s+", cleaned.strip()) if t]
+    while tokens and tokens[-1].strip(".,").lower() in _NAME_SUFFIXES:
+        tokens.pop()
+    if not tokens:
+        return None
+    return tokens[-1].strip(".,")
+
+
+# How a non-partisan judicial contest RESOLVES relative to the November
+# ballot. Three real states, three different answers — which is exactly
+# why this cannot be one blanket rule inferred from advance_count, and
+# why a state is not opted in until its own statute has been read.
+#
+#   "sole_candidate"  Washington. RCW 29A.36.170: "only the name of that
+#                     candidate may be printed for that position on the
+#                     ballot at the general election". The winner IS a
+#                     November candidate, standing alone.
+#   "elects"          Idaho. Idaho Code 34-1217 certifies the majority
+#                     winner "as duly elected to such office" and says
+#                     "he shall not be required to stand for election at
+#                     the general election following". The seat is gone
+#                     from the November ballot entirely, so publishing
+#                     that judge as a candidate would be wrong.
+JUDICIAL_RESOLUTION_SOLE_CANDIDATE = "sole_candidate"
+JUDICIAL_RESOLUTION_ELECTS = "elects"
+# Georgia. O.C.G.A. 21-2-138 puts EVERY judicial office -- superior
+# court, Court of Appeals, Supreme Court, state court -- "on the ballot
+# in a nonpartisan election to be held and conducted jointly with the
+# general primary", and 21-2-285.1 declares "duly elected" either the
+# candidate with a majority there OR the winner of the nonpartisan
+# RUNOFF. Both branches finish months before November, so no Georgia
+# judgeship is ever on the general ballot and none is published. This is
+# why the field describes RESOLUTION and not only what a majority does:
+# Georgia's no-majority branch goes to a June runoff, where Idaho's and
+# Florida's go to November.
+JUDICIAL_RESOLUTION_DECIDED_EARLY = "decided_before_general"
+
+
+# The source-entry keys that say how a primary resolves. Anything that
+# copies a state's rules into another entry (the weekly crawler building a
+# replacement source) must copy all of them, or a discovered source reads
+# Iowa's "thirty-five percent or more" as strictly more.
+NOMINATION_RULE_KEYS = ("runoff_threshold_pct", "runoff_threshold_inclusive", "advance_count")
+
+
+class InclusiveThreshold(float):
+    """A runoff threshold a leader clears by REACHING it, not only by
+    passing it. See runoff_threshold."""
+
+
+def runoff_threshold(source: dict | None) -> float | None:
+    """The state's primary threshold from its source entry, carrying how
+    it is met. Every caller reads it through here, so whether a leader is
+    named -- and whether a contest counts as owed a runoff, which is the
+    same pick_nominees call without it -- agrees everywhere.
+
+    A threshold is STRICT by default: a majority is more than half (GA
+    O.C.G.A. 21-2-501, TX Elec. Code 172.003, AL Code 17-13-18, AR Code
+    7-7-202, MS Code 23-15-305), and North Carolina's substantial
+    plurality is "any excess of" thirty percent of the votes (G.S.
+    163-111(a)(1)). `runoff_threshold_inclusive: true` makes it
+    inclusive, for Iowa alone: "thirty-five percent or more of the votes
+    cast" (Iowa Code 43.52(1)). A leader at exactly 50.0% in Georgia is
+    withheld; at exactly 35.0% in Iowa, named."""
+    value = (source or {}).get("runoff_threshold_pct")
+    if value is None:
+        return None
+    if (source or {}).get("runoff_threshold_inclusive"):
+        return InclusiveThreshold(value)
+    return float(value)
+
+
+def pick_nominees(
+    choices: list[tuple[str, int]],
+    runoff_threshold_pct: float | None = None,
+    advance_count: int = 1,
+    judicial_resolution: str | None = None,
+) -> list[tuple[str, float]]:
+    """Who advances to the general from one contest, as [(name, pct), ...]
+    from [(name, votes), ...]. Empty when nobody can be named safely.
+
+    `advance_count` is the state's own rule, not a tuning knob. Most states
+    run a party primary and send ONE nominee per party. The top-two states
+    (CA, WA) and top-four (AK) run a single all-party contest and advance
+    that many regardless of party, so a top-two contest legitimately sends
+    two candidates of the SAME party to the general — treating it as a
+    one-winner race would silently drop a real ballot option.
+
+    Nobody advances on: an empty field, or no votes cast yet. A tie
+    spanning the cutoff truncates to whoever is strictly above it — the
+    state resolves ties by recount or draw, and guessing which tied
+    candidate advanced would be fabrication.
+
+    `runoff_threshold_pct` applies only to one-nominee party primaries,
+    where it is the load-bearing safety rule: states that send a
+    sub-threshold leader somewhere else to be decided would otherwise have
+    that candidate confirmed as the winner of a race still being settled.
+    "Somewhere else" is not always a runoff — it is a second primary in NC
+    (30%) and the 50% runoff states TX/GA/MS/AL/AR/OK/SC, but a party
+    CONVENTION in Iowa (35%, Iowa Code 43.52), where a sub-threshold
+    leader may end up not being the nominee at all. The threshold is the
+    state's own rule from config either way.
+
+    `judicial_resolution` answers a different question from that
+    threshold, and the two must not be confused. A threshold WITHHOLDS a
+    leader who failed to clear it, because the contest is still being
+    settled elsewhere. This says what a majority MEANS — and the two
+    states that have one mean opposite things by it, which is why it is
+    a value rather than a flag and why no state gets it by inference:
+
+      "sole_candidate"  Washington (RCW 29A.36.170) leaves that one name
+                        on the general ballot. Read as an ordinary
+                        top-two contest, two of its four 2026 Supreme
+                        Court seats would have published a runner-up who
+                        appears on no ballot (Position 1, 53.0%;
+                        Position 7, 58.1%).
+      "elects"          Idaho (Idaho Code 34-1217) seats the winner
+                        outright — "shall not be required to stand for
+                        election at the general election following" — so
+                        the seat is absent from November and NOBODY is
+                        published for it.
+
+    Deliberately NOT inferred from advance_count: in the same state and
+    the same file, an ordinary top-two race still advances two whatever
+    the leader's share, so this is a per-contest-kind rule a state's own
+    entry has to state.
+    """
+    ranked = sorted(
+        [(n, v) for n, v in choices if isinstance(v, int) and v > 0],
+        key=lambda t: t[1], reverse=True,
+    )
+    if not ranked:
+        return []
+
+    # Applied BEFORE the cutoff, because it changes what the cutoff is.
+    # "A majority of all the votes cast" is strictly more than half, so a
+    # dead-even field has no majority and both names reach the general.
+    if judicial_resolution == JUDICIAL_RESOLUTION_DECIDED_EARLY:
+        # Settled before November either way — by a majority here or by a
+        # runoff that is itself held before the general.
+        return []
+    if judicial_resolution and advance_count > 1:
+        cast = sum(v for _, v in ranked)
+        if cast and ranked[0][1] * 2 > cast:
+            if judicial_resolution == JUDICIAL_RESOLUTION_ELECTS:
+                # Seated already; the seat is not on the November ballot,
+                # so there is no candidate to publish for it.
+                return []
+            advance_count = 1
+
+    # Truncate at a tie that straddles the cutoff: everyone strictly above
+    # the tied vote count advanced, and who broke the tie isn't ours to say.
+    cutoff = min(advance_count, len(ranked))
+    if cutoff < len(ranked) and ranked[cutoff - 1][1] == ranked[cutoff][1]:
+        tied_at = ranked[cutoff][1]
+        ranked = [r for r in ranked if r[1] > tied_at]
+        if not ranked:
+            return []
+    else:
+        ranked = ranked[:cutoff]
+
+    total = sum(v for _, v in choices if isinstance(v, int) and v > 0)
+    out = [(n, 100.0 * v / total if total else 0.0) for n, v in ranked]
+
+    if advance_count == 1 and runoff_threshold_pct is not None:
+        # ponytail: withholds the contest until the leader clears the bar;
+        # the upgrade is fetching that state's second-primary/runoff feed
+        # and merging it in.
+        # Strict unless the state's own rule says "or more" (see
+        # runoff_threshold): a leader at exactly 50.0% has no majority.
+        if isinstance(runoff_threshold_pct, InclusiveThreshold):
+            out = [(n, p) for n, p in out if p >= runoff_threshold_pct]
+        else:
+            out = [(n, p) for n, p in out if p > runoff_threshold_pct]
+    return out
+
+
+def pick_nominee(
+    choices: list[tuple[str, int]], runoff_threshold_pct: float | None,
+) -> tuple[str, float] | None:
+    """Single-nominee convenience wrapper for the party-primary adapters."""
+    won = pick_nominees(choices, runoff_threshold_pct, advance_count=1)
+    return won[0] if won else None
+
+
+def resolve_confirmed_nominees(
+    by_seat: dict[tuple[str, int | None, str], list[tuple[str, int]]],
+    runoff_threshold_pct: float | None,
+    name_transform: Callable[[str], str | None] | None = None,
+) -> list[dict]:
+    """Every {"office", "district", "party", "last_name"} record this
+    by-seat grouping resolves to via the shared tie-safe pick_nominee --
+    the "group real vote choices by seat, pick a safe winner, shape the
+    confirmed-candidate record" tail that was hand-copied, near-
+    identically, in OR/VT/MA/KS/MS/TotalVote before being pulled in here
+    (crossing this system's own "3 strikes" extraction bar well before
+    the pull actually happened — flagged independently across four PR
+    reviews and deliberately deferred each time to keep those PRs
+    scoped). A seat with no safely-nameable winner (a tie, a sub-
+    threshold leader, an empty field) contributes nothing, never a
+    guess -- matching pick_nominee's own withholding behavior exactly.
+
+    `name_transform`, when given, runs on the winning name AFTER
+    pick_nominee has already resolved it from the real vote totals, and
+    the seat is skipped if it returns a falsy result. This is for a
+    state whose raw choices carry a full display name rather than an
+    already-reduced surname (Vermont) -- reducing every choice to a
+    surname BEFORE pick_nominee would risk quietly dropping a real
+    candidate's votes from the denominator if their own reduction were
+    ever empty, the same "never drop real votes from the total" rule
+    this system's Oregon/Arkansas/North Dakota modules already apply.
+    """
+    results = []
+    for key, choices in by_seat.items():
+        # A fourth element is the SEAT, for the states that elect more
+        # than one member from a district (see parse_state_leg_office).
+        # Optional so every federal caller's three-part key still works
+        # unchanged.
+        office, district, party = key[0], key[1], key[2]
+        seat = key[3] if len(key) > 3 else None
+        won = pick_nominee(choices, runoff_threshold_pct=runoff_threshold_pct)
+        if not won:
+            continue
+        name = name_transform(won[0]) if name_transform else won[0]
+        if name:
+            record = {
+                "office": office, "district": district,
+                "party": party, "last_name": name,
+            }
+            if name_transform and office in ("S", "H"):
+                # The whole printed name, kept beside the surname the
+                # matcher reads — see federal_record.
+                record["display_name"] = clean_display_name(won[0])
+            # Present only where a district really has more than one
+            # seat. A federal or single-member record carries no seat
+            # concept at all, so it carries no key either.
+            if seat is not None:
+                record["seat"] = seat
+            results.append(record)
+    return results
+
+
+class DiscoveryFailed(Exception):
+    """Raised by a strategy's own discovery step on a genuine fetch/parse
+    failure (network error, malformed list/detail response, a matched
+    record missing a field it should always have) -- never for a healthy
+    "nothing published for this cycle yet" or "no match this year", both
+    of which a strategy should signal by returning None (or []) from its
+    own discovery function instead. Collapsing the two would silently
+    report a broken feed as a healthy empty cycle -- originally a private
+    class duplicated near-word-for-word in state_candidates_or.py and
+    state_candidates_vt.py before being pulled in here."""

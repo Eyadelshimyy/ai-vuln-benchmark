@@ -1,0 +1,28 @@
+{
+  "repo": "DeepCivic__womblex",
+  "file": "src/womblex/cli/ui.py",
+  "function": "cmd_ui",
+  "line": 56,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Serve the read-only console sidecar over the resolved run source.",
+  "prompt_source": "def cmd_ui(args: argparse.Namespace) -> int:\n    \"\"\"Serve the read-only console sidecar over the resolved run source.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def cmd_ui(args: argparse.Namespace) -> int:\n    \"\"\"Serve the read-only console sidecar over the resolved run source.\"\"\"\n    try:\n        import uvicorn\n\n        from womblex.ui.app import create_app\n        from womblex.ui.deps import resolve_settings\n    except ImportError:\n        logger.error(\"`womblex ui` requires the 'ui' extra. Install with: pip install womblex[ui]\")\n        return 1\n\n    try:\n        settings = resolve_settings(\n            args.output_root, args.store,\n            db_dsn=args.dsn, presets_dir=args.presets_dir,\n            ingest_uri=args.ingest,\n        )\n    except ValueError as e:\n        logger.error(\"%s\", e)\n        return 1\n\n    app = create_app(\n        output_root=settings.output_root,\n        store_uri=settings.store_uri,\n        db_dsn=settings.db_dsn,\n        presets_dir=settings.presets_dir,\n        ingest_uri=settings.ingest_uri,\n    )\n    source = settings.store_uri or settings.output_root\n    logger.info(\"womblex ui: serving %s on %s:%d\", source, args.host, args.port)\n    uvicorn.run(app, host=args.host, port=args.port)\n    return 0",
+  "module_source": "\"\"\"UI CLI subcommand: ``womblex ui`` (console sidecar).\n\nThe console is an admin and debugging utility; integrations use\n``womblex serve``.\n\nBinds to loopback by default. The console has no authentication by design\n\u2014 it is kept undiscoverable at the network layer instead \u2014 so exposing it\nbeyond localhost is an explicit ``--host`` choice the operator makes\nalongside whatever fronts it.\n\"\"\"\nfrom __future__ import annotations\n\nimport argparse\nimport logging\nfrom pathlib import Path\n\nfrom womblex.cli._shared import Command\n\nlogger = logging.getLogger(\"womblex\")\n\n\ndef _register_ui(p: argparse.ArgumentParser) -> None:\n    target = p.add_mutually_exclusive_group()\n    target.add_argument(\n        \"--output-root\", type=Path, default=None,\n        help=\"Local run root \u2014 the parent of run-*/ dirs (or $WOMBLEX_UI_OUTPUT_ROOT).\",\n    )\n    target.add_argument(\n        \"--store\", default=None,\n        help=\"Object-store base URI containing runs/ (or $WOMBLEX_STORE_URI). \"\n             \"Needs the 'cloud' extra.\",\n    )\n    p.add_argument(\"--host\", default=\"127.0.0.1\", help=\"Bind address. Default: 127.0.0.1.\")\n    p.add_argument(\"--port\", type=int, default=8080, help=\"Bind port. Default: 8080.\")\n    p.add_argument(\n        \"--dsn\", default=None,\n        help=\"Postgres DSN for the job queue the dashboard reads \"\n             \"(or $WOMBLEX_DB_DSN / $DATABASE_URL). Optional: without one the \"\n             \"dashboard falls back to the run's per-stage checkpoints.\",\n    )\n    p.add_argument(\n        \"--presets-dir\", type=Path, default=None,\n        help=\"Writable dir the Pipeline Composer saves operator-authored presets \"\n             \"into (or $WOMBLEX_UI_PRESETS_DIR). Without one, built-in presets \"\n             \"still serve but saving is disabled.\",\n    )\n    p.add_argument(\n        \"--ingest\", default=None,\n        help=\"Object-store base URI (or local path) source documents arrive at \"\n             \"(or $WOMBLEX_INGEST_URI). Must be disjoint from --store's runs/ \"\n             \"output. Without one, the Execution Controls can configure and \"\n             \"audit but not dispatch.\",\n    )\n\n\ndef cmd_ui(args: argparse.Namespace) -> int:\n    \"\"\"Serve the read-only console sidecar over the resolved run source.\"\"\"\n    try:\n        import uvicorn\n\n        from womblex.ui.app import create_app\n        from womblex.ui.deps import resolve_settings\n    except ImportError:\n        logger.error(\"`womblex ui` requires the 'ui' extra. Install with: pip install womblex[ui]\")\n        return 1\n\n    try:\n        settings = resolve_settings(\n            args.output_root, args.store,\n            db_dsn=args.dsn, presets_dir=args.presets_dir,\n            ingest_uri=args.ingest,\n        )\n    except ValueError as e:\n        logger.error(\"%s\", e)\n        return 1\n\n    app = create_app(\n        output_root=settings.output_root,\n        store_uri=settings.store_uri,\n        db_dsn=settings.db_dsn,\n        presets_dir=settings.presets_dir,\n        ingest_uri=settings.ingest_uri,\n    )\n    source = settings.store_uri or settings.output_root\n    logger.info(\"womblex ui: serving %s on %s:%d\", source, args.host, args.port)\n    uvicorn.run(app, host=args.host, port=args.port)\n    return 0\n\n\nCOMMANDS = [\n    Command(\"ui\", \"Serve the read-only console sidecar over a run's artefacts\", _register_ui, cmd_ui),\n]\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 1
+    },
+    "ai_commit": "373c29262449",
+    "evidence": "Co-authored-by: Claude <noreply@anthropic.com>",
+    "ai_line_fraction": 0.031,
+    "span": [
+      56,
+      87
+    ]
+  }
+}

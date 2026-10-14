@@ -1,0 +1,15 @@
+.
+can_logger/p0
+mf4_analyzer
+mf4_analyzer/acquisition_capture
+mf4_analyzer/acquisition_ui
+mf4_analyzer/acquisition_ui/main_window
+mf4_analyzer/help
+mf4_analyzer/io
+mf4_analyzer/ui
+mf4_analyzer/ui/drawers/batch
+mf4_analyzer/ui/pg_canvas
+scripts
+tests
+tools
+tools/matlab_ports

@@ -1,0 +1,28 @@
+{
+  "repo": "VibeBB__fpga-agent",
+  "file": "src/fpga/formal.py",
+  "function": "run_formal",
+  "line": 63,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `run_formal` function (parameters: contract, contract_path, run, out_dir).",
+  "prompt_source": "def run_formal(\n    contract: FpgaContract, contract_path: Path, run: Formal, out_dir: Path\n) -> FormalResult:\n    \"\"\"Implement the `run_formal` function (parameters: contract, contract_path, run, out_dir).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def run_formal(\n    contract: FpgaContract, contract_path: Path, run: Formal, out_dir: Path\n) -> FormalResult:\n    work = resolve(contract_path, contract.build.dir) / f\"formal-{run.id}\"\n    work.mkdir(parents=True, exist_ok=True)\n    script = work / f\"{run.id}.sby\"\n    script.write_text(sby_text(contract, contract_path, run), encoding=\"utf-8\")\n    argv = [\"sby\", \"-f\", \"-d\", (work / \"run\").as_posix()]\n    if contract.design_language == \"vhdl\":\n        argv += [\"--yosys\", \"yosys -m ghdl\"]\n    argv.append(script.as_posix())\n    log = out_dir / f\"formal-{run.id}.log\"\n    log.unlink(missing_ok=True)\n    result = run_tool(argv, contract_path.parent, log, run.timeout_s)\n    status = _status(result.output)\n    ok = result.ok and status == \"PASS\"\n    detail = \"\" if ok else (result.detail or f\"sby status {status}\")\n    if not ok and status not in (\"UNKNOWN\", \"\"):\n        detail = f\"sby status {status}\" + (f\" ({result.detail})\" if result.detail else \"\")\n    return FormalResult(ok, detail, argv, status, result.seconds)",
+  "module_source": "\"\"\"Formal verification with SymbiYosys.\n\nThe ``.sby`` script is generated from the contract so the proof always\nreads the same sources as synthesis. VHDL designs go through the\nghdl-yosys-plugin (PSL ``assert``/``assume``/``cover``); Verilog designs\nare read with ``read_verilog -formal`` and ``FORMAL`` defined (immediate\nand concurrent SVA subset supported by Yosys).\n\"\"\"\n\nfrom __future__ import annotations\n\nfrom dataclasses import dataclass\nfrom pathlib import Path\n\nfrom .contract import Formal, FpgaContract, resolve\nfrom .hdl import ghdl_args, include_dirs, param_text, units, verilog_read\nfrom .toolrun import run_tool\n\n\n@dataclass\nclass FormalResult:\n    ok: bool\n    detail: str\n    argv: list[str]\n    status: str\n    seconds: float\n\n\ndef sby_text(contract: FpgaContract, contract_path: Path, run: Formal) -> str:\n    unit_list = units(contract, contract_path, run.sources)\n    if contract.design_language == \"vhdl\":\n        read = [f\"ghdl {ghdl_args(contract, unit_list, run.top, run.parameters)}\"]\n    else:\n        read = verilog_read(\n            contract, unit_list, formal=True, includes=include_dirs(contract, contract_path)\n        )\n        chparams = \" \".join(f\"-chparam {k} {param_text(v)}\" for k, v in run.parameters.items())\n        read.append(f\"hierarchy -check -top {run.top} {chparams}\".rstrip())\n    return \"\\n\".join(\n        [\n            \"[options]\",\n            f\"mode {run.mode}\",\n            f\"depth {run.depth}\",\n            \"\",\n            \"[engines]\",\n            run.engine,\n            \"\",\n            \"[script]\",\n            *read,\n            f\"prep -top {run.top}\",\n            \"\",\n        ]\n    )\n\n\ndef _status(output: str) -> str:\n    for line in reversed(output.splitlines()):\n        if \"DONE (\" in line:\n            return line.split(\"DONE (\", 1)[1].split(\",\", 1)[0].split(\")\", 1)[0].strip()\n    return \"UNKNOWN\"\n\n\ndef run_formal(\n    contract: FpgaContract, contract_path: Path, run: Formal, out_dir: Path\n) -> FormalResult:\n    work = resolve(contract_path, contract.build.dir) / f\"formal-{run.id}\"\n    work.mkdir(parents=True, exist_ok=True)\n    script = work / f\"{run.id}.sby\"\n    script.write_text(sby_text(contract, contract_path, run), encoding=\"utf-8\")\n    argv = [\"sby\", \"-f\", \"-d\", (work / \"run\").as_posix()]\n    if contract.design_language == \"vhdl\":\n        argv += [\"--yosys\", \"yosys -m ghdl\"]\n    argv.append(script.as_posix())\n    log = out_dir / f\"formal-{run.id}.log\"\n    log.unlink(missing_ok=True)\n    result = run_tool(argv, contract_path.parent, log, run.timeout_s)\n    status = _status(result.output)\n    ok = result.ok and status == \"PASS\"\n    detail = \"\" if ok else (result.detail or f\"sby status {status}\")\n    if not ok and status not in (\"UNKNOWN\", \"\"):\n        detail = f\"sby status {status}\" + (f\" ({result.detail})\" if result.detail else \"\")\n    return FormalResult(ok, detail, argv, status, result.seconds)\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 20
+    },
+    "ai_commit": "6cd9aacd33d2",
+    "evidence": "author/committer='devin-ai-integration[bot] <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      63,
+      82
+    ]
+  }
+}

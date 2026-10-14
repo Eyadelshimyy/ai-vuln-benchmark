@@ -1,0 +1,207 @@
+"""Ready-triggered "prepare now" automation (design agreed with Silvio 2026-07-02): the moment the
+car goes READY (ignition/power-on, signal 1258), fire a one-shot climate/seats/windows preparation
+— the same action as manually tapping "Prepara Ora", but automatic. Optionally gated on the
+interior temperature (e.g. only pre-cool above 25°C, or only pre-heat below 5°C — no external-temp
+signal exists in the cloud API, so the condition is necessarily interior-only).
+
+Edge-triggered, NOT repeated: fires ONCE per Ready session (Ready OFF→ON), never re-fires while
+still Ready even if the temperature condition changes truth value mid-session, and does not
+re-fire for a later trip within the same session — a Ready session can span several Mate trips
+(see db_reader.ready_session(): "the cloud's SESSION runs from READY-on until the car is switched
+OFF, so it can span SEVERAL Mate trips + idle"). Two robustness rules, both lessons already learned
+on THIS exact signal elsewhere in the codebase:
+  - Debounce: `ready` occasionally blips OFF for a single poll (db_reader._READY_DEBOUNCE_S: "brief
+    ready=0 dips shorter than this — signal blips seen in the log"). Re-arming on the very first 0
+    seen would let a blip double-fire the action mid-session; only re-arm after `ready` has read 0
+    continuously for READY_DEBOUNCE_S.
+  - Restart safety: a poller restart mid-session must not re-fire the action just because this
+    module's own "previous ready" memory was lost — the first poll after (re)start only seeds
+    state, it never fires (mirrors Recorder._resume_or_close's reasoning for trip/charge sessions).
+
+Commands go through the POLLER's own already-authenticated session (client._api / client._vehicle,
+under the same api_lock the MQTT command bridge uses) — no second login, no session eviction risk.
+`build_prepare_bundle` is imported from web/command_client (a pure, session-free function — the
+exact same builder "Prepara Ora" uses) so the two paths can never drift into different payloads.
+"""
+import json
+import logging
+import time
+
+log = logging.getLogger("leapmotor.ready_automation")
+
+READY_DEBOUNCE_S = 60   # same job and same number as db_reader._READY_BLIP_S: how short a
+                        # ready=0 gap has to be to be a glitch rather than a real switch-off
+
+_VALID_PRESETS = {"cool", "heat", "vent", "defrost", "none"}
+_VALID_SEAT_MODES = {"off", "heat", "vent"}
+
+# The edge detector's memory, PER CAR: was Ready on last time, has this on-session already fired,
+# and since when has Ready been continuously off.
+#
+# 🔴 One set for the module was the single most damaging piece of shared state in the poller. Two
+# cars would have shared one `_fired`, so getting into the second car after the first would find the
+# automation already spent and preheat nothing; and they would have shared `_last_ready`, so car B
+# reporting Ready would read as a rising edge on car A and preheat the car nobody was in.
+_last_ready: dict = {}     # vin → bool (absent = unknown: startup/restart)
+_fired: dict = {}          # vin → already actuated for the CURRENT on-session
+_off_since: dict = {}      # vin → monotonic ts of the first continuous ready=0 poll
+
+
+def _config(db, vin: str = "") -> dict:
+    """Sanitised config for ONE car (JSON blob). Defensive against a hand-edited or partial DB
+    value — never raises, always returns safe defaults.
+
+    ⚠️ Takes the VIN because the poller runs over EVERY car, not over the one selected in the web:
+    reading the install-wide blob applied one car's climate answer to all of them."""
+    key = f"ready_automation_{vin.lower()}" if vin else "ready_automation"
+    blob = db.get_setting(key, "")
+    if not blob and not vin:
+        blob = db.get_setting("ready_automation", "")
+    try:
+        raw = json.loads(blob or "{}")
+        if not isinstance(raw, dict):
+            raw = {}
+    except (ValueError, TypeError):
+        raw = {}
+    ac_preset = raw.get("ac_preset")
+    if ac_preset not in _VALID_PRESETS:
+        ac_preset = None
+    try:
+        ac_temperature = float(raw.get("ac_temperature"))
+    except (TypeError, ValueError):
+        ac_temperature = 22.0
+    ac_temperature = max(18.0, min(ac_temperature, 32.0))
+    windows_pct = raw.get("windows_pct")
+    try:
+        windows_pct = None if windows_pct is None else max(0, min(int(windows_pct), 100))
+    except (TypeError, ValueError):
+        windows_pct = None
+
+    def _seat(key):
+        v = raw.get(key)
+        return v if v in _VALID_SEAT_MODES else "off"
+
+    try:
+        temp_value = float(raw.get("temp_value"))
+    except (TypeError, ValueError):
+        temp_value = 25.0
+    return {
+        "enabled":         bool(raw.get("enabled")),
+        "temp_enabled":    bool(raw.get("temp_enabled")),
+        "temp_comparator": raw.get("temp_comparator") if raw.get("temp_comparator") in (">", "<") else ">",
+        "temp_value":      temp_value,
+        "ac_preset":       ac_preset,
+        "ac_temperature":  ac_temperature,
+        "windows_pct":     windows_pct,
+        "seat_driver":     _seat("seat_driver"),   # per-seat, matches Prepara Ora's own two
+        "seat_copilot":    _seat("seat_copilot"),  # independent driver/passenger selectors
+        "steering":        bool(raw.get("steering")),
+        "mirror":          bool(raw.get("mirror")),
+    }
+
+
+def _condition_met(cfg: dict, inside_temp) -> bool:
+    """Whether the optional interior-temperature condition holds.
+
+    ⚠️ An UNKNOWN temperature is not a cold one. Since #144 a car that never reports the cabin
+    sends None here instead of a fabricated 0.0 — and 0.0 satisfied "only pre-heat below 5 °C" on
+    every single poll, so the automation fired every time the car was switched on, all year. It is
+    refused explicitly, and said out loud: "the condition could not be evaluated" is a different
+    fact from "the condition is false", and a silent TypeError swallowed by the caller's guard would
+    have looked like the latter."""
+    if not cfg["temp_enabled"]:
+        return True
+    if inside_temp is None:
+        log.info("Ready automation: the car reports no interior temperature, so the temperature "
+                 "condition cannot be evaluated — not firing")
+        return False
+    if cfg["temp_comparator"] == ">":
+        return inside_temp > cfg["temp_value"]
+    return inside_temp < cfg["temp_value"]
+
+
+def _ensure_web_on_path() -> None:
+    """Same cross-directory trick Recorder._read_wallbox uses for ha_client — web/ isn't
+    normally on the poller's sys.path, but command_client.py's own imports are lightweight
+    (the cloud client + stdlib, no fastapi), so it's safe to reach into from here."""
+    import sys
+    import pathlib
+    web = str(pathlib.Path(__file__).resolve().parent.parent / "web")
+    if web not in sys.path:
+        sys.path.insert(0, web)
+
+
+def _build_bundle(cfg: dict) -> dict:
+    _ensure_web_on_path()
+    from command_client import build_prepare_bundle   # pure function, no session state
+    seats = None
+    if cfg["seat_driver"] != "off" or cfg["seat_copilot"] != "off":
+        seats = {"driver": cfg["seat_driver"], "copilot": cfg["seat_copilot"]}
+    return build_prepare_bundle(
+        ac_preset=cfg["ac_preset"], ac_temperature=cfg["ac_temperature"],
+        seats=seats, steering=cfg["steering"], mirror=cfg["mirror"],
+    )
+
+
+def _windows_native(pct: int, car_type: str) -> str:
+    _ensure_web_on_path()
+    from command_client import _WINDOWS_SCALE   # same native-scale table the web side uses —
+    full = _WINDOWS_SCALE.get((car_type or "").upper(), 100)   # imported, not duplicated: this
+    return str(round(max(0, min(pct, 100)) / 100 * full))      # table gets corrected per-model
+
+
+def maybe_trigger(db, client, data, api_lock, now: float = None, vehicle=None) -> bool:
+    """Per-poll hook: fire the automation on a Ready OFF→ON edge if enabled and the optional
+    temperature condition is met. Best-effort — never raises, a failure can't disturb the poll.
+    Returns True when a command was actually sent.
+
+    `vehicle` is the car this frame came from. It decides both whose edge is being watched and
+    WHICH CAR gets preheated — the commands used to go to `client._vehicle`, the first car on the
+    account, so with two cars a Ready edge on the second would have warmed up the first."""
+    vehicle = vehicle or client._vehicle
+    vin = getattr(vehicle, "vin", "") or ""
+    now = time.monotonic() if now is None else now
+    ready = bool(getattr(data, "ready", False))
+    try:
+        if vin not in _last_ready:
+            _last_ready[vin] = ready  # first poll after (re)start: seed only, never fire
+            return False
+
+        if not ready:
+            if _off_since.get(vin) is None:
+                _off_since[vin] = now
+            if now - _off_since[vin] >= READY_DEBOUNCE_S:
+                _fired[vin] = False   # confirmed off long enough — re-arm for the next session
+            _last_ready[vin] = False
+            return False
+        _off_since[vin] = None        # any ready=1 poll clears a pending debounce window
+
+        rising_edge = not _last_ready[vin]
+        _last_ready[vin] = True
+        if not rising_edge or _fired.get(vin):
+            return False
+        _fired[vin] = True            # a real Ready-on happened — never re-evaluate mid-session,
+                                       # even if the temperature crosses the threshold later on
+
+        cfg = _config(db, getattr(data, 'vin', '') or '')
+        if not cfg["enabled"] or not _condition_met(cfg, getattr(data, "inside_temp", None)):
+            return False
+
+        bundle = _build_bundle(cfg)
+        sent = False
+        with api_lock:
+            if bundle:
+                client._api.prepare_car(vin, params=bundle)
+                sent = True
+            if cfg["windows_pct"] is not None:
+                client._api.windows(vin, value=_windows_native(
+                    cfg["windows_pct"], getattr(vehicle, "car_type", "")))
+                sent = True
+        if sent:
+            log.info("Ready automation fired on %s: bundle=%s windows_pct=%s (inside_temp=%.1f)",
+                     vin[-4:] or "?", list(bundle.keys()), cfg["windows_pct"],
+                     getattr(data, "inside_temp", None))
+        return sent
+    except Exception as e:  # noqa: BLE001
+        log.warning("Ready automation failed: %s", e)
+        return False

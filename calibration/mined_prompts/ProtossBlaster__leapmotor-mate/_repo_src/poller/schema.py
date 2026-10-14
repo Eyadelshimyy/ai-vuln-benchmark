@@ -1,0 +1,705 @@
+"""The database schema, and the one function that brings a file up to it.
+
+Deliberately a module of its OWN, importing nothing from the rest of Mate. The WEB has to be able to
+run this — it reads these tables and until v3.6.6 merely hoped the poller had migrated them, which
+cost a 500 on the Charges page and on every trip detail for anyone whose poller had not started.
+
+Its own module rather than an import from `db`, because `poller/db.py` pulls in `crypto` and
+`geohash`, and `web/` has files by BOTH of those names — `geohash.py` differs between the two by 64
+lines. Reaching into the poller from the web would have loaded the wrong ones under the right names,
+and the first attempt at exactly that also put `poller/` ahead of `web/` on the path, so uvicorn
+re-imported `poller/main.py` and the web would not boot at all. Nothing here imports anything, so
+none of that can happen.
+"""
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vehicles (
+    id          INTEGER PRIMARY KEY,
+    vin         TEXT UNIQUE NOT NULL,
+    car_type    TEXT,
+    year        INTEGER,
+    created_at  TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS positions (
+    id           INTEGER PRIMARY KEY,
+    vehicle_id   INTEGER REFERENCES vehicles(id),
+    recorded_at  TEXT NOT NULL,
+    latitude     REAL,
+    longitude    REAL,
+    speed_kmh    REAL,
+    odometer_km  REAL,
+    soc                 REAL,
+    outside_temp        REAL,
+    inside_temp         REAL,
+    climate_target_temp REAL,
+    battery_min_temp    REAL,
+    range_km            REAL,
+    gear             TEXT,
+    charging         INTEGER DEFAULT 0,
+    is_locked        INTEGER DEFAULT NULL,
+    climate_on       INTEGER DEFAULT NULL,
+    climate_cooling  INTEGER DEFAULT NULL,
+    climate_heating  INTEGER DEFAULT NULL,
+    climate_defrost  INTEGER DEFAULT NULL,
+    trunk_open       INTEGER DEFAULT NULL,
+    windows_open     INTEGER DEFAULT NULL,
+    sunshade_pct     INTEGER DEFAULT NULL,   -- how far the sunshade is open, % (signal 1724); NULL = not said
+    plug_connected   INTEGER DEFAULT NULL,
+    ready            INTEGER DEFAULT NULL,
+    charge_completed INTEGER DEFAULT NULL,
+    security_active  INTEGER DEFAULT NULL,
+    windows_open_count INTEGER DEFAULT NULL,
+    door_driver_open     INTEGER DEFAULT NULL,
+    door_passenger_open  INTEGER DEFAULT NULL,
+    door_rear_left_open  INTEGER DEFAULT NULL,
+    door_rear_right_open INTEGER DEFAULT NULL,
+    window_fl_open       INTEGER DEFAULT NULL,
+    window_rl_open       INTEGER DEFAULT NULL
+);
+
+CREATE TABLE IF NOT EXISTS trips (
+    id                   INTEGER PRIMARY KEY,
+    vehicle_id           INTEGER REFERENCES vehicles(id),
+    started_at           TEXT,
+    ended_at             TEXT,
+    start_lat            REAL,
+    start_lon            REAL,
+    end_lat              REAL,
+    end_lon              REAL,
+    distance_km          REAL,
+    start_soc            REAL,
+    end_soc              REAL,
+    start_odometer_km    REAL,
+    end_odometer_km      REAL,
+    regen_kwh            REAL DEFAULT 0,
+    duration_min         REAL,
+    efficiency_kwh_100km REAL,
+    efficiency_soc       REAL,                    -- backup of the SoC-derived efficiency (EC override is reversible)
+    ec_kwh               REAL,                    -- cloud getEC total for this trip (driving energy)
+    ec_driving           REAL,
+    ec_ac                REAL,
+    ec_other             REAL,
+    ec_tried             INTEGER DEFAULT 0,       -- EC enrichment attempts (cloud aggregation lags a fresh trip)
+    ec_stable            INTEGER DEFAULT 0,       -- 1 once the cloud EC stabilised (two equal reads) → stop re-fetching
+    merged_into_id       INTEGER DEFAULT NULL,
+    note                 TEXT,                    -- #107: optional free-text user note (traffic, weather, road…)
+    drive_mode           TEXT,                    -- #107: manual tag — 'comfort' / 'normal' / 'sport' (not in cloud)
+    one_pedal            INTEGER                  -- #107: manual tag — 1 on / 0 off / NULL not set (not in cloud)
+);
+
+CREATE TABLE IF NOT EXISTS trip_positions (
+    id          INTEGER PRIMARY KEY,
+    trip_id     INTEGER REFERENCES trips(id),
+    recorded_at TEXT NOT NULL,
+    latitude    REAL NOT NULL,
+    longitude   REAL NOT NULL,
+    speed_kmh   REAL,
+    soc         REAL
+);
+
+-- What the poller reads of another device during a poll, by role (see the kinds below SCHEMA):
+-- the home wallbox's power and counter while a charge runs there. Kept for good, like trip_positions,
+-- so the chart's wallbox line outlives Home Assistant's history, which its recorder purges.
+CREATE TABLE IF NOT EXISTS ha_samples (
+    id          INTEGER PRIMARY KEY,
+    vehicle_id  INTEGER REFERENCES vehicles(id),
+    recorded_at TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    value       REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS charges (
+    id               INTEGER PRIMARY KEY,
+    vehicle_id       INTEGER REFERENCES vehicles(id),
+    started_at       TEXT,
+    ended_at         TEXT,
+    start_soc        REAL,
+    end_soc          REAL,
+    energy_added_kwh REAL,
+    duration_min     REAL,
+    latitude         REAL,
+    longitude        REAL,
+    charge_type      TEXT DEFAULT 'AC',        -- AC / DC (from power level)
+    location_type    TEXT DEFAULT NULL,         -- HOME / AC / FAST / HPC (user-set)
+    max_power_kw     REAL,
+    cost             REAL,
+    ac_energy_kwh    REAL,         -- wallbox energy a HOME charge is billed on = sum of the counter's rises
+    wallbox_energy_start_kwh REAL, -- last wallbox counter reading seen (running baseline for that sum)
+    wb_stuck_kwh     REAL,         -- #215: kWh the CAR reported drawing while the counter never moved
+    wb_dark_min      REAL,         -- #295: minutes this charge was open at the wallbox with NO counter
+                                   -- reading taken — time nobody measured, so the AC total is short
+                                   -- by an unknown amount. Counted in minutes, never in kWh: with
+                                   -- no reading there is nothing to count kWh from.
+    gross_kwh        REAL,         -- #222: kWh the CHARGER says it delivered, TYPED BY THE OWNER.
+                                   -- Never measured by Mate and never mixed with the measured
+                                   -- figures: it prices the charge (like a wallbox meter does at
+                                   -- home) and shows the conversion loss. The energy Mate reports
+                                   -- and totals stays the battery (DC) one — see _billed_kwh.
+    gross_kwh_from   INTEGER,      -- the row whose gross_kwh covers THIS row: its own id, or the
+                                   -- merged charge's parent when the figure was typed on the merged
+                                   -- card. Merging rewrites no row, so this is the only record of
+                                   -- which pieces a typed figure was typed for; a merged charge's
+                                   -- energy counts that figure once for those pieces and every
+                                   -- other piece on its own. Written by the web with the figure.
+    solar_kwh        REAL,         -- #272: kWh of this charge that came off the owner's own roof,
+                                   -- TYPED BY THE OWNER. Subtracted from the measured wallbox
+                                   -- energy before pricing, so only the grid share is billed.
+                                   -- Like gross_kwh it is a payment fact, never a measurement:
+                                   -- the energy Mate reports stays ac_energy_kwh.
+    note             TEXT,         -- #107: optional free-text user note (location, shade, weather…)
+    merged_into_id   INTEGER DEFAULT NULL  -- user merge: a child charge points at its parent. The
+                                   -- car declares the CABLE GONE the instant the current stops, so
+                                   -- one plug-in comes back as several rows (beta #29: a single
+                                   -- 30-second frame; a load-balancing wallbox: six rows from one
+                                   -- night). A grace window would have to guess how long a real
+                                   -- pause lasts, and a closed charge is never recomputed — so the
+                                   -- user joins the rows instead, and can split them again.
+);
+
+CREATE TABLE IF NOT EXISTS maintenance_logs (
+    id               INTEGER PRIMARY KEY,
+    vehicle_id       INTEGER REFERENCES vehicles(id),
+    service_type     TEXT NOT NULL,             -- matches a pack item's service_type
+    done_date        TEXT NOT NULL,             -- ISO date the service was performed
+    done_odometer_km REAL,                       -- odometer at the service (prefilled with current)
+    note             TEXT,
+    created_at       TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_positions_vehicle ON positions(vehicle_id, recorded_at);
+-- One car's rows in the order they were written: the odometer baseline a restart reads back
+-- (Database.get_last_odometer_reading) walks them from the newest without sorting the history.
+CREATE INDEX IF NOT EXISTS idx_positions_vehicle_order ON positions(vehicle_id, id);
+CREATE INDEX IF NOT EXISTS idx_trip_positions_trip ON trip_positions(trip_id);
+CREATE INDEX IF NOT EXISTS idx_ha_samples_kind ON ha_samples(vehicle_id, kind, recorded_at);
+CREATE INDEX IF NOT EXISTS idx_trips_vehicle ON trips(vehicle_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_charges_vehicle ON charges(vehicle_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_maintenance_vehicle ON maintenance_logs(vehicle_id, service_type);
+-- Charge/Wallbox queries (power curve, time-of-use cost split, "has power" EXISTS)
+-- filter charging=1 and range/scan recorded_at; a small partial index keeps them
+-- fast as `positions` grows to millions of rows (~8% of rows are charging=1).
+CREATE INDEX IF NOT EXISTS idx_positions_charging_recorded ON positions(recorded_at) WHERE charging = 1;
+
+-- Research / BetaTester mode only (MateBetaTesterOnly build). Full raw-signal history (delta:
+-- one row per signal that changed value), plus the tester's logbook. Empty/unused in the
+-- normal build. Pruned by retention so it can't grow unbounded.
+CREATE TABLE IF NOT EXISTS raw_signals_log (
+    id          INTEGER PRIMARY KEY,
+    vehicle_id  INTEGER,
+    ts          INTEGER NOT NULL,   -- epoch ms (signal timestamp)
+    sig_key     TEXT NOT NULL,      -- raw Leapmotor signal id, e.g. "3235"
+    value       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_raw_signals_ts ON raw_signals_log(ts);
+
+CREATE TABLE IF NOT EXISTS research_logbook (
+    id          INTEGER PRIMARY KEY,
+    ts          INTEGER NOT NULL,   -- epoch ms the note was added
+    note        TEXT NOT NULL       -- e.g. "engine started to charge while driving", "refueled to 100%"
+);
+
+-- Daily ledger of the car's OFFICIAL lifetime counters (cloud mileage/energy/detail: totalEnergy
+-- includes parked/standby, integer kWh) plus the getEC driving split over the window since the
+-- previous snapshot. Δ between two rows = total consumption incl. parked, error ≤ ±1 kWh at the
+-- window edges REGARDLESS of span (counter sampling — errors don't accumulate); Δ − getEC = the
+-- parked/standby share. Raw readings, stored as served, never corrected in place: counter resets
+-- and cloud gaps are handled at READ time (total_increasing-style). Silent phase-1 collector, no
+-- UI yet.
+CREATE TABLE IF NOT EXISTS energy_counter_snapshots (
+    id                INTEGER PRIMARY KEY,
+    vin               TEXT NOT NULL,
+    taken_at          TEXT NOT NULL,     -- UTC ISO
+    total_energy_kwh  INTEGER,           -- lifetime consumption counter, integer kWh as served
+    total_mileage_km  REAL,              -- from the 0.1-mile field ×1.609344 (finer than the km int)
+    ec_driving_kwh    REAL,              -- getEC over [previous snapshot's taken_at, taken_at]
+    ec_ac_kwh         REAL,
+    ec_other_kwh      REAL,
+    ec_status         TEXT               -- 'first' | 'ok' | 'empty' (no driving) | 'miss' (cloud gap)
+);
+CREATE INDEX IF NOT EXISTS idx_energy_snap_vin_taken ON energy_counter_snapshots(vin, taken_at);
+
+-- Kilometres the car covered while the cloud had nothing new to say. They belong to no trip: the
+-- silence may hold the tail of one drive, a night's parking and the start of another, and nothing
+-- in the data says how it divides. So they are recorded HERE rather than welded onto whichever
+-- trip opens next, and stay out of distances, consumption and costs — both halves of the fraction
+-- together, or the consumption figures get worse instead of better.
+CREATE TABLE IF NOT EXISTS offline_gaps (
+    id             INTEGER PRIMARY KEY,
+    vehicle_id     INTEGER NOT NULL,
+    started_at     TEXT NOT NULL,     -- UTC ISO: when the cloud last had NEWS (not the last poll)
+    ended_at       TEXT NOT NULL,     -- UTC ISO: when it spoke again
+    odometer_start REAL,
+    odometer_end   REAL,
+    distance_km    REAL NOT NULL,
+    soc_start      REAL,
+    soc_end        REAL,
+    energy_kwh     REAL               -- ΔSoC × the capacity in force then; 0 when the SoC rose
+);
+CREATE INDEX IF NOT EXISTS idx_offline_gaps_vehicle ON offline_gaps(vehicle_id, started_at);
+
+-- One row per poll and per login attempt, so "is Mate getting data?" is answered from a table
+-- instead of counted by hand out of the log (#300). `outcome` is what the REQUEST did; the frame's
+-- own age sits beside it, measured at poll time, because an answer can carry a frame that is hours
+-- old and a repeated frame can still be current. Kept a week.
+CREATE TABLE IF NOT EXISTS poll_log (
+    id           INTEGER PRIMARY KEY,
+    at           TEXT NOT NULL,       -- UTC ISO, the poll clock
+    vehicle_id   INTEGER,             -- NULL on a login row: the session is the account's
+    kind         TEXT NOT NULL,       -- 'poll' | 'login'
+    outcome      TEXT NOT NULL,       -- poll: answer|empty|failed|refused · login: ok|refused|failed
+    frame_age_s  INTEGER,             -- poll+answer: host clock − car clock; NULL = no clock, or ahead
+    process      TEXT,                -- login: 'poller' | 'web'
+    reason       TEXT                 -- failed/refused: the error, truncated
+);
+CREATE INDEX IF NOT EXISTS idx_poll_log_at ON poll_log(at);
+
+-- One row per change of a car's state that held for two frames (poller/events.py): `state` 1 opens
+-- a span of `kind`, 0 closes it, and `at` is the first frame's `recorded_at`. The next row of the
+-- same car and kind IN ID ORDER is the span's other end, which a stepped host clock cannot reorder.
+-- The position, charge level, odometer and temperatures are the first frame's. Pruned with `positions`.
+CREATE TABLE IF NOT EXISTS events (
+    id           INTEGER PRIMARY KEY,
+    vehicle_id   INTEGER NOT NULL,
+    kind         TEXT NOT NULL,
+    at           TEXT NOT NULL,       -- UTC ISO, the host clock
+    frame_ts     INTEGER,             -- the car's own clock on that frame, when it had one
+    state        INTEGER NOT NULL,    -- 1 = the state began, 0 = it ended; a level kind: the level reached
+    latitude     REAL,
+    longitude    REAL,
+    soc          REAL,
+    odometer_km  REAL,
+    inside_temp  REAL,
+    climate_target_temp REAL,
+    outside_temp REAL
+);
+CREATE INDEX IF NOT EXISTS idx_events_vehicle_kind_id ON events(vehicle_id, kind, id);
+
+-- The address of a spot a trip started or ended at, one row per geohash-8 cell (19 m north to south, at
+-- most 38 m across) and shared by every car: web/place_lookup.py fills it, a trip finds its ends' rows
+-- by their coordinates. The parts mean the same whoever answered (web/geocode.py maps each provider).
+CREATE TABLE IF NOT EXISTS addresses (
+    id            INTEGER PRIMARY KEY,
+    geohash       TEXT NOT NULL UNIQUE,  -- geohash-8 of the point asked about
+    latitude      REAL NOT NULL,
+    longitude     REAL NOT NULL,
+    provider      TEXT NOT NULL,         -- who gave the answer kept here (or failed, with nothing kept)
+    status        TEXT NOT NULL,         -- found | none (the provider has nothing there) | failed
+    attempts      INTEGER NOT NULL DEFAULT 0,   -- failures in a row of retry_provider
+    retry_at      TEXT,                  -- UTC ISO: retry_provider is not asked again before it
+    retry_provider TEXT,                 -- whose failures those are: a refresh can fail at another one
+    name          TEXT,                  -- the place's own name: a shop, a station
+    house_number  TEXT,
+    road          TEXT,
+    suburb        TEXT,
+    locality      TEXT,                  -- city, town or village
+    postcode      TEXT,
+    country_code  TEXT,                  -- ISO 3166-1, lower case
+    display_name  TEXT,                  -- the provider's full text
+    looked_up_at  TEXT NOT NULL          -- UTC ISO
+);
+"""
+
+# The kinds `ha_samples` holds, each in the unit its name says. A role, not an entity id, so a sensor
+# mapped anew keeps the readings its predecessor gave readable.
+WALLBOX_POWER_KW = "wallbox_power_kw"
+WALLBOX_ENERGY_KWH = "wallbox_energy_kwh"
+
+
+# A reading that is a sample of a charge: the car's own flag, or current entering the pack while parked.
+# The partial index below is built on it; web/db_reader._charging_sample asks the same with a table alias.
+CHARGE_SAMPLE = ("charging = 1 OR (charge_current_a <= -0.5 AND "
+                 "COALESCE(speed_kmh, 0) <= 2 AND COALESCE(gear, 'P') = 'P')")
+
+
+def _add_column(conn, sql: str) -> None:
+    """One `ALTER TABLE … ADD COLUMN`, tolerating the column already being there.
+
+    `ensure_schema` is run by the poller AND by the web — that is the whole reason it exists as its
+    own function. On an install being upgraded, both read `PRAGMA table_info(...)` at boot, both see
+    the same column missing, and both issue the same ALTER. Whoever arrives second is told
+    `duplicate column name`, which is not a failure: the column is there, which is all the caller
+    wanted. Raised, though, it left `ensure_schema` — and every migration BELOW that line never ran
+    for that process.
+
+    Measured on @dommi1966's install (#338, 29/09/2026): its web log carries exactly one line,
+    `Schema check skipped: duplicate column name: ac_port_mode`, and `ac_port_mode` sits two thirds
+    of the way down the function. The climate columns, the REEV columns, `fuel_liters`, `frame_ts`,
+    `abilities` and every trips / trip_positions migration come after it.
+
+    ⚠️ ONLY that one message, and only on an ADD COLUMN. A missing table, a bad type, an index the
+    table cannot take: all still raise, because a database that really cannot be migrated has to
+    say so. → tests/test_a_column_another_process_added_does_not_stop_the_migration.py
+    🔑 Caught by its MESSAGE, not by `sqlite3.OperationalError` — this module imports nothing, on
+    purpose (see the module docstring: `web/` has files named like the poller's and a stray import
+    here would load the wrong ones). The message is what decides in either case; only sqlite3 raises
+    out of `conn.execute` here, and anything that is not that one sentence goes straight back up.
+    """
+    try:
+        conn.execute(sql)
+    except Exception as exc:                          # noqa: BLE001 — re-raised below unless it is THE one
+        if "duplicate column name" not in str(exc).lower():
+            raise
+
+
+def ensure_schema(conn) -> None:
+    """Create/alter everything Mate's tables need, and NOTHING else.
+
+    Lifted out of Database.__init__ so the WEB can run it too. The schema is the poller's, and the
+    web merely hoped it had run: v3.6.6 added `charges.gross_kwh`, the web named it in five queries,
+    and any install whose poller had not started yet answered 500 on the Charges page and on every
+    trip detail. Guarding that one column fixed that one column; this is what stops the next one.
+
+    Deliberately NOT the rest of __init__ — the constructor also runs eleven data repairs, deletes
+    phantom rows and migrates the secrets. Those belong to the process that owns the data; a reader
+    must not do them, least of all concurrently with the poller doing the same.
+
+    Idempotent by construction (every step is `IF NOT EXISTS`, `if column not in ...` or `INSERT OR IGNORE`)
+    and cheap: a handful of PRAGMAs on a database that is already up to date."""
+    conn.executescript(SCHEMA)
+    conn.execute("""CREATE TABLE IF NOT EXISTS charging_places (
+        id INTEGER PRIMARY KEY, vehicle_id INTEGER NOT NULL,
+        name TEXT NOT NULL, latitude REAL NOT NULL, longitude REAL NOT NULL,
+        radius_m REAL NOT NULL, rate REAL NOT NULL, enabled INTEGER NOT NULL DEFAULT 1
+    )""")
+    # A place used to always land a charge on HOME (disc #288 scoped v1 to a "second home", not
+    # a public charger). A place may instead declare its OWN type (AC/FAST/HPC/FREE), for a public station
+    # you charge at often and want typed and priced without confirming it by hand each
+    # time — existing places default to HOME, matching the behaviour before this column.
+    if "charge_type" not in {r[1] for r in conn.execute("PRAGMA table_info(charging_places)")}:
+        _add_column(conn, "ALTER TABLE charging_places ADD COLUMN charge_type TEXT NOT NULL DEFAULT 'HOME'")
+    place_cols = {r[1] for r in conn.execute("PRAGMA table_info(charges)")}
+    for column, kind in (("charging_place_id", "INTEGER"), ("charging_place_name", "TEXT"),
+                         ("charging_place_rate", "REAL"), ("charging_place_source", "TEXT")):
+        if column not in place_cols:
+            _add_column(conn, f"ALTER TABLE charges ADD COLUMN {column} {kind}")
+
+    # migration: add battery_min_temp if missing (existing DBs)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(positions)").fetchall()}
+    if "climate_target_temp" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN climate_target_temp REAL")
+    if "battery_min_temp" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN battery_min_temp REAL")
+    if "is_locked" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN is_locked INTEGER DEFAULT NULL")
+    if "climate_on" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN climate_on INTEGER DEFAULT NULL")
+    if "climate_cooling" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN climate_cooling INTEGER DEFAULT NULL")
+    if "climate_heating" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN climate_heating INTEGER DEFAULT NULL")
+    # The SoH estimate asks, once per charge, whether anyone was sitting in the car with the cabin
+    # heater or cooler running — a charge like that has its energy/SoC ratio distorted and is left
+    # out of the figure. `LIMIT 1` makes it look cheap; it is the opposite, because the answer is
+    # almost always "no" and proving a negative without an index means reading every frame in the
+    # window. Measured on a real database: 618.05 ms for 33 charges, `SCAN positions`, none of them
+    # with the cabin in use. With this index the plan is a SEARCH and the same 33 cost 0.10 ms.
+    # Partial, so it holds 2081 rows out of 374 511 and costs nothing to keep.
+    # 🔴 HERE, not in SCHEMA: on a database made before these columns existed they arrive with the
+    # ALTERs just above, and an index on them inside the schema script fails on a fresh database and
+    # takes the WHOLE script down with it — 1037 red tests the first time.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_cabin_use ON positions(vehicle_id, recorded_at)"
+                 " WHERE climate_cooling = 1 OR climate_heating = 1")
+    if "climate_defrost" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN climate_defrost INTEGER DEFAULT NULL")
+    if "trunk_open" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN trunk_open INTEGER DEFAULT NULL")
+    if "windows_open" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN windows_open INTEGER DEFAULT NULL")
+    # Replaces sunshade_open, whose 0/1 is not a percent; an older database keeps that column, unused.
+    if "sunshade_pct" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN sunshade_pct INTEGER DEFAULT NULL")
+    if "plug_connected" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN plug_connected INTEGER DEFAULT NULL")
+    if "remaining_charge_min" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN remaining_charge_min INTEGER DEFAULT NULL")
+    if "charge_voltage_v" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN charge_voltage_v REAL DEFAULT NULL")
+    if "charge_current_a" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN charge_current_a REAL DEFAULT NULL")
+    # The battery-health estimate asks this — _charging_sample()'s own "the flag, OR current +
+    # stationary + park" — up to four times per charge (energy, SoC-jump, cold-temp/odometer; the
+    # cabin-use probe below has its own index already). Same shape as idx_positions_cabin_use and
+    # idx_positions_v2l just below/above: a charge with no matching sample made SQLite walk forward
+    # through however much of the table came after it, because idx_positions_charging_recorded's
+    # own predicate is `charging = 1` alone, not this whole OR. Measured on a synthetic
+    # 1,000-charge/200k-position database: get_battery_health 16.6s -> 0.09s with this index. The
+    # literal -0.5 has to stay in step with db_reader._CHARGE_SAMPLE_MIN_A if that ever moves.
+    # 🔴 HERE, not in SCHEMA: charge_current_a arrives with the ALTER just above, so an index on it
+    # inside the schema script fails on a fresh database and takes the WHOLE script down with it.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_charge_sample ON positions(vehicle_id, recorded_at)"
+                 " WHERE " + CHARGE_SAMPLE)
+    if "ready" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN ready INTEGER DEFAULT NULL")
+    if "charge_completed" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN charge_completed INTEGER DEFAULT NULL")
+    if "security_active" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN security_active INTEGER DEFAULT NULL")
+    if "windows_open_count" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN windows_open_count INTEGER DEFAULT NULL")
+    # Per-door + left-side window state (the live Overview car image; the poller already computes
+    # these — see car_image.py). Names are fixed literals, never user input.
+    for _c in ("door_driver_open", "door_passenger_open", "door_rear_left_open",
+               "door_rear_right_open", "window_fl_open", "window_rl_open"):
+        if _c not in cols:
+            _add_column(conn, f"ALTER TABLE positions ADD COLUMN {_c} INTEGER DEFAULT NULL")
+    # migration: AC-port / V2L mode (signal 47). 0 idle / 1 AC charging / 2 V2L discharge. Lets the
+    # V2L monitor read per-poll mode AND lets get_vampire_drain EXCLUDE V2L periods (a parked V2L
+    # discharge must NOT be counted as standby/vampire drain).
+    if "ac_port_mode" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN ac_port_mode INTEGER DEFAULT NULL")
+    # V2L samples are a handful among hundreds of thousands of frames, and every page asks whether
+    # the car has used V2L lately. Without this the question is a scan of the whole window — 19731
+    # rows and 12.7 ms on a real database, four times that on an add-on, for an answer that is
+    # almost always "no". Partial, so it holds only the V2L rows and costs nothing to keep.
+    # 🔴 HERE, not in SCHEMA: the column it indexes is added by the ALTER above, so an index on it
+    # inside the schema script fails on a fresh database and takes the WHOLE script down with it.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_v2l ON positions(vehicle_id, recorded_at)"
+                 " WHERE ac_port_mode = 2")
+    # migration: extended climate panel (validated on-car 2026-06-20) — fan level (1941 acAirVolume,
+    # 1-7), recirculation (1943: 1=recirc / 0=fresh), base climate mode (3713: 0 auto/1 cool/3 heat/4 vent).
+    if "fan_level" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN fan_level INTEGER DEFAULT NULL")
+    if "recirculation" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN recirculation INTEGER DEFAULT NULL")
+    if "climate_mode" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN climate_mode INTEGER DEFAULT NULL")
+    # migration: REEV dual-energy for the live Overview — fuel tank level % (3235), range on fuel
+    # alone (3259), and combined battery+fuel range (3261). All NULL on a BEV; the status card shows
+    # them only when present (range-extender models). range_km stays the EV-only range (3260).
+    for _c in ("fuel_level_pct", "fuel_range_km", "combined_range_km"):
+        if _c not in cols:
+            _add_column(conn, f"ALTER TABLE positions ADD COLUMN {_c} REAL DEFAULT NULL")
+    # migration: the litres the car itself counts (signal 3263, millilitres → litres). Everything
+    # in litres was until now a percentage multiplied by an ASSUMED tank size, and the assumption
+    # was wrong on the C10 (47.5 L, not 50) — so every litre figure a C10 owner ever saw was 5 %
+    # high. With this the car does the counting. NULL on a BEV and on every row written before.
+    if "fuel_liters" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN fuel_liters REAL DEFAULT NULL")
+    # migration: the CAR's own timestamp on the frame this row came from (signal sts, or 1) — #178.
+    # `recorded_at` is when MATE wrote the row, which is always a few seconds ago; it says nothing
+    # about how old the data inside it is. When the car can't reach the cloud, the cloud keeps
+    # re-serving the last frame it got, so the row is new and its contents are not. Storing the
+    # frame's own time is what lets the web tell those two apart. NULL where the car doesn't
+    # report it (and on every row written before this column existed).
+    if "frame_ts" not in cols:
+        _add_column(conn, "ALTER TABLE positions ADD COLUMN frame_ts INTEGER DEFAULT NULL")
+    # migration: the car's DECLARED ability codes (VehicleAbility ints, stored as a JSON list) —
+    # lets the diagnostic + future capability-gating show ONLY what a model actually supports,
+    # instead of assuming every car has the same commands (#67; also covers models we don't own
+    # yet, e.g. the B05). Refreshed by ensure_vehicle on every poller start.
+    vcols = {r[1] for r in conn.execute("PRAGMA table_info(vehicles)").fetchall()}
+    if "abilities" not in vcols:
+        _add_column(conn, "ALTER TABLE vehicles ADD COLUMN abilities TEXT DEFAULT NULL")
+    # migration: PER-VEHICLE battery capacity (usable + as-new nominal for SoH). Capacity is a
+    # vehicle attribute — energy is written as ΔSoC×capacity — so with >1 car per account each
+    # needs its OWN (a B10's ~65 kWh vs a T03's ~36 kWh is ~80% off, and it corrupts the STORED
+    # trip/charge energy, not just the display). _backfill_vehicle_capacity() then seeds existing
+    # rows from the legacy global so a single-car install stays byte-identical.
+    if "capacity_kwh" not in vcols:
+        _add_column(conn, "ALTER TABLE vehicles ADD COLUMN capacity_kwh REAL DEFAULT NULL")
+    if "capacity_nominal_kwh" not in vcols:
+        _add_column(conn, "ALTER TABLE vehicles ADD COLUMN capacity_nominal_kwh REAL DEFAULT NULL")
+    # migration: per-charge wallbox AC energy (the "wallbox, to pay" figure) on existing DBs
+    ccols = {r[1] for r in conn.execute("PRAGMA table_info(charges)").fetchall()}
+    if "ac_energy_kwh" not in ccols:
+        _add_column(conn, "ALTER TABLE charges ADD COLUMN ac_energy_kwh REAL")
+    if "wallbox_energy_start_kwh" not in ccols:
+        _add_column(conn, "ALTER TABLE charges ADD COLUMN wallbox_energy_start_kwh REAL")
+    # migration: #215 — energy the car reported drawing while the wallbox counter stood still
+    if "wb_stuck_kwh" not in ccols:
+        _add_column(conn, "ALTER TABLE charges ADD COLUMN wb_stuck_kwh REAL")
+    # migration: #295 — minutes a charge sat open at the wallbox with no counter reading taken
+    if "wb_dark_min" not in ccols:
+        _add_column(conn, "ALTER TABLE charges ADD COLUMN wb_dark_min REAL")
+    # migration: #222 — the charger's own kWh, typed in for a public charge
+    if "gross_kwh" not in ccols:
+        _add_column(conn, "ALTER TABLE charges ADD COLUMN gross_kwh REAL")
+    # Backfill which pieces a legacy reading covers, without repricing stored costs. A group entry
+    # cleared its children's costs: infer that scope when the parent has an automatic price.
+    # With no parent price or a manual total, entry order is ambiguous; retain own positive readings.
+    # Pieces with their own costs stay independent; unpriced pieces without readings use the parent.
+    if "gross_kwh_from" not in ccols:
+        _add_column(conn, "ALTER TABLE charges ADD COLUMN gross_kwh_from INTEGER")
+        conn.execute("UPDATE charges SET gross_kwh_from=id WHERE gross_kwh > 0")
+        if "merged_into_id" in ccols:
+            # Older schemas encode manual pricing in the type, before cost_manual is added below.
+            automatic = "COALESCE(location_type, '') != 'MANUAL'"
+            if "cost_manual" in ccols:
+                automatic += " AND COALESCE(cost_manual, 0) = 0"
+            conn.execute("UPDATE charges SET gross_kwh_from=merged_into_id WHERE merged_into_id IN "
+                         "(SELECT id FROM charges WHERE gross_kwh > 0) AND cost IS NULL "
+                         "AND (COALESCE(gross_kwh, 0) <= 0 OR merged_into_id IN "
+                         f"(SELECT id FROM charges WHERE cost IS NOT NULL AND {automatic}))")
+    # migration: #272 — the owner's own solar kWh, subtracted from the wallbox energy before pricing
+    if "solar_kwh" not in ccols:
+        _add_column(conn, "ALTER TABLE charges ADD COLUMN solar_kwh REAL")
+    # migration: flag charges reconstructed from a SoC jump (car was asleep/offline to the
+    # cloud during the charge, so it was never seen live — recorded from the SoC delta instead).
+    if "reconstructed" not in ccols:
+        _add_column(conn, "ALTER TABLE charges ADD COLUMN reconstructed INTEGER DEFAULT 0")
+    # migration: WHY the charge stopped (#289). Reading a duration cannot tell a cable that came
+    # out from a car that fell asleep with Mate still watching — and on the bundle that started
+    # this, 9 of 13 charges are the second. One word, written at the close; diagnostic only, so
+    # nothing prices or counts on it. NULL means the row predates this column and nothing else:
+    # every path that writes a charge names its reason.
+    # → tests/test_a_charge_records_why_it_closed.py
+    if "close_reason" not in ccols:
+        _add_column(conn, "ALTER TABLE charges ADD COLUMN close_reason TEXT DEFAULT NULL")
+    # migration: WHEN the car ended its charge session, or, for one closed after an outage, its last reading.
+    # `ended_at` is when the charge stopped adding energy, minutes or hours earlier; what reads the session
+    # (a kWh helper in Home Assistant, the wallbox counter) reads up to this. NULL on rows older than the
+    # column and on manual and reconstructed charges, which had no session.
+    if "closed_at" not in ccols:
+        _add_column(conn, "ALTER TABLE charges ADD COLUMN closed_at TEXT DEFAULT NULL")
+    # migration: public charging-station label, resolved by the web layer from OSM
+    # (web/charger_locator.py; '' = looked up, nothing found). Display-only — it never
+    # feeds charge detection, costs or the HOME/AC/FAST/HPC location_type.
+    if "location_name" not in ccols:
+        _add_column(conn, "ALTER TABLE charges ADD COLUMN location_name TEXT DEFAULT NULL")
+    # migration: link back to the label's source page (openstreetmap.org / openchargemap.org),
+    # when the winning candidate had one (web/charger_locator.py _osm_url / OCM's poi/details
+    # URL). Display-only, like location_name — NULL on charges labelled before this column
+    # existed, until they're re-swept or manually recalculated (📍 button).
+    if "location_url" not in ccols:
+        _add_column(conn, "ALTER TABLE charges ADD COLUMN location_url TEXT DEFAULT NULL")
+    # migration: #107 — optional free-text user note on a charge (station location, shade,
+    # reliability, parking, weather, personal remarks). Display/context only, never computed on.
+    if "note" not in ccols:
+        _add_column(conn, "ALTER TABLE charges ADD COLUMN note TEXT")
+    # migration: #120 — mark a HOME charge as FREE (e.g. self-produced solar, or any free home
+    # charge). The charge KEEPS its Home location (stays on the Home side of the Home-vs-Public
+    # split) but its cost is pinned to 0 and protected from every recompute (compute_cost returns
+    # 0 when is_free). "Free-away" stays the FREE location_type — this flag is HOME-only.
+    if "is_free" not in ccols:
+        _add_column(conn, "ALTER TABLE charges ADD COLUMN is_free INTEGER DEFAULT 0")
+    # migration: #188 — mark a charge the user TYPED IN (the "add a past charge" form or the CSV
+    # import) as opposed to one the poller measured. location_type='MANUAL' cannot answer this:
+    # it doubles as the COST BASIS someone picks to type the price of a real charge, so an edit
+    # form gated on it would hand out the times and SoC of measured sessions to be rewritten.
+    # Existing rows are backfilled from the signature a typed-in charge has always carried — the
+    # MANUAL basis plus no telemetry whatsoever (the poller fills lat/lon at charge start and
+    # duration/peak power at the end, and a reconstructed charge gets both too).
+    if "manual_entry" not in ccols:
+        _add_column(conn, "ALTER TABLE charges ADD COLUMN manual_entry INTEGER DEFAULT 0")
+        conn.execute(
+            "UPDATE charges SET manual_entry = 1 "
+            "WHERE location_type = 'MANUAL' AND COALESCE(reconstructed, 0) = 0 "
+            "AND latitude IS NULL AND longitude IS NULL "
+            "AND duration_min IS NULL AND max_power_kw IS NULL AND ac_energy_kwh IS NULL")
+    # migration: location_type='MANUAL' used to mean two different things at once — a charge type
+    # (HOME/AC/FAST/HPC) AND "the cost was typed by hand, don't auto-price this". Picking Manual on
+    # a real HPC session lost its HPC tag for good: unfindable by type search, badge showing ✎
+    # instead of 🚀. `cost_manual` splits the second meaning out into its own column, going
+    # forward, so new charges never conflate the two again — every row that is 'MANUAL' today had
+    # its cost typed by hand by construction, so the backfill is unconditional.
+    #
+    # Deliberately NOT also fixed here: a charge already stuck on 'MANUAL' stays exactly that —
+    # its real original type (was it HOME? HPC? plain DC?) cannot be recovered from anything still
+    # on the row, so guessing risks getting it wrong with real money attached (an HPC session
+    # silently priced at the DC rate, or a HOME session losing its Home status and getting
+    # repriced as public AC). The badge already renders any unrecognized location_type — 'MANUAL'
+    # included — as "❓ Unconfirmed", so the owner can put the ONE fact only they know right with a
+    # single click, and cost_manual=1 (just above) means that click never touches the price they
+    # already typed. Left to a human, not guessed at.
+    if "cost_manual" not in ccols:
+        _add_column(conn, "ALTER TABLE charges ADD COLUMN cost_manual INTEGER DEFAULT 0")
+        conn.execute("UPDATE charges SET cost_manual = 1 WHERE location_type = 'MANUAL'")
+    # migration: #237 — the car's own odometer at the moment the charge started. Written by the
+    # poller from the same frame that opens the charge, TYPED by the owner on a charge they add by
+    # hand, and back-filled once from `positions` for sessions already in the DB (see
+    # Database._backfill_charge_odometer — measured 26 of 28 recoverable on a real B10, to the
+    # second, because both rows come from the SAME poll).
+    #
+    # 🔑 Why a stored column rather than a lookup: `positions` is prunable
+    # (positions_retention_days), so deriving it on the fly would quietly lose the odometer of
+    # every older charge on any install that prunes. And it is the ONLY way a charge from before
+    # Mate existed can carry kilometres at all — no poll of it was ever made.
+    if "odometer_km" not in ccols:
+        _add_column(conn, "ALTER TABLE charges ADD COLUMN odometer_km REAL")
+    # migration: manual charge-merge link — twin of the trips one below. A child charge points at
+    # the parent it was merged into; the merge writes ONLY this column, so unmerging restores the
+    # original rows exactly. See the CREATE TABLE above for why the rows arrive split.
+    if "merged_into_id" not in ccols:
+        _add_column(conn, "ALTER TABLE charges ADD COLUMN merged_into_id INTEGER DEFAULT NULL")
+    # migration: manual trip-merge link — a child trip points to the parent it was merged into
+    tcols = {r[1] for r in conn.execute("PRAGMA table_info(trips)").fetchall()}
+    if "merged_into_id" not in tcols:
+        _add_column(conn, "ALTER TABLE trips ADD COLUMN merged_into_id INTEGER DEFAULT NULL")
+    # migration: flag trips RECONSTRUCTED from an odometer jump (car offline/asleep to the cloud —
+    # or poller down — for the whole drive, so no DRIVING poll ever fired). Twin of charges.reconstructed.
+    if "reconstructed" not in tcols:
+        _add_column(conn, "ALTER TABLE trips ADD COLUMN reconstructed INTEGER DEFAULT 0")
+    # migration: per-trip EC (driving) energy split from the cloud getEC endpoint (Phase 2).
+    # efficiency_soc backs up the original SoC-derived efficiency so the EC override is fully
+    # reversible; ec_tried counts enrichment attempts (cloud aggregation lags a fresh trip).
+    for _c, _t in (("efficiency_soc", "REAL"), ("ec_kwh", "REAL"), ("ec_driving", "REAL"),
+                   ("ec_ac", "REAL"), ("ec_other", "REAL"), ("ec_tried", "INTEGER DEFAULT 0"),
+                   ("ec_stable", "INTEGER DEFAULT 0")):
+        if _c not in tcols:
+            _add_column(conn, f"ALTER TABLE trips ADD COLUMN {_c} {_t}")
+    # migration: #107 — per-trip user note + MANUAL driving tags. drive_mode/one_pedal are user-set
+    # because the Leapmotor cloud does not expose drive mode or One-Pedal (verified on-car); they
+    # explain consumption differences the raw data can't. Display/context only, never computed on.
+    for _c, _t in (("note", "TEXT"), ("drive_mode", "TEXT"), ("one_pedal", "INTEGER")):
+        if _c not in tcols:
+            _add_column(conn, f"ALTER TABLE trips ADD COLUMN {_c} {_t}")
+    # migration: REEV Phase C — fuel tank level % (signal 3235) at trip start/end. The drop gives
+    # the fuel burned (× tank litres) → per-trip L/100km and the EV/fuel split. NULL on a BEV.
+    for _c, _t in (("fuel_start_pct", "REAL"), ("fuel_end_pct", "REAL")):
+        if _c not in tcols:
+            _add_column(conn, f"ALTER TABLE trips ADD COLUMN {_c} {_t}")
+    # migration: the same two ends in LITRES, straight off the car's own counter (3263) instead of
+    # a percentage times an assumed tank. "× tank litres" above was the whole problem — the assumed
+    # tank was 50 L for everyone and a C10's is 47.5. Where these are present the burn is measured;
+    # where they aren't (a BEV, or any trip recorded before this) the percentages still answer.
+    for _c, _t in (("fuel_start_l", "REAL"), ("fuel_end_l", "REAL")):
+        if _c not in tcols:
+            _add_column(conn, f"ALTER TABLE trips ADD COLUMN {_c} {_t}")
+    # migration: per-trip elevation gain/loss (metres) + outside temperature (°C), looked up
+    # post-trip against Open-Meteo (the Leapmotor cloud exposes neither altitude nor an ambient
+    # temperature — only lat/lon and cabin temp). Per-segment like regen_kwh — a merged group's
+    # total is the sum of its segments (web/db_reader.py _trip_group_stats), so merging never
+    # needs re-enrichment. elev_tried/elev_done mirror ec_tried/ec_stable but need no convergence
+    # logic: terrain (and a past hour's weather) is static, one successful lookup is final.
+    for _c, _t in (("elevation_gain_m", "REAL"), ("elevation_loss_m", "REAL"),
+                   ("outside_temp_start_c", "REAL"), ("outside_temp_end_c", "REAL"),
+                   ("elev_tried", "INTEGER DEFAULT 0"), ("elev_done", "INTEGER DEFAULT 0")):
+        if _c not in tcols:
+            _add_column(conn, f"ALTER TABLE trips ADD COLUMN {_c} {_t}")
+    # migration: per-POINT altitude (metres) for the trip-profile chart. Only the downsampled
+    # subset the enrichment sweep actually queried Open-Meteo for gets a value here — the rest
+    # stay NULL and web/db_reader.py interpolates them at read time for a smooth chart line.
+    tpcols = {r[1] for r in conn.execute("PRAGMA table_info(trip_positions)").fetchall()}
+    if "elevation_m" not in tpcols:
+        _add_column(conn, "ALTER TABLE trip_positions ADD COLUMN elevation_m REAL")
+    # migration: the poll's readings the trip detail shows, kept with each point so they outlive the
+    # positions retention — battery power (kW, + out of the pack), coldest cell, range, outside air.
+    for _c in ("power_kw", "battery_temp_c", "range_km", "outside_temp_c"):
+        if _c not in tpcols:
+            _add_column(conn, f"ALTER TABLE trip_positions ADD COLUMN {_c} REAL")
+    # migration: geohash (7 chars ≈ 150m cell) of start/end lat-lon — the "similar trips"
+    # comparator's fast pre-filter (web/db_reader.py get_similar_trips groups candidates by
+    # this before validating the actual route). Set at trip creation/finalize (below) going
+    # forward; _backfill_trip_geohashes fills every existing trip once, offline (pure math on
+    # lat/lon already stored — unlike the address lookup (web/place_lookup.py), no network call, so
+    # there's no reason to defer this to a web-side sweep).
+    for _c in ("start_geohash", "end_geohash"):
+        if _c not in tcols:
+            _add_column(conn, f"ALTER TABLE trips ADD COLUMN {_c} TEXT DEFAULT NULL")
+    # migration: the trip address lookup's switch starts as the automatic note's was, the note having sent
+    # a trip's ends to the lookup service until then; written once, so the two are separate from here on.
+    conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('place_lookup', COALESCE("
+                 "(SELECT CASE value WHEN '0' THEN '0' ELSE '1' END FROM settings WHERE key = 'auto_note'), '1'))")
+    conn.commit()
+
+
+# Everything else Database.__init__ does — eleven data repairs, dropping phantom rows, migrating the
+# secrets — stays with the poller. Those belong to the process that owns the data; a reader must not
+# run them, least of all at the same time as the poller.

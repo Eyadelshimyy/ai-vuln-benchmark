@@ -1,0 +1,175 @@
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
+
+from app.api.response_helpers import (
+    CACHE_TTL_CONFIG_S,
+    CACHE_TTL_DETAIL_S,
+    CACHE_TTL_LIST_S,
+    cached_json as _cached_json,
+    score_history_json,
+)
+from app.database import get_db
+from app.member_ids import resolve_member_id
+from app.services.holdings_service import HOLDING_CATEGORY_PATTERN, get_senator_holdings
+
+from app.services.senator_service import (
+    get_leaderboard,
+    get_senator_by_id,
+    get_senator_score_breakdown,
+    get_senator_stock_trades,
+    get_senator_votes,
+    get_senators_by_state,
+    get_states_with_counts,
+)
+
+router = APIRouter()
+
+
+@router.get("/config")
+def get_config() -> JSONResponse:
+    """Return all dynamic configuration for the frontend.
+
+    Serves industries, platform categories, score weights, and policy areas
+    so the frontend never needs to hardcode these values.
+    """
+    from app.config_definitions import (
+        BILL_STAGES,
+        INDUSTRIES,
+        PLATFORM_CATEGORIES,
+        POLICY_AREAS,
+        PRESIDENT_SCORE_WEIGHTS,
+        SCORE_WEIGHTS,
+    )
+    from app.pipeline.analyze.score_calculator import SUBSTANTIVE_BILL_TYPES
+
+    return _cached_json({
+        "scoreWeights": SCORE_WEIGHTS,
+        "presidentScoreWeights": PRESIDENT_SCORE_WEIGHTS,
+        "industries": INDUSTRIES,
+        "platformCategories": PLATFORM_CATEGORIES,
+        "policyAreas": POLICY_AREAS,
+        "billStages": BILL_STAGES,
+        # Bills and joint resolutions, as Congress.gov spells the type: what
+        # Legislative Effectiveness counts as a bill (simple and concurrent
+        # resolutions are weighted a fifth as much and listed apart).
+        "substantiveBillTypes": sorted(t.upper() for t in SUBSTANTIVE_BILL_TYPES),
+    }, max_age=CACHE_TTL_CONFIG_S)
+
+
+@router.get("/signal-overlap")
+def get_signal_overlap() -> JSONResponse:
+    """How closely each pair of related score components moved together over
+    the last run's members (analyze/signal_overlap.py), per chamber. A
+    chamber not yet measured is null."""
+    from app.pipeline.analyze.signal_overlap import ACTION_R, SIGNAL_OVERLAP, WATCH_R
+
+    stored = SIGNAL_OVERLAP.load()
+    return _cached_json({
+        "actionR": ACTION_R,
+        "watchR": WATCH_R,
+        "chambers": {
+            chamber: (
+                {"pairs": stored[chamber].get("pairs", {}), "computedAt": stored[chamber].get("computed_at")}
+                if chamber in stored else None
+            )
+            for chamber in ("senate", "house")
+        },
+    }, max_age=CACHE_TTL_LIST_S)
+
+
+@router.get("/senators/states")
+def list_states(db: Session = Depends(get_db)) -> JSONResponse:
+    """Return all states that have senator data, with counts."""
+    data = get_states_with_counts(db)
+    return _cached_json([s.model_dump(by_alias=True) for s in data], max_age=CACHE_TTL_LIST_S)
+
+
+@router.get("/senators/leaderboard")
+def list_leaderboard(db: Session = Depends(get_db)) -> JSONResponse:
+    """Return all senators ranked by representation score."""
+    data = get_leaderboard(db)
+    return _cached_json([e.model_dump(by_alias=True) for e in data], max_age=CACHE_TTL_LIST_S)
+
+
+@router.get("/senators/{senator_id}/history")
+def get_senator_history(senator_id: str, db: Session = Depends(get_db)) -> JSONResponse:
+    """Return historical score snapshots for a senator."""
+    return score_history_json(db, "senator", resolve_member_id(db, resolve_member_id(db, senator_id)))
+
+
+@router.get("/senators/{senator_id}/score-breakdown")
+def get_senator_score_breakdown_route(senator_id: str, db: Session = Depends(get_db)) -> JSONResponse:
+    """Return the full component-level derivation behind each of a senator's
+    scored dimensions — the "show the math" panel's data source."""
+    breakdown = get_senator_score_breakdown(db, resolve_member_id(db, senator_id))
+    if breakdown is None:
+        raise HTTPException(status_code=404, detail="Senator not found")
+    return _cached_json(breakdown, max_age=CACHE_TTL_DETAIL_S)
+
+
+@router.get("/senators/{senator_id}/votes")
+def get_votes(
+    senator_id: str,
+    category: str = Query("recent", pattern="^(recent|key|all)$"),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(15, ge=1, le=100),
+    filter: str = Query("all", pattern="^(all|yea|nay|against-party)$"),
+    q: str | None = Query(None, max_length=100, description="Bill number, title or question to search for"),
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    """Return paginated votes for a senator."""
+    result = get_senator_votes(db, resolve_member_id(db, senator_id), category, page, per_page, filter, q)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Senator not found")
+    return _cached_json(result.model_dump(by_alias=True), max_age=CACHE_TTL_DETAIL_S)
+
+
+@router.get("/senators/{senator_id}/stock-trades")
+def get_stock_trades(
+    senator_id: str,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(15, ge=1, le=100),
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    """Return paginated STOCK Act trade disclosures for a senator."""
+    result = get_senator_stock_trades(db, resolve_member_id(db, senator_id), page, per_page)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Senator not found")
+    return _cached_json(result.model_dump(by_alias=True), max_age=CACHE_TTL_DETAIL_S)
+
+
+@router.get("/senators/{senator_id}/holdings")
+def get_senator_holdings_route(
+    senator_id: str,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(15, ge=1, le=100),
+    category: str | None = Query(None, pattern=HOLDING_CATEGORY_PATTERN),
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    """Return the asset holdings from the latest annual financial disclosure:
+    a by-category breakdown plus a page of holdings, largest first
+    (optionally one category's)."""
+    result = get_senator_holdings(db, resolve_member_id(db, senator_id), page, per_page, category)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Senator not found")
+    return _cached_json(result.model_dump(by_alias=True), max_age=CACHE_TTL_DETAIL_S)
+
+
+@router.get("/senators/{senator_id}")
+def get_senator(senator_id: str, db: Session = Depends(get_db)) -> JSONResponse:
+    """Return a single senator by ID."""
+    result = get_senator_by_id(db, resolve_member_id(db, senator_id))
+    if result is None:
+        raise HTTPException(status_code=404, detail="Senator not found")
+    return _cached_json(result.model_dump(by_alias=True), max_age=CACHE_TTL_DETAIL_S)
+
+
+@router.get("/senators")
+def list_senators(
+    state: str = Query(..., min_length=2, max_length=2, description="Two-letter state code"),
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    """Return senators filtered by state."""
+    data = get_senators_by_state(db, state)
+    return _cached_json([s.model_dump(by_alias=True) for s in data], max_age=CACHE_TTL_DETAIL_S)

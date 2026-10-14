@@ -1,0 +1,1220 @@
+"""FFTTimeMixin: FFT-vs-Time (spectrogram) compute, cache, dispatch, render."""
+
+import itertools
+from dataclasses import replace
+
+import numpy as np
+
+_FFT_TIME_PANE_TOKENS = itertools.count(1)
+
+from ... import db_reference
+from ...signal import (
+    nfft_facts_signature,
+    nfft_facts_signature_from_decision,
+    resolve_auto_nfft,
+)
+from ...signal.analysis_defaults import (
+    AUTO_NFFT_POLICY_VERSION,
+    DEFAULT_FFT_T_WIN_S,
+)
+from ...signal.spectrogram import spectrogram_facts_from_result
+from ..compute_feedback import ComputeOutcome
+from ..analysis_result_state import bind_result, mark_pending, snapshot_request
+from ._sentinel import _INSPECTOR_TIME_RANGE
+from ._state_holders import (
+    FftTimeHeatmapRenderInputs,
+    canvas_previous_db_reference,
+    composite_source_id,
+    heatmap_slice_snapshot,
+    widget_raster_metrics,
+)
+from .fft_time_coordinator import make_fft_time_analysis_key
+from .ultraview_coordinator import notify_ultraview_plot
+
+
+def _fft_time_pane_token(pane):
+    """Generation stamped on the pane object. ``id(pane)`` is reused."""
+    if pane is None:
+        return None
+    token = getattr(pane, "_fft_time_pane_token", None)
+    if isinstance(token, int):
+        return token
+    token = next(_FFT_TIME_PANE_TOKENS)
+    pane._fft_time_pane_token = token
+    return token
+
+
+class FFTTimeMixin:
+    """Domain adapter for FFT-vs-Time input collection and rendering.
+
+    Shared worker lifecycle, FIFO queueing and per-section progress accounting
+    belong to ``AnalysisJobService``.  Each submitted job carries its own
+    opaque context so completion never reads a mutable window-wide pending
+    record.
+    """
+
+    def _fft_time_pane_token(self, pane):
+        return _fft_time_pane_token(pane)
+
+    @staticmethod
+    def _resolve_fft_time_effective_params(p, n_samples):
+        """Return FFT-vs-Time params with a concrete integer NFFT.
+
+        ``FFTTimeContextual`` may emit ``nfft=None`` for auto mode because the
+        real sample count is unknown at collection time. Resolve it only after
+        the caller has applied the active time-range mask.
+        """
+        out = dict(p)
+        auto = out.get('nfft') is None or out.get('nfft_mode') == 'auto'
+        t_win_s = float(out.get('t_win_s', DEFAULT_FFT_T_WIN_S))
+        out['t_win_s'] = t_win_s
+        n_samples = int(n_samples)
+        if auto:
+            out['nfft_mode'] = 'auto'
+            decision = resolve_auto_nfft(
+                out['fs'],
+                n_samples,
+                t_win_s,
+                out['overlap'],
+                purpose='fft_time',
+            )
+            out['nfft_decision'] = decision
+            out['nfft_facts_signature'] = nfft_facts_signature_from_decision(
+                decision,
+                t_win_s=t_win_s,
+                policy_version=AUTO_NFFT_POLICY_VERSION,
+            )
+            if decision.status == 'blocked':
+                out['nfft'] = None
+                out['nfft_effective'] = None
+                out['nfft_status'] = 'blocked'
+            else:
+                out['nfft'] = int(decision.effective_nfft)
+                out['nfft_effective'] = int(decision.effective_nfft)
+        else:
+            effective = int(out['nfft'])
+            out['nfft'] = effective
+            out['nfft_effective'] = effective
+            out['nfft_mode'] = 'fixed'
+            out['nfft_facts_signature'] = nfft_facts_signature(
+                nfft_mode='fixed',
+                requested_nfft=effective,
+                effective_nfft=effective,
+                n_samples=n_samples,
+            )
+        return out
+
+    def _fft_time_analysis_cache_key(self, fid, ch, p, time_range=None):
+        """Build the shared FFT-vs-Time compute key.
+
+        New coordinator callers always pass ``time_range`` explicitly.  The
+        integer compatibility branch keeps older cache-restoration callers on
+        the same pane-local contract while they still pass a pane index.
+        """
+        if isinstance(time_range, int):
+            time_range = self._pane_time_range_for('fft_time', time_range)
+        nfft = p.get('nfft_effective', p.get('nfft'))
+        params = {
+            'fs': p.get('fs'),
+            'nfft': None if nfft is None else int(nfft),
+            'window': p.get('window'),
+            'overlap': p.get('overlap'),
+            'remove_mean': p.get('remove_mean'),
+            'weighting': str(p.get('weighting', 'None')),
+            'nfft_facts_signature': p.get('nfft_facts_signature'),
+        }
+        return make_fft_time_analysis_key(
+            self.analysis_caches['fft_time'].make_key,
+            fid,
+            ch,
+            params,
+            time_range,
+        )
+
+    def _fft_time_view_is_uncomputed(self, state) -> bool:
+        """True when the View has a source but no cached spectrogram."""
+        panes = tuple(getattr(state, "panes", ()) or ())
+        if not panes:
+            return False
+        pane = panes[0]
+        sources = tuple(getattr(pane, "sources", ()) or ())
+        if not sources:
+            return False
+        fid, ch = sources[0]
+        key = self._analysis_cache_key_for_view_source(
+            "fft_time", state, pane, 0, fid, ch,
+        )
+        return self.analysis_caches["fft_time"].get(key) is None
+
+    def _cancel_fft_time_page_transition_cover(self, view_id=None) -> None:
+        """Drop a pending FFT vs Time cover before a live result replaces it."""
+        token = getattr(self.chart_stack, "_page_transition_target", None)
+        if token is None or token.section != "fft_time":
+            return
+        if view_id is not None and str(token.view_id) != str(view_id):
+            return
+        self.chart_stack.cancel_page_transition("fft-time-live-result")
+
+    def _fft_time_effective_params_for_source(self, p, fid, ch, time_range):
+        """Resolve params for cache lookup without starting a worker."""
+        _fid, _ch, t, sig, _fd = self._fft_time_signal_for((fid, ch))
+        if sig is None or len(sig) < 2:
+            return None
+        rng = self._normalize_analysis_time_range(time_range)
+        if rng is not None:
+            t, sig = self._mask_time_range(t, sig, time_range=rng)
+            if len(sig) < 2:
+                return None
+            compute_time_range = rng
+        else:
+            compute_time_range = (float(t[0]), float(t[-1]))
+        from ...analysis_time_axis import prepare_analysis_time_axis
+        try:
+            _axis, fs, _facts = prepare_analysis_time_axis(
+                t, float(getattr(_fd, 'fs', p['fs'])),
+                materialize=False,
+            )
+        except ValueError:
+            return None
+        p = dict(p, fs=fs)
+        return (
+            self._resolve_fft_time_effective_params(p, len(sig)),
+            compute_time_range,
+        )
+
+    def _invalidate_all_analysis_caches_for_fid(self, fid):
+        """Single entry point: drop ALL per-fid cache entries whenever a
+        compute input changes for that file (e.g. time-axis rebuild, channel
+        edit, file close).
+
+        Every ``AnalysisResultCache`` in ``self.analysis_caches`` ('fft',
+        'fft_time', 'order') is invalidated via ``invalidate_fid``.
+        """
+        for section, cache in self.analysis_caches.items():
+            if section == 'fft_time':
+                coordinator = getattr(self, '_fft_time_coordinator', None)
+                if coordinator is not None:
+                    coordinator.invalidate_fid(fid)
+                    continue
+            if section == 'frf':
+                coordinator = getattr(self, '_frf_coordinator', None)
+                if coordinator is not None:
+                    coordinator.invalidate_fid(fid)
+                    continue
+            cache.invalidate_fid(fid)
+        if getattr(self, 'inspector', None) is None:
+            return
+        for section in ('fft', 'fft_time', 'order'):
+            sync = getattr(self, f'_sync_{section}_effective_facts', None)
+            if callable(sync):
+                sync()
+
+    def _get_fft_time_signal(self):
+        """Resolve the (fid, channel, time, signal, file_data) tuple
+        for the currently-selected fft_time signal.
+
+        Adapts to this repo's ``FileData`` API: ``fd.data`` is the
+        DataFrame (NOT ``fd.df``), ``fd.time_array`` is the time axis,
+        ``fd.channel_units`` carries unit strings (NOT ``fd.units``).
+        Returns ``(None,) * 5`` when no usable selection exists so
+        ``do_fft_time`` can surface a single warning and bail.
+        """
+        data = self.inspector.fft_time_ctx.current_signal()
+        return self._fft_time_signal_for(data)
+
+    def _fft_time_signal_for(self, source):
+        """Resolve the (fid, channel, time, signal, file_data) tuple for an
+        explicit ``(fid, ch)`` source. V7b: the split-heatmap queue needs to
+        fetch a NON-focused pane's source directly, not the inspector's
+        current selection. Returns ``(None,) * 5`` when the source is
+        unavailable so the queue can skip that job without aborting the rest.
+        """
+        if not source:
+            return None, None, None, None, None
+        fid, ch = source
+        if fid not in self.files:
+            return None, None, None, None, None
+        fd = self.files[fid]
+        if not hasattr(fd, 'data') or ch not in fd.data.columns:
+            return None, None, None, None, None
+        t = np.asarray(fd.time_array, dtype=float)
+        sig = np.asarray(fd.data[ch].to_numpy(copy=False), dtype=float)
+        return fid, ch, t, sig, fd
+
+    def _fft_time_preview_n_samples(self):
+        """Sample count for the FFT-vs-Time auto-NFFT summary, or ``None``.
+
+        Pull-based hook registered via
+        ``FFTTimeContextual.set_auto_nfft_provider``: returns the
+        inspector-time-range-gated length of the current spectrogram source so
+        the collapsed 自动(N) tracks ``_resolve_fft_time_effective_params`` (same
+        ``resolve_auto_nfft``). Returns ``None`` when unavailable. Never raises — it
+        feeds a paint path.
+        """
+        try:
+            source = self.inspector.fft_time_ctx.current_signal()
+            _fid, _ch, t, sig, _fd = self._fft_time_signal_for(source)
+            if sig is None or len(sig) < 2:
+                return None
+            top = self.inspector.top
+            if top.range_enabled():
+                _t, sig = self._mask_time_range(
+                    t, sig, time_range=top.range_values()
+                )
+                if sig is None or len(sig) < 2:
+                    return None
+            return int(len(sig))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalize_freq_range(p):
+        """Translate the panel's ``freq_*`` fields into the canvas's
+        ``freq_range`` tuple, with a clamp against contradictory
+        ``freq_max <= freq_min`` input.
+
+        Returns ``None`` to mean "auto" (canvas falls back to Nyquist).
+        Reviewer Important #3: when a user toggles auto off and leaves
+        ``freq_max == 0`` while raising ``freq_min``, the panel emits
+        ``(lo>0, hi=0)``; the canvas's silent fallback is correct but
+        confusing. We force ``hi=0`` (auto) whenever ``hi <= lo`` AND
+        ``hi > 0``, and treat the entire pair as auto so the canvas
+        reuses its existing fallback rather than receiving the bogus
+        pair. Documented in
+        ``docs/superpowers/reports/2026-04-25-fft-vs-time-T5-mainwindow-sync-compute.md``.
+        """
+        if p.get('freq_auto', True):
+            return None
+        lo = float(p.get('freq_min', 0.0))
+        hi = float(p.get('freq_max', 0.0))
+        # If freq_max is 0 it already means "auto / use Nyquist" per
+        # FFTTimeContextual contract — pass the (lo, 0) pair through.
+        # If freq_max > 0 but <= freq_min, the user input is
+        # contradictory; force auto so the canvas does not silently
+        # invert or collapse the range.
+        if hi > 0 and hi <= lo:
+            return None
+        return (lo, hi)
+
+    def _recompute_restored_fft_time_view(self, view_id):
+        """Dispatch persisted FFT-vs-Time panes without reading live combos."""
+        state = self._analysis_state_by_id("fft_time", view_id)
+        if state is None:
+            return
+        compute_p = self._compute_params_overlay_state("fft_time", state)
+        ctx = self.inspector.fft_time_ctx
+        display_getter = getattr(ctx, "display_params", None)
+        display_live = display_getter() if callable(display_getter) else {}
+        saved = dict(state.params or {})
+        display_p = dict(display_live)
+        display_p.update({key: saved[key] for key in display_p if key in saved})
+        candidates = []
+        for pane_idx, pane in enumerate(state.panes):
+            sources = pane.sources
+            if not sources:
+                continue
+            fid, ch = sources[0]
+            blocker = getattr(self, "_analysis_restore_time_range_block_reason", None)
+            if callable(blocker):
+                reason = blocker("fft_time", state, pane_idx)
+                if reason:
+                    toast = getattr(self, "toast", None)
+                    if callable(toast):
+                        toast(reason, "warning")
+                    status = getattr(self, "statusBar", None)
+                    if status is not None:
+                        status.showMessage(reason)
+                    continue
+            time_range = self._normalize_analysis_time_range(pane.time_range)
+            prepared = self._fft_time_effective_params_for_source(
+                compute_p, fid, ch, time_range
+            )
+            if prepared is None:
+                continue
+            effective_compute_p, _compute_time_range = prepared
+            render_p = {**effective_compute_p, **display_p}
+            candidates.append({
+                "fid": fid,
+                "channel": ch,
+                "params": dict(effective_compute_p),
+                "pane_idx": pane_idx,
+                "pane_token": _fft_time_pane_token(pane),
+                "time_range": time_range,
+                "render_params": dict(render_p),
+                "source": (fid, ch),
+                "force": False,
+                "view_id": state.view_id,
+                "job_factory": lambda pane_idx=pane_idx, fid=fid, ch=ch,
+                raw_params=dict(compute_p), display_params=dict(display_p),
+                time_range=time_range: self._build_fft_time_job(
+                    pane_idx, fid, ch, raw_params, time_range=time_range,
+                    display_params=display_params,
+                ),
+            })
+        if candidates:
+            self._fft_time_coordinator.request_batch(candidates)
+
+    def do_fft_time(self, force=False):
+        """Compute and render the FFT-vs-Time spectrogram(s) for the active view.
+
+        The mixin collects pane-local plain candidate dictionaries only.  The
+        coordinator owns cache probing, service submission, pending state, and
+        result caching; ``job_factory`` defers non-uniform-axis preflight until
+        a true cache miss so a cache hit has no compute-side effects.
+        """
+        if not self._offer_analysis_time_range_before_compute('fft_time'):
+            return
+        self._capture_active_analysis_view('fft_time')
+        if self._analysis_jobs.is_running('fft_time'):
+            self._emit_compute_feedback(
+                ComputeOutcome(),
+                busy=True,
+                section_label="FFT-vs-Time",
+            )
+            return
+        self._fft_time_outcome = None
+        state = self._analysis_state_for_dispatch('fft_time')
+        self._clear_analysis_view_viewports(state)
+        ctx = self.inspector.fft_time_ctx
+        compute_getter = getattr(ctx, 'compute_params', None)
+        compute_p = (
+            compute_getter() if callable(compute_getter) else ctx.get_params()
+        )
+        display_getter = getattr(ctx, 'display_params', None)
+        display_p = (
+            display_getter() if callable(display_getter) else ctx.get_params()
+        )
+
+        focus = self._dispatch_focus_index('fft_time', state)
+        pane_order = sorted(
+            self._dispatch_pane_indices('fft_time', state),
+            key=lambda i: (i != focus, i),
+        )
+        candidates = []
+        any_source = False
+        outcome = ComputeOutcome()
+        self._fft_time_outcome = outcome
+        for pane_idx in pane_order:
+            sources = state.panes[pane_idx].sources
+            if not sources:
+                continue
+            any_source = True
+            fid, ch = sources[0]
+            mark_pending(state.panes[pane_idx])
+            request = snapshot_request(state, state.panes[pane_idx])
+            render_p = {**compute_p, **display_p}
+            time_range = self._dispatch_time_range('fft_time', state, pane_idx)
+            prepared = self._fft_time_effective_params_for_source(
+                compute_p, fid, ch, time_range)
+            if prepared is None:
+                outcome.skipped.append('源通道缺失或样本不足')
+                candidates.append({
+                    'fid': fid,
+                    'channel': ch,
+                    'params': dict(compute_p),
+                    'pane_idx': pane_idx,
+                    'pane_token': _fft_time_pane_token(state.panes[pane_idx]),
+                    'time_range': time_range,
+                    'job': None,
+                    'render_params': dict(render_p),
+                    'source': (fid, ch),
+                    'force': force,
+                    'view_id': state.view_id,
+                    'request_snapshot': request,
+                })
+                continue
+            effective_compute_p, _compute_time_range = prepared
+            render_p = {**effective_compute_p, **display_p}
+            candidates.append({
+                'fid': fid,
+                'channel': ch,
+                'params': dict(effective_compute_p),
+                'pane_idx': pane_idx,
+                'pane_token': _fft_time_pane_token(state.panes[pane_idx]),
+                'time_range': time_range,
+                'render_params': dict(render_p),
+                'source': (fid, ch),
+                'force': force,
+                'view_id': state.view_id,
+                'request_snapshot': request,
+                'job_factory': lambda pane_idx=pane_idx, fid=fid, ch=ch,
+                raw_params=dict(compute_p), display_params=dict(display_p), \
+                time_range=time_range: self._build_fft_time_job(
+                    pane_idx, fid, ch, raw_params, time_range=time_range,
+                    display_params=display_params,
+                ),
+            })
+
+        if not candidates:
+            if not any_source:
+                self._fft_time_outcome = None
+                self._do_fft_time_single(force=force)
+                return
+            self._emit_compute_feedback(outcome, section_label="FFT-vs-Time")
+            self._fft_time_outcome = None
+            return
+
+        queued = self._fft_time_coordinator.request_batch(candidates)
+        if queued == 0:
+            self._finish_fft_time_outcome_feedback()
+
+    def _do_fft_time_single(self, force=False):
+        """Legacy single-source FFT-vs-Time path: compute the inspector's
+        currently-selected signal onto the primary canvas. Kept so a view
+        whose panes have no captured source (e.g. a brand-new heatmap view
+        before the navigator/inspector echo wires a source) still computes
+        the inspector selection, matching pre-V7b behaviour and tests.
+
+        Fetches via :meth:`_get_fft_time_signal` (the inspector-selection
+        getter, which standalone-signal tests monkeypatch) rather than the
+        per-pane ``_fft_time_signal_for`` used by the split queue.
+        """
+        page = self._analysis_page('fft_time')
+        pane_idx = page.focused_index()
+        state = self._analysis_state_for_dispatch('fft_time')
+        mark_pending(state.panes[pane_idx])
+        fid, ch, t, sig, fd = self._get_fft_time_signal()
+        if sig is None or len(sig) < 2:
+            self.toast("请选择有效信号", "warning")
+            return
+        ctx = self.inspector.fft_time_ctx
+        compute_getter = getattr(ctx, 'compute_params', None)
+        compute_p = (
+            compute_getter() if callable(compute_getter) else ctx.get_params()
+        )
+        display_getter = getattr(ctx, 'display_params', None)
+        display_p = (
+            display_getter() if callable(display_getter) else ctx.get_params()
+        )
+        compute_time_range = self._pane_time_range_for("fft_time", pane_idx)
+        if compute_time_range is None and self.inspector.top.range_enabled():
+            compute_time_range = self.inspector.top.range_values()
+        rng = self._normalize_analysis_time_range(compute_time_range)
+        if rng is not None:
+            t, sig = self._mask_time_range(t, sig, time_range=rng)
+        if sig is None or len(sig) < 2:
+            self.toast("当前范围内样本不足", "warning")
+            return
+        from ...analysis_time_axis import prepare_analysis_time_axis
+        try:
+            _axis, analysis_fs, _facts = prepare_analysis_time_axis(
+                t, float(getattr(fd, 'fs', compute_p['fs'])),
+                materialize=False,
+            )
+        except ValueError as issue:
+            self.toast(str(issue), "warning")
+            return
+        compute_p = dict(compute_p, fs=analysis_fs)
+        effective_compute_p = self._resolve_fft_time_effective_params(
+            compute_p, len(sig))
+        render_p = {**effective_compute_p, **display_p}
+        self._fft_time_outcome = None
+        mgr = self.analysis_managers['fft_time']
+        view_id = mgr.get(mgr.active).view_id
+        single_state = mgr.get(mgr.active)
+        request = replace(
+            snapshot_request(single_state, single_state.panes[pane_idx]),
+            sources=((fid, ch),), time_range=rng,
+        )
+        pane_token = (
+            _fft_time_pane_token(single_state.panes[pane_idx])
+            if 0 <= pane_idx < len(single_state.panes) else None
+        )
+        self._fft_time_coordinator.request_batch([{
+            'fid': fid,
+            'channel': ch,
+            'params': dict(effective_compute_p),
+            'pane_idx': pane_idx,
+            'pane_token': pane_token,
+            'time_range': self._pane_time_range_for('fft_time', pane_idx),
+            'render_params': dict(render_p),
+            'source': (fid, ch),
+            'force': force,
+            'view_id': view_id,
+            'request_snapshot': request,
+            'job_factory': lambda: self._build_fft_time_job(
+                pane_idx, fid, ch, dict(compute_p), time_range=compute_time_range,
+                signal_getter=self._get_fft_time_signal,
+                display_params=dict(display_p),
+            ),
+        }])
+
+    def _on_fft_time_batch_started(self, total, first_ctx):
+        """Create the UI token before service submission can finish skips."""
+        if self._analysis_jobs.progress_token("fft_time") is None:
+            self._analysis_jobs.set_progress_token(
+                "fft_time",
+                self._begin_compute_progress(
+                    "FFT-时间 1/%d" % total,
+                    total=1000,
+                    process_events=False,
+                ),
+            )
+        p = first_ctx.get('render_params') or {}
+        nfft = p.get('nfft_effective', p.get('nfft'))
+        self.statusBar.showMessage(
+            f"正在计算… · NFFT {nfft}" if nfft is not None else "正在计算…"
+        )
+
+    def _finish_fft_time_outcome_feedback(self):
+        outcome = getattr(self, '_fft_time_outcome', None)
+        if outcome is None:
+            return
+        self._emit_compute_feedback(outcome, section_label="FFT-vs-Time")
+        self._fft_time_outcome = None
+
+    def _record_fft_time_skip(self, reason):
+        outcome = getattr(self, '_fft_time_outcome', None)
+        if outcome is not None:
+            outcome.skipped.append(reason)
+
+    def _build_fft_time_job(
+        self, pane_idx, fid, ch, raw_params, *, time_range=_INSPECTOR_TIME_RANGE,
+        signal_getter=None, display_params=None,
+    ):
+        """Prepare one job and its immutable completion context, or skip it."""
+        from ...signal import SpectrogramParams
+        if signal_getter is None:
+            signal_getter = lambda: self._fft_time_signal_for((fid, ch))
+        fid, ch, t, sig, fd = signal_getter()
+        if sig is None:
+            self._record_fft_time_skip("源通道缺失")
+            return None
+        if len(sig) < 2:
+            self._record_fft_time_skip("信号过短")
+            return None
+        if not self._check_uniform_or_prompt(fd, 'fft_time'):
+            self._record_fft_time_skip("时间轴无效")
+            return None
+        if time_range is _INSPECTOR_TIME_RANGE:
+            resolver = getattr(self, "_resolve_job_time_range", None)
+            if callable(resolver):
+                time_range = resolver("fft_time", time_range, pane_idx)
+            elif self.inspector.top.range_enabled():
+                time_range = self.inspector.top.range_values()
+            else:
+                time_range = None
+        rng = self._normalize_analysis_time_range(time_range)
+        if rng is not None:
+            t, sig = self._mask_time_range(t, sig, time_range=rng)
+            if len(sig) < 2:
+                self._record_fft_time_skip("样本不足")
+                return None
+        from ...analysis_time_axis import prepare_analysis_time_axis
+        try:
+            t, analysis_fs, time_facts = prepare_analysis_time_axis(
+                t, float(getattr(fd, 'fs', raw_params['fs'])),
+                time_source=getattr(fd, '_time_source', 'column'),
+            )
+        except ValueError as issue:
+            self._record_fft_time_skip(str(issue))
+            return None
+        raw_params = dict(raw_params, fs=analysis_fs)
+        p = self._resolve_fft_time_effective_params(raw_params, len(sig))
+        decision = p.get('nfft_decision')
+        if p.get('nfft_effective') is None:
+            if decision is not None and decision.status == 'blocked':
+                codes = ",".join(decision.reasons) or "blocked"
+                self._record_fft_time_skip(f"自动 NFFT 不可计算（{codes}）")
+                return None
+            self._record_fft_time_skip("自动 NFFT 不可计算")
+            return None
+        # SpectrogramParams is the cache key on the analyzer side; build
+        # it from compute-relevant fields only (db_reference is display-only
+        # and lives render-side, so it is intentionally not passed here).
+        params = SpectrogramParams(
+            fs=float(p['fs']),
+            nfft=int(p['nfft_effective']),
+            window=str(p['window']),
+            overlap=float(p['overlap']),
+            remove_mean=bool(p['remove_mean']),
+            weighting=str(p.get('weighting', 'None')),
+        )
+        unit = ''
+        if fd is not None and hasattr(fd, 'channel_units'):
+            unit = fd.channel_units.get(ch, '') or ''
+        auto = raw_params.get('nfft') is None or raw_params.get('nfft_mode') == 'auto'
+        if auto and decision is not None:
+            nfft_requested = int(decision.requested_nfft)
+        elif auto:
+            nfft_requested = int(p['nfft_effective'])
+        else:
+            nfft_requested = int(p['nfft_effective'])
+        n_samples = len(sig)
+        nfft_mode = 'auto' if auto else 'fixed'
+
+        def job(
+            worker, _sig=sig, _t=t, _params=params, _ch=ch, _unit=unit,
+            _requested=nfft_requested, _n_samples=n_samples,
+            _mode=nfft_mode, _decision=decision, _time_facts=time_facts,
+        ):
+            from ...signal import SpectrogramAnalyzer
+            result = SpectrogramAnalyzer.compute(
+                _sig, _t, _params, channel_name=_ch, unit=_unit,
+                progress_callback=worker.progress.emit,
+                cancel_token=worker.cancelled,
+            )
+            result.effective = spectrogram_facts_from_result(
+                result,
+                nfft_requested=_requested,
+                n_samples=_n_samples,
+                nfft_mode=_mode,
+                decision=_decision,
+            )
+            if _time_facts is not None:
+                from dataclasses import replace
+                result.effective = replace(result.effective, time_axis=_time_facts)
+            return result
+
+        render_params = {**p, **dict(display_params or {})}
+        return job, {
+            'fid': fid,
+            'channel': ch,
+            'params': p,
+            'render_params': render_params,
+            'source': (fid, ch),
+        }
+
+    def _render_fft_time(self, result, p, source=None):
+        """Apply display-only options and draw on the primary canvas.
+
+        Display fields are NOT part of the cache key; this is the sole
+        place they are read.
+        """
+        self._render_fft_time_on(self.canvas_fft_time, result, p, source=source)
+
+    def _fft_time_label_resolution(self, source, p):
+        """Resolve this render's dB reference (spec §15 C2, Task 7): each
+        pane's SINGLE source resolves independently -- honoring the section's
+        current Auto/Manual View mode -- rather than reusing the FOCUSED
+        pane's control value for a non-focused pane's render.
+
+        ``source`` is ``None`` only for direct-call test doubles that never
+        wire a real ``(fid, ch)`` (e.g. bare-canvas smoke tests); those keep
+        the historical ``p['db_reference']`` numeric default degraded through
+        the shared validator so existing callers are unaffected.
+        """
+        if source is not None:
+            if 'db_reference_mode' in p:
+                return self._resolve_db_reference_for_source('fft_time', source, params=p)
+            return self._resolve_db_reference_for_source('fft_time', source)
+        return db_reference.degraded_numeric_resolution(p)
+
+    @staticmethod
+    def _fft_time_result_extents(result):
+        """Coverage/time and frequency extents, or ``None`` when absent.
+
+        ``plot_result`` recomputes the image rectangle itself. These copies
+        exist so a later entry can see that the result's display geometry
+        changed. A bare ``object()`` test double has neither axis.
+        """
+        time_extent = None
+        frequency_extent = None
+        times = getattr(result, "times", None)
+        frequencies = getattr(result, "frequencies", None)
+        if times is not None:
+            try:
+                arr = np.asarray(times, dtype=float)
+                finite = arr[np.isfinite(arr)] if getattr(arr, "ndim", 0) == 1 else arr[:0]
+                if finite.size:
+                    from ..pg_canvas.heatmap_canvas import time_axis_display_extent
+                    extent = time_axis_display_extent(
+                        arr,
+                        params=getattr(result, "params", None),
+                        metadata=getattr(result, "metadata", None),
+                        fallback=(float(finite[0]), float(finite[-1])),
+                    )
+                    time_extent = (float(extent[0]), float(extent[1]))
+            except (AttributeError, TypeError, ValueError, IndexError):
+                time_extent = None
+        if frequencies is not None:
+            try:
+                freq = np.asarray(frequencies, dtype=float)
+                finite = (
+                    freq[np.isfinite(freq)] if getattr(freq, "ndim", 0) == 1 else freq[:0]
+                )
+                if finite.size:
+                    frequency_extent = (float(finite.min()), float(finite.max()))
+            except (AttributeError, TypeError, ValueError, IndexError):
+                frequency_extent = None
+        return time_extent, frequency_extent
+
+    def _current_fft_time_heatmap_inputs(self, canvas, result, p, source):
+        """Snapshot the display inputs the next FFT-vs-Time paint or retain check reads."""
+        p = self._analysis_params_for_canvas('fft_time', canvas, p)
+        resolution = self._fft_time_label_resolution(source, p)
+        inputs = self._fft_time_render_inputs(
+            canvas, result, p, source, resolution, dry_run=True,
+        )
+        return replace(inputs, db_value=float(resolution.value))
+
+    def _fft_time_render_inputs(
+        self, canvas, result, p, source, resolution, color_policy=None, *, dry_run=False,
+    ):
+        """Build the frozen display snapshot. Paint reads this object only.
+
+        ``dry_run`` resolves the color policy without storing a coordinator
+        prepare. Picture-retain checks use it so a retain probe cannot become
+        the next paint's request.
+        """
+        if color_policy is None and dry_run:
+            coordinator_getter = getattr(self, "_heatmap_color_coordinator", None)
+            coordinator = coordinator_getter("fft_time") if callable(coordinator_getter) else None
+            if coordinator is not None:
+                color_policy = coordinator.prepare(
+                    "fft_time", canvas, p, resolution, source, p["amplitude_mode"],
+                    dry_run=True,
+                )
+        elif color_policy is None:
+            resolver = getattr(self, "_heatmap_color_policy_for_canvas", None)
+            if callable(resolver):
+                color_policy = resolver("fft_time", canvas, p, resolution, source, p["amplitude_mode"])
+        if bool(p.get("freq_auto", p.get("y_auto", True))):
+            freq_range = None
+        else:
+            freq_range = self._normalize_freq_range(p)
+        result_params = getattr(result, "params", None)
+        weighting = str(
+            getattr(result_params, "weighting", None) or p.get("weighting", "None")
+        )
+        slice_dir, slice_x, slice_y = heatmap_slice_snapshot(canvas)
+        x_origin, x_lim, y_origin, y_lim = self._heatmap_viewport_snapshot(
+            "fft_time", canvas,
+        )
+        width, height, dpr = widget_raster_metrics(canvas)
+        tick_x, tick_y = self._heatmap_tick_counts()
+        time_extent, frequency_extent = self._fft_time_result_extents(result)
+        return FftTimeHeatmapRenderInputs(
+            amplitude_mode=p["amplitude_mode"],
+            weighting=weighting,
+            db_reference_mode=str(p.get("db_reference_mode", "") or ""),
+            db_value=float(resolution.value),
+            db_unit=str(resolution.unit or ""),
+            db_quantity=str(resolution.quantity or ""),
+            db_source=str(resolution.source or ""),
+            db_warning=str(resolution.warning or ""),
+            z_auto=color_policy.z_auto if color_policy is not None else bool(p.get("z_auto", False)),
+            z_floor=color_policy.z_floor if color_policy is not None else float(p.get("z_floor", -80.0)),
+            z_ceiling=color_policy.z_ceiling if color_policy is not None else float(p.get("z_ceiling", 0.0)),
+            x_auto=bool(p.get("x_auto", True)),
+            x_min=float(p.get("x_min", 0.0)),
+            x_max=float(p.get("x_max", 0.0)),
+            y_auto=bool(p.get("freq_auto", p.get("y_auto", True))),
+            y_min=float(p.get("y_min", 0.0)),
+            y_max=float(p.get("y_max", 0.0)),
+            freq_range=freq_range,
+            cmap=self._heatmap_cmap_for_canvas("fft_time", canvas),
+            interp="bilinear",
+            tick_x=tick_x,
+            tick_y=tick_y,
+            source_id=composite_source_id(source),
+            x_origin=x_origin,
+            y_origin=y_origin,
+            x_lim=x_lim,
+            y_lim=y_lim,
+            slice_dir=slice_dir,
+            slice_x=slice_x,
+            slice_y=slice_y,
+            seed_slice=getattr(canvas, "_slice_curve", None) is not None,
+            canvas_width=width,
+            canvas_height=height,
+            canvas_dpr=dpr,
+            previous_db_reference=None if color_policy is not None else canvas_previous_db_reference(canvas),
+            levels_are_resolved=color_policy is not None,
+            time_extent=time_extent,
+            frequency_extent=frequency_extent,
+            channel_name=str(getattr(result, "channel_name", "") or ""),
+            channel_unit=str(getattr(result, "unit", "") or ""),
+        )
+
+    def _paint_fft_time_heatmap(self, canvas, result, inputs):
+        """Draw ``inputs`` onto ``canvas``. Display knobs are not re-read from ``p``."""
+        resolution = db_reference.DbReferenceResolution(
+            value=float(inputs.db_value),
+            unit=inputs.db_unit,
+            quantity=inputs.db_quantity,
+            source=inputs.db_source,
+            warning=inputs.db_warning,
+        )
+        output_scale = "db" if inputs.amplitude_mode == "amplitude_db" else "linear"
+        amplitude_label = db_reference.format_amplitude_label(
+            resolution, weighting=inputs.weighting, output_scale=output_scale,
+        )
+        z_unit_suffix = (
+            db_reference.format_reference_note(
+                resolution, weighting=inputs.weighting,
+            )
+            if output_scale == "db" else None
+        )
+        setter = getattr(canvas, "set_overlay_source", None)
+        if callable(setter):
+            setter(inputs.source_id)
+        if not inputs.levels_are_resolved and inputs.amplitude_mode == "amplitude_db":
+            delta_fn = getattr(canvas, "reference_delta_since_last_render", None)
+            if callable(delta_fn) and hasattr(canvas, "_last_db_reference"):
+                canvas._last_db_reference = inputs.previous_db_reference
+        canvas.plot_result(
+            result,
+            amplitude_mode=inputs.amplitude_mode,
+            cmap=inputs.cmap,
+            z_auto=inputs.z_auto,
+            z_floor=float(inputs.z_floor),
+            z_ceiling=float(inputs.z_ceiling),
+            freq_range=inputs.freq_range,
+            interp=inputs.interp,
+            x_auto=inputs.x_auto,
+            x_min=float(inputs.x_min),
+            x_max=float(inputs.x_max),
+            y_auto=inputs.y_auto,
+            y_min=float(inputs.y_min),
+            y_max=float(inputs.y_max),
+            db_reference=inputs.db_value,
+            amplitude_label=amplitude_label,
+            colorbar_label=amplitude_label,
+            z_unit_suffix=z_unit_suffix,
+            **({"levels_are_resolved": True} if inputs.levels_are_resolved else {}),
+        )
+        echo_levels = (not inputs.levels_are_resolved
+                       and self._analysis_canvas_updates_controls("fft_time", canvas))
+        if echo_levels and inputs.z_auto and inputs.amplitude_mode == "amplitude_db":
+            automatic = getattr(canvas, "_automatic_color_window", None)
+            auto_lvls = automatic() if callable(automatic) else None
+            if auto_lvls is not None:
+                ctx = self.inspector.fft_time_ctx
+                for spin, val in (
+                    (ctx.spin_z_floor, auto_lvls[0]),
+                    (ctx.spin_z_ceiling, auto_lvls[1]),
+                ):
+                    spin.blockSignals(True)
+                    spin.setValue(val)
+                    spin.blockSignals(False)
+        elif echo_levels and (not inputs.z_auto) and inputs.amplitude_mode == "amplitude_db":
+            shifted = getattr(canvas, "_last_manual_levels_shifted", None)
+            if shifted is not None:
+                ctx = self.inspector.fft_time_ctx
+                for spin, val in (
+                    (ctx.spin_z_floor, shifted[0]),
+                    (ctx.spin_z_ceiling, shifted[1]),
+                ):
+                    spin.blockSignals(True)
+                    spin.setValue(val)
+                    spin.blockSignals(False)
+        canvas.set_tick_density(inputs.tick_x, inputs.tick_y)
+        project = getattr(self, "_project_heatmap_pane_appearance", None)
+        if callable(project):
+            project("fft_time", canvas)
+
+    def _render_fft_time_on(self, canvas, result, p, source=None):
+        """Multi-pane variant: render ``result`` on an arbitrary FFT-vs-Time
+        heatmap canvas with display options from ``p``. ``source`` is the
+        ``(fid, ch)`` this specific pane/result came from -- required for a
+        per-pane-accurate dB-reference resolution (spec §15 C2)."""
+        p = self._analysis_params_for_canvas('fft_time', canvas, p)
+        resolution = self._fft_time_label_resolution(source, p)
+        resolver = getattr(self, "_heatmap_color_policy_for_canvas", None)
+        from ...heatmap_color_policy import HeatmapColorPolicyError
+
+        try:
+            policy = (resolver("fft_time", canvas, p, resolution, source, p["amplitude_mode"])
+                      if callable(resolver) else None)
+        except HeatmapColorPolicyError as error:
+            self._reject_heatmap_color_render("fft_time", canvas, source, error)
+            return
+        inputs = replace(
+            self._fft_time_render_inputs(canvas, result, p, source, resolution, color_policy=policy),
+            db_value=float(resolution.value),
+        )
+        self._paint_fft_time_heatmap(canvas, result, inputs)
+        complete = getattr(self, "_complete_heatmap_color_render", None)
+        if policy is not None and callable(complete):
+            complete("fft_time", canvas, policy)
+        self._restore_analysis_canvas_viewport("fft_time", canvas)
+        # After the viewport restore, so the signature records the pane
+        # limits the next entry will read.
+        finish = getattr(self, "_finish_heatmap_color_presentation", None)
+        if callable(finish):
+            finish("fft_time", canvas, inputs, result)
+        else:
+            notify_ultraview_plot(self, "fft_time", "heatmap-plot")
+            commit = getattr(self, "_commit_heatmap_reveal", None)
+            if callable(commit):
+                commit("fft_time", canvas, inputs, result)
+
+    # ---- FFT vs Time coordinator events --------------------------------
+    def _on_fft_time_render_requested(self, ctx, result, cache_hit):
+        """Render a cache hit or freshly computed result for its own pane.
+
+        The coordinator stores cache/pin under the dispatch-time identity
+        before emitting this signal.  An inactive View keeps that pin and
+        skips the live draw (A7).  A completion whose compute request is no
+        longer the active pane's request is not published: the cache entry
+        stays under the old key, and its pin is removed.
+        """
+        outcome = getattr(self, '_fft_time_outcome', None)
+        if outcome is not None:
+            if cache_hit:
+                outcome.cached += 1
+            else:
+                outcome.computed += 1
+        decision = self._fft_time_completion_decision(ctx)
+        if decision == 'reject':
+            self._unpublish_analysis_completion('fft_time', ctx)
+            return
+        state = self._analysis_state_by_id('fft_time', ctx.get('view_id'))
+        pane_idx = ctx.get('pane_idx', 0)
+        request = ctx.get('request_snapshot')
+        if request is not None:
+            key = ctx.get('analysis_key')
+            if not bind_result(state.panes[int(pane_idx)], request, (key,) if key is not None else ()):
+                self._unpublish_analysis_completion('fft_time', ctx)
+                return
+            self._replace_analysis_pane_pins('fft_time', state.view_id, int(pane_idx), (key,))
+        if decision == 'keep':
+            return
+        source = ctx.get('source')
+        p = self._fft_time_completion_display_params(state, ctx)
+        self._cancel_fft_time_page_transition_cover(ctx.get('view_id'))
+        try:
+            pane_idx = int(pane_idx)
+        except (TypeError, ValueError):
+            pane_idx = 0
+        canvas = self._canvas_for_completion('fft_time', state.view_id, pane_idx)
+        if canvas is not None:
+            self._render_fft_time_on(canvas, result, p, source=source)
+        elif not self._comparison_routes('fft_time'):
+            page = self._analysis_page('fft_time')
+            if page is not None and 0 <= pane_idx < page.pane_count():
+                self._render_fft_time_on(
+                    page.pane_canvas(pane_idx), result, p, source=source)
+            else:
+                self._render_fft_time(result, p, source=source)
+        if not self._completion_updates_focus('fft_time', ctx):
+            return
+        nfft = getattr(getattr(result, 'params', None), 'nfft', None)
+        suffix = f" · NFFT {int(nfft)}" if nfft is not None else ""
+        if cache_hit:
+            self.statusBar.showMessage(
+                "使用缓存结果 · "
+                f"{result.metadata.get('frames', 0)} frames{suffix}"
+            )
+        else:
+            self.statusBar.showMessage(
+                f"FFT vs Time 完成 · {result.metadata.get('frames', 0)} frames"
+                f"{suffix}"
+            )
+        self._sync_fft_time_effective_facts(state)
+
+    def _fft_time_completion_decision(self, ctx) -> str:
+        """``draw``, ``keep`` (inactive A7), or ``reject`` (not the current request)."""
+        state = self._analysis_state_by_id('fft_time', ctx.get('view_id'))
+        if state is None:
+            return 'reject'
+        try:
+            pane_idx = int(ctx.get('pane_idx', 0))
+        except (TypeError, ValueError):
+            return 'reject'
+        if not (0 <= pane_idx < len(state.panes)):
+            return 'reject'
+        pane = state.panes[pane_idx]
+        token = ctx.get('pane_token')
+        if token is not None and token != _fft_time_pane_token(pane):
+            return 'reject'
+        request = ctx.get('request_snapshot')
+        if request is not None and request.revision != pane.request_revision:
+            return 'reject'
+        source = ctx.get('source')
+        if source is None and ctx.get('fid') is not None:
+            source = (ctx.get('fid'), ctx.get('channel'))
+        if source:
+            source = tuple(source)
+            if source[0] not in getattr(self, 'files', {}):
+                return 'reject'
+            live = list(pane.sources or [])
+            if live and tuple(live[0]) != source:
+                return 'reject'
+        if request is None and self._fft_time_completion_request_changed(state, pane, pane_idx, ctx):
+            return 'reject'
+        if not self._analysis_completion_is_visible('fft_time', ctx):
+            return 'keep'
+        return 'draw'
+
+    def _fft_time_current_cache_key(self, state, pane, pane_idx):
+        sources = list(pane.sources or [])
+        if not sources:
+            return None
+        fid, ch = sources[0]
+        if fid not in getattr(self, 'files', {}):
+            return None
+        time_range = self._normalize_analysis_time_range(
+            getattr(pane, 'time_range', None),
+        )
+        params = self._compute_params_overlay_state('fft_time', state)
+        return self._analysis_cache_key(
+            'fft_time', fid, ch, pane_idx=pane_idx,
+            params=params, time_range=time_range,
+        )
+
+    def _fft_time_completion_request_changed(self, state, pane, pane_idx, ctx) -> bool:
+        """True only when the completion carries a compute identity that disagrees.
+
+        A callback with no ``params`` and no real cache key keeps the view-id
+        gate. Dispatch display (``render_params``) is not compute identity.
+        """
+        completed = ctx.get('analysis_key')
+        params = ctx.get('params')
+        if not isinstance(completed, tuple) and not params:
+            return False
+        current = self._fft_time_current_cache_key(state, pane, pane_idx)
+        if current is None:
+            return True
+        if isinstance(completed, tuple):
+            return completed != current
+        source = ctx.get('source') or (ctx.get('fid'), ctx.get('channel'))
+        if not source or source[0] is None:
+            return True
+        time_range = None
+        if 'time_range' in ctx:
+            time_range = self._normalize_analysis_time_range(ctx.get('time_range'))
+        built = self._fft_time_analysis_cache_key(
+            source[0], source[1], params, time_range,
+        )
+        return built != current
+
+    def _fft_time_completion_display_params(self, state, ctx):
+        """Latest display intent over the completed compute params.
+
+        ``render_params`` is the dispatch-time snapshot. It fills compute
+        fields only when the job context has no ``params``; live display
+        always wins.
+        """
+        base = dict(ctx.get('params') or ctx.get('render_params') or {})
+        live = {}
+        inspector = getattr(self, 'inspector', None)
+        fft_ctx = getattr(inspector, 'fft_time_ctx', None) if inspector else None
+        getter = getattr(fft_ctx, 'display_params', None)
+        if callable(getter) and self._analysis_state_for_capture('fft_time') is state:
+            live = dict(getter())
+        elif state is not None:
+            saved = dict(getattr(state, 'params', None) or {})
+            display_names = {
+                'amplitude_mode', 'cmap', 'dynamic',
+                'x_auto', 'x_min', 'x_max',
+                'y_auto', 'y_min', 'y_max',
+                'z_auto', 'z_floor', 'z_ceiling',
+                'freq_auto', 'freq_min', 'freq_max',
+            }
+            live = {
+                key: saved[key]
+                for key in saved
+                if key in display_names or key.startswith('db_')
+            }
+        base.update(live)
+        return base
+
+    def _sync_fft_time_effective_facts(self, state=None):
+        """Re-fill the Inspector facts card from the focused spectrogram."""
+        ctx = self.inspector.fft_time_ctx
+        if state is None:
+            mgr = self.analysis_managers.get('fft_time')
+            if mgr is None or not mgr.views:
+                ctx.clear_effective_facts()
+                return
+            state = mgr.get(mgr.active)
+        page = self._analysis_page('fft_time')
+        idx = page.focused_index()
+        if self._comparison_routes('fft_time'):
+            comp = self._comparison()
+            focus = comp.focused('fft_time') if comp is not None else None
+            if focus is not None and str(focus[0]) == str(getattr(state, 'view_id', '')):
+                idx = int(focus[1])
+        if state is None or not (0 <= idx < len(state.panes)):
+            ctx.clear_effective_facts()
+            return
+        pane = state.panes[idx]
+        binding = pane.result_binding
+        if binding is None or not binding.request.sources:
+            ctx.clear_effective_facts()
+            return
+        sources = list(binding.request.sources)
+        fid, ch = sources[0]
+        result = self.analysis_caches['fft_time'].get(binding.keys[0])
+        facts = getattr(result, 'effective', None) if result is not None else None
+        if facts is None:
+            ctx.clear_effective_facts()
+            return
+        _fid, _ch, _t, sig, _fd = self._fft_time_signal_for((fid, ch))
+        self._publish_analysis_effective_facts(
+            ctx, facts, sig=sig, fid=fid, sources=sources,
+        )
+        if binding.stale:
+            ctx.mark_effective_facts_stale()
+
+    def _on_fft_time_failed(self, _ctx, message):
+        """Coordinator failure — keep the previous chart on screen.
+
+        Mirrors the synchronous T5 error pattern: ``toast(error)`` plus
+        a status-bar message; the canvas is NEVER cleared so the user
+        keeps the last-known-good chart while debugging the input.
+
+        Cancel is also routed here (the analyzer raises
+        ``RuntimeError('spectrogram computation cancelled')`` when
+        ``cancel_token`` returns truthy) — the message string itself
+        carries the distinction, no separate signal needed.
+
+        T2 (2026-04-26) removed the in-handler auto-rebuild + retry
+        branch that previously handled ``non-uniform time axis``
+        errors. Non-uniform inputs are now caught synchronously by
+        :meth:`_check_uniform_or_prompt` BEFORE worker dispatch (see
+        ``do_fft_time``). The handler's earlier ``_fft_time_retry_pending``
+        flag had a latent lifecycle bug (cleared in the deferred
+        ``_retry``'s ``finally`` before the next worker could fail);
+        deleting the retry path eliminates that risk and simplifies the
+        contract: every worker failure now surfaces verbatim. If the
+        worker still raises ``non-uniform time axis`` (e.g. a future
+        regression or a genuinely racy axis mutation), the message
+        surfaces as a normal error toast and the user can click
+        重建时间轴 manually.
+        """
+        request = _ctx.get('request_snapshot')
+        state = self._analysis_state_by_id('fft_time', _ctx.get('view_id'))
+        pane_idx = int(_ctx.get('pane_idx', 0))
+        if request is not None:
+            if state is None or not 0 <= pane_idx < len(state.panes):
+                return
+            pane = state.panes[pane_idx]
+            if _ctx.get('pane_token', id(pane)) != id(pane) or request.revision != pane.request_revision:
+                return
+            mark_pending(pane)
+            if (
+                self.chart_stack.current_mode() != 'fft_time'
+                or not self._analysis_completion_is_visible('fft_time', _ctx)
+                or not self._completion_updates_focus('fft_time', _ctx)
+                or self._dispatch_focus_index('fft_time', state) != pane_idx
+            ):
+                return
+            self._sync_fft_time_effective_facts(state)
+        msg = str(message)
+        outcome = getattr(self, '_fft_time_outcome', None)
+        if outcome is not None:
+            outcome.failed += 1
+        else:
+            self.toast(msg, "error")
+        self.statusBar.showMessage(f"FFT vs Time 错误: {message}")
+
+    def _on_fft_time_job_progress(self, done, total):
+        """Project service-owned batch progress onto the existing UI bar."""
+        token = self._analysis_jobs.progress_token('fft_time')
+        if token is None:
+            return
+        completed, total_jobs = self._analysis_jobs.progress_counts('fft_time')
+        total_jobs = max(1, total_jobs)
+        job_index = min(completed + 1, total_jobs)
+        label = f"FFT-时间 {job_index}/{total_jobs}"
+        self._update_compute_progress(
+            done, total, label=label, token=token,
+        )
+        if done == total and not self._analysis_jobs.is_running('fft_time'):
+            self._finish_compute_progress(token=token)
+            self._analysis_jobs.clear_progress_token('fft_time')
+            self._finish_fft_time_outcome_feedback()
+            self._finish_analysis_restore_if_idle()

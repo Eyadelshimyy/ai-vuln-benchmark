@@ -1,0 +1,3228 @@
+"""BatchSheet — pipeline-style batch dialog (Wave 6: end-to-end runnable).
+
+The pipeline strip and three detail panels are wired into
+``_recompute_pipeline_status`` which is called once at __init__ end (per
+the conditional-visibility-init-sync lesson) so the badge state is
+correct before ``show()``.
+
+Wave 6 adds the bottom task list, the ``BatchRunnerThread`` lifecycle,
+lock/unlock during a run, and a closeEvent confirmation that re-routes
+through the cancel path. **Unlock is bound to ``QThread.finished``**, not
+``finished_with_result`` (spec §6.2): even if ``runner.run()`` raises
+before the result signal would have fired, ``QThread.finished`` still
+arrives via Qt and the dialog re-enables.
+"""
+from __future__ import annotations
+
+from contextlib import contextmanager
+import dataclasses
+from dataclasses import dataclass
+from pathlib import Path
+import tempfile
+
+from PyQt5 import sip
+from PyQt5.QtCore import QCoreApplication, QEvent, QEventLoop, QTimer, Qt, QUrl
+from PyQt5.QtGui import QDesktopServices
+from PyQt5.QtWidgets import (
+    QApplication, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel,
+    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
+    QVBoxLayout, QWidget,
+)
+
+from ....batch import AnalysisPreset, BatchOutput, BatchRunner, logger as _batch_logger
+from ....batch_grouping import group_render_tasks
+from ....qt_analysis_shared import amplitude_mode_is_db
+from ....ui_kit.qt_lifecycle import weak_bound
+from ....batch_preset_io import (
+    UnsupportedPresetVersion, load_preset_from_json, save_preset_to_json,
+)
+from ....batch_recipe import TIME_RENDER_DEFAULTS, normalize_batch_params
+from ....batch_validation import (
+    ValidationIssue, validate_outputs, validate_recipe,
+)
+from ....io.source_adapters import DEFAULT_SOURCE_ADAPTER_REGISTRY
+from ...batch_settings import BatchPanelPrefs, BatchPanelPrefsStore
+from ...drop_paths import (
+    DropOverlay,
+    filter_drop_files,
+    has_supported_drop_suffix,
+    iter_local_paths,
+)
+from ...widgets.toast import Toast
+from ._geometry import (
+    clear_tool_window_transient_parent,
+    configure_independent_tool_window,
+    fit_dialog_to_available_screen,
+    present_independent_tool_window,
+)
+from .analysis_panel import AnalysisPanel
+from .input_panel import InputPanel, STATE_PATH_PENDING, STATE_PROBING
+from .output_panel import OutputPanel
+from .pipeline_strip import PipelineStrip
+from .preview_dialog import BatchPreviewDialog
+from .result_details import BatchResultDetailsPanel, result_has_detail_payload
+from .runner_thread import BatchPreviewThread, BatchRunnerThread
+from .task_list import TaskListWidget
+
+
+_METHOD_LABELS: dict[str, str] = {
+    "time": "时域",
+    "fft": "频谱",
+    "fft_time": "时频",
+    "frf": "频响",
+    "order_time": "阶次",
+}
+
+_DB_REFERENCE_SECTION_BY_METHOD: dict[str, str] = {
+    "fft": "fft",
+    "fft_time": "fft_time",
+    "order_time": "order",
+}
+
+_OUTPUT_ISSUE_FIELDS = frozenset({
+    "outputs",
+    "data_format",
+    "image_format",
+    "image_size",
+    "image_width",
+    "image_height",
+    "image_pixels",
+    "image_dpi",
+    "image_background",
+    "image_line_width",
+    "conflict_policy",
+    "resume_policy",
+})
+
+_PIPELINE_RECOMPUTE_DEBOUNCE_MS = 150
+_STOP_ON_CLOSE_TITLE = "确认关闭"
+_STOP_ON_CLOSE_TEXT = "批量任务正在运行，关闭将取消剩余任务。要继续吗？"
+_STOP_WAIT_TIMEOUT_MS = 30_000
+
+
+_METHOD_CAPTION_START = "先选分析方法"
+_METHOD_CAPTION_ENGAGED = "分析方法"
+_METHOD_START_HINT = "先确定分析方法，下方目标与参数会随之切换。"
+_METHOD_READY_HINT = "配置已完整，可预览或运行"
+_METHOD_ROW_HEIGHT_PX = 40
+
+
+class _ElidingHint(QLabel):
+    """Single-line hint that elides in place and keeps the full text as tooltip."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._full = ""
+        self.setObjectName("BatchMethodHint")
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setTextInteractionFlags(Qt.NoTextInteraction)
+
+    def set_full_text(self, text: str) -> None:
+        self._full = str(text or "")
+        self._apply_elide()
+
+    def full_text(self) -> str:
+        return self._full
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        self._apply_elide()
+
+    def _apply_elide(self) -> None:
+        elided = self.fontMetrics().elidedText(
+            self._full, Qt.ElideRight, max(0, self.width()),
+        )
+        self.setText(elided)
+        self.setToolTip(self._full)
+
+
+def _analysis_issue_summary(issue: ValidationIssue, method: str) -> str:
+    """Return a compact, user-facing stage summary for recipe issues."""
+
+    label = _METHOD_LABELS.get(method, method or "分析")
+    detail = {
+        "rpm_channel": "RPM 通道未配置",
+        "x_channel": "X 通道未配置",
+        "fs": "采样率无效",
+        "nfft": "NFFT 参数无效",
+        "x_range": "X 范围无效",
+        "y_range": "Y 范围无效",
+        "z_range": "色阶范围无效",
+        "slice": "切片位置无效",
+        "slice_positions": "切片位置无效",
+    }.get(issue.field, "参数待完善")
+    return f"{label} · {detail}"
+
+
+def _output_issue_summary(issue: ValidationIssue) -> str:
+    """Keep backend output field names out of the compact pipeline strip."""
+
+    return {
+        "outputs": "未选择导出内容",
+        "data_format": "数据导出设置待完善",
+        "image_format": "图片导出设置待完善",
+        "image_size": "图片尺寸设置待完善",
+        "image_width": "图片尺寸设置待完善",
+        "image_height": "图片尺寸设置待完善",
+        "image_pixels": "图片尺寸设置待完善",
+    }.get(issue.field, "导出设置待完善")
+
+
+def _blocked_issue_reason(issue: ValidationIssue) -> str:
+    """Translate validation details for the single-line footer status."""
+
+    if issue.field in _OUTPUT_ISSUE_FIELDS:
+        return (
+            "请至少选择数据文件或图片"
+            if issue.field == "outputs" else "请检查导出设置"
+        )
+    return {
+        "rpm_channel": "请选择 RPM 通道",
+        "time_range": "请检查时间范围",
+        "x_channel": "请选择 X 通道",
+        "fs": "请检查采样率",
+        "nfft": "请检查 NFFT 参数",
+        "slice": "请检查切片位置",
+        "slice_positions": "请检查切片位置",
+        "frf_pair_rules": "请检查 FRF 输入/输出配对",
+    }.get(issue.field, "请检查分析参数")
+
+
+@dataclass(frozen=True)
+class GroupingCountSnapshot:
+    """One pipeline-recompute fact used by grouping cards, footer, and preview."""
+
+    status: str
+    task_count: int
+    groups_by_mode: dict[str, int]
+    images_enabled: bool
+    artifact_count: int
+    reason: str = ""
+
+
+_EMPTY_GROUP_COUNTS = {"none": 0, "source": 0, "channel": 0}
+
+
+class BatchSheet(QDialog):
+    def __init__(self, parent, files, current_preset=None, prefs_store=None):
+        """``prefs_store`` is the injection seam for
+        :class:`~mf4_analyzer.ui.batch_settings.BatchPanelPrefsStore`; tests
+        MUST pass one backed by an isolated ``QSettings(IniFormat)`` so the
+        dialog's open/close cycle cannot read or write the real user config.
+        """
+        super().__init__(parent)
+        self._recompute_timer = QTimer(self)
+        self._recompute_timer.setSingleShot(True)
+        self._recompute_timer.setInterval(_PIPELINE_RECOMPUTE_DEBOUNCE_MS)
+        self._recompute_timer.timeout.connect(self._recompute_pipeline_status)
+        self.setObjectName("SheetSurface")
+        self.setWindowTitle("批处理分析")
+        configure_independent_tool_window(self)
+        self._files = files if files is not None else {}
+        self._current_preset = current_preset
+        self._prefs_store = (
+            prefs_store if prefs_store is not None else BatchPanelPrefsStore()
+        )
+        self._base_name = "batch"
+        self._base_params: dict = {}
+        self._recipe_method = "fft"
+        self._applied_control_snapshot: dict = {}
+        self._applying_preset = False
+        self._applying_analysis_preset = False
+        self._analysis_preset_output_snapshot: dict | None = None
+        self._scope_source = "free_config"
+        self._scope_signal = None
+        self._scope_rpm_signal = None
+        self._scope_target_pairs: tuple = ()
+        self._scope_file_ids: tuple = ()
+        self._scope_file_paths: tuple[str, ...] = ()
+        self._scope_source_ids: tuple = ()
+        self._scope_source_paths: tuple[str, ...] = ()
+        self._scope_target_policy = "common"
+        self._scope_signals: tuple[str, ...] = ()
+        self._scope_rpm_channel = ""
+        self._x_channel_common: tuple[str, ...] = ()
+        self._x_channel_partial: dict[str, str] = {}
+        self._source_registry = DEFAULT_SOURCE_ADAPTER_REGISTRY
+        source_context = getattr(parent, "batch_source_context", {}) if parent else {}
+        self._source_context = (
+            dict(source_context) if isinstance(source_context, dict) else {}
+        )
+
+        # Run-state bookkeeping (W6).
+        self._running: bool = False
+        self._runner_thread: BatchRunnerThread | None = None
+        self._last_result = None
+        self._result_generation = 0
+        self._result_stale = False
+        # Window-local method-first guidance.  Not persisted, not a run gate.
+        self._guidance_engaged: bool = False
+        self._guidance_ready: bool = False
+        self._locate_kind: str | None = None
+        self._count_snapshot = GroupingCountSnapshot(
+            status="ready",
+            task_count=0,
+            groups_by_mode=dict(_EMPTY_GROUP_COUNTS),
+            images_enabled=True,
+            artifact_count=0,
+        )
+        # Preview state is deliberately separate from run/preset state.
+        self._preview_thread: BatchPreviewThread | None = None
+        self._preview_result = None
+        self._preview_dialog: BatchPreviewDialog | None = None
+        self._preview_temp: tempfile.TemporaryDirectory | None = None
+        self._preview_close_pending: bool = False
+        self._close_pending: bool = False
+
+        # W7 toast bookkeeping — populated by ``_toast`` so headless tests
+        # can assert deterministically without mocking the parent's toast
+        # API. Production paths additionally render the message, on this
+        # sheet while it is up and on ``parent.toast`` otherwise.
+        self._last_toast_text: str = ""
+        self._last_toast_kind: str = ""
+        self._own_toast: Toast | None = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # Toolbar — W7 wires three buttons:
+        #   • 从当前单次填入: enabled iff a current_preset was passed in,
+        #     fills the dialog from that preset (spec §6.4 current_single).
+        #   • 导入方案…  : open JSON, load, apply (warns on
+        #     UnsupportedPresetVersion / corrupt JSON via toast).
+        #   • 导出方案… : strip runtime fields via dataclasses.replace
+        #     and save to JSON (spec §6.3).
+        self._toolbar_host = QWidget(self)
+        self._toolbar_host.setObjectName("BatchCompactToolbar")
+        self._toolbar_host.setAttribute(Qt.WA_StyledBackground, True)
+        # 36px, down from 50: the three preset buttons are secondary chrome,
+        # so a toolbar-scoped QSS rule drops them to min-height 24 (+4 padding
+        # +2 border = 30) and the 3px margins land the row exactly on 36.
+        # The strip keeps its own row below — the two rows carry different
+        # things (方案 I/O vs. pipeline state) and stay separate.
+        self._toolbar_host.setFixedHeight(36)
+        bar = QHBoxLayout(self._toolbar_host)
+        bar.setContentsMargins(14, 3, 14, 3)
+        bar.setSpacing(7)
+        self._toolbar_title = QLabel("批处理分析", self._toolbar_host)
+        self._toolbar_title.setObjectName("BatchToolbarTitle")
+        bar.addWidget(self._toolbar_title)
+        bar.addStretch(1)
+
+        self._btn_fill_from_current = QPushButton("从当前单次同步")
+        self._btn_fill_from_current.setEnabled(self._current_preset is not None)
+        self._btn_fill_from_current.clicked.connect(self._on_fill_from_current)
+        bar.addWidget(self._btn_fill_from_current)
+
+        self._btn_import_preset = QPushButton("导入方案…")
+        self._btn_import_preset.clicked.connect(self._on_import_preset)
+        bar.addWidget(self._btn_import_preset)
+
+        self._btn_export_preset = QPushButton("导出方案…")
+        self._btn_export_preset.clicked.connect(self._on_export_preset)
+        bar.addWidget(self._btn_export_preset)
+        for button in (
+            self._btn_fill_from_current,
+            self._btn_import_preset,
+            self._btn_export_preset,
+        ):
+            button.setAutoDefault(False)
+            button.setCursor(Qt.PointingHandCursor)
+
+        root.addWidget(self._toolbar_host)
+
+        self._method_row = QWidget(self)
+        self._method_row.setObjectName("BatchMethodRow")
+        self._method_row.setAttribute(Qt.WA_StyledBackground, True)
+        self._method_row.setFixedHeight(_METHOD_ROW_HEIGHT_PX)
+        self._method_row.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        method_row_lay = QHBoxLayout(self._method_row)
+        method_row_lay.setContentsMargins(14, 0, 14, 0)
+        method_row_lay.setSpacing(12)
+
+        self._method_caption = QWidget(self._method_row)
+        self._method_caption.setObjectName("BatchMethodCaption")
+        caption_lay = QHBoxLayout(self._method_caption)
+        caption_lay.setContentsMargins(0, 0, 0, 0)
+        caption_lay.setSpacing(8)
+        self._method_step_number = QLabel("01", self._method_caption)
+        self._method_step_number.setObjectName("BatchMethodStepNumber")
+        self._method_step_number.setAlignment(Qt.AlignCenter)
+        self._method_step_label = QLabel(
+            _METHOD_CAPTION_START, self._method_caption,
+        )
+        self._method_step_label.setObjectName("BatchMethodStepLabel")
+        caption_lay.addWidget(self._method_step_number)
+        caption_lay.addWidget(self._method_step_label)
+        self._method_step_label.setSizePolicy(
+            QSizePolicy.Minimum, QSizePolicy.Fixed,
+        )
+        self._method_caption.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        method_row_lay.addWidget(self._method_caption, 0)
+        self._sync_method_caption_width()
+
+        self._method_tabs_host = QWidget(self._method_row)
+        self._method_tabs_host.setObjectName("BatchMethodTabsHost")
+        self._method_tabs_host.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        self._method_tabs_layout = QHBoxLayout(self._method_tabs_host)
+        self._method_tabs_layout.setContentsMargins(0, 0, 0, 0)
+        self._method_tabs_layout.setSpacing(0)
+        method_row_lay.addWidget(self._method_tabs_host, 0)
+
+        self._method_hint = _ElidingHint(self._method_row)
+        method_row_lay.addWidget(self._method_hint, 1)
+        root.addWidget(self._method_row)
+
+        # Pipeline strip — its own row, slimmed from 62px to 40px.
+        self.strip = PipelineStrip(self)
+        root.addWidget(self.strip)
+
+        # Detail row: input | analysis | output
+        detail = QWidget(self)
+        detail.setObjectName("BatchCompactWorkspace")
+        detail_lay = QHBoxLayout(detail)
+        detail_lay.setContentsMargins(0, 0, 0, 0)
+        detail_lay.setSpacing(0)
+        self._detail_host = detail
+        self._detail_lay = detail_lay
+
+        self._input_panel = InputPanel(
+            self, files=self._files, source_registry=self._source_registry,
+            source_context=self._source_context,
+        )
+        recent_store = getattr(parent, "_recent_files", None)
+        if recent_store is not None:
+            self._input_panel._file_list.set_recent_store(recent_store)
+        # Route through a closure over a *weak* reference, not the bound
+        # method directly: ``InputPanel``/``FileListWidget`` store this
+        # handler as a plain attribute for the lifetime of the sheet, which
+        # is a strong reference back to ``self`` held by a descendant --
+        # exactly the shape that left ``BatchSheet`` a zombie Python wrapper
+        # in the lambda-connection bug fixed above, except here there is no
+        # QObject-destruction hook to release it. A weak closure means the
+        # descendant never keeps ``self`` alive past its own refcount.
+        self._input_panel.set_disk_paths_handler(
+            weak_bound(self._add_disk_paths_with_blf_context)
+        )
+        self._handoff_notice = QLabel(self._input_panel)
+        self._handoff_notice.setObjectName("BatchHandoffNotice")
+        self._handoff_notice.setWordWrap(True)
+        self._handoff_notice.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Preferred,
+        )
+        self._handoff_notice.setStyleSheet(
+            "QLabel#BatchHandoffNotice { color:#9a6700;"
+            " background:#fff8dc; border:1px solid #f0d98b;"
+            " border-radius:4px; padding:4px 6px; }"
+        )
+        self._handoff_notice.hide()
+        self._handoff_notice_row_inserted = False
+        self._analysis_panel = AnalysisPanel(self)
+        self._analysis_panel.mount_method_selector(self._method_tabs_layout)
+        self._analysis_panel.set_weighting_options(
+            self._weighting_options_from_parent()
+        )
+        self._output_panel = OutputPanel(self)
+        store = getattr(parent, "db_reference_store", None) if parent else None
+        if store is not None:
+            self._output_panel.set_reference_catalog(store.snapshot())
+
+        def scrolling_pane(
+            panel: QWidget, name: str, background: str, *, last: bool = False,
+        ) -> QScrollArea:
+            panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+            scroll = QScrollArea(detail)
+            scroll.setObjectName(name)
+            scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            scroll.setMinimumSize(0, 0)
+            scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
+            right_border = "0" if last else "1px solid #dbe4ef"
+            scroll.setStyleSheet(
+                f"QScrollArea#{name} {{ border:0; border-right:{right_border};"
+                f" background:{background}; }}"
+                f"QScrollArea#{name} QWidget#qt_scrollarea_viewport {{"
+                f" background:{background}; }}"
+                f"QScrollArea#{name} > QWidget > QWidget {{"
+                f" background:{background}; }}"
+            )
+            scroll.setWidget(panel)
+            return scroll
+
+        self._input_scroll = scrolling_pane(
+            self._input_panel, "BatchInputScroll", "#ffffff",
+        )
+        self._analysis_scroll = scrolling_pane(
+            self._analysis_panel, "BatchAnalysisScroll", "#fcfefd",
+        )
+        self._output_scroll = scrolling_pane(
+            self._output_panel, "BatchOutputScroll", "#fffdfa", last=True,
+        )
+        detail_lay.addWidget(self._input_scroll, 29)
+        detail_lay.addWidget(self._analysis_scroll, 39)
+        detail_lay.addWidget(self._output_scroll, 32)
+        root.addWidget(detail, 1)
+
+        # Keep the task model for runner events and testable artifact facts,
+        # but remove the old lower task-list surface from the product layout.
+        # The compact footer below is its only visible projection.
+        self._task_list = TaskListWidget(self)
+        self._task_list.hide()
+
+        # Fixed status footer: one compact status/progress projection plus
+        # the required close/run/cancel actions.  The run gate remains the
+        # same: an incomplete sheet cannot reach BatchRunner's legacy file
+        # fallback and accidentally analyse every loaded file/channel.
+        self._footer_host = QWidget(self)
+        self._footer_host.setObjectName("BatchCompactFooter")
+        self._footer_host.setFixedHeight(50)
+        self._footer_lay = QHBoxLayout(self._footer_host)
+        # 5px, not 7: the footer action buttons carry QSS min-height 30 plus
+        # 4px padding and a 1px border on each side, so their real minimum
+        # height is 40. 5 + 40 + 5 lands exactly on the 50px host — at 7 the
+        # layout's minimum (54) overflowed the host and Qt silently pinned
+        # the buttons to the top, leaving a lopsided 7px/3px gap.
+        self._footer_lay.setContentsMargins(16, 5, 14, 5)
+        self._footer_lay.setSpacing(8)
+        self._footer_state_dot = QLabel(self._footer_host)
+        self._footer_state_dot.setObjectName("BatchFooterStateDot")
+        self._footer_state_dot.setFixedSize(8, 8)
+        self._footer_lay.addWidget(self._footer_state_dot)
+        self._footer_status = QLabel("待配置", self._footer_host)
+        self._footer_status.setObjectName("BatchFooterStatus")
+        self._footer_lay.addWidget(self._footer_status)
+        self._footer_task_summary = QLabel("等待运行", self._footer_host)
+        self._footer_task_summary.setObjectName("BatchFooterTaskSummary")
+        self._footer_lay.addWidget(self._footer_task_summary, 1)
+        self._btn_result_details = QPushButton("查看详情", self._footer_host)
+        self._btn_result_details.setObjectName("BatchResultDetailsEntry")
+        self._btn_result_details.setFlat(True)
+        self._btn_result_details.setCursor(Qt.PointingHandCursor)
+        self._btn_result_details.setFocusPolicy(Qt.TabFocus)
+        self._btn_result_details.setAutoDefault(False)
+        self._btn_result_details.setDefault(False)
+        self._btn_result_details.clicked.connect(self._show_result_details)
+        self._btn_result_details.setEnabled(False)
+        self._btn_result_details.hide()
+        self._footer_lay.addWidget(self._btn_result_details)
+        self._footer_locate = QPushButton("", self._footer_host)
+        self._footer_locate.setObjectName("BatchFooterLocate")
+        self._footer_locate.setFlat(True)
+        self._footer_locate.setCursor(Qt.PointingHandCursor)
+        self._footer_locate.setFocusPolicy(Qt.TabFocus)
+        self._footer_locate.clicked.connect(self._on_footer_locate)
+        self._footer_locate.hide()
+        self._footer_lay.addWidget(self._footer_locate)
+        self._footer_progress = QProgressBar(self._footer_host)
+        self._footer_progress.setObjectName("BatchFooterProgress")
+        self._footer_progress.setRange(0, 1)
+        self._footer_progress.setValue(0)
+        self._footer_progress.setTextVisible(False)
+        self._footer_progress.setMinimumWidth(130)
+        self._footer_progress.setMaximumWidth(180)
+        self._footer_lay.addWidget(self._footer_progress)
+
+        # Idle-mode buttons
+        self._btn_cancel = QPushButton("关闭", self._footer_host)
+        self._btn_cancel.clicked.connect(self.reject)
+        self._footer_lay.addWidget(self._btn_cancel)
+
+        self._btn_preview = QPushButton("预览", self._footer_host)
+        self._btn_preview.setToolTip("生成正式渲染链路的代表最终图")
+        self._btn_preview.setProperty("role", "secondary")
+        self._btn_preview.clicked.connect(self._on_preview_clicked)
+        self._footer_lay.addWidget(self._btn_preview)
+
+        self._btn_run = QPushButton("运行", self._footer_host)
+        self._btn_run.setDefault(True)
+        self._btn_run.setProperty("role", "primary")
+        self._btn_run.clicked.connect(self._on_run_clicked)
+        self._footer_lay.addWidget(self._btn_run)
+
+        # Running-mode button (hidden until a run starts)
+        self._btn_abort = QPushButton("中断", self._footer_host)
+        self._btn_abort.setProperty("role", "danger")
+        self._btn_abort.clicked.connect(self._on_cancel_clicked)
+        self._btn_abort.setVisible(False)
+        self._footer_lay.addWidget(self._btn_abort)
+
+        root.addWidget(self._footer_host)
+
+        # Overlay above the footer; not part of the three-column layout.
+        self._result_details = BatchResultDetailsPanel(self)
+        self._result_details.hide()
+        self._result_details.artifactRequested.connect(
+            self._on_details_artifact_requested
+        )
+        self._result_details.locateRequested.connect(
+            self._on_details_locate_requested
+        )
+        self._result_details._btn_close.clicked.connect(
+            self._on_result_details_close
+        )
+
+        # Wire status recomputation. Each signal is independent — we wire all
+        # of them so that any sub-control mutation flows into a single
+        # recompute pass.
+        self._input_panel.changed.connect(self._on_input_scope_changed)
+        self._input_panel.filterChanged.connect(self._on_user_configuration)
+        self._input_panel._file_list.filesChanged.connect(
+            self._schedule_pipeline_recompute
+        )
+        # Connect the bound method directly rather than via
+        # ``lambda _x: self._schedule_pipeline_recompute()``: PyQt truncates
+        # the signal's payload to match a slot with fewer parameters, so the
+        # lambda bought nothing. It did cost something -- a lambda closing
+        # over ``self`` is a slot PyQt does not tie to any receiver's
+        # lifetime the way it does a bound method, so when a parentless test
+        # host is torn down by ordinary refcounting (cascading a synchronous
+        # C++ delete through the whole child tree) the closure survives the
+        # cascade as a stray reference, leaving this ``BatchSheet`` a zombie
+        # Python wrapper over an already-deleted C++ object. ``qtbot``
+        # teardown then hits ``RuntimeError: wrapped C/C++ object of type
+        # BatchSheet has been deleted`` calling ``.close()`` on it. A direct
+        # bound-method connection does not exhibit this -- PyQt releases it
+        # promptly when the receiver is destroyed.
+        self._input_panel._file_list.intersectionChanged.connect(
+            self._schedule_pipeline_recompute
+        )
+        self._input_panel._signal_picker.selectionChanged.connect(
+            self._schedule_pipeline_recompute
+        )
+        # Drive RPM-row visibility from the method (init-sync below).
+        self._analysis_panel.methodChanged.connect(self._input_panel.set_method)
+        self._analysis_panel.methodChanged.connect(
+            self._output_panel.apply_method_defaults
+        )
+        self._analysis_panel.methodChanged.connect(self._on_recipe_method_changed)
+        self._analysis_panel.methodChanged.connect(self._schedule_pipeline_recompute)
+        self._analysis_panel.methodChanged.connect(
+            self._sync_result_details_locate_context
+        )
+        self._analysis_panel.methodActivated.connect(self._on_user_method_activated)
+        self._analysis_panel.paramsChanged.connect(self._sync_x_axis_context)
+        self._analysis_panel.paramsChanged.connect(self._schedule_pipeline_recompute)
+        self._analysis_panel.presetApplied.connect(
+            self._on_builtin_analysis_preset
+        )
+        self._output_panel.changed.connect(self._on_output_controls_changed)
+        self._output_panel.restore_defaults_requested.connect(
+            self._on_restore_output_defaults
+        )
+        self._output_panel.db_reference_control.manage_requested.connect(
+            self._open_shared_db_reference_manager
+        )
+        self._task_list.artifactOpenRequested.connect(
+            self._open_artifact_location
+        )
+        self._input_panel.channelUniverseChanged.connect(
+            self._on_channel_universe_changed
+        )
+
+        # A fresh batch starts with time-domain analysis; explicit presets
+        # and single-analysis synchronization can override this later.
+        self._analysis_panel.set_method("time")
+
+        # Init-sync (per conditional-visibility-init-sync lesson): seed the
+        # RPM row before show() so it doesn't flash visible.
+        self._input_panel.set_method(self._analysis_panel.current_method())
+        self._input_panel._refresh_signal_universe()
+        self._sync_x_axis_context()
+
+        # Remembered display preferences land on top of the hard-coded
+        # defaults, and strictly BEFORE any ``apply_preset``: nothing applies
+        # a preset during __init__, so a preset the user actively pulls in
+        # later (从当前单次同步 / 导入方案…) always wins over this memory.
+        self._restore_panel_prefs()
+
+        # Init-sync — seed badges with the current default state.
+        self._recompute_pipeline_status()
+        self._compact_mode: bool | None = None
+        self._apply_compact_mode(self.width() <= 1180)
+
+        # Initial size: intersect the 1080x760 target with the available
+        # screen so a small laptop display never clips the footer's run/
+        # preview/close actions off-screen (plan §3 改动 A). Deliberately
+        # last in __init__, after every sub-panel exists, since it only
+        # changes the dialog's own geometry.
+        self._fit_to_available_screen(parent, 1080, 760)
+        self._init_drop_import()
+        self._guidance_ready = True
+        self._input_panel._file_list.userSourceAdded.connect(
+            self._on_user_configuration
+        )
+        self._input_panel._signal_picker.selectionChanged.connect(
+            self._on_user_configuration
+        )
+        self._input_panel._frf_pair_editor.changed.connect(
+            self._on_user_configuration
+        )
+        self._input_panel._rpm_picker.selectionChanged.connect(
+            self._on_user_configuration
+        )
+        self._analysis_panel.paramsChanged.connect(self._on_user_configuration)
+
+    def _fit_to_available_screen(self, parent, target_w: int, target_h: int) -> None:
+        """Thin forwarder to the shared clamp so ``BatchSheet`` and
+        ``BatchPreviewDialog`` (``preview_dialog.py``) share one
+        implementation instead of drifting apart."""
+        fit_dialog_to_available_screen(
+            self, parent, target_w, target_h, min_w=640, min_h=480,
+        )
+
+    def present(self) -> None:
+        """Show this sheet as a non-modal tool window and raise it."""
+        present_independent_tool_window(self)
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().showEvent(event)
+        clear_tool_window_transient_parent(self)
+        from mf4_analyzer.ui_kit.dialog_geometry import nudge_into_work_area
+
+        nudge_into_work_area(self, parent=self.parentWidget())
+        self._sync_method_caption_width()
+        self._settle_initial_content_layout()
+
+    def _settle_initial_content_layout(self) -> None:
+        """Resolve nested size hints without dispatching input or timers.
+
+        Method visibility and compact cards invalidate layouts inside the
+        scroll panes. Settle children before their parents, then repeat after
+        the panes have allocated their final widths (including scrollbars).
+        """
+        widgets = [self, *self.findChildren(QWidget)]
+        for widget in reversed(widgets):
+            widget.ensurePolished()
+            if widget.layout() is not None:
+                widget.layout().activate()
+            QCoreApplication.sendPostedEvents(widget, QEvent.LayoutRequest)
+        self._output_panel.db_reference_control.refresh_geometry()
+        for widget in reversed(widgets):
+            QCoreApplication.sendPostedEvents(widget, QEvent.LayoutRequest)
+        # Child scroll areas now have their final viewport geometry. Qt can
+        # still have a queued scrollbar hide from their pre-show size, leaving
+        # an 8px gutter until the next event-loop turn. Reapply the existing
+        # policy to settle that layout synchronously before the window appears.
+        for scroll in (
+            self._input_scroll, self._analysis_scroll, self._output_scroll,
+        ):
+            scroll.setVerticalScrollBarPolicy(scroll.verticalScrollBarPolicy())
+
+    def changeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().changeEvent(event)
+        if event.type() in (QEvent.StyleChange, QEvent.FontChange):
+            self._sync_method_caption_width()
+
+    def _sync_method_caption_width(self) -> None:
+        """Reserve the longer caption after QSS fonts apply, never clip CJK."""
+        caption = getattr(self, "_method_caption", None)
+        label = getattr(self, "_method_step_label", None)
+        number = getattr(self, "_method_step_number", None)
+        if caption is None or label is None or number is None:
+            return
+        label.ensurePolished()
+        number.ensurePolished()
+        fm = label.fontMetrics()
+        text_w = max(
+            max(fm.horizontalAdvance(text), fm.boundingRect(text).width())
+            for text in (_METHOD_CAPTION_START, _METHOD_CAPTION_ENGAGED)
+        )
+        # horizontalAdvance is the ink width; QLabel still needs a little
+        # bearing or the last CJK glyph clips against the tabs.
+        label.setMinimumWidth(text_w + 4)
+        number_w = max(21, number.minimumSizeHint().width())
+        # 128px is the HTML prototype floor for 01 + gap + 先选分析方法.
+        caption.setMinimumWidth(max(128, number_w + 8 + text_w + 4))
+
+    def _apply_compact_mode(self, compact: bool) -> None:
+        compact = bool(compact)
+        if getattr(self, "_compact_mode", None) is compact:
+            return
+        self._compact_mode = compact
+        self._input_panel.set_compact_mode(compact)
+        self._analysis_panel.set_compact_mode(compact)
+        self._output_panel.set_compact_mode(compact)
+        side = 12 if compact else 18
+        self._footer_lay.setContentsMargins(side, 5, 14, 5)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        if hasattr(self, "_analysis_panel"):
+            self._apply_compact_mode(event.size().width() <= 1180)
+        overlay = getattr(self, "_drop_overlay", None)
+        if overlay is not None and not overlay.isHidden():
+            overlay.setGeometry(self.rect())
+        self._layout_result_details()
+
+    def _init_drop_import(self) -> None:
+        self.setAcceptDrops(True)
+        self._drop_overlay = None
+
+    def _drop_suffixes(self) -> set[str]:
+        return {ext.lower() for ext in self._source_registry.supported_extensions}
+
+    def _show_drop_overlay(self) -> None:
+        if self._drop_overlay is None:
+            self._drop_overlay = DropOverlay(self, message="松手添加到批处理")
+        self._drop_overlay.setGeometry(self.rect())
+        self._drop_overlay.raise_()
+        self._drop_overlay.show()
+
+    def _hide_drop_overlay(self) -> None:
+        if self._drop_overlay is not None:
+            self._drop_overlay.hide()
+
+    def _has_batch_drop_urls(self, mime) -> bool:
+        return has_supported_drop_suffix(
+            iter_local_paths(mime), suffixes=self._drop_suffixes(),
+        )
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self._running or not self._has_batch_drop_urls(event.mimeData()):
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self._show_drop_overlay()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self._running or not self._has_batch_drop_urls(event.mimeData()):
+            event.ignore()
+            return
+        event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802 - Qt override
+        self._hide_drop_overlay()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt override
+        self._hide_drop_overlay()
+        if self._running:
+            event.ignore()
+            return
+        mime = event.mimeData()
+        local_paths = iter_local_paths(mime)
+        paths = filter_drop_files(local_paths, suffixes=self._drop_suffixes())
+        total = len(local_paths)
+        if paths:
+            event.acceptProposedAction()
+            self._input_panel.add_disk_paths(paths)
+        else:
+            event.ignore()
+        skipped = total - len(paths)
+        if skipped > 0:
+            self._toast(f"忽略 {skipped} 个不支持的文件", kind="warning")
+
+    def _set_source_context(self, source_context: dict) -> None:
+        self._source_context = dict(source_context or {})
+        self._input_panel.set_source_context(self._source_context)
+
+    def _blf_paths_among(self, paths) -> list[str]:
+        selected = []
+        for path in (paths or ()):
+            try:
+                if DEFAULT_SOURCE_ADAPTER_REGISTRY.adapter_for(path).key == "blf":
+                    selected.append(str(path))
+            except Exception:
+                continue
+        return selected
+
+    def _ensure_blf_dbc_context(self, paths) -> bool:
+        """Resolve DBC via MainWindow's shared dialog path when needed.
+
+        Returns False when BLF intake must abort (cancel / no resolver).
+        Non-BLF paths never fail this gate.
+        """
+        blf_paths = self._blf_paths_among(paths)
+        if not blf_paths:
+            return True
+        existing = [
+            str(item)
+            for item in (self._source_context.get("dbc_paths") or ())
+            if item
+        ]
+        if existing:
+            return True
+
+        parent = self.parent()
+        resolver = getattr(self, "_blf_dbc_resolver", None)
+        if not callable(resolver):
+            resolver = getattr(parent, "resolve_blf_dbc_paths_for_batch", None)
+        if not callable(resolver):
+            self._toast(
+                "无法为 CAN 日志选择 DBC（批处理未连接到主窗口）",
+                kind="warning",
+            )
+            return False
+
+        resolved = resolver(blf_paths)
+        if not resolved:
+            self._toast("已取消 CAN 日志的 DBC 选择", kind="info")
+            return False
+
+        context = dict(self._source_context)
+        context["dbc_paths"] = list(resolved)
+        self._set_source_context(context)
+        return True
+
+    def _add_disk_paths_with_blf_context(self, paths) -> None:
+        """Disk/drop intake: ensure BLF DBC context, then add paths.
+
+        On DBC cancel, non-BLF files in the same selection are still added.
+        """
+        selected = [str(path) for path in (paths or ()) if path]
+        if not selected:
+            return
+        blf_paths = self._blf_paths_among(selected)
+        others = [path for path in selected if path not in set(blf_paths)]
+        if blf_paths and not self._ensure_blf_dbc_context(blf_paths):
+            if others:
+                self._input_panel.add_disk_paths_resolved(others)
+            return
+        self._input_panel.add_disk_paths_resolved(selected)
+
+    def _present_footer(
+        self, state: str, *, done: int = 0, total: int = 1,
+        task_count: int | None = None, reason: str = "",
+    ) -> None:
+        """Project one runner/configuration state into the fixed footer."""
+        state = str(state or "blocked")
+        maximum = max(1, int(total or 1))
+        value = min(maximum, max(0, int(done or 0)))
+        count = maximum if task_count is None else max(0, int(task_count))
+        labels = {
+            "ready": "配置就绪",
+            "blocked": "待配置",
+            "running": "运行中",
+            "cancelling": "正在停止…",
+            "done": "已完成",
+            "partial": "部分完成",
+            "cancelled": "已取消",
+        }
+        if state == "ready" or count == 0:
+            # 0-task completion must keep idle guidance; a run-level
+            # warning summary must not replace it.
+            if state == "blocked":
+                task_text = "请选择文件、信号和输出目录"
+            else:
+                task_text = "点击运行后生成任务"
+            value, maximum = 0, 1
+        elif state == "blocked":
+            task_text = reason or "请选择文件、信号和输出目录"
+            value, maximum = 0, 1
+        else:
+            task_text = f"{value}/{count} 任务"
+            if reason:
+                task_text = f"{task_text} · {reason}"
+        self._footer_status.setText(labels.get(state, state))
+        self._footer_task_summary.setText(task_text)
+        self._footer_progress.setRange(0, maximum)
+        self._footer_progress.setValue(value)
+        self._footer_state_dot.setProperty("state", state)
+        self._footer_state_dot.style().unpolish(self._footer_state_dot)
+        self._footer_state_dot.style().polish(self._footer_state_dot)
+        self._sync_own_toast_margin()
+
+    def _own_toast_bottom_margin(self) -> int:
+        """Live clearance from the compact footer's real height."""
+        host = getattr(self, "_footer_host", None)
+        height = int(host.height()) if host is not None else 0
+        panel = getattr(self, "_result_details", None)
+        if panel is not None and panel.isVisible():
+            height += int(panel.height())
+        return max(0, height) + 12
+
+    def _sync_own_toast_margin(self) -> None:
+        """Re-derive toast clearance whenever footer geometry may change.
+
+        Uses the live ``margin_provider`` (footer height) rather than pinning
+        an override, so a later taller/shorter footer is picked up on show.
+        """
+        toast = getattr(self, "_own_toast", None)
+        if toast is None:
+            return
+        if toast.isVisible():
+            toast._reposition()
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if event.key() == Qt.Key_Escape and self._result_details_is_open():
+            self._hide_result_details(focus_entry=True)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    # ------------------------------------------------------------------
+    # Pipeline status recompute
+    # ------------------------------------------------------------------
+    def _on_input_scope_changed(self) -> None:
+        self._refresh_x_channel_candidates()
+        self._schedule_pipeline_recompute()
+
+    def _schedule_pipeline_recompute(self) -> None:
+        self._recompute_timer.start()
+
+    def _on_user_method_activated(self, _method: str) -> None:
+        """User click on a method tab; never re-applies the current method."""
+        if not self._guidance_ready:
+            return
+        self._guidance_engaged = True
+        self._mark_result_previous()
+        if not self._recompute_timer.isActive():
+            self._refresh_method_guidance()
+
+    def _on_user_configuration(self) -> None:
+        if not self._guidance_ready or self._applying_preset:
+            return
+        self._guidance_engaged = True
+        self._mark_result_previous()
+        self._refresh_method_guidance()
+
+    @contextmanager
+    def _suspend_user_configuration(self):
+        """Keep programmatic restore/apply off the first-user-config path."""
+        previous = self._applying_preset
+        self._applying_preset = True
+        try:
+            yield
+        finally:
+            self._applying_preset = previous
+
+    def grouping_count_snapshot(self) -> GroupingCountSnapshot:
+        return self._count_snapshot
+
+    def _empty_count_snapshot(
+        self, *, status: str, images_enabled: bool, reason: str = "",
+    ) -> GroupingCountSnapshot:
+        return GroupingCountSnapshot(
+            status=status,
+            task_count=0,
+            groups_by_mode=dict(_EMPTY_GROUP_COUNTS),
+            images_enabled=images_enabled,
+            artifact_count=0,
+            reason=reason,
+        )
+
+    def _compute_grouping_snapshot(
+        self,
+        *,
+        any_pending: bool,
+        any_failed: bool,
+        pair_error: str,
+    ) -> GroupingCountSnapshot:
+        outputs = self._output_panel.get_outputs()
+        images_enabled = bool(outputs.export_image)
+        if any_pending:
+            return self._empty_count_snapshot(
+                status="pending", images_enabled=images_enabled,
+            )
+        if pair_error:
+            return self._empty_count_snapshot(
+                status="incomplete",
+                images_enabled=images_enabled,
+                reason=str(pair_error),
+            )
+        loaded = self._input_panel._file_list.loaded_rows()
+        selected = self.selected_signals()
+        if any_failed and not loaded:
+            reasons = self._input_panel._file_list.unavailable_reasons()
+            return self._empty_count_snapshot(
+                status="failed",
+                images_enabled=images_enabled,
+                reason=reasons[0] if reasons else "解析失败",
+            )
+        if not loaded or (self.method() != "frf" and not selected):
+            return self._empty_count_snapshot(
+                status="ready", images_enabled=images_enabled,
+            )
+        try:
+            runner = self._make_runner()
+            preset = self.get_preset()
+            tasks = runner.plan_render_tasks(
+                preset,
+                source_channels=self._input_panel.source_channel_sets(),
+            )
+        except (TypeError, ValueError, OSError) as exc:
+            return self._empty_count_snapshot(
+                status="failed",
+                images_enabled=images_enabled,
+                reason=str(exc),
+            )
+        params = normalize_batch_params(dict(preset.params), preset.method)
+        groups_by_mode = {}
+        for mode in ("none", "source", "channel"):
+            mode_params = dict(params)
+            mode_params["render_group_by"] = mode
+            if mode != "none":
+                layout = str(mode_params.get("render_layout") or "overlay").lower()
+                if layout not in {"overlay", "subplot"}:
+                    mode_params["render_layout"] = "overlay"
+            groups_by_mode[mode] = len(group_render_tasks(tasks, mode_params))
+        group_by = str(params.get("render_group_by") or "none").strip().lower()
+        if group_by not in groups_by_mode:
+            group_by = "none"
+        data_count = len(tasks) if outputs.export_data else 0
+        image_count = groups_by_mode[group_by] if images_enabled else 0
+        return GroupingCountSnapshot(
+            status="ready",
+            task_count=len(tasks),
+            groups_by_mode=groups_by_mode,
+            images_enabled=images_enabled,
+            artifact_count=data_count + image_count,
+        )
+
+    def _guidance_problem(
+        self,
+        *,
+        loaded_paths,
+        selected,
+        any_pending: bool,
+        preflight_issues,
+        runnable: bool,
+    ) -> tuple[str | None, str, str]:
+        """Return (locate_kind, message, locate_verb) from already-computed facts."""
+        method = self._analysis_panel.current_method()
+        if any_pending:
+            return "source", "正在解析…", "去检查"
+        for issue in preflight_issues:
+            if issue.field == "source":
+                return "source", issue.message, "去检查"
+        if not loaded_paths:
+            if self._input_panel._file_list.has_probe_failed():
+                return "source", "文件解析失败，请检查文件列表", "去检查"
+            return "files", "尚未添加数据文件", "去添加"
+        if method == "frf":
+            pair_error = self._input_panel.frf_pair_validation_message()
+            if pair_error or not selected:
+                return "frf", pair_error or "尚未完成输入与输出配对", "去选择"
+        elif not selected:
+            return "signals", "尚未选择分析信号", "去选择"
+        if method == "order_time" and not self.rpm_channel():
+            return "rpm", "尚未指定转速通道", "去选择"
+        for issue in preflight_issues:
+            if issue.field == "target_signals":
+                return "signals", issue.message, "去选择"
+            if issue.field == "frf_pair_rules":
+                return "frf", issue.message, "去选择"
+            if issue.field == "rpm_channel":
+                return "rpm", issue.message, "去选择"
+            if issue.field in _OUTPUT_ISSUE_FIELDS:
+                verb = "去选择" if issue.field == "outputs" else "去检查"
+                return f"field:{issue.field}", issue.message, verb
+            return f"field:{issue.field}", issue.message, "去检查"
+        if not self.output_dir():
+            return "output", "尚未填写输出目录", "去填写"
+        if runnable:
+            return None, _METHOD_READY_HINT, ""
+        return "params", "请检查分析参数", "去检查"
+
+    def _refresh_method_guidance(
+        self,
+        *,
+        loaded_paths=None,
+        selected=None,
+        any_pending: bool | None = None,
+        preflight_issues=None,
+        runnable: bool | None = None,
+    ) -> None:
+        if loaded_paths is None:
+            loaded_paths = self._input_panel._file_list.all_loaded_paths()
+        if selected is None:
+            selected = self._input_panel.selected_signals()
+        if any_pending is None:
+            any_pending = self._input_panel._file_list.has_pending_probe()
+        if preflight_issues is None:
+            preflight_issues = self.preflight_issues()
+        if runnable is None:
+            runnable = (not self._running) and self.is_runnable(
+                issues=preflight_issues,
+            )
+        method_name = _METHOD_LABELS.get(
+            self._analysis_panel.current_method(),
+            self._analysis_panel.current_method(),
+        )
+        locate_kind = None
+        locate_verb = ""
+        if self._running:
+            caption = _METHOD_CAPTION_ENGAGED
+            hint = f"已选{method_name}"
+            self._method_row.setProperty("guidance", "engaged")
+        elif not self._guidance_engaged:
+            caption = _METHOD_CAPTION_START
+            hint = _METHOD_START_HINT
+            locate_kind, _message, locate_verb = self._guidance_problem(
+                loaded_paths=loaded_paths,
+                selected=selected,
+                any_pending=any_pending,
+                preflight_issues=preflight_issues,
+                runnable=runnable,
+            )
+            self._method_row.setProperty("guidance", "start")
+        else:
+            caption = _METHOD_CAPTION_ENGAGED
+            locate_kind, message, locate_verb = self._guidance_problem(
+                loaded_paths=loaded_paths,
+                selected=selected,
+                any_pending=any_pending,
+                preflight_issues=preflight_issues,
+                runnable=runnable,
+            )
+            if locate_kind == "files" and not loaded_paths and not any_pending:
+                next_text = "下一步：添加数据文件"
+            elif locate_kind is None:
+                next_text = _METHOD_READY_HINT
+            else:
+                next_text = message
+            hint = f"已选{method_name} · {next_text}"
+            self._method_row.setProperty("guidance", "engaged")
+        self._method_step_label.setText(caption)
+        self._method_hint.set_full_text(hint)
+        self._method_row.style().unpolish(self._method_row)
+        self._method_row.style().polish(self._method_row)
+        self._locate_kind = None if self._running else locate_kind
+        target = self._resolve_locate_widget(self._locate_kind)
+        if (
+            self._running or not locate_kind or not locate_verb
+            or target is None or not target.isVisibleTo(self)
+        ):
+            self._footer_locate.hide()
+            self._footer_locate.setText("")
+        else:
+            self._footer_locate.setText(locate_verb)
+            self._footer_locate.show()
+
+    def _on_footer_locate(self) -> None:
+        self._focus_locate_target(self._locate_kind)
+
+    def _widget_is_usable(self, widget: QWidget | None) -> bool:
+        if widget is None:
+            return False
+        try:
+            if sip.isdeleted(widget):
+                return False
+        except RuntimeError:
+            return False
+        if self.isVisible():
+            return bool(widget.isVisible())
+        return bool(widget.isVisibleTo(self))
+
+    def _focus_locate_target(self, kind: str | None) -> bool:
+        """Scroll to and focus a locate target. Does not rewrite `_locate_kind`."""
+        widget = self._resolve_locate_widget(kind)
+        if kind == "frf" and not self._widget_is_usable(widget):
+            editor = getattr(self._input_panel, "_frf_pair_editor", None)
+            if self.method() == "frf" and self._widget_is_usable(editor):
+                widget = editor
+        if not self._widget_is_usable(widget):
+            return False
+        scroll = self._scroll_for_widget(widget)
+        if scroll is not None:
+            scroll.ensureWidgetVisible(widget)
+        widget.setFocus(Qt.OtherFocusReason)
+        return True
+
+    def _scroll_for_widget(self, widget: QWidget) -> QScrollArea | None:
+        for scroll in (
+            self._input_scroll, self._analysis_scroll, self._output_scroll,
+        ):
+            panel = scroll.widget()
+            current = widget
+            while current is not None:
+                if current is panel:
+                    return scroll
+                current = current.parentWidget()
+        return None
+
+    def _resolve_locate_widget(self, kind: str | None) -> QWidget | None:
+        if not kind:
+            return None
+        if kind == "files":
+            return self._input_panel._file_list._btn_loaded
+        if kind == "signals":
+            return self._input_panel._signal_picker._trigger
+        if kind == "frf":
+            return self._input_panel._frf_pair_editor.validation_target()
+        if kind == "rpm":
+            return self._input_panel._rpm_picker._trigger
+        if kind == "source":
+            return self._input_panel._file_list
+        if kind == "params":
+            return self._analysis_panel._param_form
+        if kind == "output":
+            return self._output_panel._dir_edit
+        if kind.startswith("field:"):
+            field = kind.removeprefix("field:")
+            analysis = self._analysis_panel
+            output = self._output_panel
+            if field == "time_range":
+                return (
+                    analysis._source_interval_edit if self.method() == "fft"
+                    else output.spin_x_min if self.method() == "time" else None
+                )
+            if field == "slice_positions":
+                return analysis._slice._positions_edit
+            if field == "rpm_factor":
+                return self._input_panel._rpm_factor_spin
+            if field == "outputs":
+                return output._chk_data
+            if field in _OUTPUT_ISSUE_FIELDS:
+                return output._btn_output_settings
+            if field in {"x_range", "y_range", "z_range"}:
+                return {
+                    "x_range": output.spin_x_min,
+                    "y_range": output.spin_y_min,
+                    "z_range": output.spin_z_floor,
+                }[field]
+            return analysis._param_form._visible_widgets.get(field)
+        return None
+
+    def _result_details_is_open(self) -> bool:
+        panel = getattr(self, "_result_details", None)
+        if panel is None:
+            return False
+        try:
+            if sip.isdeleted(panel):
+                return False
+        except RuntimeError:
+            return False
+        return bool(panel.isVisible())
+
+    def _layout_result_details(self) -> None:
+        panel = getattr(self, "_result_details", None)
+        footer = getattr(self, "_footer_host", None)
+        if panel is None or footer is None or not panel.isVisible():
+            return
+        work = getattr(self, "_detail_host", None)
+        work_h = int(work.height()) if work is not None else max(0, self.height() - footer.height())
+        cap = int(work_h * 0.45) if work_h > 0 else 240
+        height = min(240, cap) if cap > 0 else 240
+        height = max(0, height)
+        y = max(0, self.height() - footer.height() - height)
+        panel.setGeometry(0, y, self.width(), height)
+        panel.raise_()
+        self._sync_own_toast_margin()
+
+    def _sync_result_details_entry(self) -> None:
+        button = getattr(self, "_btn_result_details", None)
+        if button is None:
+            return
+        available = (
+            not self._running
+            and result_has_detail_payload(self._last_result)
+        )
+        button.setEnabled(available)
+        button.setVisible(available)
+
+    def _sync_result_details_locate_context(self, *_args) -> None:
+        panel = getattr(self, "_result_details", None)
+        if panel is None:
+            return
+        output_widget = self._resolve_locate_widget("output")
+        editor = getattr(self._input_panel, "_frf_pair_editor", None)
+        frf_enabled = self.method() == "frf" and self._widget_is_usable(editor)
+        if self.method() != "frf":
+            reason = "当前方法已切换，无法检查信号配对"
+        elif not frf_enabled:
+            reason = "当前无法核对信号配对"
+        else:
+            reason = ""
+        panel.set_locate_context(
+            output_enabled=self._widget_is_usable(output_widget),
+            frf_enabled=frf_enabled,
+            frf_reason=reason,
+        )
+
+    def _mark_result_previous(self) -> None:
+        if self._running or self._last_result is None or self._result_stale:
+            return
+        panel = getattr(self, "_result_details", None)
+        if panel is None:
+            return
+        self._result_stale = True
+        panel.set_previous_run(True)
+
+    def _begin_new_result_generation(self) -> None:
+        self._result_generation += 1
+        self._result_stale = False
+        self._hide_result_details(focus_entry=False)
+        panel = getattr(self, "_result_details", None)
+        if panel is not None:
+            panel.clear()
+        self._sync_result_details_entry()
+
+    def _attach_result_details(self, result) -> None:
+        panel = getattr(self, "_result_details", None)
+        if panel is None:
+            return
+        if result is None:
+            self._hide_result_details(focus_entry=False)
+            panel.clear()
+            self._result_stale = False
+            self._sync_result_details_entry()
+            return
+        panel.set_result(result, generation=self._result_generation)
+        panel.set_previous_run(False)
+        self._result_stale = False
+        self._sync_result_details_locate_context()
+        self._sync_result_details_entry()
+
+    def _show_result_details(self) -> None:
+        if self._running or not result_has_detail_payload(self._last_result):
+            return
+        panel = self._result_details
+        if panel.isHidden():
+            panel.set_result(
+                self._last_result, generation=self._result_generation,
+            )
+            if self._result_stale:
+                panel.set_previous_run(True)
+        self._sync_result_details_locate_context()
+        panel.show()
+        self._layout_result_details()
+        panel._list.setFocus(Qt.OtherFocusReason)
+
+    def _hide_result_details(self, *, focus_entry: bool = False) -> None:
+        panel = getattr(self, "_result_details", None)
+        if panel is None:
+            return
+        try:
+            if sip.isdeleted(panel):
+                return
+        except RuntimeError:
+            return
+        panel.hide()
+        self._sync_own_toast_margin()
+        if (
+            focus_entry
+            and self._btn_result_details.isVisible()
+            and self._btn_result_details.isEnabled()
+        ):
+            self._btn_result_details.setFocus(Qt.OtherFocusReason)
+
+    def _on_result_details_close(self) -> None:
+        self._hide_result_details(focus_entry=True)
+
+    def _on_details_artifact_requested(self, artifact_path: str) -> None:
+        raw = str(artifact_path or "").strip()
+        path = Path(raw).expanduser()
+        if not raw or not path.exists():
+            self._toast("文件已移动或删除", kind="warning")
+            return
+        self._open_artifact_location(raw)
+
+    def _on_details_locate_requested(self, kind: str) -> None:
+        if not self._focus_locate_target(kind):
+            self._toast("当前无法定位该检查入口", kind="info")
+
+    def _teardown_result_details(self) -> None:
+        panel = getattr(self, "_result_details", None)
+        if panel is None:
+            return
+        try:
+            if sip.isdeleted(panel):
+                return
+        except RuntimeError:
+            return
+        try:
+            panel.artifactRequested.disconnect(
+                self._on_details_artifact_requested
+            )
+        except TypeError:
+            pass
+        try:
+            panel.locateRequested.disconnect(self._on_details_locate_requested)
+        except TypeError:
+            pass
+        try:
+            panel._btn_close.clicked.disconnect(self._on_result_details_close)
+        except TypeError:
+            pass
+        panel.hide()
+        panel.clear()
+
+    def _recompute_pipeline_status(self) -> None:
+        self._recompute_timer.stop()
+        # INPUT
+        fl = self._input_panel._file_list
+        loaded_paths = fl.all_loaded_paths()
+        any_pending = fl.has_pending_probe()
+        unavailable_reasons = fl.unavailable_reasons()
+        any_failed = fl.has_probe_failed() or bool(unavailable_reasons)
+        selected = self._input_panel.selected_signals()
+        pair_error = self._input_panel.frf_pair_validation_message()
+        snapshot = self._compute_grouping_snapshot(
+            any_pending=any_pending,
+            any_failed=any_failed,
+            pair_error=pair_error,
+        )
+        self._count_snapshot = snapshot
+        self._analysis_panel.set_grouping_snapshot(snapshot)
+        time_error = self._time_range_error()
+        if any_pending:
+            input_status = "pending"
+            input_summary = "正在解析…"
+        elif pair_error:
+            input_status = "warn"
+            input_summary = f"输入 · {pair_error}"
+        elif time_error:
+            input_status = "warn"
+            input_summary = time_error
+        elif any_failed:
+            # A row in probe_failed must surface as warn even when other
+            # config is otherwise complete (ultrareview bug_005). The
+            # runner skips failed rows so is_runnable still allows Run.
+            input_status = "warn"
+            input_summary = unavailable_reasons[0] if unavailable_reasons else (
+                f"{len(loaded_paths)} 文件 · {len(selected)} 信号"
+                if (loaded_paths or selected) else "解析失败"
+            )
+        elif not loaded_paths or not selected:
+            input_status = "warn"
+            input_summary = (
+                f"{len(loaded_paths)} 文件 · {len(selected)} 信号"
+                if (loaded_paths or selected) else "未配置"
+            )
+        else:
+            input_status = "ok"
+            input_summary = f"{len(loaded_paths)} 文件 · {len(selected)} 信号"
+        self.strip.set_stage(0, input_status, input_summary)
+
+        # ANALYSIS
+        method = self._analysis_panel.current_method()
+        params = self._analysis_panel.get_params()
+        preflight_issues = self.preflight_issues()
+        analysis_issues = tuple(
+            issue for issue in preflight_issues
+            if issue.field != "time_range"
+            and issue.field != "frf_pair_rules"
+            and issue.field not in _OUTPUT_ISSUE_FIELDS
+        )
+        if analysis_issues:
+            issue = analysis_issues[0]
+            self.strip.set_stage(
+                1, "warn", _analysis_issue_summary(issue, method),
+            )
+        elif not method:
+            self.strip.set_stage(1, "warn", "未选择方法")
+        else:
+            label = _METHOD_LABELS.get(method, method)
+            window = params.get("window", "")
+            if method == "time":
+                grouping = {
+                    "none": "每项单独",
+                    "source": "按数据源分组",
+                    "channel": "按信号分组",
+                }.get(str(params.get("render_group_by", "none")), "每项单独")
+                summary = f"{label} · {grouping}"
+            else:
+                summary = f"{label} · {window}" if window else label
+            self.strip.set_stage(1, "ok", summary)
+
+        # OUTPUT
+        directory = self._output_panel.directory()
+        outputs = self._output_panel.get_outputs()
+        export_data = outputs.export_data
+        export_image = outputs.export_image
+        self._update_xlsx_size_warning()
+        output_issues = tuple(
+            issue for issue in preflight_issues
+            if issue.field in _OUTPUT_ISSUE_FIELDS
+        )
+        if output_issues:
+            issue = output_issues[0]
+            self.strip.set_stage(
+                2, "warn", _output_issue_summary(issue),
+            )
+            self._output_panel.set_output_preview(error=issue.message)
+        elif not directory or not (export_data or export_image):
+            self.strip.set_stage(2, "warn", "目录/导出未配置")
+            self._output_panel.set_output_preview(None)
+        else:
+            parts: list[str] = []
+            if export_data:
+                parts.append(outputs.data_format.upper())
+            if export_image:
+                parts.append(outputs.image_format.upper())
+            output_summary = " + ".join(parts)
+            if loaded_paths and selected and method and snapshot.status == "ready":
+                self._output_panel.set_output_preview(snapshot)
+                output_summary += f" · {snapshot.artifact_count} 个文件"
+            elif (
+                loaded_paths and selected and method
+                and snapshot.status == "failed" and snapshot.reason
+            ):
+                self._output_panel.set_output_preview(error=snapshot.reason)
+            else:
+                self._output_panel.set_output_preview(None)
+            self.strip.set_stage(2, "ok", output_summary)
+
+        self._output_panel.update_effective_preview(
+            tuple(fl._rows.values()), selected,
+            weighting=str(params.get("weighting", "None")),
+            target_policy=self.target_policy(),
+            target_pairs=(
+                self._scope_target_pairs
+                if self._scope_target_policy == "exact_pairs" else ()
+            ),
+        )
+
+        # Gate the Run button on is_runnable() so an empty/partial
+        # config cannot reach BatchRunner's legacy fallback (ultrareview
+        # bug_018). The __init__'s seed call to this method correctly
+        # leaves the run button disabled at first show. While a run is in
+        # progress, the run button is hidden behind the 中断 swap, so we
+        # only adjust enabled-state in idle mode.
+        if not self._running:
+            runnable = self.is_runnable(issues=preflight_issues)
+            self._btn_run.setEnabled(runnable)
+            self._btn_preview.setEnabled(runnable)
+            blocked_reason = "请选择文件、信号和输出目录"
+            if preflight_issues:
+                blocked_reason = _blocked_issue_reason(preflight_issues[0])
+            self._present_footer(
+                "ready" if runnable else "blocked", reason=blocked_reason,
+            )
+            self._refresh_method_guidance(
+                loaded_paths=loaded_paths,
+                selected=selected,
+                any_pending=any_pending,
+                preflight_issues=preflight_issues,
+                runnable=runnable,
+            )
+        else:
+            self._refresh_method_guidance(
+                loaded_paths=loaded_paths,
+                selected=selected,
+                any_pending=any_pending,
+                preflight_issues=preflight_issues,
+                runnable=False,
+            )
+
+    def _weighting_options_from_parent(self) -> tuple[str, ...]:
+        parent = self.parent()
+        inspector = getattr(parent, "inspector", None)
+        for ctx_name in ("fft_ctx", "fft_time_ctx", "order_ctx"):
+            ctx = getattr(inspector, ctx_name, None)
+            combo = getattr(ctx, "combo_weighting", None)
+            count = combo.count() if combo is not None else 0
+            if count:
+                return tuple(combo.itemText(i) for i in range(count))
+        return ("None", "A")
+
+    # ------------------------------------------------------------------
+    # Public accessors
+    # ------------------------------------------------------------------
+    def method(self) -> str:
+        return self._analysis_panel.current_method()
+
+    def selected_signals(self) -> tuple[str, ...]:
+        return self._input_panel.selected_signals()
+
+    def rpm_channel(self) -> str:
+        return self._input_panel.rpm_channel()
+
+    def _free_config_rpm_signal(self) -> tuple[object, str] | None:
+        """Return the unambiguous runtime source selected for a free RPM.
+
+        A channel name alone means each target source supplies its own RPM.
+        When that name occurs in exactly one selected logical source, preserve
+        the source pair so ``BatchRunner`` can interpolate it onto a target in
+        another raster group.  The pair remains runtime-only and is therefore
+        intentionally excluded from portable preset JSON.
+        """
+        if self.method() != "order_time":
+            return None
+        rpm_channel = self.rpm_channel()
+        if not rpm_channel:
+            return None
+        channel_sets = self._input_panel.source_channel_sets()
+        source_ids = tuple(
+            source_id for source_id in self.source_ids()
+            if rpm_channel in channel_sets.get(source_id, frozenset())
+        )
+        return (source_ids[0], rpm_channel) if len(source_ids) == 1 else None
+
+    def _x_range_crops_time(self) -> bool:
+        """Whether the X range doubles as the time-domain data window.
+
+        ``time_range`` masks the TIME array in ``batch_preprocess``. That is
+        only what the X range means while X *is* time; once the user puts a
+        channel on X (rack travel in mm), the same numbers would crop the run
+        by seconds using millimetres and silently empty the task. In that mode
+        the X range stays a pure display window (``x_min``/``x_max``).
+        """
+        return str(self.params().get("x_source", "time")) != "channel"
+
+    def time_range(self):
+        method = self.method()
+        if method == "fft":
+            return self._analysis_panel.source_time_range()
+        if method == "time" and self._x_range_crops_time():
+            axis = self._output_panel.axis_params()
+            if axis.get("x_auto", True):
+                return None
+            return (axis["x_min"], axis["x_max"])
+        return None
+
+    def _time_range_error(self) -> str:
+        if self.method() == "fft":
+            return self._analysis_panel.source_time_range_error()
+        if self.method() == "time":
+            axis = self._output_panel.axis_params()
+            if axis.get("x_auto", True):
+                return ""
+            if float(axis["x_min"]) >= float(axis["x_max"]):
+                return "坐标 X：最小值必须小于最大值"
+        return ""
+
+    def file_ids(self) -> tuple:
+        return self._input_panel.file_ids()
+
+    def file_paths(self) -> tuple[str, ...]:
+        return self._input_panel.file_paths()
+
+    def source_ids(self) -> tuple:
+        return self._input_panel.source_ids()
+
+    def source_paths(self) -> tuple[str, ...]:
+        return self._input_panel.source_paths()
+
+    def target_policy(self) -> str:
+        exact_scope_unchanged = (
+            self.source_ids(), self.source_paths(), self.selected_signals()
+        ) == (
+            self._scope_source_ids, self._scope_source_paths, self._scope_signals
+        )
+        if (
+            self._scope_target_policy == "exact_pairs"
+            and self._scope_target_pairs
+            and exact_scope_unchanged
+        ):
+            return "exact_pairs"
+        return self._input_panel.target_policy()
+
+    def params(self) -> dict:
+        return self._analysis_panel.get_params()
+
+    def output_dir(self) -> str:
+        return self._output_panel.directory()
+
+    def export_data(self) -> bool:
+        return self._output_panel.export_data()
+
+    def export_image(self) -> bool:
+        return self._output_panel.export_image()
+
+    def data_format(self) -> str:
+        return self._output_panel.data_format()
+
+    def signals_marked_unavailable(self) -> tuple[str, ...]:
+        file_list = self._input_panel._file_list
+        policy = self.target_policy()
+        if policy == "exact_pairs":
+            rows = file_list.loaded_rows()
+            unavailable: list[str] = []
+            for source_id, signal in self._scope_target_pairs:
+                row = next(
+                    (
+                        item for item in rows
+                        if item.source_id == source_id or item.fid == source_id
+                    ),
+                    None,
+                )
+                if row is None or signal not in row.channels:
+                    unavailable.append(str(signal))
+            return tuple(dict.fromkeys(unavailable))
+
+        if policy == "available_per_source":
+            available = frozenset().union(
+                *(row.channels for row in file_list.loaded_rows())
+            )
+        else:
+            available = file_list.current_intersection()
+        return tuple(
+            signal for signal in self.selected_signals()
+            if signal not in available
+        )
+
+    # ------------------------------------------------------------------
+    # Mutators
+    # ------------------------------------------------------------------
+    def apply_method(self, method: str) -> None:
+        self._analysis_panel.apply_method(method)
+
+    def apply_signals(self, signals: tuple[str, ...]) -> None:
+        with self._suspend_user_configuration():
+            self._input_panel.apply_signals(signals)
+
+    def apply_rpm_channel(self, ch: str) -> None:
+        with self._suspend_user_configuration():
+            self._input_panel.apply_rpm_channel(ch)
+
+    def set_handoff_notice(self, text: str) -> None:
+        """Show a main-window handoff message beside the RPM controls."""
+        notice = str(text or "").strip()
+        self._handoff_notice.setText(notice)
+        if notice and not self._handoff_notice_row_inserted:
+            # When the default FFT method has detached the RPM rows, insert at
+            # their saved position.  Switching to order_time later inserts the
+            # channel and factor rows above this notice, keeping all three
+            # adjacent without coupling the message to pipeline recomputation.
+            row = self._input_panel._rpm_row_index
+            if self._input_panel._rpm_row_visible:
+                factor_row, _role = self._input_panel._form_ref.getWidgetPosition(
+                    self._input_panel._rpm_factor_spin
+                )
+                if factor_row >= 0:
+                    row = factor_row + 1
+            self._input_panel._form_ref.insertRow(row, self._handoff_notice)
+            self._handoff_notice_row_inserted = True
+        elif not notice and self._handoff_notice_row_inserted:
+            row, _role = self._input_panel._form_ref.getWidgetPosition(
+                self._handoff_notice
+            )
+            if row >= 0:
+                self._input_panel._form_ref.takeRow(row)
+            self._handoff_notice.setParent(self._input_panel)
+            self._handoff_notice_row_inserted = False
+        self._handoff_notice.setVisible(bool(notice))
+
+    def apply_time_range(self, rng) -> None:
+        method = self.method()
+        if method == "fft":
+            self._analysis_panel.apply_source_time_range(rng)
+        elif method == "time":
+            if rng is None:
+                self._output_panel.apply_axis_params({"x_auto": True})
+            else:
+                self._output_panel.apply_axis_params({
+                    "x_auto": False, "x_min": rng[0], "x_max": rng[1],
+                })
+
+    def apply_params(self, params: dict) -> None:
+        with self._suspend_user_configuration():
+            self._analysis_panel.apply_params(params)
+
+    def apply_outputs(self, out: BatchOutput) -> None:
+        self._output_panel.apply_outputs(out)
+
+    def apply_files(self, file_ids: tuple, file_paths: tuple[str, ...]) -> None:
+        paths = tuple(str(path) for path in (file_paths or ()) if path)
+        if self._blf_paths_among(paths):
+            if not self._ensure_blf_dbc_context(paths):
+                paths = tuple(
+                    path for path in paths
+                    if Path(path).suffix.lower() != ".blf"
+                )
+                if not paths and not file_ids:
+                    return
+        with self._suspend_user_configuration():
+            self._input_panel.apply_files(file_ids, paths)
+
+    def apply_sources(self, source_ids: tuple, source_paths: tuple[str, ...]) -> None:
+        paths = tuple(str(path) for path in (source_paths or ()) if path)
+        if not source_ids and self._blf_paths_among(paths):
+            if not self._ensure_blf_dbc_context(paths):
+                paths = tuple(
+                    path for path in paths
+                    if Path(path).suffix.lower() != ".blf"
+                )
+                if not paths:
+                    return
+        with self._suspend_user_configuration():
+            self._input_panel.apply_sources(source_ids, paths)
+
+    def _on_builtin_analysis_preset(self, _key: str, patch: dict) -> None:
+        # AnalysisPanel already applied its owned fields.  OUTPUT owns display
+        # scale/axes; partial application deliberately excludes export choices,
+        # source scope and dB reference state.
+        display_patch = {
+            key: value for key, value in dict(patch or {}).items()
+            if key not in {"db_reference", "db_reference_mode"}
+        }
+        self._applying_analysis_preset = True
+        try:
+            self._output_panel.apply_axis_params(display_patch)
+        finally:
+            self._applying_analysis_preset = False
+        self._analysis_preset_output_snapshot = self._output_controls_snapshot()
+        self._schedule_pipeline_recompute()
+
+    def _output_controls_snapshot(self) -> dict:
+        return {
+            "axes": self._output_panel.axis_params(),
+            "reference": self._output_panel.reference_params(),
+            "render_style": self._output_panel.render_style_params(),
+            "outputs": dataclasses.asdict(self._output_panel.get_outputs()),
+        }
+
+    # ------------------------------------------------------------------
+    # Remembered display preferences (QSettings). Plan:
+    # docs/analyzer/plans/2026-08-02-batch-settings-persistence-plan.md
+    # ------------------------------------------------------------------
+    def _restore_panel_prefs(self) -> None:
+        """Apply the remembered display preferences to the output panel.
+
+        Only what the store persists is touched — directory, render style and
+        the export block. Files, target signals, RPM channel/factor, axes and
+        analysis parameters are never remembered, so a panel opened against a
+        new data source starts clean (plan 2.1).
+
+        ``apply_directory`` writes the line edit, whose ``textChanged``
+        re-emits ``OutputPanel.changed``; the ``_applying_analysis_preset``
+        flag keeps that from being read as a user edit and clearing a freshly
+        applied analysis card.
+        """
+        prefs = self._prefs_store.load()
+        self._applying_analysis_preset = True
+        try:
+            # An empty remembered directory means "never chosen" — leave the
+            # panel's own default in place rather than blanking the field.
+            if prefs.directory:
+                self._output_panel.apply_directory(prefs.directory)
+            self._output_panel.apply_open_folder_after_run(
+                prefs.open_folder_after_run
+            )
+            self._output_panel.apply_render_style_params(prefs.render_style)
+            # Data export requires an opt-in for each newly opened panel.
+            # Explicitly imported presets still restore their saved intent.
+            self._output_panel.apply_outputs(
+                dataclasses.replace(prefs.as_output(), export_data=False)
+            )
+        finally:
+            self._applying_analysis_preset = False
+
+    def _panel_prefs(self) -> BatchPanelPrefs:
+        snapshot = self._output_controls_snapshot()
+        # ``snapshot["outputs"]`` is a full ``dataclasses.asdict`` including
+        # runtime fields; BatchPanelPrefs whitelists them back out.
+        return BatchPanelPrefs(
+            directory=self._output_panel.directory(),
+            render_style=snapshot["render_style"],
+            outputs=snapshot["outputs"],
+            open_folder_after_run=self._output_panel.open_folder_after_run(),
+        )
+
+    def _persist_panel_prefs(self) -> None:
+        """Write the current display preferences.
+
+        Called from ``done`` (every close path) and right after a run starts —
+        never from ``_on_output_controls_changed``, which fires on every
+        keystroke and spin-box tick.
+        """
+        self._prefs_store.save(self._panel_prefs())
+
+    def _on_restore_output_defaults(self) -> None:
+        """恢复默认: forget the stored preferences and reset the panel.
+
+        Both halves are required — resetting the widgets alone would be undone
+        by the next ``_persist_panel_prefs``, and clearing the key alone would
+        not visibly change anything until the dialog is reopened.
+        """
+        self._prefs_store.clear()
+        self._applying_analysis_preset = True
+        try:
+            self._output_panel.restore_defaults()
+        finally:
+            self._applying_analysis_preset = False
+        if self._analysis_preset_output_snapshot is not None:
+            # Re-baseline instead of leaving a stale comparison behind: an
+            # applied analysis card owns axes, not display preferences, so it
+            # must survive this reset without going deaf to the next real edit.
+            self._analysis_preset_output_snapshot = self._output_controls_snapshot()
+        self._schedule_pipeline_recompute()
+        self._toast("已恢复导出默认设置", kind="success")
+
+    def _on_output_controls_changed(self) -> None:
+        if (
+            not self._applying_analysis_preset
+            and self._analysis_panel.has_applied_preset()
+            and self._analysis_preset_output_snapshot is not None
+            and self._output_controls_snapshot()
+            != self._analysis_preset_output_snapshot
+        ):
+            self._analysis_panel.clear_applied_preset()
+            self._analysis_preset_output_snapshot = None
+        if not self._applying_analysis_preset:
+            self._mark_result_previous()
+        self._schedule_pipeline_recompute()
+
+    def _db_reference_host(self):
+        """Return the owning MainWindow without coupling BatchSheet to it."""
+        host = self.parentWidget()
+        while host is not None:
+            if callable(getattr(host, "_open_db_reference_dialog", None)):
+                return host
+            host = host.parentWidget()
+        return None
+
+    def _open_shared_db_reference_manager(self) -> None:
+        """Open the same global dB-reference manager as single-file views."""
+        host = self._db_reference_host()
+        if host is None:
+            return
+        section = _DB_REFERENCE_SECTION_BY_METHOD.get(self.method(), "fft")
+        host._open_db_reference_dialog(
+            section,
+            view_control=self._output_panel.db_reference_control,
+            on_catalog_saved=self._on_batch_db_reference_catalog_saved,
+            on_view_mode_committed=self._on_batch_db_reference_view_mode_committed,
+        )
+
+    def _on_batch_db_reference_catalog_saved(self) -> None:
+        """Refresh the Batch resolver after the shared catalog is saved."""
+        host = self._db_reference_host()
+        store = getattr(host, "db_reference_store", None) if host else None
+        snapshot = getattr(store, "snapshot", None)
+        if callable(snapshot):
+            self._output_panel.set_reference_catalog(snapshot())
+        self._schedule_pipeline_recompute()
+
+    def _on_batch_db_reference_view_mode_committed(self, mode: str) -> None:
+        """Apply the dialog's current-view mode to Batch, never Inspector."""
+        self._output_panel.db_reference_control.set_mode(mode)
+        self._on_output_controls_changed()
+
+    def apply_preset(self, preset: AnalysisPreset) -> None:
+        """Fill the dialog from a preset (spec §6.4).
+
+        For ``current_single``: narrow the file list to ``preset.signal[0]``
+        and select ``preset.signal[1]``. The captured signal is the only
+        one in scope — the user opted in to "this exact analysis".
+
+        For ``free_config``: keep the current file selection (a free_config
+        preset is a recipe; file selection is local) but apply the recipe
+        fields. Signals not in the current intersection get red-marked via
+        ``signals_marked_unavailable`` (spec §4.2).
+
+        ``time_range`` lives in ``preset.params`` (W2/W6 contract); we
+        round-trip it into the time-range field so the user sees the
+        original window.
+        """
+        if preset is None:
+            return
+        method = str(preset.method)
+        params = normalize_batch_params(dict(preset.params), method)
+        target_pairs = tuple(tuple(pair) for pair in (preset.target_pairs or ()))
+        runtime_source_ids = tuple(
+            getattr(preset, "source_ids", ()) or preset.file_ids or ()
+        )
+        runtime_source_paths = tuple(
+            getattr(preset, "source_paths", ()) or preset.file_paths or ()
+        )
+        requested_policy = str(
+            getattr(preset, "target_policy", "common") or "common"
+        )
+
+        self._applying_preset = True
+        try:
+            self._base_name = str(preset.name or "batch")
+            self._base_params = dict(params)
+            self._recipe_method = method
+            self._scope_source = str(preset.source or "free_config")
+            self._scope_signal = (
+                tuple(preset.signal) if preset.signal is not None else None
+            )
+            self._scope_rpm_signal = (
+                tuple(preset.rpm_signal) if preset.rpm_signal is not None else None
+            )
+            self._scope_target_pairs = target_pairs
+            self._scope_target_policy = (
+                "exact_pairs" if target_pairs else requested_policy
+            )
+            self._input_panel.apply_target_policy(self._scope_target_policy)
+
+            if preset.source == "current_single" and preset.signal is not None:
+                signal_fid, signal_name = preset.signal
+                source_path = runtime_source_paths
+                if not source_path:
+                    fd = self._files.get(signal_fid)
+                    filepath = getattr(fd, "filepath", None)
+                    source_path = (str(filepath) if filepath is not None else str(signal_fid),)
+                self.apply_sources(
+                    source_ids=runtime_source_ids or (signal_fid,),
+                    source_paths=source_path,
+                )
+                self.apply_signals((signal_name,))
+            elif target_pairs:
+                pair_file_ids = tuple(dict.fromkeys(pair[0] for pair in target_pairs))
+                pair_signals = tuple(dict.fromkeys(str(pair[1]) for pair in target_pairs))
+                self.apply_sources(
+                    source_ids=runtime_source_ids or pair_file_ids,
+                    source_paths=runtime_source_paths,
+                )
+                self.apply_signals(tuple(preset.target_signals or pair_signals))
+            else:
+                # A reusable free-config preset carries a recipe, not a forced
+                # runtime file scope. Keep the dialog's current file selection.
+                if runtime_source_ids or runtime_source_paths:
+                    self.apply_sources(runtime_source_ids, runtime_source_paths)
+                self.apply_signals(tuple(preset.target_signals))
+
+            self.apply_method(method)
+            if method == "frf":
+                self._input_panel.apply_frf_pair_rules(
+                    tuple(getattr(preset, "frf_pair_rules", ()) or ())
+                )
+            # ``apply_preset`` is a full-recipe boundary.  Canonical time
+            # recipes omit default-valued sparse fields, so materialize those
+            # defaults for the controls here.  ``apply_params`` itself remains
+            # incremental for built-in presets and other partial patches.
+            control_params = (
+                {**TIME_RENDER_DEFAULTS, **params}
+                if method == "time"
+                else params
+            )
+            self.apply_params(control_params)
+            if "rpm_factor" in params:
+                self._input_panel.apply_rpm_factor(params["rpm_factor"])
+            self._input_panel.apply_filter_params(params.get("filter"))
+            self._output_panel.apply_axis_params(params)
+            self._output_panel.apply_reference_params(params)
+            self._output_panel.apply_render_style_params(params)
+            rpm_channel = preset.rpm_channel or (
+                preset.rpm_signal[1] if preset.rpm_signal is not None else ""
+            )
+            self.apply_rpm_channel(rpm_channel)
+            self.apply_outputs(preset.outputs)
+            self.apply_time_range(params.get("time_range"))
+        finally:
+            self._applying_preset = False
+
+        self._applied_control_snapshot = self._control_params_snapshot(method)
+        self._scope_file_ids = self.file_ids()
+        self._scope_file_paths = self.file_paths()
+        self._scope_source_ids = self.source_ids()
+        self._scope_source_paths = self.source_paths()
+        self._scope_signals = self.selected_signals()
+        self._scope_rpm_channel = self.rpm_channel()
+        self._guidance_engaged = True
+        self._refresh_method_guidance()
+        self._schedule_pipeline_recompute()
+
+    def _on_recipe_method_changed(self, method: str) -> None:
+        method = str(method)
+        if method != self._recipe_method:
+            self._mark_result_previous()
+        if not self._applying_preset and method != self._recipe_method:
+            self._base_params = normalize_batch_params(self._base_params, method)
+        self._recipe_method = method
+        self._sync_x_axis_context()
+
+    def _on_channel_universe_changed(
+        self, common: tuple, partial: dict,
+    ) -> None:
+        self._x_channel_common = tuple(str(name) for name in common if str(name))
+        self._x_channel_partial = {
+            str(name): str(suffix)
+            for name, suffix in partial.items()
+            if str(name)
+        }
+        self._refresh_x_channel_candidates()
+        self._sync_x_axis_context()
+
+    def _custom_x_compatible_rows(self, channel: str) -> tuple:
+        """Return logical sources where a custom X can pair with a target.
+
+        ``available_per_source`` deliberately treats a multi-rate container as
+        multiple logical sources. An X channel is eligible only in rows that
+        contain both that channel and at least one selected target.
+        """
+        rows = tuple(self._input_panel._file_list.loaded_rows())
+        if self.target_policy() != "available_per_source":
+            return tuple(row for row in rows if channel in row.channels)
+        selected = frozenset(self.selected_signals())
+        if not selected:
+            return tuple(row for row in rows if channel in row.channels)
+        return tuple(
+            row for row in rows
+            if channel in row.channels and selected.intersection(row.channels)
+        )
+
+    def _refresh_x_channel_candidates(self) -> None:
+        partial_selectable: tuple[str, ...] = ()
+        if self.target_policy() == "available_per_source":
+            selected = frozenset(self.selected_signals())
+            compatible_channels = {
+                str(channel)
+                for row in self._input_panel._file_list.loaded_rows()
+                if not selected or selected.intersection(row.channels)
+                for channel in row.channels
+            }
+            partial_selectable = tuple(
+                name for name in self._x_channel_partial
+                if name in compatible_channels
+            )
+        self._analysis_panel._param_form.set_x_channel_candidates(
+            self._x_channel_common,
+            self._x_channel_partial,
+            partial_selectable=partial_selectable,
+        )
+
+    def _x_channel_units(self, channel: str) -> tuple[str, ...]:
+        units: set[str] = set()
+        for row in self._custom_x_compatible_rows(channel):
+            metadata = dict(getattr(row, "metadata", {}) or {})
+            channel_metadata = metadata.get("channel_metadata") or {}
+            facts = dict(channel_metadata.get(channel) or {})
+            unit = facts.get("unit") or dict(
+                getattr(row, "units", {}) or {}
+            ).get(channel, "")
+            clean = str(unit or "").strip()
+            # Missing/blank units are still source facts.  Dropping them would
+            # make ("", "rpm") look uniformly rpm and publish a false axis
+            # unit instead of rejecting the mixed-source recipe.
+            units.add(clean)
+        return tuple(sorted(units))
+
+    def _sync_x_axis_context(self, *_args) -> None:
+        if self.method() != "time":
+            return
+        params = self.params()
+        if str(params.get("x_source", "time")) != "channel":
+            self._output_panel.set_x_axis_context(label="Time", unit="s")
+            self._analysis_panel.set_chart_statistics_x_context(x_source="time", unit="s")
+            return
+        channel = str(params.get("x_channel") or "").strip()
+        units = self._x_channel_units(channel) if channel else ()
+        unit = units[0] if len(units) == 1 else ""
+        self._output_panel.set_x_axis_context(
+            label=channel or "X", unit=unit,
+        )
+        self._analysis_panel.set_chart_statistics_x_context(
+            x_source="channel", x_channel=channel, unit=unit,
+        )
+
+    def _control_params_snapshot(self, method: str | None = None) -> dict:
+        method_key = str(method or self.method())
+        params = dict(self.params())
+        axis = self._output_panel.axis_params()
+        params.update(axis)
+        params.update(self._output_panel.reference_params())
+        params.update(self._output_panel.render_style_params())
+        if method_key == "fft":
+            params["amp_y"] = (
+                "dB" if amplitude_mode_is_db(axis.get("amplitude_mode")) else "Linear"
+            )
+        params.update(self._input_panel.rpm_params())
+        params["filter"] = self._input_panel.filter_params()
+        rng = self.time_range()
+        if rng is not None:
+            params["time_range"] = rng
+        return normalize_batch_params(params, method_key)
+
+    def _merged_params(self) -> dict:
+        method = self.method()
+        merged = normalize_batch_params(self._base_params, method)
+        current = self._control_params_snapshot(method)
+        baseline = self._applied_control_snapshot
+        missing = object()
+        for key in set(baseline) | set(current):
+            if baseline.get(key, missing) == current.get(key, missing):
+                continue
+            if key in current:
+                merged[key] = current[key]
+            else:
+                merged.pop(key, None)
+        return normalize_batch_params(merged, method)
+
+    # ------------------------------------------------------------------
+    # W7: toolbar handlers (preset import / export / fill-from-current)
+    # ------------------------------------------------------------------
+    def _on_fill_from_current(self) -> None:
+        if self._current_preset is None:
+            return
+        self.apply_preset(self._current_preset)
+
+    def _on_import_preset(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入方案", "", "JSON (*.json)"
+        )
+        if not path:
+            return
+        try:
+            preset = load_preset_from_json(path)
+        except UnsupportedPresetVersion as exc:
+            self._toast(f"不支持的 preset 版本：{exc}", kind="warning")
+            return
+        except (ValueError, OSError) as exc:
+            self._toast(f"preset 解析失败：{exc}", kind="error")
+            return
+        if preset is None:
+            # load_preset_from_json returns None when the preset
+            # references a method no longer in SUPPORTED_METHODS (e.g.
+            # legacy order_track presets). Surface a warning and skip.
+            self._toast(
+                "导入的预设引用了已移除的方法（如 order_track），已跳过。",
+                kind="warning",
+            )
+            return
+        self.apply_preset(preset)
+        self._toast(f"已加载 preset：{preset.name}", kind="success")
+
+    def _on_export_preset(self) -> None:
+        preset = self._build_preset_for_export()
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出方案", "", "JSON (*.json)"
+        )
+        if not path:
+            return
+        try:
+            save_preset_to_json(preset, path)
+        except OSError as exc:
+            self._toast(f"导出失败：{exc}", kind="error")
+            return
+        self._toast(f"已导出方案到：{path}", kind="success")
+
+    def _build_preset_for_export(self) -> AnalysisPreset:
+        """Build the recipe-only preset to persist.
+
+        ``save_preset_to_json`` already whitelists the JSON payload; we
+        also strip runtime / legacy fields at the source via
+        ``dataclasses.replace`` so the export invariant matches spec §6.3
+        wording (belt-and-suspenders).
+        """
+        preset = self.get_preset()
+        return dataclasses.replace(
+            preset,
+            file_ids=(),
+            file_paths=(),
+            source_ids=(),
+            source_paths=(),
+            signal=None,
+            rpm_signal=None,
+            signal_pattern="",
+            target_pairs=(),
+        )
+
+    def _toast(self, text: str, kind: str = "info") -> None:
+        """Show a toast on whichever surface the user is actually looking at.
+
+        Always records ``_last_toast_*`` so headless tests can assert
+        without needing a parent to mock.
+
+        ``MainWindow._toast`` is a child of the main window, so forwarding
+        there while this sheet is up painted the message *underneath* the
+        sheet: a user who hit 预览 saw nothing happen and only found the
+        reason after dragging the sheet aside.  While the sheet is visible it
+        owns its own toast; the parent's stays the target for anything raised
+        after it closes.
+        """
+        self._last_toast_text = text
+        self._last_toast_kind = kind
+        if self.isVisible():
+            try:
+                if self._own_toast is None:
+                    self._own_toast = Toast(
+                        self,
+                        margin_provider=self._own_toast_bottom_margin,
+                    )
+                self._own_toast.show_message(text, level=kind)
+                return
+            except Exception:  # noqa: BLE001
+                # Toast is purely informational — fall through to the parent
+                # rather than letting a paint bug break the action.
+                pass
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "toast"):
+            try:
+                parent.toast(text, kind)
+            except Exception:  # noqa: BLE001
+                # Toast is purely informational — never let a parent
+                # implementation bug break the toolbar action.
+                pass
+
+    # ------------------------------------------------------------------
+    # Run-time gates
+    # ------------------------------------------------------------------
+    def is_runnable(
+        self, *, issues: tuple[ValidationIssue, ...] | None = None,
+    ) -> bool:
+        fl = self._input_panel._file_list
+        for r in fl._rows.values():
+            if r.state in (STATE_PATH_PENDING, STATE_PROBING):
+                return False
+        if fl.unavailable_reasons():
+            return False
+        if not fl.all_loaded_paths():
+            return False
+        if not self.selected_signals():
+            return False
+        if not self.method():
+            return False
+        if not self.output_dir():
+            return False
+        if (self.preflight_issues() if issues is None else issues):
+            return False
+        return True
+
+    def preflight_issues(self) -> tuple[ValidationIssue, ...]:
+        issues: list[ValidationIssue] = []
+        pair_error = self._input_panel.frf_pair_validation_message()
+        if self.method() == "frf" and pair_error:
+            issues.append(ValidationIssue(
+                "frf_pair_rules", "invalid_pair", pair_error,
+            ))
+        time_error = self._time_range_error()
+        if time_error:
+            issues.append(ValidationIssue(
+                "time_range", "invalid_text", time_error,
+            ))
+        slice_error = self._analysis_panel.slice_positions_error()
+        if slice_error:
+            issues.append(ValidationIssue(
+                "slice_positions", "invalid_text", slice_error,
+            ))
+        for reason in self._input_panel._file_list.unavailable_reasons():
+            issues.append(ValidationIssue(
+                "source", "source_unavailable", str(reason),
+            ))
+        rows = self._input_panel._file_list.loaded_rows()
+        selected = self.selected_signals()
+        policy = self.target_policy()
+        if self.method() != "frf" and policy != "exact_pairs" and selected:
+            if policy == "common":
+                common = self._input_panel._file_list.current_intersection()
+                missing = tuple(signal for signal in selected if signal not in common)
+            else:
+                union = frozenset().union(*(row.channels for row in rows)) if rows else frozenset()
+                missing = tuple(signal for signal in selected if signal not in union)
+            if missing:
+                issues.append(ValidationIssue(
+                    "target_signals", "unavailable_target",
+                    "目标信号在所选来源中不可用: " + ", ".join(missing),
+                ))
+        params = self._merged_params()
+        effective_rpm_signal = (
+            self._scope_rpm_signal
+            if self.rpm_channel() == self._scope_rpm_channel
+            else None
+        )
+        issues.extend(validate_recipe(
+            self.method(),
+            params,
+            rpm_channel=self.rpm_channel(),
+            rpm_signal=effective_rpm_signal,
+        ))
+        if (
+            self.method() == "order_time"
+            and not self.rpm_channel()
+            and effective_rpm_signal is None
+            and not any(issue.field == "rpm_channel" for issue in issues)
+        ):
+            issues.append(ValidationIssue(
+                "rpm_channel", "missing_rpm_channel",
+                "阶次分析的通道转速模式需要 RPM 通道",
+            ))
+        x_channel = str(params.get("x_channel") or "").strip()
+        if (
+            self.method() == "time"
+            and str(params.get("x_source", "time")) == "channel"
+            and x_channel
+        ):
+            compatible_rows = self._custom_x_compatible_rows(x_channel)
+            if (
+                policy == "available_per_source"
+                and selected
+                and not compatible_rows
+            ):
+                issues.append(ValidationIssue(
+                    "x_channel", "unavailable_x_channel",
+                    "X channel is unavailable for the selected target signals",
+                ))
+            elif len(self._x_channel_units(x_channel)) > 1:
+                issues.append(ValidationIssue(
+                    "x_channel", "mixed_x_units",
+                    "X channel units differ across matching sources",
+                ))
+        issues.extend(validate_outputs(self._output_panel.get_outputs()))
+        return tuple(issues)
+
+    # ------------------------------------------------------------------
+    # Preset assembly
+    # ------------------------------------------------------------------
+    def _preset_name(self) -> str:
+        return "batch"
+
+    # ------------------------------------------------------------------
+    # W6: Run / cancel / lock-unlock
+    # ------------------------------------------------------------------
+    def _build_dry_run_preview(
+        self, preset: AnalysisPreset | None = None,
+    ) -> list[tuple[str, str, str]]:
+        """Compute the dry-run task list from UI state ONLY.
+
+        Spec §3.5 / W6 invariant: never call ``BatchRunner._expand_tasks``
+        — that path runs ``_resolve_files`` which would ``loader(path)``
+        full-load disk files on the UI thread and freeze the dialog. Per
+        spec §3.2 disk files use the cached probe set on the file row.
+
+        Policy filtering mirrors preflight: common only lists the true
+        intersection; available-per-source lists each valid source/signal
+        pair; exact-pair scope is preserved verbatim above.
+        """
+        preset = preset or self.get_preset()
+        method = preset.method or ""
+        signals = self.selected_signals()
+        rows: list[tuple[str, str, str]] = []
+
+        if preset.target_pairs:
+            file_rows = tuple(self._input_panel._file_list._rows.values())
+            for source_id, sig in preset.target_pairs:
+                fd = self._files.get(source_id)
+                label = getattr(fd, "filename", None)
+                if not label:
+                    match = next(
+                        (
+                            row for row in file_rows
+                            if row.source_id == source_id or row.fid == source_id
+                        ),
+                        None,
+                    )
+                    label = getattr(match, "label", None) or str(source_id)
+                rows.append((str(label), str(sig), str(method)))
+            return rows
+
+        fl = self._input_panel._file_list
+        policy = preset.target_policy or "common"
+        common = fl.current_intersection() if policy == "common" else frozenset()
+        params = dict(preset.params or {})
+        x_channel = str(params.get("x_channel") or "").strip()
+        needs_custom_x = (
+            method == "time"
+            and str(params.get("x_source", "time") or "time") == "channel"
+            and bool(x_channel)
+        )
+        for row in fl.loaded_rows():
+            fd = self._files.get(row.source_id)
+            label = getattr(fd, "filename", None) or row.label or str(row.source_id)
+            for sig in signals:
+                if policy == "common" and sig not in common:
+                    continue
+                if policy == "available_per_source" and sig not in row.channels:
+                    continue
+                if (
+                    policy == "available_per_source"
+                    and needs_custom_x
+                    and x_channel not in row.channels
+                ):
+                    continue
+                rows.append((str(label), str(sig), str(method)))
+
+        return rows
+
+    def _outputs_per_task(self) -> int:
+        outputs = self._output_panel.get_outputs()
+        return int(bool(outputs.export_data)) + int(bool(outputs.export_image))
+
+    def _update_xlsx_size_warning(self) -> None:
+        from ....batch_export_size import (
+            estimate_table_size, source_size_facts, xlsx_size_warning,
+        )
+
+        outputs = self._output_panel.get_outputs()
+        text = ""
+        if outputs.export_data and outputs.data_format == "xlsx":
+            preset = self.get_preset()
+            try:
+                tasks = self._make_runner().plan_render_tasks(
+                    preset, source_channels=self._input_panel.source_channel_sets(),
+                )
+            except (TypeError, ValueError, OSError):
+                text = "XLSX 大小暂无法估算，请先完善输入和分析配置。"
+            else:
+                rows = {row.source_id: row for row in self._input_panel._file_list.loaded_rows()}
+                sizes = []
+                for task in tasks:
+                    fd = self._files.get(task.source_key)
+                    row = rows.get(task.source_key)
+                    facts = source_size_facts(fd) if fd is not None else (
+                        row.metadata if row is not None else {}
+                    )
+                    sizes.append(estimate_table_size(preset.method, preset.params, facts))
+                text = xlsx_size_warning(sizes)
+        self._output_panel.set_xlsx_size_warning(text)
+
+    def _make_runner(self) -> BatchRunner:
+        """Build the GUI-free runner with the parent catalog snapshot."""
+        store = getattr(self.parent(), "db_reference_store", None)
+        if store is not None:
+            snapshot = store.snapshot()
+            runner = BatchRunner(
+                self._files,
+                source_registry=self._source_registry,
+                source_context=self._source_context,
+                db_reference_catalog=snapshot,
+                prefer_channel_metadata=snapshot.prefer_channel_metadata,
+            )
+        else:
+            runner = BatchRunner(
+                self._files,
+                source_registry=self._source_registry,
+                source_context=self._source_context,
+            )
+        # Planning is no-load, so a disk row's channels are invisible to the
+        # runner unless we hand over the probe result the input panel already
+        # holds.  Without it a file that split into logical sources with
+        # disjoint channels (WWT recorded over different spans, HDF split by
+        # sample rate) gets the target planned into the source that never had
+        # it -- Preview refuses outright, Run reports a phantom
+        # ``missing signal``.
+        runner.seed_source_channels(self._input_panel.source_channel_sets())
+        return runner
+
+    def _on_run_clicked(self) -> None:
+        """Idle-mode 运行 handler — synchronously locks the dialog and starts
+        the runner thread.
+
+        Reentrance guarantee: ``self._running = True`` and disabling the
+        Run button happens **before** ``thread.start()`` so a fast double-
+        click cannot launch two threads (W6 invariant 2).
+        """
+        if self._running:
+            return
+        if not self.is_runnable():
+            return
+
+        # A previous run result must never survive into a new lifecycle. If
+        # the worker fails before emitting its result, QThread.finished still
+        # unlocks against None rather than presenting stale success/failure.
+        self._last_result = None
+        self._begin_new_result_generation()
+
+        runner = self._make_runner()
+        preset = self.get_preset()
+        output_dir = self.output_dir()
+        preview = runner.preview_outputs(preset, output_dir)
+
+        # Build rows from cached UI state; the visible output count comes
+        # from the runner's group-aware planner.
+        tasks = self._build_dry_run_preview(preset)
+        self._task_list.apply_dry_run(
+            tasks,
+            self._outputs_per_task(),
+            artifact_count=preview.artifact_count,
+        )
+
+        # Synchronous lock: order matters.
+        self._running = True
+        self._btn_run.setEnabled(False)
+        self.lock_editing()
+        self._task_list.on_run_started()
+        total = max(1, len(tasks))
+        self._present_footer(
+            "running", done=0, total=total, task_count=len(tasks),
+        )
+        self._refresh_method_guidance()
+
+        # Build runner. We pass the parent's loader contract (BatchRunner
+        # default loader walks DataLoader.load_mf4) — main_window owns the
+        # file map; here we only have the dict already supplied to __init__.
+        #
+        # dB-reference-defaults Task 10 Part A: this Sheet's Run button is
+        # the ONLY live Batch Run path (``MainWindow.open_batch`` presents
+        # the sheet as a non-modal tool window and does not launch a second
+        # runner). Mirror the same snapshot pass-through Task 9 already
+        # wired there, following the existing
+        # ``_weighting_options_from_parent`` precedent: read the catalog
+        # store off ``self.parent()`` defensively (direct-construction
+        # tests pass ``parent=None``, and any parent lacking the attribute
+        # falls back to BatchRunner's no-kwargs factory-catalog default).
+        thread = BatchRunnerThread(
+            runner,
+            preset,
+            output_dir,
+            parent=self,
+        )
+        self._runner_thread = thread
+        # AutoConnection is correct in production (live event loop). Both
+        # signals are object-tagged so qtbot can connect bare callables.
+        thread.progress.connect(self._on_runner_progress)
+        thread.finished_with_result.connect(self._on_runner_finished_with_result)
+        thread.finished.connect(self._on_thread_finished)
+        thread.start()
+
+        # Persist here as well as on close: a long run that ends in a crash
+        # (or a force-quit while it works) would otherwise lose the settings
+        # the user just tuned for exactly this export.
+        self._persist_panel_prefs()
+
+    def _representative_channel_gap_message(self, group) -> str:
+        """Name the reason no planned group can show the selected channels.
+
+        "预览不可用" on its own sent a user hunting: his HDF had been split by
+        sample rate into four logical sources and the channels he picked lived
+        in only two of them, which nothing on screen said.  Report the source
+        that was planned and, when that file really did split, how far.
+        """
+
+        detail = ""
+        subject = "代表分组"
+        if group.group_by == "source":
+            subject = "代表来源"
+            base = str(group.display_name or "").strip()
+            siblings = sum(
+                1 for path in self._input_panel.source_paths()
+                if base and Path(str(path)).name == base
+            )
+            if siblings > 1:
+                detail = f"；该文件按采样率拆成了 {siblings} 个子来源"
+        return (
+            f"预览不可用：{subject} {group.display_name} 不含所选通道{detail}"
+        )
+
+    def _on_preview_clicked(self) -> None:
+        """No-load-plan, then immediately render the first formal group."""
+        if self._running or self._preview_thread is not None or not self.is_runnable():
+            return
+        runner = self._make_runner()
+        preset = self.get_preset()
+        try:
+            plan = runner.preview_outputs(
+                preset,
+                self.output_dir(),
+                # One physical file can expand into several logical sources, so
+                # the first planned group is not necessarily one that holds the
+                # selected channels.  Planning is no-load; hand the planner the
+                # probe result the input panel already has.
+                source_channels=self._input_panel.source_channel_sets(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._toast(f"预览不可用：{exc}", kind="warning")
+            return
+        group = plan.representative_group
+        if group is None:
+            self._toast("预览不可用：没有可生成的代表输出", kind="warning")
+            return
+        if not group.channel_available:
+            self._toast(
+                self._representative_channel_gap_message(group), kind="warning",
+            )
+            return
+        dialog = self._preview_dialog
+        if dialog is None:
+            dialog = BatchPreviewDialog(self)
+            dialog.regenerate_requested.connect(self._start_preview_render)
+            dialog.run_all_requested.connect(self._run_all_from_preview)
+            dialog.cancel_requested.connect(self._cancel_preview)
+            dialog.finished.connect(self._cleanup_preview_temp)
+            self._preview_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self._preview_plan = (runner, preset, group)
+        self._start_preview_render()
+
+    def _start_preview_render(self) -> None:
+        if self._preview_thread is not None:
+            return
+        runner, preset, group = getattr(self, "_preview_plan", (None, None, None))
+        if runner is None or group is None:
+            return
+        self._cleanup_preview_temp()
+        self._preview_temp = tempfile.TemporaryDirectory(prefix="tracelab-batch-preview-")
+        dialog = self._preview_dialog
+        if dialog is None:
+            return
+        dialog.set_loading(
+            f"{group.display_name} · 代表输出 {group.ordinal} / {group.total_groups} · "
+            f"将读取 {group.required_source_count} 个来源"
+        )
+        self._preview_result = None
+        self._btn_preview.setEnabled(False)
+        thread = BatchPreviewThread(
+            runner, preset, group.group_id, self._preview_temp.name, parent=self,
+        )
+        self._preview_thread = thread
+        thread.finished_with_result.connect(self._on_preview_finished_with_result)
+        # The only preview unlock/cleanup boundary is QThread.finished.
+        thread.finished.connect(self._on_preview_thread_finished)
+        thread.start()
+
+    def _cancel_preview(self) -> None:
+        if self._preview_thread is not None:
+            self._preview_thread.request_cancel()
+
+    def _on_preview_finished_with_result(self, result) -> None:
+        self._preview_result = result
+
+    def _on_preview_thread_finished(self) -> None:
+        thread = self._preview_thread
+        self._preview_thread = None
+        if thread is not None:
+            thread.deleteLater()
+        dialog = self._preview_dialog
+        if dialog is not None:
+            result = self._preview_result
+            if str(getattr(result, "status", "")) == "cancelled":
+                dialog.set_cancelled()
+            else:
+                dialog.set_result(result)
+        if not self._running:
+            self._btn_preview.setEnabled(self.is_runnable())
+        if self._preview_close_pending:
+            self._preview_close_pending = False
+            self.close()
+
+    def _cleanup_preview_temp(self, *_args) -> None:
+        if self._preview_thread is not None:
+            return
+        temp = self._preview_temp
+        self._preview_temp = None
+        if temp is not None:
+            temp.cleanup()
+
+    def _run_all_from_preview(self) -> None:
+        dialog = self._preview_dialog
+        if dialog is not None:
+            dialog.accept()
+        self._cleanup_preview_temp()
+        self._on_run_clicked()
+
+    def _on_cancel_clicked(self) -> None:
+        """Running-mode 中断 handler — sets the cancel token and disables
+        the abort button so it cannot be clicked twice."""
+        if not self._running or self._runner_thread is None:
+            return
+        self._btn_abort.setEnabled(False)
+        self._btn_abort.setText("正在停止…")
+        self._present_footer(
+            "cancelling",
+            done=self._footer_progress.value(),
+            total=self._footer_progress.maximum(),
+            task_count=self._task_list.row_count(),
+        )
+        self._runner_thread.request_cancel()
+
+    def _on_runner_progress(self, event) -> None:
+        # Keep the legacy task model current for programmatic artifact facts;
+        # the visible compact footer deliberately exposes only aggregate state.
+        self._task_list.on_event(event)
+        total = max(1, int(getattr(event, "total", 0) or 1))
+        task_index = max(0, int(getattr(event, "task_index", 0) or 0))
+        kind = str(getattr(event, "kind", "") or "")
+        completed = kind in {
+            "task_done", "task_failed", "task_cancelled", "task_skipped",
+            "task_resumed",
+        }
+        progress = task_index if completed else max(0, task_index - 1)
+        self._footer_progress.setRange(0, total)
+        self._footer_progress.setValue(max(self._footer_progress.value(), progress))
+        if kind != "run_finished":
+            self._footer_task_summary.setText(
+                f"{self._footer_progress.value()}/{total} 任务"
+            )
+
+    def _on_runner_finished_with_result(self, result) -> None:
+        """Stash the BatchRunResult; the actual unlock happens in
+        ``_on_thread_finished`` (bound to ``QThread.finished``) per spec
+        §6.2 unlock contract."""
+        self._last_result = result
+        if result is None:
+            return
+
+    def _on_thread_finished(self) -> None:
+        """Bound to ``QThread.finished`` — guaranteed to fire by Qt even if
+        ``runner.run()`` raised before ``finished_with_result`` would have
+        emitted (W6 invariant 1).
+        """
+        result = self._last_result
+        self._task_list.on_run_finished(result)
+        self.unlock_editing()
+        status = str(getattr(result, "status", "") or "未知")
+        labels = {
+            "done": "已完成",
+            "partial": "部分完成",
+            "cancelled": "已取消",
+            "blocked": "未运行",
+        }
+        total = max(1, self._task_list.row_count())
+        done = min(total, max(0, self._task_list._done_count))
+        if status == "done":
+            done = total
+        from .preview_dialog import format_batch_run_warnings
+        warn_summary = format_batch_run_warnings(
+            getattr(result, "warnings", ()) or (),
+            style="inline",
+        ) if result is not None else ""
+        self._present_footer(
+            status if status in labels else labels.get(status, status),
+            done=done, total=total, task_count=self._task_list.row_count(),
+            reason=warn_summary,
+        )
+        self._attach_result_details(result)
+        self._show_result_toast(result)
+        self._maybe_open_output_folder(result)
+
+        # Clean up thread reference.
+        thread = self._runner_thread
+        self._runner_thread = None
+        if thread is not None:
+            try:
+                thread.deleteLater()
+            except Exception:  # noqa: BLE001
+                pass
+
+        # If the user requested close mid-run, complete it now.
+        if self._close_pending:
+            self._close_pending = False
+            self.close()
+
+    def _show_result_toast(self, result) -> None:
+        """Inline status toast on run completion.
+
+        Only fired when the sheet is currently shown. Headless unit tests
+        never call ``show()`` so they bypass the toast entirely (avoids a
+        Windows offscreen access violation when the modal opens nested
+        under ``qtbot.waitUntil``). A richer toast widget belongs to W7.
+        """
+        if result is None:
+            return
+        if not self.isVisible():
+            return
+        status = getattr(result, "status", "") or ""
+        if not status:
+            return
+        from .preview_dialog import format_batch_run_warnings
+        warn_block = format_batch_run_warnings(
+            getattr(result, "warnings", ()) or (),
+            style="block",
+        )
+
+        def _with_warnings(body: str) -> str:
+            if not warn_block:
+                return body
+            return f"{body}\n\n{warn_block}"
+
+        if status == "done":
+            QMessageBox.information(
+                self, "批处理完成", _with_warnings("全部任务已完成。"),
+            )
+        elif status == "partial":
+            blocked = getattr(result, "blocked", []) or []
+            degraded_count = int(
+                getattr(result, "degraded_count", 0) or 0
+            )
+            if degraded_count and not blocked:
+                QMessageBox.information(
+                    self,
+                    "批处理降级完成",
+                    _with_warnings(
+                        f"完成，共 {degraded_count} 个任务仅导出数据文件。"
+                    ),
+                )
+            else:
+                QMessageBox.warning(
+                    self, "批处理部分完成",
+                    _with_warnings(f"完成，共 {len(blocked)} 个失败任务。"),
+                )
+        elif status == "cancelled":
+            QMessageBox.information(
+                self, "批处理已取消",
+                _with_warnings("运行已被用户取消。"),
+            )
+        elif status == "blocked":
+            blocked = getattr(result, "blocked", []) or []
+            reason = "; ".join(blocked) if blocked else "未知原因"
+            QMessageBox.warning(
+                self, "批处理无法运行",
+                _with_warnings(f"原因：{reason}"),
+            )
+
+    def _maybe_open_output_folder(self, result) -> None:
+        """完成后打开输出文件夹: fires once, right after the (blocking) result
+        toast has been dismissed -- opening Explorer underneath a modal
+        QMessageBox would just fight it for focus.
+
+        Only for a run that actually produced (``done``) or attempted
+        (``partial``) output; ``cancelled`` / ``blocked`` never had a real
+        output pass, so there is nothing worth revealing.
+        """
+        if result is None:
+            return
+        if not self._output_panel.open_folder_after_run():
+            return
+        status = str(getattr(result, "status", "") or "")
+        if status not in {"done", "partial"}:
+            return
+        target_dir = self.output_dir()
+        if not target_dir or not Path(target_dir).expanduser().is_dir():
+            return
+        self._open_artifact_location(target_dir)
+
+    def lock_editing(self) -> None:
+        """Disable detail panels + swap footer to running mode."""
+        # The method selector is mounted outside the analysis panel.
+        self._method_tabs_host.setEnabled(False)
+        self._input_panel.setEnabled(False)
+        self._analysis_panel.setEnabled(False)
+        self._output_panel.setEnabled(False)
+        self._btn_fill_from_current.setEnabled(False)
+        self._btn_import_preset.setEnabled(False)
+        self._btn_export_preset.setEnabled(False)
+        self._btn_cancel.setVisible(False)
+        self._btn_preview.setVisible(False)
+        self._btn_run.setVisible(False)
+        self._btn_abort.setEnabled(True)
+        self._btn_abort.setText("中断")
+        self._btn_abort.setVisible(True)
+
+    def unlock_editing(self) -> None:
+        """Re-enable detail panels + swap footer back to idle mode.
+
+        Always called from ``_on_thread_finished`` (QThread.finished) so
+        the dialog can never get stuck locked.
+        """
+        self._running = False
+        self._method_tabs_host.setEnabled(True)
+        self._input_panel.setEnabled(True)
+        self._analysis_panel.setEnabled(True)
+        self._output_panel.setEnabled(True)
+        self._btn_fill_from_current.setEnabled(self._current_preset is not None)
+        self._btn_import_preset.setEnabled(True)
+        self._btn_export_preset.setEnabled(True)
+        self._btn_abort.setVisible(False)
+        self._btn_cancel.setVisible(True)
+        self._btn_preview.setVisible(True)
+        self._btn_run.setVisible(True)
+        # Re-evaluate Run-button enabled state against current config.
+        self._btn_run.setEnabled(self.is_runnable())
+        self._btn_preview.setEnabled(self.is_runnable())
+        # Refresh only guidance here; keep the completion footer/result intact.
+        self._refresh_method_guidance()
+
+    def _open_artifact_location(self, artifact_path: str) -> None:
+        """Open an artifact's containing folder after explicit activation."""
+        path = Path(str(artifact_path or "")).expanduser()
+        if not str(artifact_path or "").strip():
+            return
+        target = path if path.is_dir() else path.parent
+        opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+        if not opened:
+            self._toast(f"无法打开输出位置：{target}", kind="warning")
+
+    def is_running(self) -> bool:
+        """Whether a batch runner currently owns the sheet."""
+        return bool(self._running)
+
+    def _confirm_stop_running_dialog(self, parent=None) -> bool:
+        """Single-sourced close-while-running confirmation.
+
+        Used by both ``closeEvent`` (sheet chrome) and
+        ``confirm_stop_and_wait`` (parent MainWindow close).
+        """
+        host = self if parent is None else parent
+        choice = QMessageBox.question(
+            host,
+            _STOP_ON_CLOSE_TITLE,
+            _STOP_ON_CLOSE_TEXT,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return choice == QMessageBox.Yes
+
+    def confirm_stop_and_wait(
+        self, parent=None, timeout_ms: int = _STOP_WAIT_TIMEOUT_MS,
+    ) -> bool:
+        """Ask to cancel an in-flight run and wait until the runner is idle.
+
+        Returns True when the parent may continue teardown. An idle sheet
+        returns True without a dialog. Declining the prompt, a missing
+        thread, or a wait timeout returns False so the parent can refuse
+        close while the runner (and this sheet) stay alive.
+        """
+        if not self._running:
+            return True
+        if not self._confirm_stop_running_dialog(parent):
+            return False
+        thread = self._runner_thread
+        if thread is None:
+            _batch_logger.warning(
+                "BatchSheet confirm_stop_and_wait: running flag set but "
+                "no runner thread"
+            )
+            return False
+        try:
+            thread.request_cancel()
+        except Exception:
+            _batch_logger.exception(
+                "BatchSheet confirm_stop_and_wait: request_cancel failed"
+            )
+            return False
+        return self._wait_until_runner_idle(timeout_ms)
+
+    def _wait_until_runner_idle(self, timeout_ms: int) -> bool:
+        """Pump the GUI loop until ``_running`` clears or ``timeout_ms`` elapses.
+
+        Poll ``_running`` instead of connecting to ``QThread.finished``: the
+        sheet's ``_on_thread_finished`` already owns that signal and
+        ``deleteLater``s the thread, so an extra disconnect after the wait
+        would touch a dying C++ object. Do not ``QThread.wait`` on the GUI
+        thread either — that slot is queued and would deadlock.
+        """
+        if not self._running:
+            return True
+        if self._runner_thread is None:
+            _batch_logger.warning(
+                "BatchSheet stop-wait: running flag set but no runner thread"
+            )
+            return False
+
+        loop = QEventLoop(self)
+        deadline = QTimer(self)
+        deadline.setSingleShot(True)
+        poll = QTimer(self)
+        poll.setInterval(20)
+
+        def _quit_loop():
+            if loop.isRunning():
+                loop.quit()
+
+        def _on_poll():
+            if not self._running:
+                _quit_loop()
+
+        try:
+            deadline.timeout.connect(_quit_loop)
+            poll.timeout.connect(_on_poll)
+            deadline.start(max(1, int(timeout_ms)))
+            poll.start()
+            if self._running:
+                loop.exec_()
+            if self._running:
+                _batch_logger.warning(
+                    "BatchSheet confirm_stop_and_wait timed out after "
+                    "%s ms; refusing close",
+                    timeout_ms,
+                )
+                return False
+            return True
+        finally:
+            poll.stop()
+            deadline.stop()
+            poll.deleteLater()
+            deadline.deleteLater()
+            loop.deleteLater()
+
+    def closeEvent(self, event):  # noqa: N802 (Qt API)
+        """If a run is in progress, prompt for confirmation and route to
+        the cancel path; the actual close happens once
+        ``_on_thread_finished`` clears ``_running`` (W6 invariant 4).
+        """
+        if self._preview_thread is not None:
+            self._preview_close_pending = True
+            self._cancel_preview()
+            event.ignore()
+            return
+        if self._running:
+            if self._confirm_stop_running_dialog(self):
+                self._close_pending = True
+                if self._runner_thread is not None:
+                    try:
+                        self._runner_thread.request_cancel()
+                    except Exception:
+                        _batch_logger.exception(
+                            "BatchSheet closeEvent: request_cancel failed"
+                        )
+            event.ignore()
+            return
+        # Normal-close branch only; the run-in-progress branch above ignores
+        # the event and comes back through here once the runner has stopped.
+        self._teardown_result_details()
+        self._persist_panel_prefs()
+        super().closeEvent(event)
+
+    def done(self, result):  # noqa: N802 (Qt API)
+        """Persist the display preferences on the way out.
+
+        ``closeEvent`` alone would miss the dialog's PRIMARY exit: 关闭 is
+        wired straight to ``QDialog.reject`` and Esc does the same, and neither
+        raises a ``QCloseEvent`` at all. ``done`` is the funnel both of those
+        reach.
+
+        Both hooks are kept because neither covers the other. ``QDialog``
+        only re-routes a close event into ``reject()`` while the dialog is
+        *visible*, so closing a never-shown sheet stops at ``closeEvent``;
+        conversely a visible close runs both, writing the same snapshot twice,
+        which is harmless.
+        """
+        self._teardown_result_details()
+        self._persist_panel_prefs()
+        super().done(result)
+
+    def get_preset(self) -> AnalysisPreset:
+        params = self._merged_params()
+        # Preserve the long-standing in-memory AnalysisPreset API while the
+        # canonical JSON/normalization layer uses one sequence shape (list).
+        if isinstance(params.get("time_range"), list):
+            params["time_range"] = tuple(params["time_range"])
+        outputs = self._output_panel.get_outputs()
+        current_scope = (
+            self.source_ids(),
+            self.source_paths(),
+            self.selected_signals(),
+        )
+        applied_scope = (
+            self._scope_source_ids,
+            self._scope_source_paths,
+            self._scope_signals,
+        )
+        scope_unchanged = current_scope == applied_scope
+
+        single_scope = (
+            len(self.source_ids()) == 1
+            and len(self.selected_signals()) == 1
+        )
+        if self._scope_source == "current_single" and single_scope:
+            exact_signal = (self.source_ids()[0], self.selected_signals()[0])
+            rpm_signal = self._scope_rpm_signal
+            current_rpm = self.rpm_channel()
+            if current_rpm != self._scope_rpm_channel:
+                rpm_signal = (
+                    (exact_signal[0], current_rpm) if current_rpm else None
+                )
+            current = AnalysisPreset.from_current_single(
+                name=self._base_name,
+                method=self.method(),
+                signal=exact_signal,
+                rpm_signal=rpm_signal,
+                rpm_channel=current_rpm,
+                params=params,
+                outputs=outputs,
+            )
+            return dataclasses.replace(
+                current,
+                source_ids=self.source_ids(),
+                source_paths=self.source_paths(),
+                file_ids=self.file_ids(),
+                file_paths=self.file_paths(),
+            )
+
+        exact_pairs = (
+            self._scope_target_pairs
+            if self._scope_target_pairs and scope_unchanged else ()
+        )
+        policy = "exact_pairs" if exact_pairs else self._input_panel.target_policy()
+
+        base = AnalysisPreset.free_config(
+            name=self._base_name or self._preset_name(),
+            method=self.method(),
+            target_signals=(
+                () if self.method() == "frf" else self.selected_signals()
+            ),
+            rpm_channel=self.rpm_channel(),
+            params=params,
+            outputs=outputs,
+            target_policy=policy,
+            frf_pair_rules=self._input_panel.frf_pair_rules(),
+        )
+        return dataclasses.replace(
+            base,
+            source_ids=self.source_ids(),
+            source_paths=self.source_paths(),
+            file_ids=self.file_ids(),
+            file_paths=self.file_paths(),
+            target_pairs=exact_pairs,
+            rpm_signal=self._free_config_rpm_signal(),
+        )

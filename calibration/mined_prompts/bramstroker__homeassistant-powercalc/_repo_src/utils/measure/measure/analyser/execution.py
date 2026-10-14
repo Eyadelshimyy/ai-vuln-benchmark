@@ -1,0 +1,134 @@
+from collections.abc import Mapping
+import json
+import logging
+from pathlib import Path
+
+from measure.analyser.models import AnalysisStatus, RecorderAnalysisResult
+from measure.analyser.service import RecorderAnalyser
+from measure.profile.model_json import write_model_json
+from measure.recording.context import build_recording_context
+from measure.recording.files import find_recording_paths
+from measure.request import RecorderMeasurementRequest
+from measure.utils.files import write_json_atomic
+
+_LOGGER = logging.getLogger("measure")
+
+ANALYSER_FILENAME = "analyser.json"
+_LEGACY_ANALYSIS_FILENAME = "analysis.json"
+
+_ANALYSIS_SUMMARY_KEYS = frozenset(
+    {
+        "Recording analysis",
+        "Recording analysis reason",
+        "Profile analysis",
+        "Profile analysis reason",
+        "Analysed feature",
+        "Analysed inputs",
+        "Validation method",
+        "Recorded activities",
+        "Validation MAE",
+        "Validation coverage",
+        "Recordings analysed",
+        "Samples analysed",
+    },
+)
+
+
+class RecorderAnalysisExecution:
+    """Turn an existing recorder artifact into analysis and profile output."""
+
+    def __init__(self, analyser: RecorderAnalyser | None = None) -> None:
+        self.analyser = analyser or RecorderAnalyser()
+
+    def run(
+        self,
+        request: RecorderMeasurementRequest,
+        output_directory: Path,
+        *,
+        summary: Mapping[str, str] | None = None,
+        voltages: list[float] | None = None,
+    ) -> dict[str, str]:
+        """Analyse the persisted recording while always preserving its raw samples."""
+
+        model_path = output_directory / "model.json"
+        retained_voltages = [*(_load_existing_voltages(model_path) or []), *(voltages or [])]
+        try:
+            context = build_recording_context(request)
+            paths = find_recording_paths(output_directory, request.export_filename)
+            analysis = self.analyser.analyse(paths, context)
+            _write_analysis_outputs(request, output_directory, analysis, context.device_type, retained_voltages)
+            return _replace_analysis_summary(
+                summary,
+                {
+                    **analysis.build_summary(),
+                    "Recordings analysed": str(len(paths)),
+                    "Samples analysed": str(analysis.sample_count),
+                },
+            )
+        except Exception as error:
+            reason = f"Recording analysis failed: {error}"
+            _LOGGER.exception(reason)
+            model_path.unlink(missing_ok=True)
+            write_json_atomic(
+                output_directory / ANALYSER_FILENAME,
+                {
+                    "schema_version": 1,
+                    "status": AnalysisStatus.INSUFFICIENT_DATA.value,
+                    "sample_count": 0,
+                    "reason": reason,
+                },
+            )
+            (output_directory / _LEGACY_ANALYSIS_FILENAME).unlink(missing_ok=True)
+            return _replace_analysis_summary(
+                summary,
+                {
+                    "Recording analysis": "Failed",
+                    "Recording analysis reason": reason,
+                },
+            )
+
+
+def _write_analysis_outputs(
+    request: RecorderMeasurementRequest,
+    output_directory: Path,
+    analysis: RecorderAnalysisResult,
+    device_type: str,
+    voltages: list[float],
+) -> None:
+    write_json_atomic(output_directory / ANALYSER_FILENAME, analysis.to_dict())
+    (output_directory / _LEGACY_ANALYSIS_FILENAME).unlink(missing_ok=True)
+    if analysis.model_ready and analysis.model_config_fragment is not None:
+        write_model_json(
+            output_directory,
+            standby_power=analysis.standby_power,
+            name=request.model_name,
+            measure_device=request.measure_device,
+            parameters=request.parameters,
+            extra_json_data={"device_type": device_type, **analysis.model_config_fragment.to_dict()},
+            voltages=voltages,
+        )
+    else:
+        (output_directory / "model.json").unlink(missing_ok=True)
+        if analysis.reason:
+            _LOGGER.warning("Profile was not created: %s", analysis.reason)
+    for warning in analysis.warnings:
+        _LOGGER.warning("Recording analysis: %s", warning)
+
+
+def _replace_analysis_summary(
+    summary: Mapping[str, str] | None,
+    analysis_summary: Mapping[str, str],
+) -> dict[str, str]:
+    retained = {key: value for key, value in (summary or {}).items() if key not in _ANALYSIS_SUMMARY_KEYS}
+    return {**retained, **analysis_summary}
+
+
+def _load_existing_voltages(path: Path) -> list[float] | None:
+    """Keep the original recording's voltage range when regenerating its profile."""
+
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        voltage_range = value["voltage_range"]
+        return [float(voltage_range["min"]), float(voltage_range["max"])]
+    except FileNotFoundError, KeyError, TypeError, ValueError:
+        return None

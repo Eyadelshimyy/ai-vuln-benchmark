@@ -1,0 +1,328 @@
+"""President service — querying and score calculation.
+
+President rows (identity fields included — name/party/term dates/number)
+are created and kept current entirely by run_president_pipeline's live
+UCSB roster fetch (president_pipeline.py's `_sync_roster`); this module
+has no seed data of its own anymore. There is no narrative summary/
+key-achievements/key-failures field either — that was hand-written
+editorial text with no live source, same problem class as the scored
+dimensions this platform removed (below), so it was dropped rather than
+kept as unscored "informational" text (2026-07).
+
+Every SCORED dimension
+(Public Mandate, Effectiveness, Historical Legacy) is computed entirely by
+run_president_pipeline (president_pipeline.py) from real fetched data,
+never seeded:
+  - Public Mandate: live approval polling (Truman-33 onward, UCSB
+    American Presidency Project — Gallup's own tracking ended Feb 2026)
+    or, for earlier presidents, historical election-margin data (also
+    UCSB) — see app.pipeline.fetch.presidential_approval/
+    presidential_elections.
+  - Effectiveness: GDP growth from BEA/FRED (modern era) or
+    MeasuringWorth's 1790-present historical series (earlier
+    presidents) + BLS jobs data (1939 onward) — see
+    app.pipeline.fetch.economic_data/historical_gdp.
+  - Agency Alignment (Federal Register rulemaking, Clinton onward) was
+    removed in president v7: administrations since 1994 finalize 59.6-61.8%
+    of the rulemakings they start, too little difference to score.
+  - Historical Legacy (2026-07): C-SPAN's Presidential Historians
+    Survey — a real, external, periodically-run expert-consensus survey
+    (~142 professional historians in the 2021 cycle, the most recent;
+    2025 was explicitly postponed by C-SPAN), covering crisis
+    leadership, moral authority, and similar historical-consequence
+    judgments none of the other three dimensions can capture. Only rates
+    presidents whose terms were complete as of that cycle — see
+    app.pipeline.fetch.cspan_historians_survey.
+
+Competence (executive-order activity rate) was removed entirely (2026-07):
+its only ever-populated component measured Spearman 0.097 (p=0.53)
+against C-SPAN's own "Administrative Skill" category — statistically no
+relationship to the real construct it claimed to represent. See
+PRESIDENT_SCORE_WEIGHTS's comment in config_definitions.py for the full
+account, including why C-SPAN's Administrative Skill score itself wasn't
+a clean substitute.
+
+A dimension's score is None, never a fabricated number or a neutral
+default, for any president it's genuinely inapplicable to (see each
+_core function in president_scorer.py and compute_president_overall_
+score's per-president renormalization).
+
+Independence and Follow-Through were removed entirely (2026-07): both
+were always 100% hand-set per-president values with no live formula and
+no realistic path to one — Independence's obvious source (OpenSecrets'
+revolving-door API) was discontinued in 2025; Follow-Through would need
+the same platform-text-vs-action embedding match already proven
+unworkable for senators' Promise Persistence (v6.0, config_definitions.
+py, after 4 failed attempts). Same precedent: remove rather than keep
+presenting a hand-set number as a computed score. See
+PRESIDENT_SCORE_WEIGHTS (config_definitions.py) for the redistribution.
+"""
+
+import logging
+
+from sqlalchemy.orm import Session
+
+from app.models import President, PresidentTrade
+from app.pipeline.analyze.president_scorer import (
+    compute_president_overall_score,
+    dimensions_available,
+    president_effective_weights,
+)
+from app.schemas import (
+    STOCK_ACT_DISCLOSURE_DEADLINE_DAYS,
+    PaginatedStockTradesSchema,
+    PresidentialScoreSchema,
+    PresidentLeaderboardEntry,
+    PresidentSchema,
+    StockTradeSchema,
+)
+from app.services.pagination import paginate_bounds
+
+logger = logging.getLogger(__name__)
+
+
+def effective_weights(p: President) -> dict[str, float]:
+    """Each scored dimension's actual share of this president's overall,
+    rounded for display (president_scorer.president_effective_weights)."""
+    return {k: round(w, 4) for k, w in president_effective_weights(p).items()}
+
+
+def _build_response(p: President) -> PresidentSchema:
+    return PresidentSchema(
+        id=p.id,
+        name=p.name,
+        party=p.party,
+        number=p.number,
+        term_start=p.term_start,
+        term_end=p.term_end,
+        is_current=p.is_current,
+        score=PresidentialScoreSchema(
+            public_mandate=p.score_public_mandate,
+            effectiveness=p.score_effectiveness,
+            historical_legacy=p.score_historical_legacy,
+            overall=compute_president_overall_score(p),
+            dimensions_available=dimensions_available(p),
+            effective_weights=effective_weights(p),
+        ),
+        avg_approval=p.avg_approval,
+        gdp_growth_avg=p.gdp_growth_avg,
+        jobs_created_millions=p.jobs_created_millions,
+        eo_count=p.eo_count,
+        election_margin=p.election_margin,
+        historical_legacy_score=p.historical_legacy_score,
+        recent_avg_approval=p.recent_avg_approval,
+    )
+
+
+def get_president(db: Session, president_id: str) -> PresidentSchema | None:
+    p = db.query(President).filter(President.id == president_id).first()
+    if not p:
+        return None
+    return _build_response(p)
+
+
+def get_president_score_breakdown(db: Session, president_id: str) -> dict | None:
+    """Recompute a president's full score-derivation breakdown on-demand,
+    directly from whatever live/historical data is currently stored
+    (gdp_growth_avg, election_margin, etc. —
+    persisted by president_pipeline.py specifically so this recompute is
+    possible without a live re-fetch).
+
+    2026-07: no more DYNAMIC_PRESIDENTS/ECONOMICS_ONLY_PRESIDENTS gating
+    and no more seedOnly fallback — every _core function now takes
+    whatever's actually stored and returns score=None on its own when a
+    dimension is genuinely inapplicable for this president (see each
+    _core function's docstring in president_scorer.py). This function
+    used to need cohort membership to distinguish "not fetched" from
+    "fetched as null" before deciding whether to trust stored data as
+    live; that distinction doesn't exist anymore because there's no
+    seed-fallback state left to accidentally present as live.
+    """
+    from app.pipeline.analyze.president_scorer import (
+        _effectiveness_core,
+        _historical_legacy_core,
+        _public_mandate_core,
+        stored_approval_groups,
+        stored_macro,
+    )
+    from app.pipeline.president_pipeline import _term_years
+
+    p = db.query(President).filter(President.id == president_id).first()
+    if not p:
+        return None
+
+    term_years = _term_years(p.term_start, p.term_end)
+    breakdown = {
+        "publicMandate": _public_mandate_core(
+            avg_approval=p.avg_approval,
+            approval_trend=p.approval_trend,
+            election_margin=p.election_margin,
+            approval_start=p.approval_start,
+            is_current=bool(p.is_current),
+            president_id=p.id,
+            approval_groups=stored_approval_groups(p),
+            polarization=p.term_polarization,
+        ),
+        "effectiveness": _effectiveness_core(
+            jobs_created_millions=p.jobs_created_millions,
+            gdp_growth_avg=p.gdp_growth_avg,
+            term_years=term_years,
+            term_start_year=int(p.term_start[:4]) if p.term_start else None,
+            gdp_per_person=p.gdp_growth_per_person,
+            gdp_peer_median=p.gdp_growth_peer_median,
+            gdp_relative=p.gdp_growth_relative,
+            macro=stored_macro(p),
+            president_id=p.id,
+        ),
+        "historicalLegacy": _historical_legacy_core(
+            historical_legacy_score=p.historical_legacy_score,
+        ),
+    }
+    # What the scorecard states beside each score that isn't scored: the
+    # last 90 days' approval and the historians' rating of the same person's other presidency (a
+    # sitting president's is unrated until the term ends).
+    breakdown["publicMandate"]["facts"]["recentApproval"] = p.recent_avg_approval
+    breakdown["historicalLegacy"]["facts"]["otherTerms"] = [
+        {"id": o.id, "number": o.number, "points": o.historical_legacy_score, "score": o.score_historical_legacy}
+        for o in db.query(President).filter(President.name == p.name, President.id != p.id).order_by(President.number)
+        if o.historical_legacy_score is not None
+    ]
+    return breakdown
+
+
+def get_all_presidents(db: Session) -> list[PresidentSchema]:
+    presidents = db.query(President).order_by(President.number.desc()).all()
+    return [_build_response(p) for p in presidents]
+
+
+def current_president(db: Session) -> President | None:
+    """The sitting president's row. During a transition the roster can
+    briefly carry two is_current rows; the higher number is the later
+    presidency, so every caller (the scorecard, the trades and holdings
+    ingests) names the same one rather than whichever the query returns."""
+    return (
+        db.query(President)
+        .filter(President.is_current == True)  # noqa: E712
+        .order_by(President.number.desc())
+        .first()
+    )
+
+
+def get_current_president(db: Session) -> PresidentSchema | None:
+    """The currently-serving president, if any — excluded from get_
+    president_leaderboard (see that function's docstring) but still
+    needed for the frontend's separate "currently serving" spotlight
+    view."""
+    p = current_president(db)
+    return _build_response(p) if p else None
+
+
+def get_president_leaderboard(db: Session) -> list[PresidentLeaderboardEntry]:
+    """Ranked, HISTORICAL presidents only — a currently-serving president
+    is structurally missing 1-2 of the 4 dimensions no matter what (no
+    completed-term C-SPAN Historians Survey rating; often no full-term
+    GDP/jobs data either), so ranking them against presidents scored on a
+    complete record is comparing partial information to complete
+    information under one ordinal position. get_current_president above
+    serves their own (separate, non-ranked) profile instead."""
+    presidents = db.query(President).filter(President.is_current == False).all()  # noqa: E712
+    entries = []
+    for p in presidents:
+        score = PresidentialScoreSchema(
+            public_mandate=p.score_public_mandate,
+            effectiveness=p.score_effectiveness,
+            historical_legacy=p.score_historical_legacy,
+            overall=compute_president_overall_score(p),
+            dimensions_available=dimensions_available(p),
+            effective_weights=effective_weights(p),
+        )
+        entries.append(PresidentLeaderboardEntry(
+            id=p.id,
+            name=p.name,
+            party=p.party,
+            number=p.number,
+            term_start=p.term_start,
+            term_end=p.term_end,
+            is_current=p.is_current,
+            score=score,
+            avg_approval=p.avg_approval,
+            gdp_growth_avg=p.gdp_growth_avg,
+        ))
+
+    # Number tiebreaker (2026-07, #218 review minor): overall scores tie
+    # often, and Python's sort is stable over an UNORDERED query result —
+    # without a secondary key, tied presidents can swap ranks between
+    # requests (same nondeterminism class #221 fixed for senators/reps,
+    # which use name as their tiebreaker since alphabetical is their only
+    # natural order; a president's own number is more meaningful here).
+    entries.sort(key=lambda e: (-e.score.overall, e.number))
+    return entries
+
+
+def get_president_trades(
+    db: Session,
+    president_id: str,
+    page: int = 1,
+    per_page: int = 15,
+) -> PaginatedStockTradesSchema | None:
+    """Return paginated OGE Form 278-T transaction disclosures for a president.
+
+    Informational only — not part of the weighted score dimensions, on the
+    same reasoning get_senator_stock_trades documents for Congress (issue
+    #45): disclosure completeness isn't comparable across filers, so scoring
+    it would rank the diligence of a filer's lawyers, not their conduct.
+
+    Reuses StockTradeSchema/PaginatedStockTradesSchema rather than defining a
+    parallel president-shaped pair: 278-T reports the same fields as the
+    congressional PTR and carries the same 45-day statutory deadline, so the
+    schema's derived `late` flag is correct here unchanged.
+
+    Returns rows in disclosed-value ranges with no profit/gain field, because
+    the form has none to report — see models.py PresidentTrade's docstring.
+    """
+    president = db.query(President).filter(President.id == president_id).first()
+    if president is None:
+        return None
+
+    query = db.query(PresidentTrade).filter(PresidentTrade.president_id == president_id)
+    total = query.count()
+    # Only trades whose timeliness is known (StockTradeSchema).
+    late_count = query.filter(
+        PresidentTrade.days_to_disclose > STOCK_ACT_DISCLOSURE_DEADLINE_DAYS, PresidentTrade.parse_confidence == "text", PresidentTrade.report_kind == "periodic",
+    ).count()
+    total_pages, page = paginate_bounds(total, page, per_page)
+
+    trades_db = (
+        # Undated rows (a scan's illegible dates) after the dated ones.
+        query.order_by(PresidentTrade.transaction_date.desc().nulls_last(), PresidentTrade.id.desc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+        .all()
+    )
+
+    return PaginatedStockTradesSchema(
+        trades=[
+            StockTradeSchema(
+                ticker=t.ticker,
+                asset_name=t.asset_name,
+                owner=t.owner,
+                transaction_type=t.transaction_type,
+                transaction_date=t.transaction_date,
+                disclosure_date=t.disclosure_date,
+                days_to_disclose=t.days_to_disclose,
+                amount_low=t.amount_low,
+                amount_high=t.amount_high,
+                industry=t.industry,
+                source_url=t.source_url,
+                parse_confidence=t.parse_confidence,
+                report_kind=t.report_kind,
+                before_term_start=bool(t.transaction_date and t.transaction_date < president.term_start),
+            )
+            for t in trades_db
+        ],
+        total=total,
+        page=page,
+        per_page=per_page,
+        total_pages=total_pages,
+        late_count=late_count,
+    )

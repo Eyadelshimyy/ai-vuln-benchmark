@@ -1,0 +1,205 @@
+"""Tests for the stock-trade read paths (senator_service, representative_service)
+and the StockTradeSchema's derived `late` flag.
+"""
+
+from app.models import RepStockTrade, Representative, Senator, StockTrade
+from app.schemas import StockTradeSchema
+from app.services.representative_service import get_rep_stock_trades
+from app.services.senator_service import get_senator_stock_trades
+
+
+def _senator(db_session, id="S1", name="Jane Smith") -> Senator:
+    s = Senator(id=id, name=name, state="CA", party="D", is_current=True)
+    db_session.add(s)
+    db_session.commit()
+    return s
+
+
+def _rep(db_session, id="R1", name="John Doe") -> Representative:
+    r = Representative(id=id, name=name, state="TX", district=1, party="R", is_current=True)
+    db_session.add(r)
+    db_session.commit()
+    return r
+
+
+def _trade(senator_id, days_to_disclose=10, ticker="AAPL", transaction_date="2026-01-01") -> StockTrade:
+    return StockTrade(
+        senator_id=senator_id,
+        ticker=ticker,
+        asset_name=f"{ticker} Inc.",
+        owner="self",
+        transaction_type="purchase",
+        transaction_date=transaction_date,
+        disclosure_date="2026-01-11",
+        days_to_disclose=days_to_disclose,
+        amount_low=1001.0,
+        amount_high=15000.0,
+        industry="TECH",
+        source_url="https://example.com/ptr.pdf",
+        filing_id="F1",
+        parse_confidence="text",
+    )
+
+
+def test_stock_trade_schema_late_flag_derived():
+    on_time = StockTradeSchema(
+        ticker="AAPL", assetName="Apple Inc.", owner="self", transactionType="purchase",
+        transactionDate="2026-01-01", disclosureDate="2026-01-10", daysToDisclose=9,
+        amountLow=1001, amountHigh=15000, industry="TECH", sourceUrl="https://x", parseConfidence="text",
+    )
+    late = StockTradeSchema(
+        ticker="AAPL", assetName="Apple Inc.", owner="self", transactionType="purchase",
+        transactionDate="2026-01-01", disclosureDate="2026-03-01", daysToDisclose=59,
+        amountLow=1001, amountHigh=15000, industry="TECH", sourceUrl="https://x", parseConfidence="text",
+    )
+    assert on_time.late is False
+    assert late.late is True
+
+
+def test_a_stored_owner_the_schema_lacks_reads_as_not_stated(db_session):
+    _senator(db_session)
+    trade = _trade("S1")
+    trade.owner = "trust"
+    db_session.add(trade)
+    db_session.commit()
+    assert get_senator_stock_trades(db_session, "S1").trades[0].owner == "unknown"
+
+
+def test_get_senator_stock_trades_not_found_returns_none(db_session):
+    assert get_senator_stock_trades(db_session, "does-not-exist") is None
+
+
+def test_get_senator_stock_trades_empty(db_session):
+    _senator(db_session)
+    result = get_senator_stock_trades(db_session, "S1")
+    assert result.total == 0
+    assert result.trades == []
+    assert result.late_count == 0
+
+
+def test_get_senator_stock_trades_pagination_and_late_count(db_session):
+    _senator(db_session)
+    for i in range(3):
+        db_session.add(_trade("S1", days_to_disclose=10 + i, ticker=f"T{i}"))
+    db_session.add(_trade("S1", days_to_disclose=90, ticker="LATE1"))
+    db_session.commit()
+
+    result = get_senator_stock_trades(db_session, "S1", page=1, per_page=2)
+    assert result.total == 4
+    assert result.late_count == 1
+    assert len(result.trades) == 2
+    assert result.total_pages == 2
+
+    page2 = get_senator_stock_trades(db_session, "S1", page=2, per_page=2)
+    assert len(page2.trades) == 2
+
+
+def test_get_senator_stock_trades_sorted_most_recent_first(db_session):
+    _senator(db_session)
+    db_session.add(_trade("S1", transaction_date="2026-01-01", ticker="OLD"))
+    db_session.add(_trade("S1", transaction_date="2026-06-01", ticker="NEW"))
+    db_session.commit()
+
+    result = get_senator_stock_trades(db_session, "S1")
+    assert result.trades[0].ticker == "NEW"
+    assert result.trades[1].ticker == "OLD"
+
+
+def test_an_undated_scan_row_lists_after_the_dated_ones(db_session):
+    _senator(db_session)
+    db_session.add(_trade("S1", transaction_date=None, ticker="UNDATED"))
+    db_session.add(_trade("S1", transaction_date="2026-01-01", ticker="OLD"))
+    db_session.commit()
+    result = get_senator_stock_trades(db_session, "S1")
+    assert [t.ticker for t in result.trades] == ["OLD", "UNDATED"]
+    assert result.trades[1].transaction_date is None
+
+
+def test_get_rep_stock_trades_not_found_returns_none(db_session):
+    assert get_rep_stock_trades(db_session, "does-not-exist") is None
+
+
+def test_get_rep_stock_trades_pagination(db_session):
+    _rep(db_session)
+    db_session.add(RepStockTrade(
+        representative_id="R1", ticker="MSFT", asset_name="Microsoft Corp.",
+        owner="spouse", transaction_type="sale_full", transaction_date="2026-02-01",
+        disclosure_date="2026-04-01", days_to_disclose=59, amount_low=15001.0,
+        amount_high=50000.0, industry="TECH", source_url="https://example.com/ptr.pdf",
+        filing_id="F2", parse_confidence="text",
+    ))
+    # The same late trade read by OCR from a scan: its date may be misread
+    # by a digit, so it supports no timeliness figure.
+    db_session.add(RepStockTrade(
+        representative_id="R1", ticker="AAPL", asset_name="Apple Inc.",
+        owner="spouse", transaction_type="sale_full", transaction_date="2026-01-01",
+        disclosure_date="2026-04-01", days_to_disclose=90, amount_low=15001.0,
+        amount_high=50000.0, industry="TECH", source_url="https://example.com/scan.pdf",
+        filing_id="F3", parse_confidence="ocr",
+    ))
+    db_session.commit()
+
+    result = get_rep_stock_trades(db_session, "R1")
+    # Schema object, not a hand-built dict — the House serializer used to
+    # be its own copy and had already drifted from the shared one.
+    assert result.total == 2
+    assert result.late_count == 1
+    assert result.trades[0].late is True
+    assert (result.trades[1].late, result.trades[1].days_to_disclose) == (None, None)
+    assert result.trades[1].parse_confidence == "ocr"
+
+
+def test_all_three_chambers_serialize_trades_identically(db_session):
+    """One serializer for senators, reps, and the president. A field added
+    to StockTradeSchema must reach every surface, or the same filing
+    renders differently depending on whose page you are on."""
+    from app.models import President, PresidentTrade, StockTrade
+    from app.services.president_service import get_president_trades
+    from app.services.senator_service import get_senator_stock_trades
+
+    _rep(db_session)
+    db_session.add(Senator(id="S1", name="Sen One", state="CA", party="D"))
+    db_session.add(President(
+        id="p-1", name="Pres One", party="R", number=47,
+        term_start="2025-01-20", is_current=True,
+    ))
+    shared = dict(
+        ticker="MSFT", asset_name="Microsoft Corp.", owner="self",
+        transaction_type="purchase", transaction_date="2026-02-01",
+        disclosure_date="2026-02-10", days_to_disclose=9, amount_low=15001.0,
+        amount_high=50000.0, industry="TECH",
+        source_url="https://example.com/ptr.pdf", filing_id="F9",
+    )
+    db_session.add(RepStockTrade(representative_id="R1", **shared))
+    db_session.add(StockTrade(senator_id="S1", **shared))
+    db_session.add(PresidentTrade(president_id="p-1", **shared))
+    db_session.commit()
+
+    shapes = {
+        frozenset(
+            fetch(db_session, entity_id).model_dump(by_alias=True)["trades"][0].keys()
+        )
+        for fetch, entity_id in (
+            (get_rep_stock_trades, "R1"),
+            (get_senator_stock_trades, "S1"),
+            (get_president_trades, "p-1"),
+        )
+    }
+    assert len(shapes) == 1, "trade payloads diverged between filer groups"
+
+
+def test_a_presidents_trade_before_the_term_is_flagged(db_session):
+    from app.models import President, PresidentTrade
+    from app.services.president_service import get_president_trades
+
+    db_session.add(President(id="p-1", name="Pres One", party="R", number=47, term_start="2025-01-20", is_current=True))
+    for day, filing in (("2025-01-10", "F1"), ("2025-03-01", "F2")):
+        db_session.add(PresidentTrade(
+            president_id="p-1", ticker="MSFT", asset_name="Microsoft Corp.", owner="self",
+            transaction_type="purchase", transaction_date=day, disclosure_date="2026-05-15",
+            days_to_disclose=None, amount_low=15001.0, amount_high=50000.0, industry="TECH",
+            source_url="https://example.com/278e.pdf", filing_id=filing, report_kind="annual",
+        ))
+    db_session.commit()
+    trades = get_president_trades(db_session, "p-1").trades
+    assert {t.transaction_date: t.before_term_start for t in trades} == {"2025-01-10": True, "2025-03-01": False}

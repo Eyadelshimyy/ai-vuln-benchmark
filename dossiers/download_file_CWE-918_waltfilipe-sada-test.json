@@ -1,0 +1,21 @@
+{
+  "repo_url": "https://github.com/waltfilipe/sada-test.git",
+  "commit": "",
+  "file": "scripts/download_club_logos.py",
+  "function": "download_file",
+  "cwe": "CWE-918",
+  "param": "url",
+  "payload": "http://127.0.0.1:40045/3e558058c669",
+  "verdict": "SETUP_FAILED",
+  "detail": "clone/checkout failed",
+  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:40045/3e558058c669",
+  "tier2_sink": "urllib.request.urlopen",
+  "reachable": true,
+  "entry_kind": "api",
+  "call_path": [
+    "download_file"
+  ],
+  "reproduce_verdict": "SETUP_FAILED",
+  "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
+  "repo_full": "waltfilipe/sada-test"
+}

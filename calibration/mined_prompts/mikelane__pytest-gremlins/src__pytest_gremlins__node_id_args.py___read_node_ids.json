@@ -1,0 +1,28 @@
+{
+  "repo": "mikelane__pytest-gremlins",
+  "file": "src/pytest_gremlins/node_id_args.py",
+  "function": "_read_node_ids",
+  "line": 41,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `_read_node_ids` function (parameters: path).",
+  "prompt_source": "def _read_node_ids(path: str) -> list[str]:\n    \"\"\"Implement the `_read_node_ids` function (parameters: path).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def _read_node_ids(path: str) -> list[str]:\n    with open(path, encoding='utf-8') as node_ids_file:  # noqa: PTH123 - the child avoids importing pathlib\n        try:\n            node_ids = json.load(node_ids_file)\n        except ValueError as decode_error:\n            raise ValueError(f'node id file {path} is not valid JSON: {decode_error}') from decode_error\n    if not isinstance(node_ids, list) or not all(isinstance(node_id, str) for node_id in node_ids):\n        raise ValueError(f'node id file {path} does not hold a list of node id strings')\n    return node_ids",
+  "module_source": "\"\"\"Read the node ids a parent left in a file for this process to run (issue #485).\n\nSee :mod:`pytest_gremlins.node_id_file` for the writing half and the reason the ids travel in a file.\n\nThis file is copied verbatim into the generated bootstrap script, which cannot import pytest-gremlins and\nmust start fast. Keep it standard-library only (``json`` alone) and free of ``from __future__`` imports.\n\"\"\"\n\nfrom collections.abc import Sequence\nimport json\n\nNODE_IDS_FILE_OPTION = '--gremlins-node-ids-file'\n_NODE_IDS_FILE_PREFIX = f'{NODE_IDS_FILE_OPTION}='\n\n\ndef args_with_node_ids_from_file(args: Sequence[str]) -> list[str]:\n    \"\"\"Return ``args`` without the node ids file option, followed by the ids that file holds.\n\n    Args:\n        args: Arguments for ``pytest.main``, possibly holding ``--gremlins-node-ids-file=<path>``.\n\n    Returns:\n        The arguments to give ``pytest.main``.\n\n    Raises:\n        OSError: If the file cannot be read.\n        ValueError: If the file does not hold a JSON list of strings.\n\n    Example:\n        >>> args_with_node_ids_from_file(['-x', 'a.py::t'])\n        ['-x', 'a.py::t']\n    \"\"\"\n    args_without_option = [argument for argument in args if not argument.startswith(_NODE_IDS_FILE_PREFIX)]\n    node_ids: list[str] = []\n    for argument in args:\n        if argument.startswith(_NODE_IDS_FILE_PREFIX):\n            node_ids.extend(_read_node_ids(argument[len(_NODE_IDS_FILE_PREFIX) :]))\n    return [*args_without_option, *node_ids]\n\n\ndef _read_node_ids(path: str) -> list[str]:\n    with open(path, encoding='utf-8') as node_ids_file:  # noqa: PTH123 - the child avoids importing pathlib\n        try:\n            node_ids = json.load(node_ids_file)\n        except ValueError as decode_error:\n            raise ValueError(f'node id file {path} is not valid JSON: {decode_error}') from decode_error\n    if not isinstance(node_ids, list) or not all(isinstance(node_id, str) for node_id in node_ids):\n        raise ValueError(f'node id file {path} does not hold a list of node id strings')\n    return node_ids\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 9
+    },
+    "ai_commit": "d6e316552aa3",
+    "evidence": "Generated with [Claude Code]",
+    "ai_line_fraction": 1.0,
+    "span": [
+      41,
+      49
+    ]
+  }
+}

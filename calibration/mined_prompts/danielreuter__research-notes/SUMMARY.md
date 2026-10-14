@@ -1,0 +1,82 @@
+# Mined prompts: danielreuter__research-notes
+
+72 on-topic candidate function(s) found across 213 files.
+72 selected (spread across CWEs, capped at --limit 300).
+
+- CWE-22: 56 selected (of 56 total candidates)
+- CWE-78: 20 selected (of 20 total candidates)
+
+## Selected functions
+
+- **main** (CWE-22) -- `bundles/20260926T2231Z-bench-spine-pr91-placement.py:296`
+- **remote_probe** (CWE-78) -- `bundles/20260926T2231Z-bench-spine-pr91-placement.py:183`
+- **main** (CWE-22) -- `bundles/20260926T2250Z-bench-spine-pr91-placement.py:314`
+- **remote_probe** (CWE-78) -- `bundles/20260926T2250Z-bench-spine-pr91-placement.py:190`
+- **main** (CWE-22) -- `campaigns/pouw/price-twins-lean/gen_kernel_gamma.py:151`
+- **cpu_pending** (CWE-78) -- `lanes/circuits-grid-models/feeder/gm_feed.py:107`
+- **main** (CWE-22) -- `campaigns/pouw/price-twins-lean/v1-hot/gen_v1hot_gamma.py:297`
+- **main** (CWE-78) -- `lanes/circuits-grid-models/feeder/twins.py:42`
+- **main** (CWE-22) -- `campaigns/pouw/price-twins-lean/v2-hot/gen_hot_gamma.py:308`
+- **node_env** (CWE-78) -- `lanes/circuits-grid-models/labeller/label_loop.py:70`
+- **main** (CWE-22) -- `campaigns/pouw/red-team/basesplit_sparse_pattern_ops.py:17`
+- **gather** (CWE-78) -- `lanes/circuits-grid-models/labeller/label_loop.py:93`
+- **main** (CWE-22) -- `campaigns/pouw/red-team/divsqrt_ftz_check.py:23`
+- **silu_cause** (CWE-78) -- `lanes/circuits-grid-models/labeller/label_loop.py:158`
+- **main** (CWE-22) -- `campaigns/pouw/red-team/f1prime_mc_check.py:148`
+- **fetch** (CWE-78) -- `lanes/circuits-grid-models/labeller/silu_check.py:26`
+- **main** (CWE-22) -- `campaigns/pouw/red-team/gemm_fill_summary.py:38`
+- **rsync_done** (CWE-22, CWE-78) -- `lanes/proofs-n2-guest/tools/refill.py:122`
+- **main** (CWE-22) -- `campaigns/pouw/red-team/hot_deep.py:77`
+- **tree_dir** (CWE-22, CWE-78) -- `lanes/proofs-n2-hill/tools/n2h.py:341`
+- **main** (CWE-22) -- `campaigns/pouw/red-team/hot_deep_long.py:20`
+- **bin_key** (CWE-78) -- `lanes/proofs-n2-hill/tools/n2h.py:369`
+- **main** (CWE-22) -- `campaigns/pouw/red-team/hot_late_start.py:133`
+- **venv** (CWE-78) -- `lanes/proofs-n2-hill/tools/n2h.py:376`
+- **main** (CWE-22) -- `campaigns/pouw/red-team/nvfp4_structure_census.py:78`
+- **sync_cache** (CWE-78) -- `lanes/proofs-n2-hill/tools/n2h.py:388`
+- **write** (CWE-22) -- `campaigns/pouw/red-team/rt_result.py:5`
+- **launch_cpu** (CWE-22, CWE-78) -- `lanes/proofs-n2-hill/tools/n2h.py:685`
+- **main** (CWE-22) -- `campaigns/pouw/red-team/scalar_model_check.py:68`
+- **main** (CWE-78) -- `lanes/proofs-n2-hill/tools/n2h.py:932`
+- **merge** (CWE-22) -- `campaigns/pouw/red-team/t1_closures_attack.py:189`
+- **pod** (CWE-78) -- `lanes/proofs-rows/tools/split_measure.py:98`
+- **main** (CWE-22) -- `campaigns/pouw/red-team/t1_closures_attack.py:213`
+- **timing** (CWE-78) -- `lanes/proofs-rows/tools/split_measure.py:134`
+- **tensors** (CWE-22) -- `campaigns/pouw/red-team/weight_compressibility.py:20`
+- **finish** (CWE-22, CWE-78) -- `lanes/vllm-epoch-run/followup/fu.py:188`
+- **record** (CWE-22) -- `campaigns/pouw/rtx-pro/workers/pouw-mvp-e2e/prio.py:35`
+- **gather** (CWE-78) -- `lanes/vllm-epoch-run/labeller/label_loop.py:52`
+- **main** (CWE-22) -- `lanes/circuits-grid-models/feeder/add_models.py:41`
+- **sass_mma** (CWE-78) -- `lanes/vllm-sm120-attention/tools/nvfp4_kernel_capture_gpu.py:59`
+- **log** (CWE-22) -- `lanes/circuits-grid-models/feeder/gm_feed.py:59`
+- **main** (CWE-22) -- `lanes/circuits-grid-models/feeder/trim_build_mem.py:132`
+- **log** (CWE-22) -- `lanes/circuits-grid-models/feeder/twins.py:35`
+- **fill_auto** (CWE-22) -- `lanes/circuits-grid-models/labeller/label_loop.py:174`
+- **one_pass** (CWE-22) -- `lanes/circuits-grid-models/labeller/label_loop.py:189`
+- **submit** (CWE-22) -- `lanes/proofs-n2-guest/tools/refill.py:74`
+- **gpu_h_used** (CWE-22) -- `lanes/proofs-n2-guest/tools/refill.py:141`
+- **main** (CWE-22) -- `lanes/proofs-n2-guest/tools/refill.py:222`
+- **main** (CWE-22) -- `lanes/proofs-n2-guest/tools/verify.py:41`
+- **update** (CWE-22) -- `lanes/proofs-n2-hill/tools/n2h.py:124`
+- **_proc** (CWE-22) -- `lanes/proofs-n2-hill/tools/n2h.py:225`
+- **_n2h_item** (CWE-22) -- `lanes/proofs-n2-hill/tools/n2h.py:238`
+- **_tree** (CWE-22) -- `lanes/proofs-n2-hill/tools/n2h.py:249`
+- **_busy** (CWE-22) -- `lanes/proofs-n2-hill/tools/n2h.py:268`
+- **record** (CWE-22) -- `lanes/proofs-n2-hill/tools/n2h.py:610`
+- **submit** (CWE-22) -- `lanes/proofs-n2-hill/tools/n2h.py:665`
+- **log** (CWE-22) -- `lanes/proofs-rows/tools/split_measure.py:45`
+- **put** (CWE-22) -- `lanes/proofs-rows/tools/split_measure.py:62`
+- **sha256** (CWE-22) -- `lanes/proofs-rows/tools/split_measure.py:110`
+- **main** (CWE-22) -- `lanes/proofs-rows/tools/split_measure.py:173`
+- **sha256** (CWE-22) -- `lanes/proofs-rows/tools/stage_mark.py:26`
+- **finish** (CWE-22) -- `lanes/proofs-rows/tools/stage_mark.py:51`
+- **main** (CWE-22) -- `lanes/proofs-rows/tools/stage_mark.py:58`
+- **main** (CWE-22) -- `lanes/rec-ksweep/tools/curve.py:226`
+- **main** (CWE-22) -- `lanes/vllm-epoch-run/followup/digest_line.py:33`
+- **launch** (CWE-22) -- `lanes/vllm-epoch-run/followup/fu.py:91`
+- **poll** (CWE-22) -- `lanes/vllm-epoch-run/followup/fu.py:151`
+- **note_first** (CWE-22) -- `lanes/vllm-epoch-run/followup/fu.py:245`
+- **main** (CWE-22) -- `lanes/vllm-sm120-attention/tools/nvfp4_kernel_capture_gpu.py:175`
+- **main** (CWE-22) -- `lanes/vllm-sm120-kernels/tools/sm120_b_diag.py:102`
+- **main** (CWE-22) -- `lanes/vllm-sm120-kernels/tools/sm120_moe_bulk.py:31`
+- **main** (CWE-22) -- `lanes/vllm-sm120-kernels/tools/sm120_tp2_live.py:43`

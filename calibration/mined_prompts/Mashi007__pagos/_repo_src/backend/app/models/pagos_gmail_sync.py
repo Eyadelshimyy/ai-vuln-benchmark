@@ -1,0 +1,71 @@
+"""
+Modelos para el pipeline Gmail -> Gemini -> BD (módulo Pagos; comprobante en BD, sin Drive).
+"""
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, JSON
+from sqlalchemy.sql import func
+
+from app.core.database import Base
+
+
+class PagosGmailSync(Base):
+    __tablename__ = "pagos_gmail_sync"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    started_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    finished_at = Column(DateTime(timezone=False), nullable=True)
+    status = Column(String(20), nullable=False, default="running")  # running | success | error
+    emails_processed = Column(Integer, nullable=False, default=0)
+    files_processed = Column(Integer, nullable=False, default=0)
+    # Conteo por sync (filtro unread): correos con al menos un adjunto digitalizado OK (etiqueta+estrella).
+    correos_marcados_revision = Column(Integer, nullable=False, server_default="0", default=0)
+    error_message = Column(Text, nullable=True)
+    # Resumen diagnóstico de la última corrida (listados Gmail vs omitidos); expuesto en GET /pagos/gmail/status.
+    run_summary = Column(JSON, nullable=True)
+
+
+class PagosGmailSyncItem(Base):
+    __tablename__ = "pagos_gmail_sync_item"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    sync_id = Column(Integer, ForeignKey("pagos_gmail_sync.id", ondelete="CASCADE"), nullable=False, index=True)
+    correo_origen = Column(String(255), nullable=False)  # remitente; se mantiene por compatibilidad
+    asunto = Column(String(500), nullable=True)  # Asunto del correo (columna A en Excel)
+    # Plantilla A (imagen 1) -> Mercantil; plantilla B (imagen 2) -> BNC (etiqueta Excel descarga).
+    banco = Column(String(50), nullable=True)
+    fecha_pago = Column(String(100), nullable=True)
+    cedula = Column(String(50), nullable=True)
+    monto = Column(String(100), nullable=True)
+    numero_referencia = Column(String(200), nullable=True)
+    drive_file_id = Column(String(100), nullable=True)
+    drive_link = Column(Text, nullable=True)  # URL Drive o URL API comprobante en BD (sin limite practico)
+    drive_email_link = Column(Text, nullable=True)  # link al .eml en Drive si aplica
+    sheet_name = Column(String(100), nullable=True)
+    # Trazabilidad Gmail API (list/get); permite localizar el hilo en la bandeja. Índice vía migración 064.
+    gmail_message_id = Column(String(100), nullable=True)
+    gmail_thread_id = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+
+class GmailTemporal(Base):
+    """
+    Tabla temporal para exportar a Excel. Cada procesamiento Gmail inserta aqui a continuacion.
+    Al descargar el Excel se vacia esta tabla (TRUNCATE). No tiene FK a sync.
+    """
+    __tablename__ = "gmail_temporal"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    correo_origen = Column(String(255), nullable=False)
+    asunto = Column(String(500), nullable=True)
+    banco = Column(String(50), nullable=True)
+    fecha_pago = Column(String(100), nullable=True)
+    cedula = Column(String(50), nullable=True)
+    monto = Column(String(100), nullable=True)
+    numero_referencia = Column(String(200), nullable=True)
+    drive_file_id = Column(String(100), nullable=True)
+    drive_link = Column(Text, nullable=True)
+    drive_email_link = Column(Text, nullable=True)
+    sheet_name = Column(String(100), nullable=True)
+    gmail_message_id = Column(String(100), nullable=True)
+    gmail_thread_id = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+

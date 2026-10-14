@@ -1,0 +1,827 @@
+"""Mate independent cloud adapter. No legacy authentication or command fallback.
+
+Local DTOs, commands and certificate-password derivation use MATE-API.
+The old module namespace is patched only at the Mate integration boundary.
+"""
+import base64
+import dataclasses
+from process_lock import exclusive
+import hashlib
+import json
+import logging
+import math
+import os
+import re
+import secrets
+import sqlite3
+import threading
+import time
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from leapmotor_cloud.private_storage import validate_private_file
+from urllib.parse import parse_qsl, urlencode
+
+import crypto
+from leapmotor_cloud.mate_compat import MateClientCompatibility, Vehicle, MateAPIError as LeapmotorApiError
+from leapmotor_cloud.pin import encrypt_operate_password
+from leapmotor_cloud.authentication import LoginClient, LoginUnavailable, REFRESH_PATH
+from leapmotor_cloud.session import CloudSession
+from leapmotor_cloud.operating_availability import OperatingState, operating_decision
+from leapmotor_cloud.models import Availability
+from leapmotor_cloud.transport import UrllibTransport, Request, validate_url
+from leapmotor_cloud.cloud import ALLOWED_HOSTS, GLOBAL_ORIGIN, CENTER_ORIGIN, _unique_object, _invalid_constant
+from leapmotor_cloud.signing import sign_authenticated
+from leapmotor_cloud.session import session_device_id
+from leapmotor_cloud.b10_commands import interpret
+from command_contracts import COMMAND_RULES, APPOINTMENT_PATH, prepare, charge
+from session_material import certificate_usable as _certificate_usable_uncached
+
+# Whether the account certificate is usable is a question about two FILES, and the answer only
+# changes when they do — but answering it reads both and parses the private key, and RSA parsing is
+# the slowest thing an add-on's CPU does. Profiled: one /api/vehicle-status request, which the
+# Vehicle page fetches after it loads, called it FOURTEEN times (0.732 s of a five-request profile
+# on a Mac, worse on aarch64). Remembered per (path, size, mtime) for both files, so a re-issued
+# certificate is read again and nothing is held across a change.
+# → tests/test_the_certificate_is_read_once_not_fourteen_times.py
+_certificate_answer_cache = {}
+
+
+def certificate_usable(cert_path, key_path, **kwargs):
+    if kwargs:                       # a caller with its own margin or clock gets the real thing
+        return _certificate_usable_uncached(cert_path, key_path, **kwargs)
+    try:
+        key = tuple((str(path), os.stat(path).st_size, os.stat(path).st_mtime_ns)
+                    for path in (cert_path, key_path))
+    except OSError:                  # a file that is not there is the library's answer to give
+        return _certificate_usable_uncached(cert_path, key_path)
+    if key not in _certificate_answer_cache:
+        _certificate_answer_cache.clear()        # one account, one pair: never a growing map
+        _certificate_answer_cache[key] = _certificate_usable_uncached(cert_path, key_path)
+    return _certificate_answer_cache[key]
+
+DB = os.environ.get('DB_PATH', '/data/leapmotor_mate.db')
+SESSION_KEY = 'api_v2_shared_session'
+LOGIN_PATH = '/base/base-user/account/v1/login'
+# Where the earlier library read a car's appointments: cmdId 190 is the charge plan, one flat object.
+GET_APPOINTMENT_PATH = '/carownerservice/oversea/vehicle/v1/app/remote/ctl/getAppointment'
+READ_PATHS = {
+    '/carownerservice/oversea/vehicle/v1/carpicture/key',
+    '/carownerservice/oversea/vehicle/v1/carpicture/package',
+    '/app/app-global-service/v1/vehicle/list',
+    '/app/app-global-service/v1/vehicle/getCarRoute',
+    '/app/app-signal-service/signal/info/query',
+    '/carownerservice/v3/api/vehicleinfo/commonConfig',
+    '/carownerservice/charge/daily/detail/page',
+    '/carownerservice/charge/statistic/days',
+    '/carownerservice/charge/vail/startTime/query',
+    '/carownerservice/mileage/daily/detail/page',
+    '/carownerservice/mileage/vail/startTime/query',
+    '/carownerservice/oversea/drivingRecord/v1/getLastweekEC',
+    '/carownerservice/oversea/drivingRecord/v1/getPlugInLastNweeks100kmEC',
+    '/carownerservice/oversea/drivingRecord/v1/getLastNweeks100kmECAndRank',
+    '/carownerservice/oversea/drivingRecord/v1/mileage/energy/detail',
+    '/carownerservice/oversea/message/v1/list',
+    '/carownerservice/oversea/message/v1/unread/count',
+    GET_APPOINTMENT_PATH,
+}
+CONTROL_PATH = '/app/app-control-service/v3/api/appremotectl'
+# Where the cloud tells whether the car carried a command out: the command's eventId as msgID, and
+# `data` 0 until the car has answered, 1 once it has (measured on a B10 04/10/2026, #395).
+RESULT_PATH = CONTROL_PATH + '/query'
+# The commands no signal of the car shows done — the charge plan (190) and a destination for the
+# navigator (180) — wait for the car's word. A physical command shows in the car's own signals, which
+# the page reads again after it.
+CONFIRMED_BY_THE_CAR = frozenset({'180', '190'})
+# Left out of the command log, which a diagnostics bundle publishes: a destination is a place, and
+# set_id names the phone that wrote a climate schedule.
+_UNLOGGED = frozenset({'address', 'addressname', 'latitude', 'longitude', 'set_id'})
+VERIFY_PATH = '/carownerservice/oversea/vehicle/v1/operPwd/verify'
+COMMAND_ABILITIES = {cmd:rule[1] for cmd,rule in COMMAND_RULES.items()}
+# Where the old library read a car's status, its model in the path (B10 and B11 read as c10). It still
+# answers Mate's client — measured 01/10/2026 on a B10: 94 signals, each equal to the signal service's —
+# and it is where every T03 was read until 4.7.7 (#368, #338). Only a plain model name opens it.
+OLD_STATUS_PATH = '/carownerservice/oversea/vehicle/v1/status/get/'
+_OLD_STATUS_MODEL = re.compile(r'[a-z0-9]{2,8}')
+log = logging.getLogger('mate.cloud')
+
+
+def _loggable(value):
+    """What a command carried, as the log shows it: everything but what `_UNLOGGED` names."""
+    if isinstance(value, dict):
+        return {k: '…' if k in _UNLOGGED else _loggable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_loggable(v) for v in value]
+    return value
+
+
+def _answer(receipt):
+    """The cloud's answer to a command, in the log's words."""
+    if receipt.outcome == 'accepted':
+        return 'accepted by the cloud' + (f', which waits {receipt.timeout_seconds} s for the car'
+                                          if receipt.timeout_seconds else '')
+    if receipt.outcome == 'accepted_untracked':
+        return 'accepted by the cloud, with nothing to follow it by'
+    if receipt.outcome == 'rejected':
+        return f'refused by the cloud (code {receipt.api_code})'
+    return 'an answer that could not be read'
+
+
+def _read_allowed(path):
+    return path in READ_PATHS or (path.startswith(OLD_STATUS_PATH)
+                                  and bool(_OLD_STATUS_MODEL.fullmatch(path[len(OLD_STATUS_PATH):])))
+
+
+def connect_db():
+    return sqlite3.connect(DB, timeout=30)
+
+
+def _integer(value):
+    # Cloud configuration permits decimal strings; retain unknown values so
+    # strict command validation still rejects missing/invalid full state.
+    if isinstance(value, str) and re.fullmatch(r'[0-9]+', value):
+        return int(value)
+    return value
+
+
+_PLAN_KEYS = ('chargeEnable', 'chargesoc', 'starttime', 'endtime', 'cycles', 'circulation', 'recharge')
+
+
+def setting(db, key, default=''):
+    row = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_setting(db, key, value):
+    db.execute('INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)', (key,value))
+
+
+class NoLegacyNetwork:
+    def close(self):
+        pass
+
+    def __getattr__(self, name):
+        raise LeapmotorApiError('Direct legacy network access disabled in independent API runtime')
+
+
+def _rejection(status, codes):
+    """The cloud's refusal, with its own codes kept on the exception.
+
+    One error covers every non-zero code, so a caller that only reads the message cannot tell an
+    empty window (100, "No data found") from a failure worth retrying — and pays three session
+    resets, three logins, for a day the car did not move (#327).
+    → tests/test_an_empty_window_is_an_answer_not_a_failure.py
+    """
+    error = LeapmotorApiError('New API rejected request: HTTP %s, code %s' % (status, str(codes)[:100]))
+    error.api_codes = tuple(codes)
+    return error
+
+
+# A sign-in refused for its password, in the words the poller and the history worker wait an hour
+# on (#411).
+REFUSED_PASSWORD='incorrect account or password'
+
+
+class NewAPIClient(MateClientCompatibility):
+    _mate_new_api = True
+
+    def __init__(self, **kwargs):
+        kwargs['verify_ssl'] = True
+        kwargs['timezone_name'] = os.environ.get('TZ')
+        super().__init__(**kwargs)
+        with connect_db() as db:
+            installation_id = setting(db, 'mate_device_id')
+            if not installation_id:
+                installation_id = secrets.token_hex(16)
+                set_setting(db, 'mate_device_id', installation_id)
+        self._installation_device_id = installation_id
+        self.session.close()
+        self.session = NoLegacyNetwork()
+        self._transport = UrllibTransport(Path(__file__).with_name('leapmotor-appsubca-public.pem'), ALLOWED_HOSTS)
+        self._mutex = threading.RLock()
+        self._new_key = None
+        self._routes = {}
+        self._access_refresh_attempt = None
+        self.last_new_command_receipt = None
+        # called from the one place the cloud is asked to authenticate, whichever read or command
+        # needed it: on_login(None) when it let us in, on_login(exc) when it did not. Must not raise.
+        self.on_login = None
+
+    def _audit(self, path, method, status, code):
+        with connect_db() as db:
+            db.execute('''CREATE TABLE IF NOT EXISTS api_v2_http_log
+                (id INTEGER PRIMARY KEY, at TEXT, method TEXT, path TEXT, http_status INTEGER, api_code TEXT)''')
+            db.execute('INSERT INTO api_v2_http_log(at,method,path,http_status,api_code) VALUES (?,?,?,?,?)',
+                       (datetime.now(timezone.utc).isoformat(),method,path,status,str(code)))
+            db.execute('DELETE FROM api_v2_http_log WHERE id < (SELECT MAX(id)-10000 FROM api_v2_http_log)')
+
+    def _wire(self, origin, path, body, *, method='POST', form=False, login=False, binary=False, cartype='B10'):
+        origin = validate_url(origin, ALLOWED_HOSTS, origin=True)
+        if not _read_allowed(path) and path not in {LOGIN_PATH,CONTROL_PATH,VERIFY_PATH,RESULT_PATH,APPOINTMENT_PATH}:
+            raise LeapmotorApiError('Endpoint not migrated; legacy fallback disabled')
+        core = dict(source='leapmotor',channel='1',acceptLanguage=self.language,
+                    version='V1.16.4-1',deviceType='android',nonce=str(secrets.randbelow(10**15)),
+                    timestamp=str(int(time.time()*1000)),deviceId=self.device_id)
+        if login:
+            combined = dict(core, **body)
+            sign = hashlib.sha256(''.join(str(combined[k]) for k in sorted(combined)).encode()).hexdigest().upper()
+            cert = (Path(self.app_cert_path), Path(self.app_key_path))
+        else:
+            sign = sign_authenticated(self._new_key, core, {k:str(v) for k,v in body.items()})
+            cert = (Path(self.account_cert_file), Path(self.account_key_file))
+        headers = dict(core,sign=sign,carvin=body.get('vin',body.get('carvin','')),cartype='' if login else cartype)
+        headers.update({'Content-Type':'application/x-www-form-urlencoded' if form else 'application/json',
+                        'x-region':'EU','x-api-signature-version':'2.0','X-P12_ENC_ALG':'1'})
+        if not login:
+            headers.update(token=self.token,userId=str(self.user_id))
+        url = origin + path
+        if method == 'GET':
+            url += '?' + urlencode(body)
+            data = None
+        else:
+            data = urlencode(body).encode() if form else json.dumps(body,separators=(',',':')).encode()
+        transport = self._transport
+        if binary:
+            transport = UrllibTransport(Path(__file__).with_name('leapmotor-appsubca-public.pem'),
+                                        ALLOWED_HOSTS, max_response_bytes=16 * 1024 * 1024)
+        response = transport.send(Request(method,url,headers,data),client_cert=cert)
+        if response.status==401 and not login:
+            self._invalidate_session(headers['token'])
+            self._audit(path,method,response.status,'authentication_rejected')
+            raise LeapmotorApiError('Session rejected; command/read not retried')
+        if binary and response.status == 200 and response.body[:4] == b'PK\x03\x04':
+            import io, zipfile
+            if len(response.body) > 32 * 1024 * 1024:
+                raise LeapmotorApiError('Picture package too large')
+            with zipfile.ZipFile(io.BytesIO(response.body)) as archive:
+                entries = archive.infolist()
+                if len(entries) > 2000 or sum(entry.file_size for entry in entries) > 128 * 1024 * 1024:
+                    raise LeapmotorApiError('Expanded picture package too large')
+            self._audit(path,method,response.status,'binary_ok')
+            return {}, response
+        try:
+            envelope = json.loads(response.body.decode(),object_pairs_hook=_unique_object,parse_constant=_invalid_constant)
+        except Exception:
+            self._audit(path,method,response.status,'invalid_json')
+            raise LeapmotorApiError('New API response could not be decoded') from None
+        if not isinstance(envelope,dict):
+            raise LeapmotorApiError('New API returned an invalid envelope')
+        codes = [envelope[k] for k in ('code','result') if k in envelope]
+        self._audit(path,method,response.status,codes)
+        if not login and any(str(code) == '302002004' for code in codes):
+            self._invalidate_session(headers['token'])
+            raise LeapmotorApiError('Session unavailable; invalidated without replay')
+        if response.status != 200 or not codes or any(type(c) is bool or str(c)!='0' for c in codes):
+            raise _rejection(response.status, codes)
+        if binary:
+            raise LeapmotorApiError('Picture endpoint did not return a ZIP')
+        return envelope, response
+
+    def _session_row(self, session):
+        """The saved session, including what lets the next process RENEW it instead of logging
+        in. A row written before 0.1.0a11 simply has no refresh keys, and is read back with
+        `.get`."""
+        row=dict(token=session.token,user_id=session.user_id,device_id=session.device_id,
+                 key=base64.b64encode(session.key).decode(),cert=str(session.client_cert[0]),
+                 private_key=str(session.client_cert[1]),expires_at=session.expires_at.timestamp(),
+                 username_hash=hashlib.sha256(self.username.encode()).hexdigest())
+        if getattr(session,'refresh_token',None):
+            row['refresh_token']=session.refresh_token
+            if getattr(session,'refresh_expires_at',None) is not None:
+                row['refresh_expires_at']=session.refresh_expires_at.timestamp()
+        return row
+
+    def _apply_session(self, saved):
+        if not certificate_usable(saved['cert'], saved['private_key']):
+            raise LeapmotorApiError('Account certificate unavailable or expiring')
+        if getattr(self, 'user_id', None) != saved['user_id']:
+            self._routes = {}
+            self._access_refresh_attempt = None
+        self.token=saved['token'];self.user_id=saved['user_id']
+        self.device_id=session_device_id(self.token,saved['device_id'])
+        self._new_key=base64.b64decode(saved['key'],validate=True)
+        if len(self._new_key)!=32:raise ValueError('Invalid session key')
+        self.account_cert_file=saved['cert'];self.account_key_file=saved['private_key']
+        self._session_expires_at=saved.get('expires_at')
+        self._refresh_token=saved.get('refresh_token')
+        self._refresh_expires_at=saved.get('refresh_expires_at')
+        self.remote_cert_synced=True
+
+    def _authenticate_session(self):
+        def material(data):
+            self._load_account_cert(dict(data, id=data['accountId']))
+            return Path(self.account_cert_file), Path(self.account_key_file)
+        client=LoginClient(self._transport,
+            application_cert=(Path(self.app_cert_path),Path(self.app_key_path)),
+            account_certificate_provider=material,
+            clock=lambda:datetime.now(timezone.utc),
+            nonce_factory=lambda:str(secrets.randbelow(10**15)),language=self.language)
+        try:
+            session=client.login(self.username,self.password,device_id=self._installation_device_id)
+        except LoginUnavailable as error:
+            self._audit(LOGIN_PATH,'POST',error.http_status or 0,
+                        str(error.api_code) if error.api_code is not None else 'login_'+error.stage)
+            detail='stage='+error.stage
+            if getattr(error,'reason',None):detail+=' ('+error.reason+')'   # why the transport failed (0.1.0a15)
+            if error.http_status is not None:detail+='; HTTP='+str(error.http_status)
+            if error.api_code is not None:detail+='; API='+str(error.api_code)
+            # The number alone says nothing to the poller, which reads a refused password by its
+            # words: 302010108 was asked again every 5 minutes, 257 times in a day (#411). It is
+            # "incorrect account or password" (kerniger/leapmotor-ha#74); in #338 it went the
+            # moment the right password was in.
+            if error.api_code==302010108:detail+=' ('+REFUSED_PASSWORD+')'
+            with connect_db() as db:
+                set_setting(db,'api_v2_login_failure',detail)
+            raise LeapmotorApiError('New API sign-in unavailable; '+detail+'; no automatic retry') from None
+        self._audit(LOGIN_PATH,'POST',200,'0')
+        return session
+
+    def _load_account_cert(self, login_data):
+        from leapmotor_cloud.account_material import AccountMaterialProvider
+        from leapmotor_cloud.account_password import AccountPasswordResolver
+        def candidates(data):
+            explicit=getattr(self,'account_p12_password',None)
+            parameters=Path(DB).parent/'api-v2-private'/'p12-parameters.json'
+            if not parameters.exists():
+                if explicit:return [explicit.encode('utf-8')]
+                raise LeapmotorApiError('Private application password parameters unavailable')
+            validate_private_file(parameters)
+            if parameters.stat().st_size>32768:
+                raise LeapmotorApiError('Private application password parameters unsafe')
+            config=json.loads(parameters.read_text(),object_pairs_hook=_unique_object,parse_constant=_invalid_constant)
+            return AccountPasswordResolver(**config).candidates(data,explicit=explicit)
+        root=Path(DB).parent/'api-v2-account-material'
+        try:
+            cert,key=AccountMaterialProvider(root,candidates)(login_data)
+        except Exception:
+            raise LeapmotorApiError('Account certificate material unavailable') from None
+        self.account_cert_file=str(cert);self.account_key_file=str(key)
+
+    def login(self):
+        """Resume the saved session when it is still good, renew it when it has run out but can
+        be renewed, else authenticate. The one place that decides between the three."""
+        with self._mutex:
+            lock_path = Path(DB).parent/'api-v2-session.lock'
+            with exclusive(lock_path):
+                with connect_db() as db:
+                    raw=setting(db,SESSION_KEY)
+                    try:
+                        saved=json.loads(crypto.decrypt(raw))
+                        usable=(saved['username_hash']==hashlib.sha256(self.username.encode()).hexdigest()
+                                and certificate_usable(saved['cert'],saved['private_key']))
+                        if usable and saved['expires_at']>time.time()+90:
+                            self._apply_session(saved)
+                            return
+                        # Its refresh token outlives it by days, and a renewal spends none of the
+                        # logins the cloud rations. A token that did not renew is offered once:
+                        # while the login below fails too, every read would ask it again.
+                        if usable and saved.get('refresh_token'):
+                            self._apply_session(saved)
+                            if self._renew_session():
+                                return
+                            saved.pop('refresh_token');saved.pop('refresh_expires_at',None)
+                            set_setting(db,SESSION_KEY,crypto.encrypt(json.dumps(saved)))
+                            db.commit()   # before the deferral below can raise and roll it back
+                    except (ValueError,KeyError,TypeError):
+                        pass
+                    try:
+                        last_attempt = float(setting(db, 'api_v2_login_attempt', '0'))
+                    except (TypeError, ValueError):
+                        last_attempt = 0
+                    if (os.environ.get('MATE_LAB_LOGIN_ONCE') != '1'
+                            and 0 <= time.time() - last_attempt < 60):
+                        raise LeapmotorApiError('Login temporarily deferred after a recent attempt')
+                    set_setting(db,'api_v2_login_attempt',str(time.time()))
+                if not self.username or not self.password:
+                    raise LeapmotorApiError('New API account credentials are missing')
+                try:
+                    session=self._authenticate_session()
+                except Exception as exc:
+                    if self.on_login:self.on_login(exc)
+                    raise
+                if self.on_login:self.on_login(None)
+                saved=self._session_row(session)
+                with connect_db() as db:
+                    set_setting(db,SESSION_KEY,crypto.encrypt(json.dumps(saved)))
+                    set_setting(db,'device_id',self._installation_device_id)
+                    set_setting(db,'api_v2_backend','active')
+                    set_setting(db,'api_v2_login_failure','')
+                self._apply_session(saved)
+
+    @property
+    def sign_key(self):
+        self.login()
+        return self._new_key
+
+    def _ensure_token(self):
+        self.login()
+
+    def _renew_session(self):
+        """Ask the cloud for a new access token from the refresh one. True when it worked.
+
+        Measured on 27/09/2026: the refresh endpoint answers a whole new session — access
+        token, refresh token and signing parameters — without a login and without re-issuing
+        the account certificate. A session saved before 0.1.0a11 carries no refresh material,
+        so there is nothing to ask with and the caller reauthenticates as before; so does a
+        refusal, which must never leave this adapter holding a dead session.
+        → tests/test_a_session_is_renewed_not_rebought.py
+        """
+        token=getattr(self,'_refresh_token',None)
+        if not token:
+            return False
+        expires=getattr(self,'_refresh_expires_at',None)
+        if expires is not None and time.time()>=float(expires):
+            return False
+        try:
+            current=CloudSession(self.token,self.user_id,self.device_id,self._new_key,
+                                 (Path(self.account_cert_file),Path(self.account_key_file)),
+                                 datetime.fromtimestamp(float(self._session_expires_at),timezone.utc)
+                                 if getattr(self,'_session_expires_at',None) else None,
+                                 token,
+                                 datetime.fromtimestamp(float(expires),timezone.utc) if expires else None)
+            client=LoginClient(self._transport,
+                application_cert=(Path(self.app_cert_path),Path(self.app_key_path)),
+                account_certificate_provider=lambda data:(Path(self.account_cert_file),
+                                                          Path(self.account_key_file)),
+                clock=lambda:datetime.now(timezone.utc),
+                nonce_factory=lambda:str(secrets.randbelow(10**15)),language=self.language)
+            renewed=client.refresh(current,device_id=self._installation_device_id)
+        except Exception as error:
+            status=getattr(error,'http_status',None) or 0
+            code=getattr(error,'api_code',None)
+            self._audit(REFRESH_PATH,'POST',status,str(code) if code is not None else 'refresh_failed')
+            return False
+        row=self._session_row(renewed)
+        with connect_db() as db:
+            set_setting(db,SESSION_KEY,crypto.encrypt(json.dumps(row)))
+        self._apply_session(row)
+        self._audit(REFRESH_PATH,'POST',200,'0')
+        return True
+
+    def token_refresh(self):
+        # The session this adapter holds stops counting as good, and login() renews it where the
+        # cloud lets us and logs in where it does not. Under the lock, so the expiry never lands on
+        # a session another process has just renewed; one it has, login() simply resumes.
+        lock_path=Path(DB).parent/'api-v2-session.lock'
+        with exclusive(lock_path),connect_db() as db:
+            raw=setting(db,SESSION_KEY)
+            if raw:
+                saved=json.loads(crypto.decrypt(raw))
+                if saved.get('token')==self.token:
+                    saved['expires_at']=0
+                    set_setting(db,SESSION_KEY,crypto.encrypt(json.dumps(saved)))
+        self.login()
+
+    def _invalidate_session(self, rejected_token):
+        lock_path=Path(DB).parent/'api-v2-session.lock'
+        with exclusive(lock_path):
+            with connect_db() as db:
+                try:saved=json.loads(crypto.decrypt(setting(db,SESSION_KEY)))
+                except (ValueError,TypeError):return False
+                if (saved.get('token')!=rejected_token or saved.get('username_hash')!=
+                    hashlib.sha256(self.username.encode()).hexdigest()):return False
+                saved['expires_at']=0
+                set_setting(db,SESSION_KEY,crypto.encrypt(json.dumps(saved)))
+                set_setting(db,'api_v2_login_attempt',str(time.time()))
+            self._routes={}
+            return True
+
+    def _clear_auth(self):
+        self.token=None
+
+    def _clear_account_cert_files(self):
+        # Shared files belong to the session generation, not to one process.
+        pass
+
+    def close(self):
+        pass
+
+    def _retry_on_token_expiry(self, func, *args, **kwargs):
+        return func(*args,**kwargs)
+
+    def read(self,path,body,*,origin=CENTER_ORIGIN,method='POST',form=False,cartype='B10'):
+        if not _read_allowed(path):raise LeapmotorApiError('Read endpoint not migrated')
+        with self._mutex:
+            self.login()
+            return self._wire(origin,path,body,method=method,form=form,cartype=cartype)[0]
+
+    def _get_vehicle_list(self):
+        self._access_refresh_attempt = time.monotonic()
+        envelope=self.read('/app/app-global-service/v1/vehicle/list',{},origin=GLOBAL_ORIGIN,method='GET')
+        data=envelope.get('data') or {}
+        from ui_command_access import snapshot_key, account_hash
+        vehicles=[]
+        with connect_db() as db:
+            for bucket,shared in [('bindcars',False),('sharedcars',True)]:
+                for row in data.get(bucket,[]):
+                    if not row.get('vin'):continue
+                    vehicles.append(Vehicle.from_dict(row,is_shared=shared))
+                    self.__dict__.setdefault('_listed_car_types',{})[row['vin']]=str(row.get('carType') or '').upper()
+                    raw={key:row.get(key) for key in ('vin','carType','rightList','moduleRights','abilities','rudder')}
+                    set_setting(db,snapshot_key(row['vin']),json.dumps(dict(
+                        account=account_hash(self.username),at=time.time(),shared=shared,vehicle=raw)))
+        return vehicles
+
+    def route(self,vin):
+        cached=self._routes.get(vin)
+        if cached and time.time()-cached[0]<300:return cached[1]
+        data=self.read('/app/app-global-service/v1/vehicle/getCarRoute',{'vin':vin},origin=GLOBAL_ORIGIN,method='GET')['data']
+        if data.get('vin')!=vin:raise LeapmotorApiError('Vehicle route mismatch')
+        for name in ('appCenter','appRegion'):
+            validate_url(data.get(name),ALLOWED_HOSTS,origin=True)
+        self._routes[vin]=(time.time(),data)
+        return data
+
+    def _refresh_command_access(self):
+        # Healthy polling must renew UI permissions before their 300-second TTL.
+        # Throttle failed attempts too; a permissions outage must not stop telemetry.
+        with self._mutex:
+            last = getattr(self, '_access_refresh_attempt', None)
+            if last is not None and 0 <= time.monotonic() - last < 240:
+                return
+            self._access_refresh_attempt = time.monotonic()
+            try:
+                self.get_vehicle_list()
+            except Exception:
+                pass  # Existing snapshots expire normally; never extend stale permissions.
+
+    def _get_vehicle_raw_status(self,vehicle):
+        self._refresh_command_access()
+        route=self.route(vehicle.vin)
+        data,cartype=self._live_readings(vehicle,route)
+        config=self.read('/carownerservice/v3/api/vehicleinfo/commonConfig',
+            dict(vin=vehicle.vin,osType='Android',appVersion='V1.16.4-1'),origin=route['appCenter'],method='GET',
+            cartype=cartype)
+        config_data=config.get('data') or {}
+        if config_data.get('vin')!=vehicle.vin:raise LeapmotorApiError('New API configuration mismatch')
+        data['config']=config_data.get('config',{})
+        return dict(code=0,result=0,data=data)
+
+    def _live_readings(self,vehicle,route):
+        """The car's live readings, and the `cartype` they were asked with.
+
+        Every request says `cartype: B10`, and the signal service routes on it: asked as a T03, it
+        answers a B10 with 100 "No data found" (measured 01/10/2026, read only). B10, C10 and the B03X
+        (`A10`) read as a B10; three T03s got that 100 at every poll from 4.7.7 on, while the old
+        library had read them at OLD_STATUS_PATH (#368, #338 — on one account a B03X read and a T03 did
+        not, same session, same minute). So a car the B10 header has never read is asked as what the
+        cloud lists it as, then at the old address, and the way that answers is kept for it. A car that
+        has read once keeps its way; a refusal other than "No data found" is raised as it is.
+        → tests/test_a_t03_is_read_as_a_t03.py
+        """
+        vin=vehicle.vin
+        ways=self.__dict__.setdefault('_status_ways',{})
+        if vin in ways:
+            return self._readings_by(ways[vin],vin,route),ways[vin][1]
+        listed=(self.__dict__.get('_listed_car_types',{}).get(vin) or str(getattr(vehicle,'car_type','') or '')).upper()
+        candidates=[('signal','B10')]
+        if listed and listed!='B10':
+            candidates+=[('signal',listed),('old',listed)]
+        first=None
+        for way in candidates:
+            try:
+                data=self._readings_by(way,vin,route)
+            except LeapmotorApiError as error:
+                if 100 not in getattr(error,'api_codes',()):raise
+                first=first or error
+                continue
+            ways[vin]=way
+            if way!=candidates[0]:
+                log.warning('Status of the %s read %s — kept for this car', listed,
+                            'with cartype %s' % way[1] if way[0]=='signal' else 'at the old status address')
+            return data,way[1]
+        raise first
+
+    def _readings_by(self,way,vin,route):
+        kind,cartype=way
+        if kind=='signal':
+            telemetry=self.read('/app/app-signal-service/signal/info/query',{'vin':vin},origin=route['appRegion'],
+                                cartype=cartype)
+            data=dict(telemetry.get('data') or {})
+            if data.get('vin')!=vin or not isinstance(data.get('signalMap'),dict):
+                raise LeapmotorApiError('New API telemetry mismatch')
+            signals=data.pop('signalMap')
+            if sum(not str(key).isdigit() for key in signals)*2>len(signals):
+                # A T03 answers in names — soc, totalMileage, expectedMileage… with eight numbered keys
+                # among 71 — the shape the old address answers in, which the poller and the web map by
+                # name. A B10's map is numbered: 98 keys, 3 of them named (privacyData, privacyGPS,
+                # sts; measured 01/10/2026). Handed on as numbers, 4.7.11 read a T03 as 0 % (#368).
+                data.update(signals)
+            else:
+                data['signal']=signals
+            return data
+        model=cartype.lower()
+        model={'b10':'c10','b11':'c10'}.get(model,model)
+        envelope=self.read(OLD_STATUS_PATH+model,{'vin':vin},form=True,cartype=cartype)
+        data=dict(envelope.get('data') or {})
+        if data.get('vin',vin)!=vin:raise LeapmotorApiError('Old status address mismatch')
+        data['vin']=vin   # a T03 answers in named fields; the poller maps them (client._named_fields_to_signal)
+        return data
+
+    def _get_charge_appointment(self,vin):
+        route=self.route(vin)
+        d=self.read('/carownerservice/v3/api/vehicleinfo/commonConfig',dict(vin=vin,osType='Android',appVersion='V1.16.4-1'),origin=route['appCenter'],method='GET')['data']
+        if not isinstance(d, dict) or d.get('vin') != vin:
+            raise LeapmotorApiError('New API configuration mismatch')
+        c=d.get('config',{}).get('3',{})
+        plan=dict(chargeEnable=_integer(c.get('isEnable')),chargesoc=_integer(c.get('percent')),starttime=c.get('beginTime'),
+                  endtime=c.get('endTime'),cycles=c.get('cycles'),circulation=_integer(c.get('circulation')),
+                  recharge=_integer(c.get('recharge')))
+        if plan['chargeEnable'] is not None and plan['starttime']:
+            return plan
+        return self._charge_plan_from_appointment(vin, c, plan)
+
+    def _charge_plan_from_appointment(self, vin, config, configured):
+        """The charge plan from getAppointment 190, where the earlier library read it, for a car whose
+        configuration does not say whether its schedule is on or when it starts; else `configured`.
+
+        A T03's configuration carries no plan: its Charges page read "No schedule" right after a save
+        the car took (#380). Asked only then — on our B10 the two disagree on whether the schedule is on
+        (02/10/2026), and a car whose configuration carries its plan keeps reading it there. What each
+        answered is logged once per car, for the bundle.
+        → tests/test_a_t03_reads_its_charge_plan_back.py"""
+        try:
+            data=self.read(GET_APPOINTMENT_PATH,{'vin':vin,'cmdId':'190'},form=True)['data']
+            if isinstance(data,str) and data:
+                data=json.loads(data,object_pairs_hook=_unique_object,parse_constant=_invalid_constant)
+            answer=data if isinstance(data,dict) else {}
+            said=', '.join(f'{k}={answer[k]}' for k in _PLAN_KEYS if k in answer) or 'nothing'
+        except Exception as error:  # noqa: BLE001 — the configuration's answer stands, as before
+            answer,said={},f'a refusal ({type(error).__name__}: {error})'
+        plan={k:(_integer(answer.get(k)) if k in ('chargeEnable','chargesoc','circulation','recharge')
+                 else answer.get(k)) for k in _PLAN_KEYS}
+        found=plan['chargeEnable'] is not None and bool(plan['starttime'])
+        noted=self.__dict__.setdefault('_charge_plan_noted',set())
+        if vin not in noted:
+            noted.add(vin)
+            log.warning("Charge plan: the car's configuration carries %s; getAppointment 190 answered %s — %s",
+                        ', '.join(sorted(config)) or 'none of it', said,
+                        'read from there' if found else 'no plan to show')
+        return plan if found else configured
+
+    def _post(self,*,path,headers,data,cert):
+        envelope=self.read(path,dict(parse_qsl(data,keep_blank_values=True)),form=True)
+        return dict(status_code=200,body=json.dumps(envelope))
+
+    def _post_json(self,*,path,headers,json_body,cert):
+        envelope=self.read(path,json_body)
+        return dict(status_code=200,body=json.dumps(envelope))
+
+    def _get(self,*,path,headers,params,cert):
+        envelope=self.read(path,params,method='GET')
+        return dict(status_code=200,body=json.dumps(envelope))
+
+    def _post_binary(self,**kwargs):
+        raise LeapmotorApiError('Binary endpoint not migrated; no legacy fallback')
+
+    def get_car_picture(self, vehicle):
+        route = self.route(vehicle.vin)
+        self._picture_origin = route['appCenter']
+        return self.read('/carownerservice/oversea/vehicle/v1/carpicture/key',
+                         {'deviceID': self.device_id, 'vin': vehicle.vin},
+                         origin=self._picture_origin, form=True)
+
+    def download_car_picture_package(self, *, picture_key):
+        if not isinstance(picture_key, str) or not picture_key or len(picture_key) > 4096:
+            raise LeapmotorApiError('Invalid picture key')
+        with self._mutex:
+            self.login()
+            _, response = self._wire(getattr(self, '_picture_origin', CENTER_ORIGIN),
+                '/carownerservice/oversea/vehicle/v1/carpicture/package',
+                {'key': picture_key}, form=True, binary=True)
+            return response.body
+
+    def _remote_control_without_pin_raw(self,**kwargs):
+        # Navigation now uses the reconstructed sender. This lab conservatively
+        # requires the configured PIN, rather than falling back to legacy HTTP.
+        if str(kwargs.get('cmd_id'))!='180':
+            raise LeapmotorApiError('Command without vehicle PIN not enabled in independent API runtime')
+        return self._remote_control_raw(**kwargs)
+
+    def _remote_control(self,*,vin,action,cmd_content=None):
+        return super()._remote_control(vin=vin,action=action,cmd_content=cmd_content)
+
+    def set_charge_limit(self,vin,charge_limit_percent):
+        current=self._get_charge_appointment(vin)
+        charge(current)  # Never replace an unreadable schedule with defaults.
+        current['chargesoc']=charge_limit_percent
+        return self._remote_control_raw(vin=vin,cmd_id='190',cmd_content=json.dumps(current),action_label='set_charge_limit')
+
+    def _remote_control_raw(self,*,vin,cmd_id,cmd_content,action_label,vehicle=None):
+        with self._mutex:
+            self.last_new_command_receipt=None
+            cmd_id=str(cmd_id)
+            vehicle=next((v for v in self.get_vehicle_list() if v.vin==vin),None)
+            if vehicle is None:
+                raise LeapmotorApiError('Command vehicle is not in the authenticated binding')
+            # No model check: appremotectl v3 is one path for the whole range. What the car may
+            # do is the data its own cloud entry publishes, checked by prepare() below, and the
+            # cloud refuses what the car has not got (result 40) without it moving.
+            if not isinstance(cmd_content,str) or len(cmd_content)>32768:
+                raise LeapmotorApiError('Invalid command payload size')
+            state=prepare(cmd_id,json.loads(cmd_content,object_pairs_hook=_unique_object,
+                                           parse_constant=_invalid_constant),vehicle,
+                          timezone_name=os.environ.get('TZ'))
+            data=self._get_vehicle_raw_status(vehicle)['data']
+            signals=data.get('signal')
+            if signals is None:
+                # A T03 answers in names (#368): the frame's time, its speed and ON3 are read by name,
+                # as the poller and the web read the rest of that map. A frame without its time is
+                # still refused below (#378).
+                on3=data.get('bcmKeyPositionOn3')
+                signals={'1':data.get('collectTimeMs'),'1319':data.get('speed'),
+                         '1258':int(on3) if type(on3) is bool else on3}
+            def num(key):
+                try:
+                    value=float(signals[key])
+                    return value if math.isfinite(value) and type(signals[key]) is not bool else None
+                except (KeyError,ValueError,TypeError):return None
+            timestamp=num('1')
+            try:observed=datetime.fromtimestamp(timestamp/1000,timezone.utc) if timestamp is not None else None
+            except (ValueError,OverflowError,OSError):observed=None
+            # Remote commands must remain available while the vehicle sleeps.
+            # Age alone cannot distinguish sleep from an unavailable live reading.
+            # Retain timestamp validity and last-known stationary/ON3 checks;
+            # an old parked reading does NOT establish the current vehicle state.
+            # Permission/PIN checks and a single cloud submission still apply.
+            # Acceptance does not confirm wake-up or physical execution.
+            configuration_only=cmd_id in ('171','180','190','361')
+            speed,on3=num('1319'),num('1258')
+            operating=OperatingState(vin,observed,None if speed is None or speed<0 else speed!=0,
+                                     None if on3 is None or on3<0 else on3!=0)
+            decision=operating_decision(operating,now=datetime.now(timezone.utc),
+                state_max_age=timedelta(seconds=60),allow_stale_parked=True)
+            if not configuration_only and decision.state is not Availability.AVAILABLE:
+                raise LeapmotorApiError('Command not sent: '+decision.reason)
+            if not self.operation_password:raise LeapmotorApiError('Vehicle PIN is missing')
+            self.login()
+            encrypted=encrypt_operate_password(self.operation_password,self.token)
+            route=self.route(vin)
+            self._wire(route['appCenter'],VERIFY_PATH,dict(vin=vin,operatePassword=encrypted),form=True)
+            appointment=cmd_id in ('171','361')
+            # What was sent and what the cloud said, one line per command: until 4.9.2 neither was
+            # logged, and a bundle could not show what a schedule save had sent (#395).
+            sent=json.dumps(_loggable(state),separators=(',',':'),ensure_ascii=False)
+            try:
+                envelope,response=self._wire(route['appCenter'] if appointment else route['appRegion'],
+                    APPOINTMENT_PATH if appointment else CONTROL_PATH,
+                    dict(carvin=vin,cmdid=cmd_id,state=json.dumps(state,separators=(',',':')),oppwd=encrypted),form=True)
+            except Exception as error:
+                codes=getattr(error,'api_codes',None)
+                log.warning('Command %s (%s) sent: %s → %s; not retried',action_label,cmd_id,sent,
+                            f'refused by the cloud (code {codes[0]})' if codes else
+                            f'no readable answer ({type(error).__name__})')
+                raise LeapmotorApiError('Remote control result unknown; command was not retried') from None
+            receipt=interpret(response)
+            log.info('Command %s (%s) sent: %s → %s',action_label,cmd_id,sent,_answer(receipt))
+            self.last_new_command_receipt=receipt
+        if receipt.outcome=='accepted' and cmd_id in CONFIRMED_BY_THE_CAR:   # 'accepted' carries an eventId
+            receipt=self._the_cars_word(route,receipt,action_label)
+            self.last_new_command_receipt=receipt
+        return dict(envelope,_new_api_outcome=receipt.outcome)
+
+    def _the_cars_word(self,route,receipt,label):
+        """Ask the cloud whether the car carried the command out, as the earlier library did for
+        every command: `data` 1 is the car's yes, 0 no word yet. Asked every second
+        until the time the cloud gave the car — 5 s for one awake, 30 for one asleep. On a B10
+        (04/10/2026) the yes came the second the car's own configuration changed: in 1.3 s awake,
+        in 15 s from 14 minutes asleep. An acceptance alone says nothing of the car, and a T03's plan
+        read «on» in Mate while the car charged at the plug (#395).
+        → tests/test_a_setting_waits_for_the_cars_word.py"""
+        began=time.monotonic()
+        wait=receipt.timeout_seconds or 30
+        said='nothing'
+        while True:
+            try:
+                with self._mutex:
+                    self.login()
+                    envelope,_=self._wire(route['appRegion'],RESULT_PATH,{'msgID':receipt.event_id},method='GET')
+                said=envelope.get('data')
+                if type(said) is not bool and str(said)=='1':
+                    log.info('Command %s: the car carried it out (%.1f s)',label,time.monotonic()-began)
+                    return dataclasses.replace(receipt,outcome='confirmed')
+            except Exception as error:  # noqa: BLE001 — a question that fails leaves the answer open
+                said=type(error).__name__
+            if time.monotonic()-began+1>=wait:
+                break
+            time.sleep(1)
+        log.warning('Command %s: the car did not say it carried it out within %d s (last answer: %s)',
+                    label,wait,said)
+        return dataclasses.replace(receipt,outcome='unconfirmed')
+
+    def seat_heat(self,vin,*,position,level):
+        return self._seat(vin,'301',position,level)
+
+    def seat_ventilation(self,vin,*,position,level):
+        return self._seat(vin,'370',position,level)
+
+    def _seat(self,vin,cmd_id,position,level):
+        if type(position)is not int or position not in (1,2) or type(level)is not int or level not in (0,1,2,3):
+            raise LeapmotorApiError('Only front seats and levels 0..3 are enabled')
+        return self._remote_control_raw(vin=vin,cmd_id=cmd_id,
+            cmd_content=json.dumps(dict(position='left_front' if position==1 else 'right_front',level=str(level))),action_label='seat')
+
+
+def install():
+    import session_share
+    session_share.install=lambda api:api
+    session_share.ensure_account_cert=lambda api: bool(api.account_cert_file and Path(api.account_cert_file).is_file())

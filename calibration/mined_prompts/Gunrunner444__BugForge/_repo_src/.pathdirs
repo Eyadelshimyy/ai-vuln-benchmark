@@ -1,0 +1,16 @@
+.
+backend
+backend/alembic/versions
+backend/app/adapters/discovery
+backend/app/adapters/hackerone
+backend/app/adapters/proxies
+backend/app/adapters/security_tools
+backend/app/discovery/bounty
+backend/app/execution
+backend/app/parsing
+backend/app/repositories
+backend/app/security_agent
+backend/app/security_testing
+backend/tests/fixtures/phase12_repo
+backend/tests/fixtures/phase13_repo/pkg_flow
+examples/sample_python_project

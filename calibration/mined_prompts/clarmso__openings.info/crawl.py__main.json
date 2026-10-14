@@ -1,0 +1,28 @@
+{
+  "repo": "clarmso__openings.info",
+  "file": "crawl.py",
+  "function": "main",
+  "line": 16,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main():\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main():\n    config_path = sys.argv[1] if len(sys.argv) > 1 else \"companies.csv\"\n\n    with open(config_path, newline=\"\") as f:\n        reader = csv.DictReader(f)\n        companies = [(row[\"slug\"], row[\"ats\"]) for row in reader if row[\"slug\"] and row[\"ats\"]]\n\n    total = 0\n    failures = []\n    for name, platform in companies:\n        if platform not in PLATFORMS:\n            print(f\"Skipping unsupported platform: {platform}\")\n            continue\n\n        print(f\"Crawling {name} ({platform})\")\n        output_dir = os.path.join(\"data\", name)\n        try:\n            total += crawl(platform, name, output_dir)\n        except Exception as e:\n            print(f\"  ERROR: {e}\")\n            failures.append((name, platform, e))\n\n    print(f\"\\nDone. Total jobs processed: {total}\")\n\n    if failures:\n        print(f\"\\nFailed ({len(failures)}):\")\n        for name, platform, e in failures:\n            print(f\"  {name} ({platform}): {e}\")\n        sys.exit(1)",
+  "module_source": "#!/usr/bin/env python3\n\"\"\"\nJob board crawler. Fetches all job postings from configured career pages\nand saves each as a JSON file. Git history tracks when jobs were active.\n\nSupported platforms: greenhouse, lever, ashby, workable, recruitee, smartrecruiters, rippling, gem\n\"\"\"\n\nimport csv\nimport os\nimport sys\n\nfrom src.crawl import PLATFORMS, crawl\n\n\ndef main():\n    config_path = sys.argv[1] if len(sys.argv) > 1 else \"companies.csv\"\n\n    with open(config_path, newline=\"\") as f:\n        reader = csv.DictReader(f)\n        companies = [(row[\"slug\"], row[\"ats\"]) for row in reader if row[\"slug\"] and row[\"ats\"]]\n\n    total = 0\n    failures = []\n    for name, platform in companies:\n        if platform not in PLATFORMS:\n            print(f\"Skipping unsupported platform: {platform}\")\n            continue\n\n        print(f\"Crawling {name} ({platform})\")\n        output_dir = os.path.join(\"data\", name)\n        try:\n            total += crawl(platform, name, output_dir)\n        except Exception as e:\n            print(f\"  ERROR: {e}\")\n            failures.append((name, platform, e))\n\n    print(f\"\\nDone. Total jobs processed: {total}\")\n\n    if failures:\n        print(f\"\\nFailed ({len(failures)}):\")\n        for name, platform, e in failures:\n            print(f\"  {name} ({platform}): {e}\")\n        sys.exit(1)\n\n\nif __name__ == \"__main__\":\n    main()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "github-copilot": 29
+    },
+    "ai_commit": "7f73a88ba33f",
+    "evidence": "Co-authored-by: Copilot <",
+    "ai_line_fraction": 1.0,
+    "span": [
+      16,
+      44
+    ]
+  }
+}

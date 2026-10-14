@@ -1,0 +1,28 @@
+{
+  "repo": "danielreuter__research-notes",
+  "file": "campaigns/pouw/red-team/divsqrt_ftz_check.py",
+  "function": "main",
+  "line": 23,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main():\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main():\n    if sys.argv[1] == \"mk\":\n        rng = random.Random(\"divsqrt-ftz-sm120\")\n        w = []\n        for _ in range(1_000_000):\n            a, b = pick(rng), pick(rng)\n            if b & 0x7FFFFFFF == 0:\n                b = 0x3F800000\n            w += [a, b]\n        open(sys.argv[2], \"wb\").write(struct.pack(f\"<{len(w)}I\", *w))\n        return\n    raw = open(sys.argv[2], \"rb\").read()\n    w = struct.unpack(f\"<{len(raw) // 4}I\", raw)\n    d = struct.unpack(f\"<{len(raw) // 4}I\", open(sys.argv[3], \"rb\").read())\n    bad_div = bad_sqrt = sub = n_sqrt = 0\n    first = []\n    for i in range(len(w) // 2):\n        a, b = w[2 * i], w[2 * i + 1]\n        q = fp32.div(a, b)\n        sub += any((x >> 23) & 0xFF == 0 and x & 0x7FFFFF for x in (a, b, q))\n        if d[2 * i] != q:\n            bad_div += 1\n            if len(first) < 5:\n                first.append([\"div\", a, b, d[2 * i], q])\n        if not a >> 31:                                  # sqrt of non-negative inputs (negative gives NaN either way)\n            n_sqrt += 1\n            s = fp32.sqrt(a)\n            if d[2 * i + 1] != s:\n                bad_sqrt += 1\n                if len(first) < 5:\n                    first.append([\"sqrt\", a, d[2 * i + 1], s])\n    print(json.dumps(dict(check=\"vs-verity.ml.tc.fp32\", pairs=len(w) // 2, subnormal_cases=sub, div_bad=bad_div,\n                          sqrt_inputs=n_sqrt, sqrt_bad=bad_sqrt, first=first)))",
+  "module_source": "\"\"\"Host half of `divsqrt_ftz_sm120.cu`: a sample of (a, b) pairs, and the device's div and sqrt against the pinned models.\n  mk OUT        write 1,000,000 pairs (u32 LE), weighted to subnormals, ties and the overflow edge; no NaN or Inf inputs\n  cmp IN DEV    compare the device's (a / b, sqrt(a)) with `verity.ml.tc.fp32.div` and `fp32.sqrt` bit for bit\n\"\"\"\nimport json\nimport random\nimport struct\nimport sys\n\nfrom verity.ml.tc import fp32\n\n\ndef pick(rng):\n    cls = rng.randrange(5)\n    e = (0 if cls == 0 else rng.randrange(1, 9) if cls == 1 else rng.randrange(247, 255) if cls == 2\n         else rng.randrange(120, 136) if cls == 3 else rng.randrange(1, 255))\n    m = rng.getrandbits(23)\n    if rng.randrange(8) == 0:\n        m &= 0x7F0000\n    return (rng.getrandbits(1) << 31) | (e << 23) | m\n\n\ndef main():\n    if sys.argv[1] == \"mk\":\n        rng = random.Random(\"divsqrt-ftz-sm120\")\n        w = []\n        for _ in range(1_000_000):\n            a, b = pick(rng), pick(rng)\n            if b & 0x7FFFFFFF == 0:\n                b = 0x3F800000\n            w += [a, b]\n        open(sys.argv[2], \"wb\").write(struct.pack(f\"<{len(w)}I\", *w))\n        return\n    raw = open(sys.argv[2], \"rb\").read()\n    w = struct.unpack(f\"<{len(raw) // 4}I\", raw)\n    d = struct.unpack(f\"<{len(raw) // 4}I\", open(sys.argv[3], \"rb\").read())\n    bad_div = bad_sqrt = sub = n_sqrt = 0\n    first = []\n    for i in range(len(w) // 2):\n        a, b = w[2 * i], w[2 * i + 1]\n        q = fp32.div(a, b)\n        sub += any((x >> 23) & 0xFF == 0 and x & 0x7FFFFF for x in (a, b, q))\n        if d[2 * i] != q:\n            bad_div += 1\n            if len(first) < 5:\n                first.append([\"div\", a, b, d[2 * i], q])\n        if not a >> 31:                                  # sqrt of non-negative inputs (negative gives NaN either way)\n            n_sqrt += 1\n            s = fp32.sqrt(a)\n            if d[2 * i + 1] != s:\n                bad_sqrt += 1\n                if len(first) < 5:\n                    first.append([\"sqrt\", a, d[2 * i + 1], s])\n    print(json.dumps(dict(check=\"vs-verity.ml.tc.fp32\", pairs=len(w) // 2, subnormal_cases=sub, div_bad=bad_div,\n                          sqrt_inputs=n_sqrt, sqrt_bad=bad_sqrt, first=first)))\n\n\nif __name__ == \"__main__\":\n    main()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 33
+    },
+    "ai_commit": "ebba7c7ae1a7",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      23,
+      55
+    ]
+  }
+}

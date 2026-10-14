@@ -1,0 +1,1711 @@
+"""
+
+Endpoints PÚBLICOS para consulta de estado de cuenta por cédula.
+
+SEGURIDAD: Sin autenticación (router sin get_current_user). Solo datos del cliente
+
+identificado por la cédula consultada. Rate limiting por IP. No expone otros servicios
+
+ni datos de otros clientes. Solo expone: validar-cedula (nombre/email) y solicitar-estado-cuenta
+
+(PDF estado de cuenta de esa cédula + envío al email registrado).
+
+"""
+
+import base64
+
+import io
+
+import json
+
+import logging
+
+import random
+
+import string
+
+from datetime import date, datetime, timedelta, timezone
+
+from typing import List, Optional, Tuple
+
+
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+
+from fastapi.responses import HTMLResponse, Response
+
+from pydantic import BaseModel
+
+from sqlalchemy import select
+
+from sqlalchemy.orm import Session
+
+from sqlalchemy import func
+
+
+
+from app.core.database import get_db
+
+from app.core.cobros_public_rate_limit import (
+
+    get_client_ip,
+
+    check_rate_limit_estado_cuenta_validar,
+
+    check_rate_limit_estado_cuenta_solicitar,
+
+    check_rate_limit_estado_cuenta_verificar,
+
+)
+
+from app.models.cliente import Cliente
+
+from app.models.prestamo import Prestamo
+
+from app.models.cuota import Cuota
+
+from app.models.configuracion import Configuracion
+
+from app.models.estado_cuenta_codigo import EstadoCuentaCodigo
+
+
+from app.models.pago import Pago
+
+from app.models.pago_comprobante_imagen import PagoComprobanteImagen
+
+from app.api.v1.endpoints.validadores import validate_cedula
+
+from app.api.v1.endpoints.pagos.comprobante_imagen_helpers import (
+    _normalizar_id_comprobante_imagen,
+)
+
+from app.core.security import decode_token
+
+from app.core.email import send_email
+
+from app.core.email_config_holder import get_email_activo_servicio
+from app.utils.cliente_emails import emails_destino_desde_objeto, unir_destinatarios_log
+from app.utils.cedula_almacenamiento import expr_cedula_normalizada_para_comparar
+
+
+
+from app.services.estado_cuenta_datos import (
+    MSG_PORTAL_ESTADO_CUENTA_DESISTIMIENTO,
+    MSG_PORTAL_ESTADO_CUENTA_NO_ELEGIBLE,
+    cedula_tiene_prestamo_elegible_estado_cuenta,
+    mensaje_no_elegible_estado_cuenta_portal,
+    obtener_pago_para_recibo_cuota,
+    texto_institucion_recibo_cuota,
+)
+from app.services.cobros.recibo_pdf import _formato_decimal_ve, _formato_monto_venezolano
+from app.services.cobros.pago_reportado_documento import texto_numero_documento_recibo_desde_pago_cartera
+from app.services.cobros.recibo_pago_cartera_pdf import generar_recibo_pago_cartera_pdf
+from app.services.documentos_cliente_centro import (
+    base_url_y_token_recibo_para_pdf_estado_cuenta,
+    generar_pdf_estado_cuenta,
+    obtener_datos_estado_cuenta_cliente,
+)
+
+MSG_ESTADO_CUENTA_NO_ELEGIBLE = MSG_PORTAL_ESTADO_CUENTA_NO_ELEGIBLE
+MSG_ESTADO_CUENTA_DESISTIMIENTO = MSG_PORTAL_ESTADO_CUENTA_DESISTIMIENTO
+
+MSG_ESTADO_CUENTA_SIN_EMAIL_VALIDO = (
+    "No hay un correo electrónico válido registrado. "
+    "Comuníquese con un asesor para actualizar sus datos."
+)
+
+MSG_ESTADO_CUENTA_CODIGO_NO_ENVIADO = (
+    "No pudimos enviar el código a su correo en este momento. "
+    "Intente de nuevo en unos minutos o contacte atención al cliente."
+)
+
+from app.services.pagos.comprobante_adjunto_pago import (
+    comprobante_blob_para_pdf_desde_pago,
+    ids_comprobante_imagen_desde_texto,
+    ids_comprobante_imagen_vinculados_a_pago,
+)
+from app.services.pagos.comprobante_link_desde_gmail import (
+    comprobante_url_para_enlace_publico,
+)
+
+
+from app.services.cobros.recibo_cuota_amortizacion import generar_recibo_cuota_amortizacion
+from app.services.cobros.recibo_cuota_moneda import contexto_moneda_montos_recibo_cuota
+
+
+
+logger = logging.getLogger(__name__)
+
+
+
+CLAVE_ESTADO_CUENTA_EMAIL = "estado_cuenta_codigo_email"
+
+DEFAULT_ASUNTO = "Codigo para estado de cuenta - RapiCredit"
+
+DEFAULT_CUERPO = (
+
+    "Estimado(a) {{nombre}},\n\n"
+
+    "Tu codigo de verificacion es: {{codigo}}\n\n"
+
+    "Valido por {{minutos_valido}} horas. No lo compartas.\n\n"
+
+    "Saludos,\nRapiCredit"
+
+)
+
+
+
+router = APIRouter(dependencies=[])
+
+
+
+MAX_CEDULA_LENGTH = 20
+
+
+
+
+
+class ValidarCedulaEstadoCuentaResponse(BaseModel):
+
+    ok: bool
+
+    nombre: Optional[str] = None
+
+    email: Optional[str] = None
+
+    error: Optional[str] = None
+
+
+
+
+
+class SolicitarEstadoCuentaRequest(BaseModel):
+
+    cedula: str
+
+    origen: Optional[str] = None  # "informes" solo aplica para staff autenticado
+
+
+
+
+
+class SolicitarEstadoCuentaResponse(BaseModel):
+
+    ok: bool
+
+    pdf_base64: Optional[str] = None
+
+    mensaje: Optional[str] = None
+
+    error: Optional[str] = None
+
+
+
+
+
+class SolicitarCodigoRequest(BaseModel):
+
+    cedula: str
+
+
+
+
+
+class SolicitarCodigoResponse(BaseModel):
+
+    ok: bool
+
+    mensaje: Optional[str] = None
+
+    error: Optional[str] = None
+
+    expira_en: Optional[str] = None  # ISO 8601 (ej. "2025-03-11T16:30:00Z") para mostrar "Código válido hasta las HH:MM"
+
+
+
+
+
+class VerificarCodigoRequest(BaseModel):
+
+    cedula: str
+
+    codigo: str
+
+
+
+
+
+class VerificarCodigoResponse(BaseModel):
+
+    ok: bool
+
+    pdf_base64: Optional[str] = None
+
+    error: Optional[str] = None
+
+    expira_en: Optional[str] = None
+
+    recibo_token: Optional[str] = None  # token para links de recibo en PDF
+
+    recibos_cuotas: Optional[List[dict]] = None  # lista { prestamo_id, producto, cuota_id, numero_cuota, url } para interfaz
+
+    comprobantes_pagos: Optional[List[dict]] = None  # pago_id, url, fecha/monto/referencia
+
+
+
+
+
+CODIGO_EXPIRA_MINUTES = 120  # 2 horas
+
+MAX_CODIGOS_ACTIVOS_POR_CEDULA = 3  # Máximo de códigos no usados y no expirados por cédula; los más viejos se eliminan
+
+
+
+
+
+def _is_internal_staff_request(request: Request) -> bool:
+
+    """
+
+    Solo considera "interno" a quien trae Bearer token de personal válido.
+
+    Evita que terceros públicos salten controles forzando `origen=informes`.
+
+    """
+
+    auth = (request.headers.get("Authorization") or "").strip()
+
+    if not auth.lower().startswith("bearer "):
+
+        return False
+
+    token = auth[7:].strip()
+
+    if not token:
+
+        return False
+
+    payload = decode_token(token)
+
+    if not payload:
+
+        return False
+
+    if payload.get("type") != "access":
+
+        return False
+
+    if payload.get("scope") == "finiquito":
+
+        return False
+
+    return True
+
+
+def _cedula_lookup(cedula_input: str) -> str:
+
+    """Normaliza cédula para búsqueda en BD (sin guión)."""
+
+    result = validate_cedula(cedula_input.strip())
+
+    if not result.get("valido"):
+
+        return ""
+
+    valor = result.get("valor_formateado", "")
+
+    return valor.replace("-", "") if valor else ""
+
+
+
+
+
+def _cliente_nombre_email_por_cedula_lookup(
+
+    db: Session,
+
+    cedula_lookup: str,
+
+) -> Optional[Tuple[str, List[str]]]:
+
+    """
+
+    Solo lectura en clientes; no sincroniza pagos ni reaplica cascada.
+
+    Devuelve (nombre, lista de correos validos del cliente, hasta 2).
+
+    Usar en solicitar-codigo; el armado completo del estado (sync/cascada) queda en verificar/PDF.
+
+    """
+
+    lu = (cedula_lookup or "").strip()
+
+    if not lu:
+
+        return None
+
+    cliente_row = db.execute(
+
+        select(Cliente).where(expr_cedula_normalizada_para_comparar(Cliente.cedula) == lu)
+
+    ).scalars().first()
+
+    if not cliente_row:
+
+        return None
+
+    cliente = cliente_row[0] if hasattr(cliente_row, "__getitem__") else cliente_row
+
+    if not getattr(cliente, "id", None):
+
+        return None
+
+    nombre = (getattr(cliente, "nombres", None) or "").strip()
+
+    return (nombre, emails_destino_desde_objeto(cliente))
+
+
+
+
+
+
+
+
+
+
+def _generar_codigo_6() -> str:
+
+    return "".join(random.choices(string.digits, k=6))
+
+
+
+
+
+def _get_plantilla_email_codigo(
+
+    db: Session,
+
+    nombre: str = "Cliente",
+
+    codigo: str = "",
+
+) -> tuple:
+
+    """
+
+    Obtiene asunto y cuerpo del email del código desde configuracion (clave estado_cuenta_codigo_email).
+
+    JSON: {"asunto": "...", "cuerpo": "..."}. Variables: {{nombre}}, {{codigo}}, {{minutos_valido}}.
+
+    Si no hay config, devuelve valores por defecto.
+
+    """
+
+    try:
+
+        row = db.get(Configuracion, CLAVE_ESTADO_CUENTA_EMAIL)
+
+        if row and getattr(row, "valor", None):
+
+            data = json.loads(row.valor) if isinstance(row.valor, str) else row.valor
+
+            asunto = (data.get("asunto") or "").strip() or DEFAULT_ASUNTO
+
+            cuerpo = (data.get("cuerpo") or "").strip() or DEFAULT_CUERPO
+
+        else:
+
+            asunto = DEFAULT_ASUNTO
+
+            cuerpo = DEFAULT_CUERPO
+
+    except Exception as e:
+
+        logger.warning("No se pudo cargar plantilla estado_cuenta_codigo_email: %s", e)
+
+        asunto = DEFAULT_ASUNTO
+
+        cuerpo = DEFAULT_CUERPO
+
+    minutos = CODIGO_EXPIRA_MINUTES // 60
+
+    cuerpo = (
+
+        cuerpo.replace("{{nombre}}", nombre)
+
+        .replace("{{codigo}}", codigo)
+
+        .replace("{{minutos_valido}}", str(minutos))
+
+    )
+
+    return asunto, cuerpo
+
+
+
+
+
+def _obtener_datos_pdf(
+    db: Session, cedula_lookup: str, *, solo_aprobados_o_liquidados: bool = True
+):
+    """Delega en obtener_datos_estado_cuenta_cliente (misma logica que PDF por prestamo).
+
+    Portal público: solo APROBADO / LIQUIDADO (nunca DESISTIMIENTO). Informes/staff
+    puede pedir el resto de estados no desistidos.
+    """
+    return obtener_datos_estado_cuenta_cliente(
+        db, cedula_lookup, solo_aprobados_o_liquidados=solo_aprobados_o_liquidados
+    )
+
+
+# Abre el PDF sin poner el JWT en query string (no viaja al servidor → no queda en access logs).
+# El token va en el fragmento #t=...; este script hace GET a /recibo-cuota con Authorization.
+_RECIBO_CUOTA_ABRIR_JS = (
+    "(function(){"
+    'var msg=document.getElementById("recibo-cuota-msg");'
+    'var prestamo=document.body.getAttribute("data-prestamo-id")||"";'
+    'var cuota=document.body.getAttribute("data-cuota-id")||"";'
+    'var h=window.location.hash||"";'
+    'if(h.charAt(0)==="#"){h=h.slice(1);}'
+    "var token=\"\";"
+    'if(h.indexOf("t=")===0){token=decodeURIComponent(h.slice(2).split("&")[0]);}'
+    'else if(h.indexOf("token=")===0){token=decodeURIComponent(h.slice(6).split("&")[0]);}'
+    'if(!prestamo||!cuota||!token){if(msg){msg.textContent="Enlace inválido o incompleto.";}return;}'
+    "var pdfUrl;"
+    'try{pdfUrl=new URL("recibo-cuota",window.location.href);}catch(e){'
+    'if(msg){msg.textContent="No se pudo preparar el enlace.";}return;}'
+    'pdfUrl.searchParams.set("prestamo_id",prestamo);'
+    'pdfUrl.searchParams.set("cuota_id",cuota);'
+    'fetch(pdfUrl.toString(),{method:"GET",headers:{Authorization:"Bearer "+token},credentials:"same-origin"})'
+    ".then(function(r){if(!r.ok){throw new Error(\"http_\"+r.status);}return r.blob();})"
+    ".then(function(blob){var u=URL.createObjectURL(blob);window.location.replace(u);})"
+    '.catch(function(){if(msg){msg.textContent="No se pudo abrir el recibo. Puede haber expirado; solicite un nuevo código.";}});'
+    "})();"
+)
+
+
+@router.get(
+    "/recibo-cuota-abrir.js",
+    include_in_schema=False,
+    name="estado_cuenta_recibo_cuota_abrir_js",
+)
+def get_recibo_cuota_abrir_js():
+    return Response(
+        content=_RECIBO_CUOTA_ABRIR_JS,
+        media_type="application/javascript; charset=utf-8",
+    )
+
+
+@router.get("/recibo-cuota-abrir", response_class=HTMLResponse)
+def get_recibo_cuota_abrir_page(
+    request: Request,
+    prestamo_id: int = Query(..., description="ID del préstamo"),
+    cuota_id: int = Query(..., description="ID de la cuota"),
+):
+    """
+    Página mínima que lee el token en el fragmento URL (#t=JWT) y solicita el PDF con Authorization.
+    Así el JWT no aparece en query string ni en logs típicos de proxy (el fragmento no se envía al servidor).
+    """
+    script_src = request.url_for("estado_cuenta_recibo_cuota_abrir_js")
+    html = f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Recibo de cuota</title>
+<script defer src="{script_src}"></script>
+</head>
+<body data-prestamo-id="{prestamo_id}" data-cuota-id="{cuota_id}">
+<p id="recibo-cuota-msg">Abriendo recibo...</p>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
+
+
+@router.get("/recibo-cuota")
+
+def get_recibo_cuota_publico(
+
+    token: str = Query(None, description="Token en query (deprecated: usar Authorization header)"),
+
+    prestamo_id: int = Query(..., description="ID del préstamo"),
+
+    cuota_id: int = Query(..., description="ID de la cuota"),
+
+    request: Request = None,
+
+    db: Session = Depends(get_db),
+
+):
+
+    """
+
+    Devuelve el PDF del recibo de una cuota. Requiere token válido (emitido al verificar código).
+
+    Público; la seguridad es el token (cédula + expiración). Para enlaces en el PDF de estado de cuenta.
+    
+    Token puede venir en:
+    - Header: Authorization: Bearer <token>
+    - Query param: ?token=<token> (deprecated; aún soportado por compatibilidad)
+
+    """
+
+    auth_header = request.headers.get("Authorization", "") if request else ""
+    token_from_header = None
+    if auth_header.lower().startswith("bearer "):
+        token_from_header = auth_header[7:].strip()
+    
+    token_to_use = token_from_header or token
+    
+    if not token_to_use:
+        raise HTTPException(status_code=401, detail="Token requerido (Authorization header o query param ?token=...).")
+
+    payload = decode_token(token_to_use)
+
+    if not payload or payload.get("type") != "recibo":
+
+        raise HTTPException(status_code=401, detail="Token inválido o expirado.")
+
+    cedula_token = (payload.get("sub") or "").strip().replace("-", "")
+
+    if not cedula_token:
+
+        raise HTTPException(status_code=401, detail="Token inválido.")
+
+    prestamo = db.get(Prestamo, prestamo_id)
+
+    if not prestamo:
+
+        raise HTTPException(status_code=404, detail="Préstamo no encontrado.")
+
+    cedula_prestamo = (getattr(prestamo, "cedula", "") or "").strip().replace("-", "")
+
+    if cedula_prestamo != cedula_token:
+
+        raise HTTPException(status_code=403, detail="No tiene permiso para este recibo.")
+
+    cuota = db.get(Cuota, cuota_id)
+
+    if not cuota or cuota.prestamo_id != prestamo_id:
+
+        raise HTTPException(status_code=404, detail="Cuota no encontrada.")
+
+    monto_cuota = float(cuota.monto or 0)
+
+    total_pagado = float(cuota.total_pagado or 0)
+
+    if total_pagado <= 0 and monto_cuota <= 0:
+
+        raise HTTPException(status_code=400, detail="La cuota no tiene monto pagado.")
+
+    referencia = f"Cuota-{cuota.numero_cuota}-Prestamo-{prestamo_id}"
+
+    institucion = "N/A"
+
+    numero_operacion = referencia
+
+    fecha_recep = None
+
+    fecha_pago_date = None
+
+    pago = obtener_pago_para_recibo_cuota(db, cuota)
+
+    if pago:
+
+        institucion = texto_institucion_recibo_cuota(db, pago)
+
+        nd = (pago.numero_documento or "").strip()
+        rp = (pago.referencia_pago or "").strip()
+        if nd.upper().startswith("COB-") and rp and not rp.upper().startswith("COB-"):
+            numero_operacion = rp[:100]
+        else:
+            numero_operacion = (nd or rp or referencia)[:100]
+
+        if pago.fecha_pago:
+
+            fecha_recep = pago.fecha_pago
+
+            fecha_pago_date = pago.fecha_pago.date() if hasattr(pago.fecha_pago, "date") else pago.fecha_pago
+
+    if not fecha_recep and cuota.fecha_pago:
+
+        fecha_recep = datetime.combine(cuota.fecha_pago, datetime.min.time())
+
+        fecha_pago_date = cuota.fecha_pago
+
+    fecha_pago_display = fecha_pago_date.strftime("%d/%m/%Y") if fecha_pago_date else "-"
+
+    fecha_reporte_aprobacion_display = None
+    if pago:
+        f_rep = getattr(pago, "fecha_conciliacion", None) or getattr(pago, "fecha_registro", None)
+        if f_rep and hasattr(f_rep, "strftime"):
+            fecha_reporte_aprobacion_display = f_rep.strftime("%d/%m/%Y %H:%M")
+
+    ctx = contexto_moneda_montos_recibo_cuota(db, prestamo, cuota, pago)
+
+    comp_bytes, comp_tipo, comp_nombre = (None, None, None)
+    if pago is not None:
+        comp_bytes, comp_tipo, comp_nombre = comprobante_blob_para_pdf_desde_pago(db, pago)
+
+    pdf_bytes = generar_recibo_cuota_amortizacion(
+
+        referencia_interna=referencia,
+
+        nombres_completos=(prestamo.nombres or "").strip(),
+
+        cedula=(prestamo.cedula or "").strip(),
+
+        institucion_financiera=institucion,
+
+        monto=ctx.monto_str,
+
+        numero_operacion=numero_operacion,
+
+        fecha_recepcion=fecha_recep,
+
+        fecha_pago=fecha_pago_date,
+
+        fecha_reporte_aprobacion_display=fecha_reporte_aprobacion_display,
+
+        aplicado_a_cuotas=f"Cuota {cuota.numero_cuota}",
+
+        saldo_inicial=ctx.saldo_inicial,
+
+        saldo_final=ctx.saldo_final,
+
+        numero_cuota=cuota.numero_cuota,
+
+        fecha_pago_display=fecha_pago_display,
+
+        moneda=ctx.moneda,
+
+        tasa_cambio=ctx.tasa_cambio,
+
+        comprobante_bytes=comp_bytes,
+
+        comprobante_tipo=comp_tipo,
+
+        comprobante_nombre=comp_nombre,
+
+    )
+
+    return Response(
+
+        content=pdf_bytes,
+
+        media_type="application/pdf",
+
+        headers={"Content-Disposition": f'inline; filename="recibo_{referencia}.pdf"'},
+
+    )
+
+
+
+
+
+@router.get("/recibo-pago")
+def get_recibo_pago_cartera_publico(
+    request: Request,
+    pago_id: int = Query(..., description="ID del pago en tabla pagos (cartera)"),
+    token: Optional[str] = Query(None, description="Token en query (deprecated: usar Authorization header)"),
+    db: Session = Depends(get_db),
+):
+    """
+    PDF del recibo anclado al pago PAGADO de cartera (tabla pagos).
+    Token: misma cedula que el titular del prestamo del pago.
+    
+    Token puede venir en:
+    - Header: Authorization: Bearer <token>
+    - Query param: ?token=<token> (deprecated; aún soportado por compatibilidad)
+    """
+    auth_header = request.headers.get("Authorization", "") or ""
+    token_from_header = None
+    if auth_header.lower().startswith("bearer "):
+        token_from_header = auth_header[7:].strip()
+    
+    token_to_use = token_from_header or token
+    
+    if not token_to_use:
+        raise HTTPException(status_code=401, detail="Token requerido (Authorization header o query param ?token=...).")
+    
+    payload = decode_token(token_to_use)
+    if not payload or payload.get("type") != "recibo":
+        raise HTTPException(status_code=401, detail="Token invalido o expirado.")
+    cedula_token = (payload.get("sub") or "").strip().replace("-", "").replace(" ", "")
+    if not cedula_token:
+        raise HTTPException(status_code=401, detail="Token invalido.")
+    pago = db.get(Pago, pago_id)
+    if not pago:
+        raise HTTPException(status_code=404, detail="Pago no encontrado.")
+    if (getattr(pago, "estado", None) or "").strip().upper() != "PAGADO":
+        raise HTTPException(status_code=400, detail="El pago no esta en estado PAGADO.")
+    prestamo_id = getattr(pago, "prestamo_id", None)
+    if not prestamo_id:
+        raise HTTPException(status_code=400, detail="Pago sin prestamo asociado.")
+    prestamo = db.get(Prestamo, prestamo_id)
+    if not prestamo:
+        raise HTTPException(status_code=404, detail="Prestamo no encontrado.")
+    ced_prest = (getattr(prestamo, "cedula", None) or "").strip().replace("-", "").replace(" ", "").upper()
+    if ced_prest != cedula_token.upper():
+        raise HTTPException(status_code=403, detail="No tiene permiso para este recibo.")
+    doc = (getattr(pago, "numero_documento", None) or "").strip()
+    refp = (getattr(pago, "referencia_pago", None) or "").strip()
+    referencia = (doc or refp or f"Pago-{pago_id}")[:80]
+    fp = getattr(pago, "fecha_pago", None)
+    fecha_pago_display = fp.strftime("%d/%m/%Y %H:%M") if fp and hasattr(fp, "strftime") else "-"
+    f_rep = getattr(pago, "fecha_conciliacion", None) or getattr(pago, "fecha_registro", None)
+    fecha_reporte_aprobacion_display = (
+        f_rep.strftime("%d/%m/%Y %H:%M") if f_rep and hasattr(f_rep, "strftime") else "-"
+    )
+
+    titular = (getattr(prestamo, "nombres", None) or "").strip() or "-"
+    ced_tit = (getattr(prestamo, "cedula", None) or "").strip() or "-"
+    ced_comp = (getattr(pago, "cedula_cliente", None) or "").strip() or "-"
+    banco = (getattr(pago, "institucion_bancaria", None) or "").strip() or "-"
+    num_disp = texto_numero_documento_recibo_desde_pago_cartera(doc, refp).strip()
+    num_op = (num_disp or "-")[:100]
+    moneda_raw = (getattr(pago, "moneda_registro", None) or "").strip().upper()
+    es_bs = moneda_raw in ("BS", "BOLIVAR", "BOLIVARES")
+    monto_usd = float(getattr(pago, "monto_pagado", 0) or 0)
+    monto_bs_val = getattr(pago, "monto_bs_original", None)
+    if es_bs and monto_bs_val is not None:
+        monto_pagado_texto = f"{_formato_monto_venezolano(float(monto_bs_val))} Bs."
+    else:
+        monto_pagado_texto = f"{_formato_monto_venezolano(monto_usd)} USD"
+    nota_tasa_bs = None
+    if es_bs:
+        tasa_val = getattr(pago, "tasa_cambio_bs_usd", None)
+        ftasa = getattr(pago, "fecha_tasa_referencia", None)
+        if tasa_val is not None:
+            try:
+                t = float(tasa_val)
+                fd = ftasa.strftime("%d/%m/%Y") if ftasa and hasattr(ftasa, "strftime") else "-"
+                t_txt = _formato_decimal_ve(t)
+                nota_tasa_bs = (
+                    f"Tasa BCV de referencia ({fd}): <b>{t_txt}</b> Bs. por 1 USD "
+                    "(registrada en cartera para este pago)."
+                )
+            except (TypeError, ValueError):
+                nota_tasa_bs = None
+    comp_bytes, comp_tipo, comp_nombre = comprobante_blob_para_pdf_desde_pago(db, pago)
+    pdf_bytes = generar_recibo_pago_cartera_pdf(
+        referencia_documento=referencia,
+        fecha_reporte_aprobacion_display=fecha_reporte_aprobacion_display,
+        fecha_pago_display=fecha_pago_display,
+        titular_credito=titular,
+        cedula_titular=ced_tit,
+        cedula_comprobante=ced_comp,
+        banco=banco,
+        numero_operacion=num_op,
+        monto_pagado_texto=monto_pagado_texto,
+        nota_tasa_bs=nota_tasa_bs,
+        comprobante_bytes=comp_bytes,
+        comprobante_tipo=comp_tipo,
+        comprobante_nombre=comp_nombre,
+    )
+    return Response(
+        content=bytes(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="recibo_pago_{pago_id}.pdf"'},
+    )
+
+
+@router.get("/comprobante-imagen")
+def get_comprobante_imagen_estado_cuenta_publico(
+    request: Request,
+    pago_id: int = Query(..., ge=1),
+    comprobante_id: str = Query(..., description="ID 32 hex en pago_comprobante_imagen"),
+    token: Optional[str] = Query(None, description="JWT recibo (alternativa: header Authorization Bearer)"),
+    db: Session = Depends(get_db),
+):
+    """
+    Sirve imagen/PDF del comprobante de un pago de cartera para quien verificó el código de estado de cuenta.
+
+    Misma seguridad que ``GET .../recibo-pago``: JWT ``type=recibo`` (cédula en ``sub``) y titularidad del pago.
+    El comprobante debe estar vinculado al pago (link en ``pagos`` o resolución Gmail/reportado, misma regla que PDF).
+
+    Token: ``Authorization: Bearer <jwt>`` o ``?token=`` (deprecated; necesario para ``<img src>`` en móvil).
+    """
+    auth_header = (request.headers.get("Authorization") or "").strip()
+    token_from_header = None
+    if auth_header.lower().startswith("bearer "):
+        token_from_header = auth_header[7:].strip()
+    token_to_use = (token_from_header or (token or "").strip())
+    if not token_to_use:
+        raise HTTPException(
+            status_code=401,
+            detail="Token requerido (Authorization header o query param ?token=...).",
+        )
+    payload = decode_token(token_to_use)
+    if not payload or payload.get("type") != "recibo":
+        raise HTTPException(status_code=401, detail="Token invalido o expirado.")
+    cedula_token = (payload.get("sub") or "").strip().replace("-", "").replace(" ", "")
+    if not cedula_token:
+        raise HTTPException(status_code=401, detail="Token invalido.")
+    pago = db.get(Pago, pago_id)
+    if not pago:
+        raise HTTPException(status_code=404, detail="Pago no encontrado.")
+    if (getattr(pago, "estado", None) or "").strip().upper() != "PAGADO":
+        raise HTTPException(status_code=400, detail="El pago no esta en estado PAGADO.")
+    prestamo_id = getattr(pago, "prestamo_id", None)
+    if not prestamo_id:
+        raise HTTPException(status_code=400, detail="Pago sin prestamo asociado.")
+    prestamo = db.get(Prestamo, prestamo_id)
+    if not prestamo:
+        raise HTTPException(status_code=404, detail="Prestamo no encontrado.")
+    ced_prest = (getattr(prestamo, "cedula", None) or "").strip().replace("-", "").replace(" ", "").upper()
+    if ced_prest != cedula_token.upper():
+        raise HTTPException(status_code=403, detail="No tiene permiso para este comprobante.")
+    cid = _normalizar_id_comprobante_imagen(comprobante_id)
+    if not cid:
+        raise HTTPException(status_code=400, detail="Identificador de comprobante no valido.")
+    if cid not in ids_comprobante_imagen_vinculados_a_pago(db, pago):
+        raise HTTPException(status_code=403, detail="No tiene permiso para este comprobante.")
+    row = db.get(PagoComprobanteImagen, cid)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Comprobante no encontrado.")
+    return Response(
+        content=row.imagen_data,
+        media_type=(row.content_type or "application/octet-stream"),
+        headers={
+            "Cache-Control": "private, no-store",
+            "Pragma": "no-cache",
+        },
+    )
+
+
+@router.get("/validar-cedula", response_model=ValidarCedulaEstadoCuentaResponse)
+
+def validar_cedula_estado_cuenta(
+
+    request: Request,
+
+    cedula: str,
+
+    origen: Optional[str] = Query(None),
+
+    db: Session = Depends(get_db),
+
+):
+
+    """
+
+    Valida cédula y verifica que exista en tabla clientes.
+
+    Público, sin auth. Rate limit: 30 req/min por IP. Retorna nombre y email si ok.
+
+    Sin límite cuando origen=informes y la petición es interna autenticada (staff).
+
+    """
+
+    ip = get_client_ip(request)
+
+    if not (
+        (origen or "").strip().lower() == "informes"
+        and _is_internal_staff_request(request)
+    ):
+
+        check_rate_limit_estado_cuenta_validar(ip)
+
+    if not cedula or not cedula.strip():
+
+        return ValidarCedulaEstadoCuentaResponse(ok=False, error="Ingrese el número de cédula.")
+
+    if len(cedula.strip()) > MAX_CEDULA_LENGTH:
+
+        return ValidarCedulaEstadoCuentaResponse(ok=False, error="Datos inválidos.")
+
+    result = validate_cedula(cedula.strip())
+
+    if not result.get("valido"):
+
+        return ValidarCedulaEstadoCuentaResponse(ok=False, error=result.get("error", "Cédula inválida."))
+
+    cedula_lookup = _cedula_lookup(cedula.strip())
+
+    if not cedula_lookup:
+
+        return ValidarCedulaEstadoCuentaResponse(ok=False, error="Formato de cédula no reconocido.")
+
+
+
+    contacto = _cliente_nombre_email_por_cedula_lookup(db, cedula_lookup)
+
+    if not contacto:
+
+        return ValidarCedulaEstadoCuentaResponse(
+
+            ok=False,
+
+            error="La cédula ingresada no se encuentra registrada en nuestro sistema.",
+
+        )
+
+    nombre, emails = contacto
+
+    email_prim = emails[0] if emails else None
+
+    if not cedula_tiene_prestamo_elegible_estado_cuenta(db, cedula_lookup):
+        return ValidarCedulaEstadoCuentaResponse(
+            ok=False,
+            error=mensaje_no_elegible_estado_cuenta_portal(db, cedula_lookup),
+        )
+
+    if not emails:
+        return ValidarCedulaEstadoCuentaResponse(
+            ok=False,
+            error=MSG_ESTADO_CUENTA_SIN_EMAIL_VALIDO,
+        )
+
+    return ValidarCedulaEstadoCuentaResponse(
+
+        ok=True,
+
+        nombre=nombre,
+
+        email=email_prim,
+
+    )
+
+
+
+
+
+
+
+@router.post("/solicitar-codigo", response_model=SolicitarCodigoResponse)
+
+def solicitar_codigo_estado_cuenta(
+
+    request: Request,
+
+    body: SolicitarCodigoRequest,
+
+    db: Session = Depends(get_db),
+
+):
+
+    """
+
+    Envia un codigo de un solo uso al email del cliente. El usuario debe ingresar
+
+    ese codigo en verificar-codigo para descargar el PDF. Mensaje generico para no revelar si la cedula existe.
+
+    Rate limit: 5/hora por IP.
+
+    """
+
+    cedula = (body.cedula or "").strip()
+
+    ip = get_client_ip(request)
+
+    try:
+
+        check_rate_limit_estado_cuenta_solicitar(ip)
+
+    except HTTPException as e:
+
+        if e.status_code == 429:
+
+            logger.info("estado_cuenta solicitar ip=%s outcome=fail reason=rate_limit", ip)
+
+        raise
+
+    if not cedula:
+
+        logger.info("estado_cuenta solicitar ip=%s outcome=fail reason=cedula_vacia", ip)
+
+        return SolicitarCodigoResponse(ok=False, error="Ingrese el numero de cedula.")
+
+    if len(cedula) > MAX_CEDULA_LENGTH:
+
+        logger.info("estado_cuenta solicitar ip=%s outcome=fail reason=cedula_larga", ip)
+
+        return SolicitarCodigoResponse(ok=False, error="Datos invalidos.")
+
+    result = validate_cedula(cedula)
+
+    if not result.get("valido"):
+
+        logger.info("estado_cuenta solicitar ip=%s outcome=fail reason=cedula_invalida", ip)
+
+        return SolicitarCodigoResponse(ok=False, error=result.get("error", "Cedula invalida."))
+
+    cedula_lookup = _cedula_lookup(cedula)
+
+    if not cedula_lookup:
+
+        logger.info("estado_cuenta solicitar ip=%s outcome=fail reason=formato_cedula", ip)
+
+        return SolicitarCodigoResponse(ok=False, error="Formato de cedula no reconocido.")
+
+    cliente_contacto = _cliente_nombre_email_por_cedula_lookup(db, cedula_lookup)
+
+    if not cliente_contacto:
+
+        logger.info("estado_cuenta solicitar ip=%s outcome=ok_sin_cliente", ip)
+
+        return SolicitarCodigoResponse(
+
+            ok=True,
+
+            mensaje="Si la cedula esta registrada, recibiras un codigo en tu correo en los proximos minutos.",
+
+        )
+
+    if not cliente_contacto[1]:
+
+        logger.info(
+            "estado_cuenta solicitar ip=%s outcome=fail reason=sin_email_valido cedula_suffix=***%s",
+            ip,
+            cedula_lookup[-4:] if len(cedula_lookup) >= 4 else "****",
+        )
+
+        return SolicitarCodigoResponse(ok=False, error=MSG_ESTADO_CUENTA_SIN_EMAIL_VALIDO)
+
+    nombre_raw, emails_dest = cliente_contacto
+
+    nombre = (nombre_raw or "").strip() or "Cliente"
+
+    email = emails_dest[0]
+
+    if not cedula_tiene_prestamo_elegible_estado_cuenta(db, cedula_lookup):
+        logger.info(
+            "estado_cuenta solicitar ip=%s outcome=fail reason=sin_prestamo_liquidado "
+            "cedula_suffix=***%s",
+            ip,
+            cedula_lookup[-4:] if len(cedula_lookup) >= 4 else "****",
+        )
+        return SolicitarCodigoResponse(
+            ok=False,
+            error=mensaje_no_elegible_estado_cuenta_portal(db, cedula_lookup),
+        )
+
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    from sqlalchemy import and_
+
+    activos = (
+
+        db.execute(
+
+            select(EstadoCuentaCodigo)
+
+            .where(
+
+                and_(
+
+                    EstadoCuentaCodigo.cedula_normalizada == cedula_lookup,
+
+                    EstadoCuentaCodigo.usado == False,
+
+                    EstadoCuentaCodigo.expira_en > now_utc,
+
+                )
+
+            )
+
+            .order_by(EstadoCuentaCodigo.creado_en.desc())
+
+        )
+
+        .scalars().all()
+
+    )
+
+    if len(activos) >= MAX_CODIGOS_ACTIVOS_POR_CEDULA:
+
+        for item in activos[MAX_CODIGOS_ACTIVOS_POR_CEDULA - 1:]:
+
+            rec = item[0] if hasattr(item, "__getitem__") else item
+
+            db.delete(rec)
+
+        db.flush()
+
+    codigo = _generar_codigo_6()
+
+    expira_en = now_utc + timedelta(minutes=CODIGO_EXPIRA_MINUTES)
+
+    creado_en = now_utc
+
+    row = EstadoCuentaCodigo(
+
+        cedula_normalizada=cedula_lookup,
+
+        email=email,
+
+        codigo=codigo,
+
+        expira_en=expira_en,
+
+        usado=False,
+
+        creado_en=creado_en,
+
+    )
+
+    db.add(row)
+
+    db.commit()
+
+    asunto, cuerpo = _get_plantilla_email_codigo(db, nombre=nombre, codigo=codigo)
+
+    email_enviado = False
+    servicio_activo = get_email_activo_servicio("estado_cuenta")
+
+    if not servicio_activo:
+        logger.warning(
+            "estado_cuenta solicitar: codigo NO enviado por correo "
+            "(servicio estado_cuenta desactivado). "
+            "Active 'Estado de cuenta' en Configuracion > Email."
+        )
+        logger.info(
+            "estado_cuenta solicitar ip=%s outcome=fail reason=servicio_email_desactivado "
+            "cedula_suffix=***%s",
+            ip,
+            cedula_lookup[-4:] if len(cedula_lookup) >= 4 else "****",
+        )
+
+    else:
+
+        try:
+
+            ok_send, err_send = send_email(
+                emails_dest,
+                asunto,
+                cuerpo,
+                servicio="estado_cuenta_otp",
+                respetar_destinos_manuales=True,
+            )
+
+            if ok_send:
+
+                email_enviado = True
+
+                logger.info(
+
+                    "estado_cuenta solicitar ip=%s outcome=ok cedula_suffix=***%s",
+
+                    ip,
+
+                    cedula_lookup[-4:] if len(cedula_lookup) >= 4 else "****",
+
+                )
+
+            else:
+
+                logger.warning(
+
+                    "estado_cuenta solicitar: codigo NO enviado por correo a %s: %s",
+
+                    unir_destinatarios_log(emails_dest),
+
+                    err_send or "send_email devolvio False",
+
+                )
+
+                logger.info(
+                    "estado_cuenta solicitar ip=%s outcome=fail reason=smtp cedula_suffix=***%s",
+                    ip,
+                    cedula_lookup[-4:] if len(cedula_lookup) >= 4 else "****",
+                )
+
+        except Exception as e:
+
+            logger.warning("No se pudo enviar codigo por email a %s: %s", unir_destinatarios_log(emails_dest), e)
+
+            logger.info(
+                "estado_cuenta solicitar ip=%s outcome=fail reason=smtp_excepcion cedula_suffix=***%s",
+                ip,
+                cedula_lookup[-4:] if len(cedula_lookup) >= 4 else "****",
+            )
+
+    expira_en_iso = expira_en.isoformat() + "Z" if expira_en else None
+
+    if not email_enviado:
+        return SolicitarCodigoResponse(
+            ok=False,
+            error=MSG_ESTADO_CUENTA_CODIGO_NO_ENVIADO,
+            expira_en=expira_en_iso,
+        )
+
+    return SolicitarCodigoResponse(
+
+        ok=True,
+
+        mensaje="Si la cedula esta registrada, recibiras un codigo en tu correo en los proximos minutos.",
+
+        expira_en=expira_en_iso,
+
+    )
+
+
+
+
+
+
+
+@router.post("/verificar-codigo", response_model=VerificarCodigoResponse)
+
+def verificar_codigo_estado_cuenta(
+
+    request: Request,
+
+    body: VerificarCodigoRequest,
+
+    db: Session = Depends(get_db),
+
+):
+
+    """
+
+    Verifica el codigo enviado al email y devuelve el PDF de estado de cuenta.
+
+    El codigo es de un solo uso. Rate limit: 15 intentos/15 min por IP.
+
+    El PDF se genera con datos actuales de la BD (pagos aplicados a cuotas incluidos).
+
+    """
+
+    cedula = (body.cedula or "").strip()
+
+    codigo = (body.codigo or "").strip()
+
+    ip = get_client_ip(request)
+
+    try:
+
+        check_rate_limit_estado_cuenta_verificar(ip)
+
+    except HTTPException as e:
+
+        if e.status_code == 429:
+
+            logger.info("estado_cuenta verificar ip=%s outcome=fail reason=rate_limit", ip)
+
+        raise
+
+    if not cedula or not codigo:
+
+        logger.info("estado_cuenta verificar ip=%s outcome=fail reason=cedula_o_codigo_vacio", ip)
+
+        return VerificarCodigoResponse(ok=False, error="Ingrese cedula y codigo.")
+
+    cedula_lookup = _cedula_lookup(cedula)
+
+    if not cedula_lookup:
+
+        logger.info("estado_cuenta verificar ip=%s outcome=fail reason=formato_cedula", ip)
+
+        return VerificarCodigoResponse(ok=False, error="Formato de cedula no reconocido.")
+
+    from sqlalchemy import and_
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    fila = db.execute(
+
+        select(EstadoCuentaCodigo).where(
+
+            and_(
+
+                EstadoCuentaCodigo.cedula_normalizada == cedula_lookup,
+
+                EstadoCuentaCodigo.codigo == codigo.strip(),
+
+                EstadoCuentaCodigo.expira_en > now,
+
+                EstadoCuentaCodigo.usado == False,
+
+            )
+
+        )
+
+    ).scalars().first()
+
+    if not fila:
+
+        return VerificarCodigoResponse(ok=False, error="Codigo invalido o expirado. Solicite uno nuevo.")
+
+    rec = fila[0] if hasattr(fila, "__getitem__") else fila
+
+    try:
+
+        if not cedula_tiene_prestamo_elegible_estado_cuenta(db, cedula_lookup):
+            return VerificarCodigoResponse(
+                ok=False,
+                error=mensaje_no_elegible_estado_cuenta_portal(db, cedula_lookup),
+            )
+
+        datos = _obtener_datos_pdf(db, cedula_lookup, solo_aprobados_o_liquidados=True)
+
+        if not datos or not (datos.get("prestamos_list") or []):
+
+            return VerificarCodigoResponse(ok=False, error=MSG_ESTADO_CUENTA_NO_ELEGIBLE)
+
+        recibos = []
+
+        base_url, recibo_token = base_url_y_token_recibo_para_pdf_estado_cuenta(
+            cedula_lookup, request=request, token_expire_hours=2
+        )
+
+        pdf_bytes = generar_pdf_estado_cuenta(
+
+            cedula=datos.get("cedula_display") or "",
+
+            nombre=datos.get("nombre") or "",
+
+            prestamos=datos.get("prestamos_list") or [],
+
+            fecha_corte=datos.get("fecha_corte") or date.today(),
+
+            amortizaciones_por_prestamo=datos.get("amortizaciones_por_prestamo") or [],
+
+            pagos_realizados=datos.get("pagos_realizados") or [],
+
+            recibos=recibos,
+
+            recibo_token=recibo_token,
+
+            base_url=base_url,
+
+        )
+
+        pdf_b64 = base64.b64encode(pdf_bytes).decode("ascii")
+
+    except Exception as e:
+
+        logger.exception("Error generando PDF estado de cuenta: %s", e)
+
+        logger.info("estado_cuenta verificar ip=%s outcome=fail reason=error_pdf", ip)
+
+        return VerificarCodigoResponse(
+
+            ok=False,
+
+            error="No se pudo generar el PDF. Intente de nuevo o solicite un nuevo codigo.",
+
+        )
+
+    rec.usado = True
+
+    db.commit()
+
+    expira_en_iso = (rec.expira_en.isoformat() + "Z") if getattr(rec, "expira_en", None) else None
+
+    recibos_cuotas = []
+
+    for item in (datos.get("amortizaciones_por_prestamo") or []):
+
+        prestamo_id = item.get("prestamo_id")
+
+        producto = (item.get("producto") or "Préstamo")[:40]
+
+        for c in (item.get("cuotas") or []):
+
+            if (c.get("estado") or "").strip().upper() != "PAGADO" or not c.get("id"):
+
+                continue
+
+            url = (
+                f"{base_url}/api/v1/estado-cuenta/public/recibo-cuota-abrir"
+                f"?prestamo_id={prestamo_id}&cuota_id={c.get('id')}#t={recibo_token}"
+            )
+
+            recibos_cuotas.append({
+
+                "prestamo_id": prestamo_id,
+
+                "producto": producto,
+
+                "cuota_id": c.get("id"),
+
+                "numero_cuota": c.get("numero_cuota"),
+
+                "url": url,
+
+            })
+
+    comprobantes_pagos_list: List[dict] = []
+
+    for pr in datos.get("pagos_realizados") or []:
+
+        link_foto = comprobante_url_para_enlace_publico(
+
+            str(pr.get("link_comprobante") or ""),
+
+            base_url=base_url,
+
+        ).strip()
+
+        low = link_foto.lower()
+
+        if not low.startswith(("http://", "https://")):
+
+            continue
+
+        url_lista = link_foto
+
+        pid = pr.get("pago_id")
+
+        if pid is not None:
+
+            try:
+
+                pid_int = int(pid)
+
+            except (TypeError, ValueError):
+
+                pid_int = None
+
+            if pid_int is not None:
+
+                ids_enlace = ids_comprobante_imagen_desde_texto(link_foto, "")
+
+                if len(ids_enlace) == 1:
+
+                    url_lista = (
+
+                        f"{base_url.rstrip('/')}/api/v1/estado-cuenta/public/comprobante-imagen"
+
+                        f"?pago_id={pid_int}&comprobante_id={ids_enlace[0]}"
+
+                    )
+
+        comprobantes_pagos_list.append(
+
+            {
+
+                "pago_id": pr.get("pago_id"),
+
+                "url": url_lista,
+
+                "fecha_pago_display": pr.get("fecha_pago_display") or "",
+
+                "monto_display": pr.get("monto_display") or "",
+
+                "referencia_tabla": pr.get("referencia_tabla") or "",
+
+            }
+
+        )
+
+    logger.info("estado_cuenta verificar ip=%s outcome=ok cedula_suffix=***%s", ip, cedula_lookup[-4:] if len(cedula_lookup) >= 4 else "****")
+
+    return VerificarCodigoResponse(
+
+        ok=True,
+
+        pdf_base64=pdf_b64,
+
+        expira_en=expira_en_iso,
+
+        recibo_token=recibo_token,
+
+        recibos_cuotas=recibos_cuotas if recibos_cuotas else None,
+
+        comprobantes_pagos=comprobantes_pagos_list if comprobantes_pagos_list else None,
+
+    )
+
+
+
+
+
+@router.post("/solicitar-estado-cuenta", response_model=SolicitarEstadoCuentaResponse)
+
+def solicitar_estado_cuenta(
+
+    request: Request,
+
+    body: SolicitarEstadoCuentaRequest,
+
+    db: Session = Depends(get_db),
+
+):
+
+    """
+
+    Genera el PDF de estado de cuenta para la cédula consultada, lo envía al email
+
+    registrado del cliente y devuelve el PDF en base64 para visualización.
+
+    Público, sin auth. Rate limit: 5 solicitudes/hora por IP.
+
+    Los datos se leen siempre de la BD en el momento de la petición (sin caché);
+
+    cualquier pago aplicado a cuotas se refleja automáticamente en la siguiente consulta.
+
+    Usado por: /pagos/rapicredit-estadocuenta y /pagos/informes; en ambos se muestran
+
+    las mismas tablas de amortización (cuotas) con columna Pago (USD aplicado por cuota) y Recibo desde la tabla cuotas.
+
+    Estados de cuota en el PDF: mismas reglas Caracas y etiquetas que la app interna
+
+    (generar_pdf_estado_cuenta usa etiqueta_estado_cuota).
+
+    """
+
+    cedula = (body.cedula or "").strip()
+
+    ip = get_client_ip(request)
+
+    # Solo flujo interno autenticado (staff) puede omitir rate limit con origen='informes'.
+    origen = (body.origen or "").strip().lower()
+    if not (origen == "informes" and _is_internal_staff_request(request)):
+
+        check_rate_limit_estado_cuenta_solicitar(ip)
+
+    if not cedula:
+
+        return SolicitarEstadoCuentaResponse(ok=False, error="Ingrese el número de cédula.")
+
+    if len(cedula.strip()) > MAX_CEDULA_LENGTH:
+
+        return SolicitarEstadoCuentaResponse(ok=False, error="Datos inválidos.")
+
+    result = validate_cedula(cedula.strip())
+
+    if not result.get("valido"):
+
+        return SolicitarEstadoCuentaResponse(ok=False, error=result.get("error", "Cédula inválida."))
+
+    cedula_lookup = _cedula_lookup(cedula.strip())
+
+    if not cedula_lookup:
+
+        return SolicitarEstadoCuentaResponse(ok=False, error="Formato de cédula no reconocido.")
+
+
+
+    if not cedula_tiene_prestamo_elegible_estado_cuenta(db, cedula_lookup):
+        return SolicitarEstadoCuentaResponse(
+            ok=False,
+            error=mensaje_no_elegible_estado_cuenta_portal(db, cedula_lookup),
+        )
+
+    datos = _obtener_datos_pdf(
+        db, cedula_lookup, solo_aprobados_o_liquidados=True
+    )
+
+    if not datos:
+
+        return SolicitarEstadoCuentaResponse(
+
+            ok=False,
+
+            error="La cédula no se encuentra registrada.",
+
+        )
+
+    if not (datos.get("prestamos_list") or []):
+        return SolicitarEstadoCuentaResponse(ok=False, error=MSG_ESTADO_CUENTA_NO_ELEGIBLE)
+
+    cedula_display = (datos.get("cedula_display") or "").strip()
+
+    nombre = (datos.get("nombre") or "").strip()
+
+    email = (datos.get("email") or "").strip()
+
+    emails_pdf = datos.get("emails")
+    if not isinstance(emails_pdf, list) or not emails_pdf:
+        emails_pdf = [email] if email and "@" in email else []
+
+    prestamos_list = datos.get("prestamos_list") or []
+
+    fecha_corte = datos.get("fecha_corte") or date.today()
+
+    amortizaciones_por_prestamo = datos.get("amortizaciones_por_prestamo") or []
+
+    recibos = []
+
+    base_url, recibo_token = base_url_y_token_recibo_para_pdf_estado_cuenta(
+        cedula_lookup, request=request, token_expire_hours=2
+    )
+
+    pdf_bytes = generar_pdf_estado_cuenta(
+
+        cedula=cedula_display,
+
+        nombre=nombre,
+
+        prestamos=prestamos_list,
+        fecha_corte=fecha_corte,
+
+        amortizaciones_por_prestamo=amortizaciones_por_prestamo,
+
+        pagos_realizados=datos.get("pagos_realizados") or [],
+
+        recibos=recibos,
+
+        recibo_token=recibo_token,
+
+        base_url=base_url,
+
+    )
+
+
+
+    # Portal: LIQUIDADO/APROBADO reciben copia por correo; reglas masivas de cobranza no aplican.
+    bloquear_email = False
+    # En flujo interno autenticado no se envía email; solo se devuelve PDF.
+    enviar_por_email = (
+        bool(emails_pdf)
+        and not bloquear_email
+        and not (origen == "informes" and _is_internal_staff_request(request))
+    )
+
+    if enviar_por_email:
+
+        try:
+
+            filename = f"estado_cuenta_{cedula_display.replace('-', '_')}.pdf"
+
+            email_body = (f"Estimado(a) {nombre},\n\nSe adjunta su estado de cuenta con fecha de corte {fecha_corte.isoformat()}.\n\nSaludos,\nRapiCredit")
+
+            if get_email_activo_servicio("estado_cuenta"):
+
+                send_email(
+
+                    emails_pdf,
+
+                    f"Estado de cuenta - {fecha_corte.isoformat()}",
+
+                    email_body,
+
+                    attachments=[(filename, pdf_bytes)],
+
+                    servicio="estado_cuenta",
+
+                    respetar_destinos_manuales=True,
+
+                )
+
+        except Exception as e:
+
+            logger.warning(
+                "No se pudo enviar estado de cuenta por email a %s: %s",
+                unir_destinatarios_log(emails_pdf),
+                e,
+            )
+
+            # No fallar la petición: el PDF se devuelve igual
+
+
+
+    pdf_b64 = base64.b64encode(pdf_bytes).decode("ascii")
+
+    mensaje = "Estado de cuenta generado. Se ha enviado una copia al correo registrado." if enviar_por_email else "Estado de cuenta generado."
+
+    return SolicitarEstadoCuentaResponse(
+
+        ok=True,
+
+        pdf_base64=pdf_b64,
+
+        mensaje=mensaje,
+
+    )
+

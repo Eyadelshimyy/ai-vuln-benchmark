@@ -1,0 +1,28 @@
+{
+  "repo": "alexandrelheinen__clave",
+  "file": "src/clave/corpus/artifacts.py",
+  "function": "digest_of",
+  "line": 58,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Compute the SHA-256 digest of a file.\n\nArgs:\n    path: File to read.\n\nReturns:\n    The digest as a lowercase hexadecimal string.",
+  "prompt_source": "def digest_of(path: Path) -> str:\n    \"\"\"Compute the SHA-256 digest of a file.\n\n    Args:\n        path: File to read.\n\n    Returns:\n        The digest as a lowercase hexadecimal string.\n    \"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def digest_of(path: Path) -> str:\n    \"\"\"Compute the SHA-256 digest of a file.\n\n    Args:\n        path: File to read.\n\n    Returns:\n        The digest as a lowercase hexadecimal string.\n    \"\"\"\n    digest = hashlib.sha256()\n    with path.open(\"rb\") as handle:\n        while chunk := handle.read(_CHUNK):\n            digest.update(chunk)\n    return digest.hexdigest()",
+  "module_source": "\"\"\"Local artifact verification.\n\nA fetch that silently accepts changed bytes gives no guarantee at all, so\nverification reports three distinct outcomes rather than a boolean plus a\nmessage. Only :attr:`ArtifactStatus.VERIFIED` makes an artifact available.\n\nRecording a digest deliberately does not write the manifest. A tool that\nupdates the file it checks against has verified nothing; the observed digest is\nreturned so a human can review it and commit it.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport hashlib\nfrom dataclasses import dataclass\nfrom enum import Enum\nfrom pathlib import Path\n\nfrom clave.corpus.manifest import Artifact\n\n_CHUNK = 1 << 20\n\n\nclass ArtifactStatus(Enum):\n    \"\"\"Outcome of verifying a local artifact against its manifest entry.\"\"\"\n\n    VERIFIED = \"verified\"\n    DIGEST_MISMATCH = \"digest_mismatch\"\n    UNVERIFIED_ENTRY = \"unverified_entry\"\n    MISSING = \"missing\"\n\n\n@dataclass(frozen=True)\nclass Verification:\n    \"\"\"The result of checking one artifact.\n\n    Attributes:\n        artifact: The manifest entry that was checked.\n        status: Which outcome applies.\n        observed_sha256: Digest computed from local bytes, when they existed.\n    \"\"\"\n\n    artifact: Artifact\n    status: ArtifactStatus\n    observed_sha256: str | None = None\n\n    @property\n    def available(self) -> bool:\n        \"\"\"Whether the artifact may be used.\n\n        True only for a verified artifact. An unverified manifest entry and a\n        digest mismatch are both unavailable, so neither can be trained on by\n        accident.\n        \"\"\"\n        return self.status is ArtifactStatus.VERIFIED\n\n\ndef digest_of(path: Path) -> str:\n    \"\"\"Compute the SHA-256 digest of a file.\n\n    Args:\n        path: File to read.\n\n    Returns:\n        The digest as a lowercase hexadecimal string.\n    \"\"\"\n    digest = hashlib.sha256()\n    with path.open(\"rb\") as handle:\n        while chunk := handle.read(_CHUNK):\n            digest.update(chunk)\n    return digest.hexdigest()\n\n\ndef verify(artifact: Artifact, path: Path) -> Verification:\n    \"\"\"Check a local file against its manifest entry.\n\n    Args:\n        artifact: The manifest entry describing the expected bytes.\n        path: Where the artifact is expected locally.\n\n    Returns:\n        A verification carrying the status and, when the file existed, the\n        digest observed.\n    \"\"\"\n    if not path.is_file():\n        return Verification(artifact, ArtifactStatus.MISSING)\n    observed = digest_of(path)\n    if artifact.is_unverified:\n        return Verification(artifact, ArtifactStatus.UNVERIFIED_ENTRY, observed)\n    if observed != artifact.sha256:\n        return Verification(artifact, ArtifactStatus.DIGEST_MISMATCH, observed)\n    return Verification(artifact, ArtifactStatus.VERIFIED, observed)\n\n\ndef record_digest(artifact: Artifact, path: Path) -> str:\n    \"\"\"Compute the digest a manifest entry is missing, for review.\n\n    This does not modify the manifest. The caller reviews the returned digest\n    and commits it, which is what keeps the manifest a record of intent rather\n    than a mirror of whatever happens to be on disk.\n\n    Args:\n        artifact: The unverified manifest entry.\n        path: Where the artifact is stored locally.\n\n    Returns:\n        The observed digest, as a lowercase hexadecimal string.\n\n    Raises:\n        FileNotFoundError: If the artifact is not present locally.\n    \"\"\"\n    if not path.is_file():\n        raise FileNotFoundError(f\"{artifact.name!r} is not present at {path}\")\n    return digest_of(path)\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 14
+    },
+    "ai_commit": "f24169df4490",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 1.0,
+    "span": [
+      58,
+      71
+    ]
+  }
+}

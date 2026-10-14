@@ -1,0 +1,250 @@
+"""Le rotte dell'unione delle ricariche, e ciò che la pagina deve ricevere per disegnarle.
+
+Il bottone lo si offre solo dove ha senso — cioè sulla riga che ha davanti a sé una ricarica
+abbastanza vicina — ma chi decide davvero è il server: la rotta rivalida tutti i cancelli, perché
+un pulsante non è un permesso.
+"""
+import asyncio
+import sqlite3
+import types
+
+import db as poller_db
+import db_reader
+import pytest
+
+pytest.importorskip("fastapi", reason="web.main needs fastapi (absent in the minimal CI test env)")
+import main
+
+
+def _setup(tmp_path, monkeypatch):
+    path = str(tmp_path / "c.db")
+    poller_db.Database(path)
+    con = sqlite3.connect(path)
+    con.execute("INSERT INTO vehicles (id, vin) VALUES (1, 'V1')")
+    con.commit(); con.close()
+    monkeypatch.setattr(db_reader, "DB_PATH", path)
+    return path
+
+
+def _charge(path, cid, start, end, ssoc, esoc, kwh=1.0):
+    con = sqlite3.connect(path)
+    con.execute(
+        "INSERT INTO charges (id, vehicle_id, started_at, ended_at, start_soc, end_soc, "
+        "energy_added_kwh, duration_min, charge_type) VALUES (?,?,?,?,?,?,?,?, 'AC')",
+        (cid, 1, start, end, ssoc, esoc, kwh, 10.0))
+    con.commit(); con.close()
+
+
+def _pair(path):
+    _charge(path, 1, "2026-08-12T18:00:00+00:00", "2026-08-12T18:04:57+00:00", 47.4, 89.6, 7.9)
+    _charge(path, 2, "2026-08-12T18:05:27+00:00", "2026-08-12T18:38:39+00:00", 89.7, 93.4, 0.7)
+
+
+def _req():
+    """Le due rotte non leggono nulla dalla richiesta: firmano solo il contratto di FastAPI."""
+    return types.SimpleNamespace(headers={})
+
+
+def _ids():
+    return [c["id"] for c in db_reader.get_charges()]
+
+
+# ── le rotte ────────────────────────────────────────────────────────────────────
+def test_the_merge_route_joins_the_two_rows(tmp_path, monkeypatch):
+    p = _setup(tmp_path, monkeypatch); _pair(p)
+
+    resp = asyncio.run(main.charges_merge(_req(), a=2, b=1))
+
+    assert resp.status_code == 200
+    assert resp.headers.get("HX-Refresh") == "true"
+    assert _ids() == [1]
+
+
+def test_the_unmerge_route_splits_them_again(tmp_path, monkeypatch):
+    p = _setup(tmp_path, monkeypatch); _pair(p)
+    asyncio.run(main.charges_merge(_req(), a=2, b=1))
+
+    resp = asyncio.run(main.charges_unmerge(_req(), parent=1))
+
+    assert resp.status_code == 200
+    assert _ids() == [2, 1]
+
+
+# Merging/unmerging used to answer with HX-Refresh unconditionally — a full page reload that
+# dropped whatever day/tab was open in Charges. `calendar=1` (only set by a button that is
+# actually inside the calendar view — see charge_card.html's `calendar_context`) asks the route to
+# redraw the month grid + day drawer in place instead, the same way /type and /place already do.
+def test_a_calendar_merge_redraws_the_month_instead_of_reloading(tmp_path, monkeypatch):
+    p = _setup(tmp_path, monkeypatch); _pair(p)
+    from starlette.testclient import TestClient
+    db_reader.set_setting("setup_complete", "1")
+    client = TestClient(main.app)
+
+    r = client.post("/api/charges/merge", params={"a": 2, "b": 1, "calendar": 1})
+
+    assert r.status_code == 200
+    assert "HX-Refresh" not in r.headers
+    assert r.headers.get("HX-Retarget") == "#charges-calendar-month"
+    assert r.headers.get("HX-Reswap") == "outerHTML"
+    assert "12 Aug" in r.text or "Aug" in r.text   # the redrawn month, not an empty fragment
+    assert _ids() == [1]
+
+
+def test_a_calendar_unmerge_redraws_the_month_instead_of_reloading(tmp_path, monkeypatch):
+    p = _setup(tmp_path, monkeypatch); _pair(p)
+    from starlette.testclient import TestClient
+    db_reader.set_setting("setup_complete", "1")
+    client = TestClient(main.app)
+    db_reader.merge_charges(1, 2)
+
+    r = client.post("/api/charges/unmerge", params={"parent": 1, "calendar": 1})
+
+    assert r.status_code == 200
+    assert "HX-Refresh" not in r.headers
+    assert r.headers.get("HX-Retarget") == "#charges-calendar-month"
+    assert _ids() == [2, 1]
+
+
+def _october(tmp_path, monkeypatch):
+    """Two plug-ins across midnight: 30 September 23:50 into 1 October, and 2 October 23:00 into the 3rd."""
+    p = _setup(tmp_path, monkeypatch)
+    con = sqlite3.connect(p)
+    con.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('timezone', 'UTC')")
+    con.commit(); con.close()
+    _charge(p, 1, "2026-09-30T23:50:00+00:00", "2026-09-30T23:58:00+00:00", 40.0, 45.0, 2.0)
+    _charge(p, 2, "2026-10-01T00:05:00+00:00", "2026-10-01T01:00:00+00:00", 45.0, 70.0, 8.0)
+    _charge(p, 3, "2026-10-02T23:00:00+00:00", "2026-10-02T23:58:00+00:00", 30.0, 60.0, 9.0)
+    _charge(p, 4, "2026-10-03T00:05:00+00:00", "2026-10-03T01:00:00+00:00", 60.0, 80.0, 7.0)
+    # A station key the fixture's charges have no coordinates for: recorded, and narrowing nothing.
+    seen = []
+    monkeypatch.setattr(db_reader, "_filter_by_station", lambda charges, station: (seen.append(station), charges)[1])
+    monkeypatch.setattr(db_reader, "get_language", lambda: "en")
+    from starlette.testclient import TestClient
+    db_reader.set_setting("setup_complete", "1")
+    return TestClient(main.app), seen
+
+
+def _drawer_days(html):
+    import re
+    return re.findall(r'data-cal-day="(\d+)"', html), re.findall(r'data-selected data-day="(\d+)"', html)
+
+
+def test_a_merge_inside_a_range_redraws_the_range(tmp_path, monkeypatch):
+    """1–3 October open, the 3rd's charge merged into the 2nd's: the range stays, every day of it with its
+    totals after the merge, and the station filter in the cards' own buttons."""
+    client, seen = _october(tmp_path, monkeypatch)
+    span = {"calendar": 1, "station": "45.0,9.0", "year": 2026, "month": 10, "day": 1, "to_day": 3}
+
+    r = client.post("/api/charges/merge", params={"a": 4, "b": 3, **span})
+
+    assert r.status_code == 200 and r.headers.get("HX-Retarget") == "#charges-calendar-month"
+    assert _ids() == [3, 2, 1]
+    assert _drawer_days(r.text) == (["2", "1"], ["1", "2"])     # the 3rd now charges nothing
+    assert "01 – 03 Oct 2026" in r.text and "2 sessions" in r.text and "24 kWh delivered" in r.text
+    assert "45.0,9.0" in seen and "&station=45.0,9.0" in r.text
+
+
+def test_a_split_inside_a_range_redraws_the_range(tmp_path, monkeypatch):
+    client, _ = _october(tmp_path, monkeypatch)
+    db_reader.merge_charges(3, 4)
+    span = {"calendar": 1, "year": 2026, "month": 10, "day": 1, "to_day": 3}
+
+    r = client.post("/api/charges/unmerge", params={"parent": 3, **span})
+
+    assert r.status_code == 200 and r.headers.get("HX-Retarget") == "#charges-calendar-month"
+    assert _ids() == [4, 3, 2, 1]
+    assert _drawer_days(r.text) == (["3", "2", "1"], ["1", "2", "3"])
+    assert "3 sessions" in r.text and "24 kWh delivered" in r.text
+
+
+@pytest.mark.parametrize("drawer, merge, month, day", [
+    ({}, (2, 1), "September", "30"),                                          # nothing said which days were open
+    ({"year": 2026, "month": 10, "day": 3}, (4, 3), "October", "2"),          # the 3rd alone, merged into the 2nd
+    ({"year": 2026, "month": 10, "day": 1, "to_day": 3}, (2, 1), "September", "30")])   # into the month before
+def test_a_merge_that_leaves_the_drawers_days_opens_the_merged_charges_day(tmp_path, monkeypatch,
+                                                                           drawer, merge, month, day):
+    """The merged charge begins where its first piece began: when that is not among the days the drawer
+    had open, the redraw opens its day, in its own month, with it on show."""
+    client, _ = _october(tmp_path, monkeypatch)
+
+    r = client.post("/api/charges/merge", params={"a": merge[0], "b": merge[1], "calendar": 1, **drawer})
+
+    assert f"{month} 2026" in r.text
+    assert _drawer_days(r.text) == ([], [day])
+    assert f'id="charge-card-{merge[1]}"' in r.text
+
+
+def test_a_merge_outside_the_calendar_still_falls_back_to_a_reload(tmp_path, monkeypatch):
+    """Search results don't carry a #charges-calendar-month to redraw (charge_card.html sets
+    calendar_context=false there), so charge_card.html never sends `calendar=1` for them — the
+    route keeps the old, always-correct HX-Refresh for that one context."""
+    p = _setup(tmp_path, monkeypatch); _pair(p)
+    from starlette.testclient import TestClient
+    db_reader.set_setting("setup_complete", "1")
+    client = TestClient(main.app)
+
+    r = client.post("/api/charges/merge", params={"a": 2, "b": 1})
+
+    assert r.headers.get("HX-Refresh") == "true"
+    assert _ids() == [1]
+
+
+def test_a_refused_merge_answers_with_a_message_not_a_crash(tmp_path, monkeypatch):
+    """Un cancello che scatta deve tornare indietro come una riga rossa nella pagina, non come
+    un 500: l'utente ha cliccato una cosa lecita su dati che non lo permettono."""
+    p = _setup(tmp_path, monkeypatch); _pair(p)
+
+    resp = asyncio.run(main.charges_merge(_req(), a=1, b=404))
+
+    assert resp.status_code == 200
+    assert "⚠️" in resp.body.decode()
+    assert _ids() == [2, 1]          # non è cambiato niente
+
+
+# ── quello che la pagina riceve per disegnare il bottone ────────────────────────
+def test_each_row_knows_the_charge_before_it(tmp_path, monkeypatch):
+    p = _setup(tmp_path, monkeypatch); _pair(p)
+
+    rows = {c["id"]: c for c in db_reader.get_charges()}
+
+    assert rows[2]["prev_charge_id"] == 1      # la #2 può unirsi alla #1
+    assert rows[1]["prev_charge_id"] is None   # sotto la #1 non c'è niente
+
+
+def test_the_button_is_offered_only_where_the_pause_is_short(tmp_path, monkeypatch):
+    p = _setup(tmp_path, monkeypatch); _pair(p)
+    _charge(p, 3, "2026-08-10T09:00:00+00:00", "2026-08-10T10:00:00+00:00", 30.0, 60.0)
+
+    rows = {c["id"]: c for c in db_reader.get_charges()}
+
+    assert rows[2]["can_merge_prev"] is True    # 30 secondi di buco
+    assert rows[1]["can_merge_prev"] is False   # due giorni dalla #3
+    assert rows[3]["can_merge_prev"] is False   # non c'è niente prima
+
+
+def test_the_offer_disappears_once_the_rows_are_joined(tmp_path, monkeypatch):
+    p = _setup(tmp_path, monkeypatch); _pair(p)
+    db_reader.merge_charges(1, 2)
+
+    rows = db_reader.get_charges()
+
+    assert len(rows) == 1
+    assert rows[0]["can_merge_prev"] is False
+    assert rows[0]["is_merged"] is True
+
+
+# ── le otto lingue ──────────────────────────────────────────────────────────────
+def test_every_language_can_say_it(tmp_path):
+    """Una chiave che esiste solo in inglese lascia la pagina metà tradotta senza che niente
+    fallisca: è il buco che aveva tenuto il polacco in inglese per mesi."""
+    import json
+    import pathlib
+    keys = {"charge_merge_btn", "charge_merge_help", "charge_merge_preview_title",
+            "charge_merge_confirm", "charge_merge_failed", "charge_unmerge_btn",
+            "charge_unmerge_confirm", "charge_merge_segments", "charge_merge_pause"}
+    locales = pathlib.Path(__file__).resolve().parent.parent / "web" / "locales"
+    files = sorted(locales.glob("*.json"))
+    assert len(files) == 8, f"lingue attese 8, trovate {len(files)}"
+    for f in files:
+        have = set(json.loads(f.read_text())["translations"])
+        assert not (keys - have), f"{f.name}: mancano {sorted(keys - have)}"

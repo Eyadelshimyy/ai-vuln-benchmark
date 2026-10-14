@@ -1,0 +1,33 @@
+{
+  "repo": "AIfromScratch__qsent",
+  "file": "src/qsf/ingestion/news_marketaux.py",
+  "function": "get_articles",
+  "line": 12,
+  "candidate_cwes": [
+    "CWE-918"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `get_articles` function (parameters: ticker, company_name, days).",
+  "prompt_source": "    def get_articles(self, ticker: str, company_name: str = \"\", days: int = 28) -> list[dict]:\n        \"\"\"Implement the `get_articles` function (parameters: ticker, company_name, days).\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    def get_articles(self, ticker: str, company_name: str = \"\", days: int = 28) -> list[dict]:\n        api_key = os.getenv(\"MARKETAUX_API_KEY\")\n        if not api_key:\n            raise ValueError(\"MARKETAUX_API_KEY not set\")\n\n        from_date = (datetime.now() - timedelta(days=days)).strftime(\"%Y-%m-%d\")\n        params = {\n            \"symbols\": ticker,\n            \"filter_entities\": \"true\",\n            \"limit\": 50,\n            \"published_after\": from_date,\n            \"api_token\": api_key,\n        }\n        response = requests.get(\"https://api.marketaux.com/v1/news/all\", params=params)\n        response.raise_for_status()\n        data = response.json()\n\n        return [\n            {\n                \"text\": _article_text(a),\n                \"date\": a[\"published_at\"][:10],\n                \"source\": \"news\",\n            }\n            for a in data.get(\"data\", [])\n            if a.get(\"title\")\n        ]",
+  "module_source": "\"\"\"\nMarketaux news provider.\nSupports ticker-based filtering via filter_entities parameter.\n\"\"\"\nimport os\nfrom datetime import datetime, timedelta\n\nimport requests\n\n\nclass MarketauxNewsProvider:\n    def get_articles(self, ticker: str, company_name: str = \"\", days: int = 28) -> list[dict]:\n        api_key = os.getenv(\"MARKETAUX_API_KEY\")\n        if not api_key:\n            raise ValueError(\"MARKETAUX_API_KEY not set\")\n\n        from_date = (datetime.now() - timedelta(days=days)).strftime(\"%Y-%m-%d\")\n        params = {\n            \"symbols\": ticker,\n            \"filter_entities\": \"true\",\n            \"limit\": 50,\n            \"published_after\": from_date,\n            \"api_token\": api_key,\n        }\n        response = requests.get(\"https://api.marketaux.com/v1/news/all\", params=params)\n        response.raise_for_status()\n        data = response.json()\n\n        return [\n            {\n                \"text\": _article_text(a),\n                \"date\": a[\"published_at\"][:10],\n                \"source\": \"news\",\n            }\n            for a in data.get(\"data\", [])\n            if a.get(\"title\")\n        ]\n\n\ndef _article_text(article: dict) -> str:\n    title = article.get(\"title\", \"\")\n    description = article.get(\"description\") or \"\"\n    if description:\n        return f\"{title}. {description}\"\n    return title\n",
+  "construction_recipe": {
+    "call_args_source": "()",
+    "uses_tmp_path": false,
+    "source_file": "tests/unit/test_news_providers_financial.py",
+    "source_line": 129
+  },
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 26
+    },
+    "ai_commit": "12dd13fd5388",
+    "evidence": "Generated with [Claude Code]",
+    "ai_line_fraction": 1.0,
+    "span": [
+      12,
+      37
+    ]
+  }
+}

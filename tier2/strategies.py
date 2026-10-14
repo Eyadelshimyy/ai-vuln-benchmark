@@ -359,6 +359,27 @@ class _PathTraversal(ExploitStrategy):
         # canary we planted in a file outside the intended directory.
         if ctx.canary in _output_text(result):
             return True, f"traversal read exfiltrated the planted canary from {ctx.secret_file}"
+        # (c) executed read-traversal proof (closes the "v2" output-capture gap
+        # for read-and-parse functions that never echo raw bytes). SOUND only
+        # under all three live-trace conditions together: our attacker payload
+        # was in the open() argument (tainted), the real open SUCCEEDED
+        # (opened_ok -> a live handle to the file was returned), and the
+        # resolved path is EXACTLY one of our own planted out-of-tree files
+        # (secret_file / proof_file). The candidate can only name that random
+        # path by passing our input through UNSANITISED -- a function that
+        # confines/basenames the path resolves elsewhere and never matches, so
+        # it correctly stays NOT_CONFIRMED. This asserts a traversal read
+        # happened, never that output was exfiltrated.
+        diag = (result or {}).get("diag") or {}
+        try:
+            planted = {os.path.realpath(ctx.secret_file), os.path.realpath(ctx.proof_file)}
+        except Exception:  # noqa: BLE001
+            planted = {ctx.secret_file, ctx.proof_file}
+        for h in diag.get("path_sink_hits", []):
+            if h.get("opened_ok") and h.get("escaped") and h.get("real") in planted:
+                return True, (f"attacker-controlled input opened our out-of-tree planted file "
+                              f"{h.get('real')} (proven by live execution trace; read-traversal, "
+                              f"no output echo required)")
         return False, ""
 
 

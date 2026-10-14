@@ -1,0 +1,28 @@
+{
+  "repo": "VibeBB__fpga-agent",
+  "file": "scripts/container_hardening_markdown.py",
+  "function": "main",
+  "line": 20,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main() -> int:\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main() -> int:\n    with open(os.environ[\"REPORT_JSON\"], encoding=\"utf-8\") as fh:\n        data: Any = json.load(fh)\n    r = cast(dict[str, Any], data)\n    t = cast(dict[str, Any], r[\"trivy\"])\n    print(\"# Container hardening report\\n\")\n    print(f\"Image: `{r['image']}`\\nDigest: `{r['digest']}`\\n\")\n    print(\"| Metric | Value |\")\n    print(\"|---|---|\")\n    print(f\"| Trivy vulns C/H/M/L | {t['critical']}/{t['high']}/{t['medium']}/{t['low']} |\")\n    print(f\"| Fixable HIGH+CRITICAL | {t['fixable_high_or_critical']} |\")\n    print(f\"| Misconfig pass | {t['misconfig_pass']}/{t['misconfig_total']} |\")\n    print(f\"| Secrets found | {_metric(t, 'secrets')} |\")\n    print(f\"| CIS Docker pass/fail | {r['cis_docker']['passed']}/{r['cis_docker']['failed']} |\")\n    print(f\"| Lynis hardening index (trend only) | {r['lynis']['hardening_index']} |\")\n    print(f\"| Lynis warnings | {r['lynis']['warnings']} |\")\n    failures = cast(\n        list[dict[str, Any]], cast(dict[str, Any], r[\"cis_docker\"]).get(\"failures\") or []\n    )\n    if failures:\n        print(\"\\n### Failed CIS Docker checks\\n\")\n        print(\"| Check | Severity | Title |\")\n        print(\"|---|---|---|\")\n        for f in failures:\n            print(f\"| {f['id']} | {f['severity']} | {f['title']} |\")\n    fixable = cast(list[dict[str, Any]], t.get(\"top_fixable\") or [])\n    if fixable:\n        print(\"\\n### Top fixable vulnerabilities\\n\")\n        print(\"| CVE | Package | Severity | Fixed in |\")\n        print(\"|---|---|---|---|\")\n        for v in fixable:\n            print(f\"| {v['id']} | {v['pkg']} | {v['severity']} | {v['fixed']} |\")\n    print(\n        f\"\\nRun: {os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}\"\n        f\"/actions/runs/{os.environ['GITHUB_RUN_ID']}\"\n    )\n    return 0",
+  "module_source": "#!/usr/bin/env python3\n\"\"\"Render container-hardening.json as the report-issue markdown body.\n\nReads REPORT_JSON and prints the markdown on stdout. Extracted from\ncontainer-audit.yml so tests can replay it against fixtures.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nimport os\nimport sys\nfrom typing import Any, cast\n\n\ndef _metric(table: dict[str, Any], key: str) -> Any:\n    return table.get(key) or 0\n\n\ndef main() -> int:\n    with open(os.environ[\"REPORT_JSON\"], encoding=\"utf-8\") as fh:\n        data: Any = json.load(fh)\n    r = cast(dict[str, Any], data)\n    t = cast(dict[str, Any], r[\"trivy\"])\n    print(\"# Container hardening report\\n\")\n    print(f\"Image: `{r['image']}`\\nDigest: `{r['digest']}`\\n\")\n    print(\"| Metric | Value |\")\n    print(\"|---|---|\")\n    print(f\"| Trivy vulns C/H/M/L | {t['critical']}/{t['high']}/{t['medium']}/{t['low']} |\")\n    print(f\"| Fixable HIGH+CRITICAL | {t['fixable_high_or_critical']} |\")\n    print(f\"| Misconfig pass | {t['misconfig_pass']}/{t['misconfig_total']} |\")\n    print(f\"| Secrets found | {_metric(t, 'secrets')} |\")\n    print(f\"| CIS Docker pass/fail | {r['cis_docker']['passed']}/{r['cis_docker']['failed']} |\")\n    print(f\"| Lynis hardening index (trend only) | {r['lynis']['hardening_index']} |\")\n    print(f\"| Lynis warnings | {r['lynis']['warnings']} |\")\n    failures = cast(\n        list[dict[str, Any]], cast(dict[str, Any], r[\"cis_docker\"]).get(\"failures\") or []\n    )\n    if failures:\n        print(\"\\n### Failed CIS Docker checks\\n\")\n        print(\"| Check | Severity | Title |\")\n        print(\"|---|---|---|\")\n        for f in failures:\n            print(f\"| {f['id']} | {f['severity']} | {f['title']} |\")\n    fixable = cast(list[dict[str, Any]], t.get(\"top_fixable\") or [])\n    if fixable:\n        print(\"\\n### Top fixable vulnerabilities\\n\")\n        print(\"| CVE | Package | Severity | Fixed in |\")\n        print(\"|---|---|---|---|\")\n        for v in fixable:\n            print(f\"| {v['id']} | {v['pkg']} | {v['severity']} | {v['fixed']} |\")\n    print(\n        f\"\\nRun: {os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}\"\n        f\"/actions/runs/{os.environ['GITHUB_RUN_ID']}\"\n    )\n    return 0\n\n\nif __name__ == \"__main__\":\n    sys.exit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 37
+    },
+    "ai_commit": "770f80b29a0d",
+    "evidence": "author/committer='devin-ai-integration[bot] <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      20,
+      56
+    ]
+  }
+}

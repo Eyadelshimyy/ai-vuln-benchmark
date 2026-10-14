@@ -1,0 +1,10297 @@
+"""
+Settings Dialog for Vocalinux.
+
+Allows users to configure speech recognition engine, model size,
+and other relevant parameters.
+
+UX Design Notes:
+- Follows GNOME Human Interface Guidelines (HIG) for modern desktop look
+- Sidebar navigation (icon + label) with topic-based pages: Dictation,
+  Speech Model, Audio, Performance, Application, Advanced
+- Live settings search (Ctrl+F) filters rows across all pages in place
+- Sidebar footer (always visible from any page): recognition state, mic
+  level, a dictation test, and the Close action
+- Settings apply immediately when changed (instant-apply pattern)
+- In-window Close button for WM compatibility (some WMs hide title bar close)
+- Multi-modal feedback (text + icon + audio level) for accessibility
+- Modal dialog for model downloads (explicit confirmation for large downloads)
+"""
+
+import itertools
+import logging
+import math
+import os
+import re
+import threading
+import time
+from contextlib import contextmanager
+from functools import partial
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, NamedTuple, Optional, cast
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+# Need GLib for idle_add
+from gi.repository import Gdk, GLib, GObject, Gtk, Pango  # noqa: E402
+
+from ..common_types import RecognitionState, _EvdevCaptureDevice  # noqa: E402
+from ..custom_dictionary import normalize_corrections  # noqa: E402
+from ..gateway_embed import GatewayStatus, get_gateway_embed_manager  # noqa: E402
+from ..speech_recognition.silero_vad import is_silero_available  # noqa: E402
+from ..utils import parakeet_model_info as parakeet  # noqa: E402
+from ..utils.faster_whisper_model_info import delete_model as delete_faster_whisper_model
+from ..utils.faster_whisper_model_info import (  # noqa: E402
+    get_recommended_model as get_recommended_faster_whisper_model,
+)
+from ..utils.faster_whisper_model_info import (
+    is_model_downloaded as is_faster_whisper_model_downloaded,
+)
+from ..utils.faster_whisper_model_info import (
+    list_downloaded_models as list_downloaded_faster_whisper_models,
+)
+from ..utils.model_choice import (
+    BALANCED,
+    PRIORITIES,
+    PRIORITY_LABELS,
+    priority_for_size,
+    size_for_priority,
+)
+from ..utils.paths import models_dir  # noqa: E402
+from ..utils.proxy import (  # noqa: E402
+    DEFAULT_PROXY_MODE,
+    DEFAULT_PROXY_PROTOCOL,
+    default_port_for_protocol,
+    normalize_proxy_mode,
+    normalize_proxy_protocol,
+    requests_proxies,
+)
+from ..utils.system_language import (  # noqa: E402
+    LANGUAGE_FOLLOWS_LAYOUT,
+    language_for_active_layout,
+)
+from ..utils.update_checker import (  # noqa: E402
+    DEFAULT_UPDATE_CHANNEL,
+    ReleaseInfo,
+    fetch_latest_release,
+    format_release_notes,
+    is_trusted_release_url,
+    is_update_available,
+    normalize_channel,
+)
+from ..utils.vosk_model_info import (  # noqa: E402
+    SUPPORTED_LANGUAGES,
+    VOSK_MODEL_INFO,
+    delete_vosk_model,
+    list_downloaded_vosk_models,
+    vosk_model_dirname,
+)
+from ..utils.whisper_model_info import (  # noqa: E402
+    migrate_legacy_checkpoint_names,
+    whisper_model_file,
+)
+from ..utils.whispercpp_model_info import MODEL_SIZES as WHISPERCPP_MODEL_SIZES
+from ..utils.whispercpp_model_info import delete_model as delete_whispercpp_model
+from ..utils.whispercpp_model_info import (
+    detect_compute_backend,
+    detect_vulkan_devices,
+    get_backend_display_name,
+)
+from ..utils.whispercpp_model_info import get_model_size as get_whispercpp_model_size
+from ..utils.whispercpp_model_info import get_model_variants as get_whispercpp_model_variants
+from ..utils.whispercpp_model_info import get_recommended_model as get_recommended_whispercpp_model
+from ..utils.whispercpp_model_info import is_english_only_model as is_english_only_whispercpp_model
+from ..utils.whispercpp_model_info import is_model_downloaded as is_whispercpp_model_downloaded
+from ..utils.whispercpp_model_info import (
+    list_downloaded_models as list_downloaded_whispercpp_models,
+)
+from ..utils.whispercpp_model_info import on_disk_stand_in as whispercpp_on_disk_stand_in
+from ..version import __copyright__, __url__, __version__  # noqa: E402
+from .config_manager import (  # noqa: E402
+    DEFAULT_CONFIG,
+    DEFAULT_PASTE_SHORTCUT,
+    DEFAULT_SOUND_EFFECT_TONE,
+    PASTE_SHORTCUTS,
+    SOUND_EFFECT_TONES,
+    normalize_language_shortcuts,
+    resolve_whispercpp_variant,
+)
+from .keyboard_backends import (  # noqa: E402
+    DEFAULT_SHORTCUT,
+    DEFAULT_SHORTCUT_MODE,
+    SHORTCUT_DISPLAY_NAMES,
+    SHORTCUT_GROUPS,
+    SHORTCUT_MODES,
+    SUPPORTED_SHORTCUTS,
+    get_shortcut_display_name,
+    is_valid_shortcut,
+    parse_shortcut_spec,
+)
+from .keyboard_backends.evdev_backend import MODIFIER_KEY_CODES  # noqa: E402
+from .transcription_history import sanitize_max_items  # noqa: E402
+
+from ..utils.faster_whisper_model_info import (  # isort:skip
+    FASTER_WHISPER_MODEL_INFO,
+)
+from ..utils.whispercpp_model_info import (  # isort:skip
+    NON_DICTATION_MODELS,
+    WHISPERCPP_MODEL_INFO,
+    default_variant_for_size,
+)
+
+# Avoid circular imports for type checking
+if TYPE_CHECKING:
+    from ..speech_recognition.recognition_manager import SpeechRecognitionManager  # noqa: E402
+    from .config_manager import ConfigManager  # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+# Serializes settings applies against deferred-edit persistence across dialog
+# instances: a dialog closed mid-apply hands its pending edits to a worker, and
+# a reopened dialog shares the same engine and config manager, so both sides
+# must agree on whose snapshot is newest.
+_apply_settings_lock = threading.Lock()
+_apply_settings_generation = 0
+# Generation of the apply that last wrote each advanced key. A deferred
+# persist uses it to tell "a newer apply rewrote this key" apart from "the
+# config still holds the baseline" — a newer user choice can legally equal
+# that baseline, so comparing values alone is not enough.
+_apply_settings_written: dict[str, int] = {}
+
+
+def _raw_audio_device_name(device_name: Optional[str]) -> Optional[str]:
+    """Return the persisted device name without UI-only suffixes."""
+    if device_name is None:
+        return None
+    return device_name.removesuffix(" (default)")
+
+
+def _resolve_audio_device_selection(
+    devices: list,
+    saved_index: Optional[int],
+    saved_name: Optional[str],
+) -> Optional[int]:
+    """Resolve a saved audio device to a currently listed index.
+
+    Returns the matched device index, or None when the saved device is gone
+    (caller should fall back to System Default).
+    """
+    saved_raw_name = _raw_audio_device_name(saved_name)
+    if saved_raw_name:
+        for idx, name, _is_default in devices:
+            if name == saved_raw_name:
+                return idx
+    if saved_index is not None:
+        for idx, _name, _is_default in devices:
+            if idx == saved_index:
+                return saved_index
+    return None
+
+
+# Define available models for each engine
+ENGINE_MODELS = {
+    "vosk": [
+        "small",
+        "medium",
+        "large",
+    ],  # Note: 'large' maps to medium internally, as higher version wasn't available
+    "whisper": [
+        "tiny",
+        "base",
+        "small",
+        "medium",
+        "large",
+    ],  # Add more whisper sizes if needed
+    "whisper_cpp": [
+        *WHISPERCPP_MODEL_SIZES,
+    ],  # whisper.cpp top-level size buckets; variants are selected separately
+    "parakeet": [
+        *parakeet.MODEL_SIZES,
+    ],  # Parakeet TDT 0.6B int8 bundles
+    "faster_whisper": [
+        "tiny",
+        "tiny.en",
+        "base",
+        "base.en",
+        "small",
+        "small.en",
+        "medium",
+        "medium.en",
+        "large-v3",
+    ],  # catalog sizes plus English-only .en variants (no large-v3.en)
+    "remote_api": [],  # Remote API does not need local models
+}
+
+# Tallest the "Unused downloads" list may grow before it starts scrolling
+_UNUSED_DOWNLOADS_MAX_HEIGHT = 220
+
+
+def _clamp_unused_downloads_height(natural_height: int) -> int:
+    """Clamp a measured list height to the height the page gives the list."""
+    return min(_UNUSED_DOWNLOADS_MAX_HEIGHT, natural_height)
+
+
+# Engine display name mapping
+ENGINE_DISPLAY_NAMES = {
+    "vosk": "Vosk",
+    "whisper": "Whisper",
+    "whisper_cpp": "whisper.cpp",
+    "parakeet": "Parakeet",
+    "faster_whisper": "Faster Whisper",
+    "remote_api": "Remote API",
+}
+
+
+def _engine_display_name(engine: str) -> str:
+    """Get the display name of the engine."""
+    return ENGINE_DISPLAY_NAMES.get(engine, engine.capitalize())
+
+
+def _engine_from_display(display_name: str) -> str:
+    """Reverse lookup engine ID from display name."""
+    for engine_id, name in ENGINE_DISPLAY_NAMES.items():
+        if name == display_name:
+            return engine_id
+    return display_name.lower()
+
+
+def _model_display_name(model_name: str) -> str:
+    """Get a user-friendly model display name."""
+    if model_name == "large":
+        return "Large v3"
+
+    display_parts = []
+    for part in model_name.split("-"):
+        if part.endswith(".en"):
+            display_parts.append(part[:-3].capitalize())
+            display_parts.append("EN")
+        elif part.startswith("q"):
+            display_parts.append(part.upper())
+        elif part == "turbo":
+            display_parts.append("Turbo")
+        elif part == "tdrz":
+            display_parts.append("TinyDiarize")
+        elif part.startswith("v") and part[1:].isdigit():
+            display_parts.append(part)
+        else:
+            display_parts.append(part.capitalize())
+
+    return " ".join(display_parts)
+
+
+def _model_specialization_display_name(model_name: str) -> str:
+    """Get a concise label for a whisper.cpp model variant."""
+    if model_name == "large":
+        return "Standard v3"
+
+    quantization = None
+    for part in model_name.split("-"):
+        if part.startswith("q"):
+            quantization = part.upper()
+            break
+
+    if model_name.startswith("large-v") and "turbo" not in model_name:
+        version = next(
+            (part for part in model_name.split("-") if part.startswith("v")),
+            "large",
+        )
+        if quantization:
+            return f"{version} {quantization}"
+        return version
+
+    if is_english_only_whispercpp_model(model_name):
+        return f"English-only {quantization}" if quantization else "English-only"
+
+    if "turbo" in model_name:
+        if quantization:
+            return f"Turbo {quantization}"
+        return "Turbo"
+
+    if quantization:
+        return f"Quantized {quantization}"
+
+    return "Standard multilingual"
+
+
+#: Engines that can honour the follow-layout mode. VOSK loads a different model
+#: per language, so following a layout would stall the hotkey on a model reload;
+#: Parakeet never consumes a catalog language at all. Module level, not a class
+#: attribute, so tests driving the methods against a Mock still reach it.
+FOLLOW_LAYOUT_ENGINES = ("whisper", "whisper_cpp", "faster_whisper", "remote_api")
+
+#: Selected-setting keys that make up the model spec. While a spec that needs a
+#: download is staged (#894), these stay out of the saved config until the
+#: explicit Download confirmation; every other key applies and saves as usual.
+_MODEL_SPEC_KEYS = ("engine", "model_size", "model_variant", "language")
+
+#: Engine attributes a Settings edit can update live with the same clamping
+#: ``reconfigure()`` applies — minus its recording cancel and any model
+#: reload. Every other key (all ``whispercpp_*`` load-time params) stays
+#: saved-only while a download is staged (#894).
+_LIVE_ENGINE_SETTINGS = {
+    "vad_sensitivity": lambda value: max(1, min(5, int(value))),
+    "silence_timeout": lambda value: max(0.5, min(5.0, float(value))),
+}
+
+
+def _is_following_layout(dialog: Any) -> bool:
+    """Whether the follow-keyboard-layout mode is on for this dialog (#821).
+
+    A module function reading a cached bool, deliberately not a method. Several
+    tests drive the dialog methods unbound against a ``Mock``, where a method
+    call on self resolves to a truthy Mock attribute and would invert every
+    guard below. The ``is True`` keeps a Mock attribute from passing either.
+    """
+    return getattr(dialog, "_follow_layout_active", False) is True
+
+
+def _language_for_whispercpp_variant(dialog: Any) -> Optional[str]:
+    """Language that drives .en vs multilingual whisper.cpp derivation.
+
+    Follow-the-layout can land on any language, so it must keep multilingual
+    weights even when the picker is showing the current English layout. Using
+    that display as the derivation language selects ``.en``, Settings then
+    refuses the mode as English-only, and the next auto-apply persists a
+    concrete language and disarms follow (#821).
+    """
+    if _is_following_layout(dialog):
+        return LANGUAGE_FOLLOWS_LAYOUT
+    # Load path: the saved mode is follow, but the switch has not been synced
+    # into ``_follow_layout_active`` yet. ``is True`` so a Mock stays out.
+    if (
+        getattr(dialog, "_follow_layout_saved", False) is True
+        and getattr(dialog, "_initializing", False) is True
+    ):
+        return LANGUAGE_FOLLOWS_LAYOUT
+    return dialog.language_combo.get_active_id() or dialog.language
+
+
+def _language_is_english(language_id: str) -> bool:
+    """Return whether a language ID maps to English for Whisper."""
+    return SUPPORTED_LANGUAGES.get(language_id, {}).get("whisper") == "en"
+
+
+def _decode_simple_languages(primary: str, wants_second: bool, secondary: Optional[str]) -> str:
+    """Resolve the two simple language answers into what the engine accepts.
+
+    whisper takes one language or none, so naming a second language has to mean
+    automatic detection. The one exception is two English entries - en-US plus
+    en-IN, say - where English can still be pinned and the English-only weights,
+    which are the same size and better at English, stay available.
+    """
+    if not wants_second:
+        return primary
+    if not secondary or secondary == primary:
+        return primary
+    if secondary == "auto":
+        return "auto"
+    if _language_is_english(primary) and _language_is_english(secondary):
+        return primary
+    return "auto"
+
+
+def _vosk_display_is_coerced_fallback(
+    previous_engine: Optional[str],
+    displayed: Optional[str],
+    remembered: Optional[str],
+) -> bool:
+    """Return whether ``displayed`` is Vosk's en-us stand-in for ``remembered``.
+
+    Vosk has no auto-detect and no model for some catalog languages (e.g. Greek).
+    Those selections are shown as en-us; that fallback is not a user preference
+    and must not replace ``remembered`` (including auto).
+    """
+    return (
+        previous_engine == "vosk"
+        and displayed == "en-us"
+        and bool(remembered)
+        and remembered != "en-us"
+    )
+
+
+def _recommended_whispercpp_variant_for_language(
+    recommended_model: str,
+    reason: str,
+    language_id: str,
+) -> tuple[str, str]:
+    """Adjust a hardware recommendation to the selected language."""
+    recommended_size = get_whispercpp_model_size(recommended_model)
+    english_variant = f"{recommended_size}.en"
+
+    if _language_is_english(language_id) and english_variant in WHISPERCPP_MODEL_INFO:
+        return english_variant, reason
+
+    return recommended_model, reason
+
+
+def _recommended_faster_whisper_variant_for_language(
+    recommended_model: str,
+    reason: str,
+    language_id: str,
+) -> tuple[str, str]:
+    """Adjust a Faster Whisper hardware recommendation to the selected language."""
+    english_variant = (
+        recommended_model if recommended_model.endswith(".en") else f"{recommended_model}.en"
+    )
+    if _language_is_english(language_id) and english_variant in FASTER_WHISPER_MODEL_INFO:
+        return english_variant, reason
+    return recommended_model, reason
+
+
+def _default_whispercpp_variant_for_size(model_size: str, language_id: str) -> Optional[str]:
+    """Return the default specialization for a user-selected size and language."""
+    return default_variant_for_size(model_size, _language_is_english(language_id))
+
+
+def _is_language_paired_standard_variant(model_name: str) -> bool:
+    """Return whether a model id is the bare multilingual / .en pair for its size.
+
+    Size bucket names (tiny, base, small, medium) are also the multilingual
+    specialization ids. Config often stores those ambiguous size-level defaults,
+    so they must not be treated as a locked multilingual choice.
+    """
+    model_name = model_name.lower()
+    size = get_whispercpp_model_size(model_name)
+    if size == "large":
+        return model_name == "large"
+    return model_name in {size, f"{size}.en"}
+
+
+def _mirror_whispercpp_english_variant(model_name: str) -> str:
+    """Map medium <-> medium.en and medium-q5_0 <-> medium.en-q5_0 style ids."""
+    model_name = model_name.lower()
+    size = get_whispercpp_model_size(model_name)
+    english_prefix = f"{size}.en"
+    if model_name.startswith(english_prefix):
+        return size + model_name[len(english_prefix) :]
+    if model_name.startswith(size):
+        return english_prefix + model_name[len(size) :]
+    return model_name
+
+
+def _whispercpp_variant_for_language(selected_model: str, language_id: str) -> str:
+    """Retarget a saved specialization when language implies .en vs multilingual."""
+    selected_model = selected_model.lower()
+    size = get_whispercpp_model_size(selected_model)
+    variants = get_whispercpp_model_variants(size)
+    if selected_model not in variants:
+        return selected_model
+
+    wants_english = _language_is_english(language_id)
+    is_english_only = is_english_only_whispercpp_model(selected_model)
+
+    if _is_language_paired_standard_variant(selected_model):
+        default = _default_whispercpp_variant_for_size(size, language_id)
+        return default if default in variants else selected_model
+
+    if wants_english != is_english_only:
+        mirrored = _mirror_whispercpp_english_variant(selected_model)
+        if mirrored in variants:
+            return mirrored
+        if not wants_english and is_english_only:
+            default = _default_whispercpp_variant_for_size(size, language_id)
+            if default in variants:
+                return default
+
+    return selected_model
+
+
+# Uniform width for right-hand row controls so they align down a page.
+# ComboBoxText sizes itself to the longest item unless the cell is ellipsized,
+# which is why Shortcut Mode used to dwarf Shortcut Key.
+_CONTROL_WIDTH = 220
+_COMBO_CHARS = 18
+_ACTION_WIDTH = 96
+_SPIN_WIDTH = 88
+_ICON_BUTTON_WIDTH = 36
+_PAIRED_COMBO_WIDTH = _CONTROL_WIDTH - _ICON_BUTTON_WIDTH - 8
+# Term rows are built on the UI thread, so a scanner-managed file with
+# thousands of entries is capped and the remainder summarized in one row.
+_MAX_TERMS_DISPLAYED = 500
+# Rows appended per GLib idle slice: building thousands at once stalls the
+# UI the same way an uncapped list would.
+_TERMS_ROWS_PER_IDLE = 150
+
+
+def _style_combo(combo: Gtk.ComboBox, width: int = _CONTROL_WIDTH) -> Gtk.ComboBox:
+    """Pin a combo to the shared control column so long items cannot stretch it."""
+    combo.set_size_request(width, -1)
+    combo.set_halign(Gtk.Align.END)
+    combo.set_hexpand(False)
+    if not isinstance(combo, Gtk.ComboBox):
+        return combo  # a SearchablePicker sizes its own button
+    combo.set_popup_fixed_width(False)
+    for cell in combo.get_cells():
+        cell.set_property("ellipsize", Pango.EllipsizeMode.END)
+        cell.set_property("width-chars", _COMBO_CHARS)
+        cell.set_property("max-width-chars", _COMBO_CHARS)
+        # Pixel cap so the closed combo cannot grow with the longest item.
+        cell.set_fixed_size(max(width - 40, 80), -1)
+    child = combo.get_child()
+    if isinstance(child, Gtk.Entry):
+        child.set_width_chars(_COMBO_CHARS)
+        child.set_max_width_chars(_COMBO_CHARS)
+        child.set_hexpand(False)
+    return combo
+
+
+def _style_spin(spin: Gtk.SpinButton) -> Gtk.SpinButton:
+    """Keep plus/minus steppers compact and right-aligned."""
+    spin.set_size_request(_SPIN_WIDTH, -1)
+    spin.set_halign(Gtk.Align.END)
+    return spin
+
+
+def _style_action_button(button: Gtk.Button, width: int = _ACTION_WIDTH) -> Gtk.Button:
+    """Give compact action buttons a shared minimum width."""
+    button.set_size_request(width, -1)
+    button.set_halign(Gtk.Align.END)
+    return button
+
+
+def _combo_with_suffix(
+    combo: Gtk.ComboBox,
+    suffix: Gtk.Widget,
+    combo_width: int = _PAIRED_COMBO_WIDTH,
+) -> Gtk.Box:
+    """Right-align a combo and a sibling button as one control cluster."""
+    _style_combo(combo, combo_width)
+    box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    box.set_halign(Gtk.Align.END)
+    box.pack_start(combo, False, False, 0)
+    box.pack_start(suffix, False, False, 0)
+    return box
+
+
+VOCALINUX_SITE_URL = "https://vocalinux.com"
+VOCAHQ_SITE_URL = "https://vocahq.com"
+VOCAMAC_SITE_URL = "https://vocamac.com"
+VOCAWIN_SITE_URL = "https://vocawin.com"
+VOCAPHONE_SITE_URL = "https://vocaphone.vocahq.com"
+VOCAGATEWAY_SITE_URL = "https://vocagateway.vocahq.com"
+GITHUB_REPO_URL = __url__
+GITHUB_ISSUES_URL = "https://github.com/VocaHQ/vocalinux/issues"
+VOCAHQ_DISCORD_URL = "https://discord.gg/t6muquAJbm"
+VOCAHQ_X_URL = "https://x.com/vocahq"
+VOCAHQ_MAILTO_URL = "mailto:hello@vocahq.com"
+
+# About page links that are not GitHub release URLs.
+_ABOUT_OPEN_URLS = frozenset(
+    {
+        VOCALINUX_SITE_URL,
+        VOCAHQ_SITE_URL,
+        VOCAMAC_SITE_URL,
+        VOCAWIN_SITE_URL,
+        VOCAPHONE_SITE_URL,
+        VOCAGATEWAY_SITE_URL,
+        GITHUB_REPO_URL,
+        GITHUB_ISSUES_URL,
+        VOCAHQ_DISCORD_URL,
+        VOCAHQ_X_URL,
+        VOCAHQ_MAILTO_URL,
+    }
+)
+
+# Official Talk-to-us marks from VocaHQ/.github brand/vocahq/social (commit 61c8eee).
+# Do not redraw. fill is currentColor; paint to match the dialog foreground so
+# the marks stay visible on both light and dark surfaces.
+_ABOUT_INK = "#14231C"
+_ABOUT_INK_ON_DARK = "#E6E1D8"
+_ABOUT_ICON_TEXT_PX = 18
+_FAMILY_ICON_PX = 22
+
+
+def _color_luminance(color: Any) -> float:
+    """Relative luminance of a Gdk.RGBA (0 = black, 1 = white)."""
+    return 0.2126 * color.red + 0.7152 * color.green + 0.0722 * color.blue
+
+
+def _rgba_to_hex(color: Any) -> str:
+    """Format a Gdk.RGBA as #rrggbb."""
+    r = max(0, min(255, int(round(color.red * 255))))
+    g = max(0, min(255, int(round(color.green * 255))))
+    b = max(0, min(255, int(round(color.blue * 255))))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _about_surface_is_dark() -> bool:
+    """Return True when GTK is using a dark theme."""
+    settings = Gtk.Settings.get_default()
+    if settings is not None:
+        try:
+            if bool(settings.get_property("gtk-application-prefer-dark-theme")):
+                return True
+        except Exception:
+            pass
+        try:
+            theme = str(settings.get_property("gtk-theme-name") or "").lower()
+            if "dark" in theme:
+                return True
+        except Exception:
+            pass
+    try:
+        from ..utils.gtk_color_scheme import read_os_color_scheme
+
+        if read_os_color_scheme() == "prefer-dark":
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _about_ink_hex(widget: Optional[Gtk.Widget] = None) -> str:
+    """Ink for currentColor marks: theme fg when known, else light/dark defaults."""
+    dark = _about_surface_is_dark()
+    if widget is not None:
+        ctx = widget.get_style_context()
+        for name in ("theme_fg_color", "theme_text_color", "fg_color"):
+            try:
+                found, color = ctx.lookup_color(name)
+            except Exception:
+                continue
+            if not found:
+                continue
+            lum = _color_luminance(color)
+            if dark and lum >= 0.45:
+                return _rgba_to_hex(color)
+            if not dark and lum <= 0.40:
+                return _ABOUT_INK
+    return _ABOUT_INK_ON_DARK if dark else _ABOUT_INK
+
+
+# Official platform marks from VocaHQ/.github brand/promo/cards/platform
+# (currentColor copies live in web/public/brand/platforms). Home is a simple
+# house so HQ does not reuse a product lockup.
+_VOCAHQ_FAMILY_LINKS = (
+    (
+        VOCAHQ_SITE_URL,
+        "VocaHQ",
+        "Family site",
+        ("platform-home",),
+        "Open vocahq.com",
+    ),
+    (
+        VOCALINUX_SITE_URL,
+        "Vocalinux",
+        "Linux, available now",
+        ("platform-linux",),
+        "Open vocalinux.com",
+    ),
+    (
+        VOCAMAC_SITE_URL,
+        "VocaMac",
+        "macOS, available now",
+        ("platform-apple",),
+        "Open vocamac.com",
+    ),
+    (
+        VOCAWIN_SITE_URL,
+        "VocaWin",
+        "Windows, unsigned beta",
+        ("platform-windows",),
+        "Open vocawin.com",
+    ),
+    (
+        VOCAPHONE_SITE_URL,
+        "VocaPhone",
+        "Android beta / iOS TestFlight",
+        ("platform-android", "platform-apple"),
+        "Open vocaphone.vocahq.com",
+    ),
+    (
+        VOCAGATEWAY_SITE_URL,
+        "VocaGateway",
+        "Self-hosted, headless",
+        ("platform-server",),
+        "Open vocagateway.vocahq.com",
+    ),
+)
+
+# Settings combo labels. The row subtitle already explains the behavior, so
+# these stay short enough to match Shortcut Key.
+_SHORTCUT_MODE_COMBO_LABELS = {
+    "toggle": "Toggle",
+    "push_to_talk": "Push-to-Talk",
+}
+
+
+def _can_open_url(url: str) -> bool:
+    """Return True for GitHub project URLs or the About page allowlist."""
+    return bool(url) and (url in _ABOUT_OPEN_URLS or is_trusted_release_url(url))
+
+
+def _set_accessible_name(widget: Gtk.Widget, name: str) -> None:
+    """Set the ATK name so identical visible labels stay distinguishable."""
+    accessible = widget.get_accessible()
+    if accessible is not None:
+        accessible.set_name(name)
+
+
+MODEL_SIZE_TOOLTIP = (
+    "Choose the largest model your computer can run comfortably. Tiny/Base are fastest, "
+    "Small is balanced, and Medium/Large can be more accurate but need more memory."
+)
+MODEL_SPECIALIZATION_TOOLTIP = (
+    "Choose Standard multilingual unless you specifically need English-only accuracy, "
+    "lower-memory quantized models, Turbo speed, or a legacy large model."
+)
+FOLLOW_LAYOUT_TOOLTIP = (
+    "Re-reads your active keyboard layout at the start of every dictation and "
+    "picks the matching language. Useful if you switch layouts to work in more "
+    "than one language. Needs a multilingual model; not available for VOSK, "
+    "which loads a separate model per language."
+)
+
+LANGUAGE_TOOLTIP = (
+    "Choose the language you dictate in. Search the list. Picking a language "
+    "other than English switches off an English-only model."
+)
+
+
+def _model_specialization_tooltip(model_name: str) -> str:
+    """Return hover guidance for a whisper.cpp specialization."""
+    is_english_only = is_english_only_whispercpp_model(model_name)
+    is_quantized = any(part.startswith("q") for part in model_name.split("-"))
+
+    if "turbo" in model_name:
+        if is_quantized:
+            return (
+                "Choose this for a faster large-v3 Turbo model with lower disk and memory use; "
+                "expect a small accuracy tradeoff from quantization."
+            )
+        return (
+            "Choose Turbo when you want high accuracy from a large model with less memory use "
+            "and faster inference than full large v3."
+        )
+
+    if model_name.startswith("large-v") and model_name != "large":
+        return (
+            "Choose this only if you specifically want that legacy large model version; "
+            "Standard v3 or Turbo is the better default for most users."
+        )
+
+    if is_english_only and is_quantized:
+        return (
+            "Choose this for English-only dictation on lower-memory systems; choose "
+            "multilingual if you use auto-detect or any non-English language."
+        )
+
+    if is_english_only:
+        return (
+            "Choose this when you dictate only in English. It can be better for English, "
+            "but it will not work for other languages."
+        )
+
+    if is_quantized:
+        return (
+            "Choose this on lower-memory systems or when download size matters; it uses "
+            "less disk and RAM with a possible accuracy tradeoff."
+        )
+
+    if model_name == "large":
+        return (
+            "Choose Standard v3 when you want the highest default accuracy and have enough "
+            "memory for a large model."
+        )
+
+    return (
+        "Choose Standard multilingual for most users, auto-detect, or any supported "
+        "non-English language."
+    )
+
+
+# Whisper model metadata for display
+WHISPER_MODEL_INFO = {
+    "tiny": {"size_mb": 75, "desc": "Fastest, lowest accuracy", "params": "39M"},
+    "base": {"size_mb": 142, "desc": "Fast, good for basic use", "params": "74M"},
+    "small": {"size_mb": 466, "desc": "Balanced speed/accuracy", "params": "244M"},
+    "medium": {"size_mb": 1500, "desc": "High accuracy, slower", "params": "769M"},
+    "large": {"size_mb": 2900, "desc": "Highest accuracy, slowest", "params": "1550M"},
+}
+
+
+def get_available_engines():
+    """
+    Detect which speech recognition engines are available/installed.
+    Returns a dictionary of engine_name -> availability (bool).
+    """
+    engines = {
+        "vosk": False,
+        "whisper": False,
+        "whisper_cpp": False,
+        "parakeet": False,
+        "faster_whisper": False,
+        "remote_api": False,
+    }
+
+    # Check VOSK
+    try:
+        import vosk
+
+        engines["vosk"] = True
+    except ImportError:
+        pass
+
+    # Check OpenAI Whisper
+    try:
+        import whisper
+
+        engines["whisper"] = True
+    except ImportError:
+        pass
+
+    # Check whisper.cpp (pywhispercpp)
+    try:
+        from pywhispercpp.model import Model
+
+        engines["whisper_cpp"] = True
+    except ImportError:
+        pass
+
+    # Check Parakeet (sherpa-onnx)
+    try:
+        import sherpa_onnx  # noqa: F401
+
+        engines["parakeet"] = True
+    except ImportError:
+        pass
+
+    try:
+        from faster_whisper import WhisperModel  # noqa: F401
+
+        engines["faster_whisper"] = True
+    except ImportError:
+        pass
+
+    # Remote API is always available (only requires requests package)
+    try:
+        import requests  # noqa: F401
+
+        engines["remote_api"] = True
+    except ImportError:
+        pass
+
+    logger.debug(f"Available engines: {engines}")
+    return engines
+
+
+# Models directory
+MODELS_DIR = models_dir()
+SYSTEM_MODELS_DIRS = [
+    "/usr/local/share/vocalinux/models",
+    "/usr/share/vocalinux/models",
+]
+
+# CSS for modern styling
+SETTINGS_CSS = """
+/* Sidebar navigation (GNOME Settings style) */
+.settings-sidebar {
+    background-color: alpha(@theme_bg_color, 0.5);
+    border-right: 1px solid alpha(@borders, 0.5);
+}
+
+.settings-sidebar list {
+    background-color: transparent;
+}
+
+.sidebar-row {
+    padding: 10px 12px;
+    border-radius: 8px;
+    margin: 1px 6px;
+}
+
+.sidebar-row:hover {
+    background-color: alpha(@theme_fg_color, 0.07);
+}
+
+.sidebar-row:selected {
+    background-color: alpha(@theme_selected_bg_color, 0.85);
+    color: @theme_selected_fg_color;
+}
+
+.sidebar-row label {
+    font-weight: 500;
+    font-size: 0.95em;
+}
+
+.sidebar-match-count {
+    font-size: 0.8em;
+    color: @theme_unfocused_fg_color;
+    background-color: alpha(@theme_fg_color, 0.1);
+    border-radius: 10px;
+    padding: 1px 7px;
+}
+
+.sidebar-row:selected .sidebar-match-count {
+    color: @theme_selected_fg_color;
+    background-color: alpha(@theme_selected_fg_color, 0.2);
+}
+
+.sidebar-update-badge {
+    font-size: 0.75em;
+    font-weight: 600;
+    color: #ffffff;
+    background-color: #26a269;
+    border-radius: 10px;
+    padding: 1px 7px;
+}
+
+.settings-search {
+    margin: 8px 6px 14px 6px;
+    border-radius: 8px;
+}
+
+/* Sidebar footer: dictation status, test action, and dialog close */
+.sidebar-footer {
+    padding: 10px 6px 12px 6px;
+}
+
+.sidebar-footer button {
+    min-height: 30px;
+    border-radius: 8px;
+}
+
+/* Empty search results */
+.search-empty-title {
+    font-size: 1.1em;
+    font-weight: bold;
+    color: @theme_unfocused_fg_color;
+}
+
+/* Recognition state label in the sidebar footer */
+.status-strip-state {
+    font-weight: 500;
+    font-size: 0.9em;
+}
+
+/* Modern GNOME-style settings dialog */
+.settings-dialog {
+    background-color: @theme_bg_color;
+}
+
+/* Preference group styling - card-like appearance */
+.preferences-group {
+    background-color: @theme_base_color;
+    border-radius: 12px;
+    padding: 0;
+    margin: 6px 0;
+    border: 1px solid alpha(@borders, 0.5);
+}
+
+/* Keep child list backgrounds inside the card's rounded lower corners. */
+.preferences-group-list {
+    background-color: transparent;
+    border-radius: 0 0 11px 11px;
+}
+
+.preferences-group-list > row:last-child,
+.preferences-group-list > row:last-child:hover {
+    border-radius: 0 0 11px 11px;
+}
+
+.dictionary-entry-list {
+    background-color: transparent;
+}
+
+.preferences-group-title {
+    font-weight: bold;
+    font-size: 0.9em;
+    color: @theme_unfocused_fg_color;
+    padding: 12px 16px 6px 16px;
+    margin: 0;
+}
+
+/* Row styling */
+.preference-row {
+    padding: 12px 16px;
+    min-height: 32px;
+    border-bottom: 1px solid alpha(@borders, 0.3);
+}
+
+.preference-row:last-child {
+    border-bottom: none;
+}
+
+.preference-row:hover {
+    background-color: alpha(@theme_selected_bg_color, 0.1);
+}
+
+.preference-row-title {
+    font-weight: 500;
+}
+
+.preference-row-subtitle {
+    font-size: 0.85em;
+    color: @theme_unfocused_fg_color;
+}
+
+/* Status indicators */
+.status-success {
+    color: #26a269;
+}
+
+.status-warning {
+    color: #e5a50a;
+}
+
+.status-error {
+    color: #c01c28;
+}
+
+.status-info {
+    color: @theme_unfocused_fg_color;
+}
+
+/* Test area styling */
+.test-area {
+    background-color: @theme_base_color;
+    border-radius: 8px;
+    padding: 12px;
+    border: 1px solid alpha(@borders, 0.5);
+}
+
+.test-textview {
+    font-family: monospace;
+    font-size: 0.95em;
+    padding: 8px;
+    background-color: alpha(@theme_bg_color, 0.5);
+    border-radius: 6px;
+}
+
+/* Level bars */
+levelbar block.filled {
+    background-color: @theme_selected_bg_color;
+    border-radius: 3px;
+}
+
+levelbar block.empty {
+    background-color: alpha(@theme_fg_color, 0.1);
+    border-radius: 3px;
+}
+
+/* Combo boxes and spin buttons */
+combobox {
+    min-width: 0;
+}
+
+combobox button,
+combobox entry,
+spinbutton {
+    min-height: 32px;
+    min-width: 0;
+    border-radius: 6px;
+}
+
+.suffix-button {
+    min-height: 32px;
+    min-width: 36px;
+    padding: 0 8px;
+    border-radius: 6px;
+}
+
+/* Section headers */
+.section-header {
+    font-size: 1.1em;
+    font-weight: bold;
+    margin-top: 12px;
+    margin-bottom: 6px;
+}
+
+/* Flat helper notices — muted surface, no accent strip */
+.info-box {
+    background-color: alpha(@theme_fg_color, 0.04);
+    border: 1px solid alpha(@borders, 0.45);
+    border-radius: 8px;
+    padding: 10px 12px;
+}
+
+.info-box image {
+    opacity: 0.55;
+}
+
+.info-box-warning {
+    background-color: alpha(#e5a50a, 0.08);
+    border-color: alpha(#e5a50a, 0.4);
+}
+
+/* Recognition status */
+.recognition-idle {
+    color: @theme_unfocused_fg_color;
+}
+
+.recognition-listening {
+    color: #26a269;
+}
+
+.recognition-processing {
+    color: #e5a50a;
+}
+
+.recognition-error {
+    color: #c01c28;
+}
+
+/* Buttons */
+.suggested-action {
+    background-color: @theme_selected_bg_color;
+    color: @theme_selected_fg_color;
+}
+
+.flat-button {
+    background: transparent;
+    border: none;
+    padding: 8px;
+    border-radius: 6px;
+}
+
+.flat-button:hover {
+    background-color: alpha(@theme_fg_color, 0.1);
+}
+
+/* Scrolled content */
+.scrolled-content {
+    background-color: transparent;
+}
+
+/* Model status: caption under the engine group, not a second card */
+.model-info-card {
+    background-color: transparent;
+    border-radius: 0;
+    padding: 2px 16px 8px 16px;
+    margin: 0;
+}
+
+.model-info-title {
+    font-weight: 500;
+    font-size: 0.95em;
+}
+
+.family-tile {
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: transparent;
+}
+
+.family-tile:hover {
+    background-color: alpha(@theme_selected_bg_color, 0.1);
+}
+
+.family-tile-title {
+    font-weight: 500;
+}
+
+.family-tile-subtitle {
+    font-size: 0.85em;
+    color: @theme_unfocused_fg_color;
+}
+
+.about-mark-button image {
+    margin-right: 8px;
+}
+
+/* Sibling expander cards on Speech Model (Advanced, Unused downloads).
+   Padding lives on the expander, not the title class: .preferences-group-title
+   already has 16px inset, which stacked with expander margin and shoved the
+   chevron off the unused-downloads title. */
+.expander-card expander {
+    padding: 10px 12px;
+}
+
+.expander-card-title {
+    font-weight: bold;
+    font-size: 0.9em;
+    color: @theme_unfocused_fg_color;
+}
+
+.expander-card-subtitle {
+    font-size: 0.85em;
+    color: @theme_unfocused_fg_color;
+}
+
+.expander-card list {
+    background-color: transparent;
+}
+
+.model-info-subtitle {
+    font-size: 0.9em;
+    color: @theme_unfocused_fg_color;
+}
+
+/* Tip styling */
+.tip-label {
+    font-size: 0.85em;
+    color: @theme_unfocused_fg_color;
+    font-style: italic;
+}
+
+.tip-highlight {
+    font-weight: bold;
+    color: @theme_selected_bg_color;
+}
+"""
+
+
+def _setup_css():
+    """Set up CSS styling for the settings dialog."""
+    css_provider = Gtk.CssProvider()
+    css_provider.load_from_data(SETTINGS_CSS.encode())
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(),
+        css_provider,
+        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+    )
+
+
+def _prevent_scroll_on_hover(widget: Gtk.Widget):
+    """
+    Prevent scroll events from modifying widget values when hovering.
+
+    Unfocused ComboBox/SpinButton widgets ignore wheel input so scrolling a
+    settings tab does not accidentally change values. The event is applied to
+    the nearest ancestor ScrolledWindow instead, so the page still scrolls.
+    """
+
+    def on_scroll(widget, event):
+        if widget.has_focus():
+            return False
+        scrolled = widget.get_ancestor(Gtk.ScrolledWindow)
+        if scrolled is not None:
+            scrolled.event(event)
+        return True
+
+    widget.connect("scroll-event", on_scroll)
+    widget.set_can_focus(True)
+
+
+def _combo_text_matches_query(query: str, item_id: str, item_text: str) -> bool:
+    """Return whether a combo row matches a case-insensitive search query."""
+    needle = (query or "").strip().lower()
+    if not needle:
+        return True
+    return needle in (item_text or "").lower() or needle in (item_id or "").lower()
+
+
+def _resolve_combo_text_query(query: str, rows: list) -> Optional[str]:
+    """Return a unique matching combo id, preferring an exact name or id."""
+    needle = (query or "").strip()
+    if not needle:
+        return None
+    needle_l = needle.lower()
+    matches = []
+    for item_id, item_text in rows:
+        item_id = item_id or ""
+        item_text = item_text or ""
+        if item_text.lower() == needle_l or item_id.lower() == needle_l:
+            return item_id
+        if _combo_text_matches_query(needle, item_id, item_text):
+            matches.append(item_id)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _combo_text_rows(combo: Gtk.ComboBoxText) -> list:
+    """Return ``(id, display text)`` pairs from a ComboBoxText model.
+
+    Gtk.ComboBoxText stores display text in column 0 and the id in column 1.
+    """
+    # A SearchablePicker keeps its rows in base_model (ComboBoxText column order);
+    # resolve typed text against every row, not only the ones currently shown.
+    model = getattr(combo, "base_model", None) or combo.get_model()
+    if not model:
+        return []
+    return [(row[1], row[0]) for row in model]
+
+
+def _combo_completion_match(completion, key, tree_iter, *_args) -> bool:
+    """GtkEntryCompletion match function for ComboBoxText text/id columns."""
+    model = completion.get_model()
+    if model is None:
+        return False
+    row = model[tree_iter]
+    return _combo_text_matches_query(key, row[1], row[0])
+
+
+class SearchablePicker(Gtk.Box):
+    """A picker you can type into while its list is open.
+
+    A GtkComboBox dropdown takes the keyboard for its own first-letter jump the
+    moment it opens, so nothing typed reaches a filter. This one opens a popover
+    holding a search entry, focused on open, above the list; every keystroke
+    narrows the rows, Enter takes the first match after a non-empty filter, and
+    a click takes that row. Empty Enter is a no-op so it cannot auto-apply the
+    first store row.
+
+    Keeps the handful of GtkComboBoxText methods the dialog relies on, so it
+    drops in where one stood. ``base_model`` mirrors the ComboBoxText store —
+    display text in column 0, id in column 1 — for the shared row helpers.
+    """
+
+    __gsignals__ = {"changed": (GObject.SignalFlags.RUN_FIRST, None, ())}
+
+    _LIST_HEIGHT = 300
+
+    def __init__(self) -> None:
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self.base_model: list[list] = []
+        self._active_id: Optional[str] = None
+        self._rows_by_id: dict = {}
+
+        self._label = Gtk.Label(xalign=0)
+        self._label.set_ellipsize(Pango.EllipsizeMode.END)
+        arrow = Gtk.Image.new_from_icon_name("pan-down-symbolic", Gtk.IconSize.BUTTON)
+        button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        button_box.pack_start(self._label, True, True, 0)
+        button_box.pack_end(arrow, False, False, 0)
+        self._button = Gtk.Button()
+        self._button.add(button_box)
+        self._button.connect("clicked", self._on_button_clicked)
+        self.pack_start(self._button, True, True, 0)
+
+        self._search = Gtk.SearchEntry()
+        self._search.set_placeholder_text("Search…")
+        self._search.connect("search-changed", self._on_search_changed)
+        self._search.connect("activate", self._on_search_activate)
+
+        self._list = Gtk.ListBox()
+        self._list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self._list.set_filter_func(self._row_is_visible)
+        self._list.connect("row-activated", self._on_row_activated)
+
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_size_request(-1, self._LIST_HEIGHT)
+        scroller.add(self._list)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        content.set_border_width(6)
+        content.pack_start(self._search, False, False, 0)
+        content.pack_start(scroller, True, True, 0)
+        content.show_all()
+
+        self._popover = Gtk.Popover.new(self._button)
+        self._popover.set_position(Gtk.PositionType.BOTTOM)
+        self._popover.add(content)
+        self._popover.connect("closed", self._on_popover_closed)
+
+    # -- GtkComboBoxText-compatible surface --------------------------------
+
+    def append(self, item_id: Optional[str], text: str) -> None:
+        """Add a row, taking the arguments in GtkComboBoxText order."""
+        self.base_model.append([text, item_id])
+        row = Gtk.ListBoxRow()
+        label = Gtk.Label(label=text, xalign=0)
+        label.set_margin_top(6)
+        label.set_margin_bottom(6)
+        label.set_margin_start(8)
+        label.set_margin_end(8)
+        row.add(label)
+        row.item_id = item_id
+        row.item_text = text
+        row.show_all()
+        self._list.add(row)
+        self._rows_by_id[item_id] = row
+
+    def remove_all(self) -> None:
+        """Drop every row and clear the active selection."""
+        self.base_model.clear()
+        self._rows_by_id.clear()
+        for row in list(self._list.get_children()):
+            self._list.remove(row)
+        self._active_id = None
+        self._label.set_text("")
+
+    def get_model(self) -> list:
+        """The ComboBoxText-shaped store: [display text, id] per row."""
+        return self.base_model
+
+    def get_active_id(self) -> Optional[str]:
+        """The id of the selected row, or None."""
+        return self._active_id
+
+    def get_active_text(self) -> Optional[str]:
+        """The display text of the selected row, or None."""
+        row = self._rows_by_id.get(self._active_id)
+        return row.item_text if row is not None else None
+
+    def set_active_id(self, item_id: Optional[str]) -> bool:
+        """Select by id; False if that id is not in the list."""
+        row = self._rows_by_id.get(item_id)
+        if row is None:
+            return False
+        self._select(item_id, row.item_text)
+        return True
+
+    def set_active(self, index: int) -> None:
+        """Select by store index; no-op if the index is out of range."""
+        if 0 <= index < len(self.base_model):
+            text, item_id = self.base_model[index]
+            self._select(item_id, text)
+
+    def get_child(self) -> Gtk.SearchEntry:
+        """The search entry, for callers that hook a ComboBoxText's entry."""
+        return self._search
+
+    # -- behaviour ---------------------------------------------------------
+
+    def _select(self, item_id: Optional[str], text: Optional[str]) -> None:
+        changed = item_id != self._active_id
+        self._active_id = item_id
+        self._label.set_text(text or "")
+        if changed:
+            self.emit("changed")
+
+    def _on_button_clicked(self, _button: Gtk.Button) -> None:
+        self._search.set_text("")
+        self._list.invalidate_filter()
+        self._popover.show_all()
+        self._popover.popup()
+        self._search.grab_focus()
+
+    def _on_popover_closed(self, _popover: Gtk.Popover) -> None:
+        self._search.set_text("")
+        self._list.invalidate_filter()
+
+    def _row_is_visible(self, row: Gtk.ListBoxRow) -> bool:
+        needle = (self._search.get_text() or "").strip()
+        if not needle:
+            return True
+        # Same rule the typed-text resolver uses, so the list and Enter agree.
+        return _combo_text_matches_query(needle, row.item_id, row.item_text)
+
+    def _on_search_changed(self, _entry: Gtk.SearchEntry) -> None:
+        self._list.invalidate_filter()
+
+    def _first_visible_row(self) -> Optional[Gtk.ListBoxRow]:
+        for row in self._list.get_children():
+            if row.get_visible() and row.get_child_visible() and self._row_is_visible(row):
+                return row
+        return None
+
+    def _on_search_activate(self, _entry: Gtk.SearchEntry) -> None:
+        # Empty (or whitespace-only) Enter must not grab the first store row and
+        # auto-apply a language the user never chose. First-match only after a
+        # non-empty filter.
+        needle = (self._search.get_text() or "").strip()
+        if not needle:
+            return
+        row = self._first_visible_row()
+        if row is not None:
+            self._on_row_activated(self._list, row)
+
+    def _on_row_activated(self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
+        self._popover.popdown()
+        self._select(row.item_id, row.item_text)
+
+
+def _attach_language_combo_search(combo: Gtk.ComboBoxText) -> None:
+    """Filter language choices as the user types in a ComboBoxText entry."""
+    if isinstance(combo, SearchablePicker):
+        return  # the picker filters its own list; a completion popup would fight it
+    entry = combo.get_child()
+    if entry is None:
+        return
+    entry.set_placeholder_text("Search languages…")
+    completion = Gtk.EntryCompletion()
+    completion.set_model(getattr(combo, "base_model", None) or combo.get_model())
+    # ComboBoxText store: column 0 is display text, column 1 is id.
+    completion.set_text_column(0)
+    completion.set_inline_completion(False)
+    completion.set_popup_completion(True)
+    completion.set_minimum_key_length(1)
+    completion.set_match_func(_combo_completion_match)
+    entry.set_completion(completion)
+
+
+def _get_whisper_cache_dir() -> str:
+    """Get the Whisper model cache directory."""
+    return os.path.join(MODELS_DIR, "whisper")
+
+
+def _whisper_model_files(model_name: str) -> list[str]:
+    """Return existing OpenAI Whisper weight files for a catalog model name."""
+    if model_name not in WHISPER_MODEL_INFO:
+        return []
+
+    filename = whisper_model_file(model_name)
+    candidates = [
+        os.path.join(_get_whisper_cache_dir(), filename),
+        os.path.join(os.path.expanduser("~/.cache/whisper"), filename),
+    ]
+    allowed_parents = {
+        os.path.realpath(_get_whisper_cache_dir()),
+        os.path.realpath(os.path.expanduser("~/.cache/whisper")),
+    }
+
+    found: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not os.path.isfile(candidate):
+            continue
+        real = os.path.realpath(candidate)
+        if real in seen or os.path.dirname(real) not in allowed_parents:
+            continue
+        if os.path.basename(real) != filename:
+            continue
+        seen.add(real)
+        found.append(real)
+    return found
+
+
+def _is_whisper_model_downloaded(model_name: str) -> bool:
+    """Check if a Whisper model is downloaded.
+
+    Only the directory the engine passes to ``whisper.load_model`` as
+    ``download_root`` counts. A copy in the default ~/.cache/whisper is not used
+    by the engine, so reporting it as downloaded would promise the user a model
+    that selecting it then spends up to 2.9GB fetching.
+
+    That has a corollary worth stating plainly, because this function is what
+    ``_list_downloaded_whisper_models`` filters on and the dialog can only delete
+    what it lists: deleting a model here also removes a copy in
+    ~/.cache/whisper, since ``_whisper_model_files`` returns both, but a model
+    that exists *only* there is not listed and so cannot be reclaimed from this
+    dialog at all.
+    """
+    model_file = os.path.join(_get_whisper_cache_dir(), whisper_model_file(model_name))
+    return os.path.exists(model_file)
+
+
+def _list_downloaded_whisper_models() -> list[str]:
+    """Return OpenAI Whisper catalog names that are present on disk.
+
+    Checkpoints an earlier release stored under the catalog name are renamed
+    first, so a "large" downloaded back then is listed here (and can therefore be
+    deleted) instead of sitting on disk unreachable from this dialog.
+    """
+    migrate_legacy_checkpoint_names(_get_whisper_cache_dir())
+    return [name for name in WHISPER_MODEL_INFO if _is_whisper_model_downloaded(name)]
+
+
+def _delete_whisper_model(model_name: str) -> list[str]:
+    """Delete OpenAI Whisper weight files for a catalog model name."""
+    if model_name not in WHISPER_MODEL_INFO:
+        raise ValueError(f"Unknown Whisper model: {model_name}")
+
+    files = _whisper_model_files(model_name)
+    if not files:
+        raise FileNotFoundError(model_name)
+
+    for path in files:
+        os.remove(path)
+        logger.info("Deleted Whisper model %s (%s)", model_name, path)
+    return files
+
+
+def _format_size(size_mb: int) -> str:
+    """Format size in MB to human readable string."""
+    if size_mb >= 1000:
+        return f"{size_mb / 1000:.1f} GB"
+    return f"{size_mb} MB"
+
+
+def _get_recommended_whisper_model() -> tuple:
+    """Get recommended model based on system configuration."""
+    import warnings
+
+    try:
+        import psutil
+
+        ram_gb = math.ceil(psutil.virtual_memory().total / (1024**3))
+
+        # Check for CUDA - suppress warnings during detection
+        has_cuda = False
+        cuda_memory_gb = 0
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                import torch
+
+                if torch.cuda.is_available():
+                    has_cuda = True
+                    cuda_memory_gb = torch.cuda.get_device_properties(0).total_memory // (1024**3)
+        except Exception:
+            pass
+
+        if has_cuda and cuda_memory_gb >= 8:
+            return "medium", f"GPU with {cuda_memory_gb}GB VRAM"
+        elif has_cuda and cuda_memory_gb >= 4:
+            return "small", f"GPU with {cuda_memory_gb}GB VRAM"
+        elif ram_gb >= 8:
+            return "small", f"{ram_gb}GB RAM - good balance"
+        elif ram_gb >= 4:
+            return "base", f"{ram_gb}GB RAM"
+        else:
+            return "tiny", f"Limited RAM ({ram_gb}GB)"
+    except Exception:
+        return "base", "Default recommendation"
+
+
+def _is_vosk_model_downloaded(size: str, language: str) -> bool:
+    """Check if a VOSK model is downloaded."""
+    if size not in VOSK_MODEL_INFO:
+        return False
+
+    # Auto-detect is not supported by VOSK, fall back to en-us
+    if language == "auto" or language not in VOSK_MODEL_INFO[size]["languages"]:
+        language = "en-us"
+
+    model_name = VOSK_MODEL_INFO[size]["languages"][language]
+
+    # Check user's local models directory
+    user_model_path = os.path.join(MODELS_DIR, model_name)
+    if os.path.exists(user_model_path):
+        return True
+
+    # Check system-wide installation directories
+    for system_dir in SYSTEM_MODELS_DIRS:
+        system_model_path = os.path.join(system_dir, model_name)
+        if os.path.exists(system_model_path):
+            return True
+
+    return False
+
+
+def _get_recommended_vosk_model() -> tuple:
+    """Get recommended VOSK model based on system configuration."""
+    try:
+        import psutil
+
+        ram_gb = math.ceil(psutil.virtual_memory().total / (1024**3))
+
+        # VOSK models are CPU-based, so we recommend based on RAM and disk space
+        if ram_gb >= 4:
+            return "medium", f"{ram_gb}GB RAM - better accuracy"
+        else:
+            return "small", f"Limited RAM ({ram_gb}GB) - optimized for speed"
+    except Exception:
+        return "small", "Default recommendation"
+
+
+class ModelRecommendation(NamedTuple):
+    """The model this system should use for an engine, ready to present."""
+
+    model_id: str
+    reason: str
+    display_name: str
+    size_label: str
+
+
+def recommended_model_for_engine(
+    engine: str, language: str = "auto"
+) -> Optional[ModelRecommendation]:
+    """Return the model to download for an engine, or None if it needs none.
+
+    This is the recommendation the model picker marks with a star, exposed for
+    callers outside the dialog (the tray offers it when dictation is attempted
+    without a model).
+    """
+    if engine == "whisper_cpp":
+        recommended_model, reason = get_recommended_whispercpp_model()
+        model_id, reason = _recommended_whispercpp_variant_for_language(
+            recommended_model, reason, language
+        )
+        size_mb = WHISPERCPP_MODEL_INFO.get(model_id, {}).get("size_mb", 0)
+    elif engine == "whisper":
+        model_id, reason = _get_recommended_whisper_model()
+        size_mb = WHISPER_MODEL_INFO.get(model_id, {}).get("size_mb", 0)
+    elif engine == "vosk":
+        model_id, reason = _get_recommended_vosk_model()
+        size_mb = VOSK_MODEL_INFO.get(model_id, {}).get("size_mb", 0)
+    elif engine == "parakeet":
+        model_id = parakeet.RECOMMENDED_MODEL
+        reason = parakeet.RECOMMENDED_REASON
+        size_mb = parakeet.PARAKEET_MODEL_INFO.get(model_id, {}).get("size_mb", 0)
+    elif engine == "faster_whisper":
+        recommended_model, reason = get_recommended_faster_whisper_model()
+        model_id, reason = _recommended_faster_whisper_variant_for_language(
+            recommended_model, reason, language
+        )
+        size_mb = FASTER_WHISPER_MODEL_INFO.get(model_id, {}).get("size_mb", 0)
+    else:
+        # Remote API transcribes server-side; there is nothing to download.
+        return None
+
+    size_mb = size_mb if isinstance(size_mb, int) else 0
+    return ModelRecommendation(
+        model_id=model_id,
+        reason=reason,
+        display_name=_model_display_name(model_id),
+        size_label=_format_size(size_mb),
+    )
+
+
+# GDK key-symbol names that are themselves modifiers (skipped while recording).
+_GDK_MODIFIER_KEYNAMES = {
+    "Control_L",
+    "Control_R",
+    "Alt_L",
+    "Alt_R",
+    "Shift_L",
+    "Shift_R",
+    "Super_L",
+    "Super_R",
+    "Meta_L",
+    "Meta_R",
+    "Hyper_L",
+    "Hyper_R",
+    "ISO_Level3_Shift",
+}
+
+# GDK key-symbol names -> canonical main-key tokens (irregular names only;
+# single letters/digits and function keys are handled by rule).
+_GDK_KEYNAME_TOKENS = {
+    "space": "space",
+    "Return": "enter",
+    "KP_Enter": "enter",
+    "Tab": "tab",
+    "Escape": "esc",
+    "BackSpace": "backspace",
+    "Delete": "delete",
+    "Insert": "insert",
+    "Home": "home",
+    "End": "end",
+    "Page_Up": "pageup",
+    "Page_Down": "pagedown",
+    "Up": "up",
+    "Down": "down",
+    "Left": "left",
+    "Right": "right",
+    "comma": "comma",
+    "period": "period",
+    "slash": "slash",
+    "semicolon": "semicolon",
+    "apostrophe": "apostrophe",
+    "grave": "grave",
+    "minus": "minus",
+    "equal": "equal",
+    "bracketleft": "leftbracket",
+    "bracketright": "rightbracket",
+    "backslash": "backslash",
+}
+
+
+def _gdk_keyname_to_token(name: Optional[str]) -> Optional[str]:
+    """Map a GDK keyval name to a canonical main-key token, or None."""
+    if not name:
+        return None
+    if name in _GDK_KEYNAME_TOKENS:
+        return _GDK_KEYNAME_TOKENS[name]
+    if len(name) == 1 and name.isalnum():
+        return name.lower()
+    if re.fullmatch(r"[Ff]([1-9]|1[0-9]|2[0-4])", name):
+        return name.lower()
+    return None
+
+
+def function_token_from_gdk_hardware_keycode(hardware_keycode: int) -> Optional[str]:
+    """Map XKB/GDK hardware keycodes 191–202 (FK13–FK24) to f13–f24.
+
+    Default evdev maps those keys to XF86* keysyms or NoSymbol; the XKB
+    keycode is the unambiguous signal. F1–F12 use other keycodes and already
+    arrive as F1–F12 keysyms.
+    """
+    try:
+        code = int(hardware_keycode)
+    except (TypeError, ValueError):
+        return None
+    if 191 <= code <= 202:
+        return f"f{code - 178}"
+    return None
+
+
+def function_token_from_evdev_code(code: int) -> Optional[str]:
+    """Map evdev KEY_F13–KEY_F24 (183–194) to f13–f24."""
+    try:
+        key = int(code)
+    except (TypeError, ValueError):
+        return None
+    if 183 <= key <= 194:
+        return f"f{key - 170}"
+    return None
+
+
+def modifiers_from_active_evdev_codes(active_codes: set[int]) -> list[str]:
+    """Return ctrl/alt/shift/super currently held in *active_codes*, in that order."""
+    held: list[str] = []
+    for name in ("ctrl", "alt", "shift", "super"):
+        if active_codes & MODIFIER_KEY_CODES[name]:
+            held.append(name)
+    return held
+
+
+def _shortcut_from_capture(modifiers: list[str], token: Optional[str]) -> Optional[str]:
+    """Build a canonical shortcut from recorded modifiers and a main key."""
+    if token is None:
+        return None
+    candidate = "+".join((*modifiers, token)) if modifiers else token
+    return candidate if is_valid_shortcut(candidate) else None
+
+
+def _gdk_capture_to_shortcut(
+    modifiers: list[str],
+    keyval_name: Optional[str],
+    hardware_keycode: int = 0,
+) -> Optional[str]:
+    """Build a shortcut from recorder inputs, preferring FK13–FK24 keycodes."""
+    token = function_token_from_gdk_hardware_keycode(hardware_keycode)
+    if token is None:
+        token = _gdk_keyname_to_token(keyval_name)
+    return _shortcut_from_capture(modifiers, token)
+
+
+# linux/input.h EV_KEY; python-evdev uses the same value.
+_EVDEV_EV_KEY = 1
+
+
+class _EvdevShortcutRecorder:
+    """Read-only F13–F24 capture from keyboard evdev nodes (no grab, no thread).
+
+    GTK 3 on Wayland drops XKB NoSymbol keys before they become GdkEvents, so
+    FK19/FK24 never reach the dialog key-press handler on the default map.
+    Unions modifiers across watched keyboards, and drops a failed device while
+    still scanning until recording stops.
+    """
+
+    def __init__(self, on_shortcut: Callable[[str], None]) -> None:
+        self._on_shortcut = on_shortcut
+        self._active = False
+        self._devices: dict[str, _EvdevCaptureDevice] = {}
+        self._watch_ids: dict[str, Any] = {}
+        self._held: dict[str, set[int]] = {}
+        self._scan_timeout_id: Optional[Any] = None
+        self._input_device_cls: Any = None
+        self._find_keyboard_devices: Optional[Callable[[], list[str]]] = None
+
+    def start(self) -> None:
+        try:
+            from .keyboard_backends.evdev_backend import (
+                DEVICE_RESCAN_SECONDS,
+                EVDEV_AVAILABLE,
+                find_keyboard_devices,
+            )
+        except ImportError:
+            logger.debug("evdev unavailable for shortcut recording; using GDK events only")
+            return
+        if not EVDEV_AVAILABLE:
+            logger.debug("evdev unavailable for shortcut recording; using GDK events only")
+            return
+        try:
+            from evdev import InputDevice
+        except ImportError:
+            logger.debug("evdev unavailable for shortcut recording; using GDK events only")
+            return
+
+        self._active = True
+        self._input_device_cls = InputDevice
+        self._find_keyboard_devices = find_keyboard_devices
+
+        paths: list[str] = []
+        listed = False
+        try:
+            paths = list(find_keyboard_devices())
+            listed = True
+        except Exception as e:
+            logger.warning("Cannot list keyboard devices for shortcut recording: %s", e)
+
+        open_error: Optional[tuple[str, BaseException]] = None
+        for path in paths:
+            err = self._attach_device(path)
+            if err is not None and open_error is None:
+                open_error = (path, err)
+
+        if not self._devices:
+            if open_error is not None:
+                logger.warning(
+                    "Cannot open keyboard devices for shortcut recording "
+                    "(%s: %s); F-keys without keysyms will not be captured",
+                    open_error[0],
+                    open_error[1],
+                )
+            elif listed and not paths:
+                logger.debug("No keyboard devices found for shortcut recording")
+            elif listed:
+                logger.debug("No keyboard devices opened for shortcut recording")
+
+        if self._active:
+            self._scan_timeout_id = GLib.timeout_add(
+                int(DEVICE_RESCAN_SECONDS * 1000),
+                self._on_device_rescan,
+            )
+
+    def stop(self) -> None:
+        self._active = False
+        timeout_id = self._scan_timeout_id
+        self._scan_timeout_id = None
+        if timeout_id is not None:
+            try:
+                GLib.source_remove(timeout_id)
+            except Exception:
+                pass
+        for watch_id in list(self._watch_ids.values()):
+            try:
+                GLib.source_remove(watch_id)
+            except Exception:
+                pass
+        self._watch_ids.clear()
+        for device in list(self._devices.values()):
+            self._close_device(device)
+        self._devices.clear()
+        self._held.clear()
+
+    def _close_device(self, device: _EvdevCaptureDevice) -> None:
+        try:
+            device.close()
+        except Exception:
+            pass
+
+    def _attach_device(self, path: str, *, hotplug: bool = False) -> Optional[BaseException]:
+        """Open and watch *path* if recording is active and it is not already watched.
+
+        Returns the InputDevice open error, or None if attached/skipped.
+        """
+        if not self._active or path in self._devices or self._input_device_cls is None:
+            return None
+        try:
+            device = self._input_device_cls(path)
+        except (OSError, IOError) as e:
+            return e
+        if not self._active:
+            self._close_device(device)
+            return None
+        # Do not grab: compositor and the runtime backend must still see keys.
+        try:
+            held = set(device.active_keys())
+        except Exception:
+            held = set()
+        try:
+            watch_id = GLib.io_add_watch(
+                device.fileno(),
+                GLib.IO_IN | GLib.IO_ERR | GLib.IO_HUP,
+                self._make_io_callback(device),
+            )
+        except Exception as e:
+            logger.debug("GLib.io_add_watch failed for %s: %s", path, e)
+            self._close_device(device)
+            return None
+        if not self._active:
+            try:
+                GLib.source_remove(watch_id)
+            except Exception:
+                pass
+            self._close_device(device)
+            return None
+        self._devices[path] = device
+        self._watch_ids[path] = watch_id
+        self._held[path] = held
+        if hotplug:
+            logger.debug("Added keyboard for shortcut recording: %s", path)
+        return None
+
+    def _drop_device(self, path: str) -> None:
+        """Close and forget *path* without source_remove of its in-flight watch."""
+        self._watch_ids.pop(path, None)
+        device = self._devices.pop(path, None)
+        self._held.pop(path, None)
+        if device is not None:
+            self._close_device(device)
+        logger.debug("Dropped keyboard from shortcut recording: %s", path)
+
+    def _union_held_codes(self) -> set[int]:
+        union: set[int] = set()
+        for codes in self._held.values():
+            union.update(codes)
+        return union
+
+    def _path_for_device(self, device: _EvdevCaptureDevice) -> Optional[str]:
+        for path, tracked in self._devices.items():
+            if tracked is device:
+                return path
+        return None
+
+    def _on_device_rescan(self) -> bool:
+        if not self._active:
+            return False
+        finder = self._find_keyboard_devices
+        if finder is None:
+            return False
+        try:
+            paths = list(finder())
+        except Exception:
+            return True
+        for path in paths:
+            if not self._active:
+                return False
+            self._attach_device(path, hotplug=True)
+        return self._active
+
+    def _make_io_callback(self, device: _EvdevCaptureDevice) -> Callable[[int, int], bool]:
+        def _on_io(fd: int, condition: int) -> bool:
+            return self._on_fd(device, condition)
+
+        return _on_io
+
+    def _on_fd(self, device: _EvdevCaptureDevice, condition: int) -> bool:
+        if not self._active:
+            return False
+        path = self._path_for_device(device)
+        if path is None:
+            return False
+        try:
+            if condition & (GLib.IO_ERR | GLib.IO_HUP):
+                self._drop_device(path)
+                return False
+        except Exception:
+            pass
+        held = self._held.setdefault(path, set())
+        try:
+            events = list(device.read())
+        except BlockingIOError:
+            return True
+        except (OSError, IOError):
+            self._drop_device(path)
+            return False
+
+        for event in events:
+            if getattr(event, "type", None) != _EVDEV_EV_KEY:
+                continue
+            code = event.code
+            value = event.value
+            if value == 1:
+                held.add(code)
+                token = function_token_from_evdev_code(code)
+                if token is None:
+                    continue
+                shortcut = _shortcut_from_capture(
+                    modifiers_from_active_evdev_codes(self._union_held_codes()),
+                    token,
+                )
+                if shortcut:
+                    # Pop before on_shortcut: the dialog stop() must not
+                    # source_remove this in-flight watch (returning False does).
+                    self._watch_ids.pop(path, None)
+                    self._on_shortcut(shortcut)
+                    return False
+            elif value == 0:
+                held.discard(code)
+        return True
+
+
+def _row_matches_query(query: str, title: str, subtitle: str = "", keywords=()) -> bool:
+    """Return whether a settings row matches a search query.
+
+    Matching is case-insensitive and checks the row title, subtitle, and any
+    extra keywords attached to the row.
+    """
+    query = (query or "").strip().casefold()
+    if not query:
+        return True
+    haystacks = [title or "", subtitle or "", *keywords]
+    return any(query in text.casefold() for text in haystacks)
+
+
+def _make_expander_card(
+    title: str, subtitle: str
+) -> tuple[Gtk.Box, Gtk.Expander, Gtk.Box, Gtk.Label]:
+    """Card with a compact title+subtitle expander, used for Advanced and Unused."""
+    island = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+    island.get_style_context().add_class("preferences-group")
+    island.get_style_context().add_class("expander-card")
+
+    expander = Gtk.Expander()
+    header = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+    title_label = Gtk.Label(label=title, xalign=0)
+    title_label.get_style_context().add_class("expander-card-title")
+    subtitle_label = Gtk.Label(label=subtitle, xalign=0, wrap=True)
+    subtitle_label.get_style_context().add_class("expander-card-subtitle")
+    header.pack_start(title_label, False, False, 0)
+    header.pack_start(subtitle_label, False, False, 0)
+    expander.set_label_widget(header)
+
+    body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+    expander.add(body)
+    island.pack_start(expander, False, False, 0)
+    return island, expander, body, subtitle_label
+
+
+class PreferencesGroup(Gtk.Box):
+    """A card-style group of preferences, similar to libadwaita's AdwPreferencesGroup."""
+
+    def __init__(
+        self,
+        title: str = "",
+        description: str = "",
+        keywords=(),
+        header_icon: Optional[Gtk.Widget] = None,
+    ):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.get_style_context().add_class("preferences-group")
+        self.title = title
+        self.description = description
+        self.keywords = tuple(keywords)
+        self.rows = []
+
+        # Header with title (optional icon aligned to the top-right)
+        if title:
+            text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+
+            title_label = Gtk.Label(label=title, xalign=0)
+            title_label.get_style_context().add_class("preferences-group-title")
+            text_box.pack_start(title_label, False, False, 0)
+
+            if description:
+                desc_label = Gtk.Label(label=description, xalign=0, wrap=True)
+                desc_label.get_style_context().add_class("preference-row-subtitle")
+                # Align with the title, which carries 16px CSS padding.
+                desc_label.set_margin_start(16)
+                desc_label.set_margin_end(16)
+                text_box.pack_start(desc_label, False, False, 0)
+
+            if header_icon is not None:
+                header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+                header_box.set_margin_top(12)
+                header_box.set_margin_bottom(4)
+                header_box.set_margin_start(16)
+                header_box.set_margin_end(16)
+                header_box.pack_start(text_box, True, True, 0)
+                header_icon.set_valign(Gtk.Align.CENTER)
+                header_box.pack_end(header_icon, False, False, 0)
+            else:
+                header_box = text_box
+                header_box.set_margin_top(12)
+                header_box.set_margin_bottom(4)
+                header_box.set_margin_start(16)
+                header_box.set_margin_end(16)
+
+            self.pack_start(header_box, False, False, 0)
+
+        # Content area with listbox for rows
+        self.listbox = Gtk.ListBox()
+        self.listbox.get_style_context().add_class("preferences-group-list")
+        self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.listbox.set_activate_on_single_click(False)
+        self.pack_start(self.listbox, False, False, 0)
+
+    def add_row(self, widget):
+        """Add a widget as a row in the preferences group."""
+        self.listbox.add(widget)
+        self.rows.append(widget)
+
+    def clear_rows(self):
+        """Remove all preference rows from the group."""
+        for row in list(self.listbox.get_children()):
+            self.listbox.remove(row)
+        self.rows.clear()
+
+
+class PreferenceRow(Gtk.ListBoxRow):
+    """A single preference row with title, subtitle, and a control widget."""
+
+    def __init__(
+        self,
+        title: str,
+        subtitle: str = "",
+        widget: Gtk.Widget = None,
+        activatable: bool = False,
+        keywords=(),
+        leading: Optional[Gtk.Widget] = None,
+    ):
+        super().__init__()
+        self.set_activatable(activatable)
+        self.get_style_context().add_class("preference-row")
+        self.title = title
+        self.subtitle = subtitle
+        self.keywords = tuple(keywords)
+
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        hbox.set_margin_top(12)
+        hbox.set_margin_bottom(12)
+        hbox.set_margin_start(16)
+        hbox.set_margin_end(16)
+
+        if leading is not None:
+            leading.set_valign(Gtk.Align.CENTER)
+            hbox.pack_start(leading, False, False, 0)
+
+        # Text container (title + subtitle)
+        text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        text_box.set_valign(Gtk.Align.CENTER)
+
+        self.title_label = Gtk.Label(label=title, xalign=0)
+        self.title_label.get_style_context().add_class("preference-row-title")
+        text_box.pack_start(self.title_label, False, False, 0)
+
+        # Store subtitle label reference for later updates
+        self.subtitle_label = None
+        if subtitle:
+            self.subtitle_label = Gtk.Label(label=subtitle, xalign=0, wrap=True)
+            self.subtitle_label.get_style_context().add_class("preference-row-subtitle")
+            self.subtitle_label.set_max_width_chars(55)
+            self.subtitle_label.set_line_wrap(True)
+            self.subtitle_label.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            text_box.pack_start(self.subtitle_label, False, False, 0)
+
+        hbox.pack_start(text_box, True, True, 0)
+
+        # Control widget on the right
+        if widget:
+            widget.set_valign(Gtk.Align.CENTER)
+            hbox.pack_end(widget, False, False, 0)
+
+        self.add(hbox)
+
+    def set_title(self, title: str) -> None:
+        """Update the title text."""
+        self.title = title
+        self.title_label.set_text(title)
+
+    def set_subtitle(self, subtitle: str) -> None:
+        """Update the subtitle text."""
+        self.subtitle = subtitle
+        if self.subtitle_label:
+            self.subtitle_label.set_text(subtitle)
+
+    def matches_query(self, query: str) -> bool:
+        """Return whether this row matches a settings search query."""
+        return _row_matches_query(query, self.title, self.subtitle, self.keywords)
+
+
+def _set_no_show_all_visible(widget: Gtk.Widget, visible: bool) -> None:
+    """Show or hide a widget flagged ``no_show_all``.
+
+    ``show_all()`` skips flagged widgets, so revealing one means clearing the
+    flag first; hiding re-arms it so the next dialog-level ``show_all()``
+    leaves it alone. The second-language and custom-shortcut rows use this
+    helper.
+    """
+    if visible:
+        widget.set_no_show_all(False)
+        widget.show_all()
+    else:
+        widget.hide()
+        widget.set_no_show_all(True)
+
+
+def _add_switch_row(
+    group: PreferencesGroup,
+    title: str,
+    subtitle: str = "",
+    keywords: tuple = (),
+    tooltip: Optional[str] = None,
+) -> Gtk.Switch:
+    """Append a titled on/off row to ``group`` and return its switch."""
+    switch = Gtk.Switch()
+    if tooltip is not None:
+        switch.set_tooltip_text(tooltip)
+    row = PreferenceRow(title=title, subtitle=subtitle, widget=switch, keywords=keywords)
+    group.add_row(row)
+    return switch
+
+
+def _combo_chrome(combo: Gtk.Widget, tooltip: Optional[str] = None) -> None:
+    """Attach the shared dropdown chrome: tooltip plus the scroll-wheel guard."""
+    if tooltip is not None:
+        combo.set_tooltip_text(tooltip)
+    _prevent_scroll_on_hover(combo)
+
+
+def _new_spin(
+    lower: float, upper: float, step: float, digits: int, tooltip: Optional[str] = None
+) -> Gtk.SpinButton:
+    """Create a SpinButton with digits, tooltip, and the wheel guard applied."""
+    spin = Gtk.SpinButton.new_with_range(lower, upper, step)
+    spin.set_digits(digits)
+    if tooltip is not None:
+        spin.set_tooltip_text(tooltip)
+    _prevent_scroll_on_hover(spin)
+    return spin
+
+
+def _connect_picker_entry(
+    picker: SearchablePicker, on_activate: Callable, on_focus_out: Callable
+) -> None:
+    """Wire a SearchablePicker's entry: Enter commits, focus-out restores."""
+    entry = picker.get_child()
+    if entry is not None:
+        entry.connect("activate", on_activate)
+        entry.connect("focus-out-event", on_focus_out)
+
+
+# Handler-suppression flags a block can hold via _suppressed().
+_HandlerFlag = Literal[
+    "_applying_settings",
+    "_populating_models",
+    "_processing_language_change",
+    "_simple_driving",
+    "_simple_syncing",
+]
+
+
+def _handlers_suppressed(dialog: "SettingsDialog") -> bool:
+    """Whether change handlers should ignore programmatic widget updates.
+
+    True while the dialog builds itself (``_initializing``) and while saved
+    settings are applied (``_applying_settings``) — the pair every handler
+    used to re-check on entry. The narrower guards (``_populating_models``,
+    ``_processing_language_change``, ``_simple_syncing``, ``_simple_driving``)
+    still apply on top for the controls they cover.
+    """
+    return dialog._initializing or dialog._applying_settings
+
+
+@contextmanager
+def _suppressed(dialog: "SettingsDialog", flag: _HandlerFlag) -> Iterator[None]:
+    """Raise a handler-suppression flag for the block, then clear it.
+
+    Every site that used to open-code ``flag = True / try / finally /
+    flag = False`` now goes through here. Blocks that must preserve a flag
+    already held by an outer frame (the apply-guard handoff and the engine
+    resync) keep their explicit save/restore instead.
+    """
+    setattr(dialog, flag, True)
+    try:
+        yield
+    finally:
+        setattr(dialog, flag, False)
+
+
+def _undownloaded_model_info(language: str, engine: str, model_name: str) -> Optional[dict]:
+    """Catalogue info for the selected model when it is not on disk yet.
+
+    Both apply paths gate the download prompt on this; the per-engine
+    branch lives here so a new engine means one edit.
+    """
+    if engine == "whisper" and not _is_whisper_model_downloaded(model_name):
+        return WHISPER_MODEL_INFO.get(model_name, {"size_mb": 500})
+    if engine == "whisper_cpp" and not is_whispercpp_model_downloaded(model_name):
+        return WHISPERCPP_MODEL_INFO.get(model_name, {"size_mb": 39})
+    if engine == "vosk" and not _is_vosk_model_downloaded(model_name, language):
+        return VOSK_MODEL_INFO.get(model_name, {"size_mb": 50})
+    if engine == "parakeet" and not parakeet.is_model_downloaded(model_name):
+        return parakeet.PARAKEET_MODEL_INFO.get(model_name, {"size_mb": 639})
+    if engine == "faster_whisper" and not is_faster_whisper_model_downloaded(model_name):
+        return FASTER_WHISPER_MODEL_INFO.get(model_name, {"size_mb": 39})
+    return None
+
+
+def _make_download_dialog(
+    dialog: "SettingsDialog", model_name: str, size_mb: int, engine: str
+) -> "ModelDownloadDialog":
+    """Build the modal progress dialog for a pending model download."""
+    return ModelDownloadDialog(
+        dialog,
+        model_name,
+        size_mb,
+        engine=engine,
+        language=dialog.language,
+    )
+
+
+class SettingsPage:
+    """One topic page in the settings dialog (sidebar entry + stack child).
+
+    Wraps the page content box and, after the page is built, records which
+    children are searchable PreferencesGroups vs. loose "extra" widgets
+    (info boxes, status labels) that are simply hidden while searching.
+    """
+
+    def __init__(self, name: str, title: str, icon_name: str):
+        self.name = name
+        self.title = title
+        self.icon_name = icon_name
+        self.groups = []
+        self.extras = []
+        self.sidebar_row = None
+        self.match_count_label = None
+        self.update_badge_label = None
+
+        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.box.set_margin_top(16)
+        self.box.set_margin_bottom(16)
+        self.box.set_margin_start(16)
+        self.box.set_margin_end(16)
+
+    def collect_children(self):
+        """Classify built descendants into searchable groups and extras.
+
+        Most groups are direct page children, but gated sections such as the
+        Advanced decoding controls live inside a Gtk.Revealer. Walk nested
+        containers so unlocked settings are searchable too.
+        """
+        self.groups = []
+        self.extras = []
+
+        def collect_groups(widget):
+            if isinstance(widget, PreferencesGroup):
+                self.groups.append(widget)
+                return True
+            if isinstance(widget, Gtk.Container):
+                found = False
+                for child in widget.get_children():
+                    found = collect_groups(child) or found
+                return found
+            return False
+
+        for child in self.box.get_children():
+            if not collect_groups(child):
+                self.extras.append(child)
+
+
+# What the downloaders report when the transfer itself ends. It is not the
+# end of the dialog's work, so it must not be shown as one.
+_DOWNLOAD_DONE_STATUSES = frozenset({"complete", "completed", "done"})
+
+
+class ModelDownloadDialog(Gtk.Dialog):
+    """Dialog showing model download progress with cancel support."""
+
+    def __init__(
+        self,
+        parent,
+        model_name: str,
+        model_size_mb: int,
+        engine: str = "whisper",
+        language: str = "en-us",
+    ):
+        super().__init__(
+            title=f"Downloading {_model_display_name(model_name)} Model",
+            transient_for=parent,
+            flags=Gtk.DialogFlags.MODAL,
+        )
+        self.set_default_size(450, 200)
+        self.set_deletable(False)  # Prevent closing during download
+
+        self.cancelled = False
+        self.engine = engine
+        self.model_name = model_name
+
+        engine_display = engine.upper() if engine == "vosk" else engine.capitalize()
+
+        box = self.get_content_area()
+        box.set_spacing(16)
+        box.set_margin_start(24)
+        box.set_margin_end(24)
+        box.set_margin_top(24)
+        box.set_margin_bottom(20)
+
+        # Info label
+        self.info_label = Gtk.Label(
+            label=(
+                f"Downloading {engine_display} {_model_display_name(model_name)} model "
+                f"(~{_format_size(model_size_mb)})..."
+            ),
+            wrap=True,
+            justify=Gtk.Justification.CENTER,
+        )
+        box.pack_start(self.info_label, False, False, 0)
+
+        # Progress bar
+        self.progress_bar = Gtk.ProgressBar()
+        self.progress_bar.set_show_text(True)
+        self.progress_bar.set_text("Connecting...")
+        box.pack_start(self.progress_bar, False, False, 8)
+
+        # Status label (shows speed and ETA)
+        self.status_label = Gtk.Label(label="")
+        self.status_label.set_markup("<i>Please wait...</i>")
+        self.status_label.get_style_context().add_class("status-info")
+        box.pack_start(self.status_label, False, False, 0)
+
+        # Cancel button
+        self.cancel_button = Gtk.Button(label="Cancel")
+        self.cancel_button.connect("clicked", self._on_cancel_clicked)
+        self.cancel_button.set_halign(Gtk.Align.CENTER)
+        self.cancel_button.set_margin_top(12)
+        box.pack_start(self.cancel_button, False, False, 0)
+
+        self.show_all()
+
+        self._pulse_timeout = None
+        # For Whisper, we can't track progress, so pulse
+        if engine == "whisper":
+            self._start_pulsing()
+
+    def _start_pulsing(self) -> None:
+        """Bounce the bar, for work that reports no measurable progress."""
+        if self._pulse_timeout is None:
+            self._pulse_timeout = GLib.timeout_add(100, self._pulse_progress)
+
+    def _stop_pulsing(self) -> None:
+        """Stop the bounce if it is running."""
+        if self._pulse_timeout is not None:
+            GLib.source_remove(self._pulse_timeout)
+            self._pulse_timeout = None
+
+    def _pulse_progress(self):
+        """Pulse the progress bar while downloading (for Whisper)."""
+        if self.cancelled:
+            self._pulse_timeout = None
+            return False
+        self.progress_bar.pulse()
+        return True  # Continue pulsing
+
+    def _on_cancel_clicked(self, widget):
+        """Handle cancel button click."""
+        self.cancelled = True
+        self.cancel_button.set_sensitive(False)
+        self.cancel_button.set_label("Cancelling...")
+        self.status_label.set_markup("<i>Cancelling download...</i>")
+
+    def update_progress(self, fraction: float, speed_mbps: float, status_text: str):
+        """Update the progress bar with actual download progress."""
+        if self.cancelled:
+            return
+
+        if fraction >= 1.0:
+            self._show_finishing(status_text)
+            return
+
+        self._stop_pulsing()
+
+        self.progress_bar.set_fraction(fraction)
+        self.progress_bar.set_text(f"{fraction * 100:.0f}%")
+        self.status_label.set_markup(f"<i>{status_text}</i>")
+
+    def _show_finishing(self, status_text: str) -> None:
+        """Show the work that follows the last byte as work, not as an end.
+
+        The bytes being in is not the dialog being done: the checksum still
+        has to run and the engine still has to load the file, seconds of it
+        on a large model, and neither reports progress or can be interrupted.
+        A bar parked at 100% — or worse, at the downloader's "Complete!" —
+        under a lone Cancel button reads as "finished, waiting for me to
+        confirm", or as a hang. So bounce the bar, name the step, and stop
+        offering a cancel that no longer cancels anything.
+        """
+        self._start_pulsing()
+
+        step = status_text.strip()
+        if not step or step.strip("!.").casefold() in _DOWNLOAD_DONE_STATUSES:
+            step = "Finishing..."
+        self.progress_bar.set_text(step)
+        self.status_label.set_markup(
+            "<i>Download finished, still working - this can take a moment...</i>"
+        )
+
+        if self.cancel_button.get_sensitive():
+            self.cancel_button.set_sensitive(False)
+            self.cancel_button.set_tooltip_text(
+                "The download is finished. Verifying and loading the model "
+                "cannot be interrupted."
+            )
+
+    def set_complete(self, success: bool, message: str = ""):
+        """Mark download as complete."""
+        self._stop_pulsing()
+
+        # Hide cancel button
+        self.cancel_button.hide()
+
+        if success:
+            self.progress_bar.set_fraction(1.0)
+            self.progress_bar.set_text("Complete!")
+            self.status_label.set_markup(
+                "<span foreground='#26a269'><b>✓ Model ready to use</b></span>"
+            )
+        else:
+            self.progress_bar.set_fraction(0)
+            self.progress_bar.set_text("Failed")
+            if "cancelled" in message.lower():
+                self.status_label.set_markup(
+                    "<span foreground='#e5a50a'>✗ Download cancelled</span>"
+                )
+            else:
+                self.status_label.set_markup(f"<span foreground='#c01c28'>✗ {message}</span>")
+
+        # Allow closing now
+        self.set_deletable(True)
+        self.add_button("OK", Gtk.ResponseType.OK)
+
+
+class SettingsDialog(Gtk.Dialog):
+    """Modern GTK Dialog for configuring Vocalinux settings."""
+
+    def __init__(
+        self,
+        parent: Gtk.Window,
+        config_manager: "ConfigManager",
+        speech_engine: "SpeechRecognitionManager",
+        shortcut_update_callback: callable = None,
+        initial_page: Optional[str] = None,
+        pending_update: Optional[ReleaseInfo] = None,
+        update_status_callback: callable = None,
+        overlay_enabled_callback: Optional[Callable[[bool], None]] = None,
+        hotkey_listener_update_callback: Optional[Callable[[], None]] = None,
+        language_shortcuts_update_callback: Optional[Callable[[], None]] = None,
+        history_update_callback: Optional[Callable[[], None]] = None,
+        history_clear_callback: Optional[Callable[[], None]] = None,
+    ):
+        super().__init__(title="Vocalinux Settings", transient_for=parent, flags=0)
+        # Force window decorations (title-bar close) on all WMs. An in-window
+        # Close button also lives in the sidebar footer so the dialog always
+        # has a visible way to dismiss it, even on window managers that hide
+        # the title-bar close button for Gtk.Dialog windows (fixes #323).
+        self.set_decorated(True)
+
+        self.config_manager = config_manager
+        self.speech_engine = speech_engine
+        self.dictionary_manager = getattr(speech_engine, "dictionary_manager", None)
+        self.shortcut_update_callback = shortcut_update_callback
+        self.update_status_callback = update_status_callback
+        self.overlay_enabled_callback = overlay_enabled_callback
+        self.hotkey_listener_update_callback = hotkey_listener_update_callback
+        self.language_shortcuts_update_callback = language_shortcuts_update_callback
+        self.history_update_callback = history_update_callback
+        self.history_clear_callback = history_clear_callback
+        # Per-language shortcut rows (#805): a dict of row widgets per binding,
+        # populated by _build_language_shortcuts_section.
+        self._language_shortcut_rows: list[dict] = []
+        self._language_shortcut_add_row: Optional[PreferenceRow] = None
+        self._recording_shortcut_target = None
+        self._test_active = False
+        self._test_result = ""
+        self._initializing = True  # Flag to prevent auto-apply during initialization
+        self._populating_models = False  # Flag to prevent model change handler during population
+        # Guards the simple-mode widgets while they are being pointed at the
+        # live configuration, so syncing them does not look like a user edit.
+        self._simple_syncing = False
+        # Set while simple mode steers the advanced controls, so their own change
+        # handlers do not each trigger a separate engine reload.
+        self._simple_driving = False
+        self.advanced_box = None
+        self.advanced_island = None
+        self.advanced_expander = None
+        self.unused_island = None
+        self.unused_expander = None
+        self.simple_page = None
+        self.simple_group = None
+        self.engine_group = None
+        self._processing_language_change = (
+            False  # Flag to prevent recursive language change handling
+        )
+        # Last user catalog-language preference across Parakeet visits and across
+        # engine-coerced fallbacks (e.g. Vosk forcing en-us for Greek). Parakeet
+        # forces language=auto for honesty; this restores the preference when the
+        # user returns to Whisper/cpp. Do not store engine-coerced fallbacks here.
+        self._last_non_parakeet_language = None
+        self._engine_for_language_memory = None
+        # Set from the saved config in _load_and_apply_settings; the switch itself
+        # is the source of truth once the dialog is built (#821).
+        self._follow_layout_saved = False
+        # Cached so Mock-driven tests and early calls read a real bool.
+        self._follow_layout_active = False
+        self._applying_settings = False  # Flag to prevent recursive settings application
+        # The last Advanced picker spec that needs a download and is still
+        # unconfirmed: picker rebuilds keep offering it instead of falling back
+        # to the saved model, and a real apply or resync clears it (#894).
+        self._staged_model_spec: Optional[dict] = None
+        self._advanced_prompt_dirty = False
+        self._language_candidates_dirty = False
+        # Deferred text edits stashed when the dialog closes mid-apply; persisted
+        # by _finish_auto_apply once the running apply releases the guard.
+        self._pending_text_edits: Optional[dict] = None
+        self._pending_text_edit_baseline: Optional[dict] = None
+        self._pending_apply_generation = 0
+        self._about_release_url = ""
+        self._update_check_in_progress = False
+        self._update_check_generation = 0
+        self._update_auto_checked = False
+        self._initial_page = initial_page
+        self._pending_update = pending_update
+
+        # Setup CSS styling
+        _setup_css()
+
+        # Dialog configuration - Close button lives in the sidebar footer (see #323)
+        # Calculate dialog size
+        display = Gdk.Display.get_default()
+        if display:
+            monitor = display.get_primary_monitor()
+            if not monitor and display.get_n_monitors() > 0:
+                monitor = display.get_monitor(0)
+            if monitor:
+                geometry = monitor.get_geometry()
+                screen_height = geometry.height
+                screen_width = geometry.width
+            else:
+                screen_height = 1080  # Default fallback
+                screen_width = 1920
+        else:
+            screen_height = 1080  # Default fallback
+            screen_width = 1920
+        dialog_height = min(760, int(screen_height * 0.8))
+        dialog_width = min(880, int(screen_width * 0.85))
+        self.set_default_size(dialog_width, dialog_height)
+        self.get_style_context().add_class("settings-dialog")
+
+        # Topic-based pages (GNOME HIG: group by topic, navigate via sidebar)
+        # Icons stick to the stock Adwaita symbolic set so they resolve on
+        # every distro (some system-monitor icons only ship with Yaru).
+        self._pages = [
+            SettingsPage("dictation", "Dictation", "input-keyboard-symbolic"),
+            SettingsPage("dictionary", "Custom Dictionary", "accessories-dictionary-symbolic"),
+            SettingsPage("model", "Speech Model", "audio-input-microphone-symbolic"),
+            SettingsPage("audio", "Audio", "audio-speakers-symbolic"),
+            SettingsPage("performance", "Performance", "power-profile-performance-symbolic"),
+            SettingsPage("application", "Application", "preferences-system-symbolic"),
+            SettingsPage("advanced", "Advanced", "applications-engineering-symbolic"),
+            SettingsPage("post-processing", "Post-Processing", "utilities-terminal-symbolic"),
+            SettingsPage("proxy", "Proxy", "preferences-system-network-proxy-symbolic"),
+            SettingsPage("about", "About", "help-about-symbolic"),
+        ]
+        pages_by_name = {page.name: page for page in self._pages}
+
+        # Aliases so the build methods keep targeting familiar boxes.
+        self.dictation_page = pages_by_name["dictation"]
+        self.shortcuts_tab = self.dictation_page.box
+        self.recognition_settings_tab = self.dictation_page.box
+        self.dictionary_tab = pages_by_name["dictionary"].box
+        self.speech_engine_tab = pages_by_name["model"].box
+        self.audio_tab = pages_by_name["audio"].box
+        self.power_tab = pages_by_name["performance"].box
+        self.general_tab = pages_by_name["application"].box
+        self.advanced_tab = pages_by_name["advanced"].box
+        self.post_processing_tab = pages_by_name["post-processing"].box
+        self.proxy_tab = pages_by_name["proxy"].box
+        self.about_tab = pages_by_name["about"].box
+
+        # Each page is wrapped in a vertical ScrolledWindow: without one, the
+        # stack's minimum height is the tallest page's full content, which
+        # overrides set_default_size and can exceed the monitor.
+        def _scrollable(tab):
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroller.set_shadow_type(Gtk.ShadowType.NONE)
+            scroller.add(tab)
+            return scroller
+
+        # Content stack + sidebar navigation with settings search
+        self.settings_stack = Gtk.Stack()
+        self.settings_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.settings_stack.set_transition_duration(120)
+        self.settings_stack.set_hexpand(True)
+        for page in self._pages:
+            # The dictionary page owns two independently scrollable management
+            # panes so its pane chooser stays visible above long term lists.
+            content = page.box if page.name == "dictionary" else _scrollable(page.box)
+            self.settings_stack.add_titled(content, page.name, page.title)
+        self.settings_stack.add_named(self._build_search_empty_page(), "search-empty")
+        self.settings_stack.connect("notify::visible-child", self._on_settings_page_changed)
+
+        sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        sidebar_box.get_style_context().add_class("settings-sidebar")
+        sidebar_box.set_size_request(200, -1)
+
+        self.search_entry = Gtk.SearchEntry()
+        self.search_entry.set_placeholder_text("Search settings…")
+        self.search_entry.get_style_context().add_class("settings-search")
+        self.search_entry.connect("search-changed", self._on_search_changed)
+        sidebar_box.pack_start(self.search_entry, False, False, 0)
+
+        self.sidebar_listbox = Gtk.ListBox()
+        self.sidebar_listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        for page in self._pages:
+            self.sidebar_listbox.add(self._build_sidebar_row(page))
+        self.sidebar_listbox.connect("row-selected", self._on_sidebar_row_selected)
+        # Same treatment as the pages: without a ScrolledWindow the category
+        # list's natural height pins the dialog's minimum height, so the
+        # window can never shrink past the list and new categories clip.
+        self.sidebar_scroller = Gtk.ScrolledWindow()
+        self.sidebar_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.sidebar_scroller.set_shadow_type(Gtk.ShadowType.NONE)
+        self.sidebar_scroller.add(self.sidebar_listbox)
+        sidebar_scroller = self.sidebar_scroller
+        sidebar_box.pack_start(sidebar_scroller, True, True, 0)
+
+        main_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        main_box.pack_start(sidebar_box, False, False, 0)
+        main_box.pack_start(self.settings_stack, True, True, 0)
+        self.get_content_area().pack_start(main_box, True, True, 0)
+
+        # Search state: baseline visibility snapshot while a query is active.
+        self._search_baseline = None
+        self._search_previous_page = None
+        self._search_previous_dictionary_pane = None
+        # Marks dictionary pane switches made by the search filter itself so a
+        # user-initiated switch can drop the saved pre-search pane.
+        self._search_pane_programmatic = False
+        # Custom-terms list stays capped for GTK row count until the user
+        # asks to render the whole file.
+        self._show_all_terms = False
+        # Bumps on every refresh so idle-sliced row builders left over from
+        # an older pass stop instead of re-adding cleared rows.
+        self._terms_build_token = 0
+        # Terms added in this dialog that land past the display cap; they are
+        # pinned to the top so a successful save is never invisible.
+        self._pinned_terms: list[str] = []
+        # A term saved under "show all" scrolls into view once the idle-sliced
+        # rebuild finishes: (row index, displayed term) so a stale target left
+        # by a superseded refresh can never jump to the wrong row.
+        self._scroll_terms_to_row: Optional[tuple[int, str]] = None
+
+        # Set content_box to speech_engine_tab for backward compatibility
+        self.content_box = self.speech_engine_tab
+
+        # Build UI sections into their topic pages
+        self._build_shortcuts_section()
+        self._build_language_shortcuts_section()
+        self._build_recognition_section()
+        self._build_simple_model_section()
+        self._build_dictionary_section()
+        self._build_engine_section()
+        self._build_remote_server_section()
+        self._build_gateway_embed_section()
+        self._build_audio_section()
+        self._build_auto_pause_section()
+        self._build_model_keepalive_section()
+        self._build_gpu_section()
+        self._build_general_section()
+        self._build_advanced_section()
+        self._build_post_processing_section()
+        self._build_proxy_section()
+        self._build_about_section()
+        self._build_sidebar_footer(sidebar_box)
+
+        # Record searchable groups vs. loose extras per page
+        for page in self._pages:
+            page.collect_children()
+
+        # Load settings and populate UI
+        self._load_and_apply_settings()
+
+        self.connect("response", self._on_settings_dialog_response)
+        self.connect("key-press-event", self._on_dialog_key_press)
+
+        # Show everything first
+        self.show_all()
+        # Release notes stay hidden until a successful update check.
+        self.release_notes_group.hide()
+        # Re-hide the About "New" badge if show_all revealed it without a pending update.
+        self._set_about_update_badge(self._pending_update is not None)
+        # Seed About from a tray background check (opens with notes already filled).
+        self._seed_pending_update_ui()
+        if self._initial_page:
+            self.navigate_to_page(self._initial_page)
+        else:
+            self.sidebar_listbox.select_row(self.sidebar_listbox.get_row_at_index(0))
+            self._scroll_sidebar_selection_into_view()
+
+        # Restore the saved mode and point the simple questions at the live model
+        # before the first visibility pass, so nothing flashes the wrong group.
+        self._sync_simple_from_advanced()
+        self.advanced_expander.set_expanded(
+            bool(self.config_manager.get("speech_recognition", "show_advanced", False))
+        )
+
+        # Then update visibility of engine-specific elements
+        self._update_engine_specific_ui()
+
+        # Initialize recognition progress UI
+        self.update_recognition_progress("Idle")
+
+        # Connect to recognition manager for progress updates
+        self.connect_to_recognition_manager()
+
+        # Initialization complete - enable auto-apply
+        self._initializing = False
+
+    # ------------------------------------------------------------------
+    # Navigation: sidebar, stack, and settings search
+    # ------------------------------------------------------------------
+
+    def _scroll_sidebar_selection_into_view(self) -> None:
+        """Bring the selected sidebar row into the scroller's viewport."""
+        row = self.sidebar_listbox.get_selected_row()
+        if row is None:
+            return
+
+        def scroll_to_row() -> bool:
+            allocation = row.get_allocation()
+            if allocation.height <= 0:
+                return True  # not laid out yet — try again
+            adjustment = self.sidebar_scroller.get_vadjustment()
+            page_size = adjustment.get_page_size()
+            value = adjustment.get_value()
+            if allocation.y < value:
+                adjustment.set_value(max(adjustment.get_lower(), allocation.y))
+            elif allocation.y + allocation.height > value + page_size:
+                adjustment.set_value(
+                    min(
+                        adjustment.get_upper() - page_size,
+                        allocation.y + allocation.height - page_size,
+                    )
+                )
+            return False
+
+        # Allocations exist only once the row is mapped, which may be after
+        # one idle turn; retry briefly instead of leaving the row hidden.
+        # A new selection aborts the retry for the previously chosen row.
+        retries_left = 20
+
+        def scroll_once() -> bool:
+            nonlocal retries_left
+            retries_left -= 1
+            if self.sidebar_listbox.get_selected_row() is not row:
+                return False
+            return scroll_to_row() and retries_left > 0
+
+        GLib.idle_add(scroll_once)
+
+    def navigate_to_page(self, page_name: str) -> bool:
+        """Select a settings page by its internal name (e.g. ``about``)."""
+        for page in self._pages:
+            if page.name == page_name and page.sidebar_row is not None:
+                self.sidebar_listbox.select_row(page.sidebar_row)
+                self._scroll_sidebar_selection_into_view()
+                return True
+        return False
+
+    def _build_sidebar_row(self, page: SettingsPage) -> Gtk.ListBoxRow:
+        """Build one sidebar navigation row (icon + title + match badge)."""
+        row = Gtk.ListBoxRow()
+        row.get_style_context().add_class("sidebar-row")
+        row.page_name = page.name
+
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        icon = Gtk.Image.new_from_icon_name(page.icon_name, Gtk.IconSize.MENU)
+        hbox.pack_start(icon, False, False, 0)
+
+        label = Gtk.Label(label=page.title, xalign=0)
+        hbox.pack_start(label, True, True, 0)
+
+        update_badge = Gtk.Label(label="New")
+        update_badge.get_style_context().add_class("sidebar-update-badge")
+        update_badge.set_no_show_all(True)
+        update_badge.hide()
+        hbox.pack_end(update_badge, False, False, 0)
+
+        match_label = Gtk.Label(label="")
+        match_label.get_style_context().add_class("sidebar-match-count")
+        match_label.set_no_show_all(True)
+        hbox.pack_end(match_label, False, False, 0)
+
+        row.add(hbox)
+        page.sidebar_row = row
+        page.match_count_label = match_label
+        page.update_badge_label = update_badge
+        if page.name == "about" and self._pending_update is not None:
+            update_badge.show()
+        return row
+
+    def _build_search_empty_page(self) -> Gtk.Widget:
+        """Build the stack page shown when a search has no results."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_valign(Gtk.Align.CENTER)
+        box.set_halign(Gtk.Align.CENTER)
+
+        icon = Gtk.Image.new_from_icon_name("edit-find-symbolic", Gtk.IconSize.DIALOG)
+        icon.set_opacity(0.4)
+        box.pack_start(icon, False, False, 0)
+
+        title = Gtk.Label(label="No matching settings")
+        title.get_style_context().add_class("search-empty-title")
+        box.pack_start(title, False, False, 0)
+
+        self.search_empty_label = Gtk.Label(label="Try a different search term.")
+        self.search_empty_label.get_style_context().add_class("preference-row-subtitle")
+        box.pack_start(self.search_empty_label, False, False, 0)
+        return box
+
+    def _on_sidebar_row_selected(self, listbox, row):
+        """Switch the stack to the page selected in the sidebar."""
+        if row is not None:
+            self.settings_stack.set_visible_child_name(row.page_name)
+
+    def _on_settings_page_changed(self, stack, pspec):
+        """Persist deferred edits when the visible settings page changes."""
+        visible = stack.get_visible_child_name()
+        if visible != "advanced":
+            self._flush_advanced_prompt_if_dirty()
+        if visible == "about" and not self._update_auto_checked:
+            self._update_auto_checked = True
+            self._start_update_check()
+
+    def _open_web_url(self, url: str) -> None:
+        """Open a trusted project URL in the user's default browser."""
+        if not _can_open_url(url):
+            logger.warning("Refusing to open untrusted URL: %s", url)
+            return
+        try:
+            if hasattr(Gtk, "show_uri_on_window"):
+                Gtk.show_uri_on_window(self, url, Gdk.CURRENT_TIME)
+            else:
+                Gtk.show_uri(None, url, Gdk.CURRENT_TIME)
+        except Exception as exc:
+            logger.warning("Failed to open URL %s: %s", url, exc)
+
+    def _on_dialog_key_press(self, widget, event):
+        """Dialog-level shortcuts: Ctrl+F focuses search, Ctrl+W closes, Esc clears search."""
+        keyname = (Gdk.keyval_name(event.keyval) or "").lower()
+        ctrl = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+
+        if ctrl and keyname == "f":
+            self.search_entry.grab_focus()
+            return True
+        if ctrl and keyname == "w":
+            self.response(Gtk.ResponseType.CLOSE)
+            return True
+        if keyname == "escape" and self.search_entry.get_text():
+            # First Esc clears the search; a second one closes the dialog
+            # through the default Gtk.Dialog binding.
+            self.search_entry.set_text("")
+            return True
+        return False
+
+    def _snapshot_search_baseline(self):
+        """Remember pre-search visibility so clearing the query restores it."""
+        visible_page = self.settings_stack.get_visible_child_name()
+        page_names = {page.name for page in self._pages}
+        self._search_previous_page = visible_page if visible_page in page_names else "dictation"
+        self._search_previous_dictionary_pane = (
+            self.dictionary_management_stack.get_visible_child_name()
+        )
+
+        baseline = {"rows": {}, "groups": {}, "extras": {}, "islands": {}}
+        for page in self._pages:
+            for group in page.groups:
+                visible = group.get_visible()
+                parent = group.get_parent()
+                while visible and parent is not None and parent is not page.box:
+                    if isinstance(parent, Gtk.Revealer) and not parent.get_reveal_child():
+                        visible = False
+                    else:
+                        visible = parent.get_visible()
+                    parent = parent.get_parent()
+                baseline["groups"][group] = visible
+                for row in group.rows:
+                    baseline["rows"][row] = row.get_visible()
+            for extra in page.extras:
+                baseline["extras"][extra] = extra.get_visible()
+        # Nested unused_models_group is the searchable unit; the expander card
+        # that wraps it is not a PreferencesGroup, so record it separately.
+        if self.unused_island is not None:
+            baseline["islands"][self.unused_island] = self.unused_island.get_visible()
+        self._search_baseline = baseline
+
+    def _restore_search_baseline(self):
+        """Restore visibility recorded before the search started."""
+        if self._search_baseline is None:
+            return
+        for widgets in self._search_baseline.values():
+            for widget, visible in widgets.items():
+                widget.set_visible(visible)
+        self._search_baseline = None
+
+        for page in self._pages:
+            page.match_count_label.hide()
+            page.sidebar_row.set_sensitive(True)
+            page.sidebar_row.show()
+
+        # Badge visibility follows _pending_update (cleared on failed About checks
+        # so a stale New badge cannot reappear when search is cleared).
+        self._set_about_update_badge(self._pending_update is not None)
+
+        # Engine-driven visibility is authoritative; re-apply it in case a
+        # control changed while the filter was active.
+        self._update_engine_specific_ui()
+
+        page = next(
+            (page for page in self._pages if page.name == self._search_previous_page),
+            self._pages[0],
+        )
+        self.sidebar_listbox.select_row(page.sidebar_row)
+        self._scroll_sidebar_selection_into_view()
+        self.settings_stack.set_visible_child_name(page.name)
+        self._search_previous_page = None
+
+        if self._search_previous_dictionary_pane is not None:
+            # A search may have auto-switched the dictionary pane to reveal a
+            # match; clearing the query returns to the pane the user selected.
+            self.dictionary_management_stack.set_visible_child_name(
+                self._search_previous_dictionary_pane
+            )
+            self._search_previous_dictionary_pane = None
+
+    def _on_dictionary_pane_changed(self, *_args: Any) -> None:
+        """Keep a manual dictionary pane switch made during an active search.
+
+        The filter auto-switches panes to reveal a match and restores the
+        pre-search pane when the query clears. If the user clicks the pane
+        switcher themselves mid-search, that newer choice wins and clearing
+        the search must not roll it back.
+        """
+        if self._search_pane_programmatic:
+            return
+        if self._search_baseline is not None:
+            self._search_previous_dictionary_pane = None
+
+    def _on_search_changed(self, entry):
+        """Live-filter settings rows across all pages."""
+        query = entry.get_text().strip()
+
+        if not query:
+            self._restore_search_baseline()
+            return
+
+        if self._search_baseline is None:
+            self._snapshot_search_baseline()
+
+        baseline = self._search_baseline
+        first_match_page = None
+        for page in self._pages:
+            page_matches = 0
+            for group in page.groups:
+                if not baseline["groups"].get(group, True):
+                    # Whole group hidden by engine-specific logic; skip it.
+                    group.hide()
+                    continue
+                group_title_match = _row_matches_query(
+                    query, group.title, group.description, group.keywords
+                )
+                visible_rows = 0
+                for row in group.rows:
+                    if not baseline["rows"].get(row, True):
+                        row.hide()
+                        continue
+                    row_matches = group_title_match or (
+                        isinstance(row, PreferenceRow) and row.matches_query(query)
+                    )
+                    row.set_visible(row_matches)
+                    if row_matches:
+                        visible_rows += 1
+                group.set_visible(visible_rows > 0)
+                page_matches += visible_rows
+            for extra in page.extras:
+                extra.hide()
+
+            if page.name == "dictionary":
+                # A search can hide the selected management pane while the
+                # other pane contains the match. Keep matching controls visible.
+                current = self.dictionary_management_stack.get_visible_child_name()
+                terms_visible = self.dictionary_terms_group.get_visible()
+                corrections_visible = self.dictionary_corrections_group.get_visible()
+                self._search_pane_programmatic = True
+                try:
+                    if current == "terms" and not terms_visible and corrections_visible:
+                        self.dictionary_management_stack.set_visible_child_name("corrections")
+                    elif current == "corrections" and not corrections_visible and terms_visible:
+                        self.dictionary_management_stack.set_visible_child_name("terms")
+                finally:
+                    self._search_pane_programmatic = False
+
+            if page_matches > 0:
+                if page.update_badge_label is not None:
+                    page.update_badge_label.hide()
+                page.match_count_label.set_text(str(page_matches))
+                page.match_count_label.show()
+                page.sidebar_row.set_sensitive(True)
+                if first_match_page is None:
+                    first_match_page = page
+            else:
+                if page.update_badge_label is not None:
+                    page.update_badge_label.hide()
+                page.match_count_label.hide()
+                page.sidebar_row.set_sensitive(False)
+
+        # collect_children finds unused_models_group inside unused_island, so the
+        # expander card is not an extra. Hide the header when the nested group
+        # has no search hits; restore puts the island back from the snapshot.
+        if self.unused_island is not None and hasattr(self, "unused_models_group"):
+            self.unused_island.set_visible(self.unused_models_group.get_visible())
+
+        if first_match_page is not None:
+            self.sidebar_listbox.select_row(first_match_page.sidebar_row)
+            self._scroll_sidebar_selection_into_view()
+            self.settings_stack.set_visible_child_name(first_match_page.name)
+        else:
+            self.sidebar_listbox.unselect_all()
+            self.search_empty_label.set_text(f"No settings match \u201c{query}\u201d.")
+            self.settings_stack.set_visible_child_name("search-empty")
+
+    def _build_audio_section(self):
+        """Build the Audio Input section."""
+        group = PreferencesGroup(title="Audio Input")
+
+        # Device selection row
+        self.audio_device_combo = Gtk.ComboBoxText()
+        _combo_chrome(
+            self.audio_device_combo,
+            tooltip="Select the microphone to use for voice recognition",
+        )
+
+        refresh_btn = Gtk.Button.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
+        refresh_btn.set_tooltip_text("Refresh device list")
+        refresh_btn.get_style_context().add_class("suffix-button")
+        refresh_btn.set_size_request(_ICON_BUTTON_WIDTH, -1)
+        refresh_btn.connect("clicked", self._on_refresh_audio_devices)
+
+        device_row = PreferenceRow(
+            title="Input Device",
+            subtitle="Microphone used for voice recognition",
+            widget=_combo_with_suffix(self.audio_device_combo, refresh_btn),
+            keywords=("microphone", "mic", "input"),
+        )
+        group.add_row(device_row)
+
+        # Microphone test row; the live level shows in the status strip below.
+        self.test_audio_btn = Gtk.Button(label="Test")
+        self.test_audio_btn.set_tooltip_text("Record 2 seconds and check the level")
+        _style_action_button(self.test_audio_btn)
+        self.test_audio_btn.connect("clicked", self._on_test_audio_clicked)
+
+        level_row = PreferenceRow(
+            title="Microphone Test",
+            subtitle="Record 2 seconds; the level meter below shows the result",
+            widget=self.test_audio_btn,
+            keywords=("audio level", "check", "volume"),
+        )
+        group.add_row(level_row)
+
+        self.audio_tab.pack_start(group, False, False, 0)
+
+        # Sound Effects section
+        sound_group = PreferencesGroup(
+            title="Sound Effects",
+            description=(
+                "Cues play when recording starts, stops, or hits an error. "
+                "Turn the switch off to mute all of them."
+            ),
+        )
+        self.sound_effects_switch = _add_switch_row(
+            sound_group,
+            title="Enable Sound Effects",
+            subtitle="Play audio feedback for recording events",
+            keywords=("tone", "chime", "cue", "feedback"),
+            tooltip="Play sounds when recording starts, stops, or encounters errors",
+        )
+
+        self.sound_tone_combo = Gtk.ComboBoxText()
+        _combo_chrome(self.sound_tone_combo, tooltip="Start and stop sound used while dictating")
+        for tone_id, label in SOUND_EFFECT_TONES:
+            self.sound_tone_combo.append(tone_id, label)
+
+        self._tone_preview_kind = "start"
+        self.preview_tone_btn = Gtk.Button(label="Start")
+        self.preview_tone_btn.get_style_context().add_class("suffix-button")
+        self.preview_tone_btn.set_size_request(_ICON_BUTTON_WIDTH + 28, -1)
+        self.preview_tone_btn.set_tooltip_text("Play the start cue. Click again for the stop cue.")
+        _set_accessible_name(self.preview_tone_btn, "Play start cue")
+
+        self.tone_row = PreferenceRow(
+            title="Dictation Tone",
+            subtitle="Start and stop cues. Off is silent for those two.",
+            widget=_combo_with_suffix(
+                self.sound_tone_combo,
+                self.preview_tone_btn,
+                combo_width=_CONTROL_WIDTH - 72,
+            ),
+            keywords=("tone", "chime", "voca", "lift", "preview"),
+        )
+        sound_group.add_row(self.tone_row)
+
+        self.audio_tab.pack_start(sound_group, False, False, 0)
+        self.sound_effects_switch.connect("state-set", self._on_sound_effects_toggled)
+        self.sound_tone_combo.connect("changed", self._on_sound_tone_changed)
+        self.preview_tone_btn.connect("clicked", self._on_preview_tone_clicked)
+
+        # Other audio: opt-in duck of the default sink for the length of a dictation.
+        other_audio = PreferencesGroup(
+            title="Other audio",
+            keywords=("duck", "volume", "speakers", "music"),
+        )
+        self.duck_playback_switch = _add_switch_row(
+            other_audio,
+            title="Lower other audio while dictating",
+            subtitle=(
+                "Turn speakers and headphones down while the microphone is open, "
+                "then put the volume back."
+            ),
+            keywords=("duck", "volume", "speakers", "music", "headphones"),
+            tooltip=(
+                "Turn speakers and headphones down while the microphone is open, "
+                "then put the volume back"
+            ),
+        )
+
+        self.duck_level_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+        self.duck_level_scale.set_digits(0)
+        self.duck_level_scale.set_round_digits(0)
+        self.duck_level_scale.set_value_pos(Gtk.PositionType.RIGHT)
+        self.duck_level_scale.set_value(20)
+        self.duck_level_scale.set_draw_value(True)
+        self.duck_level_scale.set_size_request(180, -1)
+        self.duck_level_scale.set_hexpand(False)
+        self.duck_level_scale.set_halign(Gtk.Align.END)
+        self.duck_level_scale.set_sensitive(False)
+        self.duck_level_scale.set_tooltip_text("Percent of the current volume. 0 is silent.")
+        _prevent_scroll_on_hover(self.duck_level_scale)
+        duck_level_row = PreferenceRow(
+            title="Level while dictating",
+            subtitle="Percent of the current volume. 0 is silent.",
+            widget=self.duck_level_scale,
+            keywords=("duck", "volume", "speakers", "music"),
+        )
+        other_audio.add_row(duck_level_row)
+        self.audio_tab.pack_start(other_audio, False, False, 0)
+        self.duck_playback_switch.connect("state-set", self._on_duck_playback_toggled)
+        self.duck_level_scale.connect("value-changed", self._on_duck_level_changed)
+
+        # Populate devices
+        self._populate_audio_devices()
+        self.audio_device_combo.connect("changed", self._on_audio_device_changed)
+
+    def _build_general_section(self):
+        """Build the Application page: general behavior."""
+        group = PreferencesGroup(title="General")
+
+        self.autostart_switch = _add_switch_row(
+            group,
+            title="Start on Login",
+            subtitle="Automatically start Vocalinux when you log in",
+            keywords=("autostart", "boot", "startup"),
+        )
+
+        self.start_minimized_switch = _add_switch_row(
+            group,
+            title="Start Minimized",
+            subtitle="Start minimized to system tray instead of showing window",
+            keywords=("tray",),
+        )
+
+        self.missing_tray_warning_switch = Gtk.Switch()
+        missing_tray_warning_row = PreferenceRow(
+            title="Warn if tray support is not detected",
+            subtitle="Show a warning when Vocalinux cannot detect AppIndicator support",
+            widget=self.missing_tray_warning_switch,
+            keywords=("tray", "appindicator", "warning"),
+        )
+        group.add_row(missing_tray_warning_row)
+
+        self.show_overlay_switch = _add_switch_row(
+            group,
+            title="Show Dictation Overlay",
+            subtitle="Floating on-screen glow when listening or processing",
+            tooltip=("Show a floating glowing indicator on screen while the microphone is active"),
+        )
+
+        self.general_tab.pack_start(group, False, False, 0)
+
+        # Transcription history group
+        history_group = PreferencesGroup(
+            title="Transcription History",
+            description="Recent dictation snippets are kept in memory and shown "
+            "in the tray menu. History clears on quit unless Keep on Disk is on, "
+            "which saves them to history.jsonl under the Vocalinux data directory.",
+        )
+
+        self.history_enabled_switch = Gtk.Switch()
+        self.history_enabled_switch.set_tooltip_text(
+            "Keep recent dictation snippets in the tray menu for quick re-copying"
+        )
+        history_enabled_row = PreferenceRow(
+            title="Keep History",
+            subtitle="Show recent snippets in the tray menu",
+            widget=self.history_enabled_switch,
+        )
+        history_group.add_row(history_enabled_row)
+
+        self.history_max_items_spin = Gtk.SpinButton.new_with_range(1, 50, 1)
+        self.history_max_items_spin.set_tooltip_text("How many recent snippets to keep")
+        _prevent_scroll_on_hover(self.history_max_items_spin)
+        history_max_items_row = PreferenceRow(
+            title="Snippets to Keep",
+            subtitle="Number of recent snippets retained",
+            widget=self.history_max_items_spin,
+        )
+        history_group.add_row(history_max_items_row)
+
+        self.history_persist_switch = Gtk.Switch()
+        self.history_persist_switch.set_tooltip_text(
+            "Save snippets to disk so they survive restarts (off by default for privacy)"
+        )
+        history_persist_row = PreferenceRow(
+            title="Keep on Disk",
+            subtitle="Save snippets to history.jsonl in the data directory across restarts",
+            widget=self.history_persist_switch,
+            keywords=("persist", "save", "disk", "transcript"),
+        )
+        history_group.add_row(history_persist_row)
+
+        self.history_clear_button = Gtk.Button(label="Clear")
+        self.history_clear_button.set_tooltip_text(
+            "Delete every saved snippet, including any written to disk"
+        )
+        _style_action_button(self.history_clear_button)
+        self.history_clear_button.connect("clicked", self._on_history_clear_clicked)
+        history_clear_row = PreferenceRow(
+            title="Clear History",
+            subtitle="Remove every saved snippet now",
+            widget=self.history_clear_button,
+            keywords=("delete", "erase", "wipe", "transcript"),
+        )
+        history_group.add_row(history_clear_row)
+
+        self.general_tab.pack_start(history_group, False, False, 0)
+
+        self.autostart_switch.connect("state-set", self._on_autostart_toggled)
+        self.start_minimized_switch.connect("state-set", self._on_start_minimized_toggled)
+        self.missing_tray_warning_switch.connect("state-set", self._on_missing_tray_warning_toggled)
+        self.show_overlay_switch.connect("state-set", self._on_show_overlay_toggled)
+        self.history_enabled_switch.connect("state-set", self._on_history_enabled_toggled)
+        self.history_max_items_spin.connect("value-changed", self._on_history_max_items_changed)
+        self.history_persist_switch.connect("state-set", self._on_history_persist_toggled)
+
+    def _build_dictionary_section(self) -> None:
+        """Build the Custom Dictionary page for terms and transcript corrections."""
+        self.dictionary_management_stack = Gtk.Stack()
+        self.dictionary_management_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.dictionary_management_stack.set_transition_duration(120)
+        self.dictionary_management_stack.set_homogeneous(False)
+        self.dictionary_management_stack.set_hexpand(True)
+        self.dictionary_management_stack.set_vexpand(True)
+        self.dictionary_management_stack.connect(
+            "notify::visible-child-name", self._on_dictionary_pane_changed
+        )
+
+        self.dictionary_management_switcher = Gtk.StackSwitcher()
+        self.dictionary_management_switcher.set_stack(self.dictionary_management_stack)
+        self.dictionary_management_switcher.set_halign(Gtk.Align.CENTER)
+        self.dictionary_management_switcher.get_accessible().set_name("Custom dictionary section")
+        self.dictionary_tab.pack_start(self.dictionary_management_switcher, False, False, 0)
+
+        self.dictionary_feedback_label = Gtk.Label(xalign=0)
+        self.dictionary_feedback_label.set_line_wrap(True)
+        self.dictionary_feedback_label.get_accessible().set_name("Custom dictionary status")
+        self.dictionary_feedback_label.get_style_context().add_class("tip-label")
+        self.dictionary_tab.pack_start(self.dictionary_feedback_label, False, False, 0)
+
+        self.dictionary_tab.pack_start(self.dictionary_management_stack, True, True, 0)
+
+        terms_group = PreferencesGroup(
+            title="Custom terms",
+            description=(
+                "Terms bias Whisper, whisper.cpp, and Faster Whisper recognition. The UTF-8 "
+                "terms file is live-reloaded and has one term per line, so accessibility tools "
+                "can edit it."
+            ),
+            keywords=("dictionary", "terms", "vocabulary", "whisper", "scanner"),
+        )
+        self.dictionary_terms_group = terms_group
+        self.dictionary_terms_enabled_switch = Gtk.Switch()
+        terms_group.add_row(
+            PreferenceRow(
+                title="Use custom terms",
+                subtitle=(
+                    "Vocabulary bias works with Whisper, whisper.cpp, and Faster Whisper; "
+                    "corrections work with every engine."
+                ),
+                widget=self.dictionary_terms_enabled_switch,
+            )
+        )
+        terms_path_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.dictionary_terms_path_entry = Gtk.Entry()
+        self.dictionary_terms_path_entry.set_hexpand(True)
+        self.dictionary_terms_path_entry.set_placeholder_text("~/.config/vocalinux/dictionary.txt")
+        self.dictionary_terms_path_entry.set_tooltip_text(
+            "UTF-8 line file used for custom terms and the accessibility scanner"
+        )
+        self.dictionary_terms_path_entry.get_accessible().set_name("Custom terms file")
+        terms_path_box.pack_start(self.dictionary_terms_path_entry, True, True, 0)
+        self.dictionary_terms_file_button = Gtk.FileChooserButton(title="Choose Terms File")
+        terms_path_box.pack_start(self.dictionary_terms_file_button, False, False, 0)
+        terms_group.add_row(
+            PreferenceRow(
+                title="Terms file",
+                subtitle="UTF-8, one term per line; # starts a comment",
+                widget=terms_path_box,
+            )
+        )
+        self.dictionary_terms_status_label = Gtk.Label(xalign=0)
+        self.dictionary_terms_status_label.set_line_wrap(True)
+        self.dictionary_terms_status_label.get_style_context().add_class("tip-label")
+        terms_group.add_row(
+            PreferenceRow(
+                title="Live status",
+                subtitle="The terms file is re-read before every transcription.",
+                widget=self.dictionary_terms_status_label,
+            )
+        )
+
+        terms_add_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        terms_add_box.set_margin_top(8)
+        terms_add_box.set_margin_bottom(4)
+        terms_add_box.set_margin_start(16)
+        terms_add_box.set_margin_end(16)
+        self.dictionary_term_entry = Gtk.Entry()
+        self.dictionary_term_entry.set_placeholder_text("Add a term")
+        self.dictionary_term_entry.set_tooltip_text(
+            "Term to add to the scanner-friendly terms file"
+        )
+        self.dictionary_term_entry.get_accessible().set_name("Custom term")
+        self.dictionary_term_entry.set_hexpand(True)
+        terms_add_box.pack_start(self.dictionary_term_entry, True, True, 0)
+        self.dictionary_add_term_button = Gtk.Button(label="Add term")
+        self.dictionary_add_term_button.connect("clicked", self._on_dictionary_add_term)
+        self.dictionary_term_entry.connect("activate", self._on_dictionary_add_term)
+        terms_add_box.pack_start(self.dictionary_add_term_button, False, False, 0)
+        terms_add_row = Gtk.ListBoxRow()
+        terms_add_row.set_activatable(False)
+        terms_add_row.add(terms_add_box)
+        terms_group.add_row(terms_add_row)
+
+        self.dictionary_terms_listbox = Gtk.ListBox()
+        self.dictionary_terms_listbox.get_style_context().add_class("dictionary-entry-list")
+        self.dictionary_terms_listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.dictionary_terms_listbox.set_placeholder(
+            Gtk.Label(label="No custom terms yet.", xalign=0.5)
+        )
+        terms_list_row = Gtk.ListBoxRow()
+        terms_list_row.set_activatable(False)
+        terms_list_row.add(self.dictionary_terms_listbox)
+        terms_group.add_row(terms_list_row)
+
+        self.dictionary_terms_scroller = Gtk.ScrolledWindow()
+        self.dictionary_terms_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.dictionary_terms_scroller.set_shadow_type(Gtk.ShadowType.NONE)
+        self.dictionary_terms_scroller.add(terms_group)
+        self.dictionary_management_stack.add_titled(
+            self.dictionary_terms_scroller, "terms", "Custom terms"
+        )
+
+        corrections_group = PreferencesGroup(
+            title="Transcript corrections",
+            description=(
+                "Corrections replace a misheard whole word or phrase in every completed "
+                "transcript. They run before voice commands, so avoid replacement text that "
+                "is itself a voice command."
+            ),
+            keywords=("dictionary", "correction", "replacement", "misheard", "transcript"),
+        )
+        self.dictionary_corrections_group = corrections_group
+        corrections_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        corrections_box.set_margin_top(8)
+        corrections_box.set_margin_bottom(4)
+        corrections_box.set_margin_start(16)
+        corrections_box.set_margin_end(16)
+        self.dictionary_heard_entry = Gtk.Entry()
+        self.dictionary_heard_entry.set_placeholder_text("Heard as, e.g. super base")
+        self.dictionary_heard_entry.set_tooltip_text("Misheard phrase, matched case-insensitively")
+        self.dictionary_heard_entry.get_accessible().set_name("Heard phrase")
+        self.dictionary_heard_entry.set_hexpand(True)
+        corrections_box.pack_start(self.dictionary_heard_entry, True, True, 0)
+        self.dictionary_replacement_entry = Gtk.Entry()
+        self.dictionary_replacement_entry.set_placeholder_text("Replace with, e.g. Supabase")
+        self.dictionary_replacement_entry.set_tooltip_text(
+            "Replacement inserted with exactly this spelling"
+        )
+        self.dictionary_replacement_entry.get_accessible().set_name("Replacement text")
+        self.dictionary_replacement_entry.set_hexpand(True)
+        corrections_box.pack_start(self.dictionary_replacement_entry, True, True, 0)
+        self.dictionary_add_correction_button = Gtk.Button(label="Add correction")
+        self.dictionary_add_correction_button.connect("clicked", self._on_dictionary_add_correction)
+        self.dictionary_heard_entry.connect("activate", self._on_dictionary_add_correction)
+        self.dictionary_replacement_entry.connect("activate", self._on_dictionary_add_correction)
+        corrections_box.pack_start(self.dictionary_add_correction_button, False, False, 0)
+        corrections_add_row = Gtk.ListBoxRow()
+        corrections_add_row.set_activatable(False)
+        corrections_add_row.add(corrections_box)
+        corrections_group.add_row(corrections_add_row)
+
+        self.dictionary_corrections_listbox = Gtk.ListBox()
+        self.dictionary_corrections_listbox.get_style_context().add_class("dictionary-entry-list")
+        self.dictionary_corrections_listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.dictionary_corrections_listbox.set_placeholder(
+            Gtk.Label(label="No transcript corrections yet.", xalign=0.5)
+        )
+        corrections_list_row = Gtk.ListBoxRow()
+        corrections_list_row.set_activatable(False)
+        corrections_list_row.add(self.dictionary_corrections_listbox)
+        corrections_group.add_row(corrections_list_row)
+
+        corrections_scroller = Gtk.ScrolledWindow()
+        corrections_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        corrections_scroller.set_shadow_type(Gtk.ShadowType.NONE)
+        corrections_scroller.add(corrections_group)
+        self.dictionary_management_stack.add_titled(
+            corrections_scroller, "corrections", "Corrections"
+        )
+
+        self.dictionary_terms_enabled_switch.connect("state-set", self._on_dictionary_terms_enabled)
+        self.dictionary_terms_path_entry.connect("activate", self._on_dictionary_terms_path_changed)
+        self.dictionary_terms_path_entry.connect(
+            "focus-out-event", self._on_dictionary_terms_path_changed
+        )
+        self.dictionary_terms_file_button.connect("file-set", self._on_dictionary_terms_file_chosen)
+
+    def _on_dictionary_terms_enabled(self, widget: Any, state: bool) -> bool:
+        """Persist terms enablement and restore the control when persistence fails."""
+        if self._initializing or self._applying_settings or self.dictionary_manager is None:
+            return False
+        if not self.dictionary_manager.set_terms_enabled(bool(state)):
+            self.dictionary_feedback_label.set_text("Could not save custom terms setting.")
+            self._refresh_dictionary_ui()
+            # Returning True suppresses GTK's own state-set so the switch
+            # shows the value that actually persisted, not the requested one.
+            return True
+        self._refresh_dictionary_ui()
+        return False
+
+    def _on_dictionary_terms_path_changed(self, widget: Any, *args: Any) -> bool:
+        """Persist a validated custom terms path and restore it on failure."""
+        if self._initializing or self._applying_settings or self.dictionary_manager is None:
+            return False
+        if self.dictionary_manager.set_terms_path(self.dictionary_terms_path_entry.get_text()):
+            self.dictionary_feedback_label.set_text("Custom terms path saved.")
+        else:
+            self.dictionary_feedback_label.set_text(
+                "Could not save that custom terms path; keeping the previous path."
+            )
+        self._refresh_dictionary_ui()
+        return False
+
+    def _on_dictionary_terms_file_chosen(self, widget: Any) -> None:
+        """Apply a terms path selected through the GTK file chooser."""
+        path = widget.get_filename()
+        if path:
+            self.dictionary_terms_path_entry.set_text(path)
+            self._on_dictionary_terms_path_changed(self.dictionary_terms_path_entry)
+
+    def _on_dictionary_add_term(self, widget: Any) -> None:
+        """Add a term to the fixed line file, reporting an observable result."""
+        if self._initializing or self._applying_settings or self.dictionary_manager is None:
+            return
+        term = self.dictionary_term_entry.get_text().strip()
+        if not term:
+            self.dictionary_feedback_label.set_text("Enter a term before adding it.")
+            return
+        terms = self.dictionary_manager.get_terms()
+        if any(existing.casefold() == term.casefold() for existing in terms):
+            self.dictionary_feedback_label.set_text("That term is already in the terms file.")
+            return
+        if not self.dictionary_manager.add_term(term):
+            self.dictionary_feedback_label.set_text(
+                "Could not save the terms file; no term was added."
+            )
+            return
+        self.dictionary_term_entry.set_text("")
+        terms_now = self.dictionary_manager.get_terms()
+        if any(existing.casefold() == term.casefold() for existing in terms_now):
+            self.dictionary_feedback_label.set_text("Term saved to the live terms file.")
+            if self._show_all_terms:
+                # Oversized or yield-capped files prepend the term, other
+                # files append it — scroll to wherever it landed once the
+                # idle-sliced rebuild finishes. Under "show all" the rebuilt
+                # rows match terms_now one to one.
+                new_index = next(
+                    index
+                    for index, existing in enumerate(terms_now)
+                    if existing.casefold() == term.casefold()
+                )
+                self._scroll_terms_to_row = (new_index, terms_now[new_index])
+            else:
+                # A term that lands past the display cap is pinned to the top
+                # of the capped list — a saved term is never invisible. The
+                # next refresh drops the pin if the term is already visible.
+                self._pinned_terms.append(term)
+        else:
+            self.dictionary_feedback_label.set_text("That term is not valid for the terms file.")
+        self._refresh_dictionary_ui()
+
+    def _on_terms_show_all(self, widget: Any) -> None:
+        """Render every term, including those past the display cap."""
+        self._show_all_terms = True
+        self._refresh_dictionary_ui()
+
+    def _on_terms_show_fewer(self, widget: Any) -> None:
+        """Collapse the terms list back to the display cap."""
+        self._show_all_terms = False
+        self._refresh_dictionary_ui()
+
+    def _on_dictionary_remove_term(self, widget: Any, term: str) -> None:
+        """Remove one term from the fixed line file."""
+        if self._initializing or self._applying_settings or self.dictionary_manager is None:
+            return
+        if self.dictionary_manager.remove_term(term):
+            self.dictionary_feedback_label.set_text("Term removed from the live terms file.")
+        else:
+            self.dictionary_feedback_label.set_text(
+                "Could not save the terms file; the term was not removed."
+            )
+        self._refresh_dictionary_ui()
+
+    def _on_dictionary_add_correction(self, widget: Any) -> None:
+        """Add or update a phrase correction in the structured corrections file."""
+        if self._initializing or self._applying_settings or self.dictionary_manager is None:
+            return
+        heard = self.dictionary_heard_entry.get_text().strip()
+        replacement = self.dictionary_replacement_entry.get_text().strip()
+        if not heard or not replacement:
+            self.dictionary_feedback_label.set_text(
+                "Enter both the heard phrase and its replacement."
+            )
+            return
+        entries = self.dictionary_manager.get_corrections_for_edit()
+        if entries is None:
+            self.dictionary_feedback_label.set_text(
+                "Could not edit corrections: fix or replace the malformed corrections file first."
+            )
+            return
+        candidate = {"heard": heard, "replacement": replacement}
+        normalized_entries = normalize_corrections([candidate])
+        if not normalized_entries:
+            self.dictionary_feedback_label.set_text("That correction is not valid for the file.")
+            return
+        candidate = normalized_entries[0]
+        heard_key = candidate["heard"].casefold()
+        existing = [entry for entry in entries if entry["heard"].casefold() == heard_key]
+        entries = [entry for entry in entries if entry["heard"].casefold() != heard_key]
+        entries.append(candidate)
+        if not self.dictionary_manager.save_corrections(entries):
+            self.dictionary_feedback_label.set_text(
+                "Could not save corrections; no correction was changed."
+            )
+            return
+        self.dictionary_heard_entry.set_text("")
+        self.dictionary_replacement_entry.set_text("")
+        if any(
+            entry["heard"].casefold() == heard_key
+            for entry in self.dictionary_manager.get_corrections()
+        ):
+            self.dictionary_feedback_label.set_text(
+                "Correction updated."
+                if existing
+                else "Correction saved to the live corrections file."
+            )
+        else:
+            self.dictionary_feedback_label.set_text("That correction is not valid for the file.")
+        self._refresh_dictionary_ui()
+
+    def _on_dictionary_remove_correction(self, widget: Any, heard: str) -> None:
+        """Remove one correction from the structured corrections file."""
+        if self._initializing or self._applying_settings or self.dictionary_manager is None:
+            return
+        editable_entries = self.dictionary_manager.get_corrections_for_edit()
+        if editable_entries is None:
+            self.dictionary_feedback_label.set_text(
+                "Could not edit corrections: fix or replace the malformed corrections file first."
+            )
+            return
+        entries = [
+            entry for entry in editable_entries if entry["heard"].casefold() != heard.casefold()
+        ]
+        if self.dictionary_manager.save_corrections(entries):
+            self.dictionary_feedback_label.set_text("Correction removed.")
+        else:
+            self.dictionary_feedback_label.set_text(
+                "Could not save corrections; nothing was removed."
+            )
+        self._refresh_dictionary_ui()
+
+    def _make_term_row(self, term: str, transient: bool) -> Gtk.ListBoxRow:
+        """Build one removable term row for the custom terms list."""
+        row = Gtk.ListBoxRow()
+        row.set_activatable(False)
+        row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row_box.set_margin_top(6)
+        row_box.set_margin_bottom(6)
+        row_box.set_margin_start(16)
+        row_box.set_margin_end(16)
+        label = Gtk.Label(label=term, xalign=0)
+        label.set_hexpand(True)
+        row_box.pack_start(label, True, True, 0)
+        remove_button = Gtk.Button(label="Remove")
+        remove_button.set_tooltip_text(f"Remove term {term}")
+        remove_button.get_accessible().set_name(f"Remove term {term}")
+        remove_button.set_sensitive(not transient)
+        remove_button.connect("clicked", self._on_dictionary_remove_term, term)
+        row_box.pack_start(remove_button, False, False, 0)
+        row.add(row_box)
+        return row
+
+    def _build_term_rows(
+        self, terms: list[str], total_terms: int, transient: bool, token: int
+    ) -> None:
+        """Populate the terms listbox in idle slices of bounded size.
+
+        Building thousands of GTK rows synchronously stalls the whole
+        dialog, so each slice appends at most ``_TERMS_ROWS_PER_IDLE`` rows
+        and reschedules itself. Every refresh bumps the build token, which
+        retires pending slices from an older pass instead of letting them
+        re-add rows the refresh already cleared.
+        """
+        pending = iter(terms)
+
+        def build_chunk() -> bool:
+            if token != self._terms_build_token:
+                return False
+            batch = list(itertools.islice(pending, _TERMS_ROWS_PER_IDLE))
+            for term in batch:
+                self.dictionary_terms_listbox.add(self._make_term_row(term, transient))
+            self.dictionary_terms_listbox.show_all()
+            if len(batch) == _TERMS_ROWS_PER_IDLE:
+                return True
+            self._finish_term_rows(total_terms)
+            return False
+
+        # The first slice runs inline so small lists appear immediately;
+        # a slice never exceeds _TERMS_ROWS_PER_IDLE rows of work.
+        if build_chunk():
+            GLib.idle_add(build_chunk)
+
+    def _finish_term_rows(self, total_terms: int) -> None:
+        """Append the overflow summary row after the last term slice."""
+        if total_terms > _MAX_TERMS_DISPLAYED:
+            overflow_row = Gtk.ListBoxRow()
+            overflow_row.set_activatable(False)
+            overflow_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            overflow_box.set_margin_top(6)
+            overflow_box.set_margin_bottom(6)
+            overflow_box.set_margin_start(16)
+            overflow_box.set_margin_end(16)
+            if self._show_all_terms:
+                overflow_text = f"Showing all {total_terms} terms."
+                toggle_button = Gtk.Button(label=f"Show first {_MAX_TERMS_DISPLAYED}")
+                toggle_button.connect("clicked", self._on_terms_show_fewer)
+            else:
+                overflow_text = f"Showing the first {_MAX_TERMS_DISPLAYED} of {total_terms} terms."
+                toggle_button = Gtk.Button(label=f"Show all {total_terms}")
+                toggle_button.connect("clicked", self._on_terms_show_all)
+            overflow_label = Gtk.Label(label=overflow_text, xalign=0)
+            overflow_label.set_line_wrap(True)
+            overflow_label.set_hexpand(True)
+            overflow_label.get_style_context().add_class("tip-label")
+            overflow_box.pack_start(overflow_label, True, True, 0)
+            overflow_box.pack_start(toggle_button, False, False, 0)
+            overflow_row.add(overflow_box)
+            self.dictionary_terms_listbox.add(overflow_row)
+        self.dictionary_terms_listbox.show_all()
+        if self._scroll_terms_to_row is not None:
+            index, expected_term = self._scroll_terms_to_row
+            self._scroll_terms_to_row = None
+            row = self.dictionary_terms_listbox.get_row_at_index(index)
+            row_text = self._term_row_text(row) if row is not None else None
+            if row_text is not None and row_text.casefold() == expected_term.casefold():
+                self._scroll_terms_row_into_view(row)
+
+    @staticmethod
+    def _term_row_text(row: Gtk.ListBoxRow) -> Optional[str]:
+        """Return the term displayed by a row built by ``_make_term_row``."""
+        row_box = row.get_child()
+        if not isinstance(row_box, Gtk.Box) or not row_box.get_children():
+            return None
+        label = row_box.get_children()[0]
+        return label.get_label() if isinstance(label, Gtk.Label) else None
+
+    def _scroll_terms_row_into_view(self, row: Gtk.ListBoxRow) -> None:
+        """Bring a term row inside the terms scroller's viewport once laid out."""
+        retries_left = 20
+
+        def scroll_once() -> bool:
+            nonlocal retries_left
+            retries_left -= 1
+            if row.get_parent() is not self.dictionary_terms_listbox:
+                return False
+            allocation = row.get_allocation()
+            if allocation.height <= 0:
+                # Not laid out yet — retry briefly instead of never scrolling.
+                return retries_left > 0
+            # The row's y is relative to the terms listbox, but the scroller's
+            # adjustment addresses the whole card (header and controls above
+            # the list) — translate into that space or the scroll stops short.
+            viewport = self.dictionary_terms_scroller.get_child()
+            content = viewport.get_child() if isinstance(viewport, Gtk.Viewport) else None
+            position = row.translate_coordinates(content, 0, 0) if content else None
+            if position is None:
+                return False
+            _, row_y = position
+            adjustment = self.dictionary_terms_scroller.get_vadjustment()
+            page_size = adjustment.get_page_size()
+            value = adjustment.get_value()
+            if row_y < value:
+                adjustment.set_value(max(adjustment.get_lower(), row_y))
+            elif row_y + allocation.height > value + page_size:
+                adjustment.set_value(
+                    min(
+                        adjustment.get_upper() - page_size,
+                        row_y + allocation.height - page_size,
+                    )
+                )
+            return False
+
+        GLib.idle_add(scroll_once)
+
+    def _refresh_dictionary_ui(self) -> None:
+        """Rebuild custom dictionary controls from the live, file-backed state."""
+        if not hasattr(self, "dictionary_terms_enabled_switch"):
+            return
+        if self.dictionary_manager is None:
+            self.dictionary_terms_enabled_switch.set_sensitive(False)
+            self.dictionary_terms_status_label.set_text("Custom dictionary support is unavailable.")
+            return
+        transient = self.dictionary_manager.is_transient_terms
+        enabled = self.dictionary_manager.terms_enabled()
+        self.dictionary_terms_enabled_switch.set_active(enabled)
+        self.dictionary_terms_enabled_switch.set_sensitive(not transient)
+        self.dictionary_terms_path_entry.set_text(self.dictionary_manager.terms_path_text())
+        self.dictionary_terms_path_entry.set_sensitive(not transient)
+        self.dictionary_terms_file_button.set_sensitive(not transient)
+        self.dictionary_terms_status_label.set_text(
+            ("Session-only --dictionary-file override is active. " if transient else "")
+            + self.dictionary_manager.terms_status()
+        )
+        self.dictionary_term_entry.set_sensitive(not transient)
+        self.dictionary_add_term_button.set_sensitive(not transient)
+
+        for child in list(self.dictionary_terms_listbox.get_children()):
+            self.dictionary_terms_listbox.remove(child)
+        terms = self.dictionary_manager.get_terms()
+        visible_terms = terms if self._show_all_terms else terms[:_MAX_TERMS_DISPLAYED]
+        # Recently added terms that would fall outside the visible window
+        # stay pinned to the top while they remain unseen; a pin expires as
+        # soon as the term disappears or becomes visible on its own.
+        visible_keys = {term.casefold() for term in visible_terms}
+        term_keys = {term.casefold() for term in terms}
+        self._pinned_terms = [
+            pinned
+            for pinned in self._pinned_terms
+            if pinned.casefold() in term_keys and pinned.casefold() not in visible_keys
+        ]
+        self._terms_build_token += 1
+        self._build_term_rows(
+            [*self._pinned_terms, *visible_terms], len(terms), transient, self._terms_build_token
+        )
+
+        for child in list(self.dictionary_corrections_listbox.get_children()):
+            self.dictionary_corrections_listbox.remove(child)
+
+        for entry in self.dictionary_manager.get_corrections():
+            row = Gtk.ListBoxRow()
+            row.set_activatable(False)
+            row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            row_box.set_margin_top(6)
+            row_box.set_margin_bottom(6)
+            row_box.set_margin_start(16)
+            row_box.set_margin_end(16)
+            label = Gtk.Label(label=f"{entry['heard']} → {entry['replacement']}", xalign=0)
+            label.set_hexpand(True)
+            row_box.pack_start(label, True, True, 0)
+            remove_button = Gtk.Button(label="Remove")
+            remove_button.set_tooltip_text(f"Remove correction for {entry['heard']}")
+            remove_button.get_accessible().set_name(f"Remove correction for {entry['heard']}")
+            remove_button.connect("clicked", self._on_dictionary_remove_correction, entry["heard"])
+            row_box.pack_start(remove_button, False, False, 0)
+            row.add(row_box)
+            self.dictionary_corrections_listbox.add(row)
+        self.dictionary_terms_listbox.show_all()
+        self.dictionary_corrections_listbox.show_all()
+
+    def _build_auto_pause_section(self):
+        """Build Auto-Pause settings: enable toggle + process name list."""
+        group = PreferencesGroup(
+            title="Auto-Pause for Games & Apps",
+            description=(
+                "Pauses dictation and unloads the speech model while any listed app "
+                "is running. Dictation comes back when the app closes."
+            ),
+            keywords=("process", "program", "game"),
+        )
+
+        self.auto_pause_switch = _add_switch_row(
+            group,
+            title="Pause for listed apps",
+            subtitle="Unload the model while these apps are open",
+            tooltip=("Pause dictation and unload the speech model while any listed app is running"),
+        )
+
+        # Add process name: entry + Add button
+        add_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        add_box.set_margin_top(8)
+        add_box.set_margin_bottom(4)
+        add_box.set_margin_start(16)
+        add_box.set_margin_end(16)
+
+        self.auto_pause_entry = Gtk.Entry()
+        self.auto_pause_entry.set_placeholder_text("Process name (e.g. overwatch, steam)")
+        self.auto_pause_entry.set_hexpand(True)
+        self.auto_pause_entry.set_tooltip_text(
+            "Process name, matched case-insensitively. "
+            "For Windows games under Wine/Proton, the .exe suffix is optional."
+        )
+        add_box.pack_start(self.auto_pause_entry, True, True, 0)
+
+        self.auto_pause_add_btn = Gtk.Button(label="Add")
+        self.auto_pause_add_btn.set_tooltip_text("Add this process name to the list")
+        self.auto_pause_add_btn.connect("clicked", self._on_auto_pause_add_clicked)
+        self.auto_pause_entry.connect("activate", self._on_auto_pause_add_clicked)
+        add_box.pack_start(self.auto_pause_add_btn, False, False, 0)
+
+        self.auto_pause_pick_btn = Gtk.Button(label="Choose Running App…")
+        self.auto_pause_pick_btn.set_tooltip_text("Pick from apps that are running right now")
+        self.auto_pause_pick_btn.connect("clicked", self._on_auto_pause_pick_running)
+        add_box.pack_start(self.auto_pause_pick_btn, False, False, 0)
+
+        # Custom row for the add controls (not a PreferenceRow)
+        add_row = Gtk.ListBoxRow()
+        add_row.set_activatable(False)
+        add_row.add(add_box)
+        group.add_row(add_row)
+
+        # List of configured apps; the empty-state text is an in-list
+        # placeholder so there is no blank hole when the list is empty.
+        self.auto_pause_listbox = Gtk.ListBox()
+        self.auto_pause_listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.auto_pause_listbox.set_activate_on_single_click(False)
+
+        self.auto_pause_empty_label = Gtk.Label(
+            label="No apps in the list yet. Type a process name or choose a running app above.",
+            xalign=0.5,
+            wrap=True,
+            justify=Gtk.Justification.CENTER,
+        )
+        self.auto_pause_empty_label.get_style_context().add_class("preference-row-subtitle")
+        self.auto_pause_empty_label.set_margin_top(12)
+        self.auto_pause_empty_label.set_margin_bottom(12)
+        self.auto_pause_empty_label.set_margin_start(16)
+        self.auto_pause_empty_label.set_margin_end(16)
+        self.auto_pause_empty_label.show()
+        self.auto_pause_listbox.set_placeholder(self.auto_pause_empty_label)
+
+        list_scrolled = Gtk.ScrolledWindow()
+        list_scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        list_scrolled.set_min_content_height(48)
+        list_scrolled.set_max_content_height(160)
+        list_scrolled.set_margin_start(8)
+        list_scrolled.set_margin_end(8)
+        list_scrolled.set_margin_bottom(8)
+        list_scrolled.add(self.auto_pause_listbox)
+
+        list_row = Gtk.ListBoxRow()
+        list_row.set_activatable(False)
+        list_row.add(list_scrolled)
+        group.add_row(list_row)
+
+        self.power_tab.pack_start(group, False, False, 0)
+
+        self.auto_pause_switch.connect("state-set", self._on_auto_pause_enabled_toggled)
+
+    def _update_auto_pause_sensitivity(self, enabled: bool) -> None:
+        """Gray out the app-list controls while auto-pause is disabled."""
+        for widget in (
+            self.auto_pause_entry,
+            self.auto_pause_add_btn,
+            self.auto_pause_pick_btn,
+            self.auto_pause_listbox,
+        ):
+            widget.set_sensitive(enabled)
+
+    def _get_auto_pause_apps(self) -> list:
+        """Return a clean list of configured auto-pause process names."""
+        apps = self.config_manager.get("auto_pause", "apps", []) or []
+        if not isinstance(apps, list):
+            return []
+        return [str(a).strip() for a in apps if a and str(a).strip()]
+
+    def _save_auto_pause_apps(self, apps: list) -> None:
+        # Deduplicate case-insensitively while preserving first-seen casing
+        seen = set()
+        cleaned = []
+        for name in apps:
+            key = name.strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(name.strip())
+        self.config_manager.set("auto_pause", "apps", cleaned)
+        self.config_manager.save_settings()
+        self._refresh_auto_pause_list()
+
+    def _refresh_auto_pause_list(self) -> None:
+        """Rebuild the auto-pause app list UI from config."""
+        if not hasattr(self, "auto_pause_listbox"):
+            return
+
+        for child in list(self.auto_pause_listbox.get_children()):
+            self.auto_pause_listbox.remove(child)
+
+        apps = self._get_auto_pause_apps()
+        for name in apps:
+            row = Gtk.ListBoxRow()
+            row.set_activatable(False)
+            hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            hbox.set_margin_top(6)
+            hbox.set_margin_bottom(6)
+            hbox.set_margin_start(16)
+            hbox.set_margin_end(16)
+
+            label = Gtk.Label(label=name, xalign=0)
+            label.set_hexpand(True)
+            hbox.pack_start(label, True, True, 0)
+
+            remove_btn = Gtk.Button(label="Remove")
+            remove_btn.set_tooltip_text(f"Remove {name} from auto-pause list")
+            remove_btn.connect("clicked", self._on_auto_pause_remove_clicked, name)
+            hbox.pack_start(remove_btn, False, False, 0)
+
+            row.add(hbox)
+            self.auto_pause_listbox.add(row)
+
+        self.auto_pause_listbox.show_all()
+
+    def _on_auto_pause_enabled_toggled(self, widget, state):
+        enabled = bool(state)
+        self._update_auto_pause_sensitivity(enabled)
+        if _handlers_suppressed(self):
+            return False
+        logger.info("Auto-pause enabled toggled: %s", enabled)
+        self.config_manager.set("auto_pause", "enabled", enabled)
+        self.config_manager.save_settings()
+        return False
+
+    def _on_auto_pause_add_clicked(self, widget):
+        if _handlers_suppressed(self):
+            return
+        name = self.auto_pause_entry.get_text().strip()
+        if not name:
+            return
+        # Strip path if user pasted a full path
+        name = os.path.basename(name)
+        if name.lower().endswith(".exe"):
+            name = name[:-4]
+        apps = self._get_auto_pause_apps()
+        if name.lower() in {a.lower() for a in apps}:
+            self.auto_pause_entry.set_text("")
+            return
+        apps.append(name)
+        self._save_auto_pause_apps(apps)
+        self.auto_pause_entry.set_text("")
+        logger.info("Added auto-pause app: %s", name)
+
+    def _on_auto_pause_remove_clicked(self, widget, name: str):
+        if _handlers_suppressed(self):
+            return
+        apps = [a for a in self._get_auto_pause_apps() if a.lower() != name.lower()]
+        self._save_auto_pause_apps(apps)
+        logger.info("Removed auto-pause app: %s", name)
+
+    def _on_auto_pause_pick_running(self, widget):
+        """Show a simple dialog listing running process names to add."""
+        if _handlers_suppressed(self):
+            return
+
+        try:
+            import psutil
+        except ImportError:
+            logger.warning("psutil not available for process picker")
+            return
+
+        names: set[str] = set()
+        for proc in psutil.process_iter(["name"]):
+            try:
+                n = proc.info.get("name")
+                if n:
+                    base = os.path.basename(n)
+                    if base.lower().endswith(".exe"):
+                        base = base[:-4]
+                    names.add(base)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+
+        if not names:
+            return
+
+        dialog = Gtk.Dialog(title="Choose a Running App", transient_for=self, flags=0)
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Add", Gtk.ResponseType.OK)
+        dialog.set_default_size(360, 400)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_margin_top(8)
+        scrolled.set_margin_bottom(8)
+        scrolled.set_margin_start(8)
+        scrolled.set_margin_end(8)
+
+        listbox = Gtk.ListBox()
+        listbox.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
+        already = {a.lower() for a in self._get_auto_pause_apps()}
+        for name in sorted(names, key=str.lower):
+            if name.lower() in already:
+                continue
+            row = Gtk.ListBoxRow()
+            label = Gtk.Label(label=name, xalign=0)
+            label.set_margin_start(8)
+            label.set_margin_end(8)
+            label.set_margin_top(4)
+            label.set_margin_bottom(4)
+            row.add(label)
+            listbox.add(row)
+        scrolled.add(listbox)
+        dialog.get_content_area().pack_start(scrolled, True, True, 0)
+        dialog.show_all()
+
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            selected = listbox.get_selected_rows()
+            apps = self._get_auto_pause_apps()
+            existing = {a.lower() for a in apps}
+            for row in selected:
+                label = row.get_child()
+                if isinstance(label, Gtk.Label):
+                    name = label.get_text().strip()
+                    if name and name.lower() not in existing:
+                        apps.append(name)
+                        existing.add(name.lower())
+            self._save_auto_pause_apps(apps)
+        dialog.destroy()
+
+    def _build_model_keepalive_section(self):
+        """Build idle unload settings: enable toggle + idle timeout."""
+        group = PreferencesGroup(
+            title="Unload When Idle",
+            description=(
+                "Unload the speech model after you stop dictating. That frees RAM and "
+                "lets hybrid-GPU laptops sleep the GPU. The next dictation loads it "
+                "again, which can take a few seconds on larger models."
+            ),
+        )
+
+        self.model_keepalive_switch = _add_switch_row(
+            group,
+            title="Unload model when idle",
+            subtitle="Free RAM and GPU after this much inactivity",
+            tooltip=("Unload the speech model after the idle timeout to save memory and battery"),
+        )
+
+        self.model_keepalive_timeout_combo = Gtk.ComboBoxText()
+        _style_combo(self.model_keepalive_timeout_combo)
+        _combo_chrome(
+            self.model_keepalive_timeout_combo,
+            tooltip="How long to wait after the last dictation before unloading the model",
+        )
+        # id = seconds as string
+        for seconds, label in (
+            (60, "1 minute"),
+            (300, "5 minutes"),
+            (600, "10 minutes"),
+            (900, "15 minutes"),
+            (1800, "30 minutes"),
+        ):
+            self.model_keepalive_timeout_combo.append(str(seconds), label)
+        timeout_row = PreferenceRow(
+            title="Idle Timeout",
+            subtitle="How long to wait after the last dictation",
+            widget=self.model_keepalive_timeout_combo,
+        )
+        group.add_row(timeout_row)
+
+        self.model_reload_buffer_switch = Gtk.Switch()
+        group.add_row(
+            PreferenceRow(
+                title="Record while model reloads",
+                subtitle="Start speaking immediately. Audio is kept in memory until the model is ready.",
+                widget=self.model_reload_buffer_switch,
+            )
+        )
+        self.model_reload_buffer_switch.connect("state-set", self._on_model_reload_buffer_toggled)
+
+        self.power_tab.pack_start(group, False, False, 0)
+
+        self.model_keepalive_switch.connect("state-set", self._on_model_keepalive_enabled_toggled)
+        self.model_keepalive_timeout_combo.connect(
+            "changed", self._on_model_keepalive_timeout_changed
+        )
+
+    def _update_model_keepalive_sensitivity(self, enabled: bool) -> None:
+        """Gray out the idle timeout selector while idle unload is disabled."""
+        self.model_keepalive_timeout_combo.set_sensitive(enabled)
+        self.model_reload_buffer_switch.set_sensitive(enabled)
+
+    def _on_model_reload_buffer_toggled(self, widget: Gtk.Switch, state: bool) -> bool:
+        """Apply and save recording during idle model reloads."""
+        if self._initializing or self._applying_settings:
+            return False
+        enabled = bool(state)
+        self.speech_engine.buffer_during_reload = enabled
+        self.config_manager.set("model_keepalive", "buffer_during_reload", enabled)
+        self.config_manager.save_settings()
+        return False
+
+    def _on_model_keepalive_enabled_toggled(self, widget, state):
+        enabled = bool(state)
+        self._update_model_keepalive_sensitivity(enabled)
+        if _handlers_suppressed(self):
+            return False
+        logger.info("Model keep-alive enabled toggled: %s", enabled)
+        self.config_manager.set("model_keepalive", "enabled", enabled)
+        self.config_manager.save_settings()
+        return False
+
+    def _on_model_keepalive_timeout_changed(self, widget):
+        if _handlers_suppressed(self):
+            return
+        active_id = self.model_keepalive_timeout_combo.get_active_id()
+        if not active_id:
+            return
+        try:
+            seconds = int(active_id)
+        except (TypeError, ValueError):
+            return
+        logger.info("Model keep-alive timeout set to %s seconds", seconds)
+        self.config_manager.set("model_keepalive", "idle_timeout_seconds", seconds)
+        self.config_manager.save_settings()
+
+    def _on_history_enabled_toggled(self, widget: Gtk.Switch, state: bool) -> bool:
+        """Handle toggle of the keep-history switch."""
+        if self._initializing or self._applying_settings:
+            return False
+
+        enabled = bool(state)
+        logger.info(f"Transcription history toggled: {enabled}")
+        self.config_manager.set("history", "enabled", enabled)
+        self.config_manager.save_settings()
+        if self.history_update_callback:
+            self.history_update_callback()
+        return False
+
+    def _on_history_max_items_changed(self, widget: Gtk.SpinButton) -> None:
+        """Handle change of the snippets-to-keep spin button."""
+        if self._initializing or self._applying_settings:
+            return
+
+        max_items = widget.get_value_as_int()
+        logger.info(f"Transcription history max items: {max_items}")
+        self.config_manager.set("history", "max_items", max_items)
+        self.config_manager.save_settings()
+        if self.history_update_callback:
+            self.history_update_callback()
+
+    def _on_history_persist_toggled(self, widget: Gtk.Switch, state: bool) -> bool:
+        """Handle toggle of the keep-on-disk switch."""
+        if self._initializing or self._applying_settings:
+            return False
+
+        persist = bool(state)
+        logger.info(f"Transcription history persistence toggled: {persist}")
+        self.config_manager.set("history", "persist", persist)
+        self.config_manager.save_settings()
+        if self.history_update_callback:
+            self.history_update_callback()
+        return False
+
+    def _on_history_clear_clicked(self, widget: Gtk.Button) -> None:
+        """Handle click of the clear-history button."""
+        if self._initializing or self._applying_settings:
+            return
+
+        logger.info("Clear history requested from settings")
+        if self.history_clear_callback:
+            self.history_clear_callback()
+
+    def _on_autostart_toggled(self, widget, state):
+        """Handle toggle of the autostart switch."""
+        if _handlers_suppressed(self):
+            return False
+
+        enabled = bool(state)
+        logger.info(f"Autostart toggled: {enabled}")
+
+        from . import autostart_manager
+
+        if autostart_manager.set_autostart(enabled):
+            self.config_manager.set("general", "autostart", enabled)
+            self.config_manager.save_settings()
+            logger.info(f"Autostart {'enabled' if enabled else 'disabled'}")
+            return False
+
+        return True
+
+    def _on_start_minimized_toggled(self, widget, state):
+        """Handle toggle of the start minimized switch."""
+        if _handlers_suppressed(self):
+            return False
+
+        enabled = bool(state)
+        logger.info(f"Start minimized toggled: {enabled}")
+        self.config_manager.set("ui", "start_minimized", enabled)
+        self.config_manager.save_settings()
+        logger.info(f"Start minimized {'enabled' if enabled else 'disabled'}")
+        return False
+
+    def _on_missing_tray_warning_toggled(self, widget, state):
+        """Handle toggle of the missing tray support warning switch."""
+        if _handlers_suppressed(self):
+            return False
+
+        enabled = bool(state)
+        logger.info(f"Missing tray warning toggled: {enabled}")
+        self.config_manager.set("ui", "show_missing_tray_warning", enabled)
+        self.config_manager.save_settings()
+        return False
+
+    def _on_show_overlay_toggled(self, widget: Gtk.Switch, state: bool) -> bool:
+        """Handle toggle of the floating dictation overlay switch."""
+        if _handlers_suppressed(self):
+            return False
+
+        enabled = bool(state)
+        self.config_manager.set_overlay_enabled(enabled)
+        self.config_manager.save_settings()
+        if self.overlay_enabled_callback is not None:
+            try:
+                self.overlay_enabled_callback(enabled)
+            except Exception as e:
+                logger.warning(f"Overlay enabled callback failed: {e}")
+        logger.info(f"Dictation overlay {'enabled' if enabled else 'disabled'}")
+        return False
+
+    def _on_copy_to_clipboard_toggled(self, widget, state):
+        """Handle toggle of the copy to clipboard switch."""
+        if _handlers_suppressed(self):
+            return False
+
+        enabled = bool(state)
+        logger.info(f"Copy to clipboard toggled: {enabled}")
+        self.config_manager.set("text_injection", "copy_to_clipboard", enabled)
+        self.config_manager.save_settings()
+        logger.info(f"Copy to clipboard {'enabled' if enabled else 'disabled'}")
+        return False
+
+    def _on_dictation_pad_toggled(self, widget: Gtk.Switch, state: bool) -> bool:
+        """Handle toggle of the in-app dictation pad switch."""
+        if _handlers_suppressed(self):
+            return False
+
+        enabled = bool(state)
+        logger.info(f"Dictate to pad toggled: {enabled}")
+        self.config_manager.set("text_injection", "dictate_to_pad", enabled)
+        self.config_manager.save_settings()
+        logger.info(f"Dictate to pad {'enabled' if enabled else 'disabled'}")
+        return False
+
+    def _on_auto_capitalize_toggled(self, widget, state):
+        """Handle toggle of the auto-capitalize switch."""
+        if _handlers_suppressed(self):
+            return False
+
+        enabled = bool(state)
+        logger.info(f"Auto-capitalize toggled: {enabled}")
+        self.config_manager.set("text_injection", "auto_capitalize", enabled)
+        self.config_manager.save_settings()
+        logger.info(f"Auto-capitalize {'enabled' if enabled else 'disabled'}")
+        return False
+
+    def _on_append_trailing_space_toggled(self, widget, state):
+        """Handle toggle of the trailing space after dictation switch."""
+        if _handlers_suppressed(self):
+            return False
+
+        enabled = bool(state)
+        logger.info(f"Append trailing space toggled: {enabled}")
+        self.config_manager.set("text_injection", "append_trailing_space", enabled)
+        self.config_manager.save_settings()
+        logger.info(f"Append trailing space {'enabled' if enabled else 'disabled'}")
+
+    def _on_paste_shortcut_changed(self, widget):
+        """Handle clipboard paste-shortcut combo changes."""
+        if _handlers_suppressed(self):
+            return
+
+        shortcut_id = self.paste_shortcut_combo.get_active_id() or DEFAULT_PASTE_SHORTCUT
+        self.config_manager.set_paste_shortcut(shortcut_id)
+        self.config_manager.save_settings()
+        logger.info(f"Paste shortcut set to {self.config_manager.get_paste_shortcut()}")
+        return False
+
+    def _update_sound_effects_sensitivity(self, enabled: bool) -> None:
+        """Gray out the tone picker while sound effects are disabled."""
+        self.tone_row.set_sensitive(enabled)
+
+    def _on_sound_effects_toggled(self, widget, state):
+        enabled = bool(state)
+        self._update_sound_effects_sensitivity(enabled)
+        if _handlers_suppressed(self):
+            return False
+
+        logger.info(f"Sound effects toggled: {enabled}")
+        self.config_manager.set_sound_effects_enabled(enabled)
+        self.config_manager.save_settings()
+        logger.info(f"Sound effects {'enabled' if enabled else 'disabled'}")
+        return False
+
+    def _on_duck_playback_toggled(self, _widget: Gtk.Widget, state: bool) -> bool:
+        enabled = bool(state)
+        self.duck_level_scale.set_sensitive(enabled)
+        if _handlers_suppressed(self):
+            return False
+        logger.info("Lower other audio while dictating toggled: %s", enabled)
+        self.config_manager.set_playback_duck_enabled(enabled)
+        self.config_manager.save_settings()
+        return False
+
+    def _on_duck_level_changed(self, scale: Gtk.Scale) -> None:
+        if _handlers_suppressed(self):
+            return
+        percent = int(round(scale.get_value()))
+        logger.info("Playback duck level set to %s%%", percent)
+        self.config_manager.set_playback_duck_percent(percent)
+        self.config_manager.save_settings()
+
+    def _sync_tone_preview_button(self, tone_id: str) -> None:
+        """Update the two-stage preview button next to the tone combo."""
+        if tone_id == "off":
+            self._tone_preview_kind = "start"
+            self.preview_tone_btn.set_sensitive(False)
+            self.preview_tone_btn.set_label("Start")
+            self.preview_tone_btn.set_tooltip_text("Off has no start or stop cue")
+            _set_accessible_name(self.preview_tone_btn, "Play start cue")
+            self.tone_row.set_subtitle("Off skips the start and stop cues")
+            return
+
+        self.preview_tone_btn.set_sensitive(True)
+        if self._tone_preview_kind == "stop":
+            self.preview_tone_btn.set_label("Stop")
+            self.preview_tone_btn.set_tooltip_text("Play the stop cue")
+            _set_accessible_name(self.preview_tone_btn, "Play stop cue")
+            self.tone_row.set_subtitle("Next click plays the stop cue")
+        else:
+            self.preview_tone_btn.set_label("Start")
+            self.preview_tone_btn.set_tooltip_text(
+                "Play the start cue. Click again for the stop cue."
+            )
+            _set_accessible_name(self.preview_tone_btn, "Play start cue")
+            self.tone_row.set_subtitle("Start and stop cues. Off is silent for those two.")
+
+    def _on_sound_tone_changed(self, combo):
+        tone_id = combo.get_active_id() or DEFAULT_SOUND_EFFECT_TONE
+        self._tone_preview_kind = "start"
+        self._sync_tone_preview_button(tone_id)
+        if _handlers_suppressed(self):
+            return
+        logger.info("Dictation tone selected: %s", tone_id)
+        self.config_manager.set_sound_effects_tone(tone_id)
+        self.config_manager.save_settings()
+
+    def _on_preview_tone_clicked(self, _widget) -> None:
+        from .audio_feedback import preview_tone_cue
+
+        tone_id = self.sound_tone_combo.get_active_id() or DEFAULT_SOUND_EFFECT_TONE
+        kind = self._tone_preview_kind
+        if not preview_tone_cue(tone_id, kind):
+            return
+        self._tone_preview_kind = "stop" if kind == "start" else "start"
+        self._sync_tone_preview_button(tone_id)
+
+    def _build_simple_model_section(self):
+        """Build the simple questions and the Advanced reveal (#779)."""
+        self.simple_group = PreferencesGroup(title="Language")
+
+        # Searchable, like the advanced row: over thirty languages is too many to
+        # scroll, and a list you cannot type into is a step backwards.
+        self.simple_language_combo = SearchablePicker()
+        _style_combo(self.simple_language_combo)
+        _combo_chrome(self.simple_language_combo)
+        for language_id, info in SUPPORTED_LANGUAGES.items():
+            # Auto-detect is the switch below, not a language you speak.
+            if language_id != "auto":
+                self.simple_language_combo.append(language_id, info["name"])
+        _attach_language_combo_search(self.simple_language_combo)
+        _connect_picker_entry(
+            self.simple_language_combo,
+            self._on_simple_language_entry_activate,
+            self._on_simple_language_entry_focus_out,
+        )
+        self.simple_language_row = PreferenceRow(
+            title="Main language",
+            subtitle="Search or pick from the list",
+            widget=self.simple_language_combo,
+            keywords=("language", "speak"),
+        )
+        self.simple_group.add_row(self.simple_language_row)
+
+        # The engine takes one language or none, so this is the only other option
+        # that exists. A second language field would promise something it cannot do.
+        self.simple_multi_switch = _add_switch_row(
+            self.simple_group,
+            title="Other languages",
+            subtitle="Guesses the language each time. Short clips can be wrong.",
+            keywords=("multilingual", "auto", "detect"),
+        )
+
+        self.simple_second_language_combo = SearchablePicker()
+        _style_combo(self.simple_second_language_combo)
+        _combo_chrome(self.simple_second_language_combo)
+        # First entry is the multilingual answer: any language, detected per
+        # utterance. Naming one specific second language means the same thing
+        # to the engine, but lets the user say which one they had in mind.
+        self.simple_second_language_combo.append("auto", "Any language")
+        for language_id, info in SUPPORTED_LANGUAGES.items():
+            if language_id != "auto":
+                self.simple_second_language_combo.append(language_id, info["name"])
+        _attach_language_combo_search(self.simple_second_language_combo)
+        # SearchablePicker already emits "changed" on Enter/row pick; do not also
+        # hook activate or a single choice would apply twice.
+        self.simple_second_language_row = PreferenceRow(
+            title="Other language",
+            # Honest about what the engine does: whisper takes one language or
+            # none, so any second language means detection per utterance.
+            subtitle="Or pick Any language to auto-detect",
+            widget=self.simple_second_language_combo,
+            keywords=("second", "language", "other"),
+        )
+        self.simple_second_language_row.set_no_show_all(True)
+        self.simple_group.add_row(self.simple_second_language_row)
+
+        self.simple_priority_combo = Gtk.ComboBoxText()
+        _style_combo(self.simple_priority_combo)
+        _combo_chrome(self.simple_priority_combo)
+        for priority in PRIORITIES:
+            self.simple_priority_combo.append(priority, PRIORITY_LABELS[priority])
+        self.simple_priority_row = PreferenceRow(
+            title="Speed vs accuracy",
+            subtitle="Balanced is the default for this computer",
+            widget=self.simple_priority_combo,
+            keywords=("speed", "accuracy", "priority"),
+        )
+        self.simple_group.add_row(self.simple_priority_row)
+
+        # The simple card and, under it, the info card the engine section adds.
+        self.simple_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.simple_page.pack_start(self.simple_group, False, False, 0)
+        self.content_box.pack_start(self.simple_page, False, False, 0)
+
+        # Advanced is its own island under the simple card: collapsed to a
+        # header by default, expanding in place. Not a second window — that went
+        # wrong twice on KWin/Wayland: transient for the dialog it crashed the
+        # compositor (findModal recursion, tag kwin-crash-repro); standing alone
+        # it could not be raised above the dialog at all. Both cards visible at
+        # once also makes the expanded rows a readout of what the simple answers
+        # resolved to.
+        (
+            self.advanced_island,
+            self.advanced_expander,
+            self.advanced_box,
+            _,
+        ) = _make_expander_card(
+            "Advanced",
+            "Engine, model, remote server, and local VocaGateway",
+        )
+        self.advanced_box.set_spacing(12)
+        self.advanced_box.set_margin_top(8)
+        self.content_box.pack_start(self.advanced_island, False, False, 0)
+
+        self.advanced_expander.connect("notify::expanded", self._on_advanced_expanded)
+        self.simple_language_combo.connect("changed", self._on_simple_choice_changed)
+        self.simple_second_language_combo.connect("changed", self._on_simple_choice_changed)
+        self.simple_multi_switch.connect("notify::active", self._on_simple_choice_changed)
+        self.simple_priority_combo.connect("changed", self._on_simple_choice_changed)
+
+    def _build_engine_section(self):
+        """Build the Speech Engine section."""
+        group = PreferencesGroup(title="Speech Engine")
+        self.engine_group = group
+
+        # Engine selection
+        self.engine_combo = Gtk.ComboBoxText()
+        _style_combo(self.engine_combo)
+        _combo_chrome(self.engine_combo)
+        engine_row = PreferenceRow(
+            title="Engine",
+            subtitle="Speech recognition backend",
+            widget=self.engine_combo,
+        )
+        group.add_row(engine_row)
+
+        # Model size selection
+        self.model_combo = Gtk.ComboBoxText()
+        _style_combo(self.model_combo)
+        self.model_combo.set_tooltip_text(MODEL_SIZE_TOOLTIP)
+        _combo_chrome(self.model_combo)
+        self.model_row = PreferenceRow(
+            title="Model size",
+            subtitle="Larger models are more accurate but slower",
+            widget=self.model_combo,
+        )
+        self.model_row.set_tooltip_text(MODEL_SIZE_TOOLTIP)
+        group.add_row(self.model_row)
+
+        # whisper.cpp specialization selection
+        self.model_variant_combo = Gtk.ComboBoxText()
+        _style_combo(self.model_variant_combo)
+        _combo_chrome(self.model_variant_combo, MODEL_SPECIALIZATION_TOOLTIP)
+        self.model_variant_row = PreferenceRow(
+            title="Specialization",
+            subtitle="Variant for language, speed, or memory use",
+            widget=self.model_variant_combo,
+        )
+        self.model_variant_row.set_tooltip_text(MODEL_SPECIALIZATION_TOOLTIP)
+        group.add_row(self.model_variant_row)
+
+        # Language selection (searchable: type to filter the 30+ language list)
+        self.language_combo = SearchablePicker()
+        _style_combo(self.language_combo)
+        _combo_chrome(self.language_combo, LANGUAGE_TOOLTIP)
+        _attach_language_combo_search(self.language_combo)
+        _connect_picker_entry(
+            self.language_combo,
+            self._on_language_entry_activate,
+            self._on_language_entry_focus_out,
+        )
+        self.language_row = PreferenceRow(
+            title="Language",
+            subtitle="Search or pick from the list",
+            widget=self.language_combo,
+        )
+        self.language_row.set_tooltip_text(LANGUAGE_TOOLTIP)
+        group.add_row(self.language_row)
+
+        # Follow-the-layout is a mode, not a language, so it is a switch over the
+        # picker rather than another entry inside it (#821). On, the picker is
+        # disabled and shows what the layout currently resolves to; off, whatever
+        # it shows becomes the pinned language again.
+        self.follow_layout_switch = Gtk.Switch()
+        self.follow_layout_switch.set_tooltip_text(FOLLOW_LAYOUT_TOOLTIP)
+        self.follow_layout_row = PreferenceRow(
+            title="Follow keyboard layout",
+            subtitle="Dictate in the language of whichever layout you are typing in",
+            widget=self.follow_layout_switch,
+            keywords=("keyboard", "layout", "follow", "bilingual", "language", "switch"),
+        )
+        self.follow_layout_row.set_tooltip_text(FOLLOW_LAYOUT_TOOLTIP)
+        group.add_row(self.follow_layout_row)
+
+        # Lives inside the revealer built above, so the Advanced switch slides it out.
+        self.advanced_box.pack_start(group, False, False, 0)
+
+        # Model info card (shown below the group)
+        self.model_info_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.model_info_card.get_style_context().add_class("model-info-card")
+        self.model_info_card.set_margin_start(4)
+        self.model_info_card.set_margin_end(4)
+
+        self.model_info_title = Gtk.Label(xalign=0)
+        self.model_info_title.get_style_context().add_class("model-info-title")
+        self.model_info_card.pack_start(self.model_info_title, False, False, 0)
+
+        self.model_info_subtitle = Gtk.Label(xalign=0, wrap=True)
+        self.model_info_subtitle.get_style_context().add_class("model-info-subtitle")
+        self.model_info_card.pack_start(self.model_info_subtitle, False, False, 0)
+
+        # Picking a spec only stages it; this button is the explicit
+        # confirmation that turns the staged spec into a download (#894).
+        self.model_download_button = Gtk.Button(label="Download")
+        self.model_download_button.get_style_context().add_class("suggested-action")
+        self.model_download_button.set_halign(Gtk.Align.START)
+        self.model_download_button.set_no_show_all(True)
+        self.model_download_button.connect("clicked", self._on_download_model_clicked)
+        self.model_info_card.pack_start(self.model_download_button, False, False, 0)
+
+        # The recommendation used to be a plain label, which left the panel stating
+        # the right answer while the pickers kept the wrong one (#778).
+        self.model_recommendation_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.model_recommendation_box.set_no_show_all(True)
+
+        self.model_recommendation = Gtk.Label(xalign=0, wrap=True)
+        self.model_recommendation.get_style_context().add_class("model-info-subtitle")
+        self.model_recommendation_box.pack_start(self.model_recommendation, True, True, 0)
+
+        self.model_recommendation_button = Gtk.Button(label="Use it")
+        self.model_recommendation_button.set_valign(Gtk.Align.CENTER)
+        self.model_recommendation_button.set_no_show_all(True)
+        self.model_recommendation_button.connect("clicked", self._on_apply_recommendation)
+        self.model_recommendation_box.pack_end(self.model_recommendation_button, False, False, 0)
+
+        self.model_info_card.pack_start(self.model_recommendation_box, False, False, 0)
+
+        # Language warning (e.g. auto-detect, English-only models) lives in
+        # the card so there is a single explanation surface below the group.
+        self.language_warning = Gtk.Label(label="", use_markup=True, xalign=0, wrap=True)
+        self.language_warning.get_style_context().add_class("status-warning")
+        self.language_warning.set_no_show_all(True)
+        self.model_info_card.pack_start(self.language_warning, False, False, 0)
+
+        # On the page, under the simple questions: it is the only feedback that a
+        # priority or language change did anything, and what it will cost.
+        self.simple_page.pack_start(self.model_info_card, False, False, 0)
+
+        (
+            self.unused_island,
+            self.unused_expander,
+            unused_body,
+            self.unused_expander_subtitle,
+        ) = _make_expander_card(
+            "Unused downloads",
+            "Downloaded, but not the one in use",
+        )
+        self.unused_models_group = PreferencesGroup(
+            keywords=("delete", "remove", "unused", "disk", "storage", "downloaded"),
+        )
+        # Title lives on the expander card. Copy it onto the nested group so
+        # search matches "Unused downloads" without drawing a second header.
+        self.unused_models_group.title = "Unused downloads"
+        self.unused_models_group.description = "Downloaded, but not the one in use"
+        # The island is the card; this group only holds rows for search/delete.
+        self.unused_models_group.get_style_context().remove_class("preferences-group")
+
+        self.unused_models_scroll = Gtk.ScrolledWindow()
+        self.unused_models_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.unused_models_scroll.set_shadow_type(Gtk.ShadowType.NONE)
+        self.unused_models_scroll.set_propagate_natural_height(True)
+        self.unused_models_scroll.set_max_content_height(_UNUSED_DOWNLOADS_MAX_HEIGHT)
+        # Keep the scrollbar in the layout: an overlay one stays invisible until
+        # hovered, so a list clipped by the cap looks like it has no more rows.
+        self.unused_models_scroll.set_overlay_scrolling(False)
+
+        # ListBox is GtkScrollable, so wrapping it in a Box forces a Viewport
+        # and lets the expander child report a real height.
+        list_holder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.unused_models_group.remove(self.unused_models_group.listbox)
+        list_holder.pack_start(self.unused_models_group.listbox, False, False, 0)
+        self.unused_models_scroll.add(list_holder)
+        self.unused_models_group.pack_start(self.unused_models_scroll, False, False, 0)
+        unused_body.pack_start(self.unused_models_group, False, False, 0)
+        self.unused_expander.set_expanded(False)
+        # Refresh may run while collapsed or before map. Remeasure on expand
+        # and on map so a short first measurement cannot leave rows clipped.
+        self.unused_expander.connect(
+            "notify::expanded", lambda *_args: self._fit_unused_downloads_height()
+        )
+        self.unused_models_scroll.connect("map", lambda *_args: self._fit_unused_downloads_height())
+        self.content_box.pack_start(self.unused_island, False, False, 0)
+
+        # Connect signals
+        self.engine_combo.connect("changed", self._on_engine_changed)
+        self.model_combo.connect("changed", self._on_model_changed)
+        self.model_variant_combo.connect("changed", self._on_model_variant_changed)
+        self.language_combo.connect("changed", self._on_language_changed)
+        self.follow_layout_switch.connect("notify::active", self._on_follow_layout_toggled)
+
+    def _on_remote_api_settings_changed(self, widget):
+        """Handle remote API URL/Key/endpoint changes."""
+        if _handlers_suppressed(self):
+            return
+
+        url = self.remote_api_url_entry.get_text().strip()
+        key = self.remote_api_key_entry.get_text().strip()
+        endpoint = self.remote_api_endpoint_combo.get_active_id() or "/inference"
+        model = self.remote_api_model_entry.get_text().strip() or "whisper-1"
+
+        self.config_manager.set("speech_recognition", "remote_api_url", url)
+        self.config_manager.set("speech_recognition", "remote_api_key", key)
+        self.config_manager.set("speech_recognition", "remote_api_endpoint", endpoint)
+        self.config_manager.set("speech_recognition", "remote_api_model", model)
+        self.config_manager.save_settings()
+
+        # Auto apply only if remote engine is currently active
+        engine_text = self.engine_combo.get_active_text()
+        engine = _engine_from_display(engine_text) if engine_text else "vosk"
+        if engine == "remote_api":
+            self._auto_apply_settings()
+
+    def _on_test_remote_connection(self, widget):
+        """Test remote server connection."""
+        url = self.remote_api_url_entry.get_text().strip()
+        if not url:
+            self.remote_status_label.set_markup(
+                "<span foreground='#c01c28'>✗ Please enter a server URL</span>"
+            )
+            return
+
+        self.remote_test_btn.set_sensitive(False)
+        self.remote_test_btn.set_label("Testing...")
+        self.remote_status_label.set_markup("<i>Connecting...</i>")
+
+        key = self.remote_api_key_entry.get_text().strip()
+        endpoint = self.remote_api_endpoint_combo.get_active_id() or "/inference"
+
+        def test_connection(url=url, key=key, endpoint=endpoint):
+            try:
+                import requests
+
+                headers = {}
+                if key:
+                    headers["Authorization"] = f"Bearer {key}"
+
+                clean_url = url.rstrip("/")
+
+                session = requests.Session()
+                try:
+                    response = session.get(clean_url, headers=headers, timeout=5)
+
+                    server_info = ""
+
+                    try:
+                        if endpoint == "/v1/audio/transcriptions":
+                            openai_resp = session.get(
+                                f"{clean_url}/v1/models", headers=headers, timeout=5
+                            )
+                            if openai_resp.status_code == 200:
+                                server_info = " (OpenAI compatible)"
+                        elif endpoint == "/inference":
+                            whispercpp_resp = session.get(
+                                f"{clean_url}/inference", headers=headers, timeout=5
+                            )
+                            if whispercpp_resp.status_code != 404:
+                                server_info = " (whisper.cpp server)"
+                    except Exception:
+                        pass
+
+                    GLib.idle_add(
+                        self.remote_status_label.set_markup,
+                        f"<span foreground='#26a269'>✓ Connected! "
+                        f"(status={response.status_code}){server_info}</span>",
+                    )
+                finally:
+                    session.close()
+
+            except Exception as e:
+                error_msg = str(e)[:80]
+                GLib.idle_add(
+                    self.remote_status_label.set_markup,
+                    f"<span foreground='#c01c28'>✗ Connection failed: {error_msg}</span>",
+                )
+
+            GLib.idle_add(self.remote_test_btn.set_sensitive, True)
+            GLib.idle_add(self.remote_test_btn.set_label, "Test Connection")
+
+        threading.Thread(target=test_connection, daemon=True).start()
+
+    def _build_recognition_section(self):
+        """Build the Listening and Output groups on the Dictation page."""
+        group = PreferencesGroup(title="Listening")
+
+        # VAD Sensitivity
+        self.vad_spin = _style_spin(
+            _new_spin(1, 5, 1, 0, tooltip="Higher = more sensitive to quiet speech")
+        )
+        silero_active = is_silero_available()
+        vad_subtitle = (
+            "Sensitivity to quiet speech (1-5) — Silero neural VAD"
+            if silero_active
+            else "Sensitivity to quiet speech (1-5) — amplitude backend"
+        )
+        self.vad_row = PreferenceRow(
+            title="Microphone Sensitivity",
+            subtitle=vad_subtitle,
+            widget=self.vad_spin,
+            keywords=("vad", "voice activity detection"),
+        )
+        group.add_row(self.vad_row)
+
+        # Silence Timeout
+        self.silence_spin = _style_spin(
+            _new_spin(0.5, 5.0, 0.1, 1, tooltip="Wait time after silence before processing speech")
+        )
+        silence_row = PreferenceRow(
+            title="Stop After Silence",
+            subtitle="Seconds of silence before processing what you said",
+            widget=self.silence_spin,
+            keywords=("timeout", "pause"),
+        )
+        group.add_row(silence_row)
+
+        self.recognition_settings_tab.pack_start(group, False, False, 0)
+
+        # Output group: what happens with the recognized text
+        output_group = PreferencesGroup(title="Output")
+
+        self.voice_commands_switch = _add_switch_row(
+            output_group,
+            title="Voice Commands",
+            subtitle="Say 'new line', 'period', 'undo' (localized punctuation too)",
+            keywords=("punctuation", "editing"),
+            tooltip=(
+                "Enable voice commands like 'new line', 'period', 'undo', etc.\n"
+                "Punctuation phrases also match the recognition language "
+                "(e.g. Italian 'virgola', French 'virgule').\n"
+                "Useful for VOSK engine. Whisper engines handle punctuation automatically."
+            ),
+        )
+
+        self.auto_capitalize_switch = _add_switch_row(
+            output_group,
+            title="Auto-Capitalize Sentences",
+            subtitle="Capitalize first letter after punctuation (Vosk only)",
+            keywords=("capitalization", "casing", "sentence"),
+            tooltip=(
+                "Automatically capitalize the first letter of each sentence. "
+                "Works after sentence-ending punctuation (period, exclamation, question mark). "
+                "Only applies to Vosk engine - Whisper models output proper capitalization "
+                "automatically."
+            ),
+        )
+
+        self.copy_to_clipboard_switch = _add_switch_row(
+            output_group,
+            title="Copy to Clipboard",
+            subtitle="Always copy recognized text to clipboard for easy pasting",
+            keywords=("paste",),
+            tooltip=(
+                "Copy recognized text to clipboard after each transcription. "
+                "Useful if injection fails or you want to paste elsewhere."
+            ),
+        )
+
+        self.dictation_pad_switch = _add_switch_row(
+            output_group,
+            title="Dictation Pad",
+            subtitle="Capture dictation in an in-app text box instead of other apps",
+            keywords=("wayland", "pad", "fallback", "text box"),
+            tooltip=(
+                "Type dictation into Vocalinux's own Dictation Pad window instead "
+                "of injecting it into other apps. The pad opens from the tray menu; "
+                "copy text out of it by hand. Useful on Wayland, where injecting "
+                "keystrokes into other windows is restricted."
+            ),
+        )
+
+        self.append_trailing_space_switch = _add_switch_row(
+            output_group,
+            title="Trailing Space After Dictation",
+            subtitle="Insert a space after each completed transcription segment",
+            keywords=("space", "spacing", "punctuation", "push-to-talk"),
+            tooltip=(
+                "Append a space after each completed transcription so the next "
+                "dictation session continues without gluing onto the previous text "
+                '(e.g. "Hello. This" instead of "Hello.This").'
+            ),
+        )
+
+        self.paste_shortcut_combo = Gtk.ComboBoxText()
+        _style_combo(self.paste_shortcut_combo)
+        _combo_chrome(
+            self.paste_shortcut_combo,
+            tooltip=(
+                "Clipboard injection uses Ctrl+V in ordinary fields and Ctrl+Shift+V "
+                "in terminal windows. Override this when a nested terminal panel "
+                "(for example in an IDE) is not detected."
+            ),
+        )
+        for shortcut_id, display_name in PASTE_SHORTCUTS:
+            self.paste_shortcut_combo.append(shortcut_id, display_name)
+        paste_shortcut_row = PreferenceRow(
+            title="Clipboard Paste Shortcut",
+            subtitle="Auto-detect terminals, or force Ctrl+V / Ctrl+Shift+V",
+            widget=self.paste_shortcut_combo,
+            keywords=("paste", "terminal", "ctrl", "clipboard"),
+        )
+        output_group.add_row(paste_shortcut_row)
+
+        self.recognition_settings_tab.pack_start(output_group, False, False, 0)
+        self.copy_to_clipboard_switch.connect("state-set", self._on_copy_to_clipboard_toggled)
+        self.dictation_pad_switch.connect("state-set", self._on_dictation_pad_toggled)
+        self.auto_capitalize_switch.connect("state-set", self._on_auto_capitalize_toggled)
+        self.append_trailing_space_switch.connect(
+            "state-set", self._on_append_trailing_space_toggled
+        )
+        self.paste_shortcut_combo.connect("changed", self._on_paste_shortcut_changed)
+
+        if not silero_active:
+            vad_info_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            vad_info_box.get_style_context().add_class("info-box")
+            vad_info_box.set_margin_start(4)
+            vad_info_box.set_margin_end(4)
+            vad_info_box.set_margin_top(4)
+
+            info_icon = Gtk.Image.new_from_icon_name(
+                "dialog-information-symbolic", Gtk.IconSize.MENU
+            )
+            vad_info_box.pack_start(info_icon, False, False, 0)
+
+            vad_info_label = Gtk.Label(
+                label=(
+                    "Neural VAD is more accurate at separating speech from background "
+                    "noise. To enable it, install onnxruntime and restart Vocalinux:\n"
+                    '    pip install "vocalinux[vad]"'
+                ),
+                xalign=0,
+                wrap=True,
+                selectable=True,
+            )
+            vad_info_label.get_style_context().add_class("tip-label")
+            vad_info_box.pack_start(vad_info_label, True, True, 0)
+
+            self.recognition_settings_tab.pack_start(vad_info_box, False, False, 0)
+
+        # Connect signals
+        self.vad_spin.connect("value-changed", self._on_vad_changed)
+        self.silence_spin.connect("value-changed", self._on_silence_changed)
+        self.voice_commands_switch.connect("state-set", self._on_voice_commands_toggled)
+        self.auto_capitalize_switch.connect("state-set", self._on_auto_capitalize_toggled)
+
+    def _build_shortcuts_section(self):
+        """Build the Keyboard Shortcuts section."""
+        group = PreferencesGroup(
+            title="Keyboard Shortcuts",
+            description="Configure the shortcut to control voice recognition",
+        )
+
+        # External activation: drive start/stop from a desktop/compositor global
+        # shortcut (bound to `vocalinux --toggle`) instead of the built-in key
+        # listener. Avoids reading /dev/input (no keylogging, no `input` group).
+        self.disable_internal_hotkey_switch = Gtk.Switch()
+        self.disable_internal_hotkey_switch.set_tooltip_text(
+            "Turn off the built-in key listener and trigger voice typing from a "
+            "desktop global shortcut bound to 'vocalinux --toggle'. Avoids reading "
+            "/dev/input (no keylogging, no 'input' group needed)."
+        )
+        external_row = PreferenceRow(
+            title="External Activation (Desktop Shortcut)",
+            subtitle="Use a compositor global shortcut instead of the built-in key listener",
+            widget=self.disable_internal_hotkey_switch,
+        )
+        group.add_row(external_row)
+
+        # Mode selection (Toggle vs Push-to-Talk)
+        self.shortcut_mode_combo = Gtk.ComboBoxText()
+        _style_combo(self.shortcut_mode_combo)
+        _combo_chrome(
+            self.shortcut_mode_combo,
+            tooltip="Choose between toggle (double-tap) or push-to-talk mode",
+        )
+
+        # Populate mode options
+        for mode_id in SHORTCUT_MODES:
+            self.shortcut_mode_combo.append(
+                mode_id, _SHORTCUT_MODE_COMBO_LABELS.get(mode_id, SHORTCUT_MODES[mode_id])
+            )
+
+        # Load current mode from config
+        current_mode = self.config_manager.get_str("shortcuts", "mode", DEFAULT_SHORTCUT_MODE)
+        if not self.shortcut_mode_combo.set_active_id(current_mode):
+            self.shortcut_mode_combo.set_active_id(DEFAULT_SHORTCUT_MODE)
+
+        self.mode_row = PreferenceRow(
+            title="Shortcut Mode",
+            subtitle="How the shortcut behaves",
+            widget=self.shortcut_mode_combo,
+        )
+        group.add_row(self.mode_row)
+
+        # Shortcut selection combo
+        self.shortcut_combo = Gtk.ComboBoxText()
+        _style_combo(self.shortcut_combo)
+        self.shortcut_combo.set_tooltip_text("Select the keyboard shortcut for voice typing")
+        _prevent_scroll_on_hover(self.shortcut_combo)
+
+        # Populate shortcut options grouped by side, then a Custom sentinel.
+        # Preset and custom are mutually exclusive: only one is active at a time.
+        for group_label, shortcut_ids in SHORTCUT_GROUPS.items():
+            # Add group separator as a disabled label entry
+            separator_id = f"__separator_{group_label}__"
+            self.shortcut_combo.append(separator_id, f"── {group_label} ──")
+            for shortcut_id in shortcut_ids:
+                display_name = SHORTCUT_DISPLAY_NAMES.get(shortcut_id, shortcut_id)
+                self.shortcut_combo.append(shortcut_id, display_name)
+        self.shortcut_combo.append("__custom__", "Custom Shortcut")
+
+        # Load current shortcut from config
+        current_shortcut = self.config_manager.get_str(
+            "shortcuts", "toggle_recognition", DEFAULT_SHORTCUT
+        )
+
+        self.shortcut_row = PreferenceRow(
+            title="Shortcut Key",
+            subtitle="Press this key to control voice typing",
+            widget=self.shortcut_combo,
+        )
+        group.add_row(self.shortcut_row)
+
+        # Custom shortcut: modifier+key combos (e.g. Alt+R) for users who want
+        # something the preset modifiers can't express (split keyboards, etc.).
+        custom_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.custom_shortcut_entry = Gtk.Entry()
+        self.custom_shortcut_entry.set_placeholder_text("e.g. alt+r or f10")
+        self.custom_shortcut_entry.set_width_chars(12)
+        self.custom_shortcut_entry.set_tooltip_text(
+            "A modifier plus a key (alt+r) or a function key (f10)"
+        )
+        self.custom_shortcut_entry.connect("activate", self._on_custom_shortcut_apply)
+        custom_box.pack_start(self.custom_shortcut_entry, False, False, 0)
+
+        self.record_shortcut_button = Gtk.Button(label="Record")
+        self.record_shortcut_button.set_tooltip_text("Click, then press your desired key combo")
+        self.record_shortcut_button.connect("clicked", self._on_record_shortcut_clicked)
+        custom_box.pack_start(self.record_shortcut_button, False, False, 0)
+
+        self.set_custom_shortcut_button = Gtk.Button(label="Set")
+        self.set_custom_shortcut_button.set_tooltip_text("Apply the typed shortcut")
+        self.set_custom_shortcut_button.connect("clicked", self._on_custom_shortcut_apply)
+        custom_box.pack_start(self.set_custom_shortcut_button, False, False, 0)
+
+        self.custom_shortcut_row = PreferenceRow(
+            title="Custom Shortcut",
+            subtitle="Modifier + key, or a function key",
+            widget=custom_box,
+            keywords=("record", "keybinding", "hotkey"),
+        )
+        # Only shown while "Custom Shortcut" is selected in the preset combo.
+        self.custom_shortcut_row.set_no_show_all(True)
+        group.add_row(self.custom_shortcut_row)
+
+        # Key-capture state for the Record button. ``_recording_shortcut_target``
+        # names (entry, apply_fn, button, hint_label) so one recorder serves the
+        # main shortcut and every per-language row (#805).
+        self._recording_shortcut = False
+        self._recording_shortcut_target = None
+        self._evdev_shortcut_recorder = None
+        self.connect("key-press-event", self._on_shortcut_key_press)
+        self.connect("destroy", self._on_shortcut_recorder_destroy)
+
+        self.shortcuts_tab.pack_start(group, False, False, 0)
+
+        # Info box about the shortcut
+        info_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        info_box.get_style_context().add_class("info-box")
+        info_box.set_margin_start(4)
+        info_box.set_margin_end(4)
+        info_box.set_margin_top(4)
+
+        info_icon = Gtk.Image.new_from_icon_name("dialog-information-symbolic", Gtk.IconSize.MENU)
+        info_box.pack_start(info_icon, False, False, 0)
+
+        self.shortcut_info_label = Gtk.Label(
+            label="Changes take effect immediately.",
+            xalign=0,
+            wrap=True,
+        )
+        self.shortcut_info_label.get_style_context().add_class("tip-label")
+        info_box.pack_start(self.shortcut_info_label, True, True, 0)
+
+        self.shortcuts_tab.pack_start(info_box, False, False, 0)
+
+        # Reflect active shortcut in combo + custom entry (preset vs custom).
+        self._sync_shortcut_selection_ui(current_shortcut)
+
+        # Connect signals
+        self.shortcut_combo.connect("changed", self._on_shortcut_changed)
+        self.shortcut_mode_combo.connect("changed", self._on_shortcut_mode_changed)
+        self.disable_internal_hotkey_switch.connect(
+            "state-set", self._on_disable_internal_hotkey_toggled
+        )
+
+        # Update UI based on initial mode
+        self._update_shortcut_ui_for_mode(current_mode)
+
+    def _update_internal_hotkey_sensitivity(self, disabled: bool) -> None:
+        """Grey out the built-in shortcut controls when external activation is on."""
+        for row in (self.mode_row, self.shortcut_row, self.custom_shortcut_row):
+            row.set_sensitive(not disabled)
+
+        if disabled:
+            self.shortcut_info_label.set_text(
+                "External activation is on: the built-in key listener is off. "
+                "Bind a desktop global shortcut to 'vocalinux --toggle' to start/stop."
+            )
+        else:
+            # Restore the mode-appropriate hint.
+            self._update_shortcut_ui_for_mode(
+                self.config_manager.get_str("shortcuts", "mode", "toggle")
+            )
+
+    def _on_disable_internal_hotkey_toggled(self, widget: Gtk.Switch, state: bool) -> bool:
+        """Handle toggle of the external-activation switch."""
+        if self._initializing or self._applying_settings:
+            return False
+
+        disabled = bool(state)
+        logger.info(f"External activation (internal hotkey disabled) toggled: {disabled}")
+        self.config_manager.set("shortcuts", "disable_internal_hotkey", disabled)
+        self.config_manager.save_settings()
+
+        self._update_internal_hotkey_sensitivity(disabled)
+
+        # Live-apply: start or stop the built-in listener without a restart.
+        if self.hotkey_listener_update_callback:
+            self.hotkey_listener_update_callback()
+
+        return False
+
+    def _build_language_shortcuts_section(self) -> None:
+        """Build the Language Shortcuts section (#805).
+
+        One row per shortcut → language binding, an Add row at the bottom, and
+        an info label the shared key-recorder writes its hints into.
+        """
+        group = PreferencesGroup(
+            title="Language Shortcuts",
+            description=(
+                "Start dictation in a specific language with its own key. The "
+                "binding lasts for that one dictation; your main language is "
+                "restored after. Needs a multilingual model."
+            ),
+            keywords=("language", "shortcut", "multilingual"),
+        )
+        self.language_shortcuts_group = group
+
+        for entry in self.config_manager.get_language_shortcuts():
+            self._add_language_shortcut_row(entry["language"], entry["shortcut"])
+
+        add_button = Gtk.Button(label="Add Language Shortcut")
+        add_button.set_tooltip_text("Bind another language to its own key")
+        add_button.connect("clicked", self._on_add_language_shortcut_clicked)
+        self._language_shortcut_add_row = PreferenceRow(
+            title="Add a binding",
+            subtitle="Pick a language, then record a key for it",
+            widget=add_button,
+            keywords=("add", "language", "shortcut"),
+        )
+        group.add_row(self._language_shortcut_add_row)
+
+        self.shortcuts_tab.pack_start(group, False, False, 0)
+
+        info_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        info_box.get_style_context().add_class("info-box")
+        info_box.set_margin_start(4)
+        info_box.set_margin_end(4)
+        info_box.set_margin_top(4)
+
+        info_icon = Gtk.Image.new_from_icon_name("dialog-information-symbolic", Gtk.IconSize.MENU)
+        info_box.pack_start(info_icon, False, False, 0)
+
+        self.language_shortcuts_info_label = Gtk.Label(
+            label="Language shortcuts take effect immediately and follow the "
+            "shortcut mode above.",
+            xalign=0,
+            wrap=True,
+        )
+        self.language_shortcuts_info_label.get_style_context().add_class("tip-label")
+        info_box.pack_start(self.language_shortcuts_info_label, True, True, 0)
+
+        self.shortcuts_tab.pack_start(info_box, False, False, 0)
+
+    def _add_language_shortcut_row(self, language: str, shortcut: str) -> None:
+        """Append one language → shortcut binding row (#805)."""
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+
+        language_picker = SearchablePicker()
+        _style_combo(language_picker, _CONTROL_WIDTH - 40)
+        _prevent_scroll_on_hover(language_picker)
+        for lang_code, lang_info in SUPPORTED_LANGUAGES.items():
+            language_picker.append(lang_code, str(cast(dict, lang_info)["name"]))
+        hbox.pack_start(language_picker, False, False, 0)
+
+        shortcut_entry = Gtk.Entry()
+        shortcut_entry.set_placeholder_text("e.g. ctrl+alt+d")
+        shortcut_entry.set_width_chars(14)
+        shortcut_entry.set_tooltip_text(
+            "A modifier plus a key (ctrl+alt+d) or a function key (f10)"
+        )
+        shortcut_entry.set_text(shortcut)
+        shortcut_entry.connect("changed", self._on_language_shortcut_row_changed)
+        hbox.pack_start(shortcut_entry, True, True, 0)
+
+        record_button = Gtk.Button(label="Record")
+        record_button.set_tooltip_text("Click, then press your desired key combo")
+        hbox.pack_start(record_button, False, False, 0)
+
+        remove_button = Gtk.Button.new_from_icon_name("list-remove-symbolic", Gtk.IconSize.BUTTON)
+        remove_button.set_tooltip_text("Remove this binding")
+        hbox.pack_start(remove_button, False, False, 0)
+
+        # ``refs["row"]`` fills in below: handlers are wired before the row
+        # exists so the picker's initial set_active_id cannot emit stale titles.
+        refs = {
+            "row": None,
+            "language_picker": language_picker,
+            "shortcut_entry": shortcut_entry,
+            "record_button": record_button,
+            # The last binding this row actually persisted; a mid-edit entry
+            # (empty or half-typed) falls back to it rather than erasing the
+            # binding.
+            "last_valid_shortcut": shortcut.strip().lower(),
+        }
+        language_picker.connect("changed", partial(self._on_language_shortcut_picker_changed, refs))
+        record_button.connect("clicked", partial(self._on_record_language_shortcut_clicked, refs))
+        remove_button.connect("clicked", partial(self._on_remove_language_shortcut_clicked, refs))
+        if not language_picker.set_active_id(language):
+            language_picker.set_active_id("auto")
+
+        lang_info = cast(Optional[dict], SUPPORTED_LANGUAGES.get(language))
+        lang_name = str(lang_info["name"]) if lang_info else language
+        row = PreferenceRow(
+            title=lang_name,
+            subtitle="",
+            widget=hbox,
+            keywords=("language", "shortcut", lang_name),
+        )
+        refs["row"] = row
+
+        # Newest binding above the Add row so the group reads top-down.
+        if self._language_shortcut_add_row is not None:
+            index = self.language_shortcuts_group.rows.index(self._language_shortcut_add_row)
+            self.language_shortcuts_group.listbox.insert(row, index)
+            self.language_shortcuts_group.rows.insert(index, row)
+        else:
+            self.language_shortcuts_group.add_row(row)
+        self._language_shortcut_rows.append(refs)
+
+    def _on_language_shortcut_picker_changed(
+        self, refs: dict[str, Any], picker: SearchablePicker
+    ) -> None:
+        """Apply a row's language change: retitle it and persist (#805)."""
+        row = refs.get("row")
+        if row is not None:
+            lang_id = picker.get_active_id() or ""
+            lang_info = cast(Optional[dict], SUPPORTED_LANGUAGES.get(lang_id))
+            lang_name = str(lang_info["name"]) if lang_info else lang_id
+            row.set_title(lang_name)
+        self._on_language_shortcut_row_changed(picker)
+
+    def _on_language_shortcut_row_changed(self, *args: object) -> None:
+        """Persist the bindings whenever a row's language or key changes (#805)."""
+        self._persist_language_shortcuts()
+
+    def _on_record_language_shortcut_clicked(
+        self, refs: dict[str, Any], button: Gtk.Button
+    ) -> None:
+        """Arm key-capture aimed at a language row's entry (#805)."""
+
+        def _apply(shortcut: str) -> None:
+            # _commit_recorded_shortcut already wrote the captured key to the
+            # entry, whose changed signal persisted it; setting the same text
+            # again would write config a second time and rebuild the
+            # listeners for one recorded key.
+            if refs["shortcut_entry"].get_text() != shortcut:
+                refs["shortcut_entry"].set_text(shortcut)
+
+        self._begin_shortcut_recording(
+            refs["shortcut_entry"],
+            _apply,
+            refs["record_button"],
+            self.language_shortcuts_info_label,
+        )
+
+    def _on_remove_language_shortcut_clicked(
+        self, refs: dict[str, Any], button: Gtk.Button
+    ) -> None:
+        """Remove a language binding row and persist (#805)."""
+        # An armed Record capture aimed at this row's entry must be cancelled
+        # first: the commit would otherwise write into a destroyed widget.
+        target = getattr(self, "_recording_shortcut_target", None)
+        if (
+            getattr(self, "_recording_shortcut", False)
+            and target is not None
+            and target[0] is refs["shortcut_entry"]
+        ):
+            self._stop_recording_shortcut()
+        row = refs["row"]
+        self.language_shortcuts_group.listbox.remove(row)
+        if row in self.language_shortcuts_group.rows:
+            self.language_shortcuts_group.rows.remove(row)
+        self._language_shortcut_rows.remove(refs)
+        row.destroy()
+        self._persist_language_shortcuts()
+
+    def _on_add_language_shortcut_clicked(self, button: Gtk.Button) -> None:
+        """Append a fresh binding row (defaults to auto-detect) (#805)."""
+        self._add_language_shortcut_row("auto", "")
+        self.language_shortcuts_group.show_all()
+        self._persist_language_shortcuts()
+
+    def _collect_language_shortcuts(self) -> list[dict[str, str]]:
+        """Read the current rows as [{shortcut, language}] for config (#805)."""
+        entries = []
+        for refs in self._language_shortcut_rows:
+            entries.append(
+                {
+                    "shortcut": refs["shortcut_entry"].get_text(),
+                    "language": refs["language_picker"].get_active_id() or "auto",
+                }
+            )
+        return entries
+
+    def _persist_language_shortcuts(self) -> None:
+        """Write the rows to config and refresh the live listeners (#805).
+
+        A row mid-edit — empty, half-typed, or claiming a key another row
+        already holds — would be dropped by config normalization, erasing its
+        binding when the dialog closes. Such rows keep their last persisted
+        binding instead, and a rejected duplicate is called out on the info
+        label.
+        """
+        if self._initializing:
+            return
+        # Each row's remembered binding belongs to that row first, so a
+        # shortcut typed into one row can never displace a binding another
+        # row already holds — the stealing edit is rejected instead.
+        owners: dict[str, int] = {}
+        for index, refs in enumerate(self._language_shortcut_rows):
+            owned = (refs.get("last_valid_shortcut") or "").strip().lower()
+            if owned and owned not in owners:
+                owners[owned] = index
+        entries = []
+        rejected = []
+        claimed = set()
+        for index, refs in enumerate(self._language_shortcut_rows):
+            language = refs["language_picker"].get_active_id() or "auto"
+            shortcut = refs["shortcut_entry"].get_text().strip().lower()
+            last_valid = refs.get("last_valid_shortcut", "")
+            owner = owners.get(shortcut)
+            if (
+                shortcut
+                and is_valid_shortcut(shortcut)
+                and shortcut not in claimed
+                and (owner is None or owner == index)
+            ):
+                refs["last_valid_shortcut"] = shortcut
+                claimed.add(shortcut)
+            elif (
+                last_valid and last_valid not in claimed and owners.get(last_valid, index) == index
+            ):
+                if shortcut and is_valid_shortcut(shortcut):
+                    rejected.append(shortcut)
+                shortcut = last_valid
+                claimed.add(shortcut)
+            else:
+                if shortcut and is_valid_shortcut(shortcut):
+                    rejected.append(shortcut)
+                continue
+            entries.append({"shortcut": shortcut, "language": language})
+        if normalize_language_shortcuts(entries) == self.config_manager.get_language_shortcuts():
+            # Nothing effective changed — a mid-edit keystroke, a rejected
+            # duplicate, or a reverted field — so the live listeners do not
+            # need another rebuild (and dictation never pauses for one).
+            self._report_language_shortcut_rejections(rejected)
+            return
+        self.config_manager.set_language_shortcuts(entries)
+        self.config_manager.save_settings()
+        if self.language_shortcuts_update_callback:
+            self.language_shortcuts_update_callback()
+        self._report_language_shortcut_rejections(rejected)
+
+    def _report_language_shortcut_rejections(self, rejected: list[str]) -> None:
+        """Surface dropped duplicate keys on the section's info label (#805)."""
+        label = getattr(self, "language_shortcuts_info_label", None)
+        if label is None:
+            return
+        if rejected:
+            keys = ", ".join(sorted(set(rejected)))
+            label.set_markup(
+                f"<span foreground='#e01b24'>Shortcut "
+                f"<b>{GLib.markup_escape_text(keys)}</b> is already bound on "
+                "another row.</span>"
+            )
+        elif not getattr(self, "_recording_shortcut", False):
+            label.set_text(
+                "Language shortcuts take effect immediately and follow the " "shortcut mode above."
+            )
+
+    def _is_preset_shortcut(self, shortcut: str) -> bool:
+        """Return True if shortcut is one of the built-in double-tap presets."""
+        return shortcut in SUPPORTED_SHORTCUTS
+
+    def _set_custom_shortcut_row_visible(self, visible: bool) -> None:
+        """Show or hide the custom shortcut entry / Record / Set controls.
+
+        The row uses ``no_show_all`` so a dialog-level ``show_all()`` does not
+        reveal it while a preset is selected. The shared dance —
+        ``set_no_show_all(False)`` then ``show_all()`` to show, ``hide()``
+        then re-arm to hide — lives in ``_set_no_show_all_visible``.
+        """
+        _set_no_show_all_visible(self.custom_shortcut_row, visible)
+
+    def _set_shortcut_combo_active_id(self, active_id: str) -> None:
+        """Select a combo item without firing the changed handler."""
+        # Handler may not be connected yet (during section build).
+        try:
+            self.shortcut_combo.handler_block_by_func(self._on_shortcut_changed)
+            blocked = True
+        except TypeError:
+            blocked = False
+        try:
+            if not self.shortcut_combo.set_active_id(active_id):
+                self.shortcut_combo.set_active_id(DEFAULT_SHORTCUT)
+        finally:
+            if blocked:
+                self.shortcut_combo.handler_unblock_by_func(self._on_shortcut_changed)
+
+    def _sync_shortcut_selection_ui(self, shortcut: str) -> None:
+        """Keep preset combo and custom entry mutually exclusive.
+
+        - Preset active: combo shows that preset; custom entry is cleared.
+        - Custom active: combo shows "Custom Shortcut"; entry holds the combo string.
+        """
+        if self._is_preset_shortcut(shortcut):
+            self._set_shortcut_combo_active_id(shortcut)
+            self.custom_shortcut_entry.set_text("")
+            self._set_custom_shortcut_row_visible(False)
+        else:
+            self._set_shortcut_combo_active_id("__custom__")
+            self.custom_shortcut_entry.set_text(shortcut)
+            self._set_custom_shortcut_row_visible(True)
+
+    def _report_shortcut_apply_result(self, display_name: str, applied: bool) -> None:
+        """Show success/restart feedback after a shortcut change."""
+        if applied:
+            self.shortcut_info_label.set_markup(
+                f"<span foreground='#26a269'>Shortcut updated to <b>{display_name}</b>. "
+                "Active now!</span>"
+            )
+        else:
+            self.shortcut_info_label.set_markup(
+                f"<i>Shortcut updated to <b>{display_name}</b>. "
+                "Restart the app for the change to take full effect.</i>"
+            )
+
+    def _apply_custom_shortcut(self, shortcut: str) -> None:
+        """Validate, persist, and live-apply a custom shortcut string."""
+        shortcut = shortcut.strip().lower()
+        if not is_valid_shortcut(shortcut):
+            self.shortcut_info_label.set_markup(
+                f"<span foreground='#e01b24'>Invalid shortcut: "
+                f"<b>{GLib.markup_escape_text(shortcut or '(empty)')}</b>. "
+                "Try a modifier + key (alt+r) or a function key (f10).</span>"
+            )
+            return
+
+        # If the user typed/recorded a preset id, treat it as selecting that preset.
+        if self._is_preset_shortcut(shortcut):
+            self.config_manager.set("shortcuts", "toggle_recognition", shortcut)
+            self.config_manager.save_settings()
+            self._sync_shortcut_selection_ui(shortcut)
+            mode_id = self.shortcut_mode_combo.get_active_id()
+            display_name = SHORTCUT_DISPLAY_NAMES.get(shortcut, shortcut)
+            logger.info(f"Keyboard shortcut changed to preset via custom entry: {display_name}")
+            applied = False
+            if self.shortcut_update_callback:
+                applied = bool(self.shortcut_update_callback(shortcut, mode_id))
+            self._report_shortcut_apply_result(display_name, applied)
+            return
+
+        self.config_manager.set("shortcuts", "toggle_recognition", shortcut)
+        self.config_manager.save_settings()
+        # Dropdown should show Custom, not a leftover preset.
+        self._sync_shortcut_selection_ui(shortcut)
+
+        mode_id = self.shortcut_mode_combo.get_active_id()
+        display_name = get_shortcut_display_name(shortcut, mode_id)
+        logger.info(f"Keyboard shortcut changed to custom: {display_name}")
+
+        applied = False
+        if self.shortcut_update_callback:
+            applied = bool(self.shortcut_update_callback(shortcut, mode_id))
+        self._report_shortcut_apply_result(display_name, applied)
+
+    def _on_custom_shortcut_apply(self, widget):
+        """Handle Set button / Entry activation for a typed custom shortcut."""
+        if self._initializing:
+            return
+        self._apply_custom_shortcut(self.custom_shortcut_entry.get_text())
+
+    def _on_record_shortcut_clicked(self, widget):
+        """Begin capturing the next key combo pressed in the dialog."""
+        self._begin_shortcut_recording(
+            self.custom_shortcut_entry,
+            self._apply_custom_shortcut,
+            self.record_shortcut_button,
+            self.shortcut_info_label,
+        )
+
+    def _begin_shortcut_recording(
+        self,
+        entry: Gtk.Entry,
+        apply_fn: Callable[[str], None],
+        button: Gtk.Button,
+        hint_label: Gtk.Label,
+    ) -> None:
+        """Arm key-capture for one shortcut target.
+
+        ``apply_fn`` receives the captured shortcut string; ``hint_label`` gets
+        the press-keys hint and any error/cancel messages for this capture.
+        """
+        if self._recording_shortcut:
+            # Only one capture can be armed: reset the previously armed
+            # button instead of leaving two targets captioned "Press keys…".
+            self._stop_recording_shortcut()
+        self._recording_shortcut = True
+        self._recording_shortcut_target = (entry, apply_fn, button, hint_label)
+        button.set_label("Press keys…")
+        hint_label.set_markup(
+            "<i>Press a modifier + key (e.g. Alt+R), or an F-key. Press Esc to cancel.</i>"
+        )
+        self._start_evdev_shortcut_recorder()
+
+    def _stop_recording_shortcut(self) -> None:
+        """Exit key-capture mode and restore the armed Record button."""
+        self._recording_shortcut = False
+        self._stop_evdev_shortcut_recorder()
+        target = getattr(self, "_recording_shortcut_target", None)
+        self._recording_shortcut_target = None
+        if target is not None:
+            try:
+                target[2].set_label("Record")
+            except Exception:
+                pass
+
+    def _start_evdev_shortcut_recorder(self) -> None:
+        """Listen on keyboard evdev nodes for F13–F24 while recording."""
+        self._stop_evdev_shortcut_recorder()
+        recorder = _EvdevShortcutRecorder(self._on_evdev_recorded_shortcut)
+        recorder.start()
+        self._evdev_shortcut_recorder = recorder
+
+    def _stop_evdev_shortcut_recorder(self) -> None:
+        recorder = getattr(self, "_evdev_shortcut_recorder", None)
+        if recorder is not None:
+            recorder.stop()
+            self._evdev_shortcut_recorder = None
+
+    def _on_shortcut_recorder_destroy(self, widget) -> None:
+        """Drop evdev watches if the dialog closes while recording."""
+        self._recording_shortcut = False
+        self._stop_evdev_shortcut_recorder()
+
+    def _commit_recorded_shortcut(self, shortcut: Optional[str]) -> bool:
+        """Apply a captured shortcut if still recording. Returns True if consumed."""
+        if not getattr(self, "_recording_shortcut", False):
+            return False
+        if not shortcut or not is_valid_shortcut(shortcut):
+            return False
+        target = getattr(self, "_recording_shortcut_target", None)
+        if target is None:
+            return False
+        entry, apply_fn, _button, _hint_label = target
+        entry.set_text(shortcut)
+        self._stop_recording_shortcut()
+        apply_fn(shortcut)
+        return True
+
+    def _on_evdev_recorded_shortcut(self, shortcut: str) -> None:
+        """Apply an F13–F24 capture from the evdev watcher (main loop)."""
+        self._commit_recorded_shortcut(shortcut)
+
+    def _gdk_event_to_shortcut(self, event) -> Optional[str]:
+        """Build a canonical shortcut string from a GDK key-press event."""
+        modifiers = []
+        state = event.state
+        if state & Gdk.ModifierType.CONTROL_MASK:
+            modifiers.append("ctrl")
+        if state & Gdk.ModifierType.MOD1_MASK:
+            modifiers.append("alt")
+        if state & Gdk.ModifierType.SHIFT_MASK:
+            modifiers.append("shift")
+        if state & Gdk.ModifierType.SUPER_MASK:
+            modifiers.append("super")
+        hardware = getattr(event, "hardware_keycode", 0) or 0
+        return _gdk_capture_to_shortcut(modifiers, Gdk.keyval_name(event.keyval), hardware)
+
+    def _on_shortcut_key_press(self, widget, event):
+        """Capture a pressed combo while recording; otherwise pass through."""
+        if not getattr(self, "_recording_shortcut", False):
+            return False  # not recording: let normal event handling proceed
+
+        keyname = Gdk.keyval_name(event.keyval) or ""
+        if keyname in _GDK_MODIFIER_KEYNAMES:
+            return True  # wait for the non-modifier key
+
+        shortcut = self._gdk_event_to_shortcut(event)
+        if self._commit_recorded_shortcut(shortcut):
+            return True
+        if not getattr(self, "_recording_shortcut", False):
+            return True
+        target = getattr(self, "_recording_shortcut_target", None)
+        hint_label = target[3] if target is not None else self.shortcut_info_label
+        if keyname == "Escape" and not shortcut:
+            self._stop_recording_shortcut()
+            hint_label.set_text("Recording cancelled.")
+            return True
+
+        hint_label.set_markup(
+            "<span foreground='#e01b24'>Need a modifier + key, or an F1–F24 "
+            "function key alone. Try again or press Esc to cancel.</span>"
+        )
+        return True
+
+    def _update_shortcut_ui_for_mode(self, mode: str):
+        """Update the shortcut UI text to match both the mode and the shortcut.
+
+        A modifier+key combo (e.g. "alt+r") toggles on a single press, not a
+        double-tap, so the wording must reflect the active shortcut instead of
+        assuming a bare-modifier gesture. Reads the saved shortcut from config
+        (the single source of truth for both preset and custom shortcuts).
+        """
+        shortcut = self.config_manager.get_str("shortcuts", "toggle_recognition", DEFAULT_SHORTCUT)
+        is_combo = is_valid_shortcut(shortcut) and parse_shortcut_spec(shortcut).is_combo
+        # e.g. "Press Alt+R" (combo toggle), "Double-tap Ctrl", "Hold Alt+R".
+        action = get_shortcut_display_name(shortcut, mode)
+
+        if mode == "toggle":
+            if is_combo:
+                self.shortcut_row.set_subtitle(f"{action} to start/stop voice typing")
+                self.shortcut_info_label.set_text(
+                    f"In Toggle mode: {action} to start voice typing, {action.lower()} "
+                    "again to stop."
+                )
+            else:
+                self.shortcut_row.set_subtitle("Double-tap this key to start/stop voice typing")
+                self.shortcut_info_label.set_text(
+                    "In Toggle mode: Double-tap the key to start voice typing, "
+                    "double-tap again to stop."
+                )
+        elif mode == "push_to_talk":
+            self.shortcut_row.set_subtitle("Hold this shortcut to speak, release to stop")
+            self.shortcut_info_label.set_text(
+                "In Push-to-Talk mode: Hold the shortcut down to speak, release to stop recording."
+            )
+
+    def _on_shortcut_mode_changed(self, widget):
+        """Handle shortcut mode selection change."""
+        if self._initializing:
+            return
+
+        mode_id = self.shortcut_mode_combo.get_active_id()
+        if not mode_id:
+            return
+
+        # Save to config
+        self.config_manager.set("shortcuts", "mode", mode_id)
+        self.config_manager.save_settings()
+
+        mode_name = SHORTCUT_MODES.get(mode_id, mode_id)
+        logger.info(f"Keyboard shortcut mode changed to: {mode_name}")
+
+        # Update UI to reflect new mode
+        self._update_shortcut_ui_for_mode(mode_id)
+
+        # Apply from saved config (source of truth for both preset and custom).
+        if self.shortcut_update_callback:
+            shortcut_id = self.config_manager.get_str(
+                "shortcuts", "toggle_recognition", DEFAULT_SHORTCUT
+            )
+            success = self.shortcut_update_callback(shortcut_id, mode_id)
+            if success:
+                self.shortcut_info_label.set_markup(
+                    f"<span foreground='#26a269'>Mode updated to <b>{mode_name}</b>. "
+                    f"Active now!</span>"
+                )
+            else:
+                self.shortcut_info_label.set_markup(
+                    f"<i>Mode updated to <b>{mode_name}</b>. "
+                    f"Restart the app for the change to take full effect.</i>"
+                )
+        else:
+            self.shortcut_info_label.set_markup(
+                f"<i>Mode updated to <b>{mode_name}</b>. "
+                f"Restart the app for the change to take full effect.</i>"
+            )
+
+    def _revert_shortcut_combo_to_saved(self) -> None:
+        """Restore combo, custom-row visibility, and info text to the saved shortcut.
+
+        Used when the user clicks a group separator in the shortcut combo.
+        Must sync the custom row too: selecting Custom Shortcut reveals
+        Record/Set, and a separator click must not leave those controls
+        visible while a preset is still the active binding. Also clear the
+        temporary Record/Set hint so the mode description matches the UI.
+        """
+        current = self.config_manager.get_str("shortcuts", "toggle_recognition", DEFAULT_SHORTCUT)
+        self._sync_shortcut_selection_ui(current)
+        mode_id = self.shortcut_mode_combo.get_active_id() or DEFAULT_SHORTCUT_MODE
+        self._update_shortcut_ui_for_mode(mode_id)
+
+    def _on_shortcut_changed(self, widget):
+        """Handle shortcut selection change."""
+        if self._initializing:
+            return
+
+        shortcut_id = self.shortcut_combo.get_active_id()
+        if not shortcut_id:
+            return
+
+        # Ignore separator entries (used for grouped display)
+        if shortcut_id.startswith("__separator_"):
+            self._revert_shortcut_combo_to_saved()
+            return
+
+        # Selecting "Custom Shortcut" does not change the active binding until
+        # the user records/sets one; just focus the custom entry for convenience.
+        if shortcut_id == "__custom__":
+            current = self.config_manager.get_str(
+                "shortcuts", "toggle_recognition", DEFAULT_SHORTCUT
+            )
+            if not self._is_preset_shortcut(current):
+                self.custom_shortcut_entry.set_text(current)
+            self._set_custom_shortcut_row_visible(True)
+            self.custom_shortcut_entry.grab_focus()
+            self.shortcut_info_label.set_markup(
+                "<i>Record or type a custom shortcut (e.g. alt+r or f10), then click Set.</i>"
+            )
+            return
+
+        # Preset selected: clear any leftover custom entry so UI matches config.
+        self.custom_shortcut_entry.set_text("")
+        self._set_custom_shortcut_row_visible(False)
+        self.config_manager.set("shortcuts", "toggle_recognition", shortcut_id)
+        self.config_manager.save_settings()
+
+        display_name = SHORTCUT_DISPLAY_NAMES.get(shortcut_id, shortcut_id)
+        logger.info(f"Keyboard shortcut changed to: {display_name}")
+
+        applied = False
+        if self.shortcut_update_callback:
+            mode_id = self.shortcut_mode_combo.get_active_id()
+            applied = bool(self.shortcut_update_callback(shortcut_id, mode_id))
+        self._report_shortcut_apply_result(display_name, applied)
+
+    def _build_sidebar_footer(self, sidebar_box: Gtk.Box):
+        """Build the sidebar footer: test output, status, test action, and Close.
+
+        Always visible regardless of the selected page: recognition state,
+        live microphone level, a dictation test button, and the dialog's
+        in-window Close button. Test output leads the footer so the revealed
+        box grows into the empty sidebar space above the controls instead of
+        pushing them down (#677).
+        """
+        separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        separator.set_margin_start(8)
+        separator.set_margin_end(8)
+        sidebar_box.pack_start(separator, False, False, 0)
+
+        footer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        footer.get_style_context().add_class("sidebar-footer")
+
+        # Test transcription output, revealed while testing
+        self.test_output_revealer = Gtk.Revealer()
+        self.test_output_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+
+        scrolled_window = Gtk.ScrolledWindow()
+        scrolled_window.set_min_content_height(60)
+        scrolled_window.set_max_content_height(100)
+        scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        # GTK3 default IN shadow draws a left etched stripe on GNOME/Wayland (#847).
+        scrolled_window.set_shadow_type(Gtk.ShadowType.NONE)
+        scrolled_window.get_style_context().add_class("test-area")
+
+        self.test_textview = Gtk.TextView()
+        self.test_textview.set_editable(False)
+        self.test_textview.set_cursor_visible(False)
+        self.test_textview.set_wrap_mode(Gtk.WrapMode.WORD)
+        self.test_textview.get_style_context().add_class("test-textview")
+        self.test_buffer = self.test_textview.get_buffer()
+        scrolled_window.add(self.test_textview)
+        self.test_output_revealer.add(scrolled_window)
+
+        footer.pack_start(self.test_output_revealer, False, False, 0)
+
+        status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+
+        self.recognition_indicator = Gtk.Image.new_from_icon_name(
+            "media-record-symbolic", Gtk.IconSize.MENU
+        )
+        self.recognition_indicator.set_opacity(0.3)
+        status_row.pack_start(self.recognition_indicator, False, False, 0)
+
+        self.recognition_status_label = Gtk.Label(label="Idle", xalign=0)
+        self.recognition_status_label.get_style_context().add_class("status-strip-state")
+        status_row.pack_start(self.recognition_status_label, False, False, 0)
+        footer.pack_start(status_row, False, False, 0)
+
+        # One shared level bar: recognition progress and the microphone test
+        # both report into it (recognition_audio_level is a legacy alias).
+        self.audio_level_bar = Gtk.LevelBar()
+        self.audio_level_bar.set_min_value(0)
+        self.audio_level_bar.set_max_value(100)
+        self.audio_level_bar.set_value(0)
+        self.audio_level_bar.set_valign(Gtk.Align.CENTER)
+        self.recognition_audio_level = self.audio_level_bar
+        footer.pack_start(self.audio_level_bar, False, False, 0)
+
+        self.test_button = Gtk.Button(label="Test Dictation")
+        self.test_button.set_tooltip_text(
+            "Record 3 seconds of speech and show the transcription here"
+        )
+        self.test_button.connect("clicked", self._on_test_clicked)
+        footer.pack_start(self.test_button, False, False, 0)
+
+        # One shared status line (audio test results and recognition info)
+        self.progress_info_label = Gtk.Label(label="", use_markup=True, xalign=0)
+        self.progress_info_label.get_style_context().add_class("status-info")
+        self.progress_info_label.set_line_wrap(True)
+        self.audio_test_status = self.progress_info_label
+        footer.pack_start(self.progress_info_label, False, False, 0)
+
+        # Separate Close from the dictation-test controls so it reads as
+        # dialog chrome, not as part of Test Dictation (#651).
+        close_separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        close_separator.set_margin_start(8)
+        close_separator.set_margin_end(8)
+        close_separator.set_margin_top(2)
+        close_separator.set_margin_bottom(2)
+        footer.pack_start(close_separator, False, False, 0)
+
+        # In-window Close so the dialog can always be dismissed, even on WMs
+        # that hide the title-bar close button for Gtk.Dialog windows (#323).
+        close_button = Gtk.Button(label="Close")
+        close_button.set_tooltip_text("Close settings (Ctrl+W)")
+        close_button.connect("clicked", self._on_close_clicked)
+        footer.pack_start(close_button, False, False, 0)
+
+        sidebar_box.pack_start(footer, False, False, 0)
+
+    def _on_close_clicked(self, button):
+        """Close the dialog through the normal response path (same as title-bar X)."""
+        self.response(Gtk.ResponseType.CLOSE)
+
+    def _build_advanced_section(self):
+        """Build the Advanced section with whisper.cpp parameters."""
+
+        # Opt-in toggle at the top of the tab
+        opt_in_group = PreferencesGroup(title="Advanced Access")
+        self.power_user_switch = _add_switch_row(
+            opt_in_group,
+            title="Unlock Advanced Settings",
+            subtitle="I know what I'm doing — show me the whisper.cpp tuning knobs",
+            tooltip="Reveal advanced whisper.cpp tuning parameters",
+        )
+        self.advanced_tab.pack_start(opt_in_group, False, False, 0)
+
+        # Revealer that hides/shows the actual advanced controls.
+        # No inner ScrolledWindow: the notebook tab already scrolls.
+        self.advanced_revealer = Gtk.Revealer()
+        self.advanced_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+
+        controls_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+
+        group = PreferencesGroup(title="Whisper.cpp Decoding")
+
+        self.advanced_no_timestamps_switch = _add_switch_row(
+            group,
+            title="No Timestamps",
+            subtitle="Disable timestamp tokens (reduces hallucinations)",
+            tooltip="Disable timestamp generation to reduce hallucinations",
+        )
+
+        self.advanced_no_context_switch = _add_switch_row(
+            group,
+            title="No Context",
+            subtitle="Prevent error loops from past text",
+            tooltip="Do not condition on previously transcribed text",
+        )
+
+        self.advanced_temperature_spin = _new_spin(
+            0.0, 1.0, 0.1, 1, tooltip="0.0 = greedy decoding, higher = more random"
+        )
+        temperature_row = PreferenceRow(
+            title="Temperature",
+            subtitle="Decoding randomness (0.0 = deterministic)",
+            widget=self.advanced_temperature_spin,
+        )
+        group.add_row(temperature_row)
+
+        self.advanced_temperature_inc_spin = _new_spin(
+            -1.0, 1.0, 0.1, 1, tooltip="-1.0 disables temperature fallback entirely"
+        )
+        temperature_inc_row = PreferenceRow(
+            title="Temperature Increment",
+            subtitle="Fallback step (-1.0 = disabled)",
+            widget=self.advanced_temperature_inc_spin,
+        )
+        group.add_row(temperature_inc_row)
+
+        self.advanced_entropy_thold_spin = _new_spin(
+            0.0, 5.0, 0.1, 1, tooltip="Higher values catch more repetition loops"
+        )
+        entropy_row = PreferenceRow(
+            title="Entropy Threshold",
+            subtitle="Repetition loop detection",
+            widget=self.advanced_entropy_thold_spin,
+        )
+        group.add_row(entropy_row)
+
+        self.advanced_logprob_thold_spin = _new_spin(
+            -5.0, 0.0, 0.1, 1, tooltip="Average log-probability threshold for fallback"
+        )
+        logprob_row = PreferenceRow(
+            title="Logprob Threshold",
+            subtitle="Fallback trigger for low confidence",
+            widget=self.advanced_logprob_thold_spin,
+        )
+        group.add_row(logprob_row)
+
+        self.advanced_no_speech_thold_spin = _new_spin(
+            0.0, 1.0, 0.05, 2, tooltip="Probability threshold for treating audio as silence"
+        )
+        no_speech_row = PreferenceRow(
+            title="No-Speech Threshold",
+            subtitle="Silence detection confidence",
+            widget=self.advanced_no_speech_thold_spin,
+        )
+        group.add_row(no_speech_row)
+
+        candidates_help = (
+            "Optional comma-separated Whisper language codes for auto-detect, "
+            "such as en,es. Leave blank to consider all languages."
+        )
+        self.advanced_language_candidates_entry = Gtk.Entry()
+        self.advanced_language_candidates_entry.set_placeholder_text("en,es")
+        self.advanced_language_candidates_entry.set_tooltip_text(candidates_help)
+        language_candidates_row = PreferenceRow(
+            title="Language Candidates",
+            subtitle="Restrict auto-detect to selected language codes",
+            widget=self.advanced_language_candidates_entry,
+        )
+        language_candidates_row.set_tooltip_text(candidates_help)
+        group.add_row(language_candidates_row)
+
+        # Initial Prompt -- moved to the end and made multiline
+        initial_prompt_help = (
+            "Optional. Add names, jargon, punctuation style, or other context to bias "
+            "whisper.cpp transcription. Leave blank for normal dictation."
+        )
+        self.advanced_initial_prompt_textview = Gtk.TextView()
+        self.advanced_initial_prompt_textview.set_wrap_mode(Gtk.WrapMode.WORD)
+        self.advanced_initial_prompt_textview.set_tooltip_text(initial_prompt_help)
+        self.advanced_initial_prompt_textview.set_size_request(250, 80)
+
+        prompt_scrolled = Gtk.ScrolledWindow()
+        prompt_scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        prompt_scrolled.set_min_content_height(80)
+        prompt_scrolled.set_tooltip_text(initial_prompt_help)
+        prompt_scrolled.add(self.advanced_initial_prompt_textview)
+
+        initial_prompt_row = PreferenceRow(
+            title="Initial Prompt",
+            subtitle="Context to steer transcription style",
+            widget=prompt_scrolled,
+        )
+        # A ListBoxRow grabs focus on click, which steals it back from the
+        # TextView before typing can start. The row is never activatable,
+        # so it does not need keyboard focus of its own.
+        initial_prompt_row.set_can_focus(False)
+        initial_prompt_row.set_tooltip_text(initial_prompt_help)
+        group.add_row(initial_prompt_row)
+
+        info_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        info_box.get_style_context().add_class("info-box")
+        info_box.set_margin_start(4)
+        info_box.set_margin_end(4)
+        info_box.set_margin_bottom(4)
+
+        info_icon = Gtk.Image.new_from_icon_name("dialog-information-symbolic", Gtk.IconSize.MENU)
+        info_box.pack_start(info_icon, False, False, 0)
+
+        self.advanced_info_label = Gtk.Label(
+            label="These settings only apply when the whisper.cpp engine is selected.",
+            xalign=0,
+            wrap=True,
+        )
+        self.advanced_info_label.get_style_context().add_class("tip-label")
+        info_box.pack_start(self.advanced_info_label, True, True, 0)
+
+        controls_box.pack_start(info_box, False, False, 0)
+        controls_box.pack_start(group, False, False, 0)
+
+        # In-page reset action for the decoding parameters above
+        self.advanced_reset_button = Gtk.Button(label="Reset to Defaults")
+        self.advanced_reset_button.set_tooltip_text(
+            "Restore the whisper.cpp advanced parameters to their default values"
+        )
+        self.advanced_reset_button.connect("clicked", self._on_reset_advanced_clicked)
+        reset_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        reset_row.set_halign(Gtk.Align.END)
+        reset_row.pack_start(self.advanced_reset_button, False, False, 0)
+        controls_box.pack_start(reset_row, False, False, 0)
+
+        self.advanced_revealer.add(controls_box)
+        self.advanced_tab.pack_start(self.advanced_revealer, False, False, 0)
+
+        self.advanced_no_timestamps_switch.connect("state-set", self._on_advanced_param_changed)
+        self.advanced_no_context_switch.connect("state-set", self._on_advanced_param_changed)
+        self.advanced_temperature_spin.connect("value-changed", self._on_advanced_param_changed)
+        self.advanced_temperature_inc_spin.connect("value-changed", self._on_advanced_param_changed)
+        self.advanced_entropy_thold_spin.connect("value-changed", self._on_advanced_param_changed)
+        self.advanced_logprob_thold_spin.connect("value-changed", self._on_advanced_param_changed)
+        self.advanced_no_speech_thold_spin.connect("value-changed", self._on_advanced_param_changed)
+        self.advanced_language_candidates_entry.connect(
+            "changed", self._on_language_candidates_changed
+        )
+
+        self.advanced_initial_prompt_buffer = self.advanced_initial_prompt_textview.get_buffer()
+        self.advanced_initial_prompt_buffer.connect("changed", self._on_advanced_prompt_changed)
+
+        self.power_user_switch.connect("state-set", self._on_power_user_toggled)
+
+    def _about_mark_image(
+        self, icon_name: str, pixel_size: int = _ABOUT_ICON_TEXT_PX
+    ) -> Optional[Gtk.Image]:
+        """Load a currentColor SVG and paint it to match the dialog foreground."""
+        from gi.repository import GdkPixbuf
+
+        from ..utils.resource_manager import ResourceManager
+
+        path = ResourceManager().get_icon_path(icon_name)
+        if not os.path.exists(path):
+            return None
+        try:
+            ink = _about_ink_hex(self)
+            with open(path, encoding="utf-8") as handle:
+                svg = handle.read().replace("currentColor", ink)
+            loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+            loader.set_size(pixel_size, pixel_size)
+            loader.write(svg.encode("utf-8"))
+            loader.close()
+            pixbuf = loader.get_pixbuf()
+            if pixbuf is None:
+                return None
+            image = Gtk.Image.new_from_pixbuf(pixbuf)
+            image.set_pixel_size(pixel_size)
+            return image
+        except Exception as exc:
+            logger.warning("Failed to load About mark %s: %s", icon_name, exc)
+            return None
+
+    def _about_open_button(
+        self,
+        url: str,
+        tooltip: str,
+        label: str = "Open",
+        icon_name: Optional[str] = None,
+        width: int = 100,
+    ) -> Gtk.Button:
+        """Button that opens a trusted About URL.
+
+        Unique labels (Website, Source code, Report a bug or idea) are the
+        accessible name. Shared "Open" labels use the tooltip instead.
+        """
+        button = Gtk.Button(label=label)
+        button.set_size_request(width, -1)
+        button.set_tooltip_text(tooltip)
+        if label == "Open":
+            _set_accessible_name(button, tooltip)
+        if icon_name:
+            image = self._about_mark_image(icon_name)
+            if image is not None:
+                image.set_margin_end(8)
+                button.set_image(image)
+                button.set_always_show_image(True)
+                button.get_style_context().add_class("about-mark-button")
+        button.connect("clicked", lambda *_args, dest=url: self._open_web_url(dest))
+        return button
+
+    def _family_tile(
+        self,
+        url: str,
+        title: str,
+        subtitle: str,
+        icon_names: tuple[str, ...],
+        tooltip: str,
+    ) -> Gtk.Button:
+        """Compact icon + name tile that opens a family site."""
+        inner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        marks = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        marks.set_valign(Gtk.Align.CENTER)
+        for icon_name in icon_names:
+            icon = self._about_mark_image(icon_name, pixel_size=_FAMILY_ICON_PX)
+            if icon is not None:
+                marks.pack_start(icon, False, False, 0)
+        inner.pack_start(marks, False, False, 0)
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        name_label = Gtk.Label(label=title, xalign=0)
+        name_label.get_style_context().add_class("family-tile-title")
+        status_label = Gtk.Label(label=subtitle, xalign=0)
+        status_label.get_style_context().add_class("family-tile-subtitle")
+        status_label.set_line_wrap(True)
+        text.pack_start(name_label, False, False, 0)
+        text.pack_start(status_label, False, False, 0)
+        inner.pack_start(text, True, True, 0)
+
+        button = Gtk.Button()
+        button.add(inner)
+        button.get_style_context().add_class("family-tile")
+        button.set_tooltip_text(tooltip)
+        button.set_hexpand(True)
+        button.set_halign(Gtk.Align.FILL)
+        _set_accessible_name(button, tooltip)
+        button.connect("clicked", lambda *_args, dest=url: self._open_web_url(dest))
+        return button
+
+    def _build_proxy_section(self) -> None:
+        """Build the Proxy page: Off / System / Manual modes (#655).
+
+        The mode applies to model downloads and update checks. The manual
+        rows stay visible but insensitive unless the mode is Manual.
+        """
+        self.proxy_group = PreferencesGroup(
+            title="Proxy",
+            description=(
+                "Route model downloads and update checks through a proxy. "
+                "Useful in regions where the model hosts are unreachable."
+            ),
+            keywords=("proxy", "network", "socks5", "https"),
+        )
+
+        self.proxy_mode_combo = Gtk.ComboBoxText()
+        _style_combo(self.proxy_mode_combo)
+        _combo_chrome(
+            self.proxy_mode_combo,
+            tooltip="How Vocalinux connects to model hosts and update checks",
+        )
+        self.proxy_mode_combo.append("off", "Off")
+        self.proxy_mode_combo.append("system", "System")
+        self.proxy_mode_combo.append("manual", "Manual")
+        mode_row = PreferenceRow(
+            title="Mode",
+            subtitle=(
+                "System uses the *_proxy environment variables and the GNOME "
+                "proxy settings; Manual uses the server configured below"
+            ),
+            widget=self.proxy_mode_combo,
+            keywords=("mode",),
+        )
+        self.proxy_group.add_row(mode_row)
+        self.proxy_tab.pack_start(self.proxy_group, False, False, 0)
+
+        self.proxy_manual_group = PreferencesGroup(
+            title="Manual Proxy",
+            description="Applied when the mode above is set to Manual.",
+        )
+
+        self.proxy_protocol_combo = Gtk.ComboBoxText()
+        _style_combo(self.proxy_protocol_combo)
+        _combo_chrome(
+            self.proxy_protocol_combo,
+            tooltip="SOCKS5 or an HTTPS (HTTP CONNECT) proxy",
+        )
+        self.proxy_protocol_combo.append("socks5", "SOCKS5")
+        self.proxy_protocol_combo.append("https", "HTTPS")
+        protocol_row = PreferenceRow(
+            title="Protocol",
+            subtitle="SOCKS5 or an HTTPS (HTTP CONNECT) proxy",
+            widget=self.proxy_protocol_combo,
+            keywords=("protocol", "socks5", "https"),
+        )
+        self.proxy_manual_group.add_row(protocol_row)
+
+        self.proxy_host_entry = Gtk.Entry()
+        self.proxy_host_entry.set_placeholder_text("127.0.0.1 or proxy.example.com")
+        self.proxy_host_entry.set_tooltip_text("Proxy server hostname or IP address")
+        self.proxy_host_entry.set_size_request(_CONTROL_WIDTH, -1)
+        host_row = PreferenceRow(
+            title="Host",
+            subtitle="Proxy server hostname or IP address",
+            widget=self.proxy_host_entry,
+            keywords=("host", "server"),
+        )
+        self.proxy_manual_group.add_row(host_row)
+
+        self.proxy_port_spin = _new_spin(
+            1,
+            65535,
+            1,
+            0,
+            tooltip="Proxy server port (SOCKS5 default 1080, HTTPS often 8080)",
+        )
+        port_row = PreferenceRow(
+            title="Port",
+            subtitle="Proxy server port",
+            widget=self.proxy_port_spin,
+            keywords=("port",),
+        )
+        self.proxy_manual_group.add_row(port_row)
+
+        self.proxy_username_entry = Gtk.Entry()
+        self.proxy_username_entry.set_placeholder_text("(optional)")
+        self.proxy_username_entry.set_tooltip_text("Proxy username (optional)")
+        self.proxy_username_entry.set_size_request(_CONTROL_WIDTH, -1)
+        username_row = PreferenceRow(
+            title="Username",
+            subtitle="Proxy username (optional)",
+            widget=self.proxy_username_entry,
+            keywords=("username", "auth"),
+        )
+        self.proxy_manual_group.add_row(username_row)
+
+        self.proxy_password_entry = Gtk.Entry()
+        self.proxy_password_entry.set_placeholder_text("(optional)")
+        self.proxy_password_entry.set_visibility(False)
+        self.proxy_password_entry.set_tooltip_text(
+            "Proxy password (optional); stored in config.json in plaintext, "
+            "the same as the remote API key"
+        )
+        self.proxy_password_entry.set_size_request(_CONTROL_WIDTH, -1)
+        password_row = PreferenceRow(
+            title="Password",
+            subtitle="Proxy password (optional)",
+            widget=self.proxy_password_entry,
+            keywords=("password", "auth"),
+        )
+        self.proxy_manual_group.add_row(password_row)
+
+        self.proxy_test_btn = Gtk.Button(label="Test Connection")
+        self.proxy_test_btn.set_tooltip_text(
+            "Check that the Hugging Face model host is reachable with these settings"
+        )
+        self.proxy_test_btn.connect("clicked", self._on_test_proxy_connection)
+        test_row = PreferenceRow(
+            title="Connection Test",
+            subtitle="Verify the Hugging Face model host is reachable",
+            widget=self.proxy_test_btn,
+            keywords=("test", "connection"),
+        )
+        self.proxy_manual_group.add_row(test_row)
+        self.proxy_tab.pack_start(self.proxy_manual_group, False, False, 0)
+
+        # Status line under the groups, matching the remote server section
+        self.proxy_status_label = Gtk.Label(label="", use_markup=True, xalign=0)
+        self.proxy_status_label.set_margin_start(16)
+        self.proxy_status_label.set_margin_top(4)
+        self.proxy_status_label.get_style_context().add_class("status-info")
+        self.proxy_tab.pack_start(self.proxy_status_label, False, False, 0)
+
+        # Load saved values into the widgets
+        proxy_settings = self.config_manager.get_settings().get("proxy", {})
+        saved_mode = normalize_proxy_mode(proxy_settings.get("mode"))
+        if not self.proxy_mode_combo.set_active_id(saved_mode):
+            self.proxy_mode_combo.set_active_id(DEFAULT_PROXY_MODE)
+        saved_protocol = normalize_proxy_protocol(proxy_settings.get("protocol"))
+        if not self.proxy_protocol_combo.set_active_id(saved_protocol):
+            self.proxy_protocol_combo.set_active_id(DEFAULT_PROXY_PROTOCOL)
+        saved_host = proxy_settings.get("host", "")
+        if saved_host:
+            self.proxy_host_entry.set_text(str(saved_host))
+        try:
+            saved_port = int(proxy_settings.get("port") or 0)
+        except (TypeError, ValueError):
+            saved_port = 0
+        if saved_port < 1 or saved_port > 65535:
+            saved_port = default_port_for_protocol(saved_protocol)
+        self.proxy_port_spin.set_value(saved_port)
+        saved_username = proxy_settings.get("username", "")
+        if saved_username:
+            self.proxy_username_entry.set_text(str(saved_username))
+        saved_password = proxy_settings.get("password", "")
+        if saved_password:
+            self.proxy_password_entry.set_text(str(saved_password))
+
+        self.proxy_mode_combo.connect("changed", self._on_proxy_mode_changed)
+        self.proxy_protocol_combo.connect("changed", self._on_proxy_settings_changed)
+        self.proxy_host_entry.connect("changed", self._on_proxy_settings_changed)
+        self.proxy_port_spin.connect("value-changed", self._on_proxy_settings_changed)
+        self.proxy_username_entry.connect("changed", self._on_proxy_settings_changed)
+        self.proxy_password_entry.connect("changed", self._on_proxy_settings_changed)
+
+        self._update_proxy_sensitivity()
+
+    def _on_proxy_mode_changed(self, widget: Gtk.Widget) -> None:
+        """Persist the proxy mode and gate the manual rows on it."""
+        if _handlers_suppressed(self):
+            return
+        self._save_proxy_settings()
+        self._update_proxy_sensitivity()
+
+    def _on_proxy_settings_changed(self, widget: Gtk.Widget) -> None:
+        """Persist the manual proxy fields as they are edited."""
+        if _handlers_suppressed(self):
+            return
+        self._save_proxy_settings()
+
+    def _save_proxy_settings(self) -> None:
+        """Write the proxy widgets to the ``proxy`` config section."""
+        self.config_manager.set(
+            "proxy", "mode", self.proxy_mode_combo.get_active_id() or DEFAULT_PROXY_MODE
+        )
+        self.config_manager.set(
+            "proxy",
+            "protocol",
+            self.proxy_protocol_combo.get_active_id() or DEFAULT_PROXY_PROTOCOL,
+        )
+        self.config_manager.set("proxy", "host", self.proxy_host_entry.get_text().strip())
+        self.config_manager.set("proxy", "port", int(self.proxy_port_spin.get_value()))
+        self.config_manager.set("proxy", "username", self.proxy_username_entry.get_text().strip())
+        self.config_manager.set("proxy", "password", self.proxy_password_entry.get_text())
+        self.config_manager.save_config()
+
+    def _update_proxy_sensitivity(self) -> None:
+        """Gray out the manual fields unless the mode is Manual."""
+        manual = (self.proxy_mode_combo.get_active_id() or DEFAULT_PROXY_MODE) == "manual"
+        self.proxy_manual_group.set_sensitive(manual)
+
+    def _on_test_proxy_connection(self, widget: Gtk.Widget) -> None:
+        """Fetch the Hugging Face model repo through the configured proxy."""
+        self.proxy_test_btn.set_sensitive(False)
+        self.proxy_test_btn.set_label("Testing...")
+        self.proxy_status_label.set_markup("<i>Connecting...</i>")
+
+        config = {
+            "mode": self.proxy_mode_combo.get_active_id() or DEFAULT_PROXY_MODE,
+            "protocol": self.proxy_protocol_combo.get_active_id() or DEFAULT_PROXY_PROTOCOL,
+            "host": self.proxy_host_entry.get_text().strip(),
+            "port": int(self.proxy_port_spin.get_value()),
+            "username": self.proxy_username_entry.get_text().strip(),
+            "password": self.proxy_password_entry.get_text(),
+        }
+
+        def test_connection(config: dict = config) -> None:
+            import requests
+
+            try:
+                response = requests.get(
+                    "https://huggingface.co/api/models/ggerganov/whisper.cpp",
+                    headers={"User-Agent": f"vocalinux/{__version__}"},
+                    timeout=10,
+                    proxies=requests_proxies(config),
+                )
+                GLib.idle_add(
+                    self.proxy_status_label.set_markup,
+                    "<span foreground='#26a269'>✓ huggingface.co reachable "
+                    f"(status={response.status_code})</span>",
+                )
+            except requests.RequestException as exc:
+                logger.warning("Proxy connection test against huggingface.co failed: %s", exc)
+                error_msg = GLib.markup_escape_text(str(exc)[:80])
+                GLib.idle_add(
+                    self.proxy_status_label.set_markup,
+                    f"<span foreground='#c01c28'>✗ Connection failed: {error_msg}</span>",
+                )
+
+            GLib.idle_add(self.proxy_test_btn.set_sensitive, True)
+            GLib.idle_add(self.proxy_test_btn.set_label, "Test Connection")
+
+        threading.Thread(target=test_connection, daemon=True).start()
+
+    def _build_about_section(self):
+        """Build the About page using the same PreferenceRow cards as other pages."""
+        from gi.repository import GdkPixbuf
+
+        from ..utils.resource_manager import ResourceManager
+
+        about_icon = None
+        logo_path = ResourceManager().get_icon_path("vocalinux")
+        if os.path.exists(logo_path):
+            try:
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file(logo_path)
+                scaled = pixbuf.scale_simple(48, 48, GdkPixbuf.InterpType.BILINEAR)
+                about_icon = Gtk.Image.new_from_pixbuf(scaled)
+                about_icon.set_pixel_size(48)
+            except Exception as exc:
+                logger.warning("Failed to load About icon: %s", exc)
+
+        app_group = PreferencesGroup(
+            title="Vocalinux",
+            description=(
+                "Available now on Linux (X11 and Wayland). After a model is downloaded, "
+                "speech is processed on this PC."
+            ),
+            keywords=("about", "version", "app"),
+            header_icon=about_icon,
+        )
+
+        self.about_version_label = Gtk.Label(label=__version__)
+        self.about_version_label.set_selectable(True)
+        self.about_version_label.get_style_context().add_class("preference-row-subtitle")
+        version_row = PreferenceRow(
+            title="Version",
+            subtitle="Currently installed Vocalinux build",
+            widget=self.about_version_label,
+            keywords=("version", "build"),
+        )
+        app_group.add_row(version_row)
+
+        link_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        link_box.pack_start(
+            self._about_open_button(
+                VOCALINUX_SITE_URL,
+                "Open vocalinux.com website",
+                label="Website",
+                width=110,
+            ),
+            False,
+            False,
+            0,
+        )
+        link_box.pack_start(
+            self._about_open_button(
+                GITHUB_REPO_URL,
+                "Open the Vocalinux GitHub repository",
+                label="Source code",
+                width=120,
+            ),
+            False,
+            False,
+            0,
+        )
+        links_row = PreferenceRow(
+            title="Open source",
+            subtitle="Product site at vocalinux.com, source on GitHub.",
+            widget=link_box,
+            keywords=("website", "vocalinux.com", "github", "source", "repo", "code", "agpl"),
+        )
+        app_group.add_row(links_row)
+
+        license_row = PreferenceRow(
+            title="License",
+            subtitle=f"GNU AGPL v3 · {__copyright__}",
+            keywords=("license", "agpl", "gpl", "copyright"),
+        )
+        app_group.add_row(license_row)
+        self.about_tab.pack_start(app_group, False, False, 0)
+
+        talk_group = PreferencesGroup(
+            title="Talk to us",
+            description=(
+                "Bugs, feedback, and feature ideas open a GitHub issue. You pick the "
+                "template on the next screen."
+            ),
+            keywords=("github", "discord", "contact", "bug", "feedback", "email"),
+        )
+        report_btn = self._about_open_button(
+            GITHUB_ISSUES_URL,
+            "Open GitHub issues for a bug or idea",
+            label="Report a bug or idea",
+            icon_name="github",
+            width=200,
+        )
+        talk_group.add_row(
+            PreferenceRow(
+                title="GitHub issues",
+                subtitle="https://github.com/VocaHQ/vocalinux/issues",
+                widget=report_btn,
+                keywords=("github", "issue", "bug", "idea"),
+            )
+        )
+        contact_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        for url, label, tooltip, icon_name, width in (
+            (VOCAHQ_DISCORD_URL, "Join Discord", "Open the VocaHQ Discord", "discord", 140),
+            (VOCAHQ_X_URL, "Follow on X", "Open X @vocahq", "x", 130),
+            (VOCAHQ_MAILTO_URL, "Email us", "Email hello@vocahq.com", "mail", 120),
+        ):
+            contact_box.pack_start(
+                self._about_open_button(
+                    url,
+                    tooltip,
+                    label=label,
+                    icon_name=icon_name,
+                    width=width,
+                ),
+                False,
+                False,
+                0,
+            )
+        talk_group.add_row(
+            PreferenceRow(
+                title="Community",
+                subtitle="Discord, X, and email",
+                widget=contact_box,
+                keywords=("discord", "x", "twitter", "email", "mail"),
+            )
+        )
+        self.about_tab.pack_start(talk_group, False, False, 0)
+
+        updates_group = PreferencesGroup(
+            title="Updates",
+            description="Stable for numbered releases. Nightly for dated development builds.",
+            keywords=("update", "version", "release", "upgrade", "appimage", "nightly", "channel"),
+        )
+
+        self.update_channel_combo = Gtk.ComboBoxText()
+        self.update_channel_combo.append("stable", "Stable")
+        self.update_channel_combo.append("nightly", "Nightly")
+        _combo_chrome(
+            self.update_channel_combo,
+            tooltip=(
+                "Stable uses the latest numbered release. Nightly uses the newest "
+                "nightly-YYYY-MM-DD build."
+            ),
+        )
+        saved_channel = normalize_channel(
+            self.config_manager.get_str("updates", "channel", DEFAULT_UPDATE_CHANNEL)
+        )
+        self.update_channel_combo.set_active_id(saved_channel)
+
+        self.check_updates_btn = Gtk.Button(label="Check")
+        self.check_updates_btn.get_style_context().add_class("suffix-button")
+        _style_action_button(self.check_updates_btn, width=80)
+        self.check_updates_btn.set_tooltip_text(
+            "Look up the latest release for this channel on GitHub"
+        )
+        self.check_updates_btn.connect("clicked", self._on_check_updates_clicked)
+
+        self.update_status_row = PreferenceRow(
+            title="Channel",
+            subtitle="Not checked yet",
+            widget=_combo_with_suffix(
+                self.update_channel_combo,
+                self.check_updates_btn,
+                combo_width=_CONTROL_WIDTH - 88,
+            ),
+            keywords=("channel", "stable", "nightly", "beta", "status", "check"),
+        )
+        updates_group.add_row(self.update_status_row)
+        self.about_tab.pack_start(updates_group, False, False, 0)
+
+        self.update_channel_combo.connect("changed", self._on_update_channel_changed)
+
+        self.release_notes_group = PreferencesGroup(
+            title="What's New",
+            keywords=("changelog", "what's new", "release notes", "latest", "download"),
+        )
+        self.open_release_btn = Gtk.Button(label="Open")
+        _style_action_button(self.open_release_btn)
+        self.open_release_btn.set_sensitive(False)
+        self.open_release_btn.set_tooltip_text(
+            "Open the release page in your browser for download links and install steps"
+        )
+        _set_accessible_name(
+            self.open_release_btn,
+            "Open the latest release page",
+        )
+        self.open_release_btn.connect("clicked", self._on_open_release_clicked)
+        self.release_notes_row = PreferenceRow(
+            title="Release notes",
+            subtitle="Notes appear here after a successful update check.",
+            widget=self.open_release_btn,
+            keywords=("notes", "changelog", "latest"),
+        )
+        self.latest_release_row = self.release_notes_row
+        if self.release_notes_row.subtitle_label is not None:
+            self.release_notes_row.subtitle_label.set_max_width_chars(72)
+        self.release_notes_group.add_row(self.release_notes_row)
+        self.about_tab.pack_start(self.release_notes_group, False, False, 0)
+        self.release_notes_group.hide()
+
+        family_group = PreferencesGroup(
+            title="Part of VocaHQ",
+            description="Private dictation for Linux, Mac, Windows, and phone.",
+            keywords=("vocahq", "vocamac", "vocawin", "vocaphone", "vocagateway", "family"),
+        )
+        family_grid = Gtk.Grid()
+        family_grid.set_column_spacing(8)
+        family_grid.set_row_spacing(4)
+        family_grid.set_column_homogeneous(True)
+        family_grid.set_margin_start(8)
+        family_grid.set_margin_end(8)
+        family_grid.set_margin_top(4)
+        family_grid.set_margin_bottom(8)
+        for index, (url, title, subtitle, icon_names, open_name) in enumerate(_VOCAHQ_FAMILY_LINKS):
+            tile = self._family_tile(url, title, subtitle, icon_names, open_name)
+            family_grid.attach(tile, index % 2, index // 2, 1, 1)
+        family_row = Gtk.ListBoxRow()
+        family_row.set_activatable(False)
+        family_row.add(family_grid)
+        family_group.add_row(family_row)
+        self.about_tab.pack_start(family_group, False, False, 0)
+
+    def _set_about_update_badge(self, visible: bool) -> None:
+        """Show or hide the green New badge on the About sidebar row."""
+        about_page = next((page for page in self._pages if page.name == "about"), None)
+        if about_page is None or about_page.update_badge_label is None:
+            return
+        # Don't fight the search filter's match-count badges.
+        searching = bool(self.search_entry.get_text().strip())
+        if visible and not searching:
+            about_page.update_badge_label.show()
+        else:
+            about_page.update_badge_label.hide()
+
+    def _seed_pending_update_ui(self) -> None:
+        """Apply a tray-discovered update to the About page without another fetch."""
+        if self._pending_update is None:
+            return
+        # Avoid an immediate re-check flicker; user can still press Check.
+        self._update_auto_checked = True
+        self._apply_update_check_result(
+            self._pending_update,
+            channel=self._current_update_channel(),
+            generation=None,
+        )
+
+    def _current_update_channel(self) -> str:
+        """Return the selected update channel id."""
+        channel_id = self.update_channel_combo.get_active_id()
+        return normalize_channel(channel_id or DEFAULT_UPDATE_CHANNEL)
+
+    def _on_update_channel_changed(self, widget):
+        """Persist channel choice and refresh the update check."""
+        if _handlers_suppressed(self):
+            return
+        channel = self._current_update_channel()
+        self.config_manager.set("updates", "channel", channel)
+        self.config_manager.save_settings()
+        self._start_update_check()
+
+    def _on_check_updates_clicked(self, widget):
+        """Manual re-check from the About page."""
+        self._start_update_check()
+
+    def _on_open_release_clicked(self, widget):
+        """Open the latest or pending release page in the browser."""
+        self._open_web_url(self._about_release_url)
+
+    def _start_update_check(self):
+        """Kick off a background GitHub release lookup."""
+        channel = self._current_update_channel()
+        self._update_check_generation += 1
+        generation = self._update_check_generation
+        self.check_updates_btn.set_sensitive(False)
+        self.check_updates_btn.set_label("…")
+        self.update_status_row.set_subtitle(f"Checking GitHub ({channel})…")
+
+        # Invalidate any in-flight result; that worker will restart on completion.
+        if self._update_check_in_progress:
+            return
+
+        self._update_check_in_progress = True
+        threading.Thread(
+            target=self._update_check_worker,
+            args=(channel, generation),
+            daemon=True,
+        ).start()
+
+    def _update_check_worker(self, channel: str, generation: int):
+        """Worker thread: fetch latest release for ``channel`` and compare versions."""
+        release = fetch_latest_release(channel=channel)
+        GLib.idle_add(self._apply_update_check_result, release, channel, generation)
+
+    def _dialog_is_alive(self) -> bool:
+        """Return False when the settings dialog has been destroyed."""
+        try:
+            # During __init__ (before map) widgets exist but are not realized yet.
+            if self._initializing:
+                return True
+            return bool(self.get_realized())
+        except Exception:
+            return False
+
+    def _apply_update_check_result(
+        self,
+        release,
+        channel: Optional[str] = None,
+        generation: Optional[int] = None,
+    ):
+        """Update About-page UI from a release lookup result."""
+        if not self._dialog_is_alive():
+            return False
+
+        channel = normalize_channel(channel or self._current_update_channel())
+        current_channel = self._current_update_channel()
+        # Drop stale results after a channel switch (or a newer check request).
+        if generation is not None and generation != self._update_check_generation:
+            self._update_check_in_progress = False
+            self._start_update_check()
+            return False
+        if channel != current_channel:
+            self._update_check_in_progress = False
+            self._start_update_check()
+            return False
+
+        self._update_check_in_progress = False
+        self.check_updates_btn.set_sensitive(True)
+        self.check_updates_btn.set_label("Check")
+
+        if release is None:
+            self._about_release_url = __url__
+            missing = "nightly build" if channel == "nightly" else "stable release"
+            self.update_status_row.set_subtitle(
+                f"Could not find a {missing}. Check your connection, or try again later."
+            )
+            self.latest_release_row.set_title("Release notes")
+            self.latest_release_row.set_subtitle("Unavailable")
+            self.open_release_btn.set_sensitive(True)
+            self.open_release_btn.set_tooltip_text("Open the Vocalinux project page")
+            self.open_release_btn.get_style_context().remove_class("suggested-action")
+            self.release_notes_group.hide()
+            # Clear dialog pending state so search restore cannot revive the New
+            # badge while About still shows the failed-lookup message. Do not
+            # call update_status_callback — tray state stays as-is (same as
+            # UpdateMonitor on a failed lookup).
+            self._pending_update = None
+            self._set_about_update_badge(False)
+            return False
+
+        self._about_release_url = (
+            release.html_url if is_trusted_release_url(release.html_url) else __url__
+        )
+        update_available = is_update_available(__version__, release, channel)
+        release_label = release.tag_name
+        if release.published_at:
+            release_label = f"{release.tag_name} · {release.published_at[:10]}"
+        if channel == "nightly" and release.prerelease:
+            release_label = f"{release_label} (nightly)"
+
+        if update_available:
+            self._pending_update = release
+            self.update_status_row.set_subtitle(
+                f"Update available on {channel} (running {__version__})"
+            )
+            self.open_release_btn.get_style_context().add_class("suggested-action")
+            self._set_about_update_badge(True)
+        else:
+            self._pending_update = None
+            self.update_status_row.set_subtitle(f"Up to date on {channel}")
+            self.open_release_btn.get_style_context().remove_class("suggested-action")
+            self._set_about_update_badge(False)
+
+        # Keep the tray menu in sync with an About-page check (no extra notification).
+        if self.update_status_callback is not None:
+            try:
+                self.update_status_callback(update_available, release if update_available else None)
+            except Exception:
+                logger.error("Update status callback failed", exc_info=True)
+
+        self.open_release_btn.set_sensitive(True)
+        self.open_release_btn.set_tooltip_text(
+            "Open the release page in your browser for download links and install steps"
+        )
+
+        notes = format_release_notes(release.body)
+        # Keep the card readable; full notes remain on the release page.
+        if len(notes) > 900:
+            notes = notes[:900].rstrip() + "…"
+        self.latest_release_row.set_title(release_label)
+        self.release_notes_row.set_subtitle(notes)
+        self.release_notes_group.show()
+        return False
+
+    def _gpu_acceleration_subtitle(self) -> str:
+        """Describe whether the bundled pywhispercpp can use the GPU picker."""
+        try:
+            from ..speech_recognition.recognition_manager import detect_pywhispercpp_gpu_backend
+
+            bundled = detect_pywhispercpp_gpu_backend()
+        except (ImportError, OSError, AttributeError):
+            return "GPU used by whisper.cpp"
+        if bundled == "cpu":
+            return "This install has no GPU libraries, so whisper.cpp runs on the CPU"
+        if bundled == "cuda":
+            return "CUDA uses NVIDIA device 0. This picker is for Vulkan builds."
+        return "GPU used by the whisper.cpp Vulkan engine"
+
+    def _build_gpu_section(self):
+        """Build the GPU device group on the Performance page.
+
+        Hardware selection, not a decoding knob — so it lives ungated on the
+        Performance page rather than behind the power-user unlock.
+        """
+        gpu_group = PreferencesGroup(title="Hardware Acceleration")
+        self.gpu_device_combo = Gtk.ComboBoxText()
+        _style_combo(self.gpu_device_combo)
+        _combo_chrome(
+            self.gpu_device_combo,
+            tooltip=(
+                "Select which GPU to use for whisper.cpp Vulkan acceleration. "
+                "Has no effect when pywhispercpp was built without GPU libraries."
+            ),
+        )
+        self._populate_gpu_devices()
+        gpu_row = PreferenceRow(
+            title="Vulkan GPU",
+            subtitle=self._gpu_acceleration_subtitle(),
+            widget=self.gpu_device_combo,
+            keywords=("graphics", "hardware", "acceleration", "device"),
+        )
+        gpu_group.add_row(gpu_row)
+        self.power_tab.pack_start(gpu_group, False, False, 0)
+
+        self.gpu_device_combo.connect("changed", self._on_advanced_param_changed)
+
+    def _build_post_processing_section(self) -> None:
+        """Build the Post-Processing section."""
+        group = PreferencesGroup(
+            title="Post-Processing Script",
+            description=(
+                "Run an executable on each transcription result. "
+                "The script receives the text on stdin and must write the replacement text to stdout."
+            ),
+        )
+
+        path_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.post_processor_entry = Gtk.Entry()
+        self.post_processor_entry.set_placeholder_text("/path/to/script.sh")
+        self.post_processor_entry.set_tooltip_text(
+            "Path to an executable that transforms transcribed text"
+        )
+        self.post_processor_entry.set_hexpand(True)
+
+        browse_button = Gtk.Button(label="Browse…")
+        browse_button.connect("clicked", self._on_post_processor_browse_clicked)
+
+        path_box.pack_start(self.post_processor_entry, True, True, 0)
+        path_box.pack_start(browse_button, False, False, 0)
+
+        script_row = PreferenceRow(
+            title="Script Path",
+            subtitle="Leave empty to disable post-processing",
+            widget=path_box,
+        )
+        group.add_row(script_row)
+        self.post_processing_tab.pack_start(group, False, False, 0)
+
+        self.post_processor_entry.connect("changed", self._on_post_processor_script_changed)
+
+    def _on_post_processor_browse_clicked(self, widget: Gtk.Button) -> None:
+        dialog = Gtk.FileChooserDialog(
+            title="Select Post-Processing Script",
+            parent=self,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL,
+            Gtk.ResponseType.CANCEL,
+            Gtk.STOCK_OPEN,
+            Gtk.ResponseType.OK,
+        )
+        if dialog.run() == Gtk.ResponseType.OK:
+            self.post_processor_entry.set_text(dialog.get_filename())
+        dialog.destroy()
+
+    def _on_post_processor_script_changed(self, widget: Gtk.Entry) -> None:
+        if self._initializing or self._applying_settings:
+            return
+        path = widget.get_text().strip()
+        self.config_manager.set("post_processing", "script_path", path)
+        self.config_manager.save_config()
+
+    def _build_remote_server_section(self):
+        """Build the Remote Server configuration section (shown when Remote API engine is selected)."""
+        self.remote_server_group = PreferencesGroup(
+            title="Remote Server",
+            description=(
+                "Offload speech recognition to a server on your network. "
+                "Supports whisper.cpp and OpenAI-compatible APIs."
+            ),
+        )
+
+        # Server URL
+        self.remote_api_url_entry = Gtk.Entry()
+        self.remote_api_url_entry.set_placeholder_text("http://192.168.1.100:8080")
+        self.remote_api_url_entry.set_tooltip_text(
+            "URL of the remote speech recognition server\n"
+            "Supports OpenAI compatible API and whisper.cpp server"
+        )
+        self.remote_api_url_entry.set_size_request(_CONTROL_WIDTH, -1)
+        remote_url_row = PreferenceRow(
+            title="Server URL",
+            subtitle="Remote speech recognition server address",
+            widget=self.remote_api_url_entry,
+        )
+        self.remote_server_group.add_row(remote_url_row)
+
+        # API Key
+        self.remote_api_key_entry = Gtk.Entry()
+        self.remote_api_key_entry.set_placeholder_text("(optional)")
+        self.remote_api_key_entry.set_visibility(False)
+        self.remote_api_key_entry.set_tooltip_text("API Key for authentication (optional)")
+        self.remote_api_key_entry.set_size_request(_CONTROL_WIDTH, -1)
+        remote_key_row = PreferenceRow(
+            title="API Key",
+            subtitle="Authentication key (optional)",
+            widget=self.remote_api_key_entry,
+        )
+        self.remote_server_group.add_row(remote_key_row)
+
+        # API Endpoint
+        self.remote_api_endpoint_combo = Gtk.ComboBoxText()
+        _style_combo(self.remote_api_endpoint_combo)
+        _combo_chrome(
+            self.remote_api_endpoint_combo,
+            tooltip="Select the API format of the remote server (API Endpoint Format)",
+        )
+        self.remote_api_endpoint_combo.append(
+            "/v1/audio/transcriptions", "OpenAI/FunASR (/v1/audio/transcriptions)"
+        )
+        self.remote_api_endpoint_combo.append("/inference", "Whisper.cpp (/inference)")
+        remote_endpoint_row = PreferenceRow(
+            title="API Endpoint",
+            subtitle="API format for the remote server",
+            widget=self.remote_api_endpoint_combo,
+        )
+        self.remote_server_group.add_row(remote_endpoint_row)
+
+        # Model name
+        self.remote_api_model_entry = Gtk.Entry()
+        self.remote_api_model_entry.set_placeholder_text("whisper-1")
+        self.remote_api_model_entry.set_tooltip_text(
+            "Model identifier sent to OpenAI-compatible and FunASR servers"
+        )
+        self.remote_api_model_entry.set_size_request(_CONTROL_WIDTH, -1)
+        remote_model_row = PreferenceRow(
+            title="Model",
+            subtitle="Remote model name, for example whisper-1 or sensevoice",
+            widget=self.remote_api_model_entry,
+        )
+        self.remote_server_group.add_row(remote_model_row)
+
+        # Connection test
+        self.remote_test_btn = Gtk.Button(label="Test Connection")
+        self.remote_test_btn.set_tooltip_text("Test connection to remote server")
+        self.remote_test_btn.connect("clicked", self._on_test_remote_connection)
+        remote_test_row = PreferenceRow(
+            title="Connection Test",
+            subtitle="Verify remote server is reachable",
+            widget=self.remote_test_btn,
+        )
+        self.remote_server_group.add_row(remote_test_row)
+
+        self.advanced_box.pack_start(self.remote_server_group, False, False, 0)
+
+        # Status label below the group
+        self.remote_status_label = Gtk.Label(label="", use_markup=True, xalign=0)
+        self.remote_status_label.set_margin_start(16)
+        self.remote_status_label.set_margin_top(4)
+        self.remote_status_label.get_style_context().add_class("status-info")
+        self.advanced_box.pack_start(self.remote_status_label, False, False, 0)
+
+        # Load saved values into the widgets
+        saved_url = self.config_manager.get("speech_recognition", "remote_api_url", "")
+        saved_key = self.config_manager.get("speech_recognition", "remote_api_key", "")
+        saved_endpoint = self.config_manager.get(
+            "speech_recognition", "remote_api_endpoint", "/inference"
+        )
+        saved_model = self.config_manager.get("speech_recognition", "remote_api_model", "whisper-1")
+        if saved_url:
+            self.remote_api_url_entry.set_text(saved_url)
+        if saved_key:
+            self.remote_api_key_entry.set_text(saved_key)
+        self.remote_api_endpoint_combo.set_active_id(saved_endpoint)
+        self.remote_api_model_entry.set_text(saved_model or "whisper-1")
+
+        self.remote_api_url_entry.connect("changed", self._on_remote_api_settings_changed)
+        self.remote_api_key_entry.connect("changed", self._on_remote_api_settings_changed)
+        self.remote_api_endpoint_combo.connect("changed", self._on_remote_api_settings_changed)
+        self.remote_api_model_entry.connect("changed", self._on_remote_api_settings_changed)
+
+        self.remote_server_group.hide()
+        self.remote_status_label.hide()
+
+    def _build_gateway_embed_section(self) -> None:
+        """Optional local VocaGateway controls (podman-first). Lives on the Advanced island."""
+        self._gateway_manager = get_gateway_embed_manager()
+        # Do not clobber LAN restored from leftover compose (orphan adopt).
+        if not self._gateway_manager.managed_by_us:
+            self._gateway_manager.lan_publish = bool(
+                self.config_manager.get("gateway_embed", "lan_publish", False)
+            )
+        lan_publish = bool(self._gateway_manager.lan_publish)
+
+        self.gateway_embed_group = PreferencesGroup(
+            title="Local VocaGateway",
+            description=(
+                "Optional self-hosted gateway via podman (or docker). "
+                "Audio goes to that container on this machine; it is not on-device "
+                "whisper.cpp. Pinned to VocaGateway v0.1.0."
+            ),
+            keywords=(
+                "vocagateway",
+                "gateway",
+                "podman",
+                "docker",
+                "pairing",
+                "phone",
+                "remote",
+            ),
+        )
+
+        self.gateway_run_btn = Gtk.Button(label="Run VocaGateway locally")
+        self.gateway_run_btn.set_size_request(_CONTROL_WIDTH, -1)
+        self.gateway_run_btn.connect("clicked", self._on_gateway_run_clicked)
+        self.gateway_embed_group.add_row(
+            PreferenceRow(
+                title="Local gateway",
+                subtitle="Start or stop the compose project vocagateway",
+                widget=self.gateway_run_btn,
+            )
+        )
+
+        self.gateway_status_label = Gtk.Label(label="Stopped", xalign=0)
+        self.gateway_status_label.get_style_context().add_class("status-info")
+        self.gateway_embed_group.add_row(
+            PreferenceRow(
+                title="Status",
+                subtitle="Stopped, Starting, Live, Pairable, Ready, or Error",
+                widget=self.gateway_status_label,
+            )
+        )
+
+        self.gateway_detail_label = Gtk.Label(label="", xalign=0, wrap=True)
+        self.gateway_detail_label.set_max_width_chars(55)
+        self.gateway_detail_label.get_style_context().add_class("preference-row-subtitle")
+        detail_row = Gtk.ListBoxRow()
+        detail_row.set_activatable(False)
+        detail_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        detail_box.set_margin_start(16)
+        detail_box.set_margin_end(16)
+        detail_box.set_margin_top(4)
+        detail_box.set_margin_bottom(8)
+        detail_box.pack_start(self.gateway_detail_label, False, False, 0)
+        detail_row.add(detail_box)
+        self.gateway_embed_group.add_row(detail_row)
+
+        self.gateway_lan_switch = Gtk.Switch()
+        self.gateway_lan_switch.set_active(lan_publish)
+        self.gateway_lan_switch.connect("notify::active", self._on_gateway_lan_toggled)
+        self.gateway_embed_group.add_row(
+            PreferenceRow(
+                title="Allow LAN access for Phone",
+                subtitle=(
+                    "Publishes 0.0.0.0:8765 and prefers a LAN URL in pairing. "
+                    "Open the port in your firewall on trusted networks only."
+                ),
+                widget=self.gateway_lan_switch,
+            )
+        )
+
+        self.gateway_use_btn = Gtk.Button(label="Use this Gateway")
+        self.gateway_use_btn.set_sensitive(False)
+        self.gateway_use_btn.set_tooltip_text(
+            "Fill Remote Server with this gateway URL and bearer token "
+            "(engine remote_api, endpoint /v1/audio/transcriptions)"
+        )
+        self.gateway_use_btn.connect("clicked", self._on_gateway_use_clicked)
+        self.gateway_embed_group.add_row(
+            PreferenceRow(
+                title="Remote API preset",
+                subtitle="Points Vocalinux at the local gateway",
+                widget=self.gateway_use_btn,
+            )
+        )
+
+        self.gateway_qr_image = Gtk.Image()
+        self.gateway_qr_image.set_no_show_all(True)
+        self.gateway_pairing_label = Gtk.Label(label="", xalign=0, wrap=True, selectable=True)
+        self.gateway_pairing_label.set_max_width_chars(55)
+        self.gateway_pairing_label.get_style_context().add_class("preference-row-subtitle")
+        pairing_row = Gtk.ListBoxRow()
+        pairing_row.set_activatable(False)
+        pairing_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        pairing_box.set_margin_start(16)
+        pairing_box.set_margin_end(16)
+        pairing_box.set_margin_top(8)
+        pairing_box.set_margin_bottom(12)
+        title = Gtk.Label(label="Phone pairing", xalign=0)
+        title.get_style_context().add_class("preference-row-title")
+        pairing_box.pack_start(title, False, False, 0)
+        pairing_box.pack_start(self.gateway_qr_image, False, False, 0)
+        pairing_box.pack_start(self.gateway_pairing_label, False, False, 0)
+        pairing_row.add(pairing_box)
+        self.gateway_embed_group.add_row(pairing_row)
+
+        if self.advanced_box is not None:
+            self.advanced_box.pack_start(self.gateway_embed_group, False, False, 0)
+
+        self._gateway_manager.add_listener(self._on_gateway_status_from_worker)
+        self.connect("destroy", self._on_gateway_embed_dialog_destroy)
+        # Runtime probe is async so Settings never blocks on podman/docker.
+        # When runtime is already ready, this probes leftover compose immediately.
+        self._gateway_manager.begin_runtime_detection()
+        if not self._gateway_manager.runtime_ready:
+            self.gateway_run_btn.set_sensitive(False)
+            self.gateway_detail_label.set_text("Detecting container runtime…")
+        elif not self._gateway_manager.available:
+            self.gateway_run_btn.set_sensitive(False)
+            self.gateway_detail_label.set_text(self._gateway_manager.unavailable_hint)
+        else:
+            hint = getattr(self._gateway_manager.runner.sandbox, "hint", "") or ""
+            if hint:
+                self.gateway_detail_label.set_text(hint)
+
+        self._apply_gateway_status_ui(
+            self._gateway_manager.status, self._gateway_manager.status_detail
+        )
+
+    def _on_gateway_embed_dialog_destroy(self, *_args) -> None:
+        """Drop status listener so polls never touch a destroyed Settings dialog."""
+        manager = getattr(self, "_gateway_manager", None)
+        if manager is not None:
+            manager.remove_listener(self._on_gateway_status_from_worker)
+
+    def _on_gateway_status_from_worker(self, status: GatewayStatus, detail: str) -> None:
+        """Marshal status updates onto the GTK main loop."""
+        GLib.idle_add(self._apply_gateway_status_ui, status, detail)
+
+    def _apply_gateway_status_ui(self, status: GatewayStatus, detail: str) -> bool:
+        if not hasattr(self, "gateway_status_label"):
+            return False
+        if not self._dialog_is_alive():
+            return False
+        label = status.value if isinstance(status, GatewayStatus) else str(status)
+        self.gateway_status_label.set_text(label)
+        if detail:
+            self.gateway_detail_label.set_text(detail)
+
+        runningish = status in {
+            GatewayStatus.STARTING,
+            GatewayStatus.LIVE,
+            GatewayStatus.PAIRABLE,
+            GatewayStatus.READY,
+            GatewayStatus.ERROR,
+        }
+        if not self._gateway_manager.runtime_ready:
+            self.gateway_run_btn.set_sensitive(False)
+            if not detail:
+                self.gateway_detail_label.set_text("Detecting container runtime…")
+        elif self._gateway_manager.available:
+            if runningish or self._gateway_manager.managed_by_us:
+                self.gateway_run_btn.set_label("Stop local Gateway")
+            else:
+                self.gateway_run_btn.set_label("Run VocaGateway locally")
+            self.gateway_run_btn.set_sensitive(status is not GatewayStatus.STARTING)
+        else:
+            self.gateway_run_btn.set_sensitive(False)
+            if not detail:
+                self.gateway_detail_label.set_text(self._gateway_manager.unavailable_hint)
+
+        can_use = status in {GatewayStatus.PAIRABLE, GatewayStatus.READY}
+        self.gateway_use_btn.set_sensitive(can_use)
+        self._sync_gateway_lan_switch()
+        self._update_gateway_pairing_widgets()
+        return False
+
+    def _sync_gateway_lan_switch(self) -> None:
+        """Keep Allow LAN honest with compose; skip the toggle handler."""
+        desired = bool(self._gateway_manager.lan_publish)
+        if bool(self.gateway_lan_switch.get_active()) != desired:
+            was_init = bool(getattr(self, "_initializing", False))
+            self._initializing = True
+            try:
+                self.gateway_lan_switch.set_active(desired)
+            finally:
+                self._initializing = was_init
+        saved = bool(self.config_manager.get("gateway_embed", "lan_publish", False))
+        if saved != desired:
+            self.config_manager.set("gateway_embed", "lan_publish", desired)
+            self.config_manager.save_config()
+
+    def _update_gateway_pairing_widgets(self) -> None:
+        info = self._gateway_manager.pairing
+        if info is None:
+            self._gateway_qr_cache_key = None
+            self.gateway_qr_image.hide()
+            self.gateway_qr_image.clear()
+            self.gateway_pairing_label.set_text(
+                "Pairing QR appears when the gateway is Live with a phone-reachable URL "
+                "(enable LAN for Phone, or set VOCAGATEWAY_PUBLIC_URL)."
+            )
+            return
+        if not info.display_url:
+            self._gateway_qr_cache_key = None
+            self.gateway_qr_image.hide()
+            self.gateway_qr_image.clear()
+            self.gateway_pairing_label.set_text(
+                "Gateway is live on loopback only. Enable LAN access for Phone "
+                "(or configure a non-loopback PUBLIC_URL) before pairing another device. "
+                "Token is held for Use this Gateway and is not shown here."
+            )
+            return
+
+        self.gateway_pairing_label.set_text(
+            f"URL: {info.display_url}\n"
+            "Token is available to Use this Gateway and the QR; it is not logged."
+        )
+        if info.qr_svg:
+            cache_key = (info.display_url, len(info.qr_svg))
+            if getattr(self, "_gateway_qr_cache_key", None) != cache_key:
+                pixbuf = self._pixbuf_from_svg_bytes(info.qr_svg)
+                if pixbuf is not None:
+                    self.gateway_qr_image.set_from_pixbuf(pixbuf)
+                    self._gateway_qr_cache_key = cache_key
+            if getattr(self, "_gateway_qr_cache_key", None) == cache_key:
+                self.gateway_qr_image.show()
+        else:
+            self._gateway_qr_cache_key = None
+            self.gateway_qr_image.hide()
+            self.gateway_qr_image.clear()
+
+    def _pixbuf_from_svg_bytes(self, data: bytes) -> Any:
+        """Best-effort SVG to GdkPixbuf; returns None when loaders are missing."""
+        try:
+            from gi.repository import GdkPixbuf
+
+            loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+            loader.write(data[: 512 * 1024])
+            loader.close()
+            return loader.get_pixbuf()
+        except Exception:
+            return None
+
+    def _on_gateway_run_clicked(self, widget: Any) -> None:
+        if not self._gateway_manager.available:
+            return
+        status = self._gateway_manager.status
+        if (
+            status
+            in {
+                GatewayStatus.STARTING,
+                GatewayStatus.LIVE,
+                GatewayStatus.PAIRABLE,
+                GatewayStatus.READY,
+                GatewayStatus.ERROR,
+            }
+            or self._gateway_manager.managed_by_us
+        ):
+            self._gateway_manager.stop_async()
+        else:
+            lan = bool(self.gateway_lan_switch.get_active())
+            self._gateway_manager.lan_publish = lan
+            self._gateway_manager.start_async(lan_publish=lan)
+
+    def _on_gateway_lan_toggled(self, widget: Any, _pspec: Any = None) -> None:
+        if getattr(self, "_initializing", False):
+            return
+        active = bool(self.gateway_lan_switch.get_active())
+        self.config_manager.set("gateway_embed", "lan_publish", active)
+        self.config_manager.save_config()
+        # Republish when compose is already running so QR/bind match LAN.
+        self._gateway_manager.apply_lan_publish(active)
+        self._update_gateway_pairing_widgets()
+
+    def _on_gateway_use_clicked(self, widget: Any) -> None:
+        try:
+            preset = self._gateway_manager.use_this_gateway(self.config_manager)
+        except Exception as exc:
+            self.gateway_detail_label.set_text(str(exc))
+            return
+        self._applying_settings = True
+        try:
+            self.remote_api_url_entry.set_text(preset["remote_api_url"])
+            self.remote_api_key_entry.set_text(preset["remote_api_key"])
+            self.remote_api_endpoint_combo.set_active_id(preset["remote_api_endpoint"])
+            self.remote_api_model_entry.set_text(preset.get("remote_api_model") or "whisper-1")
+            if hasattr(self, "engine_combo"):
+                self.engine_combo.set_active_id("remote_api")
+        finally:
+            self._applying_settings = False
+        self._auto_apply_settings()
+        self.gateway_detail_label.set_text(
+            "Remote Server now points at this gateway " f"({preset['remote_api_endpoint']})."
+        )
+        self._update_engine_specific_ui()
+
+    def _on_power_user_toggled(self, widget, state):
+        """Handle the power-user opt-in toggle."""
+        if _handlers_suppressed(self):
+            return False
+        if getattr(self, "_power_user_dialog_open", False):
+            return True
+        if state:
+            self._power_user_dialog_open = True
+            try:
+                dialog = Gtk.MessageDialog(
+                    transient_for=self,
+                    flags=Gtk.DialogFlags.MODAL,
+                    message_type=Gtk.MessageType.WARNING,
+                    buttons=Gtk.ButtonsType.NONE,
+                    text="Advanced Settings",
+                )
+                dialog.format_secondary_text(
+                    "These settings control whisper.cpp's internal decoding parameters. "
+                    "Changing them can affect transcription quality and performance. "
+                    "Only proceed if you understand the impact."
+                )
+                dialog.add_button("_Keep it Simple", Gtk.ResponseType.CANCEL)
+                confirm_btn = dialog.add_button("_I Know What I'm Doing", Gtk.ResponseType.YES)
+                confirm_btn.get_style_context().add_class("suggested-action")
+                response = dialog.run()
+                dialog.destroy()
+            finally:
+                self._power_user_dialog_open = False
+            if response != Gtk.ResponseType.YES:
+                return True
+        self.config_manager.set("advanced", "power_user_mode", state)
+        self.config_manager.save_settings()
+        self.advanced_revealer.set_reveal_child(state)
+        return False
+
+    def _on_settings_dialog_response(self, dialog, response_id):
+        """Persist deferred text edits before the settings dialog closes."""
+        if response_id in (Gtk.ResponseType.CLOSE, Gtk.ResponseType.DELETE_EVENT):
+            self._flush_advanced_prompt_if_dirty()
+            self._resync_engine_ui_if_unapplied()
+
+    def _on_advanced_prompt_changed(self, buffer):
+        """Track prompt edits without applying settings on every keystroke."""
+        if self._initializing:
+            return
+        self._advanced_prompt_dirty = True
+
+    def _on_language_candidates_changed(self, entry: Gtk.Entry) -> None:
+        """Track candidate edits without applying settings on every keystroke."""
+        if self._initializing:
+            return
+        self._language_candidates_dirty = True
+
+    def _deferred_text_edit_settings(self) -> dict[str, Any]:
+        """Current values of the deferred text fields, for a mid-apply close."""
+        pending: dict[str, Any] = {}
+        if self._advanced_prompt_dirty:
+            pending["whispercpp_initial_prompt"] = self.advanced_initial_prompt_buffer.get_text(
+                self.advanced_initial_prompt_buffer.get_start_iter(),
+                self.advanced_initial_prompt_buffer.get_end_iter(),
+                False,
+            )
+        if self._language_candidates_dirty:
+            pending["whispercpp_language_candidates"] = (
+                self.advanced_language_candidates_entry.get_text()
+            )
+        return pending
+
+    def _flush_advanced_prompt_if_dirty(self):
+        """Apply deferred advanced text edits (initial prompt, language candidates)."""
+        if self._initializing:
+            return
+        if not (self._advanced_prompt_dirty or self._language_candidates_dirty):
+            return
+        if self._applying_settings:
+            # The apply holding the guard cannot see these edits; stash them so
+            # _finish_auto_apply can re-apply (dialog open) or persist (closed).
+            self._pending_text_edits = self._deferred_text_edit_settings()
+            # Pre-edit values: lets a later persist keep keys a newer apply
+            # never touched instead of dropping the whole snapshot.
+            self._pending_text_edit_baseline = {
+                key: self.config_manager.get("advanced", key) for key in self._pending_text_edits
+            }
+            self._pending_apply_generation = _apply_settings_generation
+            return
+        self._auto_apply_settings()
+
+    def _persist_pending_text_edits(self) -> None:
+        """Persist deferred edits captured when the dialog closed mid-apply."""
+        pending = self._pending_text_edits
+        baseline = self._pending_text_edit_baseline or {}
+        self._pending_text_edits = None
+        self._pending_text_edit_baseline = None
+        if not pending:
+            return
+
+        def persist() -> None:
+            try:
+                with _apply_settings_lock:
+                    if _apply_settings_generation != self._pending_apply_generation:
+                        # A newer apply already reconfigured the shared engine
+                        # and saved newer values. Keep only the keys it left
+                        # untouched — the rest of the snapshot is stale and
+                        # must not reach the engine or the config again. A key
+                        # counts as touched only when the newer apply wrote
+                        # it: its choice can legally equal the baseline, and
+                        # the older edit must not overwrite it.
+                        surviving = {
+                            key: value
+                            for key, value in pending.items()
+                            if _apply_settings_written.get(key, self._pending_apply_generation)
+                            <= self._pending_apply_generation
+                            and self.config_manager.get("advanced", key) == baseline.get(key)
+                        }
+                    else:
+                        surviving = dict(pending)
+                    if not surviving:
+                        return
+                    if all(
+                        self.config_manager.get("advanced", key) == value
+                        for key, value in surviving.items()
+                    ):
+                        # The apply that was running already landed these values.
+                        return
+                    self.speech_engine.reconfigure(**surviving)
+                    for key, value in surviving.items():
+                        self.config_manager.set("advanced", key, value)
+                        _apply_settings_written[key] = _apply_settings_generation
+                    self.config_manager.save_settings()
+            except (OSError, ValueError, TypeError, RuntimeError) as e:
+                logger.warning(
+                    "Could not persist deferred settings edits for keys %s: %s",
+                    sorted(pending),
+                    e,
+                    exc_info=True,
+                )
+
+        # reconfigure() restarts the model; like the normal apply path it runs
+        # on a worker so the model load never blocks the GTK main loop.
+        threading.Thread(target=persist, daemon=True).start()
+
+    def _on_advanced_param_changed(self, widget, *args):
+        """Handle any advanced parameter change."""
+        if _handlers_suppressed(self):
+            return False
+        self._auto_apply_settings()
+        return False
+
+    def _on_reset_advanced_clicked(self, widget):
+        """Reset whisper.cpp advanced parameters to defaults."""
+        if _handlers_suppressed(self):
+            return
+
+        defaults = DEFAULT_CONFIG["advanced"]
+        with _suppressed(self, "_applying_settings"):
+            self.advanced_no_timestamps_switch.set_active(defaults["whispercpp_no_timestamps"])
+            self.advanced_no_context_switch.set_active(defaults["whispercpp_no_context"])
+            self.advanced_initial_prompt_buffer.set_text(defaults["whispercpp_initial_prompt"], -1)
+            self.advanced_language_candidates_entry.set_text(
+                defaults["whispercpp_language_candidates"]
+            )
+            self.advanced_temperature_spin.set_value(defaults["whispercpp_temperature"])
+            self.advanced_temperature_inc_spin.set_value(defaults["whispercpp_temperature_inc"])
+            self.advanced_entropy_thold_spin.set_value(defaults["whispercpp_entropy_thold"])
+            self.advanced_logprob_thold_spin.set_value(defaults["whispercpp_logprob_thold"])
+            self.advanced_no_speech_thold_spin.set_value(defaults["whispercpp_no_speech_thold"])
+            self.gpu_device_combo.set_active_id("-1")
+
+        self._auto_apply_settings()
+
+    def _load_and_apply_settings(self):
+        """Load current settings and populate the UI."""
+        settings = self._get_current_settings()
+        self.current_engine = settings["engine"]
+        self.language = settings["language"]
+        # The picker holds languages, not modes. Remember the mode separately and
+        # seed the picker with whatever the layout resolves to right now, so the
+        # disabled row reads as a live answer instead of going blank (#821).
+        self._follow_layout_saved = self.language == LANGUAGE_FOLLOWS_LAYOUT
+        if self._follow_layout_saved:
+            self.language = language_for_active_layout(SUPPORTED_LANGUAGES) or "auto"
+        if self.current_engine == "parakeet":
+            # Config may already be auto; keep any non-auto leftover as restore seed.
+            self._last_non_parakeet_language = (
+                self.language if self.language and self.language != "auto" else None
+            )
+        else:
+            self._last_non_parakeet_language = self.language
+        self._engine_for_language_memory = self.current_engine
+        self.current_model_size = settings["model_size"]
+        self.current_vad = settings.get("vad_sensitivity", 3)
+        self.current_silence = settings.get("silence_timeout", 2.0)
+
+        logger.info(
+            f"Starting dialog with settings: engine={self.current_engine}, model={self.current_model_size}"
+        )
+
+        general_settings = self.config_manager.get_settings().get("general", {})
+        ui_settings = self.config_manager.get_settings().get("ui", {})
+        text_injection_settings = self.config_manager.get_settings().get("text_injection", {})
+        history_settings = self.config_manager.get_settings().get("history", {})
+
+        # The login desktop entry can be added or removed outside the app; the
+        # real file state wins over the stored preference (previously synced by
+        # the tray menu's Start on Login item).
+        from . import autostart_manager
+
+        autostart_enabled = autostart_manager.is_autostart_enabled()
+        if autostart_enabled != general_settings.get("autostart", False):
+            self.config_manager.set("general", "autostart", autostart_enabled)
+            self.config_manager.save_settings()
+
+        start_minimized = ui_settings.get("start_minimized", False)
+        show_missing_tray_warning = ui_settings.get("show_missing_tray_warning", True)
+        show_overlay = ui_settings.get("show_overlay", True)
+        copy_to_clipboard = text_injection_settings.get("copy_to_clipboard", False)
+        dictate_to_pad = text_injection_settings.get("dictate_to_pad", False)
+        auto_capitalize = text_injection_settings.get("auto_capitalize", True)
+        append_trailing_space = text_injection_settings.get("append_trailing_space", True)
+        paste_shortcut = self.config_manager.get_paste_shortcut()
+        history_enabled = bool(history_settings.get("enabled", True))
+        # A hand-edited config.json can hold a non-numeric value; sanitize so a
+        # bad preference cannot crash the settings dialog.
+        history_max_items = sanitize_max_items(history_settings.get("max_items", 10))
+
+        self.autostart_switch.set_active(autostart_enabled)
+        self.start_minimized_switch.set_active(start_minimized)
+        self.missing_tray_warning_switch.set_active(show_missing_tray_warning)
+        self.show_overlay_switch.set_active(show_overlay)
+        self.copy_to_clipboard_switch.set_active(copy_to_clipboard)
+        self.dictation_pad_switch.set_active(dictate_to_pad)
+        self.auto_capitalize_switch.set_active(auto_capitalize)
+        self.append_trailing_space_switch.set_active(append_trailing_space)
+        if not self.paste_shortcut_combo.set_active_id(paste_shortcut):
+            self.paste_shortcut_combo.set_active_id(DEFAULT_PASTE_SHORTCUT)
+        sound_effects_enabled = self.config_manager.is_sound_effects_enabled()
+        self.sound_effects_switch.set_active(sound_effects_enabled)
+        self._update_sound_effects_sensitivity(sound_effects_enabled)
+        duck_enabled = self.config_manager.is_playback_duck_enabled()
+        self.duck_level_scale.set_value(self.config_manager.get_playback_duck_percent())
+        self.duck_playback_switch.set_active(duck_enabled)
+        self.duck_level_scale.set_sensitive(duck_enabled)
+        tone_id = self.config_manager.get_sound_effects_tone()
+        if not self.sound_tone_combo.set_active_id(tone_id):
+            self.sound_tone_combo.set_active_id(DEFAULT_SOUND_EFFECT_TONE)
+        self._tone_preview_kind = "start"
+        self._sync_tone_preview_button(self.sound_tone_combo.get_active_id() or tone_id)
+
+        auto_pause_settings = self.config_manager.get_settings().get("auto_pause", {})
+        auto_pause_enabled = bool(auto_pause_settings.get("enabled", False))
+        self.auto_pause_switch.set_active(auto_pause_enabled)
+        self._update_auto_pause_sensitivity(auto_pause_enabled)
+        self._refresh_auto_pause_list()
+        self._refresh_dictionary_ui()
+
+        keepalive_settings = self.config_manager.get_settings().get("model_keepalive", {})
+        keepalive_enabled = bool(keepalive_settings.get("enabled", False))
+        self.model_keepalive_switch.set_active(keepalive_enabled)
+        self.model_reload_buffer_switch.set_active(
+            bool(keepalive_settings.get("buffer_during_reload", False))
+        )
+        self._update_model_keepalive_sensitivity(keepalive_enabled)
+        timeout_seconds = int(keepalive_settings.get("idle_timeout_seconds", 300) or 300)
+        if not self.model_keepalive_timeout_combo.set_active_id(str(timeout_seconds)):
+            self.model_keepalive_timeout_combo.set_active_id("300")
+
+        self.history_enabled_switch.set_active(history_enabled)
+        self.history_max_items_spin.set_value(history_max_items)
+        self.history_persist_switch.set_active(bool(history_settings.get("persist", False)))
+
+        disable_internal_hotkey = self.config_manager.get_bool(
+            "shortcuts", "disable_internal_hotkey", False
+        )
+        self.disable_internal_hotkey_switch.set_active(disable_internal_hotkey)
+        self._update_internal_hotkey_sensitivity(disable_internal_hotkey)
+
+        post_processing_settings = self.config_manager.get_settings().get("post_processing", {})
+        self.post_processor_entry.set_text(post_processing_settings.get("script_path", ""))
+
+        available_engines = get_available_engines()
+        available_count = 0
+
+        for engine in ENGINE_MODELS.keys():
+            if available_engines.get(engine, False):
+                display_name = _engine_display_name(engine)
+                self.engine_combo.append(display_name, display_name)
+                available_count += 1
+
+        if available_count == 0:
+            logger.error("No speech recognition engines available!")
+            # Still add them so the UI works, but log the error
+            for engine in ENGINE_MODELS.keys():
+                display_name = _engine_display_name(engine)
+                self.engine_combo.append(display_name, display_name)
+        else:
+            logger.info(f"Populated {available_count} available engines: {available_engines}")
+
+        if not available_engines.get(self.current_engine, False):
+            logger.warning(
+                f"Current engine '{self.current_engine}' is not available, "
+                "selecting first available"
+            )
+            for engine in ENGINE_MODELS.keys():
+                if available_engines.get(engine, False):
+                    self.current_engine = engine
+                    break
+
+        engine_text = _engine_display_name(self.current_engine)
+        logger.info(f"Setting active engine to: {engine_text}")
+        if not self.engine_combo.set_active_id(engine_text):
+            logger.warning("Could not set engine by ID, trying by index")
+            # Find index of current engine
+            model = self.engine_combo.get_model()
+            for i, row in enumerate(model):
+                if _engine_from_display(row[0]) == self.current_engine:
+                    self.engine_combo.set_active(i)
+                    break
+            else:
+                # Fallback to first available
+                if self.engine_combo.get_model():
+                    self.engine_combo.set_active(0)
+
+        # Populate model and language options for the selected engine
+        self._populate_model_options()
+        self._sync_language_options_for_selected_model(self.language)
+        self.follow_layout_switch.set_active(
+            self._follow_layout_saved and self._follow_layout_supported()
+        )
+        self._sync_follow_layout_controls()
+
+        # Set spin button values
+        self.vad_spin.set_value(self.current_vad)
+        self.silence_spin.set_value(self.current_silence)
+
+        # Set voice commands switch based on config
+        voice_commands_enabled = self.config_manager.is_voice_commands_enabled()
+        self.voice_commands_switch.set_active(voice_commands_enabled)
+
+        advanced_settings = self.config_manager.get_settings().get("advanced", {})
+        power_user_mode = advanced_settings.get("power_user_mode", False)
+        self.power_user_switch.set_active(power_user_mode)
+        self.advanced_revealer.set_reveal_child(power_user_mode)
+        self.advanced_no_timestamps_switch.set_active(
+            advanced_settings.get("whispercpp_no_timestamps", True)
+        )
+        self.advanced_no_context_switch.set_active(
+            advanced_settings.get("whispercpp_no_context", True)
+        )
+        self.advanced_initial_prompt_buffer.set_text(
+            advanced_settings.get("whispercpp_initial_prompt", ""), -1
+        )
+        # The saved value may be a JSON list (the engine accepts both forms);
+        # render the canonical comma-separated text its normalization produces.
+        from ..speech_recognition.recognition_manager import SpeechRecognitionManager
+
+        self.advanced_language_candidates_entry.set_text(
+            ",".join(
+                SpeechRecognitionManager._normalize_language_candidates(
+                    advanced_settings.get("whispercpp_language_candidates", "")
+                )
+            )
+        )
+        self.advanced_temperature_spin.set_value(
+            advanced_settings.get("whispercpp_temperature", 0.0)
+        )
+        self.advanced_temperature_inc_spin.set_value(
+            advanced_settings.get("whispercpp_temperature_inc", -1.0)
+        )
+        self.advanced_entropy_thold_spin.set_value(
+            advanced_settings.get("whispercpp_entropy_thold", 2.4)
+        )
+        self.advanced_logprob_thold_spin.set_value(
+            advanced_settings.get("whispercpp_logprob_thold", -1.0)
+        )
+        self.advanced_no_speech_thold_spin.set_value(
+            advanced_settings.get("whispercpp_no_speech_thold", 0.6)
+        )
+
+    def _get_current_settings(self):
+        """Get current settings from config manager."""
+        self.config_manager.load_config()
+        settings = self.config_manager.get_settings()
+
+        sr_settings = settings.get("speech_recognition", {})
+        engine = sr_settings.get("engine", "vosk")
+        language = sr_settings.get("language", "en-us")
+        model_size = self.config_manager.get_model_size_for_engine(engine)
+        vad_sensitivity = sr_settings.get("vad_sensitivity", 3)
+        silence_timeout = sr_settings.get("silence_timeout", 2.0)
+
+        logger.info(
+            f"Loaded current settings: engine={engine}, language={language}, model_size={model_size}, "
+            f"vad={vad_sensitivity}, silence={silence_timeout}"
+        )
+
+        return {
+            "engine": engine,
+            "language": language,
+            "model_size": model_size,
+            "vad_sensitivity": vad_sensitivity,
+            "silence_timeout": silence_timeout,
+        }
+
+    def _get_selected_engine(self) -> str:
+        """Return the currently selected engine ID."""
+        engine_text = self.engine_combo.get_active_text()
+        return _engine_from_display(engine_text) if engine_text else "vosk"
+
+    def _get_selected_whispercpp_model(self) -> str:
+        """Return the selected whisper.cpp model variant."""
+        variant_id = self.model_variant_combo.get_active_id()
+        if variant_id:
+            return variant_id
+
+        size_id = self.model_combo.get_active_id()
+        model_size = size_id.lower() if size_id else "small"
+        variants = get_whispercpp_model_variants(model_size)
+        return variants[0] if variants else "small"
+
+    def _get_recommended_whispercpp_model_for_language(self) -> tuple[str, str]:
+        """Return the recommended whisper.cpp variant for the selected language."""
+        recommended_model, reason = get_recommended_whispercpp_model()
+        language_id = _language_for_whispercpp_variant(self)
+        return _recommended_whispercpp_variant_for_language(
+            recommended_model,
+            reason,
+            language_id,
+        )
+
+    def _downloaded_alternative_for(self, recommended: str) -> Optional[str]:
+        """Return a model already on disk that can stand in for ``recommended``.
+
+        Every entry in these pickers is a download decision priced in gigabytes, so
+        suggesting a fresh download while something equivalent is already on disk
+        wastes the user's bandwidth (#778). Only candidates that are not smaller than
+        the recommendation qualify, so this never quietly downgrades accuracy, and
+        English-only weights are only offered when English is actually selected.
+        """
+        if recommended in WHISPERCPP_MODEL_INFO and is_whispercpp_model_downloaded(recommended):
+            return None
+
+        language_id = _language_for_whispercpp_variant(self)
+        wants_english = _language_is_english(language_id)
+        recommended_mb = WHISPERCPP_MODEL_INFO.get(recommended, {}).get("size_mb", 0)
+
+        # An English-only recommendation must not be answered with multilingual
+        # weights: they weigh the same and recognise English worse, which is the
+        # accuracy loss #776 is about.
+        needs_english_only = is_english_only_whispercpp_model(recommended)
+
+        best = None
+        best_mb = None
+        for model_name in list_downloaded_whispercpp_models():
+            if model_name in NON_DICTATION_MODELS:
+                continue
+            info = WHISPERCPP_MODEL_INFO.get(model_name)
+            if not info:
+                continue
+            if is_english_only_whispercpp_model(model_name) and not wants_english:
+                continue
+            if needs_english_only and not is_english_only_whispercpp_model(model_name):
+                continue
+            if info["size_mb"] < recommended_mb:
+                continue
+            if best_mb is None or info["size_mb"] < best_mb:
+                best, best_mb = model_name, info["size_mb"]
+
+        return best
+
+    def _get_default_whispercpp_variant_for_size(self, model_size: str) -> Optional[str]:
+        """Return the default specialization for a user-selected size."""
+        language_id = _language_for_whispercpp_variant(self)
+        return _default_whispercpp_variant_for_size(model_size, language_id)
+
+    def _on_apply_recommendation(self, _button: Any) -> None:
+        """Set both pickers to the model the card is offering.
+
+        Size and specialization must land under ``_populating_models`` so
+        ``_on_model_changed`` does not auto-apply the default size variant
+        (e.g. full ``large``) before the intended target (e.g. turbo q5_0).
+        """
+        target = getattr(self, "_recommended_target_model", None)
+        if not target or target not in WHISPERCPP_MODEL_INFO:
+            return
+
+        model_size = get_whispercpp_model_size(target)
+        with _suppressed(self, "_populating_models"):
+            self.model_combo.set_active_id(model_size)
+            self._populate_whispercpp_variant_options(model_size, target)
+            self.model_variant_combo.set_active_id(target)
+            self._sync_language_options_for_selected_model()
+
+        self._update_model_info()
+        self._refresh_unused_downloads()
+        self._auto_apply_settings()
+
+    def _is_selected_whispercpp_model_english_only(self) -> bool:
+        """Return whether the selected model is a whisper.cpp English-only variant."""
+        if self._get_selected_engine() != "whisper_cpp":
+            return False
+        return is_english_only_whispercpp_model(self._get_selected_whispercpp_model())
+
+    def _set_combo_active_id_or_first(self, combo, active_id: Optional[str]) -> bool:
+        """Set a combo to an ID, falling back to the first row."""
+        if active_id and combo.set_active_id(active_id):
+            return True
+
+        model = combo.get_model()
+        if model:
+            combo.set_active(0)
+            return True
+        return False
+
+    def _default_language_for_engine(self, engine: str) -> str:
+        """Return a safe default language for the selected engine and model."""
+        if engine == "vosk":
+            return "en-us"
+        return "auto"
+
+    def _update_model_picker_tooltips(self):
+        """Refresh model picker hover guidance for the current selection."""
+        self.model_combo.set_tooltip_text(MODEL_SIZE_TOOLTIP)
+        self.model_row.set_tooltip_text(MODEL_SIZE_TOOLTIP)
+        self.language_combo.set_tooltip_text(LANGUAGE_TOOLTIP)
+        self.language_row.set_tooltip_text(LANGUAGE_TOOLTIP)
+
+        if self._get_selected_engine() == "whisper_cpp":
+            specialization_tooltip = _model_specialization_tooltip(
+                self._get_selected_whispercpp_model()
+            )
+        else:
+            specialization_tooltip = MODEL_SPECIALIZATION_TOOLTIP
+
+        self.model_variant_combo.set_tooltip_text(specialization_tooltip)
+        self.model_variant_row.set_tooltip_text(specialization_tooltip)
+
+    def _sync_language_options_for_selected_model(self, preferred_language: Optional[str] = None):
+        """Refresh language options and keep the current model/language pair valid."""
+        engine = self._get_selected_engine()
+        if engine == "parakeet":
+            # Coverage is the model (v2-english vs v3-european), not this picker.
+            # Remember a non-auto preferred leftover, but never clobber memory with
+            # the forced auto that follows an engine switch into Parakeet.
+            if preferred_language and preferred_language != "auto":
+                self._last_non_parakeet_language = preferred_language
+            self.language = "auto"
+            language_to_keep = "auto"
+        else:
+            language_to_keep = (
+                preferred_language or self.language_combo.get_active_id() or self.language
+            )
+
+        with _suppressed(self, "_processing_language_change"):
+            self._populate_language_options()
+            if not self._set_combo_active_id_or_first(self.language_combo, language_to_keep):
+                return
+
+            active_language = self.language_combo.get_active_id()
+            if active_language != language_to_keep:
+                fallback_language = self._default_language_for_engine(engine)
+                self._set_combo_active_id_or_first(self.language_combo, fallback_language)
+
+            if engine == "parakeet":
+                self.language = "auto"
+            else:
+                self.language = (
+                    self.language_combo.get_active_id() or self._default_language_for_engine(engine)
+                )
+                if self.language and not _vosk_display_is_coerced_fallback(
+                    engine, self.language, self._last_non_parakeet_language
+                ):
+                    self._last_non_parakeet_language = self.language
+
+        self._sync_follow_layout_controls()
+        self._update_language_warning()
+        self._update_model_picker_tooltips()
+
+    def _populate_model_options(self):
+        """Populate model options based on the current engine selection."""
+        try:
+            with _suppressed(self, "_populating_models"):
+                self.model_combo.remove_all()
+                self.model_variant_combo.remove_all()
+
+                engine_text = self.engine_combo.get_active_text()
+                if not engine_text:
+                    logger.warning("No engine selected during model options population")
+                    return
+
+                engine = _engine_from_display(engine_text)
+                logger.info(f"Populating model options for engine: {engine}")
+
+                # Remote API does not need model options
+                if engine == "remote_api":
+                    logger.info("Remote API engine selected, no model options needed")
+                    return
+
+                saved_model_for_engine = self.config_manager.get_model_size_for_engine(engine)
+                logger.info(f"Saved model for {engine}: {saved_model_for_engine}")
+
+                if engine == "whisper_cpp":
+                    self._populate_whispercpp_model_options(saved_model_for_engine)
+                    return
+
+                downloaded_models = []
+                smallest_model = None
+                if engine == "whisper":
+                    recommended_model, _ = _get_recommended_whisper_model()
+                elif engine == "parakeet":
+                    recommended_model = parakeet.RECOMMENDED_MODEL
+                elif engine == "faster_whisper":
+                    recommended_model, _ = get_recommended_faster_whisper_model()
+                    recommended_model, _ = _recommended_faster_whisper_variant_for_language(
+                        recommended_model,
+                        "",
+                        self.language_combo.get_active_id() or self.language,
+                    )
+                else:
+                    recommended_model, _ = _get_recommended_vosk_model()
+
+                if engine in ENGINE_MODELS:
+                    for size in ENGINE_MODELS[engine]:
+                        if engine == "whisper" and size in WHISPER_MODEL_INFO:
+                            info = WHISPER_MODEL_INFO[size]
+                            is_downloaded = _is_whisper_model_downloaded(size)
+                        elif engine == "faster_whisper" and size in FASTER_WHISPER_MODEL_INFO:
+                            info = FASTER_WHISPER_MODEL_INFO[size]
+                            is_downloaded = is_faster_whisper_model_downloaded(size)
+                        elif engine == "vosk" and size in VOSK_MODEL_INFO:
+                            info = VOSK_MODEL_INFO[size]
+                            is_downloaded = _is_vosk_model_downloaded(size, self.language)
+                        elif engine == "parakeet":
+                            info = parakeet.PARAKEET_MODEL_INFO[size]
+                            is_downloaded = parakeet.is_model_downloaded(size)
+                        else:
+                            is_downloaded = False
+                            info = {"size_mb": 0}
+
+                        model_display_name = _model_display_name(size)
+                        status = "✓" if is_downloaded else "↓"
+                        star = " ★" if size == recommended_model else ""
+                        display_text = (
+                            f"{model_display_name} ({_format_size(info.get('size_mb', 0))}) "
+                            f"{status}{star}"
+                        )
+
+                        if is_downloaded:
+                            downloaded_models.append(size)
+                        if smallest_model is None:
+                            smallest_model = size
+
+                        # whisper.cpp already appends the catalog id; Faster Whisper
+                        # ids include dots (`small.en`) which capitalize() mangles.
+                        combo_id = size if engine == "faster_whisper" else size.capitalize()
+                        self.model_combo.append(combo_id, display_text)
+
+                # Determine which model to select. A staged spec wins over the
+                # saved model so a rebuild (e.g. a language change) keeps the
+                # unconfirmed pick instead of snapping back to the saved one.
+                saved_model = saved_model_for_engine.lower()
+                valid_models = [m.lower() for m in ENGINE_MODELS.get(engine, [])]
+
+                staged = self._staged_model_spec
+                staged_model = None
+                if isinstance(staged, dict) and staged.get("engine") == engine:
+                    candidate = str(staged.get("model_size") or "").lower()
+                    if candidate in valid_models:
+                        staged_model = candidate
+
+                if staged_model:
+                    selected = staged_model
+                elif saved_model in valid_models:
+                    selected = saved_model
+                elif downloaded_models:
+                    selected = downloaded_models[0]
+                else:
+                    selected = smallest_model
+
+                if engine == "faster_whisper":
+                    model_to_set = selected or "tiny"
+                else:
+                    model_to_set = selected.capitalize() if selected else "Small"
+
+                logger.info(f"Setting active model to: {model_to_set}")
+
+                if not self.model_combo.set_active_id(model_to_set):
+                    logger.warning(f"Could not set model by ID '{model_to_set}'")
+                    model = self.model_combo.get_model()
+                    for i, row in enumerate(model):
+                        if row[0].lower() == model_to_set.lower():
+                            self.model_combo.set_active(i)
+                            break
+                    else:
+                        if len(ENGINE_MODELS.get(engine, [])) > 0:
+                            self.model_combo.set_active(0)
+
+                logger.info(f"Final selected model: {self.model_combo.get_active_text()}")
+        finally:
+            self._refresh_unused_downloads()
+
+    def _resolve_saved_whispercpp_variant(self, saved_model_for_engine: str) -> str:
+        """Resolve which variant the saved configuration actually asks for.
+
+        ``whisper_cpp_model_size`` holds the id that loads the model, but for every
+        size below "large" the multilingual variant id *is* the bare size name, so
+        a stored "medium" cannot say whether the user chose the multilingual variant
+        or never chose anything. The explicit pin written by Settings answers that.
+        Without a pin the variant follows the selected language, which is what makes
+        picking English actually select an English-only model.
+
+        A leftover plain ``{size}.en`` English-only id is not treated as a permanent
+        specialization: it is re-derived from the language currently in the combo.
+        """
+        pinned = self.config_manager.get_model_variant_for_engine("whisper_cpp")
+        language_id = _language_for_whispercpp_variant(self)
+        return resolve_whispercpp_variant(saved_model_for_engine, pinned, language_id)
+
+    def _populate_whispercpp_model_options(self, saved_model_for_engine: str):
+        """Populate whisper.cpp size and specialization selectors."""
+        recommended_model, _ = self._get_recommended_whispercpp_model_for_language()
+        recommended_size = get_whispercpp_model_size(recommended_model)
+
+        staged = self._staged_model_spec
+        staged_model = ""
+        if isinstance(staged, dict) and staged.get("engine") == "whisper_cpp":
+            staged_model = str(staged.get("model_size") or "")
+        if staged_model in WHISPERCPP_MODEL_INFO:
+            # The staged spec survives rebuilds until its Download confirmation
+            # or a real apply (#894); it wins over the saved seed.
+            saved_model = staged_model
+        else:
+            saved_model = self._resolve_saved_whispercpp_variant(saved_model_for_engine)
+        if saved_model not in WHISPERCPP_MODEL_INFO:
+            saved_model = (
+                recommended_model if recommended_model in WHISPERCPP_MODEL_INFO else "tiny"
+            )
+
+        saved_size = get_whispercpp_model_size(saved_model)
+
+        for model_size in ENGINE_MODELS["whisper_cpp"]:
+            # Same shape as the specialization list: a size is a download decision
+            # too, so its price and whether it is already paid for belong here (#778).
+            size_variant = self._get_default_whispercpp_variant_for_size(model_size)
+            display_text = _model_display_name(model_size)
+            if size_variant in WHISPERCPP_MODEL_INFO:
+                info = WHISPERCPP_MODEL_INFO[size_variant]
+                status = "✓" if is_whispercpp_model_downloaded(size_variant) else "↓"
+                display_text += f" ({_format_size(info['size_mb'])}) {status}"
+            if model_size == recommended_size:
+                display_text += " ★"
+            self.model_combo.append(model_size, display_text)
+
+        self._set_combo_active_id_or_first(self.model_combo, saved_size)
+        active_size = self.model_combo.get_active_id() or saved_size
+        self._populate_whispercpp_variant_options(active_size, saved_model)
+
+    def _populate_whispercpp_variant_options(
+        self,
+        model_size: str,
+        selected_model: Optional[str] = None,
+    ):
+        """Populate the whisper.cpp specialization selector for a size."""
+        self.model_variant_combo.remove_all()
+
+        variants = get_whispercpp_model_variants(model_size.lower())
+        recommended_model, _ = self._get_recommended_whispercpp_model_for_language()
+
+        for model_name in variants:
+            info = WHISPERCPP_MODEL_INFO[model_name]
+            is_downloaded = is_whispercpp_model_downloaded(model_name)
+            status = "✓" if is_downloaded else "↓"
+            star = " ★" if model_name == recommended_model else ""
+            display_text = (
+                f"{_model_specialization_display_name(model_name)} "
+                f"({_format_size(info['size_mb'])}) {status}{star}"
+            )
+            self.model_variant_combo.append(model_name, display_text)
+
+        language_id = _language_for_whispercpp_variant(self)
+        model_to_set = selected_model if selected_model in variants else None
+        if model_to_set:
+            # Bare size ids double as multilingual variants; retarget for language
+            # so English picks .en instead of leaving Standard multilingual stuck.
+            # Follow mode uses the layout sentinel here so an English *display*
+            # does not retarget onto .en and then refuse the mode.
+            model_to_set = _whispercpp_variant_for_language(model_to_set, language_id)
+            if model_to_set not in variants:
+                model_to_set = None
+        if not model_to_set and recommended_model in variants:
+            model_to_set = recommended_model
+        if not model_to_set:
+            model_to_set = self._get_default_whispercpp_variant_for_size(model_size.lower())
+        if not model_to_set and variants:
+            model_to_set = variants[0]
+
+        self._set_combo_active_id_or_first(self.model_variant_combo, model_to_set)
+        self._update_model_picker_tooltips()
+
+    def _active_removable_model_id(self) -> Optional[str]:
+        """Return the on-disk id of the model currently selected in Settings."""
+        engine = self._get_selected_engine()
+        if engine == "whisper_cpp":
+            return self._get_selected_whispercpp_model()
+        if engine == "whisper":
+            model_id = self.model_combo.get_active_id()
+            return model_id.lower() if model_id else None
+        if engine == "vosk":
+            size = (self.model_combo.get_active_id() or "").lower()
+            language = self.language_combo.get_active_id() or self.language
+            return vosk_model_dirname(size, language)
+        if engine == "parakeet":
+            model_id = self.model_combo.get_active_id()
+            return model_id.lower() if model_id else None
+        if engine == "faster_whisper":
+            model_id = self.model_combo.get_active_id()
+            return model_id.lower() if model_id else None
+        return None
+
+    def _list_unused_downloads(self) -> list[tuple[str, str, str]]:
+        """Return (id, title, size_label) for unused downloaded models."""
+        return [
+            (model_id, label, size_label)
+            for model_id, label, size_label, in_use in self._list_downloaded_models()
+            if not in_use
+        ]
+
+    def _list_downloaded_models(self) -> list[tuple[str, str, str, bool]]:
+        """Return (id, title, size_label, in_use) for downloaded models."""
+        engine = self._get_selected_engine()
+        active_id = self._active_removable_model_id()
+        items: list[tuple[str, str, str, bool]] = []
+
+        if engine == "whisper_cpp":
+            for name in list_downloaded_whispercpp_models():
+                info = WHISPERCPP_MODEL_INFO[name]
+                size_mb = info["size_mb"] if isinstance(info.get("size_mb"), int) else 0
+                items.append(
+                    (
+                        name,
+                        _model_display_name(name),
+                        _format_size(size_mb),
+                        name == active_id,
+                    )
+                )
+        elif engine == "whisper":
+            for name in _list_downloaded_whisper_models():
+                info = WHISPER_MODEL_INFO[name]
+                size_mb = info["size_mb"] if isinstance(info.get("size_mb"), int) else 0
+                items.append(
+                    (
+                        name,
+                        _model_display_name(name),
+                        _format_size(size_mb),
+                        name == active_id,
+                    )
+                )
+        elif engine == "vosk":
+            for model in list_downloaded_vosk_models():
+                lang_info = SUPPORTED_LANGUAGES.get(model.language, {})
+                lang_name = model.language
+                if isinstance(lang_info, dict):
+                    name = lang_info.get("name")
+                    if isinstance(name, str):
+                        lang_name = name
+                items.append(
+                    (
+                        model.dirname,
+                        f"{lang_name} · {_model_display_name(model.size)}",
+                        _format_size(model.size_mb),
+                        model.dirname == active_id,
+                    )
+                )
+        elif engine == "parakeet":
+            for name in parakeet.list_downloaded_models():
+                items.append(
+                    (
+                        name,
+                        _model_display_name(name),
+                        _format_size(parakeet.PARAKEET_MODEL_INFO[name]["size_mb"]),
+                        name == active_id,
+                    )
+                )
+        elif engine == "faster_whisper":
+            for name in list_downloaded_faster_whisper_models():
+                items.append(
+                    (
+                        name,
+                        _model_display_name(name),
+                        _format_size(FASTER_WHISPER_MODEL_INFO[name]["size_mb"]),
+                        name == active_id,
+                    )
+                )
+
+        return items
+
+    def _refresh_unused_downloads(self):
+        """Rebuild the Unused downloads list, or hide it when empty."""
+        if not hasattr(self, "unused_models_group") or self.unused_island is None:
+            return
+
+        if self._get_selected_engine() == "remote_api":
+            self.unused_island.hide()
+            return
+
+        unused = self._list_unused_downloads()
+        self.unused_models_group.clear_rows()
+        if not unused:
+            self.unused_island.hide()
+            return
+
+        count = len(unused)
+        leftover = "unused model" if count == 1 else "unused models"
+        self.unused_expander_subtitle.set_text(f"{count} {leftover} on disk")
+
+        was_expanded = self.unused_expander.get_expanded()
+        for model_id, title, size_label in unused:
+            delete_btn = Gtk.Button(label="Delete")
+            delete_btn.set_tooltip_text(f"Delete {title} from disk")
+            delete_btn.get_style_context().add_class("destructive-action")
+            delete_btn.connect(
+                "clicked",
+                self._on_unused_download_delete_clicked,
+                model_id,
+                f"{title} ({size_label})",
+            )
+            row = PreferenceRow(
+                title=title,
+                subtitle=size_label,
+                widget=delete_btn,
+                keywords=("delete", "remove", "unused", "disk", "storage", "downloaded"),
+            )
+            self.unused_models_group.add_row(row)
+
+        self.unused_island.show_all()
+        self.unused_expander.set_expanded(was_expanded)
+        self._fit_unused_downloads_height()
+
+    def _fit_unused_downloads_height(self):
+        """Size the list from the rows it actually holds.
+
+        A per-row estimate cannot know how tall a row renders: with margins and
+        a Delete button the rows are taller than the estimate, so the last one
+        was cut off below the edge of the viewport while the header still
+        counted it (#683).
+        """
+        if not hasattr(self, "unused_models_scroll"):
+            return
+        if self.unused_expander is not None and not self.unused_expander.get_expanded():
+            return
+        _, natural_height = self.unused_models_group.listbox.get_preferred_height()
+        self.unused_models_scroll.set_min_content_height(
+            _clamp_unused_downloads_height(natural_height)
+        )
+
+    def _confirm_model_delete(self, text: str, secondary: str) -> bool:
+        """Ask before deleting model files from disk."""
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=Gtk.DialogFlags.MODAL,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.NONE,
+            text=text,
+        )
+        dialog.format_secondary_text(secondary)
+        dialog.add_button("_Cancel", Gtk.ResponseType.CANCEL)
+        delete_btn = dialog.add_button("_Delete", Gtk.ResponseType.YES)
+        delete_btn.get_style_context().add_class("destructive-action")
+        response = dialog.run()
+        dialog.destroy()
+        return response == Gtk.ResponseType.YES
+
+    def _delete_model_from_disk(self, model_id: str) -> None:
+        """Delete a downloaded model for the selected engine."""
+        engine = self._get_selected_engine()
+        if engine == "whisper_cpp":
+            delete_whispercpp_model(model_id)
+        elif engine == "whisper":
+            _delete_whisper_model(model_id)
+        elif engine == "vosk":
+            delete_vosk_model(model_id)
+        elif engine == "parakeet":
+            parakeet.delete_model(model_id)
+        elif engine == "faster_whisper":
+            delete_faster_whisper_model(model_id)
+        else:
+            raise ValueError(f"No local models to delete for engine {engine}")
+
+    def _on_unused_download_delete_clicked(self, widget, model_id: str, label: str):
+        """Confirm and delete one unused downloaded model."""
+        if model_id == self._active_removable_model_id():
+            return
+        if not self._confirm_model_delete(
+            "Delete unused download?",
+            f"{label} will be removed from disk. You can download it again later if needed.",
+        ):
+            return
+
+        try:
+            self._delete_model_from_disk(model_id)
+        except (OSError, ValueError, FileNotFoundError) as e:
+            logger.error("Failed to delete model %s: %s", model_id, e)
+            err = Gtk.MessageDialog(
+                transient_for=self,
+                flags=Gtk.DialogFlags.MODAL,
+                message_type=Gtk.MessageType.ERROR,
+                buttons=Gtk.ButtonsType.OK,
+                text="Could not delete model",
+            )
+            err.format_secondary_text(str(e))
+            err.run()
+            err.destroy()
+            return
+
+        self._populate_model_options()
+        self._update_model_info()
+
+    def _on_engine_changed(self, widget):
+        """Handle changes in the selected engine."""
+        engine_text = self.engine_combo.get_active_text()
+        if not engine_text:
+            return
+
+        engine = _engine_from_display(engine_text)
+
+        # A programmatic change — the resync after a failed apply — must repaint
+        # for the engine now shown, but must not rewrite the language the user
+        # picked, and must not cascade into another apply. Every other control on
+        # this page checks these flags itself rather than leaning on
+        # _auto_apply_settings to do it.
+        programmatic = _handlers_suppressed(self)
+
+        current_lang = None if self._applying_settings else self.language_combo.get_active_id()
+        previous_engine = self._engine_for_language_memory
+        # When Vosk coerces an unsupported language to en-us, keep the user
+        # preference in memory and re-apply it after sync (which would otherwise
+        # write the coerced active value back into memory).
+        preserve_language_memory = None
+        vosk_coerced = False
+        if engine == "parakeet":
+            # Force auto for honesty, but remember the prior catalog preference so
+            # leaving Parakeet can restore Whisper/cpp language instead of auto.
+            # Only capture on entry: a re-fired changed signal while already on
+            # Parakeet would otherwise overwrite memory with the forced auto.
+            if previous_engine != "parakeet":
+                remembered = current_lang or self.language
+                # Vosk may still display coerced en-us for an unsupported
+                # catalog language. Entering Parakeet must not record that
+                # fallback over the pre-coercion preference (e.g. Greek or auto).
+                if remembered and not _vosk_display_is_coerced_fallback(
+                    previous_engine, remembered, self._last_non_parakeet_language
+                ):
+                    self._last_non_parakeet_language = remembered
+            self.language = "auto"
+        elif current_lang is None and self._applying_settings:
+            # Programmatic resync must not rewrite the language the user picked.
+            pass
+        else:
+            # Prefer remembered preference over a prior engine's coerced active
+            # value (Vosk en-us for Greek). Trust the combo for other engines.
+            if (
+                current_lang
+                and current_lang != "auto"
+                and not _vosk_display_is_coerced_fallback(
+                    previous_engine, current_lang, self._last_non_parakeet_language
+                )
+            ):
+                chosen = current_lang
+            elif self._last_non_parakeet_language:
+                chosen = self._last_non_parakeet_language
+            else:
+                chosen = current_lang or self.language or self._default_language_for_engine(engine)
+
+            if engine == "vosk" and (
+                chosen == "auto" or not SUPPORTED_LANGUAGES.get(chosen, {}).get("vosk")
+            ):
+                # Keep the pre-coercion preference (including auto) so sync cannot
+                # persist Vosk's en-us fallback as the remembered Whisper language.
+                preserve_language_memory = (
+                    chosen
+                    if chosen and chosen != "auto"
+                    else (self._last_non_parakeet_language or "auto")
+                )
+                chosen = "en-us"
+                vosk_coerced = True
+
+            self.language = chosen
+            # Never store the coerced en-us fallback as the user preference.
+            if vosk_coerced:
+                self._last_non_parakeet_language = preserve_language_memory
+            elif chosen:
+                self._last_non_parakeet_language = chosen
+
+        self._engine_for_language_memory = engine
+        self._populate_model_options()
+        self._sync_language_options_for_selected_model(self.language)
+        if vosk_coerced and preserve_language_memory is not None:
+            self._last_non_parakeet_language = preserve_language_memory
+        self._update_engine_specific_ui()
+        self._update_model_info()
+        self._update_voice_commands_for_engine()
+
+        if programmatic:
+            return
+
+        # Every other control on this page applies as soon as it changes. Without
+        # this the new engine is only displayed: the config and the running
+        # recognizer stay on the previous one until some other control is touched,
+        # and closing the dialog drops the change silently.
+        if engine == "remote_api" and not self.remote_api_url_entry.get_text().strip():
+            # Applying now would only fail validation; _on_remote_api_settings_changed
+            # applies once the server URL is filled in.
+            return
+        self._auto_apply_settings()
+
+    def _update_voice_commands_for_engine(self):
+        """Update voice commands switch based on current engine."""
+        sr_config = self.config_manager.get_settings().get("speech_recognition", {})
+        voice_commands_enabled = sr_config.get("voice_commands_enabled")
+
+        if voice_commands_enabled is None:
+            engine_text = self.engine_combo.get_active_text()
+            engine = _engine_from_display(engine_text) if engine_text else "whisper_cpp"
+            auto_enabled = engine == "vosk"
+            self.voice_commands_switch.set_active(auto_enabled)
+
+    def _on_model_changed(self, widget):
+        """Handle changes in the selected model."""
+        if self._populating_models:
+            return
+        if _handlers_suppressed(self):
+            return
+
+        if self._get_selected_engine() == "whisper_cpp":
+            model_size = self.model_combo.get_active_id()
+            if model_size:
+                with _suppressed(self, "_populating_models"):
+                    self._populate_whispercpp_variant_options(model_size)
+                self._sync_language_options_for_selected_model()
+
+        self._update_model_info()
+        self._refresh_unused_downloads()
+        self._auto_apply_settings()
+
+    def _on_model_variant_changed(self, widget):
+        """Handle changes in the selected whisper.cpp specialization."""
+        if self._populating_models:
+            return
+        if _handlers_suppressed(self):
+            return
+
+        self._sync_language_options_for_selected_model()
+        self._update_model_info()
+        self._refresh_unused_downloads()
+        self._auto_apply_settings()
+
+    def _on_vad_changed(self, widget):
+        """Handle changes in VAD sensitivity."""
+        self._auto_apply_settings()
+
+    def _on_silence_changed(self, widget):
+        """Handle changes in silence timeout."""
+        self._auto_apply_settings()
+
+    def _on_voice_commands_toggled(self, widget, state):
+        """Handle toggle of the voice commands switch."""
+        if _handlers_suppressed(self):
+            return False
+
+        enabled = bool(state)
+        logger.info(f"Voice commands toggled: {enabled}")
+
+        self.config_manager.set("speech_recognition", "voice_commands_enabled", enabled)
+        self.config_manager.save_settings()
+        try:
+            self.speech_engine.reconfigure(voice_commands_enabled=enabled, force_download=False)
+        except Exception as e:
+            logger.warning(f"Failed to apply voice commands toggle immediately: {e}")
+        logger.info(f"Voice commands {'enabled' if enabled else 'disabled'}")
+        return False
+
+    def _populate_language_options(self):
+        """Populate language dropdown with supported languages."""
+        self.language_combo.remove_all()
+        engine = self.engine_combo.get_active_text()
+        if not engine:
+            return
+
+        engine = _engine_from_display(engine)
+
+        for lang_code, lang_info in SUPPORTED_LANGUAGES.items():
+            display_text = lang_info["name"]
+
+            if engine == "vosk":
+                has_model = lang_info["vosk"] is not None
+                if not has_model or lang_code == "auto":
+                    continue
+                is_downloaded = _is_vosk_model_downloaded("small", lang_code)
+                display_text += " ✓" if is_downloaded else " ↓"
+            elif engine in ["whisper", "whisper_cpp", "parakeet", "faster_whisper", "remote_api"]:
+                # An English-only model must not hide other languages: picking
+                # Polish (or auto) retargets to the multilingual sibling.
+                if lang_code == "auto":
+                    display_text += " ⚠"
+            else:
+                continue
+
+            self.language_combo.append(lang_code, display_text)
+
+    def _update_language_warning(self):
+        """Update language help text for the selected engine/model/language."""
+        if self._get_selected_engine() == "parakeet":
+            self.language_warning.set_markup("")
+            self.language_warning.hide()
+            return
+
+        lang_code = self.language_combo.get_active_id()
+        lang_info = SUPPORTED_LANGUAGES.get(lang_code, {})
+
+        if self._is_selected_whispercpp_model_english_only():
+            self.language_warning.set_markup(
+                "<span foreground='#e5a50a'>⚠ This model only understands English.</span>"
+            )
+            self.language_warning.show()
+        elif _is_following_layout(self):
+            resolved = language_for_active_layout(SUPPORTED_LANGUAGES)
+            resolved_name = SUPPORTED_LANGUAGES.get(resolved, {}).get("name") if resolved else None
+            self.language_warning.set_markup(
+                "<span foreground='#3584e4'>Follows your active keyboard layout. "
+                f"Right now that is {resolved_name or 'auto-detect'}.</span>"
+            )
+            self.language_warning.show()
+        elif lang_info.get("warning"):
+            lang_name = lang_info.get("name", "This language")
+            self.language_warning.set_markup(
+                f"<span foreground='#e5a50a'>⚠ {lang_name}: {lang_info['warning'].lower()}</span>"
+            )
+            self.language_warning.show()
+        else:
+            self.language_warning.set_markup("")
+            self.language_warning.hide()
+
+    def _follow_layout_supported(self, engine: Optional[str] = None) -> bool:
+        """Whether the selected engine can follow the keyboard layout."""
+        return (engine or self._get_selected_engine()) in FOLLOW_LAYOUT_ENGINES
+
+    def _sync_follow_layout_controls(self) -> None:
+        """Enable/disable the switch for the engine, and the picker for the mode."""
+        # An English-only model has no non-English weights, so it cannot honour
+        # a layout that points anywhere else. Refusing the mode here is honest;
+        # the alternative is a switch that silently does nothing.
+        supported = self._follow_layout_supported() and not (
+            self._is_selected_whispercpp_model_english_only()
+        )
+        self.follow_layout_row.set_sensitive(supported)
+
+        if not supported and self.follow_layout_switch.get_active():
+            # An engine or model that cannot run the mode must not keep it on.
+            with _suppressed(self, "_processing_language_change"):
+                self.follow_layout_switch.set_active(False)
+
+        self._follow_layout_active = bool(self.follow_layout_switch.get_active()) and supported
+        active = self._follow_layout_active
+        # The picker still shows a language while the mode drives it -- the one
+        # the layout resolves to right now -- so it reads as a live readout
+        # rather than going blank, and turning the mode off pins what is shown.
+        self.language_row.set_sensitive(not active)
+
+    def _on_follow_layout_toggled(self, *_args: Any) -> None:
+        """Apply the follow mode, or pin whatever the picker shows when it goes off."""
+        if _handlers_suppressed(self) or self._processing_language_change:
+            return
+
+        if self.follow_layout_switch.get_active():
+            # Show what it resolves to, so the greyed-out picker stays meaningful.
+            resolved = language_for_active_layout(SUPPORTED_LANGUAGES)
+            if resolved:
+                with _suppressed(self, "_processing_language_change"):
+                    self._set_combo_active_id_or_first(self.language_combo, resolved)
+
+        self._sync_follow_layout_controls()
+        self._update_language_warning()
+        self._refresh_simple_readout()
+        self._auto_apply_settings()
+
+    def _on_language_changed(self, widget: Any) -> None:
+        """Handle language selection change.
+
+        Repaint the recommendation card after the size list rebuilds so
+        ``_recommended_target_model`` / ★ / "Use it" track EN→non-EN flips
+        instead of applying a stale English-only target.
+        """
+        if self._processing_language_change:
+            return
+        if _handlers_suppressed(self) or self._simple_driving:
+            return
+
+        lang_code = self.language_combo.get_active_id()
+        if not lang_code:
+            return
+
+        engine = self.engine_combo.get_active_text()
+        if not engine:
+            return
+
+        with _suppressed(self, "_processing_language_change"):
+            self.language = lang_code
+            if _engine_from_display(engine) != "parakeet":
+                self._last_non_parakeet_language = lang_code
+            self._populate_model_options()
+            self._update_language_warning()
+            # Explicit refresh: Mock tests assert this call; _update_model_info
+            # also refreshes on a real dialog.
+            self._refresh_simple_readout()
+            self._update_model_info()
+            self._auto_apply_settings()
+
+    def _on_language_entry_activate(self, entry: Any) -> None:
+        """Commit a unique typed match when Enter is pressed in the language entry."""
+        self._commit_or_restore_language_entry()
+
+    def _on_language_entry_focus_out(self, entry: Any, event: Any) -> bool:
+        """Commit or restore the language after the entry loses focus."""
+        # Defer so a completion click can set the active id before we restore.
+        GLib.idle_add(self._commit_or_restore_language_entry)
+        return False
+
+    def _commit_or_restore_language_entry(self) -> bool:
+        """Resolve typed language text, or restore the last valid selection."""
+        if self._processing_language_change or self._initializing:
+            return False
+        if self.language_combo.get_active_id():
+            return False
+        entry = self.language_combo.get_child()
+        typed = entry.get_text() if entry is not None else ""
+        match_id = _resolve_combo_text_query(typed, _combo_text_rows(self.language_combo))
+        if match_id:
+            self.language_combo.set_active_id(match_id)
+            return False
+        # Restoring the same language should not re-apply settings.
+        with _suppressed(self, "_processing_language_change"):
+            self._set_combo_active_id_or_first(self.language_combo, self.language)
+        return False
+
+    def _sync_simple_from_advanced(self) -> None:
+        """Point the simple questions at the configuration that is actually live.
+
+        Switching modes must not change the model on its own, so the priority is
+        read back from the size already chosen rather than reset to a default.
+
+        A leftover simple multi answer is restored only when it still decodes
+        to the live Advanced language. Otherwise the next simple edit would
+        silently replace it: a named second language over a pin becomes auto,
+        and two English answers over Advanced auto pin English. Two English
+        answers still pin English, so that configuration is kept on an English
+        pin and dropped when Advanced is auto.
+        """
+        language = self.language_combo.get_active_id() or self.language or "auto"
+
+        if _is_following_layout(self):
+            # Neither simple question can say "follow the layout", and writing an
+            # answer here would let the next simple edit silently replace the mode
+            # with whatever those two controls happen to read. Refresh only the
+            # part that does not depend on the language and leave them alone.
+            with _suppressed(self, "_simple_syncing"):
+                recommended, _ = self._get_recommended_whispercpp_model_for_language()
+                current = self._get_selected_whispercpp_model()
+                self.simple_priority_combo.set_active_id(
+                    priority_for_size(
+                        get_whispercpp_model_size(recommended),
+                        get_whispercpp_model_size(current),
+                    )
+                )
+            self._update_simple_visibility()
+            return
+
+        is_auto = language == "auto"
+
+        stored_second = self.config_manager.get("speech_recognition", "simple_second_language", "")
+
+        with _suppressed(self, "_simple_syncing"):
+            if is_auto:
+                self.simple_multi_switch.set_active(True)
+                primary = self.simple_language_combo.get_active_id()
+                if not primary:
+                    self.simple_language_combo.set_active_id("en-us")
+                    primary = "en-us"
+            else:
+                self.simple_language_combo.set_active_id(language)
+                primary = language
+
+            keeps_live = bool(stored_second) and (
+                _decode_simple_languages(primary, True, stored_second) == language
+            )
+            if keeps_live:
+                if not is_auto:
+                    self.simple_multi_switch.set_active(True)
+                self.simple_second_language_combo.set_active_id(stored_second)
+            else:
+                if not is_auto:
+                    self.simple_multi_switch.set_active(False)
+                if stored_second:
+                    self.config_manager.set("speech_recognition", "simple_second_language", "")
+                # Reset so turning the switch on later starts from "any", not a
+                # stale pick that Advanced already superseded.
+                self.simple_second_language_combo.set_active_id("auto")
+
+            recommended, _ = self._get_recommended_whispercpp_model_for_language()
+            current = self._get_selected_whispercpp_model()
+            priority = priority_for_size(
+                get_whispercpp_model_size(recommended), get_whispercpp_model_size(current)
+            )
+            self.simple_priority_combo.set_active_id(priority)
+        self._update_simple_visibility()
+
+    def _simple_decoding_language(self) -> str:
+        """Resolve the two simple language answers into what the engine accepts."""
+        primary = self.simple_language_combo.get_active_id() or "en-us"
+        return _decode_simple_languages(
+            primary,
+            self.simple_multi_switch.get_active(),
+            self.simple_second_language_combo.get_active_id(),
+        )
+
+    def _on_disk_stand_in(self, variant: str, size: str, language: str) -> str:
+        """Prefer a downloaded weight of the same size over fetching a sibling.
+
+        Flipping the "other languages" switch swapped base for base.en, or back:
+        same size, different weights, and a modal download each way, blocking the
+        window for it. A same-size weight already on disk that can serve the
+        language stands in instead; the info card still offers the better variant
+        as a download, it just no longer forces it.
+        """
+        return whispercpp_on_disk_stand_in(variant, size, _language_is_english(language))
+
+    def _apply_simple_choice(self) -> None:
+        """Drive the advanced controls from the simple questions.
+
+        Simple mode deliberately steers the existing widgets instead of writing the
+        configuration itself, so applying, downloading and the info card keep going
+        through exactly one code path.
+
+        Faster Whisper and Parakeet stay selected: language still follows the
+        simple questions, but the engine is not forced to whisper.cpp. Other
+        engines are steered onto whisper.cpp and get the full size/variant derive.
+        """
+        language = self._simple_decoding_language()
+        priority = self.simple_priority_combo.get_active_id() or BALANCED
+
+        engine = self._get_selected_engine()
+        if engine not in ("faster_whisper", "parakeet"):
+            self.engine_combo.set_active_id("whisper_cpp")
+            engine = "whisper_cpp"
+
+        self._set_combo_active_id_or_first(self.language_combo, language)
+        self.language = language
+
+        if engine != "whisper_cpp":
+            return
+
+        recommended, _ = self._get_recommended_whispercpp_model_for_language()
+        size = size_for_priority(get_whispercpp_model_size(recommended), priority)
+        variant = _default_whispercpp_variant_for_size(size, language) or size
+        variant = self._on_disk_stand_in(variant, size, language)
+
+        self.model_combo.set_active_id(size)
+        self._populate_whispercpp_variant_options(size, variant)
+        self.model_variant_combo.set_active_id(variant)
+
+    def _on_advanced_expanded(self, expander, _param) -> None:
+        """Expand or collapse the advanced island, remembering the choice."""
+        expanded = expander.get_expanded()
+        if expanded:
+            self.advanced_box.show_all()
+            # Per-engine visibility has to run after show_all, which would
+            # otherwise reveal rows the active engine does not use.
+            self._update_engine_specific_ui()
+        else:
+            self._sync_simple_from_advanced()
+        if not self._initializing:
+            self.config_manager.set("speech_recognition", "show_advanced", expanded)
+            self.config_manager.save_settings()
+
+    def _refresh_simple_readout(self) -> None:
+        """Keep the simple answers describing the live model.
+
+        With both cards on screen, a change made in the advanced rows has to show
+        in the simple ones too, or the two would contradict each other. Skipped
+        while simple mode is itself steering the advanced rows, and during init.
+        """
+        if self._initializing or self._simple_driving or self._simple_syncing:
+            return
+        self._sync_simple_from_advanced()
+
+    def _on_simple_choice_changed(self, *_args) -> None:
+        """React to one of the simple questions changing.
+
+        Driving the four advanced controls emits "changed" on each of them, and
+        every one of those handlers ends in _auto_apply_settings, so a single pick
+        used to reconfigure the engine up to four times and freeze the window while
+        each reload ran. Suppress those while steering, then apply exactly once.
+        """
+        if _handlers_suppressed(self) or self._simple_syncing:
+            return
+        if self._simple_driving:
+            return
+
+        # Turning the switch on with nothing picked yet means "any language";
+        # otherwise the switch alone would visibly do nothing.
+        if (
+            self.simple_multi_switch.get_active()
+            and not self.simple_second_language_combo.get_active_id()
+        ):
+            with _suppressed(self, "_simple_syncing"):
+                self.simple_second_language_combo.set_active_id("auto")
+
+        with _suppressed(self, "_simple_driving"):
+            self._apply_simple_choice()
+
+        second = (
+            self.simple_second_language_combo.get_active_id()
+            if self.simple_multi_switch.get_active()
+            else ""
+        )
+        self.config_manager.set("speech_recognition", "simple_second_language", second or "")
+        self._update_simple_visibility()
+        # A simple answer resolves to a complete spec, so its pick keeps the
+        # instant apply-and-download flow the Advanced pickers no longer get.
+        self._auto_apply_settings(allow_download=True)
+
+    def _commit_or_restore_simple_language_entry(self) -> bool:
+        """Resolve text typed into the simple language box, or restore the last pick."""
+        if self._initializing or self._simple_syncing:
+            return False
+        if self.simple_language_combo.get_active_id():
+            return False
+
+        entry = self.simple_language_combo.get_child()
+        typed = entry.get_text() if entry is not None else ""
+        match_id = _resolve_combo_text_query(typed, _combo_text_rows(self.simple_language_combo))
+        if match_id:
+            self.simple_language_combo.set_active_id(match_id)
+            return False
+
+        # Restoring the same language must not re-apply settings.
+        with _suppressed(self, "_simple_syncing"):
+            fallback = self.language if self.language != "auto" else "en-us"
+            self._set_combo_active_id_or_first(self.simple_language_combo, fallback)
+        return False
+
+    def _on_simple_language_entry_activate(self, _entry: Any) -> None:
+        self._commit_or_restore_simple_language_entry()
+
+    def _on_simple_language_entry_focus_out(self, _entry: Any, _event: Any) -> bool:
+        return self._commit_or_restore_simple_language_entry()
+
+    def _update_simple_visibility(self) -> None:
+        """Show the simple questions, with the second language only when asked for."""
+        self.simple_group.show_all()
+        wants_second = self.simple_multi_switch.get_active()
+        _set_no_show_all_visible(self.simple_second_language_row, wants_second)
+
+    def _update_engine_specific_ui(self):
+        """Show/hide UI elements driven by the active engine."""
+        engine_text = self.engine_combo.get_active_text()
+        engine = _engine_from_display(engine_text) if engine_text else "vosk"
+        is_remote = engine == "remote_api"
+
+        if is_remote:
+            self.model_row.hide()
+            self.model_variant_row.hide()
+            if self.unused_island is not None:
+                self.unused_island.hide()
+            self.model_info_card.hide()
+            self.remote_server_group.show_all()
+            self.remote_status_label.show()
+        else:
+            self.model_row.show_all()
+            if engine == "whisper_cpp":
+                self.model_variant_row.show_all()
+            else:
+                self.model_variant_row.hide()
+            self.remote_server_group.hide()
+            self.remote_status_label.hide()
+
+        self._update_simple_visibility()
+
+        self._update_model_info()
+        self._refresh_unused_downloads()
+        self._update_language_warning()
+        if engine == "parakeet":
+            self.language_row.hide()
+            self.language_warning.hide()
+        else:
+            self.language_row.show_all()
+        self._update_model_picker_tooltips()
+        self._update_advanced_tab_sensitivity()
+
+    def _update_advanced_tab_sensitivity(self):
+        """Enable or disable advanced settings based on selected engine."""
+        is_whispercpp = self._get_selected_engine() == "whisper_cpp"
+
+        widgets = [
+            self.advanced_no_timestamps_switch,
+            self.advanced_no_context_switch,
+            self.advanced_initial_prompt_textview,
+            self.advanced_temperature_spin,
+            self.advanced_temperature_inc_spin,
+            self.advanced_entropy_thold_spin,
+            self.advanced_logprob_thold_spin,
+            self.advanced_no_speech_thold_spin,
+            self.advanced_reset_button,
+        ]
+        for widget in widgets:
+            widget.set_sensitive(is_whispercpp)
+
+        if is_whispercpp:
+            self.advanced_info_label.set_text("These settings apply to the whisper.cpp engine.")
+        else:
+            self.advanced_info_label.set_text(
+                "These settings only apply when the whisper.cpp engine is selected."
+            )
+
+    def _update_model_info(self):
+        """Update the model info card display."""
+        self._refresh_simple_readout()
+        engine_text = self.engine_combo.get_active_text()
+        if not engine_text:
+            self.model_info_card.hide()
+            return
+
+        engine = _engine_from_display(engine_text)
+
+        if engine == "whisper_cpp":
+            model_name = self._get_selected_whispercpp_model()
+        else:
+            model_id = self.model_combo.get_active_id()
+            if not model_id:
+                self.model_info_card.hide()
+                return
+            model_name = model_id.lower()
+
+        if engine == "whisper":
+            if model_name not in WHISPER_MODEL_INFO:
+                self.model_info_card.hide()
+                return
+            info = WHISPER_MODEL_INFO[model_name]
+            is_downloaded = _is_whisper_model_downloaded(model_name)
+            recommended, reason = _get_recommended_whisper_model()
+            extra_info = f"Parameters: {info['params']}"
+        elif engine == "whisper_cpp":
+            if model_name not in WHISPERCPP_MODEL_INFO:
+                self.model_info_card.hide()
+                return
+            info = WHISPERCPP_MODEL_INFO[model_name]
+            is_downloaded = is_whispercpp_model_downloaded(model_name)
+            recommended, reason = self._get_recommended_whispercpp_model_for_language()
+            backend, backend_info = detect_compute_backend()
+            extra_info = (
+                f"Parameters: {info['params']} • Backend: {get_backend_display_name(backend)}"
+            )
+        elif engine == "vosk":
+            if model_name not in VOSK_MODEL_INFO:
+                self.model_info_card.hide()
+                return
+            info = VOSK_MODEL_INFO[model_name]
+            is_downloaded = _is_vosk_model_downloaded(model_name, self.language)
+            recommended, reason = _get_recommended_vosk_model()
+            extra_info = f"Size: {_format_size(info['size_mb'])}"
+        elif engine == "parakeet":
+            if model_name not in parakeet.PARAKEET_MODEL_INFO:
+                self.model_info_card.hide()
+                return
+            info = parakeet.PARAKEET_MODEL_INFO[model_name]
+            is_downloaded = parakeet.is_model_downloaded(model_name)
+            recommended, reason = parakeet.RECOMMENDED_MODEL, parakeet.RECOMMENDED_REASON
+            extra_info = f"Size: {_format_size(info['size_mb'])}"
+        elif engine == "faster_whisper":
+            if model_name not in FASTER_WHISPER_MODEL_INFO:
+                self.model_info_card.hide()
+                return
+            info = FASTER_WHISPER_MODEL_INFO[model_name]
+            is_downloaded = is_faster_whisper_model_downloaded(model_name)
+            recommended, reason = get_recommended_faster_whisper_model()
+            recommended, reason = _recommended_faster_whisper_variant_for_language(
+                recommended,
+                reason,
+                self.language_combo.get_active_id() or self.language,
+            )
+            extra_info = f"Parameters: {info['params']}"
+        else:
+            self.model_info_card.hide()
+            return
+
+        model_display_name = _model_display_name(model_name)
+        recommended_display_name = _model_display_name(recommended)
+
+        self.model_info_title.set_markup(f"<b>{model_display_name}</b>: {info['desc']}")
+
+        if is_downloaded:
+            status = "<span foreground='#26a269'>Downloaded</span>"
+        else:
+            status = f"<span foreground='#e5a50a'>Download ~{_format_size(info['size_mb'])}</span>"
+        self.model_info_subtitle.set_markup(f"{extra_info} · {status}")
+        # The confirm action follows the displayed spec: offered only while it
+        # names a model that is not on disk (#894).
+        self.model_download_button.set_visible(not is_downloaded)
+
+        target = recommended
+        message = None
+        if engine == "whisper_cpp":
+            already_have = self._downloaded_alternative_for(recommended)
+            if already_have and already_have != model_name:
+                target = already_have
+                message = (
+                    f"You already have {_model_display_name(already_have)} on disk. "
+                    "Using it needs no download."
+                )
+
+        if target == model_name:
+            self._recommended_target_model = None
+            self.model_recommendation_box.hide()
+            self.model_recommendation_button.hide()
+        else:
+            self._recommended_target_model = target
+            if message is None:
+                message = f"Recommended: {_model_display_name(target)} ({reason})"
+            self.model_recommendation.set_text(message)
+            self.model_recommendation.show()
+            can_apply = engine == "whisper_cpp" and target in WHISPERCPP_MODEL_INFO
+            self.model_recommendation_button.set_visible(can_apply)
+            self.model_recommendation_box.show()
+
+        self._update_model_picker_tooltips()
+        self.model_info_card.show()
+        self.model_info_title.show()
+        self.model_info_subtitle.show()
+
+    def _auto_apply_settings(self, allow_download: bool = False) -> None:
+        """Automatically apply settings when changed.
+
+        A picker change stages a model spec; it never confirms a download.
+        ``allow_download`` is passed only by the simple questions, whose each
+        answer resolves to a complete spec, so their pick keeps the existing
+        apply-and-download flow. Every other caller leaves a missing model
+        staged: the pickers keep it, the info card offers Download, and only
+        ``apply_settings`` (that button, or Test) starts the transfer (#894).
+        """
+        if _handlers_suppressed(self):
+            return
+
+        if self._test_active:
+            return
+
+        if self._populating_models:
+            return
+
+        # Simple mode is mid-way through steering the advanced controls; it applies
+        # once itself when it is done.
+        if self._simple_driving:
+            return
+
+        # Bump before the guard is set so a close-time stash always reads a
+        # generation that already includes this in-flight apply.
+        global _apply_settings_generation
+        _apply_settings_generation += 1
+        apply_generation = _apply_settings_generation
+        self._applying_settings = True
+        # Already-downloaded apply is handed to a worker that clears this flag
+        # via GLib.idle_add. Download still holds it for the modal run() below.
+        worker_holds_guard = False
+        try:
+            settings = self.get_selected_settings()
+            # Collecting consumed every deferred text field; clear the flags
+            # here so edits that arrived mid-apply still schedule a follow-up.
+            self._advanced_prompt_dirty = False
+            self._language_candidates_dirty = False
+            self._pending_text_edits = None
+            self._pending_text_edit_baseline = None
+            engine = settings.get("engine", "vosk")
+            model_name = settings.get("model_size", "small")
+
+            # Check if model needs to be downloaded
+            missing_model = _undownloaded_model_info(self.language, engine, model_name)
+
+            if missing_model is not None and not allow_download:
+                # Staging, not confirming: leave the staged spec in the pickers
+                # and the saved one in the config, and repaint the info card so
+                # its Download action offers the explicit confirmation (#894).
+                self._staged_model_spec = {
+                    "engine": engine,
+                    "model_size": model_name,
+                    "model_variant": settings.get("model_variant", ""),
+                    "language": self.language,
+                }
+                # Edits outside the spec are not part of the staging: apply
+                # and persist them so VAD, timeouts and advanced params are
+                # not dropped while a download is staged. Not reconfigure() —
+                # it cancels a buffered recording and waits on its worker
+                # here on the GTK thread, and every whispercpp_* kwarg forces
+                # a model reload. Live-set only what actually changed; the
+                # load-time params stay saved-only until the Download apply
+                # or the next start.
+                non_model_settings = {
+                    key: value for key, value in settings.items() if key not in _MODEL_SPEC_KEYS
+                }
+                applied = True
+                for key, clamp in _LIVE_ENGINE_SETTINGS.items():
+                    if key not in non_model_settings:
+                        continue
+                    try:
+                        live_value = clamp(non_model_settings[key])
+                    except (TypeError, ValueError) as e:
+                        logger.error(f"Invalid {key} while staging: {e}")
+                        applied = False
+                        continue
+                    if getattr(self.speech_engine, key, None) == live_value:
+                        continue
+                    setattr(self.speech_engine, key, live_value)
+                if non_model_settings and applied:
+                    self._save_selected_settings(non_model_settings)
+                self._update_model_info()
+                return
+
+            if missing_model is not None:
+                if not self.speech_engine.try_begin_download():
+                    # The tray is already downloading a model; a second download
+                    # would fight it over the engine's progress callback and
+                    # configuration. Put the picker back on the saved model.
+                    self._show_download_busy_dialog()
+                    self._resync_model_ui_from_config()
+                    return
+                logger.info(f"Model {model_name} needs download, showing progress dialog")
+                download_dialog = _make_download_dialog(
+                    self, model_name, missing_model["size_mb"], engine
+                )
+
+                def progress_callback(fraction, speed, status):
+                    GLib.idle_add(download_dialog.update_progress, fraction, speed, status)
+
+                def download_and_apply():
+                    try:
+                        self.speech_engine.set_download_progress_callback(progress_callback)
+
+                        def check_cancelled():
+                            if download_dialog.cancelled:
+                                self.speech_engine.cancel_download()
+                            return not download_dialog.cancelled
+
+                        cancel_check_id = GLib.timeout_add(100, check_cancelled)
+
+                        try:
+                            applied = self._apply_settings_internal(
+                                settings, raise_errors=True, force_reinit=True
+                            )
+                            if applied:
+                                GLib.idle_add(download_dialog.set_complete, True, "")
+                                GLib.idle_add(self._populate_model_options)
+                            else:
+                                # raise_errors makes failures raise today, but a
+                                # False return must not be read as success: it
+                                # means nothing was saved and the pickers still
+                                # show settings the engine never took.
+                                GLib.idle_add(self._idle_resync_model_ui_from_config)
+                                GLib.idle_add(
+                                    download_dialog.set_complete,
+                                    False,
+                                    "Could not apply the new settings",
+                                )
+                        finally:
+                            GLib.source_remove(cancel_check_id)
+                            self.speech_engine.set_download_progress_callback(None)
+                            self.speech_engine.end_download()
+
+                    except Exception as e:
+                        error_msg = str(e)
+                        # The settings were never saved, so the previously working
+                        # model is still the configured one; put the pickers back on
+                        # it so the UI matches the config and a retry is possible.
+                        GLib.idle_add(self._idle_resync_model_ui_from_config)
+                        if "cancelled" in error_msg.lower():
+                            GLib.idle_add(
+                                download_dialog.set_complete,
+                                False,
+                                "Download cancelled",
+                            )
+                        elif engine == "whisper" and "no module named" in error_msg.lower():
+                            GLib.idle_add(
+                                download_dialog.set_complete,
+                                False,
+                                "Whisper not installed",
+                            )
+                            GLib.idle_add(self._show_whisper_install_dialog)
+                        else:
+                            GLib.idle_add(download_dialog.set_complete, False, error_msg[:100])
+
+                threading.Thread(target=download_and_apply, daemon=True).start()
+                download_dialog.run()
+                download_dialog.destroy()
+                # Whatever ended the modal — cancel, failure, or a path not
+                # covered above — the pickers must not outlive the config.
+                self._resync_engine_ui_if_unapplied()
+                # Repaint the info card too: after a success it still showed the
+                # pre-download render (amber size line, Download action) until
+                # some other change repainted it (#894 follow-up).
+                self._update_model_info()
+                return
+
+            logger.info(f"Auto-applying settings: {settings}")
+
+            def apply_already_downloaded() -> None:
+                try:
+                    self._apply_settings_internal(
+                        settings, raise_errors=True, apply_generation=apply_generation
+                    )
+                    logger.info("Settings auto-applied successfully")
+                except Exception as e:
+                    logger.error(f"Failed to auto-apply settings: {e}")
+                    GLib.idle_add(self._idle_resync_model_ui_from_config)
+                finally:
+                    GLib.idle_add(self._finish_auto_apply)
+
+            threading.Thread(target=apply_already_downloaded, daemon=True).start()
+            worker_holds_guard = True
+            return
+        except Exception as e:
+            logger.error(f"Failed to auto-apply settings: {e}")
+            self._resync_model_ui_from_config()
+        finally:
+            if not worker_holds_guard:
+                self._applying_settings = False
+
+    def _finish_auto_apply(self) -> bool:
+        """Release the apply-guard after an already-downloaded worker finishes.
+
+        Always resync while the dialog is alive: handlers early-return during
+        apply, so selected settings can still match the saved config even when
+        a combo (whisper.cpp size) has already moved.
+        """
+        self._applying_settings = False
+        if self._dialog_is_alive():
+            if self._advanced_prompt_dirty or self._language_candidates_dirty:
+                # Edits landed while the guard was held; run their apply now.
+                self._auto_apply_settings()
+            else:
+                self._resync_model_ui_from_config()
+        else:
+            # Closed mid-apply: the running apply saved an older snapshot, so
+            # write any edits it could not see now that it has finished.
+            self._persist_pending_text_edits()
+        return False
+
+    def _idle_resync_model_ui_from_config(self) -> bool:
+        """Main-loop resync from a worker thread; no-op if the dialog is gone."""
+        if self._dialog_is_alive():
+            self._resync_model_ui_from_config()
+        return False
+
+    def _resync_model_ui_from_config(self):
+        """Put the pickers back on the settings that are actually saved.
+
+        Called when applying failed: the config still names the previous
+        engine and model, and leaving the pickers on the rejected ones also
+        blocks a retry, since re-selecting the same entry emits no "changed"
+        signal.
+        """
+        try:
+            sr_config = self.config_manager.get_settings().get("speech_recognition", {})
+            saved_engine = sr_config.get("engine")
+            if saved_engine:
+                display = _engine_display_name(saved_engine)
+                if self.engine_combo.get_active_text() != display:
+                    # Hold the apply-suppression flag: restoring the combo fires
+                    # _on_engine_changed(), which must repaint the pickers but
+                    # not cascade into another apply or download prompt. The
+                    # outer frame may already hold the guard, so restore the
+                    # previous value rather than clearing it.
+                    was_applying = self._applying_settings
+                    self._applying_settings = True
+                    try:
+                        self.engine_combo.set_active_id(display)
+                    finally:
+                        self._applying_settings = was_applying
+            self._populate_model_options()
+            saved_language = sr_config.get("language")
+            if saved_language:
+                self._sync_language_options_for_selected_model(saved_language)
+            self._update_model_info()
+        except Exception as e:  # pragma: no cover - UI resync must never mask the original error
+            logger.debug(f"Could not resync model pickers: {e}")
+
+    def _resync_engine_ui_if_unapplied(self):
+        """Resync when the engine on screen is not the engine that got saved.
+
+        Covers every way an apply can end without writing the config: a
+        cancelled download, a failure, and Remote API left without a server
+        URL, where applying is deliberately deferred. Leaving the combo on
+        the unapplied engine misreports what dictation will actually use.
+        """
+        try:
+            saved_engine = (
+                self.config_manager.get_settings().get("speech_recognition", {}).get("engine")
+            )
+            if not saved_engine:
+                return
+            if self._get_selected_engine() == saved_engine:
+                return
+            self._resync_model_ui_from_config()
+        except Exception as e:  # pragma: no cover - a resync must never mask the real error
+            logger.debug(f"Could not check the engine picker against the config: {e}")
+
+    def _save_selected_settings(self, settings: dict[str, Any]) -> None:
+        """Persist selected settings to their appropriate config sections."""
+        sr_settings = {k: v for k, v in settings.items() if not k.startswith("whispercpp_")}
+        advanced_settings = {k: v for k, v in settings.items() if k.startswith("whispercpp_")}
+
+        self.config_manager.update_speech_recognition_settings(sr_settings)
+        for key, value in advanced_settings.items():
+            self.config_manager.set("advanced", key, value)
+        self.config_manager.save_settings()
+        if any(key in settings for key in _MODEL_SPEC_KEYS):
+            # A real spec just persisted, so nothing is staged anymore (#894).
+            self._staged_model_spec = None
+
+    def get_selected_settings(self) -> dict[str, Any]:
+        """Return the currently selected settings from the UI."""
+        engine_text = self.engine_combo.get_active_text()
+        model_id = self.model_combo.get_active_id()
+        language_id = self.language_combo.get_active_id()
+
+        engine = _engine_from_display(engine_text) if engine_text else "vosk"
+        model_variant = ""
+        if engine == "whisper_cpp":
+            selected = self._get_selected_whispercpp_model()
+            size = get_whispercpp_model_size(selected)
+            derived = self._get_default_whispercpp_variant_for_size(size)
+            # Full id for reconfigure/download. Pin deliberate specializations
+            # (including multilingual while English). A language-derived default
+            # stays unpinned so a later language change can re-derive — except
+            # when an existing bare-size pin already matches the selection: that
+            # is a deliberate multilingual pin that became the new language's
+            # default, and must survive so returning to English still honours it.
+            model_size = selected
+            existing_pin = (
+                self.config_manager.get_model_variant_for_engine("whisper_cpp") or ""
+            ).lower()
+            if selected != derived:
+                model_variant = selected
+            elif existing_pin == selected and selected in WHISPERCPP_MODEL_SIZES:
+                model_variant = selected
+            else:
+                model_variant = ""
+        else:
+            model_size = model_id.lower() if model_id else "small"
+        if engine == "parakeet":
+            language = "auto"
+        elif _is_following_layout(self):
+            language = LANGUAGE_FOLLOWS_LAYOUT
+        else:
+            language = language_id if language_id else self._default_language_for_engine(engine)
+
+        vad = int(self.vad_spin.get_value())
+        silence = self.silence_spin.get_value()
+
+        settings = {
+            "engine": engine,
+            "model_size": model_size,
+            "model_variant": model_variant,
+            "language": language,
+            "vad_sensitivity": vad,
+            "silence_timeout": silence,
+            "whispercpp_no_timestamps": self.advanced_no_timestamps_switch.get_active(),
+            "whispercpp_no_context": self.advanced_no_context_switch.get_active(),
+            "whispercpp_initial_prompt": self.advanced_initial_prompt_buffer.get_text(
+                self.advanced_initial_prompt_buffer.get_start_iter(),
+                self.advanced_initial_prompt_buffer.get_end_iter(),
+                False,
+            ),
+            "whispercpp_language_candidates": self.advanced_language_candidates_entry.get_text(),
+            "whispercpp_temperature": self.advanced_temperature_spin.get_value(),
+            "whispercpp_temperature_inc": self.advanced_temperature_inc_spin.get_value(),
+            "whispercpp_entropy_thold": self.advanced_entropy_thold_spin.get_value(),
+            "whispercpp_logprob_thold": self.advanced_logprob_thold_spin.get_value(),
+            "whispercpp_no_speech_thold": self.advanced_no_speech_thold_spin.get_value(),
+        }
+
+        gpu_device_id = self.gpu_device_combo.get_active_id()
+        if gpu_device_id is not None:
+            gpu_device_val = int(gpu_device_id)
+            settings["whispercpp_gpu_device"] = None if gpu_device_val == -1 else gpu_device_val
+
+        # Remote API additional settings
+        if engine == "remote_api":
+            settings["remote_api_url"] = self.remote_api_url_entry.get_text().strip()
+            settings["remote_api_key"] = self.remote_api_key_entry.get_text().strip()
+            settings["remote_api_endpoint"] = (
+                self.remote_api_endpoint_combo.get_active_id() or "/inference"
+            )
+            settings["remote_api_model"] = (
+                self.remote_api_model_entry.get_text().strip() or "whisper-1"
+            )
+
+        return settings
+
+    def _on_test_clicked(self, widget):
+        """Handle click on the test button."""
+        if self._test_active:
+            logger.warning("Test already in progress.")
+            return
+
+        if self._applying_settings:
+            # The live engine may still be mid-reconfigure even when the UI
+            # already matches the saved config. Do not apply or start a test.
+            self.test_output_revealer.set_reveal_child(True)
+            self.test_buffer.set_text("Settings are still applying. Try Test again in a moment.")
+            return
+
+        current_config = self.config_manager.get_settings().get("speech_recognition", {})
+        selected_settings = self.get_selected_settings()
+        selected_engine = selected_settings.get("engine")
+        selected_model = selected_settings.get("model_size")
+        # Compare to the live engine too: UI can match the file while the
+        # in-memory manager is still on another engine/size (sidecar, pending apply).
+        live_engine = getattr(self.speech_engine, "engine", None)
+        live_model = getattr(self.speech_engine, "model_size", None)
+
+        settings_differ = False
+        if (
+            current_config.get("engine") != selected_engine
+            or current_config.get("model_size") != selected_model
+            or live_engine != selected_engine
+            or live_model != selected_model
+        ):
+            settings_differ = True
+        elif selected_engine == "vosk":
+            if current_config.get("vad_sensitivity") != selected_settings.get(
+                "vad_sensitivity"
+            ) or current_config.get("silence_timeout") != selected_settings.get("silence_timeout"):
+                settings_differ = True
+
+        if settings_differ:
+            self.test_buffer.set_text("Applying settings...")
+            if not self.apply_settings():
+                self.test_buffer.set_text("Failed to apply settings. Please try again.")
+                return
+            self.test_buffer.set_text("Settings applied. Starting test...")
+
+        self.connect_to_recognition_manager()
+
+        self._saved_text_callbacks = self.speech_engine.get_text_callbacks()
+        self.speech_engine.set_text_callbacks([self._test_text_callback])
+        # History recording runs on segment callbacks keyed by capture time:
+        # stamp the window so test speech stays out of Recent Snippets while
+        # leftover segments from a dictation still file normally.
+        self.speech_engine.test_capture_ceiling = None
+        self.speech_engine.test_capture_floor = time.monotonic()
+
+        if not self.speech_engine.start_recognition():
+            self.speech_engine.set_text_callbacks(self._saved_text_callbacks)
+            self.speech_engine.test_capture_floor = None
+            self.speech_engine.test_capture_ceiling = None
+            del self._saved_text_callbacks
+            self.test_output_revealer.set_reveal_child(True)
+            if getattr(self.speech_engine, "is_auto_paused", False):
+                self.test_buffer.set_text(
+                    "Dictation is paused. Close the listed app or remove it from "
+                    "Auto-Pause settings."
+                )
+            elif not getattr(self.speech_engine, "model_ready", True):
+                self.test_buffer.set_text(
+                    "No speech model downloaded. Open the Speech Model page and "
+                    "download a model to use Test Dictation."
+                )
+            else:
+                self.test_buffer.set_text("Could not start recognition test.")
+            return
+
+        self._test_active = True
+        self._test_timeout_cancel_attempted = False
+        self.test_button.set_sensitive(False)
+        self.test_button.set_label("Testing… Speak Now!")
+        self.test_output_revealer.set_reveal_child(True)
+        self.test_buffer.set_text("")
+        self._test_result = ""
+        self.update_recognition_progress("Listening", info="Starting recognition test...")
+
+        # Enough room for one utterance plus the configured silence window.
+        delay = float(selected_settings.get("silence_timeout", 2.0)) + 2.0
+        threading.Thread(target=self._stop_test_after_delay, args=(delay,)).start()
+
+    def _test_text_callback(self, text: str):
+        """Callback specifically for the test recognition."""
+        GLib.idle_add(self._append_test_result, text)
+
+    def _append_test_result(self, text: str):
+        current_text = self.test_buffer.get_text(
+            self.test_buffer.get_start_iter(), self.test_buffer.get_end_iter(), False
+        )
+        separator = " " if current_text.strip() else ""
+        self.test_buffer.insert(self.test_buffer.get_end_iter(), separator + text)
+        mark = self.test_buffer.get_insert()
+        self.test_textview.scroll_to_mark(mark, 0.0, True, 0.0, 1.0)
+        return False
+
+    def _stop_test_after_delay(self, delay: float):
+        """Stops the recognition test after a specified delay."""
+        time.sleep(delay)
+        GLib.idle_add(self._finalize_test)
+
+    def _finalize_test(self):
+        """Finalize the test state and UI updates."""
+        if not self._test_active:
+            return False
+
+        self.speech_engine.stop_recognition()
+
+        # Buffered reload's stop_recognition() returns while PROCESSING; the
+        # worker may still deliver the test utterance via current text_callbacks.
+        # Keep the test callbacks installed (and block auto-apply / re-test)
+        # until recognition reaches IDLE so we never restore the live injector
+        # early. Use GLib polling — never join the worker on the GTK thread.
+        state = getattr(self.speech_engine, "state", RecognitionState.IDLE)
+        buffered = getattr(self.speech_engine, "_buffered_reload_session", False)
+        if state in (RecognitionState.LISTENING, RecognitionState.PROCESSING) or buffered:
+            self.test_button.set_sensitive(False)
+            self.test_button.set_label("Processing…")
+            self.update_recognition_progress("Processing")
+            self._test_idle_wait_ticks = 0
+            self._test_timeout_cancel_attempted = False
+            GLib.timeout_add(100, self._wait_for_idle_then_restore_callbacks)
+            return False
+
+        # Non-buffered stop already joined to IDLE; brief settle for any
+        # GLib.idle_add text delivery still in flight.
+        GLib.timeout_add(500, self._restore_callbacks_and_check_result)
+
+        self._test_active = False
+        self.test_button.set_sensitive(True)
+        self.test_button.set_label("Test Dictation")
+
+        self.update_recognition_progress("Idle")
+
+        return False
+
+    def _wait_for_idle_then_restore_callbacks(self) -> bool:
+        """Poll until recognition is idle, then restore callbacks / check result.
+
+        Returns True so GLib.timeout_add keeps scheduling while the buffered
+        reload worker is still PROCESSING.
+
+        On the ~3 minute timeout, never restore live injector callbacks while a
+        buffered reload worker may still deliver text (privacy-adjacent Test
+        Dictation inject-into-app race). Prefer cancelling via
+        ``_cancel_reload_recording`` (off the GTK thread — it joins) and only
+        then restoring. If cancel is unavailable or fails, keep polling with
+        test callbacks and ``_test_active`` so live injectors are not restored
+        early and later dictation cannot be hijacked into the test buffer.
+        """
+        if not hasattr(self, "_saved_text_callbacks"):
+            self._test_active = False
+            self.test_button.set_sensitive(True)
+            self.test_button.set_label("Test Dictation")
+            return False
+
+        state = getattr(self.speech_engine, "state", RecognitionState.IDLE)
+        still_busy = state in (
+            RecognitionState.LISTENING,
+            RecognitionState.PROCESSING,
+        ) or getattr(self.speech_engine, "_buffered_reload_session", False)
+
+        if still_busy:
+            self._test_idle_wait_ticks = getattr(self, "_test_idle_wait_ticks", 0) + 1
+            # ~3 minutes at 100ms — generous for cold large-model reload.
+            if self._test_idle_wait_ticks < 1800:
+                return True
+            if not getattr(self, "_test_timeout_cancel_attempted", False):
+                self._test_timeout_cancel_attempted = True
+                return self._on_test_idle_wait_timeout()
+            # Cancel already tried (or unavailable): keep waiting — never
+            # restore live injectors and never mark the test inactive while busy.
+            return True
+
+        return self._finish_test_restore_ui()
+
+    def _on_test_idle_wait_timeout(self) -> bool:
+        """Handle idle-wait timeout without restoring live injectors early."""
+        cancel = getattr(self.speech_engine, "_cancel_reload_recording", None)
+        if callable(cancel):
+            logger.warning(
+                "Test Dictation: timed out waiting for recognition IDLE; "
+                "cancelling buffered reload before restoring callbacks"
+            )
+            self.test_button.set_sensitive(False)
+            self.test_button.set_label("Cancelling…")
+            self.update_recognition_progress("Cancelling")
+            threading.Thread(
+                target=self._cancel_buffered_reload_then_restore,
+                daemon=True,
+                name="vocalinux-test-dictation-cancel",
+            ).start()
+            return False
+
+        logger.error(
+            "Test Dictation: timed out waiting for recognition IDLE with no "
+            "cancel API; keeping test callbacks until IDLE"
+        )
+        self._keep_waiting_after_timeout(
+            "(Timed out waiting for recognition to finish. "
+            "Still waiting so live injectors are not restored early and later "
+            "dictation cannot be hijacked into the test buffer.)"
+        )
+        return True
+
+    def _cancel_buffered_reload_then_restore(self) -> None:
+        """Cancel buffered reload off the GTK thread, then restore on idle."""
+        cancel = getattr(self.speech_engine, "_cancel_reload_recording", None)
+        try:
+            if callable(cancel):
+                cancel()
+        except (AttributeError, OSError, RuntimeError, TypeError):
+            logger.exception(
+                "Test Dictation: failed to cancel buffered reload after idle-wait timeout"
+            )
+            GLib.idle_add(self._on_buffered_cancel_failed)
+            return
+        GLib.idle_add(self._finish_test_after_buffered_cancel)
+
+    def _on_buffered_cancel_failed(self) -> bool:
+        """Resume idle-wait polling if cancel failed — do not end the test early."""
+        self._keep_waiting_after_timeout(
+            "(Timed out waiting for recognition, and cancelling the buffered "
+            "reload failed. Still waiting for IDLE before restoring live callbacks.)"
+        )
+        # _test_timeout_cancel_attempted is already True, so the resumed poll
+        # will not re-enter cancel — it only waits for IDLE.
+        GLib.timeout_add(100, self._wait_for_idle_then_restore_callbacks)
+        return False
+
+    def _finish_test_after_buffered_cancel(self) -> bool:
+        """Restore live callbacks only after cancel has discarded the session."""
+        return self._finish_test_restore_ui()
+
+    def _keep_waiting_after_timeout(self, message: str) -> None:
+        """Keep Test Dictation active with test callbacks until recognition IDLE."""
+        self._test_active = True
+        self.test_button.set_sensitive(False)
+        self.test_button.set_label("Still processing…")
+        self.update_recognition_progress("Processing")
+        if hasattr(self, "test_buffer"):
+            self.test_buffer.set_text(message)
+
+    def _finish_test_restore_ui(self) -> bool:
+        """Reset Test Dictation chrome and restore saved live callbacks."""
+        self._test_active = False
+        self._test_timeout_cancel_attempted = False
+        self.test_button.set_sensitive(True)
+        self.test_button.set_label("Test Dictation")
+        self.update_recognition_progress("Idle")
+        return self._restore_callbacks_and_check_result()
+
+    def _restore_callbacks_and_check_result(self) -> bool:
+        """Restore callbacks and check test result after delay."""
+        # Restore original text callbacks
+        if hasattr(self, "_saved_text_callbacks"):
+            self.speech_engine.set_text_callbacks(self._saved_text_callbacks)
+            del self._saved_text_callbacks
+        # Close the test-capture window rather than reopening history for
+        # everything after the floor: segments captured during the test but
+        # still decoding must keep failing the window check.
+        self.speech_engine.test_capture_ceiling = time.monotonic()
+
+        # Check result after giving time for final callbacks to complete
+        GLib.timeout_add(300, self._check_test_result)
+        return False
+
+    def _check_test_result(self):
+        """Check if any text was captured after all callbacks have run."""
+        final_text = self.test_buffer.get_text(
+            self.test_buffer.get_start_iter(), self.test_buffer.get_end_iter(), False
+        )
+        if not final_text.strip():
+            self.test_buffer.set_text("(No speech detected during test)")
+        return False
+
+    def _show_whisper_install_dialog(self):
+        """Show a dialog with instructions for installing Whisper."""
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.OK,
+            text="Whisper Not Installed",
+        )
+
+        install_text = """Whisper AI is not installed. To use Whisper for speech recognition, you need to install it first.
+
+Installation Options:
+
+1. Using the installation script:
+   ./install.sh --engine=whisper
+
+2. Manual installation in virtual environment:
+   source venv/bin/activate
+   pip install openai-whisper 'torch>=2.13.0'
+
+3. If you have SSL issues, try:
+   pip install openai-whisper 'torch>=2.13.0' --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
+
+Note: Whisper requires significant disk space (~1-3GB) and may take time to download.
+
+For now, the engine has been reverted to VOSK."""
+
+        dialog.format_secondary_text(install_text)
+        dialog.run()
+        dialog.destroy()
+
+        self.engine_combo.set_active_id("Vosk")
+        self._populate_model_options()
+        self._update_engine_specific_ui()
+
+    def _on_download_model_clicked(self, _button: Any) -> None:
+        """Confirm the staged model spec and start its download (#894).
+
+        The pickers only stage a specification; this is the one explicit
+        confirmation that turns it into a transfer. It goes through
+        ``apply_settings`` so the engine claim, the modal progress dialog, and
+        the post-download apply behave exactly like any other confirmed apply.
+        """
+        self.apply_settings()
+
+    def apply_settings(self) -> bool:
+        """Apply the selected settings."""
+        if self._applying_settings:
+            logger.warning("Ignoring apply_settings(); another apply is already in progress")
+            return False
+
+        global _apply_settings_generation
+        _apply_settings_generation += 1
+        settings = self.get_selected_settings()
+        # Same consumption as _auto_apply_settings: an apply snapshots the
+        # deferred text fields, so their pending-edit flags are done.
+        self._advanced_prompt_dirty = False
+        self._language_candidates_dirty = False
+        self._pending_text_edits = None
+        self._pending_text_edit_baseline = None
+        logger.info(f"Applying settings: {settings}")
+
+        engine = settings.get("engine", "vosk")
+        model_name = settings.get("model_size", "small")
+
+        missing_model = _undownloaded_model_info(self.language, engine, model_name)
+
+        if missing_model is not None:
+            if not self.speech_engine.try_begin_download():
+                # Same guard as in _auto_apply_settings: one download at a time.
+                self._show_download_busy_dialog()
+                self._resync_model_ui_from_config()
+                return False
+            download_dialog = _make_download_dialog(
+                self, model_name, missing_model["size_mb"], engine
+            )
+
+            def progress_callback(fraction, speed, status):
+                GLib.idle_add(download_dialog.update_progress, fraction, speed, status)
+
+            def download_and_apply():
+                try:
+                    self.speech_engine.set_download_progress_callback(progress_callback)
+
+                    def check_cancelled():
+                        if download_dialog.cancelled:
+                            self.speech_engine.cancel_download()
+                        return not download_dialog.cancelled
+
+                    cancel_check_id = GLib.timeout_add(100, check_cancelled)
+
+                    try:
+                        applied = self._apply_settings_internal(
+                            settings, raise_errors=True, force_reinit=True
+                        )
+                        if applied:
+                            GLib.idle_add(download_dialog.set_complete, True, "")
+                        else:
+                            GLib.idle_add(self._idle_resync_model_ui_from_config)
+                            GLib.idle_add(
+                                download_dialog.set_complete,
+                                False,
+                                "Could not apply the new settings",
+                            )
+                    finally:
+                        GLib.source_remove(cancel_check_id)
+                        self.speech_engine.set_download_progress_callback(None)
+                        self.speech_engine.end_download()
+
+                except Exception as e:
+                    error_msg = str(e)
+                    # Nothing was saved, so the config still names the previous
+                    # engine and model; put the pickers back on them.
+                    GLib.idle_add(self._idle_resync_model_ui_from_config)
+                    if "cancelled" in error_msg.lower():
+                        GLib.idle_add(download_dialog.set_complete, False, "Download cancelled")
+                    elif engine == "whisper" and "no module named" in error_msg.lower():
+                        GLib.idle_add(download_dialog.set_complete, False, "Whisper not installed")
+                        GLib.idle_add(self._show_whisper_install_dialog)
+                    else:
+                        GLib.idle_add(download_dialog.set_complete, False, error_msg[:100])
+
+            threading.Thread(target=download_and_apply, daemon=True).start()
+            download_dialog.run()
+            download_dialog.destroy()
+
+            self._populate_model_options()
+            self._resync_engine_ui_if_unapplied()
+            # Same repaint as the auto-apply path: a finished download must not
+            # leave the card offering a Download for the model just fetched.
+            self._update_model_info()
+            return True
+
+        return self._apply_settings_internal(settings)
+
+    def _show_download_busy_dialog(self):
+        """Tell the user a model download is already running elsewhere."""
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text="A model download is already running",
+        )
+        dialog.format_secondary_text("Wait for it to finish, then pick the model again.")
+        dialog.run()
+        dialog.destroy()
+
+    def _apply_settings_internal(
+        self,
+        settings: dict,
+        raise_errors: bool = False,
+        force_reinit: bool = False,
+        apply_generation: Optional[int] = None,
+    ) -> bool:
+        """Internal method to apply settings.
+
+        Args:
+            settings: The settings to persist and hand to the engine.
+            raise_errors: Re-raise failures instead of showing an error dialog.
+                The download threads pass True: their own handlers report the
+                failure through the progress dialog, and building a Gtk dialog
+                off the main loop is not safe anyway.
+            force_reinit: Re-initialize the engine even when the selection
+                matches its live state. The download threads pass True: they
+                only run because the model is missing on disk, and a no-op
+                reconfigure would report success for a download that never ran.
+            apply_generation: The apply generation captured when this snapshot
+                was collected. When a newer apply began since, this snapshot is
+                stale and its write is skipped — otherwise lock order, not
+                collection order, would decide which snapshot wins.
+        """
+        try:
+            # Persist only once the engine really runs these settings: this call
+            # downloads missing models, and a config saved up front would keep
+            # pointing at a model that never made it to disk. The lock orders
+            # this snapshot against _persist_pending_text_edits' deferred one —
+            # and the staleness check must precede stop_recognition, or a
+            # superseded apply would still interrupt a live dictation session.
+            with _apply_settings_lock:
+                if apply_generation is not None and _apply_settings_generation != apply_generation:
+                    logger.info(
+                        "Settings apply superseded by a newer one; " "skipping the stale snapshot"
+                    )
+                    return True
+                was_running = self.speech_engine.state != RecognitionState.IDLE
+                if was_running:
+                    self.speech_engine.stop_recognition()
+                    time.sleep(0.5)
+
+                self.speech_engine.reconfigure(force_reinit=force_reinit, **settings)
+                self._save_selected_settings(settings)
+                written_gen = (
+                    apply_generation if apply_generation is not None else _apply_settings_generation
+                )
+                for key in settings:
+                    if key.startswith("whispercpp_"):
+                        _apply_settings_written[key] = written_gen
+
+            logger.info("Settings applied successfully.")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to apply settings: {e}", exc_info=True)
+            if raise_errors:
+                raise
+
+            if "whisper" in str(e).lower() and "no module named" in str(e).lower():
+                self._show_whisper_install_dialog()
+            else:
+                error_dialog = Gtk.MessageDialog(
+                    transient_for=self,
+                    flags=0,
+                    message_type=Gtk.MessageType.ERROR,
+                    buttons=Gtk.ButtonsType.OK,
+                    text="Error Applying Settings",
+                )
+                error_dialog.format_secondary_text(f"Could not apply settings: {e}")
+                error_dialog.run()
+                error_dialog.destroy()
+            return False
+
+    def _populate_gpu_devices(self):
+        """Populate the GPU device dropdown with available Vulkan devices."""
+        self.gpu_device_combo.remove_all()
+        self.gpu_device_combo.append("-1", "Auto (discrete GPU)")
+
+        devices = detect_vulkan_devices()
+        for device in devices:
+            type_label = device["device_type"].capitalize()
+            label = f"[{device['index']}] {device['name']} ({type_label})"
+            self.gpu_device_combo.append(str(device["index"]), label)
+
+        saved_device = self.config_manager.get("advanced", "whispercpp_gpu_device", None)
+        if saved_device is None:
+            self.gpu_device_combo.set_active_id("-1")
+        else:
+            if not self.gpu_device_combo.set_active_id(str(saved_device)):
+                self.gpu_device_combo.set_active_id("-1")
+
+    def _populate_audio_devices(self):
+        """Populate the audio device dropdown with available input devices."""
+        from ..speech_recognition.recognition_manager import get_audio_input_devices
+
+        self.audio_device_combo.remove_all()
+
+        self.audio_device_combo.append("-1", "System Default")
+
+        devices = get_audio_input_devices()
+
+        for device_index, device_name, is_default in devices:
+            label = device_name
+            if is_default:
+                label += " (default)"
+            self.audio_device_combo.append(str(device_index), label)
+
+        saved_device = self.config_manager.get_optional_int("audio", "device_index", None)
+        saved_device_name = self.config_manager.get("audio", "device_name", None)
+
+        if saved_device is None:
+            self.audio_device_combo.set_active_id("-1")
+        else:
+            matched_index = _resolve_audio_device_selection(
+                devices, saved_device, saved_device_name
+            )
+            if matched_index is not None:
+                self.audio_device_combo.set_active_id(str(matched_index))
+                # Migrate legacy configs that stored the UI "(default)" suffix.
+                saved_raw_name = _raw_audio_device_name(saved_device_name)
+                if saved_device_name and saved_raw_name and saved_device_name != saved_raw_name:
+                    self.config_manager.set("audio", "device_name", saved_raw_name)
+                    self.config_manager.set("audio", "device_index", matched_index)
+                    self.config_manager.save_settings()
+            else:
+                logger.warning(
+                    f"Saved audio device {saved_device} "
+                    f"(name: {saved_device_name}) no longer available"
+                )
+                self.audio_device_combo.set_active_id("-1")
+                # Keep combo, config, and engine aligned on System Default.
+                self.config_manager.set("audio", "device_index", None)
+                self.config_manager.set("audio", "device_name", None)
+                self.config_manager.save_settings()
+                if self.speech_engine is not None:
+                    self.speech_engine.set_audio_device(None, None)
+
+        logger.info(f"Found {len(devices)} audio input devices")
+
+    def _on_refresh_audio_devices(self, widget):
+        """Handle refresh button click for audio devices."""
+        self._populate_audio_devices()
+        self.audio_test_status.set_markup("<i>Device list refreshed</i>")
+
+    def _on_audio_device_changed(self, widget):
+        """Handle changes in the selected audio device."""
+        if self._initializing:
+            return
+
+        device_id = self.audio_device_combo.get_active_id()
+        if device_id is None:
+            return
+
+        device_index = int(device_id)
+        device_label = self.audio_device_combo.get_active_text()
+        device_name = _raw_audio_device_name(device_label)
+
+        if device_index == -1:
+            self.config_manager.set("audio", "device_index", None)
+            self.config_manager.set("audio", "device_name", None)
+        else:
+            self.config_manager.set("audio", "device_index", device_index)
+            self.config_manager.set("audio", "device_name", device_name)
+
+        self.config_manager.save_settings()
+
+        if device_index == -1:
+            self.speech_engine.set_audio_device(None, None)
+        else:
+            self.speech_engine.set_audio_device(device_index, device_name)
+
+        logger.info(f"Audio device changed to: [{device_index}] {device_name}")
+        self.audio_test_status.set_markup(f"<i>Selected: {device_label}</i>")
+
+    def _on_test_audio_clicked(self, widget):
+        """Handle test audio button click."""
+        self.test_audio_btn.set_sensitive(False)
+        self.test_audio_btn.set_label("Testing...")
+        self.audio_test_status.set_markup("<i>Recording... speak into your microphone</i>")
+        self.audio_level_bar.set_value(0)
+
+        device_id = self.audio_device_combo.get_active_id()
+        device_index = None if device_id == "-1" else int(device_id)
+
+        def run_test():
+            from ..speech_recognition.recognition_manager import test_audio_input
+
+            result = test_audio_input(device_index=device_index, duration=2.0)
+            GLib.idle_add(self._handle_audio_test_result, result)
+
+        threading.Thread(target=run_test, daemon=True).start()
+
+    def _handle_audio_test_result(self, result: dict):
+        """Handle the result of an audio test."""
+        self.test_audio_btn.set_sensitive(True)
+        self.test_audio_btn.set_label("Test")
+
+        if result.get("success"):
+            max_level = result.get("max_amplitude", 0)
+            has_signal = result.get("has_signal", False)
+            sample_rate = result.get("sample_rate", 16000)
+
+            level_percent = min(100, (max_level / 327.68))
+            self.audio_level_bar.set_value(level_percent)
+
+            # Build sample rate info string
+            if sample_rate == 16000:
+                rate_info = "(16kHz native)"
+            else:
+                rate_info = f"({sample_rate // 1000}kHz → 16kHz auto)"
+
+            if has_signal:
+                self.audio_test_status.set_markup(
+                    f"<span foreground='#26a269'>✓ Audio detected!</span> "
+                    f"Peak: {level_percent:.0f}% {rate_info}"
+                )
+            else:
+                self.audio_test_status.set_markup(
+                    f"<span foreground='#e5a50a'>⚠ Very low audio level</span> "
+                    f"(peak: {level_percent:.1f}%)\n"
+                    "<small>Check if microphone is muted or try a different device</small>"
+                )
+        else:
+            error_msg = result.get("error", "Unknown error")
+            self.audio_test_status.set_markup(
+                f"<span foreground='#c01c28'>✗ Test failed:</span> {error_msg}"
+            )
+
+        return False
+
+    def update_recognition_progress(self, state: str, audio_level: float = 0.0, info: str = ""):
+        """Update the recognition progress feedback UI."""
+        self.recognition_status_label.set_text(state)
+
+        # Remove existing state classes
+        for css_class in [
+            "recognition-idle",
+            "recognition-listening",
+            "recognition-processing",
+            "recognition-error",
+        ]:
+            self.recognition_status_label.get_style_context().remove_class(css_class)
+
+        if state == "Listening":
+            self.recognition_indicator.set_opacity(1.0)
+            self.recognition_status_label.get_style_context().add_class("recognition-listening")
+            self.progress_info_label.set_markup("<span foreground='#26a269'>● Listening...</span>")
+        elif state == "Processing":
+            self.recognition_indicator.set_opacity(1.0)
+            self.recognition_status_label.get_style_context().add_class("recognition-processing")
+            self.progress_info_label.set_markup(
+                "<span foreground='#e5a50a'>● Processing speech...</span>"
+            )
+        elif state == "Idle":
+            self.recognition_indicator.set_opacity(0.3)
+            self.recognition_status_label.get_style_context().add_class("recognition-idle")
+            self.progress_info_label.set_text("")
+        elif state == "Error":
+            self.recognition_indicator.set_opacity(0.3)
+            self.recognition_status_label.get_style_context().add_class("recognition-error")
+            self.progress_info_label.set_markup(
+                f"<span foreground='#c01c28'>✗ Error: {info}</span>"
+            )
+        else:
+            self.recognition_indicator.set_opacity(0.3)
+            if info:
+                self.progress_info_label.set_text(info)
+
+        if audio_level > 0:
+            normalized_level = min(100, max(0, audio_level))
+            self.recognition_audio_level.set_value(normalized_level)
+        elif state == "Idle":
+            self.recognition_audio_level.set_value(0)
+
+    def connect_to_recognition_manager(self):
+        """Connect to speech recognition manager for progress updates."""
+        if hasattr(self, "speech_engine") and self.speech_engine:
+            if not hasattr(self, "_callbacks_registered"):
+                self.speech_engine.state_callbacks.append(self._on_recognition_state_changed)
+                self.speech_engine.register_audio_level_callback(self._on_audio_level_changed)
+                self._callbacks_registered = True
+                self.connect("destroy", self._on_dialog_destroy)
+
+    def _on_dialog_destroy(self, widget):
+        """Clean up callbacks when dialog is destroyed."""
+        self._recording_shortcut = False
+        self._stop_evdev_shortcut_recorder()
+        if hasattr(self, "speech_engine") and self.speech_engine:
+            if self._on_recognition_state_changed in self.speech_engine.state_callbacks:
+                self.speech_engine.state_callbacks.remove(self._on_recognition_state_changed)
+            self.speech_engine.unregister_audio_level_callback(self._on_audio_level_changed)
+
+    def _on_recognition_state_changed(self, state):
+        """Handle recognition state changes."""
+        state_map = {
+            RecognitionState.IDLE: "Idle",
+            RecognitionState.LISTENING: "Listening",
+            RecognitionState.PROCESSING: "Processing",
+            RecognitionState.ERROR: "Error",
+        }
+
+        state_str = state_map.get(state, "Unknown")
+        GLib.idle_add(self.update_recognition_progress, state_str)
+
+    def _on_audio_level_changed(self, level: float):
+        """Handle audio level changes."""
+        GLib.idle_add(self.update_recognition_progress, "Listening", level)

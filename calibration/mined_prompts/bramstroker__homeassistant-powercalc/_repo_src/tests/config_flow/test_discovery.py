@@ -1,0 +1,422 @@
+from homeassistant import config_entries, data_entry_flow
+from homeassistant.const import CONF_DEVICE, CONF_ENTITY_ID, CONF_NAME
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers.selector import SelectSelector
+import pytest
+from pytest_homeassistant_custom_component.common import mock_device_registry
+import voluptuous as vol
+
+from custom_components.powercalc.common import SourceEntity, create_source_entity
+from custom_components.powercalc.config_flow import Step
+from custom_components.powercalc.const import (
+    CONF_AVAILABILITY_ENTITY,
+    CONF_CREATE_ENERGY_SENSOR,
+    CONF_CUSTOM_MODEL_DIRECTORY,
+    CONF_MANUFACTURER,
+    CONF_MODEL,
+    CONF_SENSOR_TYPE,
+    CONF_SUB_PROFILE,
+    DUMMY_ENTITY_ID,
+    SensorType,
+)
+from custom_components.powercalc.device_binding import get_config_entry_ids
+from custom_components.powercalc.discovery import get_power_profile_by_source_entity
+from custom_components.powercalc.power_profile.factory import get_power_profile
+from custom_components.powercalc.power_profile.library import ModelInfo
+from tests.common import (
+    build_device_entry,
+    create_mock_config_entry,
+    get_test_profile_dir,
+    mock_device,
+    mock_device_with_entities,
+    mock_devices,
+    mock_entities_in_registry,
+    requires_child_devices,
+)
+from tests.config_flow.common import (
+    DEFAULT_ENTITY_ID,
+    DEFAULT_UNIQUE_ID,
+    confirm_auto_discovered_model,
+    handle_options_flow_update,
+    initialize_discovery_flow,
+)
+
+
+async def test_discovery_flow(
+    hass: HomeAssistant,
+) -> None:
+    mock_device_with_entities(
+        hass,
+        "light.test",
+        "signify",
+        "LCT010",
+        unique_id=DEFAULT_UNIQUE_ID,
+    )
+
+    source_entity = create_source_entity(DEFAULT_ENTITY_ID, hass)
+    result = await initialize_discovery_flow(hass, source_entity)
+
+    progress = hass.config_entries.flow.async_get(result["flow_id"])
+    assert progress["context"]["title_placeholders"]["name"] == "test - Test Components"
+
+    # Confirm selected manufacturer/model
+    result = await confirm_auto_discovered_model(hass, result)
+
+    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert result["data"] == {
+        CONF_ENTITY_ID: DEFAULT_ENTITY_ID,
+        CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
+        CONF_MANUFACTURER: "signify",
+        CONF_MODEL: "LCT010",
+        CONF_NAME: "test",
+    }
+
+
+async def test_discovery_flow_remarks_are_shown(hass: HomeAssistant) -> None:
+    """Model.json can provide remarks to show in the discovery flow. Check if these are displayed correctly"""
+    source_entity = create_source_entity("media_player.test", hass)
+    power_profile = await get_power_profile(hass, {}, source_entity, ModelInfo("sonos", "one"))
+    result = await initialize_discovery_flow(hass, source_entity, power_profile)
+    assert result["description_placeholders"]["remarks"] is not None
+
+
+async def _setup_ups_discovery_flow(
+    hass: HomeAssistant,
+    use_child_device: bool = False,
+) -> tuple[SourceEntity, data_entry_flow.FlowResult]:
+    """Set up UPS device with translation key entities and initialize discovery flow."""
+    device_entry = mock_device(hass, "ups-device", model="discovery_translation_key", name="UPS")
+    sensor_device_id = device_entry.id
+    if use_child_device:
+        child = dr.async_get(hass).async_get_or_create_child(
+            config_entry_id=next(iter(get_config_entry_ids(device_entry))),
+            parent_device_id=device_entry.id,
+            identifiers={("test", "ups-output")},
+        )
+        sensor_device_id = child.id
+    mock_entities_in_registry(
+        hass,
+        {
+            "sensor.ups_output": {"unique_id": "ups_output", "device_id": device_entry.id, "platform": "test"},
+            "sensor.ups_nominal_power": {
+                "unique_id": "ups_nominal_power",
+                "device_id": sensor_device_id,
+                "platform": "test",
+                "translation_key": "ups_power_nominal",
+            },
+        },
+    )
+
+    source_entity = create_source_entity("sensor.ups_output", hass)
+    power_profile = await get_power_profile(
+        hass,
+        {
+            CONF_CUSTOM_MODEL_DIRECTORY: get_test_profile_dir("discovery_translation_key"),
+            CONF_MANUFACTURER: "test",
+            CONF_MODEL: "discovery_translation_key",
+        },
+        source_entity,
+        process_variables=False,
+    )
+
+    result = await initialize_discovery_flow(hass, source_entity, power_profile)
+    return source_entity, result
+
+
+async def test_discovery_flow_remarks_are_hidden_when_translation_key_entities_resolve(hass: HomeAssistant) -> None:
+    _, result = await _setup_ups_discovery_flow(hass)
+
+    assert result["description_placeholders"]["remarks"] is None
+
+
+async def test_discovery_flow_uses_device_name_as_source_placeholder(hass: HomeAssistant) -> None:
+    device_entry = mock_device(hass, "youless-device", model="discovery_type_device", name="FooBar")
+    source_entity = SourceEntity(
+        object_id=device_entry.name,
+        name=device_entry.name,
+        entity_id=DUMMY_ENTITY_ID,
+        domain="sensor",
+        device_entry=device_entry,
+    )
+    power_profile = await get_power_profile(hass, {}, source_entity, ModelInfo("test", "discovery_type_device"))
+
+    result = await initialize_discovery_flow(hass, source_entity, power_profile)
+
+    assert result["description_placeholders"]["source"].endswith(": FooBar")
+
+
+async def test_discovery_flow_remarks_are_shown_when_translation_key_entity_missing(hass: HomeAssistant) -> None:
+    device_entry = mock_device(hass, "ups-device", model="discovery_translation_key", name="UPS")
+    mock_entities_in_registry(
+        hass,
+        {
+            "sensor.ups_output": {"unique_id": "ups_output", "device_id": device_entry.id, "platform": "test"},
+        },
+    )
+
+    source_entity = create_source_entity("sensor.ups_output", hass)
+    power_profile = await get_power_profile(
+        hass,
+        {
+            CONF_CUSTOM_MODEL_DIRECTORY: get_test_profile_dir("discovery_translation_key"),
+            CONF_MANUFACTURER: "test",
+            CONF_MODEL: "discovery_translation_key",
+        },
+        source_entity,
+        process_variables=False,
+    )
+
+    result = await initialize_discovery_flow(hass, source_entity, power_profile)
+
+    assert result["description_placeholders"]["remarks"] == "\n\nEnable the Nominal Power entity first."
+
+
+@pytest.mark.parametrize("matching_entities", [0, 1, 2])
+async def test_discovery_flow_resolves_dock_entities(
+    hass: HomeAssistant,
+    matching_entities: int,
+) -> None:
+    mock_devices(
+        hass,
+        {
+            "robot": {"identifiers": {("roborock", "robot")}, "model": "vacuum_dock"},
+            "dock": {"identifiers": {("roborock", "robot_dock")}},
+        },
+    )
+    entities = {"vacuum.robot": {"platform": "roborock", "device_id": "robot"}}
+    for index in range(matching_entities):
+        entities[f"switch.dock_drying_{index}"] = {
+            "platform": "roborock",
+            "device_id": "dock",
+            "translation_key": "mop_drying",
+        }
+    mock_entities_in_registry(hass, entities)
+    source = create_source_entity("vacuum.robot", hass)
+    profile = await get_power_profile(
+        hass,
+        {CONF_CUSTOM_MODEL_DIRECTORY: get_test_profile_dir("vacuum_dock")},
+        source,
+        ModelInfo("test", "vacuum_dock"),
+        process_variables=False,
+    )
+
+    result = await initialize_discovery_flow(hass, source, profile)
+
+    expected_remarks = None if matching_entities == 1 else "\n\nEnable the dock drying switch."
+    assert result["description_placeholders"]["remarks"] == expected_remarks
+    if matching_entities == 1:
+        result = await confirm_auto_discovered_model(hass, result)
+        assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+
+
+@pytest.mark.parametrize("use_child_device", [False, pytest.param(True, marks=requires_child_devices)])
+async def test_discovery_flow_auto_resolves_availability_entity_from_translation_key(
+    hass: HomeAssistant,
+    use_child_device: bool,
+) -> None:
+    _, result = await _setup_ups_discovery_flow(hass, use_child_device)
+    result = await confirm_auto_discovered_model(hass, result)
+
+    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_AVAILABILITY_ENTITY] == "sensor.ups_nominal_power"
+
+
+async def test_discovery_flow_with_subprofile_selection(
+    hass: HomeAssistant,
+) -> None:
+    mock_device_with_entities(
+        hass,
+        "light.test",
+        "lifx",
+        "LZHC2M4INUC07",
+        unique_id=DEFAULT_UNIQUE_ID,
+    )
+
+    source_entity = create_source_entity(DEFAULT_ENTITY_ID, hass)
+    power_profile = await get_power_profile_by_source_entity(hass, source_entity)
+
+    result = await initialize_discovery_flow(hass, source_entity, power_profile)
+
+    result = await confirm_auto_discovered_model(hass, result)
+
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == Step.SUB_PROFILE
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_SUB_PROFILE: "length_6"},
+    )
+
+    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert result["data"] == {
+        CONF_ENTITY_ID: DEFAULT_ENTITY_ID,
+        CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
+        CONF_MANUFACTURER: "lifx",
+        CONF_MODEL: "LZHC2M4INUC07/length_6",
+        CONF_NAME: "test",
+    }
+
+
+async def test_discovery_flow_multi_profiles(
+    hass: HomeAssistant,
+) -> None:
+    """Test that discovery provides the user with a choice when multiple profiles are available"""
+    mock_device_with_entities(
+        hass,
+        "light.test",
+        "signify",
+        "LCT010",
+        unique_id=DEFAULT_UNIQUE_ID,
+    )
+
+    source_entity = create_source_entity(DEFAULT_ENTITY_ID, hass)
+    power_profiles = [
+        await get_power_profile(hass, {}, source_entity, ModelInfo("signify", "LCT010")),
+        await get_power_profile(hass, {}, source_entity, ModelInfo("signify", "LCT012")),
+    ]
+    result = await initialize_discovery_flow(hass, source_entity, power_profiles)
+
+    assert result["step_id"] == Step.LIBRARY_MULTI_PROFILE
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+
+    data_schema: vol.Schema = result["data_schema"]
+    select: SelectSelector = data_schema.schema[CONF_MODEL]
+    options = select.config["options"]
+    assert len(options) == 2
+    option_labels = [option["label"] for option in options]
+    assert option_labels == ["LCT010", "LCT012"]
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_MODEL: options[1]["value"]},
+    )
+
+    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert result["data"] == {
+        CONF_ENTITY_ID: DEFAULT_ENTITY_ID,
+        CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
+        CONF_MANUFACTURER: "signify",
+        CONF_MODEL: "LCT012",
+        CONF_NAME: "test",
+    }
+
+
+async def test_autodiscovered_option_flow(hass: HomeAssistant) -> None:
+    """
+    Test that we can open an option flow for an auto discovered config entry
+    """
+    entry = await create_mock_config_entry(
+        hass,
+        {
+            CONF_ENTITY_ID: "light.test",
+            CONF_NAME: "Test",
+            CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
+            CONF_MANUFACTURER: "signify",
+            CONF_MODEL: "LCT010",
+        },
+        source=config_entries.SOURCE_INTEGRATION_DISCOVERY,
+    )
+
+    await handle_options_flow_update(hass, entry, Step.BASIC_OPTIONS, {CONF_CREATE_ENERGY_SENSOR: False})
+
+    assert not entry.data[CONF_CREATE_ENERGY_SENSOR]
+
+
+async def test_discovery_by_device(hass: HomeAssistant) -> None:
+    device_entry = mock_device(hass, "youless-device", model="discovery_type_device", name="FooBar")
+    mock_entities_in_registry(
+        hass,
+        {
+            "switch.test": {"device_id": device_entry.id, "platform": "youless"},
+        },
+    )
+    source_entity = SourceEntity(
+        object_id=device_entry.name,
+        name=device_entry.name,
+        entity_id=DUMMY_ENTITY_ID,
+        domain="sensor",
+        device_entry=device_entry,
+    )
+    power_profiles = [
+        await get_power_profile(hass, {}, source_entity, ModelInfo("test", "discovery_type_device")),
+    ]
+    result = await initialize_discovery_flow(hass, source_entity, power_profiles)
+
+    result = await confirm_auto_discovered_model(hass, result)
+
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == Step.AVAILABILITY_ENTITY
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_AVAILABILITY_ENTITY: "switch.test"},
+    )
+
+    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert result["data"] == {
+        CONF_AVAILABILITY_ENTITY: "switch.test",
+        CONF_ENTITY_ID: DUMMY_ENTITY_ID,
+        CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
+        CONF_MANUFACTURER: "test",
+        CONF_MODEL: "discovery_type_device",
+        CONF_NAME: "FooBar",
+        CONF_DEVICE: "youless-device",
+    }
+
+    assert hass.states.get("sensor.foobar_power")
+
+
+async def test_discovery_by_config_entry(hass: HomeAssistant) -> None:
+    devices = {
+        f"device-{index}": build_device_entry(
+            config_entry_id="source-entry",
+            name=f"Device {index}",
+            id=f"device-{index}",
+            manufacturer="test",
+            model="discovery_type_config_entry",
+        )
+        for index in range(6)
+    }
+    mock_device_registry(hass, devices)
+    source_entity = SourceEntity(
+        object_id="source-entry",
+        name="Shared integration",
+        entity_id=DUMMY_ENTITY_ID,
+        domain="sensor",
+        device_entry=devices["device-0"],
+        config_entry_id="source-entry",
+    )
+    power_profile = await get_power_profile(
+        hass,
+        {},
+        source_entity,
+        ModelInfo("test", "discovery_type_config_entry"),
+    )
+
+    result = await initialize_discovery_flow(hass, source_entity, power_profile)
+    assert result["description_placeholders"]["source"] == "Shared integration"
+
+    result = await confirm_auto_discovered_model(hass, result)
+
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == Step.SELECT_DEVICE
+    device_selector = result["data_schema"].schema[CONF_DEVICE]
+    assert [option["value"] for option in device_selector.config["options"]] == list(devices)
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_DEVICE: "device-4"},
+    )
+
+    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert result["data"] == {
+        CONF_DEVICE: "device-4",
+        CONF_ENTITY_ID: DUMMY_ENTITY_ID,
+        CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
+        CONF_MANUFACTURER: "test",
+        CONF_MODEL: "discovery_type_config_entry",
+        CONF_NAME: "Shared integration",
+    }
+    assert hass.states.get("sensor.shared_integration_power")
+    registry_entry = er.async_get(hass).async_get("sensor.shared_integration_power")
+    assert registry_entry
+    assert registry_entry.device_id == "device-4"

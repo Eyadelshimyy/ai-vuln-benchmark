@@ -1,0 +1,1364 @@
+"""Cursor-result display preferences, pure projection, and settings popover."""
+
+from __future__ import annotations
+
+from html import escape
+import json
+import math
+from typing import Iterable
+import weakref
+
+from PyQt5 import sip
+from PyQt5.QtCore import QRectF, QSettings, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QPainter, QPen
+from PyQt5.QtWidgets import (
+    QCheckBox,
+    QFrame,
+    QLabel,
+    QVBoxLayout,
+)
+
+from ...ui_kit.dialog_geometry import fit_popover
+
+from ..pinned_cursor_facts import _finite, _frequency_sample_channel_kind
+from ..cursor_display_model import (
+    CursorDisplayBlock,
+    CursorDisplayBranch,
+    CursorDisplayChannel,
+    CursorDisplayOptions,
+    CursorDisplayRow,
+    CursorTableRow,
+    CursorPresentation,
+    FrequencyCursorChannel,
+    FrfCursorSample,
+    FrfLiveCursorFacts,
+    _OPTION_NAMES,
+    enabled_value_fields,
+)
+from ..plot_helpers import cursor_result_source_count
+
+_POPOVER_BG = QColor(255, 255, 255, 248)
+_POPOVER_BORDER = QColor("#d8e0eb")
+_POPOVER_RADIUS = 10.0
+_DOT_MARKER = "●"
+
+
+CURSOR_DISPLAY_SETTINGS_KEY = "charts/time_cursor/display_options_v1"
+
+
+class CursorDisplaySettingsStore:
+    """Persist one immutable option snapshot under the versioned JSON key."""
+
+    def __init__(self, settings=None):
+        self._settings = settings if settings is not None else QSettings()
+
+    def load(self) -> CursorDisplayOptions:
+        raw = self._settings.value(CURSOR_DISPLAY_SETTINGS_KEY, None)
+        if raw is None:
+            return CursorDisplayOptions()
+        try:
+            payload = json.loads(str(raw))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return CursorDisplayOptions()
+        if not isinstance(payload, dict):
+            return CursorDisplayOptions()
+        return CursorDisplayOptions(**{
+            name: payload[name] if type(payload.get(name)) is bool else True
+            for name in _OPTION_NAMES
+        })
+
+    def save(self, options: CursorDisplayOptions) -> None:
+        if not isinstance(options, CursorDisplayOptions):
+            raise TypeError("options must be CursorDisplayOptions")
+        payload = {name: getattr(options, name) for name in _OPTION_NAMES}
+        self._settings.setValue(
+            CURSOR_DISPLAY_SETTINGS_KEY,
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        )
+        self._settings.sync()
+
+
+def _formatted(value, unit="") -> str:
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value):.4g}{unit}"
+    except (TypeError, ValueError):
+        return f"{value}{unit}"
+
+
+def _face_name(channel) -> str:
+    return str(channel.channel_label or channel.qualified_label or "").strip()
+
+
+_MINI_PRIORITY = ("Δ", "Avg", "Max", "Min")
+_BRANCH_ATTR = {
+    "min_value": "min_value",
+    "max_value": "max_value",
+    "avg_value": "avg_value",
+    "delta": "delta_value",
+}
+
+
+def _identity_row(name):
+    return CursorDisplayRow(name, "")
+
+
+def _priority_stat(stats):
+    return next(
+        (row for wanted in _MINI_PRIORITY for row in stats if row.label == wanted),
+        None,
+    )
+
+
+def _time_rows(channel, options, cursor_mode, mini):
+    name = _face_name(channel)
+    if cursor_mode == "single":
+        value = _formatted(channel.current_value, channel.unit_suffix)
+        tooltip = (CursorDisplayRow(name, value),)
+        if mini:
+            return (CursorDisplayRow(_DOT_MARKER, value),), tooltip
+        return (CursorDisplayRow(name, value),), tooltip
+    stats = []
+    for label, attr in enabled_value_fields(options):
+        row = CursorDisplayRow(label, _formatted(getattr(channel, attr), channel.unit_suffix))
+        stats.append(row)
+    tooltip = tuple(stats) if stats else (_identity_row(name),)
+    if mini:
+        priority = _priority_stat(stats)
+        if priority is None:
+            return (_identity_row(name),), tooltip
+        return (CursorDisplayRow(name, priority.value, role=priority.label),), tooltip
+    return tuple(stats) if stats else (_identity_row(name),), tooltip
+
+
+def _custom_rows(channel, options, cursor_mode, mini):
+    visible = []
+    tooltip = []
+    enabled = enabled_value_fields(options)
+    priority = next(
+        (item for wanted in _MINI_PRIORITY for item in enabled if item[0] == wanted),
+        None,
+    )
+    if cursor_mode == "single":
+        for branch in channel.branches:
+            row = CursorDisplayRow(
+                branch.label, _formatted(branch.current_value, channel.unit_suffix)
+            )
+            visible.append(row)
+            tooltip.append(row)
+        if visible:
+            face = _DOT_MARKER if mini else _face_name(channel)
+            visible.insert(0, CursorDisplayRow(face, ""))
+        elif channel.diagnostic:
+            row = CursorDisplayRow("状态", str(channel.diagnostic))
+            visible.append(row)
+            tooltip.append(row)
+        return tuple(visible), tuple(tooltip)
+    for branch in channel.branches:
+        visible.append(CursorDisplayRow(branch.label, "", role="branch"))
+        tooltip.append(CursorDisplayRow(branch.label, "", role="branch"))
+        for label, attr in enabled:
+            branch_attr = _BRANCH_ATTR.get(attr, attr)
+            row = CursorDisplayRow(
+                label, _formatted(getattr(branch, branch_attr), channel.unit_suffix)
+            )
+            tooltip.append(row)
+            if not mini:
+                visible.append(row)
+        if mini and priority is not None:
+            label, attr = priority
+            branch_attr = _BRANCH_ATTR.get(attr, attr)
+            visible.append(CursorDisplayRow(
+                label, _formatted(getattr(branch, branch_attr), channel.unit_suffix)
+            ))
+    if not visible and channel.diagnostic:
+        row = CursorDisplayRow("状态", str(channel.diagnostic))
+        visible.append(row)
+        tooltip.append(row)
+    return tuple(visible), tuple(tooltip)
+
+
+def _channel_face_name(block: CursorDisplayBlock) -> str:
+    return str(block.channel_label or block.qualified_label or "").strip()
+
+
+def visible_block_label(block: CursorDisplayBlock, omit_source_prefix: bool) -> str:
+    """Visible identity: channel-only when D1 omits the source prefix."""
+    if omit_source_prefix:
+        return _channel_face_name(block)
+    return str(block.qualified_label or "").strip()
+
+
+def _metric_cells(rows, color: str) -> str:
+    parts = []
+    for row in rows:
+        if not row.value:
+            parts.append(
+                f'<td style="color:#94a3b8;padding-right:10px;">{escape(row.label)}</td>'
+            )
+            continue
+        parts.append(
+            f'<td style="color:#94a3b8;padding-right:4px;">{escape(row.label)}</td>'
+            f'<td style="color:{color};font-family:Consolas,monospace;padding-right:10px;">'
+            f'{escape(row.value)}</td>'
+        )
+    return "".join(parts)
+
+
+def _branch_groups(rows):
+    groups = []
+    label = None
+    metrics = []
+    pending = False
+    for row in rows:
+        if not row.value:
+            if pending:
+                groups.append((label, tuple(metrics)))
+            label = row.label
+            metrics = []
+            pending = True
+            continue
+        metrics.append(row)
+        pending = True
+    if pending:
+        groups.append((label, tuple(metrics)))
+    return groups
+
+
+def _dot_html(color: str) -> str:
+    return f'<span style="color:{color};">{_DOT_MARKER}</span>'
+
+
+def _compact_block_html(
+    block: CursorDisplayBlock,
+    *,
+    color: str,
+    constrained: bool,
+    header_override: str | None,
+    mini: bool,
+    cursor_mode: str,
+    x_mode: str,
+) -> str:
+    out = ['<table cellspacing="0" cellpadding="0" style="font-size:11px;">']
+    face_name = header_override or _channel_face_name(block)
+    rows = block.visible_rows
+    if cursor_mode == "single" and x_mode in {"time", "frequency"}:
+        row = rows[0] if rows else CursorDisplayRow(
+            _DOT_MARKER if mini else face_name, "—"
+        )
+        if mini:
+            out.append(
+                '<tr>'
+                f'<td style="padding-right:5px;line-height:1.15;">{_dot_html(color)}</td>'
+                f'<td style="color:{color};line-height:1.15;'
+                'font-family:Consolas,monospace;font-weight:650;">'
+                f'{escape(row.value)}</td>'
+                '</tr>'
+            )
+        else:
+            out.append(
+                '<tr>'
+                f'<td style="color:{color};font-weight:600;padding-right:8px;">'
+                f'{escape(row.label)}</td>'
+                f'<td style="color:{color};font-family:Consolas,monospace;">'
+                f'{escape(row.value)}</td>'
+                '</tr>'
+            )
+        out.append('</table>')
+        return "".join(out)
+    if cursor_mode == "dual" and x_mode in {"time", "frequency"} and mini:
+        row = rows[0] if rows else CursorDisplayRow(face_name, "—")
+        metric_cell = ""
+        if row.value:
+            if row.role == "Δ":
+                prefix = "△"
+            elif row.role in {"Min", "Max", "Avg"}:
+                prefix = escape(row.role)
+            else:
+                prefix = "△"
+            metric_cell = (
+                f'<td style="color:{color};font-family:Consolas,monospace;">'
+                f'{prefix}&nbsp;{escape(row.value)}</td>'
+            )
+        out.append(
+            '<tr>'
+            f'<td style="padding-right:4px;">{_dot_html(color)}</td>'
+            f'{metric_cell}'
+            '</tr>'
+        )
+        out.append('</table>')
+        return "".join(out)
+    metrics = list(rows)
+    identity_label = None
+    if (
+        cursor_mode == "single"
+        and x_mode == "custom"
+        and metrics
+        and not metrics[0].value
+        and metrics[0].label
+    ):
+        identity_label = metrics[0].label
+        metrics = metrics[1:]
+    if mini:
+        face = f'<td style="padding-right:5px;">{_dot_html(color)}</td>'
+    else:
+        name = header_override or identity_label or face_name
+        face = (
+            f'<td style="color:{color};font-weight:600;padding-right:8px;">'
+            f'{escape(name)}</td>'
+        )
+    wrap_branches = (
+        constrained and mini and cursor_mode == "dual" and x_mode == "custom"
+    )
+    groups = _branch_groups(metrics)
+    if wrap_branches:
+        out.append(f'<tr>{face}</tr>')
+        for label, group_rows in groups:
+            cells = ""
+            if label:
+                cells += (
+                    f'<td style="color:#94a3b8;padding-right:4px;">'
+                    f'{escape(label)}</td>'
+                )
+            cells += _metric_cells(group_rows, color)
+            out.append(f'<tr>{cells}</tr>')
+    else:
+        cells = face
+        for label, group_rows in groups:
+            if label:
+                cells += (
+                    f'<td style="color:#94a3b8;padding-right:4px;">'
+                    f'{escape(label)}</td>'
+                )
+            cells += _metric_cells(group_rows, color)
+        out.append(f'<tr>{cells}</tr>')
+    out.append('</table>')
+    return "".join(out)
+
+
+def _block_html(
+    block: CursorDisplayBlock,
+    *,
+    constrained: bool,
+    header_override: str | None = None,
+    mini: bool = False,
+    cursor_mode: str = "dual",
+    x_mode: str = "time",
+    omit_visible_source_prefix: bool = False,
+) -> str:
+    color = escape(block.color or "#111827", quote=True)
+    compact = bool(mini) or cursor_mode == "single"
+    if compact:
+        return _compact_block_html(
+            block,
+            color=color,
+            constrained=constrained,
+            header_override=header_override,
+            mini=bool(mini),
+            cursor_mode=cursor_mode,
+            x_mode=x_mode,
+        )
+    default_header = visible_block_label(block, omit_visible_source_prefix)
+    header = escape(header_override or default_header)
+    out = [
+        '<table cellspacing="0" cellpadding="0" style="font-size:11px;">',
+        f'<tr><td colspan="8" style="color:{color};font-weight:600;padding:2px 0;">{header}</td></tr>',
+    ]
+    if constrained:
+        pending = []
+
+        def append_metric_pair(rows):
+            values = " · ".join(
+                f'<span style="color:#94a3b8;">{escape(row.label)}</span> '
+                f'<span style="color:{color};font-family:Consolas,monospace;">'
+                f'{escape(row.value)}</span>'
+                for row in rows
+            )
+            out.append(
+                '<tr><td colspan="4" style="padding-right:4px;">'
+                f'{values}</td></tr>'
+            )
+
+        for row in block.visible_rows:
+            if not row.value:
+                if pending:
+                    append_metric_pair(pending)
+                    pending = []
+                out.append(
+                    '<tr>'
+                    f'<td colspan="4" style="color:#94a3b8;">{escape(row.label)}</td>'
+                    '</tr>'
+                )
+                continue
+            pending.append(row)
+            if len(pending) == 2:
+                append_metric_pair(pending)
+                pending = []
+        if pending:
+            append_metric_pair(pending)
+    else:
+        out.append('<tr>')
+        first_cell = True
+        for row in block.visible_rows:
+            if row.role == "branch":
+                if not first_cell:
+                    out.append('</tr><tr>')
+                first_cell = False
+                out.append(
+                    f'<td colspan="2" style="color:#94a3b8;padding-right:10px;">'
+                    f'{escape(row.label)}</td>'
+                )
+                continue
+            first_cell = False
+            if not row.value:
+                out.append(
+                    f'<td colspan="2" style="color:#94a3b8;padding-right:10px;">'
+                    f'{escape(row.label)}</td>'
+                )
+                continue
+            out.append(
+                f'<td style="color:#94a3b8;padding-right:4px;">{escape(row.label)}</td>'
+                f'<td style="color:{color};font-family:Consolas,monospace;padding-right:10px;">'
+                f'{escape(row.value)}</td>'
+            )
+        out.append('</tr>')
+    out.append('</table>')
+    return "".join(out)
+
+
+_VALUE_FONT_STYLE = "font-family:'SF Mono',Menlo,Consolas,monospace;"
+_TABLE_FALLBACK_COLOR = "#111827"
+_TABLE_SECONDARY_COLOR = "#94a3b8"
+
+
+def _shared_value_cell(width, value, *, color, bold=False, top_pad="0"):
+    weight = "font-weight:700;" if bold else ""
+    return (
+        f'<td width="{int(width)}" align="right" '
+        f'style="padding-top:{top_pad};color:{color};{_VALUE_FONT_STYLE}{weight}">'
+        f'{escape(value)}</td>'
+    )
+
+
+def _shared_name_span(color, name, unit_html):
+    unit = ""
+    if unit_html:
+        unit = (f'&nbsp;<span style="color:{color};'
+                f'font-weight:400;">{unit_html}</span>')
+    return (
+        f'<span style="color:{color};">{_DOT_MARKER}</span>&nbsp;'
+        f'<span style="color:{color};font-weight:600;">'
+        f'{name}{unit}</span>'
+    )
+
+
+def _render_shared_table(projection, plan, shown_blocks, header_overrides, header_lines):
+    """Render every structured mode in one grid, with whole-channel grouping.
+
+    Layout supplies plain name lines and measured cell widths. This boundary
+    alone escapes those lines; explicit line breaks are controlled markup.
+    Branches and diagnostics remain inside the same grid as normal values.
+    """
+    if not shown_blocks:
+        return ""
+    labels = projection.metric_labels
+    k = len(labels)
+    horizontal = plan.kind == "horizontal"
+    compact = plan.kind == "compact"
+    branch_width = getattr(plan, "branch_column_width", 0.0)
+    has_branch = any(
+        row.branch_label for block in projection.blocks for row in block.table_rows
+    )
+    branch_columns = int(has_branch)
+    slots = 2 * max(1, plan.pairs_per_row) if compact else max(1, k)
+    columns = slots + branch_columns + int(horizontal)
+    rows = []
+
+    def branch_cell(label, top_pad="0", color=_TABLE_SECONDARY_COLOR):
+        return (f'<td width="{int(branch_width)}" '
+                f'style="padding-top:{top_pad};color:{color};">'
+                f'{escape(label) or "&nbsp;"}</td>')
+
+    if k and not compact and plan.kind != "identity":
+        cells = []
+        if horizontal:
+            cells.append(f'<td width="{int(plan.signal_column_width)}" '
+                         f'style="color:{_TABLE_SECONDARY_COLOR};">&nbsp;</td>')
+        if has_branch:
+            cells.append(branch_cell("方向"))
+        cells.extend(
+            f'<td width="{int(plan.column_width)}" align="right" '
+            f'style="color:{_TABLE_SECONDARY_COLOR};">{escape(label)}</td>'
+            for label in labels
+        )
+        rows.append('<tr>' + ''.join(cells) + '</tr>')
+
+    for index, block in enumerate(shown_blocks):
+        color = escape(block.color or _TABLE_FALLBACK_COLOR, quote=True)
+        if projection.mini and not projection.retain_mini_labels:
+            name = ""
+        elif header_lines is not None and index < len(header_lines):
+            name = '<br>'.join(escape(line) for line in header_lines[index])
+        elif header_overrides is not None and index < len(header_overrides):
+            name = escape(header_overrides[index])
+        else:
+            name = escape(visible_block_label(block, projection.omit_visible_source_prefix))
+        identity = _shared_name_span(color, name, escape(str(block.unit_text or "").strip()))
+        block_rows = block.table_rows or (CursorTableRow(metric_texts=block.metric_texts),)
+        top_pad = '7px' if index else '3px'
+        if not horizontal:
+            rows.append(f'<tr><td colspan="{columns}" style="padding-top:{top_pad};">'
+                        f'{identity}</td></tr>')
+        first = True
+        for row in block_rows:
+            cell_pad = top_pad if horizontal and first else "0"
+            leading = ''
+            if horizontal:
+                leading = (f'<td width="{int(plan.signal_column_width)}" '
+                           f'style="padding-top:{cell_pad};">'
+                           f'{identity if first else "&nbsp;"}</td>')
+            if has_branch:
+                leading += branch_cell(row.branch_label, cell_pad, color=color)
+            if row.diagnostic:
+                rows.append('<tr>' + leading +
+                            f'<td colspan="{slots}" style="padding-top:{cell_pad};color:{color};">'
+                            f'{escape(row.diagnostic)}</td></tr>')
+            elif not k:
+                # Identity-only settings still preserve real branch labels.
+                if horizontal or row.branch_label:
+                    rows.append('<tr>' + leading + f'<td colspan="{slots}">&nbsp;</td></tr>')
+            elif compact:
+                values = row.metric_texts + ('—',) * max(0, k - len(row.metric_texts))
+                for offset in range(0, k, max(1, plan.pairs_per_row)):
+                    cells = leading if offset == 0 else (branch_cell('') if has_branch else '')
+                    items = list(zip(labels, values))[offset:offset + max(1, plan.pairs_per_row)]
+                    for label, value in items:
+                        cells += (f'<td width="{int(plan.label_column_width)}" '
+                                  f'style="color:{_TABLE_SECONDARY_COLOR};">{escape(label)}</td>')
+                        cells += _shared_value_cell(plan.value_column_width, value, color=color, bold=label == 'Δ')
+                    missing = slots - 2 * len(items)
+                    if missing:
+                        cells += f'<td colspan="{missing}">&nbsp;</td>'
+                    rows.append('<tr>' + cells + '</tr>')
+            else:
+                values = row.metric_texts + ('—',) * max(0, k - len(row.metric_texts))
+                cells = ''.join(_shared_value_cell(plan.column_width, value, color=color,
+                                                 bold=label == 'Δ', top_pad=cell_pad)
+                                for label, value in zip(labels, values))
+                rows.append('<tr>' + leading + cells + '</tr>')
+            first = False
+    return ('<table cellspacing="0" cellpadding="0" style="font-size:11px;">'
+            + ''.join(rows) + '</table>')
+
+
+def render_cursor_presentation(
+    projection: CursorPresentation,
+    *,
+    layout_category: str | None = None,
+    visible_count: int | None = None,
+    header_overrides: tuple[str, ...] | None = None,
+    layout_plan=None,
+    header_lines: tuple[tuple[str, ...], ...] | None = None,
+) -> str:
+    category = layout_category or projection.layout_category
+    constrained = category == "constrained"
+    count = len(projection.blocks) if visible_count is None else max(0, visible_count)
+    shown = projection.blocks[:count]
+    use_shared_table = layout_plan is not None
+    if use_shared_table:
+        parts = [_render_shared_table(projection, layout_plan, shown,
+                                      header_overrides, header_lines)]
+        omitted = len(projection.blocks) - len(shown)
+        if omitted:
+            parts.append(
+                '<div style="color:#64748b;padding-top:4px;">'
+                f'{_omitted_summary(projection, omitted)}</div>'
+            )
+        return "".join(parts)
+    gap = "4px" if constrained else "6px"
+    parts = [f'<div style="margin:0;">']
+    for index, block in enumerate(shown):
+        if index:
+            parts.append(f'<div style="height:{gap};"></div>')
+        header = (
+            header_overrides[index]
+            if header_overrides is not None and index < len(header_overrides)
+            else None
+        )
+        parts.append(_block_html(
+            block,
+            constrained=constrained,
+            header_override=header,
+            mini=projection.mini,
+            cursor_mode=projection.cursor_mode,
+            x_mode=projection.x_mode,
+            omit_visible_source_prefix=projection.omit_visible_source_prefix,
+        ))
+    omitted = len(projection.blocks) - len(shown)
+    if omitted:
+        parts.append(
+            '<div style="color:#64748b;padding-top:4px;">'
+            f'{_omitted_summary(projection, omitted)}</div>'
+        )
+    parts.append('</div>')
+    return "".join(parts)
+
+
+def _omitted_summary(projection: CursorPresentation, omitted: int) -> str:
+    """Whole-block overflow line. The noun is a display property, not a parse."""
+    noun = str(getattr(projection, "overflow_noun", "") or "channels")
+    if noun == "channels":
+        return f"+{omitted} channels"
+    return f"+{omitted} {noun}"
+
+
+def _tooltip(blocks: Iterable[CursorDisplayBlock]) -> str:
+    lines = []
+    for block in blocks:
+        lines.append(block.qualified_label)
+        branch = ""
+        for row in block.tooltip_rows:
+            if row.role == "branch" or (not row.value and row.label not in {_DOT_MARKER}):
+                branch = row.label
+                lines.append(branch)
+                continue
+            prefix = f"{branch} " if branch else ""
+            lines.append(f"{prefix}{row.label}={row.value}")
+        if block.diagnostic and not any(
+            row.value == block.diagnostic for row in block.tooltip_rows
+        ):
+            lines.append(block.diagnostic)
+    return "\n".join(lines)
+
+
+def build_cursor_presentation(
+    channels: Iterable[CursorDisplayChannel],
+    options: CursorDisplayOptions,
+    *,
+    cursor_mode: str,
+    x_mode: str,
+    mini: bool,
+    layout_category: str = "natural",
+) -> CursorPresentation:
+    """Build a deterministic, calculation-free cursor-result projection."""
+    if cursor_mode not in {"single", "dual"}:
+        raise ValueError("cursor_mode must be single or dual")
+    if x_mode not in {"time", "custom"}:
+        raise ValueError("x_mode must be time or custom")
+    channel_list = tuple(channels)
+    omit_prefix = cursor_result_source_count(channel_list) <= 1
+    enabled = enabled_value_fields(options)
+    displayed_fields = enabled
+    if cursor_mode == "single":
+        displayed_fields = (("Value", "current_value"),)
+    elif mini:
+        displayed_fields = tuple(
+            item for wanted in _MINI_PRIORITY for item in enabled if item[0] == wanted
+        )[:1]
+    metric_labels = tuple(label for label, _attr in displayed_fields)
+    blocks = []
+    for channel in channel_list:
+        if x_mode == "custom":
+            visible, tooltip = _custom_rows(channel, options, cursor_mode, mini)
+        else:
+            visible, tooltip = _time_rows(channel, options, cursor_mode, mini)
+        if not visible:
+            continue
+        # Display formatting only. Keep original row/tooltip interfaces while
+        # the structured grid carries raw units and real branch identities.
+        table_rows = []
+        if x_mode == "custom":
+            for branch in channel.branches:
+                table_rows.append(CursorTableRow(
+                    branch_label=str(branch.label),
+                    metric_texts=tuple(
+                        _formatted(getattr(branch, _BRANCH_ATTR.get(attr, attr)))
+                        for _label, attr in displayed_fields
+                    ),
+                ))
+        else:
+            table_rows.append(CursorTableRow(metric_texts=tuple(
+                _formatted(getattr(channel, attr)) for _label, attr in displayed_fields
+            )))
+        if channel.diagnostic:
+            table_rows.append(CursorTableRow(diagnostic=str(channel.diagnostic)))
+        metric_texts = table_rows[0].metric_texts if table_rows else ()
+        unit_text = str(channel.unit_suffix or "")
+        blocks.append(CursorDisplayBlock(
+            identity=channel.identity,
+            qualified_label=channel.qualified_label,
+            channel_label=channel.channel_label,
+            color=channel.color,
+            visible_rows=visible,
+            tooltip_rows=tooltip,
+            diagnostic=channel.diagnostic,
+            metric_texts=metric_texts,
+            unit_text=unit_text,
+            table_rows=tuple(table_rows),
+        ))
+    projection = CursorPresentation(
+        blocks=tuple(blocks),
+        html="",
+        tooltip="",
+        layout_category=layout_category,
+        cursor_mode=cursor_mode,
+        x_mode=x_mode,
+        mini=bool(mini),
+        omit_visible_source_prefix=omit_prefix,
+        metric_labels=metric_labels,
+    )
+    return CursorPresentation(
+        blocks=projection.blocks,
+        html=render_cursor_presentation(projection),
+        tooltip=_tooltip(projection.blocks),
+        layout_category=projection.layout_category,
+        cursor_mode=projection.cursor_mode,
+        x_mode=projection.x_mode,
+        mini=projection.mini,
+        omit_visible_source_prefix=omit_prefix,
+        metric_labels=metric_labels,
+    )
+
+
+def _fft_single_value_text(channel: FrequencyCursorChannel) -> str:
+    text = _formatted(channel.value)
+    if channel.delta_to_primary is None:
+        return text
+    return f"{text}  Δ{channel.delta_to_primary:+.4g}"
+
+
+def _fft_status_block(channel: CursorDisplayChannel, *, mini: bool) -> CursorDisplayBlock:
+    """Project an explicit non-numeric frequency placeholder (unchecked / missing)."""
+    face = str(channel.channel_label or channel.qualified_label or "").strip()
+    text = str(channel.diagnostic)
+    visible = (
+        (CursorDisplayRow(_DOT_MARKER, text),)
+        if mini else (CursorDisplayRow(face, text),)
+    )
+    return CursorDisplayBlock(
+        identity=channel.identity,
+        qualified_label=channel.qualified_label,
+        channel_label=channel.channel_label,
+        color=channel.color,
+        visible_rows=visible,
+        tooltip_rows=(CursorDisplayRow(face, text),),
+        diagnostic=channel.diagnostic,
+        metric_texts=(),
+        unit_text="",
+        table_rows=(CursorTableRow(diagnostic=text),),
+    )
+
+
+def _fft_numeric_block(
+    channel: FrequencyCursorChannel,
+    *,
+    cursor_mode: str,
+    mini: bool,
+) -> CursorDisplayBlock:
+    face = str(channel.channel_label or channel.qualified_label or "").strip()
+    if cursor_mode == "single":
+        value_text = _fft_single_value_text(channel)
+        table_rows = (CursorTableRow(metric_texts=(value_text,)),)
+        tooltip = (CursorDisplayRow(face, value_text),)
+        if mini:
+            visible = (CursorDisplayRow(_DOT_MARKER, value_text),)
+        else:
+            visible = (CursorDisplayRow(face, value_text),)
+    else:
+        a_text = _formatted(channel.a_value)
+        b_text = _formatted(channel.b_value)
+        delta_text = _formatted(channel.delta_ab)
+        if mini:
+            table_rows = (CursorTableRow(metric_texts=(delta_text,)),)
+            visible = (CursorDisplayRow(face, delta_text, role="Δ"),)
+        else:
+            table_rows = (CursorTableRow(
+                metric_texts=(a_text, b_text, delta_text),
+            ),)
+            visible = (
+                CursorDisplayRow("A", a_text),
+                CursorDisplayRow("B", b_text),
+                CursorDisplayRow("Δ", delta_text),
+            )
+        tooltip = (
+            CursorDisplayRow("A", a_text),
+            CursorDisplayRow("B", b_text),
+            CursorDisplayRow("Δ", delta_text),
+        )
+    return CursorDisplayBlock(
+        identity=channel.identity,
+        qualified_label=channel.qualified_label,
+        channel_label=channel.channel_label,
+        color=channel.color,
+        visible_rows=visible,
+        tooltip_rows=tooltip,
+        metric_texts=table_rows[0].metric_texts,
+        unit_text=str(channel.unit_suffix or ""),
+        table_rows=table_rows,
+    )
+
+
+def build_fft_cursor_presentation(
+    channels: Iterable[FrequencyCursorChannel | CursorDisplayChannel],
+    *,
+    cursor_mode: str,
+    mini: bool,
+    layout_category: str = "natural",
+) -> CursorPresentation:
+    """Project FFT cursor readings, including explicit diagnostic placeholders."""
+    if cursor_mode not in {"single", "dual"}:
+        raise ValueError("cursor_mode must be single or dual")
+    channel_list = tuple(channels)
+    omit_prefix = cursor_result_source_count(channel_list) <= 1
+    if cursor_mode == "single":
+        metric_labels = ("Value",)
+    elif mini:
+        metric_labels = ("Δ",)
+    else:
+        metric_labels = ("A", "B", "Δ")
+    blocks = []
+    for channel in channel_list:
+        kind = _frequency_sample_channel_kind(channel)
+        if kind == "status":
+            blocks.append(_fft_status_block(channel, mini=mini))
+            continue
+        blocks.append(_fft_numeric_block(
+            channel, cursor_mode=cursor_mode, mini=mini,
+        ))
+    projection = CursorPresentation(
+        blocks=tuple(blocks),
+        html="",
+        tooltip="",
+        layout_category=layout_category,
+        cursor_mode=cursor_mode,
+        x_mode="frequency",
+        mini=bool(mini),
+        omit_visible_source_prefix=omit_prefix,
+        metric_labels=metric_labels,
+    )
+    return CursorPresentation(
+        blocks=projection.blocks,
+        html=render_cursor_presentation(projection),
+        tooltip=_tooltip(projection.blocks),
+        layout_category=projection.layout_category,
+        cursor_mode=projection.cursor_mode,
+        x_mode=projection.x_mode,
+        mini=projection.mini,
+        omit_visible_source_prefix=omit_prefix,
+        metric_labels=metric_labels,
+    )
+
+
+def live_pin_hint_text(cursor_mode: str, *, dual_complete: bool = True) -> str:
+    """Live P-button tooltip. Empty hides the control (dual still placing)."""
+    if cursor_mode == "single":
+        return "按 P 固定当前读数"
+    if cursor_mode == "dual":
+        return "按 P 固定此组" if dual_complete else ""
+    return ""
+
+
+def pin_status_primary_html(intent, status_text) -> str:
+    tag = (
+        f'<span style="color:#416faa;">P{intent.ordinal}</span>'
+        '<span style="color:#cbd5e1;">  &nbsp;│&nbsp;  </span>'
+    )
+    return (
+        tag
+        + f'<span style="color:#64748b;">{escape(str(status_text))}</span>'
+    )
+
+
+def pin_primary_html(intent) -> str:
+    tag = (
+        f'<span style="color:#416faa;">P{intent.ordinal}</span>'
+        '<span style="color:#cbd5e1;">  &nbsp;│&nbsp;  </span>'
+    )
+    return tag + pin_coord_html(intent)
+
+
+def pin_live_primary_html(domain, mode, sample) -> str:
+    unit = "s" if domain == "time" else ("Hz" if domain in {"frequency", "frf"} else "")
+    if mode == "single":
+        return pin_format_coord_html(domain, getattr(sample, "x", None), unit)
+    return pin_format_dual_html(
+        domain, getattr(sample, "ax", None), getattr(sample, "bx", None), unit,
+    )
+
+
+def pin_coord_html(intent) -> str:
+    unit = intent.x_unit
+    if intent.mode == "single":
+        return pin_format_coord_html(intent.domain, intent.x, unit)
+    return pin_format_dual_html(intent.domain, intent.ax, intent.bx, unit)
+
+
+def pin_format_coord_html(domain, x, unit) -> str:
+    value = _finite(x)
+    text = "—" if value is None else pin_format_value(domain, value, unit)
+    return f'<span style="color:#111827;">{text}</span>'
+
+
+def pin_format_dual_html(domain, ax, bx, unit) -> str:
+    a = _finite(ax)
+    b = _finite(bx)
+    a_text = "—" if a is None else pin_format_number(domain, a, unit)
+    b_text = "—" if b is None else pin_format_number(domain, b, unit)
+    return (
+        f'<span style="color:#111827;">A={a_text}</span>'
+        '<span style="color:#cbd5e1;">  &nbsp;│&nbsp;  </span>'
+        f'<span style="color:#111827;">B={b_text}</span>'
+    )
+
+
+def pin_format_value(domain, value, unit) -> str:
+    if domain == "time":
+        return f"t={value:.4f}{unit or 's'}"
+    if domain == "channel":
+        suffix = f" {unit}" if unit else ""
+        return f"X={value:.4g}{suffix}"
+    suffix = f" {unit}" if unit else " Hz"
+    return f"f={value:g}{suffix}"
+
+
+def pin_format_number(domain, value, unit) -> str:
+    if domain == "time":
+        return f"{value:.4f}{unit or 's'}"
+    suffix = f" {unit}" if unit else ""
+    if domain in {"frequency", "frf"} and not suffix:
+        suffix = " Hz"
+    return f"{value:g}{suffix}"
+
+
+# Live FRF keeps the historical readout precision. Do not route these
+# through ``_formatted`` (.4g) or the FFT mini "dot only" name policy.
+_FRF_VALUE_SPEC = {
+    "magnitude": ".5g",
+    "phase": ".5g",
+    "coherence": ".4g",
+}
+_FRF_DELTA_SPEC = {
+    "magnitude": "+.5g",
+    "phase": "+.5g",
+    "coherence": "+.4g",
+}
+_FRF_METRICS = (
+    ("magnitude", "幅值 |H|", "|H|", "magnitude", "magnitude"),
+    ("phase", "相位 φ", "φ", "phase_deg", "phase_deg"),
+    ("coherence", "相干度 γ²", "γ²", "coherence", "coherence"),
+)
+_FRF_DELTA_ATTR = {
+    "magnitude": "delta_magnitude",
+    "phase": "delta_phase_deg",
+    "coherence": "delta_coherence",
+}
+_FRF_TITLE_SEP = '<span style="color:#cbd5e1;">  &nbsp;│&nbsp;  </span>'
+_FRF_DELTA_STYLE = "color:#0b7af3; background-color:#e8f1ff; font-weight:700;"
+
+
+def _format_frf_number(value, spec: str) -> str:
+    if isinstance(value, bool) or value is None:
+        return "—"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if not math.isfinite(number):
+        return "—"
+    return format(number, spec)
+
+
+def _format_frf_frequency(value) -> str:
+    return _format_frf_number(value, "g") if value is not None else "—"
+
+
+def _frf_unit(sample: FrfCursorSample, identity: str) -> str:
+    if identity == "magnitude":
+        return str(sample.magnitude_unit or "").strip()
+    if identity == "phase":
+        return "°"
+    return ""
+
+
+def _frf_metric_block(
+    *,
+    identity: str,
+    label: str,
+    metric_texts: tuple[str, ...],
+    unit: str,
+    cursor_mode: str,
+    mini: bool,
+) -> CursorDisplayBlock:
+    if cursor_mode == "single" or mini:
+        role = "Δ" if cursor_mode == "dual" else "value"
+        visible = (CursorDisplayRow(label, metric_texts[0], role=role),)
+        tooltip = (CursorDisplayRow(label, metric_texts[0]),)
+    else:
+        visible = (
+            CursorDisplayRow("A", metric_texts[0]),
+            CursorDisplayRow("B", metric_texts[1]),
+            CursorDisplayRow("Δ", metric_texts[2]),
+        )
+        tooltip = (CursorDisplayRow(label, ""),) + visible
+    return CursorDisplayBlock(
+        identity=identity,
+        qualified_label=label,
+        channel_label=label,
+        color="#111827",
+        visible_rows=visible,
+        tooltip_rows=tooltip,
+        metric_texts=metric_texts,
+        unit_text=unit,
+        table_rows=(CursorTableRow(metric_texts=metric_texts),),
+    )
+
+
+def _frf_presentation(
+    blocks: tuple[CursorDisplayBlock, ...],
+    *,
+    cursor_mode: str,
+    mini: bool,
+    layout_category: str,
+) -> CursorPresentation:
+    if not blocks:
+        metric_labels: tuple[str, ...] = ()
+    elif cursor_mode == "single":
+        metric_labels = ("Value",)
+    elif mini:
+        metric_labels = ("Δ",)
+    else:
+        metric_labels = ("A", "B", "Δ")
+    projection = CursorPresentation(
+        blocks=blocks,
+        html="",
+        tooltip="",
+        layout_category=layout_category,
+        cursor_mode=cursor_mode,
+        x_mode="frf",
+        mini=bool(mini),
+        omit_visible_source_prefix=True,
+        metric_labels=metric_labels,
+        retain_mini_labels=True,
+        overflow_noun="项指标",
+    )
+    return CursorPresentation(
+        blocks=projection.blocks,
+        html=render_cursor_presentation(projection),
+        tooltip=_tooltip(projection.blocks),
+        layout_category=projection.layout_category,
+        cursor_mode=projection.cursor_mode,
+        x_mode=projection.x_mode,
+        mini=projection.mini,
+        omit_visible_source_prefix=projection.omit_visible_source_prefix,
+        metric_labels=projection.metric_labels,
+        retain_mini_labels=True,
+        overflow_noun="项指标",
+    )
+
+
+def frf_live_primary_html(facts: FrfLiveCursorFacts | None) -> str:
+    """Frequency title for one live FRF reading. Metrics stay in the table."""
+    if facts is None or facts.mode == "off":
+        return ""
+    if facts.awaiting_b:
+        return (
+            f"A={_format_frf_frequency(facts.a_frequency_hz)} Hz"
+            f"{_FRF_TITLE_SEP}点击 B 选择第二点"
+        )
+    sample = facts.sample
+    if sample is None:
+        return ""
+    if facts.mode == "single" or sample.a is None or sample.b is None:
+        return f"f={_format_frf_frequency(sample.frequency_hz)} Hz"
+    delta = _format_frf_number(sample.delta_frequency_hz, "+g")
+    return _FRF_TITLE_SEP.join((
+        f"A={_format_frf_frequency(sample.a.frequency_hz)} Hz",
+        f"B={_format_frf_frequency(sample.b.frequency_hz)} Hz",
+        f'<span style="{_FRF_DELTA_STYLE}">Δf={delta} Hz</span>',
+    ))
+
+
+def build_frf_cursor_presentation(
+    sample: FrfCursorSample | None,
+    *,
+    mini: bool,
+    layout_category: str = "natural",
+    awaiting_b: bool = False,
+) -> CursorPresentation:
+    """Project FRF evaluate facts into the shared table (one panel, three rows).
+
+    Full rows use the long name plus the symbol. Mini keeps only the short
+    symbol (``|H|`` / ``φ`` / ``γ²``) and still shows the unit. Positive
+    deltas keep a leading ``+``. Missing or non-finite metrics render ``—``.
+    """
+    if awaiting_b or sample is None:
+        return _frf_presentation(
+            (),
+            cursor_mode="dual" if awaiting_b else "single",
+            mini=mini,
+            layout_category=layout_category,
+        )
+    dual = sample.a is not None and sample.b is not None
+    cursor_mode = "dual" if dual else "single"
+    blocks = []
+    for identity, full_label, short_label, sample_attr, point_attr in _FRF_METRICS:
+        label = short_label if mini else full_label
+        unit = _frf_unit(sample, identity)
+        if dual:
+            texts = (
+                _format_frf_number(getattr(sample.a, point_attr), _FRF_VALUE_SPEC[identity]),
+                _format_frf_number(getattr(sample.b, point_attr), _FRF_VALUE_SPEC[identity]),
+                _format_frf_number(
+                    getattr(sample, _FRF_DELTA_ATTR[identity]),
+                    _FRF_DELTA_SPEC[identity],
+                ),
+            )
+            shown = (texts[2],) if mini else texts
+        else:
+            shown = (
+                _format_frf_number(getattr(sample, sample_attr), _FRF_VALUE_SPEC[identity]),
+            )
+        blocks.append(_frf_metric_block(
+            identity=identity,
+            label=label,
+            metric_texts=shown,
+            unit=unit,
+            cursor_mode=cursor_mode,
+            mini=mini,
+        ))
+    return _frf_presentation(
+        tuple(blocks),
+        cursor_mode=cursor_mode,
+        mini=mini,
+        layout_category=layout_category,
+    )
+
+
+class CursorDisplayPopover(QFrame):
+    """Six-option floating control anchored by :class:`TimeChartCard`."""
+
+    options_changed = pyqtSignal(object)
+    visibility_changed = pyqtSignal(object)
+
+    _LABELS = (
+        ("show_max_point", "显示最大值点"),
+        ("show_min_point", "显示最小值点"),
+        ("show_max_value", "显示最大值"),
+        ("show_min_value", "显示最小值"),
+        ("show_avg_value", "显示平均值"),
+        ("show_delta_value", "显示差值"),
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(
+            parent,
+            Qt.Popup | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint,
+        )
+        self.setObjectName("cursorDisplayPopover")
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setMinimumWidth(252)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(6)
+        title = QLabel("游标显示", self)
+        title.setObjectName("cursorDisplayPopoverTitle")
+        layout.addWidget(title)
+        point_group = QLabel("极值点", self)
+        point_group.setObjectName("cursorDisplayPopoverGroup")
+        layout.addWidget(point_group)
+        self._checks = {}
+        for index, (name, label) in enumerate(self._LABELS):
+            if index == 2:
+                value_group = QLabel("双游标统计", self)
+                value_group.setObjectName("cursorDisplayPopoverGroup")
+                layout.addWidget(value_group)
+            check = QCheckBox(label, self)
+            check.setObjectName("cursorDisplayOption")
+            check.setProperty("optionName", name)
+            check.toggled.connect(self._on_toggle)
+            self._checks[name] = check
+            layout.addWidget(check)
+        self._note = QLabel("", self)
+        self._note.setObjectName("cursorDisplayPopoverNote")
+        self._note.setWordWrap(True)
+        layout.addWidget(self._note)
+        self._options = CursorDisplayOptions()
+        self._refit_pending = False
+        self._anchor_ref = None
+        self.set_options(self._options)
+
+    def options(self) -> CursorDisplayOptions:
+        return self._options
+
+    def checkbox(self, name: str) -> QCheckBox:
+        return self._checks[name]
+
+    def context_note(self) -> str:
+        return self._note.text()
+
+    def set_options(self, options: CursorDisplayOptions) -> None:
+        self._options = options
+        for name, check in self._checks.items():
+            old = check.blockSignals(True)
+            check.setChecked(getattr(options, name))
+            check.blockSignals(old)
+
+    def set_cursor_mode(self, mode: str) -> None:
+        self._note.setText(
+            "最大值、最小值与平均值仅用于双游标统计。"
+            if mode == "single" else ""
+        )
+        self._note.setVisible(bool(self._note.text()))
+        self._schedule_refit()
+
+    def show_for(self, anchor, cursor_mode: str) -> None:
+        self._bind_anchor(anchor)
+        self.set_cursor_mode(cursor_mode)
+        if not self._apply_final_geometry():
+            return
+        self.show()
+        self.raise_()
+        self.visibility_changed.emit(self.frameGeometry())
+        self._schedule_refit()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self.visibility_changed.emit(None)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+            painter.setBrush(_POPOVER_BG)
+            painter.setPen(QPen(_POPOVER_BORDER, 1.0))
+            painter.drawRoundedRect(rect, _POPOVER_RADIUS, _POPOVER_RADIUS)
+        finally:
+            painter.end()
+
+    def _on_toggle(self, _checked):
+        sender = self.sender()
+        if sender not in self._checks.values():
+            return
+        self._options = CursorDisplayOptions(**{
+            name: check.isChecked() for name, check in self._checks.items()
+        })
+        self.options_changed.emit(self._options)
+
+    def _schedule_refit(self):
+        if self._refit_pending:
+            return
+        self._refit_pending = True
+        QTimer.singleShot(0, self._deferred_refit)
+
+    def _deferred_refit(self):
+        self._refit_pending = False
+        try:
+            if sip.isdeleted(self):
+                return
+            if not self._apply_final_geometry():
+                return
+            if self.isVisible():
+                self.visibility_changed.emit(self.frameGeometry())
+        except RuntimeError:
+            return
+
+    def _bind_anchor(self, anchor) -> None:
+        self._release_anchor()
+        if anchor is None:
+            return
+        try:
+            if sip.isdeleted(anchor):
+                return
+        except RuntimeError:
+            return
+        self._anchor_ref = weakref.ref(anchor)
+        anchor.destroyed.connect(self._on_anchor_destroyed)
+
+    def _release_anchor(self) -> None:
+        previous = None
+        if self._anchor_ref is not None:
+            try:
+                previous = self._anchor_ref()
+            except RuntimeError:
+                previous = None
+        self._anchor_ref = None
+        if previous is None:
+            return
+        try:
+            if sip.isdeleted(previous):
+                return
+            previous.destroyed.disconnect(self._on_anchor_destroyed)
+        except (RuntimeError, TypeError):
+            return
+
+    def _live_anchor(self):
+        if self._anchor_ref is None:
+            return None
+        try:
+            anchor = self._anchor_ref()
+        except RuntimeError:
+            self._anchor_ref = None
+            return None
+        if anchor is None:
+            return None
+        try:
+            if sip.isdeleted(anchor):
+                self._anchor_ref = None
+                return None
+        except RuntimeError:
+            self._anchor_ref = None
+            return None
+        return anchor
+
+    def _on_anchor_destroyed(self, *_args):
+        self._anchor_ref = None
+        try:
+            if sip.isdeleted(self):
+                return
+            self.hide()
+        except RuntimeError:
+            return
+
+    def _apply_final_geometry(self) -> bool:
+        """Layout to the final size, then place from the stored anchor."""
+        if sip.isdeleted(self):
+            return False
+        if self.layout() is not None:
+            self.layout().activate()
+        hint = self.sizeHint().expandedTo(self.minimumSizeHint())
+        preferred = (max(hint.width(), 252), hint.height())
+        if self._anchor_ref is None:
+            self.resize(preferred[0], preferred[1])
+            return True
+        anchor = self._live_anchor()
+        if anchor is None:
+            self.hide()
+            return False
+        fit_popover(self, anchor, preferred=preferred, prefer_below=True)
+        return True
+
+
+__all__ = [
+    "CURSOR_DISPLAY_SETTINGS_KEY",
+    "CursorDisplayBranch",
+    "CursorDisplayChannel",
+    "CursorDisplayOptions",
+    "CursorDisplayPopover",
+    "CursorDisplaySettingsStore",
+    "CursorDisplayBlock",
+    "CursorDisplayRow",
+    "CursorTableRow",
+    "CursorPresentation",
+    "FrequencyCursorChannel",
+    "build_cursor_presentation",
+    "build_fft_cursor_presentation",
+    "build_frf_cursor_presentation",
+    "frf_live_primary_html",
+    "enabled_value_fields",
+    "render_cursor_presentation",
+    "visible_block_label",
+]

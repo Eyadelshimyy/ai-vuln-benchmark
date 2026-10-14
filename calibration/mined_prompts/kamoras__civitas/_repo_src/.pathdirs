@@ -1,0 +1,11 @@
+.
+backend
+backend/app
+backend/app/api
+backend/app/pipeline
+backend/app/pipeline/analyze
+backend/app/pipeline/fetch
+backend/app/pipeline/transform
+backend/app/services
+backend/migrations/versions
+backend/scripts

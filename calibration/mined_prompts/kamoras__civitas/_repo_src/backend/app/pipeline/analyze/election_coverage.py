@@ -1,0 +1,618 @@
+"""Match already-fetched news articles to Races by candidate-name match with
+mandatory corroboration.
+
+Deliberately deterministic string matching, not embedding similarity —
+but a bare surname is NOT treated as identifying (2026-07 review F8: with
+thousands of FEC candidates, the roster's surname set covers a large
+fraction of common English surnames, so surname-only matching against
+general news/social text GUARANTEES false associations — an article about
+any unrelated Smith attached to every race with a Smith in it; the worst
+realistic failure is a scandal story pinned to the wrong same-surname
+candidate). A match therefore requires the surname PLUS corroboration in
+the same text:
+
+  "full_name"       — the candidate's own first name also appears
+                      (word-boundary, case-insensitive), or
+  "surname_context" — the candidate's state name appears (full name, e.g.
+                      "Georgia" — the 2-letter code is far too ambiguous
+                      in prose). This corroborates nothing when the
+                      OUTLET is that state's own newsroom, which names
+                      the state in nearly every article it runs; those
+                      matches must additionally clear the relevance bar
+                      (vacuous_corroboration_clause).
+
+If, after corroboration, an item still matches candidates in MORE THAN
+ONE race, it is dropped entirely rather than guessed or fanned out — the
+same no-guessed-attribution rule fec.find_candidate applies to financial
+data (ambiguity => None, never "probably this one"). One item attaches to
+at most one race.
+
+Coverage items store the source's own title/summary verbatim — never
+LLM-generated — so the on-site feed has no hallucination surface; only
+the separate Bluesky-posting path (election_bluesky.py) generates text,
+and it is restricted to items matched on the stronger "full_name" basis
+(match_basis is stored per item for exactly that gate).
+"""
+
+import functools
+import logging
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+from sqlalchemy import and_, or_
+from sqlalchemy.orm import Session
+
+from app.models import Candidate, Race, RaceCoverageItem
+from app.pipeline.analyze import race_relevance
+from app.pipeline.fetch.news_feeds import (
+    STATE_OUTLET_NAMES,
+    fetch_news_articles,
+    fetch_state_news_articles,
+)
+from app.pipeline.run_tracker import PipelineRunTracker
+
+logger = logging.getLogger(__name__)
+
+# Below this length a surname is too likely to produce false-positive
+# matches in general news/social text ("OZ", "LEE", "ROE") to trust even
+# with corroboration.
+MIN_SURNAME_LENGTH = 4
+
+# In-process guard shared by the 15-minute election-season refresh and the
+# nightly pipeline's coverage phase (behind the COVERAGE_REFRESH lease, see
+# lease.tracked_job), so two ingestion/posting passes can't
+# interleave (2026-07 review B3: duplicate rows and duplicate public
+# posts; same pattern as _hourly_action_refresh's guard after the
+# 2026-07-13 pileup incident).
+_coverage_tracker = PipelineRunTracker()
+
+
+def coverage_tracker() -> PipelineRunTracker:
+    return _coverage_tracker
+
+
+# 2-letter state code -> full state name, for the corroboration check.
+STATE_NAMES: dict[str, str] = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
+    "CA": "California", "CO": "Colorado", "CT": "Connecticut",
+    "DE": "Delaware", "FL": "Florida", "GA": "Georgia", "HI": "Hawaii",
+    "ID": "Idaho", "IL": "Illinois", "IN": "Indiana", "IA": "Iowa",
+    "KS": "Kansas", "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine",
+    "MD": "Maryland", "MA": "Massachusetts", "MI": "Michigan",
+    "MN": "Minnesota", "MS": "Mississippi", "MO": "Missouri",
+    "MT": "Montana", "NE": "Nebraska", "NV": "Nevada",
+    "NH": "New Hampshire", "NJ": "New Jersey", "NM": "New Mexico",
+    "NY": "New York", "NC": "North Carolina", "ND": "North Dakota",
+    "OH": "Ohio", "OK": "Oklahoma", "OR": "Oregon", "PA": "Pennsylvania",
+    "RI": "Rhode Island", "SC": "South Carolina", "SD": "South Dakota",
+    "TN": "Tennessee", "TX": "Texas", "UT": "Utah", "VT": "Vermont",
+    "VA": "Virginia", "WA": "Washington", "WV": "West Virginia",
+    "WI": "Wisconsin", "WY": "Wyoming",
+}
+
+
+def _surname(name: str) -> str:
+    """FEC candidate names are "LAST, FIRST MIDDLE" — the surname is what
+    news coverage and social posts actually use, not the full FEC string."""
+    return name.split(",")[0].strip()
+
+
+def _first_name(name: str) -> str | None:
+    """First given name from "LAST, FIRST MIDDLE", or None when it's too
+    short to corroborate anything (an initial like "J." matches noise)."""
+    parts = name.split(",")
+    if len(parts) < 2:
+        return None
+    tokens = parts[1].strip().split()
+    if not tokens:
+        return None
+    first = tokens[0].strip(".")
+    return first if len(first) >= 3 else None
+
+
+def _word_pattern(word: str) -> "re.Pattern[str]":
+    return re.compile(r"\b" + re.escape(word) + r"\b", re.IGNORECASE)
+
+
+def _full_name_pattern(first: str, surname: str) -> "re.Pattern[str]":
+    """The two names TOGETHER — "Jane Doe" or "Doe, Jane" — not merely
+    both present somewhere in the text.
+
+    The old rule asked only that the surname appear capitalised and the
+    first name appear anywhere at all, in any position, any case. That is
+    how Alaska's at-large race — which has a real, $1.3M-raised candidate
+    whose name is also two common words — collected "The Hill" plus "I'm just a bill, sittin
+    here on Capitol Hill" as full-name coverage, and then posted about it
+    nine times. Measured across all 7,471 stored full_name matches, 25.1%
+    were incidental in exactly this way: "<first> <other surname> to lead FEMA"
+    for a candidate whose given name is that surname, "<first> Driver will
+    play Mister Sinister" for a candidate sharing the given name, "Warner Bros. bid" for William Todd Warner.
+
+    Up to two intervening tokens carry real middle names and initials
+    ("Robert F. Kennedy"). Compiled case-INSENSITIVELY, with
+    capitalisation verified on the matched text by the caller, for the
+    same reason _matches_as_a_name documents: building "Mcallister" to
+    compare case-sensitively rejects every real "McAllister".
+    """
+    f, ln = re.escape(first), re.escape(surname)
+    return re.compile(
+        rf"\b{f}\b(?:\s+[A-Za-z][\w.'’-]*){{0,2}}\s+\b{ln}\b"
+        rf"|\b{ln}\b,?\s+\b{f}\b",
+        re.IGNORECASE,
+    )
+
+
+def _matches_full_name(pattern: "re.Pattern[str]", text: str) -> bool:
+    """True where first and last name occur together, both capitalised."""
+    for m in pattern.finditer(text):
+        tokens = [t for t in re.split(r"[\s,]+", m.group(0)) if t]
+        if len(tokens) >= 2 and tokens[0][:1].isupper() and tokens[-1][:1].isupper():
+            return True
+    return False
+
+
+def _matches_as_a_name(pattern: "re.Pattern[str]", text: str) -> bool:
+    """True only where the word occurs CAPITALISED — i.e. as a name.
+
+    Plenty of real candidate surnames are ordinary English nouns, and
+    case-insensitive matching attached their races to any article using
+    the word. Measured against the 554 live coverage items: HAND matched
+    "born without a right hand", REGISTER matched "deciding to register",
+    GREEN matched "waves the green flag", PEOPLE matched "describes
+    people who move somewhere", plus ELSE, CASE, LONG, DREW, LIGHT,
+    MILLION, MARKS, DRIVER.
+
+    Requiring a capital costs 6.3% of stored items (35 of 554) and every
+    one of the dozen sampled was a false positive — none was real
+    coverage. It needs no curated stop-word list, and it keeps intercaps
+    names, which is why the match is found case-insensitively and only
+    the matched TEXT is checked: lower-casing the tail to build
+    "Mcallister" would reject every real "McAllister" (that error is what
+    a first, wrong measurement of this rule reported as an 18.8% cost).
+
+    ALL-CAPS headlines still qualify — the first character is a capital.
+    """
+    return any(m.group(0)[:1].isupper() for m in pattern.finditer(text))
+
+
+def _state_name_pattern(state_name: str) -> "re.Pattern[str]":
+    """Like _word_pattern, but refuses a match enclosed in a longer state name.
+
+    Word boundaries are not enough here: "Virginia" word-matches inside
+    "West Virginia", so every West Virginia story corroborated every
+    Virginia candidate whose surname appeared anywhere in it. Found live
+    — a story about a former WEST Virginia senator "deciding to register
+    as an independent" attached to VA-5 because the roster has a
+    candidate surnamed REGISTER.
+
+    Virginia/West Virginia is the ONLY such pair among the fifty (checked
+    exhaustively, not assumed: no other state name word-matches inside
+    another), but the guard is derived from STATE_NAMES rather than
+    hardcoded so it stays correct if that map ever changes.
+    """
+    guards = ""
+    for other in STATE_NAMES.values():
+        if other == state_name:
+            continue
+        m = re.search(r"\b" + re.escape(state_name) + r"\b", other, re.IGNORECASE)
+        if m:
+            # Fixed-width lookbehind ("West "), which Python's re requires.
+            guards += f"(?<!{re.escape(other[:m.start()])})"
+    return re.compile(guards + r"\b" + re.escape(state_name) + r"\b", re.IGNORECASE)
+
+
+_lowered = functools.lru_cache(maxsize=1)(str.lower)
+
+
+@dataclass
+class CandidateMatcher:
+    """Compiled match predicates for one candidate."""
+    candidate_id: str
+    race_id: str
+    state: str
+    surname_re: "re.Pattern[str]"
+    full_name_re: "re.Pattern[str] | None"
+    state_re: "re.Pattern[str]"
+    surname_key: str  # surname.lower(), for the prefilter below
+
+    def match_basis(self, text: str) -> str | None:
+        """"full_name" / "surname_context" / None — see module docstring."""
+        # Every article is tried against every candidate (4,251 on
+        # 2026-09-30), and a case-insensitive regex scan of the whole text
+        # costs ~90µs: 277s of CPU per 15-minute refresh, which starved the
+        # event loop until Swarm's health check killed the process mid-run.
+        # A substring test is a necessary condition for the surname regex
+        # and runs in C, so almost every pair stops here. _lowered caches
+        # the one text all matchers are being tried against in turn.
+        if self.surname_key not in _lowered(text):
+            return None
+        if not _matches_as_a_name(self.surname_re, text):
+            return None
+        if self.full_name_re is not None and _matches_full_name(self.full_name_re, text):
+            return "full_name"
+        if self.state_re.search(text):
+            return "surname_context"
+        return None
+
+
+def _build_matchers(db: Session) -> list[CandidateMatcher]:
+    matchers = []
+    rows = db.query(Candidate.id, Candidate.name, Candidate.race_id).all()
+    for cand_id, name, race_id in rows:
+        if not name or not race_id:
+            continue
+        surname = _surname(name)
+        if len(surname) < MIN_SURNAME_LENGTH:
+            continue
+        # Race ids are "{cycle}-SEN-{ST}[-SPECIAL]" / "{cycle}-HOUSE-{ST}-{n}".
+        parts = race_id.split("-")
+        state_name = STATE_NAMES.get(parts[2]) if len(parts) >= 3 else None
+        if state_name is None:
+            continue
+        first = _first_name(name)
+        matchers.append(CandidateMatcher(
+            candidate_id=cand_id,
+            race_id=race_id,
+            state=parts[2],
+            surname_re=_word_pattern(surname),
+            full_name_re=_full_name_pattern(first, surname) if first else None,
+            state_re=_state_name_pattern(state_name),
+            surname_key=surname.lower(),
+        ))
+    return matchers
+
+
+_BASIS_RANK = {"full_name": 0, "surname_context": 1}
+
+
+def resolve_item_race(
+    matchers: list[CandidateMatcher], text: str,
+) -> tuple[CandidateMatcher, str] | None:
+    """The single (matcher, basis) an item attaches to, or None.
+
+    Ambiguity rule: corroborated matches in more than one distinct race
+    mean the text doesn't identify one candidate — drop rather than guess
+    (or worse, attach everywhere). Multiple matched candidates within the
+    SAME race (e.g. an article naming two rivals in one primary) is fine —
+    the attachment target is the race; the strongest-basis candidate is
+    recorded as the match evidence.
+    """
+    matched: list[tuple[CandidateMatcher, str]] = []
+    for m in matchers:
+        basis = m.match_basis(text)
+        if basis is not None:
+            matched.append((m, basis))
+    if not matched:
+        return None
+    races = {m.race_id for m, _ in matched}
+    if len(races) > 1:
+        logger.debug(
+            "Coverage item matched %d races (%s) — dropped as ambiguous",
+            len(races), ", ".join(sorted(races)),
+        )
+        return None
+    return min(matched, key=lambda pair: _BASIS_RANK[pair[1]])
+
+
+def _to_naive_utc(dt: datetime | None) -> datetime | None:
+    """Normalize to the repo's naive-UTC convention (time_utils.utcnow) at
+    the ingestion boundary — RSS/atproto sources hand us aware datetimes."""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _already_ingested(db: Session, race_id: str, url: str) -> bool:
+    return (
+        db.query(RaceCoverageItem.id)
+        .filter(RaceCoverageItem.race_id == race_id, RaceCoverageItem.url == url)
+        .first()
+        is not None
+    )
+
+
+def _title_key(title: str | None) -> str:
+    """The identity of a story, independent of who republished it."""
+    return re.sub(r"\s+", " ", (title or "")).strip().lower()
+
+
+def _drop_syndicated_reprints(db: Session) -> set[tuple[str, str, str]]:
+    """Collapse stories a race already carries, and return the seen-set.
+
+    The URL key cannot see syndication. States Newsroom distributes one
+    piece to its whole network, so "Flock surveillance cameras raise
+    constitutional questions" arrived from Oklahoma Voice, Ohio Capital
+    Journal, Kentucky Lantern, Florida Phoenix, Nevada Current and
+    seventeen more — every one a distinct, legitimate URL from a
+    distinct, legitimate outlet. Measured on the live database: MO-6
+    carried 25 items that were 4 stories, and one race held 22 copies of
+    that single headline.
+
+    Same retroactive reasoning as _drop_items_the_matcher_would_now_reject:
+    nothing ever deletes a RaceCoverageItem, so a rule added today has to
+    reach backwards or the stored data and the rules drift apart
+    permanently. The oldest row wins — it ran the story first.
+
+    Returns the surviving (race, title) keys so the ingest that follows
+    can test membership in memory. The first version instead ran one
+    `lower(trim(title)) = ?` query PER ARTICLE, which no index can
+    serve — a full scan of every stored item, hundreds of times, inside
+    the write transaction. In production that held SQLite's single
+    writer past its 30-second busy timeout and the whole coverage
+    refresh died with "database is locked". One scan, reused, is both
+    the correct and the cheap shape.
+    """
+    doomed: list[int] = []
+    seen: set[tuple[str, str, str]] = set()
+    rows = (
+        db.query(RaceCoverageItem.id, RaceCoverageItem.race_id, RaceCoverageItem.title)
+        .order_by(RaceCoverageItem.id)
+        .all()
+    )
+    for item_id, race_id, title in rows:
+        key = _title_key(title)
+        if not key:
+            continue
+        if ("title", race_id, key) in seen:
+            doomed.append(item_id)
+        else:
+            seen.add(("title", race_id, key))
+
+    if doomed:
+        for i in range(0, len(doomed), 500):
+            (db.query(RaceCoverageItem)
+               .filter(RaceCoverageItem.id.in_(doomed[i:i + 500]))
+               .delete(synchronize_session=False))
+        db.commit()
+        logger.info(
+            "Dropped %d syndicated reprints already covered on their race", len(doomed))
+    return seen
+
+
+def _drop_items_the_matcher_would_now_reject(
+    db: Session, matchers: list[CandidateMatcher],
+) -> int:
+    """Re-validate stored coverage against the CURRENT matching rules.
+
+    Nothing ever deletes a RaceCoverageItem — there is no retention
+    sweep — so an item attached by a rule later found to be wrong stays
+    in the database for good. The API orders newest-first under a cap,
+    which pushes old items off a busy race's feed, but a quiet race
+    keeps showing its false positive indefinitely: NE-3's was an article
+    about a government shutdown, matched because a candidate there is
+    surnamed ELSE.
+
+    So every tightening of the matcher has to apply retroactively, or
+    the rules and the stored data drift apart permanently.
+
+    Deliberately keyed on the item's OWN matched candidate rather than
+    re-running the whole race: if that candidate has since left the
+    roster there is nothing to re-validate against, and dropping the
+    item would delete real coverage every time the roster churns. Those
+    are left alone.
+    """
+    by_candidate = {m.candidate_id: m for m in matchers}
+    if not by_candidate:
+        return 0  # never prune against an empty roster
+
+    doomed: list[int] = []
+    for item in db.query(RaceCoverageItem).all():
+        matcher = by_candidate.get(item.matched_candidate_id)
+        if matcher is None:
+            continue
+        if matcher.match_basis(f"{item.title or ''} {item.summary or ''}") is None:
+            doomed.append(item.id)
+
+    if not doomed:
+        return 0
+    for i in range(0, len(doomed), 500):
+        (db.query(RaceCoverageItem)
+           .filter(RaceCoverageItem.id.in_(doomed[i:i + 500]))
+           .delete(synchronize_session=False))
+    db.commit()
+    logger.info(
+        "Dropped %d stored coverage items the current matcher rejects", len(doomed))
+    return len(doomed)
+
+
+def vacuous_corroboration_clause(db: Session):
+    """SQL for "surname_context corroborated nothing" — hide, never delete.
+
+    A bare surname is not identifying — this module's docstring explains
+    why — so a surname match needs corroboration, and "the candidate's
+    state name appears in the same text" was a sound one while every
+    feed was national. Adding 41 per-state outlets broke that
+    assumption: the Kentucky Lantern says "Kentucky" in virtually every
+    article it publishes, so the corroboration fires on all of them and
+    surname_context silently degenerates into exactly the bare-surname
+    match it exists to prevent.
+
+    Measured over the live corpus, the interaction is unambiguous —
+    full_name is unaffected by which feed an item came from, while
+    surname_context degrades 2.6x:
+
+        national / full_name        n=351  mean 0.301   6% below 0.1
+        national / surname_context  n=112  mean 0.258  14% below 0.1
+        state    / full_name        n= 30  mean 0.295   3% below 0.1
+        state    / surname_context  n=128  mean 0.166  37% below 0.1
+
+    That 37% is "Williams sisters, at 44 and 46, reunite their iconic
+    doubles team" on OH-9, a Minnesota salmonella outbreak on SEN-MN,
+    and "A Kentucky man with a meat allergy was craving a burger" on
+    KY-1 — each one a different person who happens to share a surname
+    with a candidate, in an article whose outlet names the state by
+    definition.
+
+    A filter's correct case and its blind spot look identical in code;
+    what separated them here was measuring the same rule against the
+    two populations it now spans.
+
+    Returned as a SQL clause rather than a per-item predicate because
+    this is a DISPLAY filter, not a delete. Deleting these rows was
+    tried and churned: the article is still in the outlet's RSS feed, so
+    removing the row is exactly what stops _already_ingested from
+    blocking it, and the next pass re-ingested, re-embedded and
+    re-deleted the same items every 15 minutes — observed live as "36
+    ingested" immediately followed by "Dropped 36". The row must STAY
+    for the ingest-time check to keep working; what must not happen is
+    showing it to a reader.
+
+    (The syndication sweep can delete safely because it KEEPS the first
+    outlet's copy, and that surviving row is what makes every later
+    reprint a duplicate at ingest.)
+
+    An unscored item matches this clause and is therefore hidden, which
+    is the same fail-closed rule the feed already applies to a NULL
+    relevance — and unlike a delete it reverses itself as soon as the
+    next pass scores the item.
+    """
+    return and_(
+        RaceCoverageItem.match_basis == "surname_context",
+        RaceCoverageItem.source_name.in_(STATE_OUTLET_NAMES),
+        or_(
+            RaceCoverageItem.relevance.is_(None),
+            RaceCoverageItem.relevance < race_relevance.threshold(db),
+        ),
+    )
+
+
+def _store_if_new(
+    db: Session, race_id: str, seen: set[tuple[str, str]], **fields,
+) -> bool:
+    """Store one coverage item, skipping anything already ingested.
+
+    `seen` carries the rows added earlier in THIS pass, and it is not
+    redundant with the query: SessionLocal is built with
+    autoflush=False, so a pending row is invisible to
+    _already_ingested until the pass commits. Both halves are needed —
+    the query for previous passes, the set for this one.
+
+    Without it a pass that legitimately attaches one item to a race
+    twice raises IntegrityError on
+    uq_race_coverage_race_url at commit, losing the ENTIRE pass
+    including the news items. That is not hypothetical: one Bluesky
+    post naming two rivals in the same primary resolves to the same
+    race twice, which is exactly the case this module's own docstring
+    calls fine ("the attachment target is the race"). It stayed hidden
+    only because Bluesky search had been returning nothing at all.
+    """
+    url_key = ("url", race_id, fields["url"])
+    if url_key in seen or _already_ingested(db, race_id, fields["url"]):
+        return False
+    # Same story, different outlet — see _drop_syndicated_reprints. `seen`
+    # is primed with every stored (race, title) before the pass starts,
+    # so this needs no query of its own.
+    title_key = ("title", race_id, _title_key(fields.get("title")))
+    if title_key[2]:
+        if title_key in seen:
+            return False
+        seen.add(title_key)
+    seen.add(url_key)
+    db.add(RaceCoverageItem(race_id=race_id, **fields))
+    return True
+
+
+async def ingest_race_coverage(db: Session) -> int:
+    """Match news articles (the national feeds and the per-state outlets) to races.
+    Returns the number of NEW coverage items stored (a url already
+    ingested for that race is skipped, not duplicated).
+    """
+    matchers = _build_matchers(db)
+    if not matchers:
+        return 0
+
+    # Before ingesting, reconcile what is already stored with the rules
+    # as they stand now. A no-op once the corpus is clean.
+    _drop_items_the_matcher_would_now_reject(db, matchers)
+
+    ingested = 0
+    # Rows added in THIS pass, invisible to _already_ingested because
+    # SessionLocal sets autoflush=False.
+    #
+    # Primed with every stored (race, title) by the reprint sweep, which
+    # has just scanned the table anyway, so the per-article syndication
+    # check costs no query of its own.
+    seen: set[tuple[str, str, str]] = _drop_syndicated_reprints(db)
+
+    # ── News: the national feeds the Action Center already fetched
+    # (cheap/idempotent), PLUS the per-state political outlets.
+    #
+    # The national eight cannot cover 50 states' House and Senate races,
+    # and that gap is what the open Bluesky name search was filling with
+    # 94% noise. Widening the SOURCES is the fix that filtering was
+    # standing in for. State outlets are read here and not by the Action
+    # Center, so national issue ranking is untouched.
+    articles = fetch_news_articles() + fetch_state_news_articles()
+    for article in articles:
+        haystack = f"{article.title} {article.summary}"
+        resolved = resolve_item_race(matchers, haystack)
+        if resolved is None:
+            continue
+        matcher, basis = resolved
+        if _store_if_new(
+            db, matcher.race_id, seen,
+            source_type="news", source_name=article.source_name,
+            title=(article.title or "")[:500], url=article.url,
+            summary=article.summary,
+            published_at=_to_naive_utc(article.published),
+            matched_candidate_id=matcher.candidate_id, match_basis=basis,
+        ):
+            ingested += 1
+
+    db.commit()
+    score_unscored_items(db)
+    return ingested
+
+
+def score_unscored_items(db: Session, batch: int = 500) -> int:
+    """Fill in relevance/has_advocacy for items that have never been scored.
+
+    Done at INGEST rather than per request because the feed cannot embed
+    itself on every page load, and in one batched pass because encoding
+    500 texts together costs far less than 500 separate calls.
+
+    Two different questions get asked, because they have different
+    answers: relevance is "is this about the race" (semantic, embedding)
+    and has_advocacy is "does this tell a reader how to vote"
+    (structural, and absolute regardless of relevance). Measured over
+    1,500 real Bluesky items: 31.5% clear relevance and 7% of those are
+    campaign advocacy — a feed gated on relevance alone would carry
+    "Elect <candidate> to Congress!" as race coverage.
+    """
+    from app.pipeline.analyze.grounding import electioneering_language
+    from app.pipeline.analyze.race_relevance import (
+        item_text, race_descriptor, score_pairs,
+    )
+
+    rows = (
+        db.query(RaceCoverageItem)
+        .filter(RaceCoverageItem.relevance.is_(None))
+        .limit(batch)
+        .all()
+    )
+    if not rows:
+        return 0
+    races = {r.id: r for r in db.query(Race).filter(
+        Race.id.in_({r.race_id for r in rows})).all()}
+    pairs = [(it, races[it.race_id]) for it in rows if it.race_id in races and item_text(it)]
+    if not pairs:
+        return 0
+
+    try:
+        scores = score_pairs(
+            [item_text(it) for it, _ in pairs],
+            [race_descriptor(r) for _, r in pairs],
+        )
+    except Exception:
+        logger.exception("Coverage relevance scoring failed — items stay unscored")
+        return 0
+
+    for (item, _), score in zip(pairs, scores):
+        item.relevance = float(score)
+        item.has_advocacy = bool(electioneering_language(item_text(item)))
+    db.commit()
+    logger.info("Scored %d coverage items for relevance", len(pairs))
+    return len(pairs)

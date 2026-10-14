@@ -1,0 +1,1079 @@
+"""PersistentTop and _AxisRangeHost widgets."""
+from functools import partial
+import math
+
+from PyQt5.QtCore import QSize, Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QPalette, QValidator
+from PyQt5.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QFormLayout,
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QSizePolicy,
+    QSpinBox,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from ...ui_kit.motion import POLICY_LIGHT
+from ...ui_kit.widgets.searchable_combo import SearchableComboBox
+from ...ui_kit.widgets.segmented_choice import SegmentedChoice
+from .. import hints
+from ..chart_stack.toolbar import DEFAULT_CHART_TICK_DENSITY
+from ..widgets.compact_spinbox import CompactDoubleSpinBox
+from ..widgets.wrapped_hint import WrappedHintFrame
+from .disclosure_icon import inspector_chevron_icon
+from ._helpers import (
+    _SHORT_FIELD_MAX_WIDTH,
+    _LONG_FIELD_MAX_WIDTH,
+    _configure_form,
+    _fit_field,
+    _no_buttons,
+    _pair_field,
+    _preset_settings,
+    _set_form_row_visible,
+    _settings_bool,
+    _AxisRangeHost,
+)
+
+
+class RangeEditQuery:
+    """Widget-local edit fact. Controller never imports this class."""
+
+    UNCHANGED = "unchanged"
+    VALID_EDIT = "valid_edit"
+    INVALID_EDIT = "invalid_edit"
+
+    __slots__ = ("status", "revision", "span", "start_text", "end_text")
+
+    def __init__(self, status, revision, span=None, start_text="", end_text=""):
+        self.status = str(status)
+        self.revision = int(revision)
+        self.span = span
+        self.start_text = "" if start_text is None else str(start_text)
+        self.end_text = "" if end_text is None else str(end_text)
+
+
+class PersistentTop(QWidget):
+    """Xaxis / Range sections plus hidden tick-density compatibility state.
+
+    R3 #6: the three sections live inside a collapsible container that
+    defaults to collapsed (single-row affordance reading "▶ 图表设置 (横坐标
+    · 时间范围)"). The collapsed state is persisted via QSettings under
+    ``_SETTINGS_KEY`` so layouts survive between sessions.
+
+    All public attributes / methods documented on the class remain
+    reachable regardless of collapser state — programmatic getters / setters
+    work even while the body widget is hidden.
+    """
+
+    _SETTINGS_KEY = "inspector/persistent_top/expanded_v2"
+    _DROP_HINT_DISMISSED_KEY = (
+        "inspector/persistent_top/xaxis_drop_hint_dismissed"
+    )
+    _XAXIS_CHANNEL_LABEL = "指定通道"
+    _XAXIS_BOUND_LABEL = "曲线自带"
+
+    xaxis_apply_requested = pyqtSignal()
+    xaxis_drop_hint_dismissed = pyqtSignal()
+    tick_density_changed = pyqtSignal(int, int)
+    # 「全部」按钮：时域查看全部（复位到已绘制通道最长全程）；分析页回 full。
+    # 控件只负责发信号，由 MainWindow 按当前模式复位视口。
+    max_range_requested = pyqtSignal()
+    _TIME_RANGE_MAX_TIP = (
+        "查看全部：X 轴回到图面已绘制通道的最长全程"
+        "（不启用「使用选定时间范围」）"
+    )
+    _ANALYSIS_RANGE_MAX_TIP = (
+        "取消勾选、清除待启用草稿，显示当前来源全时段"
+    )
+    _TIME_RANGE_FULL_TIP = (
+        "全时段使用当前来源的完整数据；这里的起止值仍随当前时域视窗变化，"
+        "切到指定范围时采用。"
+    )
+    _ANALYSIS_RANGE_FULL_TIP = (
+        "全时段使用当前分析来源的完整数据；起止值来自当前来源的物理时间边界。"
+    )
+    _RANGE_SELECTED_TIP = "使用下方起止时间。"
+    _RANGE_STATUS_TEXT = {
+        "full": "",
+        "enabled": "",
+        "draft": "范围已调整，尚未启用",
+        "invalid": "范围无效，无法用于计算",
+        "unavailable": "当前没有可用时间范围",
+        "review": "已启用范围需要复核",
+    }
+    # User-committed start/end only. Programmatic set_range_values / limits /
+    # checkout / set_range_from_span must not emit this.
+    range_edited = pyqtSignal(float, float)
+    # Invalid / incomplete text. No forged (0, 0) / NaN payload.
+    range_edit_invalid = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        root = QVBoxLayout(self)
+        # 紧凑化【3】: tightened from 10 → 6 (2026-04-26).
+        root.setSpacing(6)
+        root.setContentsMargins(0, 0, 0, 0)
+
+        # ------- Collapser handle -------
+        # Same stroke chevron as the analysis parameter sections
+        # (谱参数 / 时频参数). Qt's native arrow is a filled triangle that
+        # QMacStyle draws heavy and accent-blue while the button is checked.
+        self.btn_collapser = QToolButton(self)
+        self.btn_collapser.setObjectName("inspectorCollapser")
+        self.btn_collapser.setCheckable(True)
+        self.btn_collapser.setAutoRaise(True)
+        self.btn_collapser.setText("图表设置 (横坐标 · 时间范围)")
+        self.btn_collapser.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.btn_collapser.setArrowType(Qt.NoArrow)
+        self.btn_collapser.setIconSize(QSize(12, 12))
+        self.btn_collapser.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed,
+        )
+        # Stylistic tweak — left-align the text so the arrow + label hug
+        # the leading edge as a normal collapser would.
+        try:
+            self.btn_collapser.setStyleSheet(
+                "QToolButton#inspectorCollapser { "
+                "  text-align: left; padding: 4px 6px; font-weight: 600; "
+                "  color: #111827; "
+                "  border: none; background: transparent; "
+                "}"
+                "QToolButton#inspectorCollapser:hover { background: #eef2f7; }"
+                "QToolButton#inspectorCollapser:checked,"
+                "QToolButton#inspectorCollapser:pressed { color: #111827; }"
+            )
+        except Exception:  # pragma: no cover — defensive on Qt style failures
+            pass
+        root.addWidget(self.btn_collapser)
+
+        # ------- Collapser body (the two cards live here) -------
+        # 2026-06-22 卡片重组: the persistent-top body now hosts TWO independent
+        # white cards inside the collapser, replacing the previous single
+        # body that stacked both groups in one card:
+        #   ① _xaxis_card    — 横坐标 group + 「应用」 (semantics unchanged)
+        #   ② _range_card    — 时间范围 group; the host Inspector adds the
+        #                       FilterPanel here, below the range group, and the
+        #                       contextual 「绘图」 button submits both.
+        # The collapser still toggles both cards together. Card surfaces reuse
+        # the existing white-card QSS (objectName-keyed) so neither shows a
+        # default gray QFrame fill.
+        self._collapser_body = QFrame(self)
+        body_lay = QVBoxLayout(self._collapser_body)
+        self._body_lay = body_lay
+        body_lay.setContentsMargins(0, 0, 0, 0)
+        body_lay.setSpacing(6)
+        root.addWidget(self._collapser_body)
+
+        def _make_card(object_name):
+            card = QFrame(self._collapser_body)
+            card.setObjectName(object_name)
+            card.setAttribute(Qt.WA_StyledBackground, True)
+            card_lay = QVBoxLayout(card)
+            # 10px horizontal breathing room (matches the previous body inset)
+            # now lives inside each card so the white surface hugs the content.
+            card_lay.setContentsMargins(10, 6, 10, 8)
+            card_lay.setSpacing(6)
+            return card, card_lay
+
+        # ------- Card ①: Xaxis -------
+        self._xaxis_card, xaxis_card_lay = _make_card("timeXaxisCard")
+        g = QGroupBox("横坐标")
+        self._xaxis_group = g
+        fl = QFormLayout(g)
+        _configure_form(fl)
+        self._xaxis_form = fl
+        self._xlabel_auto_from_channel = False
+        self._curve_bound_xaxis_summary = ""
+        self.combo_xaxis = QComboBox()
+        self.combo_xaxis.addItems([
+            '自动(时间)', self._XAXIS_CHANNEL_LABEL,
+        ])
+        self.choice_xaxis = SegmentedChoice()
+        self.choice_xaxis.bind(self.combo_xaxis)
+        self.choice_xaxis.set_motion_policy(POLICY_LIGHT)
+        self._xaxis_source_label = QLabel("来源:")
+        fl.addRow(self._xaxis_source_label, _fit_field(self.choice_xaxis))
+        self._combo_xaxis_ch = SearchableComboBox()
+        self._combo_xaxis_ch.setEnabled(False)
+        fl.addRow("通道:", _fit_field(self._combo_xaxis_ch))
+        self.edit_xlabel = QWidget()
+        from PyQt5.QtWidgets import QLineEdit
+        self.edit_xlabel = QLineEdit()
+        self.edit_xlabel.setPlaceholderText("Time (s)")
+        fl.addRow("标签:", _fit_field(self.edit_xlabel))
+        self.btn_apply_xaxis = QPushButton("应用")
+        # Same quiet wash as 「在时域查看」: applying an axis label is not a
+        # primary compute action, so it does not take the solid accent fill.
+        self.btn_apply_xaxis.setProperty("role", "secondary")
+        fl.addRow(self.btn_apply_xaxis)
+        self._xaxis_drop_hint = self._build_xaxis_drop_hint()
+        fl.addRow(self._xaxis_drop_hint)
+        xaxis_card_lay.addWidget(g)
+        body_lay.addWidget(self._xaxis_card)
+
+        # ------- Card ②: Range (+ FilterPanel, mounted by Inspector) -------
+        self._range_card, range_card_lay = _make_card("timeRangeFilterCard")
+        self._range_card_lay = range_card_lay
+        # ------- Range group -------
+        g = QGroupBox("时间范围")
+        self._range_group = g
+        g.setToolTip("限制参与绘图、统计、单次分析和导出的时间窗口（单位：秒）。")
+        fl = QFormLayout(g)
+        _configure_form(fl)
+        self._range_form = fl
+        # Hidden boolean compatibility owner. Visible chrome is SegmentedChoice
+        # bound to combo_range; range_enabled() still reads this checkbox.
+        self.chk_range = QCheckBox("使用选定时间范围", self)
+        self.chk_range.setToolTip(
+            "勾选后，只使用开始到结束之间的数据；取消勾选则使用全时段。"
+        )
+        self.chk_range.hide()
+        # Hidden Home / full-conversion trigger. Tests and window still click it.
+        self.btn_range_max = QToolButton(self)
+        self.btn_range_max.setObjectName("inspectorRangeMax")
+        self.btn_range_max.setText("全部")
+        self.btn_range_max.setToolTip(self._TIME_RANGE_MAX_TIP)
+        self.btn_range_max.setAutoRaise(True)
+        self.btn_range_max.setCursor(Qt.PointingHandCursor)
+        self.btn_range_max.setStyleSheet(
+            "QToolButton#inspectorRangeMax { "
+            "  padding: 2px 8px; border: none; background: transparent; "
+            "  color: #2563eb; font-weight: 600; "
+            "}"
+            "QToolButton#inspectorRangeMax:hover { background: #eef2f7; }"
+        )
+        self.btn_range_max.hide()
+        self.combo_range = QComboBox(self)
+        self.combo_range.addItem("全时段")
+        self.combo_range.addItem("指定范围")
+        self.combo_range.setItemData(0, self._TIME_RANGE_FULL_TIP, Qt.ToolTipRole)
+        self.combo_range.setItemData(1, self._RANGE_SELECTED_TIP, Qt.ToolTipRole)
+        self.choice_range = SegmentedChoice()
+        self.choice_range.bind(self.combo_range)
+        self.choice_range.set_motion_policy(POLICY_LIGHT)
+        # Host row: visible 全时段 | 指定范围. Hidden chk_range / 全部 stay
+        # parented on PersistentTop so they occupy no layout space.
+        self._chk_range_host = QWidget()
+        self._chk_range_host.setObjectName("timeRangeToggleRow")
+        self._chk_range_host.setAutoFillBackground(False)
+        self._chk_range_host.setAttribute(Qt.WA_StyledBackground, False)
+        _chk_host_lay = QHBoxLayout(self._chk_range_host)
+        _chk_host_lay.setContentsMargins(0, 0, 0, 0)
+        _chk_host_lay.setSpacing(0)
+        _chk_host_lay.addWidget(
+            _fit_field(self.choice_range, align_right=False), 1,
+        )
+        # Use the regular field column, rather than a spanning row, so the
+        # dual-choice track begins on the same x-coordinate as the start/end
+        # editors in every mode that reparents this shared range group.
+        fl.addRow("", self._chk_range_host)
+        # 紧凑化【1】: 开始 / 结束 share one form row.
+        self.spin_start = _no_buttons(CompactDoubleSpinBox())
+        self.spin_start.setObjectName("timeRangeStart")
+        # Keep half this quantum aligned with DISPLAY_ENDPOINT_TOL; tested.
+        self.spin_start.setDecimals(12)
+        self.spin_start.setSuffix(" s")
+        self.spin_start.setRange(0, 1e9)
+        self.spin_start.setToolTip("时间范围起点，单位为秒。")
+        self.spin_end = _no_buttons(CompactDoubleSpinBox())
+        self.spin_end.setObjectName("timeRangeEnd")
+        self.spin_end.setDecimals(12)
+        self.spin_end.setSuffix(" s")
+        self.spin_end.setRange(0, 1e9)
+        self.spin_end.setToolTip("时间范围终点，单位为秒。")
+        self._range_row_host = _pair_field(
+            self.spin_start, "– 结束", self.spin_end,
+        )
+        fl.addRow("开始:", self._range_row_host)
+        self._range_status_host = QWidget()
+        self._range_status_host.setAutoFillBackground(False)
+        self._range_status_host.setAttribute(Qt.WA_StyledBackground, False)
+        _status_lay = QHBoxLayout(self._range_status_host)
+        _status_lay.setContentsMargins(0, 0, 0, 0)
+        _status_lay.setSpacing(0)
+        self.lbl_range_status = QLabel("")
+        self.lbl_range_status.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.lbl_range_status.setWordWrap(False)
+        self.lbl_range_status.setTextInteractionFlags(Qt.NoTextInteraction)
+        _status_color = QColor("#64748b")
+        _status_palette = self.lbl_range_status.palette()
+        _status_palette.setColor(QPalette.WindowText, _status_color)
+        self.lbl_range_status.setPalette(_status_palette)
+        _status_h = max(18, self.lbl_range_status.fontMetrics().height() + 4)
+        self.lbl_range_status.setFixedHeight(_status_h)
+        self._range_status_host.setFixedHeight(_status_h)
+        self._range_status_host.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed,
+        )
+        self.lbl_range_status.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed,
+        )
+        _status_lay.addWidget(self.lbl_range_status)
+        fl.addRow(self._range_status_host)
+        range_card_lay.addWidget(g)
+        body_lay.addWidget(self._range_card)
+
+        # ------- Tick density compatibility state -------
+        # The visible control moved to the chart toolbar popout. Keep these
+        # hidden spin boxes so existing view-state/project plumbing can keep
+        # using ``PersistentTop.tick_density()`` without a broad rewrite.
+        self.spin_xt = _no_buttons(QSpinBox(self))
+        self.spin_xt.setRange(3, 30)
+        default_x, default_y = DEFAULT_CHART_TICK_DENSITY
+        self.spin_xt.setValue(default_x)
+        self.spin_xt.setToolTip("X 轴主刻度的大致数量，范围 3–30。")
+        self.spin_xt.hide()
+        self.spin_yt = _no_buttons(QSpinBox(self))
+        self.spin_yt.setRange(3, 20)
+        self.spin_yt.setValue(default_y)
+        self.spin_yt.setToolTip("Y 轴主刻度的大致数量，范围 3–20。")
+        self.spin_yt.hide()
+
+        # Per-mode range-checkbox state. ``chk_range`` is a SINGLE hidden
+        # QCheckBox on PersistentTop; the visible range group (including
+        # SegmentedChoice) is reparented across time/fft/fft_time/order/frf
+        # by inspector._place_range_group_for_mode. Checked state must NOT
+        # leak between modes (e.g. an FFT time-window arming must not arrive
+        # checked when the user switches back to Time-Domain). We
+        # snapshot/restore the flag per mode so each mode keeps its own
+        # intent. Defaults to unchecked (全时段 / readonly) for every mode.
+        self._range_mode = 'time'
+        self._range_checked_by_mode = {}
+        self._range_silent = False
+        self._range_committed = None
+        self._range_limits = (0.0, 1e9)
+        self._range_edit_revision = 0
+        self._range_projected_revision = 0
+        self._range_flushed_revision = 0
+        self._range_user_editing = False
+        self._range_start_raw = None
+        self._range_end_raw = None
+        self._range_last_query = None
+
+        self._wire()
+        self._xaxis_section_visible = True
+        # Restore persisted collapser state (defaults to expanded).
+        try:
+            persisted = _preset_settings().value(self._SETTINGS_KEY, True)
+            # QSettings can return strings on some platforms.
+            if isinstance(persisted, str):
+                persisted = persisted.lower() in ("true", "1", "yes")
+            initial_expanded = bool(persisted)
+        except Exception:  # pragma: no cover
+            initial_expanded = True
+        self.btn_collapser.setChecked(initial_expanded)
+        self._sync_collapser(initial_expanded)
+        # 紧凑化【2】: apply initial conditional visibility once everything
+        # is wired (so a programmatic reset before show() also lands).
+        self._update_xaxis_channel_row_visible(self.combo_xaxis.currentIndex())
+        self._update_range_rows_visible()
+        self._sync_range_mode_chrome()
+        self._remember_committed_range()
+        if _settings_bool(
+            _preset_settings(), self._DROP_HINT_DISMISSED_KEY, False,
+        ):
+            self._set_xaxis_drop_hint_visible(False)
+
+        # 2026-04-26 R3 紧凑化 fix-3: cap the short numeric fields so toggling
+        # 时间范围 / 通道 visibility no longer makes the pane look wider.
+        # The label / xlabel fields keep room for representative text.
+        for sp in (self.spin_start, self.spin_end, self.spin_xt, self.spin_yt):
+            sp.setMaximumWidth(_SHORT_FIELD_MAX_WIDTH)
+        # Long-text fields: xaxis source combo + label LineEdit may host
+        # representative text; keep a generous (but not unbounded) cap.
+        for w in (
+            self.choice_xaxis, self.choice_range,
+            self._combo_xaxis_ch, self.edit_xlabel,
+        ):
+            w.setMaximumWidth(_LONG_FIELD_MAX_WIDTH)
+
+    def _wire(self):
+        self.combo_xaxis.currentIndexChanged.connect(
+            lambda i: self._combo_xaxis_ch.setEnabled(i == 1)
+        )
+        # 紧凑化【2】: hide (not just disable) the 通道 row when 自动(时间).
+        self.combo_xaxis.currentIndexChanged.connect(
+            self._update_xaxis_channel_row_visible
+        )
+        self.chk_range.toggled.connect(self._update_range_rows_visible)
+        self.combo_range.currentIndexChanged.connect(
+            self._on_range_mode_combo_changed
+        )
+        # 「全部」只转发信号；MainWindow 负责按当前模式复位视口。隐藏后仍可被
+        # 测试 / Home 方法链点击。
+        self.btn_range_max.clicked.connect(self.max_range_requested)
+        self.spin_start.editingFinished.connect(self._on_range_editing_finished)
+        self.spin_end.editingFinished.connect(self._on_range_editing_finished)
+        start_edit = self.spin_start.lineEdit()
+        end_edit = self.spin_end.lineEdit()
+        if start_edit is not None:
+            start_edit.textEdited.connect(
+                partial(self._on_range_text_edited, "start")
+            )
+        if end_edit is not None:
+            end_edit.textEdited.connect(
+                partial(self._on_range_text_edited, "end")
+            )
+        self.spin_start.valueChanged.connect(
+            partial(self._on_range_value_changed, "start")
+        )
+        self.spin_end.valueChanged.connect(
+            partial(self._on_range_value_changed, "end")
+        )
+        self.btn_apply_xaxis.clicked.connect(self.xaxis_apply_requested)
+        self.btn_xaxis_drop_hint_close.clicked.connect(
+            self._dismiss_xaxis_drop_hint
+        )
+        self.spin_xt.valueChanged.connect(self._emit_ticks)
+        self.spin_yt.valueChanged.connect(self._emit_ticks)
+        # Sync label field when user changes channel selection interactively.
+        # blockSignals during restore/repopulate suppresses this correctly.
+        self._combo_xaxis_ch.currentIndexChanged.connect(self._sync_xlabel_from_channel)
+        self.combo_xaxis.currentIndexChanged.connect(self._sync_xlabel_for_xaxis_mode)
+        self.edit_xlabel.textEdited.connect(
+            lambda _text: setattr(self, '_xlabel_auto_from_channel', False)
+        )
+        # R3 #6: collapser toggle reveals/hides the inner three groups
+        # and persists the choice via QSettings.
+        self.btn_collapser.toggled.connect(self._sync_collapser)
+
+    def _build_xaxis_drop_hint(self):
+        """Dismissible tip under 「应用」: drag a channel onto the X band."""
+        frame = WrappedHintFrame()
+        frame.setObjectName("xaxisDropHint")
+        frame.setAttribute(Qt.WA_StyledBackground, True)
+        lay = QHBoxLayout(frame)
+        lay.setContentsMargins(8, 6, 4, 6)
+        lay.setSpacing(4)
+        label = QLabel(hints.XAXIS_DROP_PANEL_HINT)
+        label.setObjectName("xaxisDropHintText")
+        label.setWordWrap(True)
+        label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._xaxis_drop_hint_label = label
+        close_btn = QToolButton()
+        close_btn.setObjectName("xaxisDropHintClose")
+        close_btn.setAutoRaise(True)
+        close_btn.setText("×")
+        close_btn.setFixedSize(18, 18)
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setFocusPolicy(Qt.NoFocus)
+        close_btn.setToolTip("关闭此提示")
+        close_btn.setAccessibleName("关闭横坐标拖放提示")
+        self.btn_xaxis_drop_hint_close = close_btn
+        lay.addWidget(label, 1)
+        lay.addWidget(close_btn, 0, Qt.AlignTop)
+        return frame
+
+    def _dismiss_xaxis_drop_hint(self):
+        self._set_xaxis_drop_hint_visible(False)
+        _preset_settings().setValue(self._DROP_HINT_DISMISSED_KEY, True)
+        self.xaxis_drop_hint_dismissed.emit()
+
+    def _set_xaxis_drop_hint_visible(self, visible):
+        _set_form_row_visible(
+            self._xaxis_form, self._xaxis_drop_hint, bool(visible),
+        )
+
+    def _sync_collapser(self, expanded):
+        """Apply the collapser state to the body widget and arrow icon,
+        then persist the choice. Safe to call before show().
+        """
+        expanded = bool(expanded)
+        self._collapser_body.setVisible(expanded)
+        self.btn_collapser.setArrowType(Qt.NoArrow)
+        self.btn_collapser.setIcon(
+            inspector_chevron_icon(
+                self.btn_collapser, 90.0 if expanded else 0.0,
+            )
+        )
+        try:
+            _preset_settings().setValue(self._SETTINGS_KEY, expanded)
+        except Exception:  # pragma: no cover
+            pass
+
+    def set_xaxis_section_visible(self, visible):
+        """Show/hide the global custom-X controls for modes that use them."""
+        self._xaxis_section_visible = bool(visible)
+        self._xaxis_group.setVisible(self._xaxis_section_visible)
+        text = (
+            "图表设置 (横坐标 · 时间范围)"
+            if self._xaxis_section_visible
+            else "图表设置 (时间范围)"
+        )
+        self.btn_collapser.setText(text)
+
+    def range_group(self):
+        return self._range_group
+
+    def range_group_layout(self):
+        # 2026-06-22 卡片重组: the range group's home in time mode is now the
+        # 时间范围·滤波 card's layout (was self._body_lay). The contextual modes
+        # still reparent the group out via inspector._place_range_group_for_mode.
+        return self._range_card_lay
+
+    def xaxis_card(self):
+        return self._xaxis_card
+
+    def range_card(self):
+        return self._range_card
+
+    def range_card_layout(self):
+        return self._range_card_lay
+
+    def set_range_group_embedded(self, embedded):
+        self._range_group.setTitle("分析时间" if embedded else "时间范围")
+        self._sync_range_mode_chrome()
+
+    def _sync_range_mode_chrome(self):
+        analysis = self._range_mode != "time"
+        self.btn_range_max.setToolTip(
+            self._ANALYSIS_RANGE_MAX_TIP if analysis else self._TIME_RANGE_MAX_TIP
+        )
+        full_tip = (
+            self._ANALYSIS_RANGE_FULL_TIP if analysis else self._TIME_RANGE_FULL_TIP
+        )
+        self.combo_range.setItemData(0, full_tip, Qt.ToolTipRole)
+        self.combo_range.setItemData(1, self._RANGE_SELECTED_TIP, Qt.ToolTipRole)
+        self.choice_range.refresh_from_bound_combo()
+        _set_form_row_visible(
+            self._range_form, self._range_status_host, analysis,
+        )
+
+    def set_range_intent_status(
+        self, kind, *, needs_review=False, errors=(), notes=(),
+    ):
+        """Project reserved-height status from a TimeRangeIntent.
+
+        Window projection (``_project_top_from_time_range_intent``) is the
+        only production caller. Switching kinds must not change row height.
+        Mixin supplies kind / review / errors / notes; this widget only
+        maps them to user-visible copy.
+        """
+        key = str(kind or "full")
+        extra_errors = tuple(item for item in (errors or ()) if item)
+        extra_notes = tuple(item for item in (notes or ()) if item)
+        if needs_review:
+            text = self._RANGE_STATUS_TEXT["review"]
+        elif key == "draft":
+            text = self._RANGE_STATUS_TEXT["draft"]
+        elif key in ("invalid", "unavailable"):
+            text = self._RANGE_STATUS_TEXT.get(key, "")
+        else:
+            text = extra_notes[0] if extra_notes else self._RANGE_STATUS_TEXT.get(
+                key, ""
+            )
+        self.lbl_range_status.setText(text)
+        tip_parts = []
+        if text:
+            tip_parts.append(text)
+        if needs_review or key in ("invalid", "unavailable"):
+            for item in extra_errors:
+                if item not in tip_parts:
+                    tip_parts.append(str(item))
+        for item in extra_notes:
+            if item not in tip_parts:
+                tip_parts.append(str(item))
+        self.lbl_range_status.setToolTip("\n".join(tip_parts))
+
+    def range_intent_status_text(self):
+        return self.lbl_range_status.text()
+
+    def _sync_xlabel_from_channel(self, idx):
+        if idx < 0:
+            return
+        data = self._combo_xaxis_ch.itemData(idx)
+        if data is not None:
+            try:
+                _resolver, _fid, ch = data
+            except (TypeError, ValueError):
+                return
+            self.edit_xlabel.setText(ch)
+            self._xlabel_auto_from_channel = True
+
+    def _sync_xlabel_for_xaxis_mode(self, idx):
+        if idx == 1:
+            self._sync_xlabel_from_channel(self._combo_xaxis_ch.currentIndex())
+            return
+        if self._xlabel_auto_from_channel:
+            self.edit_xlabel.clear()
+            self._xlabel_auto_from_channel = False
+
+    def _update_xaxis_channel_row_visible(self, index):
+        _set_form_row_visible(self._xaxis_form, self._combo_xaxis_ch, index == 1)
+
+    def _on_range_mode_combo_changed(self, index):
+        """User segment click: write the compatibility checkbox once."""
+        enabled = int(index) == 1
+        if self.chk_range.isChecked() != enabled:
+            self.chk_range.setChecked(enabled)
+            return
+        self._project_range_mode_from_checkbox()
+
+    def _update_range_rows_visible(self):
+        _set_form_row_visible(self._range_form, self._range_row_host, True)
+        self._project_range_mode_from_checkbox()
+
+    def _project_range_mode_from_checkbox(self):
+        """Project combo index and spin readonly from chk_range truth."""
+        enabled = bool(self.chk_range.isChecked())
+        want = 1 if enabled else 0
+        old = self.combo_range.blockSignals(True)
+        try:
+            self.combo_range.setCurrentIndex(want)
+        finally:
+            self.combo_range.blockSignals(old)
+        self.choice_range.sync_from_bound_combo()
+        self._apply_range_fields_readonly(readonly=not enabled)
+
+    def _apply_range_fields_readonly(self, *, readonly):
+        readonly = bool(readonly)
+        for spin in (self.spin_start, self.spin_end):
+            if spin.isReadOnly() != readonly:
+                spin.setReadOnly(readonly)
+            spin.setProperty("readOnly", readonly)
+            style = spin.style()
+            if style is None:
+                continue
+            style.unpolish(spin)
+            style.polish(spin)
+            edit = spin.lineEdit()
+            if edit is not None:
+                style.unpolish(edit)
+                style.polish(edit)
+            spin.update()
+
+    def _emit_ticks(self):
+        self.tick_density_changed.emit(self.spin_xt.value(), self.spin_yt.value())
+
+    # ---- public getters/setters used by MainWindow ----
+    def xaxis_mode(self):
+        return 'channel' if self.combo_xaxis.currentIndex() == 1 else 'time'
+
+    def set_xaxis_mode(self, mode):
+        self.combo_xaxis.setCurrentIndex(1 if mode == 'channel' else 0)
+
+    def set_curve_bound_xaxis_summary(self, summary=None):
+        """Project exact per-curve X ownership without inventing a global X.
+
+        ``curve_bindings`` can give different curves different X records, so
+        neither 自动(时间) nor one editable ordinary channel is truthful.  The
+        existing second segment becomes a read-only ``曲线自带`` projection;
+        clearing the projection restores the ordinary editable control.
+        """
+        text = str(summary or "").strip()
+        bound = bool(text)
+        self._curve_bound_xaxis_summary = text
+        tip = hints.XAXIS_CURVE_BOUND_HINT if bound else ""
+        old_mode = self.combo_xaxis.blockSignals(True)
+        try:
+            self.combo_xaxis.setItemText(
+                1,
+                self._XAXIS_BOUND_LABEL if bound
+                else self._XAXIS_CHANNEL_LABEL,
+            )
+            self.combo_xaxis.setItemData(1, tip, Qt.ToolTipRole)
+            if bound:
+                self.set_xaxis_candidates(((text, None),))
+                self.combo_xaxis.setCurrentIndex(1)
+        finally:
+            self.combo_xaxis.blockSignals(old_mode)
+        self.choice_xaxis.refresh_from_bound_combo()
+        self.choice_xaxis.setEnabled(not bound)
+        self.choice_xaxis.setToolTip(tip)
+        self._xaxis_source_label.setToolTip(tip)
+        self._combo_xaxis_ch.setEnabled(False if bound else self.xaxis_mode() == 'channel')
+        self._combo_xaxis_ch.setToolTip(tip)
+        self.edit_xlabel.setEnabled(not bound)
+        self.btn_apply_xaxis.setEnabled(not bound)
+        self.btn_apply_xaxis.setToolTip(tip)
+        self._update_xaxis_channel_row_visible(self.combo_xaxis.currentIndex())
+
+    def curve_bound_xaxis_summary(self):
+        return self._curve_bound_xaxis_summary
+
+    def xaxis_channel_data(self):
+        """Return ``(resolver, fid, channel)`` tagged triple or ``None``."""
+        if self.combo_xaxis.currentIndex() != 1:
+            return None
+        return self._combo_xaxis_ch.currentData()
+
+    def xaxis_label(self):
+        return self.edit_xlabel.text().strip()
+
+    def xaxis_label_origin(self):
+        return "auto" if self._xlabel_auto_from_channel else "user"
+
+    def set_xaxis_label(self, text, *, auto_from_channel=None):
+        """Project an X-axis label, optionally preserving its provenance.
+
+        Programmatic Custom-X restore/drop paths do not emit ``textEdited``.
+        They must therefore state whether the displayed label was generated
+        from the selected channel, so the first switch back to time can clear
+        only that generated value and retain a user-entered title.
+        """
+        self.edit_xlabel.setText("" if text is None else str(text))
+        if auto_from_channel is not None:
+            self._xlabel_auto_from_channel = bool(auto_from_channel)
+
+    def set_xaxis_channel_data(self, payload):
+        """Select the Inspector candidate whose tagged triple equals ``payload``."""
+        if payload is None:
+            return False
+        for i in range(self._combo_xaxis_ch.count()):
+            if self._combo_xaxis_ch.itemData(i) == payload:
+                self._combo_xaxis_ch.setCurrentIndex(i)
+                return True
+        return False
+
+    def set_xaxis_candidates(self, candidates):
+        """Set ``(display_text, (resolver, fid, channel))`` candidates."""
+        prev = self._combo_xaxis_ch.currentData()
+        self._combo_xaxis_ch.blockSignals(True)
+        _le = self._combo_xaxis_ch.lineEdit()
+        _old_le = _le.blockSignals(True) if _le is not None else False
+        try:
+            self._combo_xaxis_ch.clear()
+            keep_idx = -1
+            for i, (text, data) in enumerate(candidates):
+                self._combo_xaxis_ch.addItem(text, data)
+                if prev is not None and data == prev:
+                    keep_idx = i
+            if keep_idx >= 0:
+                self._combo_xaxis_ch.setCurrentIndex(keep_idx)
+        finally:
+            self._combo_xaxis_ch.blockSignals(False)
+            if _le is not None:
+                _le.blockSignals(_old_le)
+        # Fresh population (no previous match): auto-fill label if empty.
+        if keep_idx < 0 and self._combo_xaxis_ch.count() > 0 and not self.edit_xlabel.text():
+            self._sync_xlabel_from_channel(0)
+
+    def range_enabled(self):
+        return self.chk_range.isChecked()
+
+    def set_range_enabled(self, enabled, *, silent=False):
+        """Set full vs selected range. Checkbox is truth; combo/readonly project.
+
+        ``silent=True`` blocks user ``toggled`` and explicitly syncs checkbox,
+        combo, and spinbox readonly. Callers that restore or project must use
+        silent mode so window._on_time_range_enabled_changed does not fire.
+        """
+        enabled = bool(enabled)
+        self._range_checked_by_mode[self._range_mode] = enabled
+        if silent:
+            old = self.chk_range.blockSignals(True)
+            try:
+                self.chk_range.setChecked(enabled)
+            finally:
+                self.chk_range.blockSignals(old)
+            self._project_range_mode_from_checkbox()
+            return
+        if self.chk_range.isChecked() != enabled:
+            self.chk_range.setChecked(enabled)
+            return
+        self._project_range_mode_from_checkbox()
+
+    def range_values(self):
+        # Projection text is not storage: an untouched endpoint keeps the
+        # physical source precision even beyond the editor's decimal limit.
+        spins = (self.spin_start, self.spin_end)
+        raw = (self._range_start_raw, self._range_end_raw)
+        return tuple(
+            self._range_committed[idx]
+            if self._range_committed is not None and raw[idx] is None
+            else spin.value()
+            for idx, spin in enumerate(spins)
+        )
+
+    def last_range_edit_query(self):
+        return self._range_last_query
+
+    def _remember_committed_range(self, values=None):
+        if values is None:
+            values = (self.spin_start.value(), self.spin_end.value())
+        self._range_committed = tuple(float(value) for value in values)
+        for label, spin, value in zip(
+            ("起点", "终点"), (self.spin_start, self.spin_end),
+            self._range_committed,
+        ):
+            spin.setToolTip(
+                f"当前时间范围{label}：{value!r} 秒。\n"
+                "支持小数秒；仅修改一端会保留另一端的完整精度。"
+            )
+
+    def _spin_raw_text(self, spin):
+        edit = spin.lineEdit()
+        if edit is not None:
+            return edit.text()
+        return spin.cleanText()
+
+    def _parse_spin_text(self, spin, text):
+        raw = "" if text is None else str(text)
+        state, _, _ = spin.validate(raw, 0)
+        if state != QValidator.Acceptable:
+            return None
+        try:
+            value = float(spin.valueFromText(raw))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value):
+            return None
+        return value
+
+    def _visible_range_text_is_unacceptable(self):
+        return not (
+            self.spin_start.hasAcceptableInput()
+            and self.spin_end.hasAcceptableInput()
+        )
+
+    def _clear_user_range_edit(self, *, projected=False):
+        self._range_user_editing = False
+        self._range_start_raw = None
+        self._range_end_raw = None
+        if projected:
+            self._range_projected_revision = self._range_edit_revision
+            self._range_flushed_revision = self._range_edit_revision
+
+    def _mark_user_range_edit(self, which, text):
+        raw = "" if text is None else str(text)
+        if which == "start":
+            self._range_start_raw = raw
+        else:
+            self._range_end_raw = raw
+        if not self._range_user_editing:
+            self._range_user_editing = True
+            self._range_edit_revision += 1
+
+    def _on_range_text_edited(self, which, text):
+        if self._range_silent:
+            return
+        self._mark_user_range_edit(which, text)
+
+    def _on_range_value_changed(self, which, _value):
+        if self._range_silent:
+            return
+        raw = self._range_start_raw if which == "start" else self._range_end_raw
+        spin = self.spin_start if which == "start" else self.spin_end
+        # Qt may correct Intermediate text on focus-out. Preserve that
+        # invalid draft, but allow successive keyboard/wheel steps to update.
+        if raw is not None and self._parse_spin_text(spin, raw) is None:
+            return
+        self._mark_user_range_edit(which, self._spin_raw_text(spin))
+
+    def _adopt_untracked_invalid_visible_text(self):
+        """Treat currently unacceptable text as an edit if nothing tracked it.
+
+        ``setText('-')`` does not emit ``textEdited``. Compute still must not
+        interpret that Intermediate state as the last valid value.
+        """
+        if self._range_silent or self._range_user_editing:
+            return
+        if not self._visible_range_text_is_unacceptable():
+            return
+        if (
+            self._range_last_query is not None
+            and self._range_last_query.status == RangeEditQuery.INVALID_EDIT
+            and self._range_flushed_revision == self._range_edit_revision
+        ):
+            return
+        self._range_user_editing = True
+        self._range_edit_revision += 1
+        if not self.spin_start.hasAcceptableInput():
+            self._range_start_raw = self._spin_raw_text(self.spin_start)
+        if not self.spin_end.hasAcceptableInput():
+            self._range_end_raw = self._spin_raw_text(self.spin_end)
+
+    def query_range_edit(self):
+        """Return unchanged / valid_edit / invalid_edit plus revision."""
+        self._adopt_untracked_invalid_visible_text()
+        start_text = (
+            self._range_start_raw
+            if self._range_start_raw is not None
+            else self._spin_raw_text(self.spin_start)
+        )
+        end_text = (
+            self._range_end_raw
+            if self._range_end_raw is not None
+            else self._spin_raw_text(self.spin_end)
+        )
+        if not self._range_user_editing:
+            return RangeEditQuery(
+                RangeEditQuery.UNCHANGED,
+                self._range_edit_revision,
+                None,
+                start_text,
+                end_text,
+            )
+        lo = (
+            self._range_committed[0] if self._range_start_raw is None
+            else self._parse_spin_text(self.spin_start, start_text)
+        )
+        hi = (
+            self._range_committed[1] if self._range_end_raw is None
+            else self._parse_spin_text(self.spin_end, end_text)
+        )
+        pair = (lo, hi) if lo is not None and hi is not None else None
+        if pair is None:
+            return RangeEditQuery(
+                RangeEditQuery.INVALID_EDIT,
+                self._range_edit_revision,
+                None,
+                start_text,
+                end_text,
+            )
+        if pair[1] <= pair[0]:
+            return RangeEditQuery(
+                RangeEditQuery.INVALID_EDIT,
+                self._range_edit_revision,
+                pair,
+                start_text,
+                end_text,
+            )
+        return RangeEditQuery(
+            RangeEditQuery.VALID_EDIT,
+            self._range_edit_revision,
+            pair,
+            start_text,
+            end_text,
+        )
+
+    def _restore_raw_range_texts(self, start_text, end_text):
+        self._range_silent = True
+        try:
+            start_edit = self.spin_start.lineEdit()
+            end_edit = self.spin_end.lineEdit()
+            if start_edit is not None and start_text is not None:
+                if start_edit.text() != start_text:
+                    start_edit.setText(start_text)
+            if end_edit is not None and end_text is not None:
+                if end_edit.text() != end_text:
+                    end_edit.setText(end_text)
+        finally:
+            self._range_silent = False
+
+    def flush_pending_range_edit(self, *, emit=True):
+        """Commit a real uncommitted edit once per revision.
+
+        Does not call ``interpretText()`` first. Invalid / Intermediate text
+        stays an invalid edit; it is never replaced by the fallback
+        ``value()``. Unchanged focus-out is silent. Same revision is
+        idempotent.
+        """
+        if self._range_silent:
+            return None
+        query = self.query_range_edit()
+        if query.status == RangeEditQuery.UNCHANGED:
+            return None
+        if (
+            query.revision == self._range_flushed_revision
+            and not self._range_user_editing
+        ):
+            return None
+        self._range_flushed_revision = query.revision
+        self._range_last_query = query
+        self._range_user_editing = False
+        if query.status == RangeEditQuery.INVALID_EDIT:
+            self._restore_raw_range_texts(query.start_text, query.end_text)
+            if emit:
+                self.range_edit_invalid.emit()
+            return None
+        lo, hi = query.span
+        self._range_silent = True
+        old_start = self.spin_start.blockSignals(True)
+        old_end = self.spin_end.blockSignals(True)
+        try:
+            self.spin_start.setValue(float(lo))
+            self.spin_end.setValue(float(hi))
+        finally:
+            self.spin_start.blockSignals(old_start)
+            self.spin_end.blockSignals(old_end)
+            self._remember_committed_range((lo, hi))
+            self._range_silent = False
+        self._range_start_raw = None
+        self._range_end_raw = None
+        if emit:
+            self.range_edited.emit(float(lo), float(hi))
+        return (float(lo), float(hi))
+
+    def _on_range_editing_finished(self):
+        if self._range_silent:
+            return
+        self.flush_pending_range_edit(emit=True)
+
+    def set_range_values(self, xmin, xmax):
+        self._range_silent = True
+        old_start = self.spin_start.blockSignals(True)
+        old_end = self.spin_end.blockSignals(True)
+        try:
+            self.spin_start.setValue(float(xmin))
+            self.spin_end.setValue(float(xmax))
+        finally:
+            self.spin_start.blockSignals(old_start)
+            self.spin_end.blockSignals(old_end)
+            self._remember_committed_range(tuple(
+                min(max(float(value), self._range_limits[0]), self._range_limits[1])
+                for value in (xmin, xmax)
+            ))
+            self._clear_user_range_edit(projected=True)
+            self._range_silent = False
+
+    def set_range_from_span(self, xmin, xmax):
+        # Explicit arming path (compute confirm, tests). Stages start/end AND
+        # enables the range filter. This is not a user spin commit — callers
+        # that persist analysis intent must ``note_enabled`` themselves.
+        # Preview pan/zoom must not call this or ``set_range_values``.
+        self.set_range_values(xmin, xmax)
+        self.set_range_enabled(True, silent=True)
+
+    def checkout_range_for_mode(self, mode):
+        """Snapshot the outgoing mode's range-checkbox state and restore the
+        incoming mode's. Called by inspector._place_range_group_for_mode on
+        every mode switch so the SINGLE shared ``chk_range`` instance carries
+        per-mode intent instead of leaking a force-checked state across modes.
+
+        Restoring is silent: the mode switch drives its own replot pipeline,
+        and main_window wires ``chk_range.toggled`` to a replot slot that must
+        not fire spuriously here.
+        """
+        if mode == self._range_mode:
+            return
+        # Save current mode's state before leaving it. Applying a restored
+        # analysis view can seed the target mode before its card is visible;
+        # a same-mode checkout must not overwrite that seed with the still
+        # displayed previous checkbox value.
+        self._range_checked_by_mode[self._range_mode] = self.chk_range.isChecked()
+        target = bool(self._range_checked_by_mode.get(mode, False))
+        self._range_mode = mode
+        self.set_range_enabled(target, silent=True)
+        self._sync_range_mode_chrome()
+
+    def set_range_limits(self, lo, hi):
+        # F14: setRange may clamp the current value and emit valueChanged.
+        # Treat clamp as programmatic so it cannot look like a user commit.
+        values = self.range_values()
+        self._range_limits = (float(lo), max(float(lo), float(hi)))
+        lo, hi = self._range_limits
+        self._range_silent = True
+        try:
+            for sp in (self.spin_start, self.spin_end):
+                old = sp.blockSignals(True)
+                try:
+                    sp.setRange(lo, hi)
+                finally:
+                    sp.blockSignals(old)
+        finally:
+            self._remember_committed_range(
+                tuple(min(max(value, lo), hi) for value in values)
+            )
+            self._clear_user_range_edit(projected=True)
+            self._range_silent = False
+
+    def tick_density(self):
+        return (self.spin_xt.value(), self.spin_yt.value())

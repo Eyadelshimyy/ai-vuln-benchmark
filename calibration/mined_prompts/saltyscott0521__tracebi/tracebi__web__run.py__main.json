@@ -1,0 +1,28 @@
+{
+  "repo": "saltyscott0521__tracebi",
+  "file": "tracebi/web/run.py",
+  "function": "main",
+  "line": 31,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main() -> None:\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main() -> None:\n    parser = argparse.ArgumentParser(description=\"TraceBi API dev server\")\n    parser.add_argument(\"--host\", default=\"127.0.0.1\")\n    parser.add_argument(\"--port\", type=int, default=8000)\n    parser.add_argument(\"--no-reload\", action=\"store_true\")\n    args = parser.parse_args()\n\n    _ensure_importable()\n\n    try:\n        import uvicorn\n    except ImportError:\n        print(\"uvicorn is required:  pip install uvicorn\")\n        sys.exit(1)\n\n    uvicorn.run(\n        \"tracebi.web.api.main:app\",\n        host=args.host,\n        port=args.port,\n        reload=not args.no_reload,\n    )",
+  "module_source": "\"\"\"\nDevelopment entrypoint for the TraceBi web API.\n\n    python -m tracebi.web.run            # default port 8000, hot-reload on\n    python -m tracebi.web.run --port 9000\n\nProduction (e.g. Docker):\n    uvicorn tracebi.web.api.main:app --host 0.0.0.0 --port 8000 --workers 4\n\"\"\"\n\nimport argparse\nimport sys\nimport os\n\n\ndef _ensure_importable() -> None:\n    \"\"\"Make ``tracebi.web.api.main`` resolvable when run as a plain script.\n\n    ``python -m tracebi.web.run`` already has the package on sys.path.\n    ``python tracebi/web/run.py`` does not \u2014 sys.path[0] is this directory \u2014\n    so add the repo root, which is three levels up from here.\n    \"\"\"\n    if \"tracebi\" in sys.modules:\n        return\n    root = os.path.dirname(\n        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\n    )\n    sys.path.insert(0, root)\n\n\ndef main() -> None:\n    parser = argparse.ArgumentParser(description=\"TraceBi API dev server\")\n    parser.add_argument(\"--host\", default=\"127.0.0.1\")\n    parser.add_argument(\"--port\", type=int, default=8000)\n    parser.add_argument(\"--no-reload\", action=\"store_true\")\n    args = parser.parse_args()\n\n    _ensure_importable()\n\n    try:\n        import uvicorn\n    except ImportError:\n        print(\"uvicorn is required:  pip install uvicorn\")\n        sys.exit(1)\n\n    uvicorn.run(\n        \"tracebi.web.api.main:app\",\n        host=args.host,\n        port=args.port,\n        reload=not args.no_reload,\n    )\n\n\nif __name__ == \"__main__\":\n    main()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 21
+    },
+    "ai_commit": "6c2e431eb8c7",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 1.0,
+    "span": [
+      31,
+      51
+    ]
+  }
+}

@@ -1,0 +1,58 @@
+[
+  {
+    "file": "../calibration/python_handbuilt/cmdi/safe_2.py",
+    "rule_id": "semgrep_rules.py-cmdi-subprocess-shell-true",
+    "cwe": "CWE-78",
+    "line": 19,
+    "message": "subprocess call uses shell=True with a command string built from a variable. This runs the string through /bin/sh, so shell metacharacters (; | & $() `` ) in the variable are interpreted, not treated as literal text. Use shell=False with an argument list."
+  },
+  {
+    "file": "../calibration/python_handbuilt/cmdi/vulnerable_1.py",
+    "rule_id": "semgrep_rules.py-cmdi-os-system",
+    "cwe": "CWE-78",
+    "line": 20,
+    "message": "os.system() runs its argument through the shell. If any part of the command string is built from a variable, this is OS command injection. Use subprocess.run([...], shell=False) with an argument list instead."
+  },
+  {
+    "file": "../calibration/python_handbuilt/cmdi/vulnerable_2.py",
+    "rule_id": "semgrep_rules.py-cmdi-subprocess-shell-true",
+    "cwe": "CWE-78",
+    "line": 14,
+    "message": "subprocess call uses shell=True with a command string built from a variable. This runs the string through /bin/sh, so shell metacharacters (; | & $() `` ) in the variable are interpreted, not treated as literal text. Use shell=False with an argument list."
+  },
+  {
+    "file": "../calibration/python_handbuilt/path_traversal/safe_2.py",
+    "rule_id": "semgrep_rules.py-path-traversal-join-open",
+    "cwe": "CWE-22",
+    "line": 15,
+    "message": "A file path is built by joining a base directory with a variable and then opened. If the variable can contain \"../\" segments or an absolute path and is not validated/contained beforehand, this is path traversal. Confirm whether the code checks the resolved path stays inside the base directory (e.g. os.path.realpath + os.path.commonpath) before this point."
+  },
+  {
+    "file": "../calibration/python_handbuilt/path_traversal/vulnerable_1.py",
+    "rule_id": "semgrep_rules.py-path-traversal-join-open",
+    "cwe": "CWE-22",
+    "line": 18,
+    "message": "A file path is built by joining a base directory with a variable and then opened. If the variable can contain \"../\" segments or an absolute path and is not validated/contained beforehand, this is path traversal. Confirm whether the code checks the resolved path stays inside the base directory (e.g. os.path.realpath + os.path.commonpath) before this point."
+  },
+  {
+    "file": "../calibration/python_handbuilt/path_traversal/vulnerable_2.py",
+    "rule_id": "semgrep_rules.py-path-traversal-fstring-open",
+    "cwe": "CWE-22",
+    "line": 15,
+    "message": "A file path is built with an f-string containing a variable and then opened, with no visible containment check. Confirm the variable can't introduce \"../\" segments or an absolute path."
+  },
+  {
+    "file": "../calibration/python_handbuilt/sqli/vulnerable_1.py",
+    "rule_id": "semgrep_rules.py-sqli-string-concat",
+    "cwe": "CWE-89",
+    "line": 33,
+    "message": "A SQL query is built with string concatenation ('+') that includes a variable. If any part of that variable is influenced by untrusted input, this is SQL injection. Use parameterized queries instead (cursor.execute(query, params))."
+  },
+  {
+    "file": "../calibration/python_handbuilt/sqli/vulnerable_2.py",
+    "rule_id": "semgrep_rules.py-sqli-fstring-or-format",
+    "cwe": "CWE-89",
+    "line": 29,
+    "message": "A SQL query is built with an f-string or .format()/\uff05 formatting containing a variable. This interpolates the variable's value directly into SQL syntax. Use parameterized queries instead."
+  }
+]

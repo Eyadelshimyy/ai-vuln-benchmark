@@ -1,0 +1,142 @@
+[
+  {
+    "full_name": "BerriAI/litellm",
+    "clone_url": "https://github.com/BerriAI/litellm.git",
+    "tools": [
+      "devin"
+    ],
+    "ai_commit_hits": 7,
+    "stars": 61097,
+    "language": "Python",
+    "pushed_at": "2026-10-13T02:00:23Z",
+    "archived": false,
+    "fork": false,
+    "size_kb": 2237360
+  },
+  {
+    "full_name": "Neotech3000/led-matrix",
+    "clone_url": "https://github.com/Neotech3000/led-matrix.git",
+    "tools": [
+      "cursor"
+    ],
+    "ai_commit_hits": 4,
+    "stars": 2,
+    "language": "Python",
+    "pushed_at": "2026-10-13T01:43:51Z",
+    "archived": false,
+    "fork": false,
+    "size_kb": 442
+  },
+  {
+    "full_name": "nthplusio/skills",
+    "clone_url": "https://github.com/nthplusio/skills.git",
+    "tools": [
+      "cursor"
+    ],
+    "ai_commit_hits": 4,
+    "stars": 0,
+    "language": "Python",
+    "pushed_at": "2026-10-13T01:59:45Z",
+    "archived": false,
+    "fork": false,
+    "size_kb": 871
+  },
+  {
+    "full_name": "shizukutanaka/Slice",
+    "clone_url": "https://github.com/shizukutanaka/Slice.git",
+    "tools": [
+      "devin"
+    ],
+    "ai_commit_hits": 3,
+    "stars": 0,
+    "language": "Python",
+    "pushed_at": "2026-10-13T00:35:29Z",
+    "archived": false,
+    "fork": false,
+    "size_kb": 3798
+  },
+  {
+    "full_name": "ckoutz/gud-vector-agent-suite",
+    "clone_url": "https://github.com/ckoutz/gud-vector-agent-suite.git",
+    "tools": [
+      "devin"
+    ],
+    "ai_commit_hits": 2,
+    "stars": 0,
+    "language": "Python",
+    "pushed_at": "2026-10-13T01:46:02Z",
+    "archived": false,
+    "fork": false,
+    "size_kb": 2976
+  },
+  {
+    "full_name": "saltyscott0521/tracebi",
+    "clone_url": "https://github.com/saltyscott0521/tracebi.git",
+    "tools": [
+      "cursor"
+    ],
+    "ai_commit_hits": 2,
+    "stars": 0,
+    "language": "Python",
+    "pushed_at": "2026-10-13T01:45:03Z",
+    "archived": false,
+    "fork": false,
+    "size_kb": 8790
+  },
+  {
+    "full_name": "VocaHQ/vocalinux",
+    "clone_url": "https://github.com/VocaHQ/vocalinux.git",
+    "tools": [
+      "devin"
+    ],
+    "ai_commit_hits": 1,
+    "stars": 933,
+    "language": "Python",
+    "pushed_at": "2026-10-13T01:10:44Z",
+    "archived": false,
+    "fork": false,
+    "size_kb": 31142
+  },
+  {
+    "full_name": "2100preet/stockscanner",
+    "clone_url": "https://github.com/2100preet/stockscanner.git",
+    "tools": [
+      "cursor"
+    ],
+    "ai_commit_hits": 1,
+    "stars": 1,
+    "language": "Python",
+    "pushed_at": "2026-10-13T01:17:31Z",
+    "archived": false,
+    "fork": false,
+    "size_kb": 1333
+  },
+  {
+    "full_name": "danielreuter/research-notes",
+    "clone_url": "https://github.com/danielreuter/research-notes.git",
+    "tools": [
+      "cursor"
+    ],
+    "ai_commit_hits": 1,
+    "stars": 1,
+    "language": "Python",
+    "pushed_at": "2026-10-13T00:55:41Z",
+    "archived": false,
+    "fork": false,
+    "size_kb": 43313
+  },
+  {
+    "full_name": "Gunrunner444/BugForge",
+    "clone_url": "https://github.com/Gunrunner444/BugForge.git",
+    "tools": [
+      "cursor"
+    ],
+    "ai_commit_hits": 1,
+    "stars": 0,
+    "language": "Python",
+    "pushed_at": "2026-10-13T01:25:01Z",
+    "archived": false,
+    "fork": false,
+    "size_kb": 2839
+  }
+]

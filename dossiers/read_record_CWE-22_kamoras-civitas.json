@@ -1,0 +1,21 @@
+{
+  "repo_url": "https://github.com/kamoras/civitas.git",
+  "commit": "",
+  "file": "backend/app/shared_state.py",
+  "function": "read_record",
+  "cwe": "CWE-22",
+  "param": "path",
+  "payload": "/tmp/tier2_proof__wx7d863/secret_143276c7c712.txt",
+  "verdict": "SETUP_FAILED",
+  "detail": "clone/checkout failed",
+  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof__wx7d863/secret_143276c7c712.txt (proven by live execution trace; read-traversal, no output echo required)",
+  "tier2_sink": "open",
+  "reachable": true,
+  "entry_kind": "api",
+  "call_path": [
+    "read_record"
+  ],
+  "reproduce_verdict": "SETUP_FAILED",
+  "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
+  "repo_full": "kamoras/civitas"
+}

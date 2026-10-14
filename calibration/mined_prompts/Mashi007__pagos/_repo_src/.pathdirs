@@ -1,0 +1,9 @@
+.
+backend
+backend/app/api/v1/endpoints
+backend/app/api/v1/endpoints/cobros
+backend/app/api/v1/endpoints/revision_manual
+backend/app/services
+backend/app/services/cobranzas
+backend/app/services/prestamos
+tests/unit/services

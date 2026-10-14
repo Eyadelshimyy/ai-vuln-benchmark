@@ -1,0 +1,255 @@
+"""Virginia's ballot-measure strategy — the Department of Elections'
+per-question "Explanation for Proposed Constitutional Amendment" PDFs
+(one of potentially many per-state strategies; see ballot_measures_pdf.py
+for the shared single-PDF contract this module does NOT use, and why).
+
+Structurally different from every other state registered so far: CA/MA/
+CO publish ONE combined guide covering every measure, and LA's is one
+PDF split by "Proposed Amendment No. N" — Virginia publishes a SEPARATE
+two-page PDF per question, discovered from a stable index page
+(elections.virginia.gov/election-law/referenda/) that links each
+question's own explanation page, which in turn links that question's
+PDF in four languages. There is no single URL this module can hand to
+ballot_measures_pdf.py's fetch-one-PDF-then-parse pipeline, so it does
+its own fetching end to end and is dispatched separately (see
+MULTI_DOCUMENT_STRATEGIES in ballot_measures_pdf.py) rather than
+plugging into STRATEGIES' `pdf.pages -> list[dict]` shape.
+
+Each PDF is plain, clearly labeled text (no column geometry to
+reconstruct): "EXPLANATION FOR VOTERS" / "QUESTION N" followed by
+"Present Law" and "Proposed Amendment" paragraphs (joined as
+official_summary — verbatim, just the "Proposed Amendment" sub-heading
+label itself dropped from between them), then a page break to "BALLOT
+QUESTION" (the literal text put to voters, "Should the Constitution of
+Virginia be amended to ...?" — stored as official_title, the field that
+holds the ballot question for every state that prints one, in its own
+field rather than joined to the explanation) and "FULL TEXT OF AMENDMENT" (the legal
+redline, not extracted — same "narrative summary only" scope as every
+other state here). No "A YES vote means.../A NO vote means..." framing
+is published (unlike CA/MA/CO) — same as Louisiana, yes_means/no_means
+stay null rather than inferred from the question's phrasing. No fiscal-
+impact statement either (constitutional amendments, not spending
+measures) — also null. All Virginia constitutional amendments are
+General-Assembly-referred — the state constitution has no citizen-
+initiative process — so origin (and title_authority, the actual
+drafter) is fixed, not derived per-amendment, same reasoning as
+Louisiana's ORIGIN constant.
+
+A question discovered on the index page but that fails at any later
+step (page fetch, PDF fetch, or a parse that doesn't match the
+verified shape) fails the WHOLE fetch (None, not a shorter list) —
+silently caching two-of-three questions as if that were the complete
+ballot for 72 hours (ballot_measures_pdf.CACHE_TTL_HOURS) would hide a
+real measure with no signal anywhere that anything was incomplete.
+[] is reserved for the index page genuinely naming zero questions this
+cycle, which is a different, legitimate answer.
+
+Verified live 2026-09-03 against all 3 real questions on the November 3,
+2026 ballot (abortion/reproductive-freedom, same-sex marriage, felony
+voting-rights restoration) — 3/3 parse cleanly with a real official
+Present-Law/Proposed-Amendment summary and the real ballot question
+text, English PDF correctly distinguished from the Spanish/Korean/
+Vietnamese versions the same page links (language versions are named
+with a "-ES"/"-KO"/"-VI" suffix; English has none). The English file is
+the one whose name the translations extend: as of 2026-10-08 each
+question page also links a brochure and a poster ("...Brochure---EN.pdf"
+beside "---SP"/"---VI"/"---KO"), and "any name not ending in a two-letter
+code" would also have taken an English file whose name happened to end
+in two letters ("...-VA.pdf").
+"""
+
+import io
+import logging
+import re
+from urllib.parse import urljoin
+
+import httpx
+import pdfplumber
+
+from app.pipeline.fetch.ballot_measure_pdf_geometry import clean_text
+from app.pipeline.fetch.http_utils import fetch_bytes_with_retry, fetch_text_with_retry
+from app.pipeline.rate_limiter import RateLimiter
+
+logger = logging.getLogger(__name__)
+
+# All Virginia constitutional amendments are General-Assembly-referred —
+# the state constitution has no citizen-initiative process for
+# amendments — so this is also who drafted the title (titleAuthority is
+# rendered as "Drafted by ___" specifically because ballot titles are
+# litigated as slanted; the actual drafter, not the publishing agency,
+# is what that field means — same reasoning ballot_measures_la.py's
+# ORIGIN constant already documents for its own TITLE_AUTHORITY).
+ORIGIN = "Virginia General Assembly"
+TITLE_AUTHORITY = ORIGIN
+
+_INDEX_URL = "https://www.elections.virginia.gov/election-law/referenda/"
+_QUESTION_LINK_RE = re.compile(
+    r'href="(/election-law/proposed-constitutional-amendment-question-(\d+)/)"',
+)
+_PDF_LINK_RE = re.compile(r'href="([^"]+\.pdf)"', re.IGNORECASE)
+# The language versions share the English file's name plus a trailing
+# "-XX" code. Case-insensitive: verified live as uppercase ("-ES.pdf"),
+# but nothing about a .gov CMS guarantees that casing survives.
+_LANGUAGE_SUFFIX = r"-[A-Za-z]{2}\.pdf$"
+
+# Cross-checked against the URL slug's own question number (see
+# fetch_measures) — the slug says which page linked here, this says what
+# the PDF itself claims to be; a mismatch means the site's own linking
+# is inconsistent and this module doesn't guess which one is right.
+_QUESTION_RE = re.compile(r"QUESTION\s+(\d+)", re.IGNORECASE)
+_SECTION_TITLE_RE = re.compile(r"Section\s+\S+\.\s*([^.\n]+)\.")
+# Present Law and Proposed Amendment are adjacent paragraphs separated
+# only by the "Proposed Amendment" sub-heading — captured as two groups
+# and joined with a plain space (not the heading label) so the heading
+# itself never lands fused mid-sentence in the stored text.
+_SUMMARY_RE = re.compile(
+    r"Present Law\s*(.*?)\s*Proposed Amendment\s*(.*?)\s*Word Count:", re.IGNORECASE | re.DOTALL,
+)
+# The "BALLOT QUESTION" section — the question as printed on the ballot,
+# stored as official_title. Never joined to official_summary: the
+# explanation and the question are two sections of the source, and
+# concatenating them with inserted text ("Ballot question: ...") would
+# blend sourced text with wording this module authored.
+_BALLOT_QUESTION_RE = re.compile(
+    r"BALLOT QUESTION\s*(.*?)\s*FULL TEXT OF AMENDMENT", re.IGNORECASE | re.DOTALL,
+)
+
+# Each explanation's first line says who approved it ("APPROVED BY JOINT
+# P&E COMMITTEE 6/22/2026" on all three 2026 documents): the General
+# Assembly's Privileges and Elections Committees, named as the explanation's
+# drafter only when the document says so.
+_APPROVED_BY_RE = re.compile(r"^\s*APPROVED BY JOINT P&E COMMITTEE\b", re.IGNORECASE)
+SUMMARY_AUTHORITY = "Virginia General Assembly's Privileges and Elections Committees (approved the explanation)"
+
+_rate_limiter = RateLimiter(rps=1.0)
+
+
+def _english_pdf_url(question_page_html: str, base_url: str) -> str | None:
+    """The one linked PDF whose name the translations extend with a
+    language code ("X.pdf" beside "X-ES.pdf"), or None if not exactly one."""
+    candidates = list(dict.fromkeys(m.group(1) for m in _PDF_LINK_RE.finditer(question_page_html)))
+    english = [
+        c for c in candidates
+        if any(re.fullmatch(re.escape(c[:-4]) + _LANGUAGE_SUFFIX, o, re.IGNORECASE) for o in candidates if o != c)
+    ]
+    if len(english) != 1:
+        return None
+    # urljoin, not a hardcoded domain: handles a relative href with no
+    # leading slash, a scheme-relative "//host/..." href, and a future
+    # move to a different subdomain (a CDN, a media host) the same way
+    # any other page-relative link on this site would resolve.
+    return urljoin(base_url, english[0])
+
+
+def _extract_text(raw: bytes) -> str:
+    with pdfplumber.open(io.BytesIO(raw)) as pdf:
+        return "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+
+def parse_document(full_text: str, number: str) -> dict | None:
+    """One question's PDF, already reduced to extract_text() output — kept
+    separate from the bytes/HTTP layer above so a test can feed real,
+    text fixtures directly (same convention every other state's parser
+    here follows), not a binary PDF."""
+    summary_match = _SUMMARY_RE.search(full_text)
+    # Structural shape check only (see _BALLOT_QUESTION_RE's module-level
+    # comment) — a document missing its BALLOT QUESTION section entirely
+    # isn't the shape this parser was verified against, so it's refused
+    # like any other unrecognized shape; its captured text is discarded.
+    question_match = _BALLOT_QUESTION_RE.search(full_text)
+    if summary_match is None or question_match is None:
+        return None
+    present_law = clean_text(summary_match.group(1))
+    proposed_amendment = clean_text(summary_match.group(2))
+    question = clean_text(question_match.group(1))
+    if not present_law or not proposed_amendment or not question:
+        return None
+
+    # The PDF's own "QUESTION N" heading, cross-checked against the
+    # number the URL slug (question_urls in fetch_measures) says this
+    # is — a mismatch means the site's own linking disagrees with the
+    # document it points to, and this module doesn't guess which one is
+    # right (same discipline as every other "don't guess" gate here).
+    printed_match = _QUESTION_RE.search(full_text)
+    if printed_match is not None and printed_match.group(1) != number:
+        logger.warning(
+            "VA question %s: URL slug disagrees with the PDF's own heading (QUESTION %s) — skipping",
+            number, printed_match.group(1),
+        )
+        return None
+
+    title_match = _SECTION_TITLE_RE.search(full_text)
+    title = title_match.group(1).strip() if title_match else f"Question {number}"
+
+    return {
+        "number": number,
+        "title": title,
+        # The ballot question, verbatim ("Should the Constitution of
+        # Virginia be amended to ...?").
+        "official_title": question,
+        "origin": ORIGIN,
+        "official_summary": f"{present_law} {proposed_amendment}",
+        "fiscal_impact": None,
+        "yes_means": None,
+        "no_means": None,
+        "title_authority": TITLE_AUTHORITY,
+        "summary_authority": SUMMARY_AUTHORITY if _APPROVED_BY_RE.match(full_text) else None,
+        "fiscal_authority": None,
+    }
+
+
+async def fetch_measures(client: httpx.AsyncClient, year: int) -> list[tuple[dict, str]] | None:
+    """[(parsed, source_url), ...] for every question on `year`'s general-
+    election ballot, or None if the index page itself fails to fetch OR
+    any question it names fails at a later step (page/PDF fetch, parse) —
+    a discovered-but-unresolved question is a real failure, not a reason
+    to silently cache a shorter list as if it were the complete ballot
+    (see module docstring). [] is reserved for the index page fetching
+    fine but naming zero questions this cycle (a year with none referred,
+    or one whose only amendment is a special election VA keys separately
+    — verified real case: April 2026's special-election amendment uses a
+    different URL shape entirely and is correctly not matched by
+    _QUESTION_LINK_RE)."""
+    index_html = await fetch_text_with_retry(client, _rate_limiter, _INDEX_URL, "VA referenda index")
+    if index_html is None:
+        return None
+
+    question_urls: dict[str, str] = {}
+    for m in _QUESTION_LINK_RE.finditer(index_html):
+        number, url = m.group(2), f"https://www.elections.virginia.gov{m.group(1)}"
+        if number in question_urls and question_urls[number] != url:
+            logger.warning(
+                "VA index page links question %s twice with different URLs (%s, %s) — "
+                "keeping the first",
+                number, question_urls[number], url,
+            )
+            continue
+        question_urls[number] = url
+    if not question_urls:
+        return []
+
+    results = []
+    for number, question_url in sorted(question_urls.items(), key=lambda kv: int(kv[0])):
+        page_html = await fetch_text_with_retry(client, _rate_limiter, question_url, f"VA question {number} page")
+        if page_html is None:
+            logger.warning("VA question %s page fetch failed", number)
+            return None
+        pdf_url = _english_pdf_url(page_html, question_url)
+        if pdf_url is None:
+            logger.warning("VA question %s: no unambiguous English PDF link found", number)
+            return None
+        pdf_bytes = await fetch_bytes_with_retry(client, _rate_limiter, pdf_url, f"VA question {number} PDF")
+        if pdf_bytes is None:
+            logger.warning("VA question %s PDF fetch failed", number)
+            return None
+        try:
+            parsed = parse_document(_extract_text(pdf_bytes), number)
+        except Exception:
+            logger.exception("VA question %s PDF parse failed", number)
+            return None
+        if parsed is None:
+            logger.warning("VA question %s: PDF didn't match the expected section shape", number)
+            return None
+        results.append((parsed, pdf_url))
+
+    return results

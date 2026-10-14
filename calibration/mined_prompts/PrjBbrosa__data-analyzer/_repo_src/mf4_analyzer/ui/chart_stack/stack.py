@@ -1,0 +1,3350 @@
+"""ChartStack — the centre-pane QWidget coordinator."""
+import logging
+import weakref
+from functools import partial
+
+from PyQt5.QtCore import QEvent, QPoint, QRect, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QImage, QPainter, QPixmap
+from PyQt5.QtWidgets import (
+    QHBoxLayout, QSizePolicy, QSplitter, QStackedWidget, QVBoxLayout, QWidget,
+)
+
+from ..pg_canvases import TimeDomainCanvasPG
+from ..pg_canvas.heatmap_canvas import PgHeatmapCanvas
+from ..pg_canvas.frf_canvas import PgFrfCanvas
+from ..pg_canvas.line_canvas import PgLineCanvas
+from ..widgets import StatsStrip
+from ..analysis_section_page import AnalysisSectionPage
+from ..analysis_view_state import AnalysisViewState
+from ..view_state import ViewManager
+from .ultraview.page import UltraViewPage
+from .page_transition import PageTransitionController, PresentationToken
+
+from ._helpers import (
+    _grab_pixmap_hidpi,
+    _pixmap_as_device_pixels,
+    _apply_mdi_icons,
+    _HIDPI_EXPORT_SCALE,
+    _STATS_STRIP_ENABLED,
+    STATUS_HINT_BAR_HEIGHT,
+    _MODE_TO_INDEX,
+    _INDEX_TO_MODE,
+    _BOTTOM_HINT_PERSISTENT,
+)
+from .cards import _ChartCard, FrequencyCursorCard, FrfChartCard, TimeChartCard
+from .cursor_pill import (
+    CursorPill,
+    format_cursor_info,
+    format_single_cursor_variants,
+    mini_single_cursor_part,
+    plain_single_cursor_tooltip_line,
+    single_cursor_channel_color,
+    strip_html,
+)
+from .cursor_display import (
+    CursorDisplayChannel,
+    CursorDisplayOptions,
+    CursorDisplaySettingsStore,
+    FrequencyCursorChannel,
+    build_cursor_presentation,
+    build_fft_cursor_presentation,
+    build_frf_cursor_presentation,
+    frf_live_primary_html,
+    live_pin_hint_text,
+)
+from ..cursor_display_model import (
+    FrfLiveCursorFacts,
+    cursor_display_channel_from_dual_row,
+)
+from .pinned_cursor_controller import PinnedCursorController
+from ..plot_helpers import (
+    apply_cursor_source_prefix_policy,
+    dual_row_is_custom_x,
+    resolve_cursor_source_label,
+)
+from .toolbar import PgNavigationToolbar
+from ...ui_kit.motion import POLICY_LIGHT, POLICY_OFF, MotionPolicy
+from ...ui_kit.qt_lifecycle import as_weak_callable
+from ..channel_drag import INTERNAL_CHANNEL_MIME, decode_channel_drag
+
+logger = logging.getLogger(__name__)
+
+# ``None`` is a valid stored primary (clear this source). Omit the argument
+# to leave the live pill primary unchanged.
+_CURSOR_PRIMARY_UNSET = object()
+
+
+class ChartStack(QWidget):
+    mode_changed = pyqtSignal(str)
+    plot_mode_changed = pyqtSignal(str)
+    cursor_mode_changed = pyqtSignal(str)
+    analysis_cursor_mode_changed = pyqtSignal(str, object, str)
+    annotation_enabled_changed = pyqtSignal(str, bool)
+    image_copied = pyqtSignal(str)  # legacy status text signal
+    image_captured = pyqtSignal(QPixmap)  # final pixmap for MainWindow publishing
+    # Emitted when the focused time card changes while side-by-side (split) is
+    # active. Carries True when the secondary card is focused, False for the
+    # primary. MainWindow uses it to route channel-check replots to the right
+    # canvas; it is inert (never emitted) outside split mode.
+    focus_changed = pyqtSignal(bool)
+    home_triggered = pyqtSignal()
+    tick_density_changed = pyqtSignal(int, int)
+    quickref_requested = pyqtSignal()
+    add_to_ultraview_requested = pyqtSignal(str, str)
+    open_ultraview_requested = pyqtSignal()
+    open_ultraview_unplaced_requested = pyqtSignal()
+    # Time-domain channel MIME drop. ``zone`` is ``plot`` or ``xaxis``.
+    # Carries (canvas, (fid, channel), zone); MainWindow owns View writes.
+    channel_drop_requested = pyqtSignal(object, object, str)
+    pin_feedback = pyqtSignal(str)
+
+    def __init__(
+        self, parent=None, *, cursor_settings=None, defer_analysis_charts=False,
+    ):
+        super().__init__(parent)
+        self._cursor_display_store = CursorDisplaySettingsStore(cursor_settings)
+        self._cursor_display_options = self._cursor_display_store.load()
+        self._cursor_rows_by_canvas = {}
+        self._legacy_detail_pending = {}
+        self._pending_fft_primary = {}
+        self._pending_cursor_primary = {}
+        self._frequency_layout_hooks = weakref.WeakSet()
+        self._source_label_resolver = None
+        self._defer_analysis_charts = bool(defer_analysis_charts)
+        self._analysis_page_bound = set()
+        self._analysis_ready_hooks = []
+        # QSS (ChartStack { border-radius:10px; background:#fff }) only paints on
+        # a plain QWidget subclass once WA_StyledBackground is set; without it Qt
+        # skips the styled fill/border and the rounded card never renders.
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 4, 0, 0)
+        lay.setSpacing(4)
+        self.stack = QStackedWidget(self)
+        self.stack.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.stack.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.stack.setAutoFillBackground(False)
+        # This controller is deliberately policy-off until each producer has a
+        # measured local endpoint capture path.  It is presentation-only: the
+        # normal mode/view restore remains the source of truth.
+        self._page_transition = PageTransitionController(
+            self.stack, policy=POLICY_OFF,
+        )
+        self._page_transition_enabled_sections = frozenset()
+        self._page_transition_target = None
+        self._page_transition_ready_canvases = ()
+        self._page_transition_ready_acks = set()
+        self._page_transition_ready_slots = []
+        self._page_transition_content_slots = []
+        self._page_transition_awaiting_pin_commit = False
+        self._discrete_quality_hold_token = None
+        self._discrete_quality_hold_canvases = ()
+        self._page_transition.transition_finished.connect(
+            self._clear_page_transition_ready_fence,
+        )
+        self._page_transition.transition_finished.connect(
+            self._release_discrete_quality_hold,
+        )
+        self._page_transition.transition_cancelled.connect(
+            self._clear_page_transition_ready_fence,
+        )
+        self._page_transition.transition_cancelled.connect(
+            self._release_discrete_quality_hold,
+        )
+        self._page_transition.transition_cancelled.connect(
+            self._abandon_pin_restore_after_transition_cancel,
+        )
+        self.canvas_time = TimeDomainCanvasPG(self)
+        self._time_card = TimeChartCard(self.canvas_time)
+        self.canvas_time.set_cursor_display_options(self._cursor_display_options)
+        self._time_card.set_cursor_display_options(self._cursor_display_options)
+        self._primary_plot_mode = self._time_card.plot_mode()
+        self._primary_cursor_mode = self._time_card.cursor_mode()
+        self._time_page = QWidget(self.stack)
+        self._time_page.setObjectName("timeDomainPage")
+        self._time_page.setAttribute(Qt.WA_TranslucentBackground, True)
+        self._time_page.setAttribute(Qt.WA_NoSystemBackground, True)
+        self._time_page.setAutoFillBackground(False)
+        time_lay = QVBoxLayout(self._time_page)
+        time_lay.setContentsMargins(0, 0, 0, 0)
+        time_lay.setSpacing(0)
+        time_lay.addWidget(self._time_card.detach_toolbar(self._time_page))
+        self._time_toolbar = self._time_card.toolbar
+        self._time_split = QSplitter(Qt.Horizontal, self._time_page)
+        self._time_split.setObjectName("timeDomainSplit")
+        self._time_split.setAttribute(Qt.WA_TranslucentBackground, True)
+        self._time_split.setAttribute(Qt.WA_NoSystemBackground, True)
+        self._time_split.setAutoFillBackground(False)
+        self._time_split.setChildrenCollapsible(False)
+        # A splitter drag resizes only its children, not necessarily this
+        # stack. Reflow both pills from their actual canvas rectangles.
+        self._time_split.splitterMoved.connect(self._on_time_splitter_moved)
+        self._time_split.addWidget(self._time_card)
+        time_lay.addWidget(self._time_split, stretch=1)
+        # QWidget (not QFrame): analysisCompareRow is a QWidget, and QFrame +
+        # QSS border-top insets contentsRect by frameWidth (1px), which pushed
+        # the TimeDomain hairline/content 1px off the analysis sections.
+        self._time_bottom_dock = QWidget(self._time_page)
+        self._time_bottom_dock.setObjectName("timeViewBottomDock")
+        # Same chrome contract as AnalysisSectionPage's #analysisCompareRow:
+        # an explicit light fill + top divider. WA_TranslucentBackground /
+        # transparent QSS suppress both the fill and the border (and the
+        # quiet-anchor 1px rule inside), which is why TimeDomain looked bare
+        # next to FFT/Order. WA_StyledBackground keeps the QSS fill from
+        # falling back to platform grey.
+        self._time_bottom_dock.setAttribute(Qt.WA_StyledBackground, True)
+        self._time_bottom_dock.setAttribute(Qt.WA_TranslucentBackground, False)
+        self._time_bottom_dock.setAttribute(Qt.WA_NoSystemBackground, False)
+        self._time_bottom_dock.setAutoFillBackground(False)
+        dock_lay = QVBoxLayout(self._time_bottom_dock)
+        dock_lay.setContentsMargins(0, 0, 0, 0)
+        dock_lay.setSpacing(0)
+        self._time_hint_bar = self._time_card.detach_bottom_hint_bar(
+            self._time_bottom_dock
+        )
+        self._configure_time_hint_bar()
+        dock_lay.addWidget(self._time_hint_bar)
+        time_lay.addWidget(self._time_bottom_dock)
+        self._secondary_card = None
+        # Focus routing (P2 Task 9 Step 5): the focused time card receives
+        # channel-check replots while side-by-side is active. Defaults to the
+        # primary card; a click on either card switches focus (see
+        # _install_focus_filter / eventFilter). Outside split mode the
+        # focused card is always the primary and the property is unset.
+        self._focused_card = self._time_card
+        self._focus_accent = "#2d7ff9"
+        self._install_focus_filter(self._time_card)
+        # V7 Step 1: the three analysis sections become per-section
+        # AnalysisSectionPage instances (QSplitter pane container + per-section
+        # ViewTabBar). ChartStack owns the three ViewManagers because V6's
+        # ViewTabBar dereferences its manager in __init__ (manager.views_changed
+        # .connect + refresh()) and cannot accept None; MainWindow reads them via
+        # ``self.chart_stack.analysis_managers`` and owns all routing/compute.
+        # ``canvas_fft`` / ``_fft_card`` etc. survive as @property aliases onto
+        # pane 0 so the large existing call surface stays unchanged (single-pane
+        # behaviour == pre-V7).
+        # Per-section analysis ViewManagers. Cap is MAX_VIEWS (12);
+        # time-domain uses TIME_DOMAIN_MAX_VIEWS (24) on MainWindow's
+        # view_manager. ViewTabBar reads the instance cap.
+        from ..view_state import MAX_VIEWS
+        self.analysis_managers = {
+            'fft': ViewManager(
+                self, state_factory=AnalysisViewState, max_views=MAX_VIEWS,
+            ),
+            'fft_time': ViewManager(
+                self, state_factory=AnalysisViewState, max_views=MAX_VIEWS,
+            ),
+            'frf': ViewManager(
+                self, state_factory=AnalysisViewState, max_views=MAX_VIEWS,
+            ),
+            'order': ViewManager(
+                self, state_factory=AnalysisViewState, max_views=MAX_VIEWS,
+            ),
+        }
+
+        def _fft_card_factory():
+            return FrequencyCursorCard(
+                PgLineCanvas(self), annotations=True, chart_mode='fft'
+            )
+
+        def _fft_time_card_factory():
+            return _ChartCard(
+                PgHeatmapCanvas(self, with_slice=True),
+                annotations=True, chart_mode='fft_time',
+            )
+
+        def _frf_card_factory():
+            return FrfChartCard(PgFrfCanvas(self))
+
+        def _order_card_factory():
+            canvas = PgHeatmapCanvas(self, with_slice=True)
+            canvas.set_default_axis_labels(x_label='Time (s)', y_label='Order')
+            # Order slice toggle reads 时间 / 阶次 (Y axis is order). Default
+            # to the 阶次 (Y) slice — the common case is "one order's amplitude
+            # over time".
+            canvas.set_slice_button_labels('时间', '阶次')
+            canvas.set_slice_direction('y')
+            return _ChartCard(canvas, annotations=True, chart_mode='order')
+
+        self.page_fft = AnalysisSectionPage(
+            section='fft', manager=self.analysis_managers['fft'],
+            card_factory=_fft_card_factory, parent=self,
+            defer_charts=self._defer_analysis_charts,
+        )
+        self.page_fft_time = AnalysisSectionPage(
+            section='fft_time', manager=self.analysis_managers['fft_time'],
+            card_factory=_fft_time_card_factory, parent=self,
+            defer_charts=self._defer_analysis_charts,
+        )
+        self.page_frf = AnalysisSectionPage(
+            section='frf', manager=self.analysis_managers['frf'],
+            card_factory=_frf_card_factory, parent=self,
+            defer_charts=self._defer_analysis_charts,
+        )
+        self.page_order = AnalysisSectionPage(
+            section='order', manager=self.analysis_managers['order'],
+            card_factory=_order_card_factory, parent=self,
+            defer_charts=self._defer_analysis_charts,
+        )
+        self.stack.addWidget(self._time_page)
+        self.stack.addWidget(self.page_fft)
+        self.stack.addWidget(self.page_fft_time)
+        self.stack.addWidget(self.page_frf)
+        self.stack.addWidget(self.page_order)
+        # Host slot for UltraViewPage. Not a live workspace mode:
+        # ChartStack.set_mode rejects 'ultraview'. The page stays in the
+        # stack so UltraViewSheet can return it on close.
+        self.page_ultraview = UltraViewPage(self)
+        self.stack.addWidget(self.page_ultraview)
+        self.page_ultraview.quickref_requested.connect(self.quickref_requested.emit)
+        for page in (
+            self.page_fft, self.page_fft_time, self.page_frf, self.page_order,
+        ):
+            page.setAttribute(Qt.WA_TranslucentBackground, True)
+            page.setAttribute(Qt.WA_NoSystemBackground, True)
+            page.setAutoFillBackground(False)
+            # Manager/tabbar/UltraView entry stay early-bound; chart card
+            # signals wait for ensure_analysis_page_ready (deferred) or the
+            # eager bind below.
+            if not self._defer_analysis_charts:
+                self._bind_analysis_page_card(page)
+            page.tabbar.add_to_ultraview_requested.connect(
+                self.add_to_ultraview_requested.emit
+            )
+            self._wire_ultraview_entry(page.ultraview_entry)
+            page._pin_chrome_compositor = as_weak_callable(
+                self._composite_cursor_pill_onto
+            )
+        # The time card's copy button lives on the shared toolbar; route it to
+        # the focused pane so 复制为图片 captures whichever pane is focused.
+        self._time_card.copy_image_requested.connect(self._copy_focused_card_image)
+        # Shared-toolbar home/save still target the focused pane; pan/zoom and
+        # history buttons broadcast to the visible peer toolbar below.
+        self._time_toolbar._action_delegate_provider = as_weak_callable(
+            self._focused_nav_delegate
+        )
+        self._time_toolbar._peer_toolbars_provider = as_weak_callable(
+            self._secondary_peer_toolbars
+        )
+        self._time_toolbar._save_pixmap_provider = as_weak_callable(
+            self.capture_explicit_export_pixmap
+        )
+        self._time_card._annotation_target_provider = as_weak_callable(
+            self.focused_card
+        )
+        self._time_toolbar.home_triggered.connect(self.home_triggered.emit)
+        # 图表选项 on the shared toolbar opens for the focused pane's canvas.
+        self._time_card._options_canvas_provider = as_weak_callable(
+            self.focused_canvas
+        )
+        # Mirror the focused pane's pan/zoom state onto the shared toolbar
+        # icons. Connected AFTER the primary card's own _on_nav_mode_toggled
+        # (bound during _ChartCard.__init__) so this runs LAST in the action's
+        # triggered emission and wins — otherwise the card handler would
+        # re-assert the primary's icon after a click that forwarded to the
+        # secondary. Idempotent; no-op outside split.
+        for _key in ('pan', 'zoom'):
+            _act = self._time_toolbar._actions_by_key.get(_key)
+            if _act is not None:
+                _act.triggered.connect(self._sync_shared_nav_highlight)
+        self._time_toolbar.mouse_mode_changed.connect(
+            self._sync_shared_nav_highlight
+        )
+        lay.addWidget(self.stack, stretch=1)
+
+        # Stats strip retained for later re-enable, but hidden from the UI for now.
+        self.stats_strip = StatsStrip(self)
+        lay.addWidget(self.stats_strip)
+        self.stats_strip.setVisible(_STATS_STRIP_ENABLED)
+
+        # Per-pane draggable cursor pills. The primary pill is always present;
+        # the secondary pill is created when split view is first opened.
+        self._pill = CursorPill(self.stack)
+        self._pill.setVisible(False)
+        self._pill.display_mode_changed.connect(
+            self._on_primary_cursor_pill_display_mode_changed
+        )
+        self._pill.pin_requested.connect(self._on_primary_live_pin_requested)
+        self._pill_layout_refresh = QTimer(self)
+        self._pill_layout_refresh.setSingleShot(True)
+        self._pill_layout_refresh.setInterval(0)
+        self._pill_layout_refresh.timeout.connect(self._reposition_pill)
+        self._pill_secondary = None  # created/destroyed with enter/exit_split
+        self._pinned_cursors = PinnedCursorController(self)
+        self._pinned_cursors.pin_feedback.connect(self.pin_feedback.emit)
+        self._pinned_cursors.restore_presentation_committed.connect(
+            self._on_pin_restore_committed_for_transition,
+        )
+        self._pinned_cursors.bind_canvas(self.canvas_time)
+        if not self._defer_analysis_charts:
+            # FFT / FRF pin hosts; heatmap sections bind when their page
+            # becomes ready (and on pane_added via split hooks).
+            self._pinned_cursors.bind_canvas(self.canvas_fft)
+            self._pinned_cursors.bind_canvas(self.canvas_frf)
+        self._install_analysis_pin_split_hooks()
+        self._active_cursor_card = self._time_card
+        # Pass the SOURCE canvas so the pill picks the right per-pane cursor
+        # mode (single/dual formatting) and anchors over the emitting pane.
+        self.canvas_time.cursor_info.connect(
+            lambda text: self._on_cursor_info(text, self.canvas_time)
+        )
+        self.canvas_time.single_cursor_rows.connect(
+            partial(self._on_single_cursor_rows, source=self.canvas_time)
+        )
+        self.canvas_time.dual_cursor_info.connect(
+            lambda text: self._on_dual_cursor_info(text, self.canvas_time)
+        )
+        if hasattr(self.canvas_time, 'dual_cursor_rows'):
+            self.canvas_time.dual_cursor_rows.connect(
+                lambda rows: self._on_dual_cursor_rows(rows, self.canvas_time)
+            )
+        self.stack.currentChanged.connect(self._reposition_pill)
+
+        # Relay time-card control signals up to MainWindow consumers.
+        self._time_card.plot_mode_changed.connect(self._on_shared_plot_mode_changed)
+        self._time_card.cursor_mode_changed.connect(
+            self._on_shared_cursor_mode_changed
+        )
+        self._time_card.cursor_display_options_changed.connect(
+            partial(
+                self._on_cursor_display_options_changed,
+                source_card=self._time_card,
+            )
+        )
+        self._time_card.cursor_display_popover_geometry_changed.connect(
+            partial(
+                self._on_cursor_display_popover_geometry_changed,
+                source_card=self._time_card,
+            )
+        )
+        # The time card's annotation relay; analysis cards (pane 0) are wired in
+        # _connect_analysis_card_signals during page construction above.
+        self._time_card.annotation_enabled_changed.connect(
+            self._on_time_annotation_enabled
+        )
+        self._time_card.tick_density_changed.connect(
+            self._on_card_tick_density_changed
+        )
+        self._time_card.quickref_requested.connect(self.quickref_requested.emit)
+
+        # Initial sync: stats_strip is currently disabled at the product level.
+        self.stats_strip.setVisible(
+            _STATS_STRIP_ENABLED and self.current_mode() == 'time'
+        )
+
+    # ---- analysis-section page accessors (V7 Step 1) ----
+    # The three analysis sections are AnalysisSectionPage instances; pane 0 of
+    # each page hosts the legacy single-canvas/card. These @property aliases
+    # keep the pre-V7 attribute names (canvas_fft / _fft_card / ...) pointing at
+    # pane 0 so MainWindow's render/copy/annotation/tick call surface and the
+    # existing test suite stay unchanged while single-pane behaviour is
+    # byte-identical to before. Under defer_analysis_charts they explicitly
+    # ensure readiness (compatibility consumers); startup/tick iteration must
+    # use peek_* instead so they do not re-eager every page.
+    def register_analysis_page_ready_hook(self, hook):
+        """Register ``hook(section, page)`` after stack-level card bind.
+
+        MainWindow uses this for markup / viewport / levels wiring that must
+        not run during deferred construction. Hooks run once per section.
+        """
+        if hook is None or hook in self._analysis_ready_hooks:
+            return
+        self._analysis_ready_hooks.append(hook)
+        # Catch up for pages already bound (eager ChartStack / late register).
+        for section in list(self._analysis_page_bound):
+            page = self.page_for_mode.get(section)
+            if page is not None and page.is_ready():
+                hook(section, page)
+
+    def peek_analysis_page(self, section):
+        return self.page_for_mode.get(section)
+
+    def peek_analysis_card(self, section):
+        page = self.peek_analysis_page(section)
+        if page is None:
+            return None
+        cards = page.peek_cards()
+        return cards[0] if cards else None
+
+    def peek_analysis_canvas(self, section):
+        page = self.peek_analysis_page(section)
+        if page is None:
+            return None
+        return page.peek_pane_canvas(0)
+
+    def ensure_analysis_page_ready(self, section):
+        """Materialize + bind one analysis page (idempotent, synchronous)."""
+        page = self.page_for_mode.get(section)
+        if page is None:
+            raise KeyError(section)
+        page.ensure_ready()
+        if section not in self._analysis_page_bound:
+            self._bind_analysis_page_card(page)
+            self._analysis_page_bound.add(section)
+            for hook in list(self._analysis_ready_hooks):
+                hook(section, page)
+        return page
+
+    def _bind_analysis_page_card(self, page):
+        """One-shot stack bind for pane-0: signals, pin host, readiness mark.
+
+        Split pane-1 continues to use ``_connect_analysis_card_signals`` via
+        MainWindow._connect_new_pane so both panes share the same connect list.
+        """
+        cards = page.peek_cards()
+        if not cards:
+            return
+        card = cards[0]
+        self._connect_analysis_card_signals(card)
+        # During eager __init__ this runs before PinnedCursorController exists;
+        # that path still binds fft/frf pins after the controller is created.
+        pinned = getattr(self, "_pinned_cursors", None)
+        if pinned is not None and page.section in {"fft", "frf"}:
+            canvas = getattr(card, "canvas", None)
+            if canvas is not None:
+                pinned.bind_canvas(canvas)
+        if not self._defer_analysis_charts:
+            self._analysis_page_bound.add(page.section)
+
+    def _connect_analysis_card_signals(self, card):
+        """Wire copy + annotation relays for an analysis pane card.
+
+        Called for pane 0 at construction/ensure and (via MainWindow re-wiring)
+        for a freshly split pane. ``_chart_mode`` is the card's section key
+        ('fft'/'fft_time'/'frf'/'order')."""
+        card.copy_image_requested.connect(
+            lambda c=card: self._copy_card_image(c)
+        )
+        mode = card._chart_mode
+        card.annotation_enabled_changed.connect(
+            partial(self._relay_card_annotation, mode, card)
+        )
+        card.tick_density_changed.connect(self._on_card_tick_density_changed)
+        card.quickref_requested.connect(self.quickref_requested.emit)
+        if mode in {'fft', 'frf'} and hasattr(card, 'cursor_mode_changed'):
+            card.cursor_mode_changed.connect(
+                lambda cursor_mode, m=mode, c=card.canvas:
+                self.analysis_cursor_mode_changed.emit(m, c, cursor_mode)
+            )
+        canvas = getattr(card, 'canvas', None)
+        if (canvas is not None and hasattr(canvas, 'cursor_info')
+                and not isinstance(canvas, PgHeatmapCanvas)):
+            canvas.cursor_info.connect(
+                lambda text, c=canvas: self._on_cursor_info(text, c)
+            )
+        if canvas is not None and hasattr(canvas, 'dual_cursor_info'):
+            canvas.dual_cursor_info.connect(
+                lambda text, c=canvas: self._on_dual_cursor_info(text, c)
+            )
+        if canvas is not None and hasattr(canvas, 'frequency_cursor_rows'):
+            canvas.frequency_cursor_rows.connect(
+                partial(self._on_frequency_cursor_rows, source=canvas)
+            )
+        if canvas is not None and hasattr(canvas, 'frequency_cursor_channels'):
+            canvas.frequency_cursor_channels.connect(
+                partial(self._on_frequency_cursor_channels, source=canvas)
+            )
+        if canvas is not None and hasattr(canvas, 'frf_cursor_facts'):
+            canvas.frf_cursor_facts.connect(
+                partial(self._on_frf_cursor_facts, source=canvas)
+            )
+        if (
+            canvas is not None
+            and hasattr(canvas, 'frequency_cursor_host_rect')
+            and hasattr(canvas, 'layout_geometry_changed')
+            and canvas not in self._frequency_layout_hooks
+        ):
+            canvas.layout_geometry_changed.connect(
+                partial(self._on_frequency_layout_geometry_changed, source=canvas)
+            )
+            self._frequency_layout_hooks.add(canvas)
+
+    def _all_cards(self):
+        cards = [self._time_card]
+        if self._secondary_card is not None:
+            cards.append(self._secondary_card)
+        for page in (
+            self.page_fft, self.page_fft_time, self.page_frf, self.page_order,
+        ):
+            cards.extend(page.all_cards())
+        return [card for card in cards if card is not None]
+
+    def _on_card_tick_density_changed(self, x, y):
+        self.set_tick_density_controls(x, y)
+        self.tick_density_changed.emit(int(x), int(y))
+
+    def set_tick_density_controls(self, x, y):
+        for card in self._all_cards():
+            setter = getattr(card, "set_tick_density_controls", None)
+            if callable(setter):
+                setter(x, y)
+
+    @property
+    def page_for_mode(self):
+        return {
+            'fft': self.page_fft,
+            'fft_time': self.page_fft_time,
+            'frf': self.page_frf,
+            'order': self.page_order,
+        }
+
+    @property
+    def _fft_card(self):
+        self.ensure_analysis_page_ready('fft')
+        return self.page_fft.peek_cards()[0]
+
+    @property
+    def _fft_time_card(self):
+        self.ensure_analysis_page_ready('fft_time')
+        return self.page_fft_time.peek_cards()[0]
+
+    @property
+    def _frf_card(self):
+        self.ensure_analysis_page_ready('frf')
+        return self.page_frf.peek_cards()[0]
+
+    @property
+    def _order_card(self):
+        self.ensure_analysis_page_ready('order')
+        return self.page_order.peek_cards()[0]
+
+    @property
+    def canvas_fft(self):
+        self.ensure_analysis_page_ready('fft')
+        return self.page_fft.pane_canvas(0)
+
+    @property
+    def canvas_fft_time(self):
+        self.ensure_analysis_page_ready('fft_time')
+        return self.page_fft_time.pane_canvas(0)
+
+    @property
+    def canvas_frf(self):
+        self.ensure_analysis_page_ready('frf')
+        return self.page_frf.pane_canvas(0)
+
+    @property
+    def canvas_order(self):
+        self.ensure_analysis_page_ready('order')
+        return self.page_order.pane_canvas(0)
+
+    def _configure_time_hint_bar(self):
+        # Time-view docked footer. This IS the time card's detached _hint_bar
+        # (see detach_bottom_hint_bar), so we re-assert the same edge-anchored
+        # layout after clearing it: the rotating row hugs the LEFT edge
+        # (stretch=1), the discovery hint hugs the RIGHT edge (提示位置 左右靠边).
+        self._configure_status_hint_bar(self._time_hint_bar)
+        lay = self._time_hint_bar.layout()
+        while lay.count():
+            lay.takeAt(0)
+        lay.addWidget(self._time_card._hint_quickref_btn, 0, Qt.AlignVCenter)
+        lay.addWidget(self._time_card._hint_context, 1, Qt.AlignVCenter)
+        lay.addWidget(self._time_card._hint_discovery, 0, Qt.AlignVCenter)
+
+    @staticmethod
+    def _configure_status_hint_bar(bar):
+        """Shared chrome for a hint bar hosted in SurfaceStatusBar."""
+        bar.setFixedHeight(STATUS_HINT_BAR_HEIGHT)
+        bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        lay = bar.layout()
+        if lay is None:
+            return
+        # Left inset clears SurfaceStatusBar's 8px border-radius so the ``?``
+        # circle is not clipped into a fake glyph remnant. Vertical padding
+        # stays tight so a 26px strip plus the status bar's 1px border still
+        # fits inside the 32px pill — a 28px strip painted over the bottom
+        # hairline and made the gray frame vanish under the hint.
+        lay.setContentsMargins(10, 2, 8, 2)
+        lay.setSpacing(4)
+
+    def count(self):
+        return self.stack.count()
+
+    def split_active(self):
+        return (
+            self._secondary_card is not None
+            and self.current_mode() == 'time'
+            and self._secondary_card.isVisibleTo(self._time_split)
+        )
+
+    def pinned_cursors_for_canvas(self, canvas):
+        """Return the pin collection for ``canvas`` (Task 4 capture seam)."""
+        return self._pinned_cursors.collection_for(canvas)
+
+    def set_pinned_cursors_for_canvas(self, canvas, collection):
+        """Replace the pin collection for ``canvas`` (Task 4 apply seam)."""
+        self._pinned_cursors.set_collection(canvas, collection)
+
+    def pinned_cursor_fingerprint(self, canvas=None):
+        """Stable pin digest for UltraView. Hover highlight is omitted."""
+        controller = getattr(self, "_pinned_cursors", None)
+        getter = getattr(controller, "capture_fingerprint_for", None)
+        if not callable(getter):
+            return ()
+        try:
+            return getter(canvas)
+        except RuntimeError:
+            # Qt C++ wrapper already deleted (teardown / closed canvas).
+            logger.warning(
+                "pinned_cursor_fingerprint failed for %r", canvas, exc_info=True,
+            )
+            return ()
+
+    def consume_live_cursor_pill(self, canvas):
+        """Hide the live candidate after a successful pin. Pins stay."""
+        source = self.canvas_time if canvas is None else canvas
+        self._drop_cursor_canvas_state(source)
+        pill = self._pill_for_canvas(source)
+        card = self._card_for_canvas(source)
+        self._clear_cursor_pill_content(pill, card)
+        hide = getattr(source, "hide_live_cursor_items", None)
+        if not callable(hide):
+            cursor = getattr(source, "_cursor", None)
+            hide = getattr(cursor, "hide_live_cursor_items", None)
+        if callable(hide):
+            hide()
+
+    def restore_live_from_pin(self, canvas, snapshot, pos, mode):
+        """Unpin: the pinned pill becomes the live candidate in-place."""
+        self.set_cursor_mode_for_canvas(canvas, mode)
+        pill = self._pill_for_canvas(canvas)
+        card = self._card_for_canvas(canvas)
+        if pill is None:
+            return
+
+        def update():
+            if snapshot:
+                pill.restore_snapshot(snapshot)
+            pill.set_pin_role("live")
+            snap_fn = getattr(canvas, "snapshot_cursor_placement", None)
+            snap = snap_fn() if callable(snap_fn) else None
+            dual_complete = mode != "dual" or (
+                isinstance(snap, dict) and snap.get("bx") is not None
+            )
+            pill.set_live_hint(
+                live_pin_hint_text(mode, dual_complete=bool(dual_complete))
+            )
+            pill.mark_user_placed(True)
+            if pos is not None:
+                pill.move(int(pos[0]), int(pos[1]))
+            pill.setVisible(True)
+
+        self._update_pill_content(pill, card, update)
+        pill.raise_()
+
+    def _install_analysis_pin_split_hooks(self):
+        for page in (self.page_fft, self.page_frf):
+            page.pane_added.connect(self._pinned_cursors.bind_canvas)
+            page.pane_removing.connect(self._pinned_cursors.unbind_canvas)
+
+    def secondary_canvas(self):
+        if self._secondary_card is None:
+            return None
+        return self._secondary_card.canvas
+
+    def _copy_focused_card_image(self, *_args):
+        self._copy_card_image(self.focused_card())
+
+    def _copy_secondary_card_image(self, *_args):
+        self._copy_card_image(self._secondary_card)
+
+    def focused_card(self):
+        """Return the time card that channel-check replots target.
+
+        Outside split mode (or when the secondary card has been hidden), the
+        focused card is always the primary ``_time_card``; this keeps the
+        non-split behaviour byte-identical. While split is active, the focused
+        card follows the last card the user clicked."""
+        if not self.split_active():
+            return self._time_card
+        if self._focused_card is self._secondary_card and self._secondary_card is not None:
+            return self._secondary_card
+        return self._time_card
+
+    def focused_canvas(self):
+        """Canvas of :meth:`focused_card`. Returns the primary time canvas
+        whenever split is inactive, so callers that previously wrote to
+        ``self.canvas_time`` keep the same target outside compare mode."""
+        return self.focused_card().canvas
+
+    def _focused_nav_delegate(self):
+        """Toolbar a shared-toolbar nav click should act on, or None.
+
+        While side-by-side is active and the secondary pane is focused, return
+        the secondary card's own canvas-bound toolbar so home/pan/zoom/back/
+        forward/save operate on the secondary canvas with ITS view history and
+        mouse mode. Otherwise None ⇒ the shared (primary) toolbar handles it,
+        keeping non-split / primary-focused behaviour byte-identical."""
+        if (self.split_active()
+                and self._secondary_card is not None
+                and self._focused_card is self._secondary_card):
+            return self._secondary_card.toolbar
+        return None
+
+    def _sync_shared_nav_highlight(self):
+        """Repaint the shared toolbar's pan/zoom highlight to match the focused
+        pane's current mouse mode.
+
+        Cosmetic only: the shared toolbar object stays bound to the primary
+        canvas (its ``mode`` must keep driving the primary's replot mouse-mode
+        re-apply), so we only repaint its icon active-state. A later primary
+        replot can transiently re-assert the primary's icon; the next focus or
+        pan/zoom change corrects it."""
+        toolbar = getattr(self, '_time_toolbar', None)
+        if toolbar is None:
+            return
+        target = self.focused_card().toolbar
+        mode = str(getattr(target, 'mode', '')).lower()
+        key = 'pan' if 'pan' in mode else ('zoom' if 'zoom' in mode else '')
+        _apply_mdi_icons(toolbar, active_key=key)
+
+    def _card_for_canvas(self, canvas):
+        """Owning card for a cursor-emitting canvas, including comparison peers."""
+        for card in self._all_cards():
+            if getattr(card, 'canvas', None) is canvas:
+                return card
+        if (canvas is not None
+                and self._secondary_card is not None
+                and canvas is self._secondary_card.canvas):
+            return self._secondary_card
+        return self._time_card
+
+    def _combined_split_pixmap(self):
+        """Return primary+secondary canvas pixels side-by-side while split.
+
+        Each half gets that pane's own live pill, pinned pills, and axis
+        labels. Primary chrome is never painted onto the secondary half.
+        """
+        if not self.split_active() or self._secondary_card is None:
+            return None
+        self._flush_pinned_layout()
+        left = _grab_pixmap_hidpi(self.canvas_time)
+        right = _grab_pixmap_hidpi(self._secondary_card.canvas)
+        if left is None or right is None or left.isNull() or right.isNull():
+            return None
+        self._composite_cursor_pill_onto(left, self.canvas_time)
+        self._composite_cursor_pill_onto(right, self._secondary_card.canvas)
+        gap = 8
+        out = QPixmap(
+            left.width() + gap + right.width(),
+            max(left.height(), right.height()),
+        )
+        out.fill(Qt.white)
+        painter = QPainter(out)
+        painter.drawPixmap(0, 0, left)
+        painter.drawPixmap(left.width() + gap, 0, right)
+        painter.end()
+        return out
+
+    def _cursor_mode_for_canvas(self, canvas):
+        """Per-pane cursor mode ('off'/'single'/'dual') for the pill formatter.
+
+        Mirrors :meth:`plot_mode_for_canvas`: the readout layout depends on the
+        mode of the pane that emitted it, not always the primary's."""
+        if isinstance(canvas, (PgLineCanvas, PgFrfCanvas)):
+            card = self._card_for_canvas(canvas)
+            getter = getattr(card, 'cursor_mode', None)
+            if callable(getter):
+                return getter()
+        if (canvas is not None
+                and self._secondary_card is not None
+                and canvas is self._secondary_card.canvas):
+            return self._secondary_card.cursor_mode()
+        return self._primary_cursor_mode
+
+    def cursor_mode_for_canvas(self, canvas):
+        """Public per-pane cursor-mode accessor, matching plot_mode_for_canvas."""
+        return self._cursor_mode_for_canvas(canvas)
+
+    def _shared_time_controls_follow_secondary(self):
+        return (
+            self.split_active()
+            and self._secondary_card is not None
+            and self._focused_card is self._secondary_card
+        )
+
+    def _set_shared_plot_mode_silent(self, mode):
+        old = self._time_card.blockSignals(True)
+        try:
+            self._time_card.set_plot_mode(mode)
+        finally:
+            self._time_card.blockSignals(old)
+
+    def _set_shared_cursor_mode_silent(self, mode):
+        old = self._time_card.blockSignals(True)
+        try:
+            self._time_card.set_cursor_mode(mode)
+        finally:
+            self._time_card.blockSignals(old)
+
+    def _sync_shared_time_controls_to_focus(self):
+        """Reflect the focused pane's state on the shared time toolbar."""
+        if self._shared_time_controls_follow_secondary():
+            plot_mode = self._secondary_card.plot_mode()
+            cursor_mode = self._secondary_card.cursor_mode()
+        else:
+            plot_mode = self._primary_plot_mode
+            cursor_mode = self._primary_cursor_mode
+        self._set_shared_plot_mode_silent(plot_mode)
+        self._set_shared_cursor_mode_silent(cursor_mode)
+
+    def set_focused_card(self, card):
+        """Make ``card`` the focused time card and repaint the focus border.
+
+        No-op outside split mode and when the target is already focused. The
+        ``focused`` dynamic property drives the QSS accent border; after every
+        change both cards are unpolished/re-polished so the property selector
+        re-evaluates (Qt does not re-apply property-keyed rules automatically).
+        Emits :attr:`focus_changed` with True when the secondary is focused."""
+        if not self.split_active():
+            return
+        if card not in (self._time_card, self._secondary_card):
+            return
+        if card is self._focused_card:
+            # Still ensure the border reflects current state (e.g. just after
+            # enter_split seeded the primary as focused).
+            self._refresh_focus_borders()
+            self._sync_shared_time_controls_to_focus()
+            self._sync_shared_nav_highlight()
+            self._time_card.sync_annotation_button()
+            return
+        self._focused_card = card
+        self._refresh_focus_borders()
+        self._sync_secondary_controls_to_focus()
+        self._sync_shared_nav_highlight()
+        self._time_card.sync_annotation_button()
+        self.focus_changed.emit(card is self._secondary_card)
+
+    def set_focus_accent(self, color):
+        """Set the top-line accent color for the currently focused time card."""
+        self._focus_accent = color or "#2d7ff9"
+        self._refresh_focus_borders()
+
+    def _refresh_focus_borders(self):
+        """Sync the ``focused`` dynamic property + repaint for both cards.
+
+        Only highlights while split is active; in single-pane mode neither card
+        carries the property so the default ``#chartCard`` border applies."""
+        active = self.split_active()
+        focused = self._focused_card if active else None
+        cards = [self._time_card]
+        if self._secondary_card is not None:
+            cards.append(self._secondary_card)
+        for card in cards:
+            want = active and card is focused
+            if card.property("focused") != want:
+                card.setProperty("focused", want)
+            # Visual focus cue is the overlay accent strip (a QSS card border is
+            # painted over by the full-bleed canvas). Color = focused view tab.
+            marker = getattr(card, "set_focus_marker", None)
+            if callable(marker):
+                card.set_focus_marker(self._focus_accent if want else None)
+            # Keep the dynamic-property polish cycle for any QSS keyed on it.
+            card.style().unpolish(card)
+            card.style().polish(card)
+            card.update()
+
+    def _install_focus_filter(self, card):
+        """Watch mouse presses on a time card (and its canvas/viewport) so a
+        click anywhere on the card focuses it. Installed once per card; the
+        base card already filters its canvas for hint pausing, so stacking a
+        second filter here is safe and order-independent.
+
+        Also enables WA_StyledBackground so the #chartCard QSS border (and the
+        focused-accent override) paints reliably on the plain QWidget card —
+        without it Qt only paints the corners and the straight edges stay
+        un-bordered, which would make the focus accent invisible behind the
+        margin-0 toolbar/canvas children. The card already declares an explicit
+        background-color in QSS, so the flag has no white-bleed side effect."""
+        card.setAttribute(Qt.WA_StyledBackground, True)
+        card.installEventFilter(self)
+        canvas = getattr(card, 'canvas', None)
+        if canvas is not None:
+            canvas.installEventFilter(self)
+            glw = getattr(canvas, '_glw', None)
+            viewport = None
+            if glw is not None:
+                try:
+                    viewport = glw.viewport()
+                except Exception:
+                    viewport = None
+            if viewport is not None:
+                viewport.setAcceptDrops(True)
+                viewport.setAccessibleName("时域绘图区")
+                viewport.installEventFilter(self)
+
+    def _card_for_object(self, obj):
+        """Map a filtered object (card, canvas, or canvas viewport) back to its
+        owning time card, or None if it belongs to neither time card."""
+        for card in (self._time_card, self._secondary_card):
+            if card is None:
+                continue
+            if obj is card:
+                return card
+            canvas = getattr(card, 'canvas', None)
+            if canvas is None:
+                continue
+            if obj is canvas:
+                return card
+            glw = getattr(canvas, '_glw', None)
+            if glw is not None:
+                try:
+                    viewport = glw.viewport()
+                except Exception:
+                    viewport = None
+                if viewport is not None and obj is viewport:
+                    return card
+        return None
+
+    def eventFilter(self, obj, event):
+        etype = event.type()
+        if etype in (
+            QEvent.DragEnter, QEvent.DragMove, QEvent.DragLeave, QEvent.Drop,
+        ):
+            if self._handle_time_channel_drag(obj, event):
+                return True
+        if etype == QEvent.MouseButtonPress and self.split_active():
+            card = self._card_for_object(obj)
+            if card is not None and card is not self._focused_card:
+                self.set_focused_card(card)
+        return super().eventFilter(obj, event)
+
+    def _handle_time_channel_drag(self, obj, event):
+        """Route a channel MIME drag over a time card. Returns True if consumed."""
+        if self.current_mode() != "time":
+            return False
+        card = self._card_for_object(obj)
+        if card is None:
+            return False
+        etype = event.type()
+        if etype == QEvent.DragLeave:
+            self._clear_channel_drop_highlights()
+            return True
+        mime = event.mimeData()
+        if mime is None or not mime.hasFormat(INTERNAL_CHANNEL_MIME):
+            return False
+        key = decode_channel_drag(bytes(mime.data(INTERNAL_CHANNEL_MIME)))
+        if key is None:
+            return False
+        if etype in (QEvent.DragEnter, QEvent.DragMove):
+            zone = self._channel_drop_zone(card, obj, event)
+            self._set_channel_drop_highlight(card, zone)
+            event.setDropAction(Qt.CopyAction)
+            event.accept()
+            return True
+        if etype == QEvent.Drop:
+            zone = self._channel_drop_zone(card, obj, event)
+            canvas = getattr(card, "canvas", None)
+            self._clear_channel_drop_highlights()
+            event.setDropAction(Qt.CopyAction)
+            event.accept()
+            if canvas is not None:
+                self.channel_drop_requested.emit(canvas, key, zone)
+            return True
+        return False
+
+    def xaxis_drop_rect(self, canvas):
+        """Viewport-local QRect of the bottom-most visible X AxisItem, or None."""
+        if canvas is None:
+            return None
+        glw = getattr(canvas, "_glw", None)
+        if glw is None:
+            return None
+        seen = set()
+        bottom_rects = []
+        handles = list(getattr(canvas, "axes_list", []) or [])
+        master = getattr(canvas, "_x_master_handle", None)
+        if master is not None:
+            handles.append(master)
+        plot_items = []
+        for handle in handles:
+            plot_item = getattr(handle, "plot_item", None)
+            if plot_item is not None and plot_item not in plot_items:
+                plot_items.append(plot_item)
+        layout = getattr(glw, "ci", None)
+        items = getattr(layout, "items", None) or {}
+        for item in list(items.keys()):
+            if hasattr(item, "getAxis") and item not in plot_items:
+                plot_items.append(item)
+        for plot_item in plot_items:
+            self._collect_bottom_axis_scene_rects(plot_item, bottom_rects, seen)
+        if not bottom_rects:
+            return None
+        scene_rect = max(bottom_rects, key=lambda rect: rect.bottom())
+        try:
+            top_left = glw.mapFromScene(scene_rect.topLeft())
+            bottom_right = glw.mapFromScene(scene_rect.bottomRight())
+        except Exception:
+            return None
+        x = int(min(top_left.x(), bottom_right.x()))
+        y = int(min(top_left.y(), bottom_right.y()))
+        width = max(1, int(abs(bottom_right.x() - top_left.x())))
+        height = max(1, int(abs(bottom_right.y() - top_left.y())))
+        mapped = QRect(x, y, width, height)
+        try:
+            view_rect = glw.viewport().rect()
+            mapped = mapped.intersected(view_rect)
+            # AxisItem.sceneBoundingRect() can cover the whole plot because
+            # it paints the X grid. Reject that as an X drop zone.
+            if mapped.height() > max(80, int(view_rect.height() * 0.28)):
+                return None
+        except Exception:
+            pass
+        if mapped.isNull() or mapped.height() <= 0:
+            return None
+        return mapped
+
+    @staticmethod
+    def _collect_bottom_axis_scene_rects(plot_item, bottom_rects, seen):
+        """Use the PlotItem grid cell, not AxisItem.sceneBoundingRect.
+
+        pyqtgraph's bottom AxisItem bounding rect includes the linked ViewBox
+        so it can paint the X grid; that would make the whole plot an X-drop
+        zone. The layout cell is the actual tick/label band.
+        """
+        layout = getattr(plot_item, "layout", None)
+        axis_items = []
+        if layout is not None:
+            try:
+                rows = int(layout.rowCount())
+                cols = int(layout.columnCount())
+            except Exception:
+                rows = cols = 0
+            for row in range(rows):
+                for col in range(cols):
+                    try:
+                        item = layout.itemAt(row, col)
+                    except Exception:
+                        item = None
+                    if getattr(item, "orientation", None) == "bottom":
+                        axis_items.append(item)
+        if not axis_items:
+            getter = getattr(plot_item, "getAxis", None)
+            if callable(getter):
+                axis_items.append(getter("bottom"))
+        mapper = getattr(plot_item, "mapRectToScene", None)
+        for axis in axis_items:
+            if axis is None or id(axis) in seen:
+                continue
+            seen.add(id(axis))
+            try:
+                geom = axis.geometry()
+                if callable(mapper):
+                    scene_rect = mapper(geom)
+                else:
+                    scene_rect = axis.sceneBoundingRect()
+            except Exception:
+                continue
+            if scene_rect is None or scene_rect.isNull() or scene_rect.height() <= 1:
+                continue
+            bottom_rects.append(scene_rect)
+
+    def _channel_drop_zone(self, card, watched, event):
+        canvas = getattr(card, "canvas", None)
+        if canvas is None:
+            return "plot"
+        glw = getattr(canvas, "_glw", None)
+        viewport = None
+        if glw is not None:
+            try:
+                viewport = glw.viewport()
+            except Exception:
+                viewport = None
+        pos = event.pos()
+        if not isinstance(pos, QPoint):
+            pos = pos.toPoint() if hasattr(pos, "toPoint") else QPoint(int(pos.x()), int(pos.y()))
+        if viewport is not None and watched is not viewport:
+            pos = viewport.mapFrom(watched, pos)
+        x_rect = self.xaxis_drop_rect(canvas)
+        if x_rect is not None and x_rect.adjusted(0, -4, 0, 6).contains(pos):
+            return "xaxis"
+        return "plot"
+
+    def _set_channel_drop_highlight(self, card, zone):
+        x_rect = None
+        if zone == "xaxis":
+            x_rect = self.xaxis_drop_rect(getattr(card, "canvas", None))
+        for other in (self._time_card, self._secondary_card):
+            if other is None:
+                continue
+            setter = getattr(other, "set_channel_drop_zone", None)
+            if not callable(setter):
+                continue
+            if other is card:
+                setter(zone, x_rect)
+            else:
+                setter("")
+
+    def _clear_channel_drop_highlights(self):
+        for card in (self._time_card, self._secondary_card):
+            if card is None:
+                continue
+            setter = getattr(card, "set_channel_drop_zone", None)
+            if callable(setter):
+                setter("")
+
+    def enter_split(self):
+        if self._page_transition.image_bytes() > 0:
+            self.cancel_page_transition("time-split-entered")
+        if self._secondary_card is None:
+            canvas = TimeDomainCanvasPG(self)
+            self._secondary_card = TimeChartCard(canvas)
+            canvas.set_cursor_display_options(self._cursor_display_options)
+            canvas.set_source_label_resolver(self._source_label_resolver)
+            self._secondary_card.set_cursor_display_options(
+                self._cursor_display_options
+            )
+            self._secondary_card.detach_toolbar(self._secondary_card).hide()
+            self._secondary_card.detach_bottom_hint_bar(self._secondary_card).hide()
+            self._set_secondary_time_controls_enabled(False)
+            self._secondary_card.copy_image_requested.connect(
+                self._copy_secondary_card_image
+            )
+            self._secondary_card.tick_density_changed.connect(
+                self._on_card_tick_density_changed
+            )
+            self._secondary_card.quickref_requested.connect(
+                self.quickref_requested.emit
+            )
+            # Per-pane control routing (P2 Task 9 1b): the secondary card's
+            # own 分屏/叠加/游标 segmented controls act on the SECONDARY canvas,
+            # not the primary. Plot-mode flips need a replot of the secondary
+            # (re-laid out subplot↔overlay), cursor flips toggle the secondary
+            # canvas's cursor directly. We keep these inside ChartStack so the
+            # secondary stays self-contained and never disturbs the primary.
+            self._secondary_card.plot_mode_changed.connect(
+                self._on_secondary_plot_mode_changed
+            )
+            self._secondary_card.cursor_mode_changed.connect(
+                self._on_secondary_cursor_mode_changed
+            )
+            self._secondary_card.cursor_display_options_changed.connect(
+                partial(
+                    self._on_cursor_display_options_changed,
+                    source_card=self._secondary_card,
+                )
+            )
+            self._secondary_card.cursor_display_popover_geometry_changed.connect(
+                partial(
+                    self._on_cursor_display_popover_geometry_changed,
+                    source_card=self._secondary_card,
+                )
+            )
+            self._secondary_card.toolbar._peer_toolbars_provider = as_weak_callable(
+                self._primary_peer_toolbars
+            )
+            self._secondary_card.toolbar.mouse_mode_changed.connect(
+                self._sync_shared_nav_highlight
+            )
+            self._secondary_card.annotation_enabled_changed.connect(
+                self._on_secondary_annotation_enabled
+            )
+            if self._secondary_card.toolbar.mode != self._time_toolbar.mode:
+                self._secondary_card.toolbar.set_mouse_mode(self._time_toolbar.mode)
+            # The secondary pane has its own pill so both split panes can show
+            # independent single/dual cursor readouts at the same time.
+            if self._pill_secondary is None:
+                self._pill_secondary = CursorPill(self.stack)
+                self._pill_secondary.setVisible(False)
+                self._pill_secondary.display_mode_changed.connect(
+                    partial(
+                        self._on_cursor_pill_display_mode_changed,
+                        source=canvas,
+                    )
+                )
+                self._pill_secondary.pin_requested.connect(
+                    self._on_secondary_live_pin_requested
+                )
+            canvas.cursor_info.connect(
+                lambda text, c=canvas: self._on_cursor_info(text, c)
+            )
+            canvas.single_cursor_rows.connect(
+                partial(self._on_single_cursor_rows, source=canvas)
+            )
+            canvas.dual_cursor_info.connect(
+                lambda text, c=canvas: self._on_dual_cursor_info(text, c)
+            )
+            if hasattr(canvas, 'dual_cursor_rows'):
+                canvas.dual_cursor_rows.connect(
+                    lambda rows, c=canvas: self._on_dual_cursor_rows(rows, c)
+                )
+            self._time_split.addWidget(self._secondary_card)
+            self._install_focus_filter(self._secondary_card)
+            self._pinned_cursors.bind_canvas(canvas)
+        self._secondary_card.setVisible(True)
+        total = max(2, self._time_split.width())
+        left = max(1, total // 2)
+        self._time_split.setSizes([left, max(1, total - left)])
+        # Entering split (re)seeds focus on the primary card and lights its
+        # accent border; the secondary stays unfocused until clicked.
+        self._focused_card = self._time_card
+        self._refresh_focus_borders()
+        self._sync_secondary_controls_to_focus()
+        self._sync_shared_nav_highlight()
+        self._pinned_cursors.reflow_visible()
+
+    def _on_secondary_plot_mode_changed(self, mode):
+        """Replot the secondary canvas in the new layout (subplot↔overlay).
+
+        Asks MainWindow to redraw the secondary pane while preserving its
+        visible X window (see TimeDomain state-preservation lesson). The
+        secondary card is the focused card whenever its controls are live, so
+        we route through ``replot_secondary`` rather than disturbing the
+        primary. No replot hook → silently no-op (secondary not yet wired)."""
+        replot = getattr(self, '_replot_secondary_cb', None)
+        if callable(replot):
+            replot()
+
+    def _on_secondary_cursor_mode_changed(self, mode):
+        """Toggle the secondary canvas's cursor (off/single/dual) in place."""
+        if mode == 'off' and self._pill_secondary is not None:
+            self._clear_cursor_pill_content(
+                self._pill_secondary, self._secondary_card
+            )
+        canvas = self._secondary_card.canvas
+        canvas.set_cursor_visible(mode != 'off')
+        canvas.set_dual_cursor_mode(mode == 'dual')
+
+    def set_secondary_replot_callback(self, cb):
+        """MainWindow registers a callable that replots the secondary canvas
+        preserving its X window. Used when the secondary card's own plot-mode
+        control flips (subplot↔overlay needs a fresh layout). Bound methods
+        are held weakly so ChartStack cannot keep MainWindow alive."""
+        self._replot_secondary_cb = as_weak_callable(cb)
+
+    def _primary_peer_toolbars(self):
+        return [self._time_toolbar] if self.split_active() else []
+
+    def _secondary_peer_toolbars(self):
+        if self.split_active() and self._secondary_card is not None:
+            return [self._secondary_card.toolbar]
+        return []
+
+    def exit_split(self):
+        if self.split_active() and self._page_transition.image_bytes() > 0:
+            self.cancel_page_transition("time-split-exited")
+        if self._secondary_card is not None:
+            secondary_toolbar = getattr(self._secondary_card, "toolbar", None)
+            if secondary_toolbar is not None:
+                secondary_toolbar.discard_pending_history()
+            self._secondary_card.close_cursor_display_popover()
+            self._secondary_card.setVisible(False)
+            self._drop_cursor_canvas_state(self._secondary_card.canvas)
+        if self._pill_secondary is not None:
+            self._clear_cursor_pill_content(
+                self._pill_secondary, self._secondary_card
+            )
+        # Back to single pane: drop focus highlighting and reset to primary.
+        self._focused_card = self._time_card
+        self._refresh_focus_borders()
+        # Restore the primary card's controls (single live group again) and
+        # disable the now-hidden secondary's.
+        self._sync_secondary_controls_to_focus()
+        self._sync_shared_nav_highlight()
+        self._pinned_cursors.reflow_visible()
+
+    def _emit_open_ultraview(self, _checked=False):
+        self.open_ultraview_requested.emit()
+
+    def _emit_open_ultraview_unplaced(self):
+        self.open_ultraview_unplaced_requested.emit()
+
+    def set_ultraview_has_content(self, has_content: bool) -> None:
+        """Project the workspace-content marker onto every source View rail."""
+        entries = (
+            getattr(self, "ultraview_entry", None),
+            getattr(getattr(self, "page_fft", None), "ultraview_entry", None),
+            getattr(getattr(self, "page_fft_time", None), "ultraview_entry", None),
+            getattr(getattr(self, "page_frf", None), "ultraview_entry", None),
+            getattr(getattr(self, "page_order", None), "ultraview_entry", None),
+        )
+        for entry in entries:
+            setter = getattr(entry, "set_has_content", None)
+            if callable(setter):
+                setter(has_content)
+
+    def set_ultraview_unplaced_count(self, count: int) -> None:
+        """Project the active Board's unplaced count onto every View rail."""
+        entries = (
+            getattr(self, "ultraview_entry", None),
+            getattr(getattr(self, "page_fft", None), "ultraview_entry", None),
+            getattr(getattr(self, "page_fft_time", None), "ultraview_entry", None),
+            getattr(getattr(self, "page_frf", None), "ultraview_entry", None),
+            getattr(getattr(self, "page_order", None), "ultraview_entry", None),
+        )
+        for entry in entries:
+            setter = getattr(entry, "set_unplaced_count", None)
+            if callable(setter):
+                setter(count)
+
+    def _wire_ultraview_entry(self, button):
+        """Connect a View-rail Dock click once; repeat calls are no-ops."""
+        if button is None:
+            return
+        wired = getattr(self, '_wired_ultraview_entries', None)
+        if wired is None:
+            self._wired_ultraview_entries = wired = set()
+        token = id(button)
+        if token in wired:
+            return
+        button.clicked.connect(self._emit_open_ultraview)
+        badge = getattr(button, "badge_clicked", None)
+        if badge is not None:
+            badge.connect(self._emit_open_ultraview_unplaced)
+        wired.add(token)
+
+    def attach_view_tabbar(self, manager):
+        from ..view_tabbar import ViewTabBar
+        from ..widgets.ultraview_entry import (
+            ENTRY_HEIGHT,
+            UltraViewEntryButton,
+            UltraViewRailFitter,
+            make_ultraview_separator,
+        )
+
+        existing = getattr(self, '_view_tabbar', None)
+        if existing is not None:
+            existing.setVisible(self.current_mode() == 'time')
+            return existing
+
+        dock = self._time_bottom_dock
+        host = QWidget(dock)
+        host.setObjectName("timeViewRail")
+        # Keep the rail transparent so #timeViewBottomDock's rounded fill
+        # remains the only bottom-corner paint (ChartStack radius 7px).
+        host.setAttribute(Qt.WA_StyledBackground, True)
+        host.setAttribute(Qt.WA_TranslucentBackground, True)
+        host.setAutoFillBackground(False)
+        host.setStyleSheet("QWidget#timeViewRail { background-color: transparent; }")
+        host.setFixedHeight(ENTRY_HEIGHT)
+        host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        rail = QHBoxLayout(host)
+        rail.setContentsMargins(0, 0, 8, 0)
+        rail.setSpacing(6)
+
+        bar = ViewTabBar(manager, host, section='time')
+        bar.set_motion_policy(POLICY_LIGHT)
+        rail.addWidget(bar, 1)
+        sep = make_ultraview_separator(host)
+        entry = UltraViewEntryButton(host)
+        rail.addWidget(sep, 0, Qt.AlignVCenter)
+        rail.addWidget(entry, 0, Qt.AlignVCenter)
+
+        dock.layout().insertWidget(0, host)
+        # A child created under an already-visible dock starts explicitly
+        # hidden; insertWidget will not auto-show it (unlike a ViewTabBar
+        # that used to be inserted directly).
+        host.show()
+        self._time_view_rail = host
+        self._view_tabbar = bar
+        self.ultraview_separator = sep
+        self.ultraview_entry = entry
+        self._ultraview_rail_fitter = UltraViewRailFitter(
+            host=host, tabbar=bar, entry=entry, extra_widgets=(),
+        )
+        bar.setVisible(self.current_mode() == 'time')
+        bar.add_to_ultraview_requested.connect(self.add_to_ultraview_requested.emit)
+        self._wire_ultraview_entry(entry)
+        return bar
+
+    def hint_bar_for_mode(self, mode):
+        if mode not in _MODE_TO_INDEX or mode == 'ultraview':
+            mode = 'time'
+        if mode == 'time':
+            return self._time_card._hint_bar
+        if mode == 'fft':
+            return self._fft_card._hint_bar
+        if mode == 'fft_time':
+            return self._fft_time_card._hint_bar
+        if mode == 'frf':
+            return self._frf_card._hint_bar
+        if mode == 'order':
+            return self._order_card._hint_bar
+        raise KeyError(mode)
+
+    def take_hint_bar(self, mode, parent):
+        """Move the mode's hint bar to a shared external container."""
+        bar = self.hint_bar_for_mode(mode)
+        old_parent = bar.parentWidget()
+        if old_parent is not None:
+            layout = old_parent.layout()
+            if layout is not None and layout.indexOf(bar) >= 0:
+                layout.removeWidget(bar)
+        bar.setParent(parent)
+        bar.setVisible(True)
+        self._configure_status_hint_bar(bar)
+        return bar
+
+    def set_mode(self, mode):
+        if mode == 'ultraview':
+            logger.warning(
+                "ChartStack.set_mode('ultraview') is not a live workspace "
+                "mode; page_ultraview remains the UltraView sheet host"
+            )
+            return
+        if mode not in _MODE_TO_INDEX:
+            mode = 'time'
+        idx = _MODE_TO_INDEX[mode]
+        if self.stack.currentIndex() == idx:
+            return
+        target = self._page_transition_target
+        if target is not None and target.section != mode:
+            self.cancel_page_transition("target-section-replaced")
+            target = None
+        # QStackedLayout raises the incoming page above our sibling cover.
+        # Keep the backing store unchanged until both the page and cover are
+        # in place; deferred pin reflow is too late to prevent a white frame.
+        hold_updates = target is not None and self.stack.updatesEnabled()
+        if hold_updates:
+            self.stack.setUpdatesEnabled(False)
+        try:
+            self.stack.setCurrentIndex(idx)
+            self._page_transition.raise_overlay()
+        finally:
+            if hold_updates:
+                self.stack.setUpdatesEnabled(True)
+        self.stats_strip.setVisible(_STATS_STRIP_ENABLED and mode == 'time')
+        bar = getattr(self, '_view_tabbar', None)
+        if bar is not None:
+            bar.setVisible(mode == 'time')
+        self._time_bottom_dock.setVisible(mode == 'time')
+        if target is not None and target.section == mode:
+            self._constrain_page_transition_overlay_to_plot_surface()
+        self.mode_changed.emit(mode)
+        self._sync_cursor_pill_to_mode(mode)
+        self._pinned_cursors.reflow_visible()
+
+    def page_transition(self) -> PageTransitionController:
+        """Return the stack-local presentation compositor.
+
+        Callers must not use this as a state owner; they provide a source only
+        after a local measured capture and arm a target only for a matching
+        natural-paint acknowledgement.
+        """
+        return self._page_transition
+
+    def set_page_transition_motion_policy(
+        self, policy: MotionPolicy | None,
+    ) -> None:
+        self._page_transition.set_motion_policy(policy)
+
+    def set_page_transition_enabled_sections(self, sections) -> None:
+        """Select product paths with completed capture/paint admission.
+
+        Motion policy alone is not a blanket feature switch. Disabled
+        sections retain their existing direct restore path with no endpoint
+        capture. Split, programmatic restore, and uncomputed targets stay
+        terminal even when a section is listed here.
+        """
+        self._page_transition_enabled_sections = frozenset(
+            str(section) for section in (sections or ())
+        )
+        target = self._page_transition_target
+        if target is not None and target.section not in self._page_transition_enabled_sections:
+            self.cancel_page_transition("section-not-enabled")
+
+    def page_transition_presentation_admitted(
+        self, source_section: str, target_section: str,
+    ) -> bool:
+        """Cheap read-only gate before animation-only key/data/capture work.
+
+        Motion policy, enabled sections, and split layout live here so the
+        analysis-internal and cross-section callers share one feature switch.
+        """
+        if not self._page_transition.motion_policy().interpolates():
+            return False
+        enabled = self._page_transition_enabled_sections
+        if (
+            str(source_section) not in enabled
+            or str(target_section) not in enabled
+        ):
+            return False
+        if self.split_active():
+            return False
+        return True
+
+    def begin_page_transition(
+        self,
+        *,
+        source_section: str,
+        source_view_id: str,
+        target_section: str,
+        target_view_id: str,
+        pane_signature: tuple = (),
+    ) -> PresentationToken | None:
+        """Capture an outgoing local page before its normal restore starts.
+
+        This is an opt-in presentation hook for approved user navigation
+        paths.  It neither selects a View nor causes rendering; callers still
+        execute the existing state transaction immediately after this returns.
+        """
+        if not self.page_transition_presentation_admitted(
+            source_section, target_section,
+        ):
+            return None
+        overlay_rect = self.page_transition_plot_surface_rect()
+        self._clear_page_transition_ready_fence()
+        source = self._crop_page_transition_pixmap(
+            self._page_transition.capture_local_endpoint(self.stack),
+            overlay_rect,
+        )
+        token = self._page_transition.begin_transition(
+            source_section=source_section,
+            source_view_id=source_view_id,
+            target_section=target_section,
+            target_view_id=target_view_id,
+            source_pixmap=source,
+            pane_signature=pane_signature,
+            overlay_rect=overlay_rect,
+        )
+        self._page_transition_target = token
+        if token is not None:
+            self._hold_discrete_quality(token, target_section)
+        return token
+
+    def _transition_target_canvases(self, section: str):
+        """Canvases whose discrete AA settle must wait out this handoff."""
+        section = str(section)
+        if section == "time":
+            return (self.canvas_time,)
+        page = {
+            "fft": self.page_fft,
+            "fft_time": self.page_fft_time,
+            "frf": self.page_frf,
+            "order": self.page_order,
+        }.get(section)
+        if page is None:
+            return ()
+        canvases = []
+        try:
+            count = int(page.pane_count())
+        except (RuntimeError, TypeError, ValueError):
+            return ()
+        for index in range(count):
+            canvas = page.pane_canvas(index)
+            if canvas is not None:
+                canvases.append(canvas)
+        return tuple(canvases)
+
+    def _hold_discrete_quality(self, token, section: str) -> None:
+        """Stop a discrete AA upgrade until this transition finishes or cancels."""
+        self._release_discrete_quality_hold()
+        canvases = self._transition_target_canvases(section)
+        self._discrete_quality_hold_token = token
+        self._discrete_quality_hold_canvases = canvases
+        for canvas in canvases:
+            hold = getattr(canvas, "hold_discrete_quality", None)
+            if callable(hold):
+                hold(token)
+
+    def _release_discrete_quality_hold(self, *_args) -> None:
+        """Arm at most one deferred discrete settle on the held canvases."""
+        token = self._discrete_quality_hold_token
+        canvases = self._discrete_quality_hold_canvases
+        self._discrete_quality_hold_token = None
+        self._discrete_quality_hold_canvases = ()
+        if token is None:
+            return
+        for canvas in canvases:
+            release = getattr(canvas, "release_discrete_quality", None)
+            if callable(release):
+                release(token)
+
+    def page_transition_plot_surface(self) -> QWidget:
+        """Visible plot surface of the current page, excluding View-tab chrome."""
+        mode = self.current_mode()
+        if mode == "time":
+            return self._time_split
+        page = {
+            "fft": self.page_fft,
+            "fft_time": self.page_fft_time,
+            "frf": self.page_frf,
+            "order": self.page_order,
+        }.get(mode)
+        split = getattr(page, "_split", None)
+        if isinstance(split, QWidget):
+            return split
+        return self.stack
+
+    def page_transition_plot_surface_rect(self, surface: QWidget | None = None) -> QRect:
+        """Plot-surface rectangle in stacked-host coordinates."""
+        widget = surface if surface is not None else self.page_transition_plot_surface()
+        origin = widget.mapTo(self.stack, QPoint(0, 0))
+        return QRect(origin, widget.size()).intersected(self.stack.rect())
+
+    def _crop_page_transition_pixmap(self, pixmap: QPixmap, rect: QRect) -> QPixmap:
+        if pixmap.isNull() or rect.width() <= 0 or rect.height() <= 0:
+            return QPixmap()
+        dpr = max(1.0, float(pixmap.devicePixelRatioF()))
+        physical = QRect(
+            int(round(rect.x() * dpr)),
+            int(round(rect.y() * dpr)),
+            int(round(rect.width() * dpr)),
+            int(round(rect.height() * dpr)),
+        ).intersected(pixmap.rect())
+        if physical.width() <= 0 or physical.height() <= 0:
+            return QPixmap()
+        cropped = pixmap.copy(physical)
+        cropped.setDevicePixelRatio(dpr)
+        return cropped
+
+    def _constrain_page_transition_overlay_to_plot_surface(self) -> None:
+        if self._page_transition_target is None:
+            return
+        self._page_transition.constrain_overlay_to(
+            self.page_transition_plot_surface_rect(),
+        )
+
+    def request_page_transition_target(
+        self,
+        token: PresentationToken | None,
+        canvases,
+    ) -> bool:
+        """Arm final target paint proof for one already-restored page."""
+        if token is None or token != self._page_transition_target:
+            return False
+        unique = tuple(
+            canvas for index, canvas in enumerate(tuple(canvases or ()))
+            if canvas is not None and canvas not in tuple(canvases or ())[:index]
+        )
+        if not unique:
+            self._page_transition.cancel("target-has-no-canvas")
+            return False
+        self._clear_page_transition_ready_fence(keep_target=True)
+        self._clear_page_transition_content_watch()
+        real_input_targets = []
+        for canvas in unique:
+            extra = getattr(canvas, "page_transition_input_widgets", None)
+            widgets = extra() if callable(extra) else (
+                (canvas,) if isinstance(canvas, QWidget) else ()
+            )
+            for widget in widgets or ():
+                if isinstance(widget, QWidget) and widget not in real_input_targets:
+                    real_input_targets.append(widget)
+            pin_widgets = getattr(
+                self._pinned_cursors, "presentation_input_widgets", None,
+            )
+            if callable(pin_widgets):
+                for widget in pin_widgets(canvas) or ():
+                    if isinstance(widget, QWidget) and widget not in real_input_targets:
+                        real_input_targets.append(widget)
+        real_input_targets = tuple(real_input_targets)
+        if real_input_targets and not self._page_transition.watch_input_targets(
+            token, real_input_targets,
+        ):
+            self._page_transition.cancel("target-has-no-input-fence")
+            return False
+        self._page_transition_ready_canvases = unique
+        self._page_transition_ready_acks = set()
+        for canvas in unique:
+            signal = getattr(canvas, "presentation_paint_acknowledged", None)
+            request = getattr(canvas, "request_presentation_paint_ack", None)
+            if signal is None or not callable(request):
+                self._page_transition.cancel("target-has-no-paint-fence")
+                return False
+            content_signal = getattr(
+                canvas, "presentation_content_invalidated", None,
+            )
+            if content_signal is None:
+                self._page_transition.cancel("target-has-no-content-fence")
+                return False
+
+            ack_slot = partial(
+                self._on_page_transition_target_painted, token, canvas,
+            )
+            signal.connect(ack_slot)
+            self._page_transition_ready_slots.append((signal, ack_slot))
+            invalidate_slot = partial(
+                self._on_page_transition_content_invalidated, token,
+            )
+            content_signal.connect(invalidate_slot)
+            self._page_transition_content_slots.append(
+                (content_signal, invalidate_slot),
+            )
+            if request(token) is not True:
+                self._page_transition.cancel("target-paint-not-requested")
+                return False
+        return self._page_transition.watch_target_ack(token)
+
+    def request_page_transition_target_for(
+        self, section: str, view_id: str, canvases,
+    ) -> bool:
+        """Arm only the target identity that the active restore just drew."""
+        token = self._page_transition_target
+        if (
+            token is None
+            or token.section != str(section)
+            or token.view_id != str(view_id)
+        ):
+            return False
+        return self.request_page_transition_target(token, canvases)
+
+    def cancel_page_transition(self, reason: str) -> None:
+        self._page_transition.cancel(str(reason))
+
+    def invalidate_page_transition_identity(
+        self, section: str, view_id: str, *, reason: str,
+    ) -> bool:
+        """Drop a local cover when its source or target View no longer exists."""
+        if not self._page_transition.invalidates_identity(section, view_id):
+            return False
+        self.cancel_page_transition(reason)
+        return True
+
+    def has_page_transition_target(self, section: str, view_id: str) -> bool:
+        """Whether this identity is currently covered by a local handoff."""
+        token = self._page_transition_target
+        return bool(
+            token is not None
+            and token.section == str(section)
+            and token.view_id == str(view_id)
+            and self._page_transition.image_bytes() > 0
+        )
+
+    def transition_source_pixmap_for(
+        self, section: str, view_id: str, canvas, *, scale=1.0,
+    ) -> QPixmap | None:
+        """Crop the already-held outgoing frame for a matching canvas.
+
+        It prevents UltraView from immediately re-running its expensive
+        canvas export during a normal View handoff.  Only native-scale,
+        direct source endpoints qualify; redirected blends and request scales
+        that need new pixels keep UltraView's existing capture path.
+        """
+        if canvas is None or float(scale or 1.0) != 1.0:
+            return None
+        source = self._page_transition.local_source_endpoint(section, view_id)
+        if source.isNull():
+            return None
+        try:
+            origin = canvas.mapTo(self.stack, QPoint(0, 0))
+            capture_origin = self._page_transition._overlay.pos()
+            relative = origin - capture_origin
+            dpr = max(1.0, float(source.devicePixelRatioF()))
+            physical = QRect(
+                int(round(relative.x() * dpr)),
+                int(round(relative.y() * dpr)),
+                int(round(canvas.width() * dpr)),
+                int(round(canvas.height() * dpr)),
+            )
+        except (RuntimeError, TypeError, ValueError):
+            return None
+        if (
+            physical.width() <= 0
+            or physical.height() <= 0
+            or not source.rect().contains(physical)
+        ):
+            return None
+        cropped = source.copy(physical)
+        if cropped.isNull():
+            return None
+        cropped.setDevicePixelRatio(dpr)
+        return cropped
+
+    def _on_page_transition_target_painted(self, token, canvas, request_id):
+        if (
+            token != self._page_transition_target
+            or request_id != token
+            or canvas not in self._page_transition_ready_canvases
+        ):
+            return
+        self._page_transition_ready_acks.add(canvas)
+        if len(self._page_transition_ready_acks) != len(
+            self._page_transition_ready_canvases
+        ):
+            return
+        if self._pin_restore_blocks_transition():
+            # Natural paint can arrive before the pin batch commits. Keep the
+            # ack and accept only after that same token's pins are published.
+            self._page_transition_awaiting_pin_commit = True
+            return
+        self._accept_prepared_page_transition(token)
+
+    def _accept_prepared_page_transition(self, token) -> None:
+        """Fade once both the paint fence and the pin batch have committed."""
+        self._page_transition_awaiting_pin_commit = False
+        # The ordinary GraphicsView paint proves the target is ready. The
+        # controller queues its snapshot outside this callback, retaining the
+        # outgoing cover until both endpoints can be crossfaded safely.
+        # Content-invalidation watches stay armed: keep_target must not drop
+        # them, because a later rebuild happens after this paint fence is gone.
+        self._clear_page_transition_ready_fence(keep_target=True)
+        if not self._page_transition.accept_target(token):
+            self._page_transition.cancel("target-paint-not-accepted")
+
+    def _pin_restore_blocks_transition(self) -> bool:
+        blocking = getattr(
+            self._pinned_cursors, "restore_presentation_blocking_any", None,
+        )
+        if not callable(blocking):
+            return False
+        return bool(blocking(self._page_transition_ready_canvases))
+
+    def _on_pin_restore_committed_for_transition(self, canvas) -> None:
+        if not self._page_transition_awaiting_pin_commit:
+            return
+        token = self._page_transition_target
+        if token is None or canvas not in self._page_transition_ready_canvases:
+            return
+        if self._pin_restore_blocks_transition():
+            return
+        self._accept_prepared_page_transition(token)
+
+    def _abandon_pin_restore_after_transition_cancel(self, _reason=None) -> None:
+        """A dropped cover must not leave pins unpublished."""
+        self._page_transition_awaiting_pin_commit = False
+        cancel = getattr(
+            self._pinned_cursors, "cancel_all_restore_presentations", None,
+        )
+        if callable(cancel):
+            cancel()
+
+    def restack_page_transition_overlay(self) -> None:
+        """Pin widgets share the stacked host; the cover stays above them."""
+        raise_overlay = getattr(self._page_transition, "raise_overlay", None)
+        if callable(raise_overlay):
+            raise_overlay()
+
+    def _on_page_transition_content_invalidated(self, token, *_args):
+        if token != self._page_transition_target:
+            return
+        self.cancel_page_transition("target-content-invalidated")
+
+    def _clear_page_transition_content_watch(self):
+        for signal, slot in self._page_transition_content_slots:
+            try:
+                signal.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+        self._page_transition_content_slots.clear()
+
+    def _clear_page_transition_ready_fence(self, *_args, keep_target=False):
+        for signal, slot in self._page_transition_ready_slots:
+            try:
+                signal.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+        self._page_transition_ready_slots.clear()
+        self._page_transition_ready_canvases = ()
+        self._page_transition_ready_acks = set()
+        if not keep_target:
+            self._page_transition_awaiting_pin_commit = False
+            self._clear_page_transition_content_watch()
+            self._page_transition_target = None
+
+    def current_mode(self):
+        return _INDEX_TO_MODE.get(self.stack.currentIndex(), 'time')
+
+    # ----- plot-mode / cursor-mode passthroughs -----
+    def plot_mode(self):
+        return self._primary_plot_mode
+
+    def set_plot_mode(self, mode):
+        if mode not in ('subplot', 'overlay'):
+            return
+        old_primary = self._primary_plot_mode
+        if old_primary == mode:
+            if not self._shared_time_controls_follow_secondary():
+                self._set_shared_plot_mode_silent(mode)
+            return
+        self._primary_plot_mode = mode
+        if not self._shared_time_controls_follow_secondary():
+            self._set_shared_plot_mode_silent(mode)
+        self.plot_mode_changed.emit(mode)
+
+    def plot_mode_for_canvas(self, canvas):
+        """Return the plot mode ('subplot'/'overlay') of the time card that
+        owns ``canvas`` (P2 Task 9 1b).
+
+        Each time pane now carries its OWN 分屏/叠加 state, so a replot must
+        read the mode from the card owning the target canvas, not always the
+        primary card. Falls back to the primary card's mode for any canvas we
+        don't recognise (keeps non-split behaviour byte-identical)."""
+        if (self._secondary_card is not None
+                and canvas is self._secondary_card.canvas):
+            return self._secondary_card.plot_mode()
+        return self._primary_plot_mode
+
+    def set_plot_mode_for_canvas(self, canvas, mode):
+        """Set plot mode on the card that owns ``canvas`` without re-emitting.
+
+        Used by ViewState apply/render paths where the target pane may be the
+        secondary compare card. The interactive controls still emit through the
+        existing set_plot_mode/_on_shared_plot_mode_changed paths.
+        """
+        if mode not in ('subplot', 'overlay'):
+            return
+        if (self._secondary_card is not None
+                and canvas is self._secondary_card.canvas):
+            self._set_secondary_plot_mode_silent(mode)
+            return
+        self._primary_plot_mode = mode
+        if not self._shared_time_controls_follow_secondary():
+            self._set_shared_plot_mode_silent(mode)
+
+    def cursor_mode(self):
+        return self._primary_cursor_mode
+
+    def set_cursor_mode(self, mode):
+        if mode not in ('off', 'single', 'dual'):
+            return
+        self._pinned_cursors.cancel_axis_edit(self.canvas_time)
+        old_primary = self._primary_cursor_mode
+        if old_primary == mode:
+            if not self._shared_time_controls_follow_secondary():
+                self._set_shared_cursor_mode_silent(mode)
+            return
+        self._primary_cursor_mode = mode
+        if not self._shared_time_controls_follow_secondary():
+            self._set_shared_cursor_mode_silent(mode)
+        self._on_time_cursor_mode_changed(mode)
+
+    def set_cursor_mode_for_canvas(self, canvas, mode):
+        """Set cursor mode on the card/canvas owning ``canvas`` without signals."""
+        if mode not in ('off', 'single', 'dual'):
+            return
+        self._pinned_cursors.cancel_axis_edit(canvas)
+        if isinstance(canvas, (PgLineCanvas, PgFrfCanvas)):
+            card = self._card_for_canvas(canvas)
+            setter = getattr(card, "set_cursor_mode", None)
+            if callable(setter):
+                try:
+                    setter(mode, notify=False)
+                except TypeError:
+                    blocked = card.blockSignals(True)
+                    try:
+                        setter(mode)
+                    finally:
+                        card.blockSignals(blocked)
+            else:
+                canvas.set_cursor_mode(mode)
+            return
+        if (self._secondary_card is not None
+                and canvas is self._secondary_card.canvas):
+            self._set_secondary_cursor_mode_silent(mode)
+            target = self._secondary_card.canvas
+        else:
+            self._primary_cursor_mode = mode
+            if not self._shared_time_controls_follow_secondary():
+                self._set_shared_cursor_mode_silent(mode)
+            target = self.canvas_time
+        target.set_cursor_visible(mode != 'off')
+        target.set_dual_cursor_mode(mode == 'dual')
+
+    def _set_secondary_plot_mode_silent(self, mode):
+        if self._secondary_card is None:
+            return
+        old = self._secondary_card.blockSignals(True)
+        try:
+            self._secondary_card.set_plot_mode(mode)
+        finally:
+            self._secondary_card.blockSignals(old)
+
+    def _set_secondary_cursor_mode_silent(self, mode):
+        if self._secondary_card is None:
+            return
+        old = self._secondary_card.blockSignals(True)
+        try:
+            self._secondary_card.set_cursor_mode(mode)
+        finally:
+            self._secondary_card.blockSignals(old)
+
+    def _on_shared_plot_mode_changed(self, mode):
+        if (
+            self.split_active()
+            and self._secondary_card is not None
+            and self._focused_card is self._secondary_card
+        ):
+            self._set_secondary_plot_mode_silent(mode)
+        else:
+            self._primary_plot_mode = mode
+        self.plot_mode_changed.emit(mode)
+
+    def _on_shared_cursor_mode_changed(self, mode):
+        # Canvas toggling + per-pane cursor_mode write-back is owned by
+        # MainWindow._on_cursor_mode_changed (driven by the cursor_mode_changed
+        # signal emitted below); applying to both canvases here too would just
+        # double-toggle. Keep only the non-split primary bookkeeping.
+        if not (self.split_active() and self._secondary_card is not None):
+            self._primary_cursor_mode = mode
+        self._on_time_cursor_mode_changed(mode)
+
+    def _on_time_cursor_mode_changed(self, mode):
+        if mode == 'off':
+            for card in (self._time_card, self._secondary_card):
+                if card is not None:
+                    card.close_cursor_display_popover()
+            self.clear_cursor_pill()
+        self.cursor_mode_changed.emit(mode)
+
+    def mark_discovered(self, hint_id):
+        cards = [self._time_card]
+        for section in ("fft", "fft_time", "frf", "order"):
+            card = self.peek_analysis_card(section)
+            if card is not None:
+                cards.append(card)
+        for card in cards:
+            if card is not None:
+                card.mark_discovered(hint_id)
+
+    def _on_time_annotation_enabled(self, enabled):
+        if self.split_active() and self.focused_card() is not self._time_card:
+            return
+        self.annotation_enabled_changed.emit("time", bool(enabled))
+
+    def _on_secondary_annotation_enabled(self, enabled):
+        if not self.split_active() or self.focused_card() is not self._secondary_card:
+            return
+        self.annotation_enabled_changed.emit("time", bool(enabled))
+        self._time_card.sync_annotation_button()
+
+    def _relay_card_annotation(self, mode, card, enabled):
+        """Forward annotation changes for the focused pane only."""
+        target = self._annotation_card_for_mode(mode)
+        if target is not None and card is not target:
+            return
+        self.annotation_enabled_changed.emit(mode, bool(enabled))
+        host = self._shared_annotation_host(mode)
+        if host is not None and host is not card:
+            host.sync_annotation_button()
+
+    def _shared_annotation_host(self, mode):
+        if mode == "time":
+            return self._time_card
+        page = self.page_for_mode.get(mode)
+        if page is None:
+            return None
+        cards = page.peek_cards() if hasattr(page, "peek_cards") else []
+        if not cards:
+            return None
+        return cards[0]
+
+    def _annotation_card_for_mode(self, mode):
+        if mode == "time":
+            return self.focused_card() if self.split_active() else self._time_card
+        if mode not in self.page_for_mode:
+            return None
+        page = self.page_for_mode[mode]
+        return page.focused_card()
+
+    def set_annotation_enabled(self, mode, enabled, notify=False):
+        if mode == "time":
+            card = self._annotation_card_for_mode(mode)
+        elif mode in self.page_for_mode:
+            # Prefer peek so incidental calls do not construct siblings;
+            # an explicit annotation toggle for that section still ensures.
+            card = self._annotation_card_for_mode(mode)
+            if card is None:
+                self.ensure_analysis_page_ready(mode)
+                card = self._annotation_card_for_mode(mode)
+        else:
+            card = None
+        if card is None:
+            return
+        card.set_annotation_enabled(enabled, notify=notify)
+        host = self._shared_annotation_host(mode)
+        if host is not None and host is not card:
+            host.sync_annotation_button()
+
+    def full_reset_all(self):
+        self.cancel_page_transition("full-reset")
+        self.canvas_time.full_reset()
+        if self._secondary_card is not None:
+            self._secondary_card.canvas.full_reset()
+        for section in ("fft", "fft_time", "frf", "order"):
+            canvas = self.peek_analysis_canvas(section)
+            if canvas is not None and hasattr(canvas, "full_reset"):
+                canvas.full_reset()
+
+    def _set_secondary_time_controls_enabled(self, enabled):
+        """Enable/disable the secondary card's own split/overlay/cursor
+        segmented controls (P2 Task 9 1b).
+
+        Semantics changed from "always disabled" to "enabled while this pane
+        is focused": when the compare (secondary) pane is the focused card its
+        分屏/叠加/游标 controls drive its OWN canvas, mirroring how the primary
+        card's identical controls drive the primary canvas. Outside split, or
+        while the primary pane is focused, the secondary's controls are
+        disabled so a single active control group is unambiguous."""
+        card = self._secondary_card
+        if card is None:
+            return
+        for button in (card.btn_subplot, card.btn_overlay):
+            button.setEnabled(enabled)
+        for button in card._cursor_buttons.values():
+            button.setEnabled(enabled)
+
+    def _sync_secondary_controls_to_focus(self):
+        """Keep the visible shared time controls live.
+
+        The secondary card keeps its own state object, but its toolbar is not
+        part of the split UI. The primary card's detached toolbar is the shared
+        toolbar and routes actions to the focused pane via MainWindow.
+        """
+        self._set_secondary_time_controls_enabled(False)
+        for button in (self._time_card.btn_subplot, self._time_card.btn_overlay):
+            button.setEnabled(True)
+        for button in self._time_card._cursor_buttons.values():
+            button.setEnabled(True)
+        self._sync_shared_time_controls_to_focus()
+
+    def grab_presentation_pixmap(
+        self, target, *, scale=1.0, cancel_page_transition=True,
+        auto_preview=False,
+    ):
+        """Grab canvas pixels plus overlapping live/pinned cursor chrome.
+
+        Copy-to-clipboard uses hi-DPI ``scale``; UltraView uses ``1.0``.
+        Does not touch the clipboard. Time-domain split copy still uses
+        ``_combined_split_pixmap`` and does not go through this helper.
+        Multi-pane analysis pages keep ``grab_combined_pixmap``.
+
+        ``auto_preview=True`` keeps the on-screen curve antialiasing.
+        Explicit copy/export leaves it false and still forces AA.
+        """
+        if not auto_preview:
+            return self._grab_presentation_pixmap(
+                target, scale=scale, cancel_page_transition=cancel_page_transition,
+            )
+        from ..pg_canvas.renderer import auto_preview_grab_scope
+
+        with auto_preview_grab_scope():
+            return self._grab_presentation_pixmap(
+                target, scale=scale, cancel_page_transition=cancel_page_transition,
+            )
+
+    def _grab_presentation_pixmap(
+        self, target, *, scale=1.0, cancel_page_transition=True,
+    ):
+        # An explicit copy/export must consume the real settled page, not a
+        # transient presentation blend.  UltraView's automatic coordinator is
+        # different: it grabs the already-bound canvas (never the overlay),
+        # and must not cancel the visual handoff merely to preserve the
+        # outgoing View before that canvas is reused.
+        if cancel_page_transition:
+            self.cancel_page_transition("explicit-presentation-capture")
+        self._flush_pinned_layout()
+        canvas, page = self._presentation_canvas_and_page(target)
+        if page is not None and getattr(page, "_peer_host", None) is not None:
+            grab_view = getattr(page, "grab_view_pixmap", None)
+            if callable(grab_view):
+                view_id = ""
+                resolver = getattr(page, "view_id_for_canvas", None)
+                if canvas is not None and callable(resolver):
+                    try:
+                        view_id = str(resolver(canvas) or "")
+                    except (RuntimeError, TypeError):
+                        view_id = ""
+                if not view_id:
+                    view_id = str(getattr(page, "_host_view_id", "") or "")
+                pix = grab_view(view_id, scale=scale) if view_id else None
+                if pix is None or pix.isNull():
+                    return None
+                pix = _pixmap_as_device_pixels(pix)
+                if self._comparison_grab_is_one_canvas(page, canvas, view_id):
+                    self._composite_cursor_pill_onto(pix, canvas)
+                return pix
+        if page is not None and callable(getattr(page, "pane_count", None)):
+            try:
+                pane_count = int(page.pane_count())
+            except (TypeError, RuntimeError):
+                pane_count = 0
+            if pane_count > 1:
+                grab_combined = getattr(page, "grab_combined_pixmap", None)
+                if not callable(grab_combined):
+                    return None
+                pix = grab_combined(scale=scale)
+                if pix is None or pix.isNull():
+                    return None
+                return _pixmap_as_device_pixels(pix)
+            if canvas is None and pane_count == 1:
+                canvas = page.pane_canvas(0)
+        if canvas is None:
+            return None
+        pix = _grab_pixmap_hidpi(canvas, requested=scale)
+        if pix is None or pix.isNull():
+            return None
+        self._composite_cursor_pill_onto(pix, canvas)
+        return pix
+
+    def _comparison_grab_is_one_canvas(self, page, canvas, view_id) -> bool:
+        """Live pill belongs on a one-pane grab of the canvas that was asked for."""
+        if canvas is None or page is None or not view_id:
+            return False
+        resolver = getattr(page, "view_id_for_canvas", None)
+        if not callable(resolver):
+            return False
+        try:
+            if str(resolver(canvas) or "") != str(view_id):
+                return False
+        except (RuntimeError, TypeError):
+            return False
+        if str(view_id) == str(getattr(page, "_peer_view_id", "")):
+            return len(page.peer_cards()) <= 1
+        try:
+            return int(page.pane_count()) <= 1
+        except (TypeError, RuntimeError):
+            return False
+
+    def _presentation_canvas_and_page(self, target):
+        mode = getattr(target, "_chart_mode", "")
+        if hasattr(target, "canvas") and mode:
+            canvas = target.canvas
+            page = None
+            if mode in ("fft", "fft_time", "frf", "order"):
+                page = self.page_for_mode.get(mode)
+            return canvas, page
+        if callable(getattr(target, "pane_count", None)):
+            return None, target
+        canvas = target
+        card = self._card_for_canvas(canvas)
+        mode = getattr(card, "_chart_mode", "") if card is not None else ""
+        page = None
+        if mode in ("fft", "fft_time", "frf", "order"):
+            page = self.page_for_mode.get(mode)
+        return canvas, page
+
+    def _iter_cursor_chrome_for_canvas(self, canvas):
+        """Axis labels, then pinned pills, then the live pill (top)."""
+        seen = set()
+        controller = getattr(self, "_pinned_cursors", None)
+        if controller is not None:
+            for widget in controller.axis_labels_for(canvas):
+                ident = id(widget)
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                yield widget
+            for widget in controller.pills_for(canvas):
+                ident = id(widget)
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                yield widget
+        live = self._pill_for_canvas(canvas)
+        if live is not None and id(live) not in seen:
+            yield live
+
+    def _stack_floater_overlaps_canvas(self, widget, canvas, canvas_origin):
+        try:
+            if not widget.isVisible():
+                return False
+            geo = widget.geometry()
+            canvas_w = int(canvas.width())
+            canvas_h = int(canvas.height())
+        except RuntimeError:
+            return False
+        if geo.width() <= 0 or geo.height() <= 0:
+            return False
+        rel_x = geo.x() - canvas_origin.x()
+        rel_y = geo.y() - canvas_origin.y()
+        return (
+            rel_x + geo.width() > 0
+            and rel_x < canvas_w
+            and rel_y + geo.height() > 0
+            and rel_y < canvas_h
+        )
+
+    def _composite_cursor_pill_onto(self, pix, canvas):
+        """Paint overlapping live/pinned pills and Pn labels onto ``pix``.
+
+        Stack floaters are mapped stack → canvas → pixmap with the same
+        scale_x/scale_y used for hi-DPI copy. Does not call canvas.grab
+        for chrome. Each call is one canvas owner; split/combined paths
+        invoke this once per pane so primary P1 never lands on secondary.
+        """
+        if pix is None or pix.isNull() or canvas is None:
+            return
+        try:
+            canvas_w = max(1, int(canvas.width()))
+            canvas_h = max(1, int(canvas.height()))
+            canvas_origin = canvas.mapTo(self.stack, canvas.rect().topLeft())
+        except (RuntimeError, TypeError):
+            return
+        scale_x = max(1.0, float(pix.width()) / float(canvas_w))
+        scale_y = max(1.0, float(pix.height()) / float(canvas_h))
+        painter = None
+        try:
+            for widget in self._iter_cursor_chrome_for_canvas(canvas):
+                if not self._stack_floater_overlaps_canvas(
+                    widget, canvas, canvas_origin,
+                ):
+                    continue
+                geo = widget.geometry()
+                rel_x = geo.x() - canvas_origin.x()
+                rel_y = geo.y() - canvas_origin.y()
+                target = QRect(
+                    int(round(rel_x * scale_x)),
+                    int(round(rel_y * scale_y)),
+                    int(round(geo.width() * scale_x)),
+                    int(round(geo.height() * scale_y)),
+                )
+                if painter is None:
+                    painter = QPainter(pix)
+                painter.drawPixmap(
+                    target,
+                    self._grab_pill_scaled(max(scale_x, scale_y), widget),
+                )
+        except RuntimeError:
+            return
+        finally:
+            if painter is not None:
+                painter.end()
+
+    def capture_explicit_export_pixmap(self):
+        """Presentation image shared by explicit save and copy.
+
+        Time-domain split reuses the side-by-side pixmap. A single time pane
+        reuses ``grab_presentation_pixmap`` so the live readout is included.
+        Analysis pages reuse their combined capture, including slice panels.
+        UltraView automatic previews do not use this entry.
+        """
+        self.cancel_page_transition("explicit-presentation-capture")
+        mode = self.current_mode()
+        if mode == "time":
+            if self.split_active():
+                return self._combined_split_pixmap()
+            return self.grab_presentation_pixmap(
+                self._time_card,
+                scale=_HIDPI_EXPORT_SCALE,
+                cancel_page_transition=False,
+            )
+        page = self.page_for_mode.get(mode)
+        grab = getattr(page, "grab_export_pixmap", None)
+        if not callable(grab):
+            grab = getattr(page, "grab_combined_pixmap", None)
+        if not callable(grab):
+            return None
+        return grab()
+
+    def _copy_card_image(self, _card):
+        """Capture the card's canvas for MainWindow to publish. For the
+        time-domain card, the floating cursor chrome (live pill, pinned
+        pills, Pn labels) overlapping the canvas is composited onto the
+        captured pixmap so the screenshot matches what the user sees.
+
+        The canvas is grabbed at a hi-DPI scale (spec §E) for a crisp,
+        DPI-independent bitmap; the canvas caps the magnification for
+        speed. Floater position AND size are scaled by the SAME
+        effective factor so they still line up on the magnified bitmap.
+        Explicit copy and save share :meth:`capture_explicit_export_pixmap`.
+        """
+        pix = self.capture_explicit_export_pixmap()
+        if pix is not None and not pix.isNull():
+            self.image_captured.emit(pix)
+
+    def _grab_pill_scaled(self, scale, pill=None):
+        """Grab a stack floater at ``scale``× for crisp compositing.
+
+        At 1× this is a plain ``QPixmap`` grab; above 1× the widget is
+        re-rendered into a magnified QImage (sharp text, not an upscale)."""
+        if pill is None:
+            pill = self._pill
+        if scale <= 1.0:
+            return pill.grab()
+        w = max(1, int(pill.width()))
+        h = max(1, int(pill.height()))
+        tw = max(1, int(round(w * scale)))
+        th = max(1, int(round(h * scale)))
+        img = QImage(tw, th, QImage.Format_ARGB32_Premultiplied)
+        img.fill(Qt.transparent)
+        painter = QPainter(img)
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            painter.scale(scale, scale)
+            pill.render(painter)
+        finally:
+            painter.end()
+        return QPixmap.fromImage(img)
+
+    def _pill_for_canvas(self, canvas):
+        """Return the CursorPill that should show readouts for ``canvas``."""
+        if (self._pill_secondary is not None
+                and self._secondary_card is not None
+                and canvas is self._secondary_card.canvas):
+            return self._pill_secondary
+        return self._pill
+
+    def _canvas_for_live_pill(self, pill):
+        """Canvas whose live readout this pill currently displays.
+
+        Inverse of :meth:`_pill_for_canvas` for the clicked widget. Time split
+        keeps the primary pill on the left card even when the last readout
+        update came from the right pane. The same primary widget is reused on
+        FFT/FRF, so those sections resolve the visible-section canvas rather
+        than hard-coding the time-domain host.
+        """
+        if pill is None:
+            return None
+        if (self._pill_secondary is not None
+                and pill is self._pill_secondary
+                and self._secondary_card is not None):
+            return self._secondary_card.canvas
+        if pill is not self._pill:
+            return None
+        mode = self.current_mode()
+        if mode == "time":
+            return getattr(self._time_card, "canvas", None)
+        card = self._active_cursor_card
+        if card is not None and getattr(card, "_chart_mode", None) == mode:
+            canvas = getattr(card, "canvas", None)
+            if canvas is not None and self._pill_for_canvas(canvas) is pill:
+                return canvas
+        page = self.page_for_mode.get(mode)
+        if page is not None:
+            for section_card in getattr(page, "_cards", ()):
+                canvas = getattr(section_card, "canvas", None)
+                if canvas is not None:
+                    return canvas
+        return None
+
+    def _cursor_source_on_screen(self, source):
+        """True when the emitting canvas belongs to the currently visible section.
+
+        Off-screen analysis canvases share the primary pill via
+        ``_pill_for_canvas``, so their empty-readout emits must not clear a
+        time-domain dual-cursor pill. ``source is None`` is the historical
+        primary-time-canvas call and is treated as on-screen.
+        """
+        if source is None:
+            return True
+        card = self._card_for_canvas(source)
+        if card is self._secondary_card:
+            return self.current_mode() == 'time'
+        return getattr(card, '_chart_mode', None) == self.current_mode()
+
+    def _cursor_pill_visible_for_mode(self, mode=None, source=None):
+        mode = self.current_mode() if mode is None else mode
+        if mode == 'time':
+            return True
+        if mode in {'fft', 'frf'}:
+            card = self._card_for_canvas(source)
+            getter = getattr(card, 'cursor_mode', None)
+            return bool(callable(getter) and getter() != 'off')
+        return False
+
+    def _update_pill_content(self, pill, card, update):
+        """Run ``update`` (a content mutation that may resize ``pill``) and then
+        settle geometry: user-placed pills keep their pre-update right edge and
+        top (clamped to the stack), default pills re-anchor to ``card``'s canvas.
+
+        This is the single seam every size-changing cursor readout must pass
+        through so single/dual switching never drifts or overflows the parent.
+        """
+        self._sync_pill_safe_rect(pill, card)
+        if getattr(pill, "_host_pending", False) and pill._visibility_requested:
+            pill._set_space_hidden(True)
+        was_user_placed = pill.is_user_placed()
+        old_right = pill.x() + pill.width()
+        old_top = pill.y()
+        update()
+        if (
+            not pill.isVisible()
+            and not pill.awaiting_space()
+            and not getattr(pill, "_host_pending", False)
+        ):
+            return
+        if was_user_placed:
+            pill.move_preserving_right_edge(old_right, old_top)
+            pill.raise_()
+        else:
+            self._reposition_one_pill(pill, card)
+
+    def _clear_cursor_pill_content(self, pill, card):
+        """Clear one pill through the sole content-mutation geometry seam."""
+        if pill is not None:
+            self._update_pill_content(pill, card, pill.clear)
+
+    def _is_managed_time_canvas(self, source):
+        """True when ``source`` is this stack's live time-domain canvas.
+
+        Spec §3.5: live canvases render detail only through the structured
+        projection pipeline. Unknown QObject emitters keep the legacy
+        ``cursor_info`` / ``dual_cursor_info`` fallback. Identity is the
+        owning canvas, not whether a rows signal happens to be present.
+        """
+        if source is None or source is self.canvas_time:
+            return True
+        secondary = self.secondary_canvas()
+        return secondary is not None and source is secondary
+
+    def _is_managed_frequency_canvas(self, source):
+        """True when ``source`` is this stack's live FFT spectrum canvas."""
+        return isinstance(source, PgLineCanvas)
+
+    def _is_managed_frf_canvas(self, source):
+        """True when ``source`` publishes live FRF facts for this stack.
+
+        Identity is the FRF canvas, not a widened FFT ``isinstance`` check.
+        Legacy ``cursor_info`` strings from this canvas must not paint the pill.
+        """
+        return isinstance(source, PgFrfCanvas)
+
+    def _on_cursor_info(self, text, source=None):
+        if self._is_managed_frf_canvas(source):
+            return
+        if not self._cursor_source_on_screen(source):
+            return
+        if text:
+            self._pinned_cursors.clear_live_suppressed(source)
+        elif self._pinned_cursors.is_live_suppressed(source):
+            return
+        mode = self._cursor_mode_for_canvas(source)
+        if source is not None:
+            self._active_cursor_card = self._card_for_canvas(source)
+        pill = self._pill_for_canvas(source)
+        card = self._card_for_canvas(source)
+        if not text:
+            self._cancel_legacy_detail_fallback(source)
+            if source is not None:
+                self._pending_fft_primary.pop(source, None)
+                self._pending_cursor_primary.pop(source, None)
+                if self._is_managed_frequency_canvas(source):
+                    self._drop_cursor_canvas_state(source)
+            self._update_pill_content(pill, card, pill.clear)
+            return
+        if self._is_managed_frequency_canvas(source):
+            primary, _detail = self._format_cursor_info_for_pill(text, mode)
+            self._pending_fft_primary[source] = primary
+            return
+        managed = self._is_managed_time_canvas(source)
+        def update():
+            if mode == 'single':
+                primary, detail, mini_detail, tooltip = (
+                    self._format_single_cursor_variants_for_pill(text)
+                )
+                pill.set_primary(primary)
+                self._remember_cursor_primary(source, primary)
+                if managed:
+                    # Rows normally arrive synchronously after cursor_info.
+                    # Delay the legacy fallback one event turn so that path
+                    # remains a single structured projection write.
+                    self._schedule_legacy_detail_fallback(
+                        source, pill, card, "single",
+                        (detail, mini_detail, tooltip),
+                    )
+                else:
+                    pill.set_single_detail_html(detail, mini_detail, tooltip)
+            else:
+                primary, _detail = self._format_cursor_info_for_pill(text, mode)
+                pill.set_primary(primary)
+                self._remember_cursor_primary(source, primary)
+            pill.setVisible(
+                self._cursor_pill_visible_for_mode(self.current_mode(), source)
+            )
+
+        self._update_pill_content(pill, card, update)
+
+    # ---- readout formatting (implemented in cursor_pill.py) ----
+    # Thin delegates: the formatting itself is pure text processing and lives
+    # next to the widget it feeds. Only the `mode` default is resolved here,
+    # because that is the one part that reads live state.
+
+    def _format_cursor_info_for_pill(self, text, mode=None):
+        if mode is None:
+            mode = self.cursor_mode()
+        return format_cursor_info(text, mode)
+
+    def _format_single_cursor_variants_for_pill(self, text):
+        return format_single_cursor_variants(text)
+
+    def _mini_single_cursor_part(self, part, top_pad):
+        return mini_single_cursor_part(part, top_pad)
+
+    def _plain_single_cursor_tooltip_line(self, part):
+        return plain_single_cursor_tooltip_line(part)
+
+    def _single_cursor_channel_color(self, part):
+        return single_cursor_channel_color(part)
+
+    def _strip_html(self, value):
+        return strip_html(value)
+
+    def _on_dual_cursor_info(self, text, source=None):
+        if self._is_managed_frf_canvas(source):
+            return
+        if not self._cursor_source_on_screen(source):
+            return
+        if text:
+            self._pinned_cursors.clear_live_suppressed(source)
+        elif self._pinned_cursors.is_live_suppressed(source):
+            return
+        if source is not None:
+            self._active_cursor_card = self._card_for_canvas(source)
+        if self._is_managed_frequency_canvas(source):
+            return
+        if self._is_managed_time_canvas(source):
+            # Live dual detail comes from dual_cursor_rows. Keep visibility
+            # if this HTML is the only signal a caller sent. Structured rows
+            # replace this legacy fallback when they arrive.
+            pill = self._pill_for_canvas(source)
+            card = self._card_for_canvas(source)
+            self._schedule_legacy_detail_fallback(
+                source, pill, card, "dual", text,
+            )
+            return
+        pill = self._pill_for_canvas(source)
+        card = self._card_for_canvas(source)
+
+        def update():
+            pill.set_detail_html(text)
+            if (self._cursor_pill_visible_for_mode(self.current_mode(), source)
+                    and (text or pill.primary_text())):
+                pill.setVisible(True)
+
+        self._update_pill_content(pill, card, update)
+
+    def _on_dual_cursor_rows(self, rows, source=None):
+        if not self._cursor_source_on_screen(source):
+            return
+        source = self.canvas_time if source is None else source
+        self._pinned_cursors.clear_live_suppressed(source)
+        self._cancel_legacy_detail_fallback(source)
+        if source is not None:
+            self._active_cursor_card = self._card_for_canvas(source)
+        channels = tuple(apply_cursor_source_prefix_policy(
+            tuple(self._cursor_display_channel_from_dual(row) for row in rows)
+        ))
+        x_mode = (
+            "custom"
+            if any(dual_row_is_custom_x(row) for row in rows)
+            else self._cursor_x_mode(source, channels)
+        )
+        self._cursor_rows_by_canvas[source] = (
+            "dual", x_mode, channels,
+            self._primary_for_stored_rows(source),
+        )
+        self._refresh_cursor_projection(source)
+
+    def _on_single_cursor_rows(self, rows, source=None):
+        if not self._cursor_source_on_screen(source):
+            return
+        source = self.canvas_time if source is None else source
+        self._pinned_cursors.clear_live_suppressed(source)
+        self._cancel_legacy_detail_fallback(source)
+        self._active_cursor_card = self._card_for_canvas(source)
+        channels = tuple(rows or ())
+        self._cursor_rows_by_canvas[source] = (
+            "single",
+            self._cursor_x_mode(source, channels),
+            channels,
+            self._primary_for_stored_rows(source),
+        )
+        self._refresh_cursor_projection(source)
+
+    def _cursor_x_mode(self, source, channels):
+        if any(getattr(channel, "branches", ()) for channel in channels):
+            return "custom"
+        checker = getattr(source, "cursor_x_mode", None)
+        return "custom" if callable(checker) and checker() else "time"
+
+    def _cursor_display_channel_from_dual(self, row):
+        return cursor_display_channel_from_dual_row(
+            row, source_label_resolver=self._source_label_resolver,
+        )
+
+    def set_source_label_resolver(self, resolver):
+        self._source_label_resolver = resolver
+        for canvas in (self.canvas_time, self.secondary_canvas()):
+            if canvas is not None:
+                canvas.set_source_label_resolver(resolver)
+
+    def _drop_cursor_canvas_state(self, source):
+        if source is None:
+            return
+        self._cursor_rows_by_canvas.pop(source, None)
+        self._pending_fft_primary.pop(source, None)
+        self._pending_cursor_primary.pop(source, None)
+
+    def _cursor_snapshot(self, source):
+        cached = self._cursor_rows_by_canvas.get(source)
+        if cached is None:
+            return None
+        cursor_mode, x_mode, channels = cached[:3]
+        primary = cached[3] if len(cached) > 3 else None
+        return cursor_mode, x_mode, channels, primary
+
+    def _remember_cursor_primary(self, source, primary):
+        text = primary or ""
+        self._pending_cursor_primary[source] = text
+        cached = self._cursor_snapshot(source)
+        if cached is None:
+            return
+        cursor_mode, x_mode, channels, _old = cached
+        self._cursor_rows_by_canvas[source] = (
+            cursor_mode, x_mode, channels, text,
+        )
+
+    def _primary_for_stored_rows(self, source):
+        pending = self._pending_cursor_primary.pop(source, None)
+        if pending is not None:
+            return pending
+        cached = self._cursor_snapshot(source)
+        if cached is not None and cached[3] is not None:
+            return cached[3]
+        return ""
+
+    def _refresh_cursor_projection(self, source, primary=_CURSOR_PRIMARY_UNSET):
+        if self._pinned_cursors.is_live_suppressed(source):
+            return
+        cached = self._cursor_snapshot(source)
+        if cached is None:
+            return
+        cursor_mode, x_mode, channels, cached_primary = cached
+        pill = self._pill_for_canvas(source)
+        card = self._card_for_canvas(source)
+        if x_mode == "frequency":
+            projection = build_fft_cursor_presentation(
+                channels,
+                cursor_mode=cursor_mode,
+                mini=pill.display_mode() == "mini",
+            )
+        elif x_mode == "frf":
+            facts = channels
+            projection = build_frf_cursor_presentation(
+                None if getattr(facts, "awaiting_b", False) else getattr(facts, "sample", None),
+                mini=pill.display_mode() == "mini",
+                awaiting_b=bool(getattr(facts, "awaiting_b", False)),
+            )
+        else:
+            projection = build_cursor_presentation(
+                channels,
+                self._cursor_display_options,
+                cursor_mode=cursor_mode,
+                x_mode=x_mode,
+                mini=pill.display_mode() == "mini",
+            )
+        apply_primary = primary is not _CURSOR_PRIMARY_UNSET
+        if apply_primary:
+            primary_text = primary or ""
+        else:
+            primary_text = None
+
+        def update():
+            if apply_primary:
+                pill._primary_original = primary_text
+            pill.set_pin_role("live")
+            dual_complete = True
+            if x_mode == "frf":
+                dual_complete = not bool(getattr(channels, "awaiting_b", False))
+            elif cursor_mode == "dual":
+                snap_fn = getattr(source, "snapshot_cursor_placement", None)
+                snap = snap_fn() if callable(snap_fn) else None
+                dual_complete = bool(
+                    isinstance(snap, dict) and snap.get("bx") is not None
+                )
+            pill.set_live_hint(
+                live_pin_hint_text(cursor_mode, dual_complete=dual_complete)
+            )
+            pill.set_display_projection(projection)
+            if self._cursor_pill_visible_for_mode(self.current_mode(), source) and (
+                channels or pill.primary_text() or primary_text
+            ):
+                pill.setVisible(True)
+
+        self._update_pill_content(pill, card, update)
+        self._pinned_cursors.nudge_live(source)
+
+    def _cancel_legacy_detail_fallback(self, source):
+        source = self.canvas_time if source is None else source
+        self._legacy_detail_pending.pop(source, None)
+
+    def _schedule_legacy_detail_fallback(self, source, pill, card, mode, payload):
+        """Render legacy detail only when rows do not arrive this event turn."""
+        source = self.canvas_time if source is None else source
+        token = object()
+        self._legacy_detail_pending[source] = token
+        QTimer.singleShot(
+            0,
+            partial(
+                self._apply_legacy_detail_fallback,
+                source, token, pill, card, mode, payload,
+            ),
+        )
+
+    def _apply_legacy_detail_fallback(
+        self, source, token, pill, card, mode, payload
+    ):
+        if self._legacy_detail_pending.get(source) is not token:
+            return
+        self._legacy_detail_pending.pop(source, None)
+        # A compatibility-only emission supersedes old structured rows before
+        # the user can toggle between the full and mini variants.
+        self._drop_cursor_canvas_state(source)
+
+        def update():
+            if mode == "single":
+                detail, mini_detail, tooltip = payload
+                pill.set_single_detail_html(detail, mini_detail, tooltip)
+            else:
+                pill.set_detail_html(payload)
+            if (
+                self._cursor_pill_visible_for_mode(self.current_mode(), source)
+                and (payload or pill.primary_text())
+            ):
+                pill.setVisible(True)
+
+        self._update_pill_content(pill, card, update)
+
+    def _on_primary_cursor_pill_display_mode_changed(self, mode):
+        source = getattr(self._active_cursor_card, "canvas", None)
+        if source is None:
+            source = self.canvas_time
+        self._on_cursor_pill_display_mode_changed(mode, source=source)
+
+    def _on_primary_live_pin_requested(self):
+        source = self._canvas_for_live_pill(self._pill)
+        if source is not None:
+            self._pinned_cursors.pin_live_readout(source)
+
+    def _on_secondary_live_pin_requested(self):
+        source = self._canvas_for_live_pill(self._pill_secondary)
+        if source is not None:
+            self._pinned_cursors.pin_live_readout(source)
+
+    def _on_cursor_pill_display_mode_changed(self, _mode, *, source):
+        self._refresh_cursor_projection(source)
+
+    def _resolve_frequency_channel(self, channel):
+        if not isinstance(channel, FrequencyCursorChannel):
+            return channel
+        source_label, channel_label = resolve_cursor_source_label(
+            channel.channel_label,
+            channel.identity,
+            self._source_label_resolver,
+        )
+        if channel.source_label:
+            source_label = channel.source_label
+        if not channel_label:
+            channel_label = channel.channel_label
+        return FrequencyCursorChannel(
+            identity=channel.identity,
+            source_label=source_label,
+            channel_label=channel_label,
+            color=channel.color,
+            unit_suffix=channel.unit_suffix,
+            value=channel.value,
+            delta_to_primary=channel.delta_to_primary,
+            a_value=channel.a_value,
+            b_value=channel.b_value,
+            delta_ab=channel.delta_ab,
+        )
+
+    def _frf_facts_are_clear(self, facts) -> bool:
+        if not isinstance(facts, FrfLiveCursorFacts):
+            return True
+        if facts.mode == "off":
+            return True
+        if facts.awaiting_b:
+            return False
+        return facts.sample is None
+
+    def _on_frf_cursor_facts(self, facts, source=None):
+        """Apply one structured FRF reading, or drop it when the pane is hidden.
+
+        A hidden clear removes only this canvas cache. It must not erase the
+        pill currently showing another section. Legacy HTML from the same
+        canvas is ignored by the cursor-info slots.
+        """
+        if source is None or not self._is_managed_frf_canvas(source):
+            return
+        on_screen = self._cursor_source_on_screen(source)
+        self._cancel_legacy_detail_fallback(source)
+        if self._frf_facts_are_clear(facts):
+            self._drop_cursor_canvas_state(source)
+            if not on_screen or self._pinned_cursors.is_live_suppressed(source):
+                return
+            pill = self._pill_for_canvas(source)
+            card = self._card_for_canvas(source)
+            self._active_cursor_card = card
+            self._update_pill_content(pill, card, pill.clear)
+            return
+        self._pinned_cursors.clear_live_suppressed(source)
+        primary = frf_live_primary_html(facts)
+        self._cursor_rows_by_canvas[source] = (
+            facts.mode, "frf", facts, primary,
+        )
+        if not on_screen:
+            return
+        self._active_cursor_card = self._card_for_canvas(source)
+        self._refresh_cursor_projection(source, primary=primary)
+
+    def _on_frequency_cursor_channels(self, channels, source=None):
+        if not self._cursor_source_on_screen(source):
+            return
+        if source is None:
+            return
+        self._pinned_cursors.clear_live_suppressed(source)
+        self._cancel_legacy_detail_fallback(source)
+        self._active_cursor_card = self._card_for_canvas(source)
+        mode = self._cursor_mode_for_canvas(source)
+        if mode not in {"single", "dual"}:
+            self._drop_cursor_canvas_state(source)
+            return
+        resolved = tuple(
+            self._resolve_frequency_channel(channel)
+            for channel in (channels or ())
+        )
+        primary = self._pending_fft_primary.pop(source, None)
+        if not resolved and not primary:
+            self._drop_cursor_canvas_state(source)
+            return
+        self._cursor_rows_by_canvas[source] = (
+            mode, "frequency", resolved, primary or "",
+        )
+        self._refresh_cursor_projection(source, primary=primary or "")
+
+    def _on_frequency_layout_geometry_changed(self, source=None):
+        if not self._cursor_source_on_screen(source):
+            return
+        self._pill_layout_refresh.start()
+
+    def _on_frequency_cursor_rows(self, rows, source=None):
+        """Render FFT A/B values through the pill's reversible row contract."""
+        if self._is_managed_frequency_canvas(source):
+            return
+        if not self._cursor_source_on_screen(source):
+            return
+        if source is not None:
+            self._active_cursor_card = self._card_for_canvas(source)
+        pill = self._pill_for_canvas(source)
+        card = self._card_for_canvas(source)
+
+        def update():
+            pill.set_frequency_dual_rows(rows)
+            if (
+                self._cursor_pill_visible_for_mode(self.current_mode(), source)
+                and (rows or pill.primary_text())
+            ):
+                pill.setVisible(True)
+
+        self._update_pill_content(pill, card, update)
+
+    def cursor_display_options(self):
+        return self._cursor_display_options
+
+    def _on_cursor_display_options_changed(self, options, *, source_card=None):
+        if not isinstance(options, CursorDisplayOptions):
+            raise TypeError("options must be CursorDisplayOptions")
+        self._cursor_display_options = options
+        self._cursor_display_store.save(options)
+        for card in (self._time_card, self._secondary_card):
+            if card is not None:
+                card.set_cursor_display_options(options)
+        for canvas in (self.canvas_time, self.secondary_canvas()):
+            if canvas is not None:
+                canvas.set_cursor_display_options(options)
+                overlay = getattr(canvas, "_pinned_overlay", None)
+                if overlay is not None:
+                    overlay.reproject()
+        if source_card is not None:
+            for card in (self._time_card, self._secondary_card):
+                if card is not None and card is not source_card:
+                    card.close_cursor_display_popover()
+        for canvas in tuple(self._cursor_rows_by_canvas):
+            cached = self._cursor_snapshot(canvas)
+            if cached is not None and cached[1] in {"frequency", "frf"}:
+                continue
+            self._refresh_cursor_projection(canvas)
+
+    def _on_cursor_display_popover_geometry_changed(
+        self, geometry, *, source_card
+    ):
+        canvas = getattr(source_card, "canvas", None)
+        pill = self._pill_for_canvas(canvas)
+        if geometry is None:
+            pill.restore_after_avoidance()
+            if pill.isVisible():
+                pill.raise_()
+            return
+        for card in (self._time_card, self._secondary_card):
+            if card is not None and card is not source_card:
+                card.close_cursor_display_popover()
+        pill.avoid_global_rect(geometry, gap=8)
+        if pill.isVisible():
+            pill.raise_()
+
+    def _sync_cursor_pill_to_mode(self, mode):
+        """Keep the shared pill on the visible section's cached readout.
+
+        Time, FFT, and FRF share one live widget. Switching sections restores
+        that section's cache or hides the pill when the cache is empty.
+        Primary and detail belong to the same per-canvas snapshot.
+        """
+        if mode == "time":
+            self._active_cursor_card = self._time_card
+            restored = False
+            for source in (self.canvas_time, self.secondary_canvas()):
+                cached = self._cursor_snapshot(source)
+                if source is not None and cached is not None:
+                    self._refresh_cursor_projection(
+                        source, primary=cached[3] or "",
+                    )
+                    restored = True
+            if not restored:
+                self._pill.setVisible(False)
+            self._reposition_pill()
+            return
+        if mode == "fft":
+            self._restore_section_cursor_pill(
+                self.page_fft, "frequency", self._fft_card,
+            )
+            return
+        if mode == "frf":
+            self._restore_section_cursor_pill(
+                self.page_frf, "frf", self._frf_card,
+            )
+
+    def _restore_section_cursor_pill(self, page, x_mode, fallback_card):
+        restored = False
+        for card in page._cards:
+            source = getattr(card, "canvas", None)
+            cached = self._cursor_snapshot(source)
+            if cached is not None and cached[1] == x_mode:
+                self._active_cursor_card = card
+                self._refresh_cursor_projection(
+                    source, primary=cached[3] or "",
+                )
+                restored = True
+                break
+        if not restored:
+            self._active_cursor_card = fallback_card
+            self._clear_cursor_pill_content(self._pill, fallback_card)
+        if self._pill_secondary is not None:
+            self._pill_secondary.setVisible(False)
+        self._reposition_pill()
+
+    def _reposition_pill(self):
+        current = self.current_mode()
+        active_canvas = getattr(self._active_cursor_card, 'canvas', None)
+        if not self._cursor_pill_visible_for_mode(current, active_canvas):
+            self._pill.setVisible(False)
+            if self._pill_secondary is not None:
+                self._pill_secondary.setVisible(False)
+            self._pinned_cursors.reflow_visible()
+            return
+        if current != 'time':
+            active_mode = getattr(self._active_cursor_card, '_chart_mode', None)
+            if active_mode != current:
+                self._pill.setVisible(False)
+                if self._pill_secondary is not None:
+                    self._pill_secondary.setVisible(False)
+                self._pinned_cursors.reflow_visible()
+                return
+            if self._pill_secondary is not None:
+                self._pill_secondary.setVisible(False)
+            self._reposition_one_pill(self._pill, self._active_cursor_card)
+            self._pinned_cursors.reflow_visible()
+            return
+        self._reposition_one_pill(self._pill, self._time_card)
+        if self._pill_secondary is not None and self._secondary_card is not None:
+            self._reposition_one_pill(self._pill_secondary, self._secondary_card)
+        self._pinned_cursors.reflow_visible()
+
+    def _reposition_one_pill(self, pill, card):
+        """Anchor ``pill`` to ``card``'s canvas top-right corner (or honour
+        its user-placed position)."""
+        if not pill.isVisible() and not pill.awaiting_space():
+            return
+        safe_changed = self._sync_pill_safe_rect(pill, card)
+        if getattr(pill, "_host_pending", False):
+            if pill._visibility_requested:
+                pill._set_space_hidden(True)
+            return
+        if safe_changed and pill._display_projection is not None:
+            # A canvas/split resize changes both the allowed frame width and
+            # the row budget. Rebuild from the current projection rather than
+            # merely clamping a stale-size widget into the new pane.
+            pill.reflow_to_parent()
+        if not pill.isVisible():
+            return
+        safe = pill.safe_rect()
+        if not safe.isValid() or safe.width() <= 0 or safe.height() <= 0:
+            return
+        if pill.is_user_placed():
+            x = max(safe.left(), min(pill.x(), safe.right() - pill.width() + 1))
+            y = max(safe.top(), min(pill.y(), safe.bottom() - pill.height() + 1))
+            pill.move(x, y)
+        else:
+            pill.move(
+                max(safe.left(), safe.right() - pill.width() + 1),
+                max(safe.top(), min(safe.top(), safe.bottom() - pill.height() + 1)),
+            )
+        pill.raise_()
+
+    def _sync_pill_safe_rect(self, pill, card):
+        """Give a shared-stack pill its owning canvas's mapped safe area."""
+        if pill is None:
+            return False
+        canvas = getattr(card, "canvas", None)
+        provider = getattr(canvas, "frequency_cursor_host_rect", None)
+        if callable(provider):
+            host = provider()
+            if host is None or not QRect(host).isValid() or host.width() <= 0 or host.height() <= 0:
+                return pill.set_safe_rect(None, host_pending=True)
+            try:
+                top_left = canvas.mapTo(self.stack, host.topLeft())
+                bottom_right = canvas.mapTo(self.stack, host.bottomRight())
+            except (RuntimeError, TypeError):
+                return pill.set_safe_rect(None, host_pending=True)
+            mapped = QRect(top_left, bottom_right).intersected(
+                self.stack.contentsRect()
+            )
+            safe = mapped.adjusted(8, 8, -8, -8)
+            if not safe.isValid() or safe.width() <= 0 or safe.height() <= 0:
+                return pill.set_safe_rect(None, host_pending=True)
+            return pill.set_safe_rect(safe)
+        if canvas is None or canvas.width() <= 0 or canvas.height() <= 0:
+            return pill.set_safe_rect(None)
+        try:
+            top_left = canvas.mapTo(self.stack, canvas.rect().topLeft())
+            bottom_right = canvas.mapTo(self.stack, canvas.rect().bottomRight())
+        except (RuntimeError, TypeError):
+            return pill.set_safe_rect(None)
+        mapped = QRect(top_left, bottom_right).intersected(
+            self.stack.contentsRect()
+        )
+        safe = mapped.adjusted(8, 8, -8, -8)
+        return pill.set_safe_rect(safe if safe.isValid() else None)
+
+    def map_canvas_rect_to_stack(self, canvas, rect):
+        """Map a canvas-local rect through viewport/stack. Never the full stack."""
+        if canvas is None or rect is None:
+            return None
+        source = QRect(rect)
+        if not source.isValid() or source.width() <= 0 or source.height() <= 0:
+            return None
+        stack = self.stack
+        try:
+            top_left = canvas.mapTo(stack, source.topLeft())
+            bottom_right = canvas.mapTo(stack, source.bottomRight())
+        except (RuntimeError, TypeError):
+            return None
+        mapped = QRect(top_left, bottom_right).intersected(stack.contentsRect())
+        if not mapped.isValid() or mapped.width() <= 0 or mapped.height() <= 0:
+            return None
+        return mapped
+
+    def _flush_pinned_layout(self):
+        """Consume pending Pin geometry before a pixmap grab/copy."""
+        controller = getattr(self, "_pinned_cursors", None)
+        flush = getattr(controller, "flush_layout", None)
+        if callable(flush):
+            flush()
+
+    def pinned_cursor_host_on_stack(self, canvas):
+        """Owner host rect in stack coordinates. Pending geometry returns None."""
+        host = None
+        overlay = getattr(canvas, "_pinned_overlay", None)
+        if overlay is not None:
+            host = overlay.host_rect()
+        if host is None:
+            provider = getattr(canvas, "frequency_cursor_host_rect", None)
+            if callable(provider):
+                try:
+                    host = provider()
+                except (RuntimeError, TypeError, AttributeError):
+                    host = None
+        if host is None or not QRect(host).isValid() or host.width() <= 1:
+            return None
+        return self.map_canvas_rect_to_stack(canvas, QRect(host))
+
+    def resizeEvent(self, event):
+        self._page_transition.cancel("stack-resize")
+        super().resizeEvent(event)
+        self._reposition_pill()
+
+    def _on_time_splitter_moved(self, _position, _index):
+        """Rebudget both time-domain pills after a user divider drag."""
+        self._reposition_pill()
+
+    def clear_cursor_pill(self):
+        """Clear live pill content only. Pinned records stay on the owner."""
+        for card in (self._time_card, self._secondary_card):
+            if card is not None:
+                card.close_cursor_display_popover()
+        self._clear_cursor_pill_content(self._pill, self._time_card)
+        self._clear_cursor_pill_content(
+            self._pill_secondary, self._secondary_card
+        )
+        self._cursor_rows_by_canvas.clear()
+        self._pending_fft_primary.clear()
+        self._pending_cursor_primary.clear()
+        self._pinned_cursors.reflow_visible()
+
+    def cursor_pill_snapshot(self):
+        """Return the current floating cursor pill UI state.
+
+        The pill content is not part of ViewState; it reflects the last cursor
+        hover/readout on the active canvas. Split rendering temporarily applies
+        another view through the primary controls, so callers can use this to
+        preserve the active readout across that off-screen render.
+        """
+        snapshot = self._pill.snapshot()
+        snapshot.update({
+            'visible': self._pill.isVisible(),
+            'primary': self._pill.primary_text(),
+            'detail': self._pill.detail_text(),
+            'detail_visible': self._pill.has_detail(),
+            'user_placed': self._pill.is_user_placed(),
+            'pos': (self._pill.x(), self._pill.y()),
+        })
+        return snapshot
+
+    def restore_cursor_pill_snapshot(self, snapshot):
+        if not snapshot:
+            return
+        self._pill.restore_snapshot(snapshot)
+        self._pill.mark_user_placed(snapshot.get('user_placed', False))
+        pos = snapshot.get('pos')
+        if pos is not None:
+            self._pill.move(pos[0], pos[1])
+        self._pill.setVisible(
+            bool(snapshot.get('visible'))
+            and self._cursor_pill_visible_for_mode(
+                source=getattr(self._active_cursor_card, "canvas", None)
+            )
+        )
+        if self._pill.isVisible():
+            if not self._pill.is_user_placed():
+                self._reposition_pill()
+            else:
+                self._pill.raise_()
+
+    def cursor_pill_text(self):
+        return self._pill.primary_text()
+
+    def cursor_pill_visible(self):
+        return self._pill.isVisible()
+
+    def cursor_pill_fingerprint(self, canvas=None):
+        """Stable dual-cursor readout fingerprint, or ``None`` if hidden.
+
+        ``canvas`` selects the primary or split-secondary pill. Hidden pills
+        are not a source change.
+        """
+        try:
+            pill = self._pill_for_canvas(canvas)
+        except (TypeError, RuntimeError):
+            return None
+        if pill is None:
+            return None
+        try:
+            if not pill.isVisible():
+                return None
+            primary = ""
+            getter = getattr(pill, "primary_text", None)
+            if callable(getter):
+                primary = getter() or ""
+            detail = ""
+            has_detail = getattr(pill, "has_detail", None)
+            detail_text = getattr(pill, "detail_text", None)
+            if callable(has_detail) and has_detail() and callable(detail_text):
+                detail = detail_text() or ""
+            return (primary, detail)
+        except RuntimeError:
+            return None

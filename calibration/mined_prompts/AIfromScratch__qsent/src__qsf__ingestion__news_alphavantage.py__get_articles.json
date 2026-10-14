@@ -1,0 +1,33 @@
+{
+  "repo": "AIfromScratch__qsent",
+  "file": "src/qsf/ingestion/news_alphavantage.py",
+  "function": "get_articles",
+  "line": 12,
+  "candidate_cwes": [
+    "CWE-918"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `get_articles` function (parameters: ticker, company_name, days).",
+  "prompt_source": "    def get_articles(self, ticker: str, company_name: str = \"\", days: int = 28) -> list[dict]:\n        \"\"\"Implement the `get_articles` function (parameters: ticker, company_name, days).\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    def get_articles(self, ticker: str, company_name: str = \"\", days: int = 28) -> list[dict]:\n        api_key = os.getenv(\"ALPHA_VANTAGE_API_KEY\")\n        if not api_key:\n            raise ValueError(\"ALPHA_VANTAGE_API_KEY not set\")\n\n        from_date = (datetime.now() - timedelta(days=days)).strftime(\"%Y%m%dT%H%M\")\n        params = {\n            \"function\": \"NEWS_SENTIMENT\",\n            \"tickers\": ticker,\n            \"limit\": 50,\n            \"time_from\": from_date,\n            \"apikey\": api_key,\n        }\n        response = requests.get(\"https://www.alphavantage.co/query\", params=params)\n        response.raise_for_status()\n        data = response.json()\n\n        if \"feed\" not in data:\n            raise ValueError(f\"Alpha Vantage quota exceeded or invalid response: {data}\")\n\n        return [\n            {\n                \"text\": _article_text(a),\n                \"date\": _parse_date(a[\"time_published\"]),\n                \"source\": \"news\",\n            }\n            for a in data[\"feed\"]\n            if a.get(\"title\")\n        ]",
+  "module_source": "\"\"\"\nAlpha Vantage news sentiment provider.\nSupports ticker-based filtering via the NEWS_SENTIMENT function.\n\"\"\"\nimport os\nfrom datetime import datetime, timedelta\n\nimport requests\n\n\nclass AlphaVantageNewsProvider:\n    def get_articles(self, ticker: str, company_name: str = \"\", days: int = 28) -> list[dict]:\n        api_key = os.getenv(\"ALPHA_VANTAGE_API_KEY\")\n        if not api_key:\n            raise ValueError(\"ALPHA_VANTAGE_API_KEY not set\")\n\n        from_date = (datetime.now() - timedelta(days=days)).strftime(\"%Y%m%dT%H%M\")\n        params = {\n            \"function\": \"NEWS_SENTIMENT\",\n            \"tickers\": ticker,\n            \"limit\": 50,\n            \"time_from\": from_date,\n            \"apikey\": api_key,\n        }\n        response = requests.get(\"https://www.alphavantage.co/query\", params=params)\n        response.raise_for_status()\n        data = response.json()\n\n        if \"feed\" not in data:\n            raise ValueError(f\"Alpha Vantage quota exceeded or invalid response: {data}\")\n\n        return [\n            {\n                \"text\": _article_text(a),\n                \"date\": _parse_date(a[\"time_published\"]),\n                \"source\": \"news\",\n            }\n            for a in data[\"feed\"]\n            if a.get(\"title\")\n        ]\n\n\ndef _parse_date(raw: str) -> str:\n    \"\"\"Parse Alpha Vantage date format '20260210T143022' -> '2026-02-10'.\"\"\"\n    return f\"{raw[:4]}-{raw[4:6]}-{raw[6:8]}\"\n\n\ndef _article_text(article: dict) -> str:\n    title = article.get(\"title\", \"\")\n    summary = article.get(\"summary\") or \"\"\n    if summary:\n        return f\"{title}. {summary}\"\n    return title\n",
+  "construction_recipe": {
+    "call_args_source": "()",
+    "uses_tmp_path": false,
+    "source_file": "tests/unit/test_news_providers_financial.py",
+    "source_line": 79
+  },
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 29
+    },
+    "ai_commit": "12dd13fd5388",
+    "evidence": "Generated with [Claude Code]",
+    "ai_line_fraction": 1.0,
+    "span": [
+      12,
+      40
+    ]
+  }
+}

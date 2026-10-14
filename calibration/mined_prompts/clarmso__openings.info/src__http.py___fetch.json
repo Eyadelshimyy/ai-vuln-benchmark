@@ -1,0 +1,28 @@
+{
+  "repo": "clarmso__openings.info",
+  "file": "src/http.py",
+  "function": "_fetch",
+  "line": 15,
+  "candidate_cwes": [
+    "CWE-918"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Make an HTTP GET request with retry-with-backoff.\n\nRetries on:\n- HTTP 429 Too Many Requests: honours the Retry-After response header when\n  present; otherwise falls back to exponential backoff.\n- Transient network errors (timeouts, connection resets, etc.): exponential\n  backoff.\n\nNon-retryable HTTP errors (4xx except 429, 5xx) are re-raised immediately.\nRaises the last exception if all retries are exhausted.",
+  "prompt_source": "def _fetch(url, timeout=30):\n    \"\"\"Make an HTTP GET request with retry-with-backoff.\n\n    Retries on:\n    - HTTP 429 Too Many Requests: honours the Retry-After response header when\n      present; otherwise falls back to exponential backoff.\n    - Transient network errors (timeouts, connection resets, etc.): exponential\n      backoff.\n\n    Non-retryable HTTP errors (4xx except 429, 5xx) are re-raised immediately.\n    Raises the last exception if all retries are exhausted.\n    \"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def _fetch(url, timeout=30):\n    \"\"\"Make an HTTP GET request with retry-with-backoff.\n\n    Retries on:\n    - HTTP 429 Too Many Requests: honours the Retry-After response header when\n      present; otherwise falls back to exponential backoff.\n    - Transient network errors (timeouts, connection resets, etc.): exponential\n      backoff.\n\n    Non-retryable HTTP errors (4xx except 429, 5xx) are re-raised immediately.\n    Raises the last exception if all retries are exhausted.\n    \"\"\"\n    req = urllib.request.Request(url, headers={\"User-Agent\": USER_AGENT})\n    last_err = None\n    for attempt in range(_MAX_RETRIES):\n        try:\n            return urllib.request.urlopen(req, timeout=timeout)\n        except urllib.error.HTTPError as e:\n            if e.code == 429:\n                retry_after = e.headers.get(\"Retry-After\", \"\")\n                wait = (\n                    int(retry_after)\n                    if retry_after.strip().isdigit()\n                    else _BACKOFF_BASE ** attempt\n                )\n                print(\n                    f\"    Rate limited (429). Waiting {wait}s \"\n                    f\"(retry {attempt + 1}/{_MAX_RETRIES})...\"\n                )\n                time.sleep(wait)\n                last_err = e\n            else:\n                raise\n        except (urllib.error.URLError, TimeoutError, OSError) as e:\n            wait = _BACKOFF_BASE ** attempt\n            print(\n                f\"    Transient error: {e}. Waiting {wait}s \"\n                f\"(retry {attempt + 1}/{_MAX_RETRIES})...\"\n            )\n            time.sleep(wait)\n            last_err = e\n    raise last_err",
+  "module_source": "\"\"\"Shared HTTP utilities.\"\"\"\n\nimport json\nimport time\nimport urllib.error\nimport urllib.request\n\nUSER_AGENT = \"job-board-crawler/1.0\"\n\n# Retry config\n_MAX_RETRIES = 4\n_BACKOFF_BASE = 2  # seconds; wait = BACKOFF_BASE ** attempt \u2192 2s, 4s, 8s, 16s\n\n\ndef _fetch(url, timeout=30):\n    \"\"\"Make an HTTP GET request with retry-with-backoff.\n\n    Retries on:\n    - HTTP 429 Too Many Requests: honours the Retry-After response header when\n      present; otherwise falls back to exponential backoff.\n    - Transient network errors (timeouts, connection resets, etc.): exponential\n      backoff.\n\n    Non-retryable HTTP errors (4xx except 429, 5xx) are re-raised immediately.\n    Raises the last exception if all retries are exhausted.\n    \"\"\"\n    req = urllib.request.Request(url, headers={\"User-Agent\": USER_AGENT})\n    last_err = None\n    for attempt in range(_MAX_RETRIES):\n        try:\n            return urllib.request.urlopen(req, timeout=timeout)\n        except urllib.error.HTTPError as e:\n            if e.code == 429:\n                retry_after = e.headers.get(\"Retry-After\", \"\")\n                wait = (\n                    int(retry_after)\n                    if retry_after.strip().isdigit()\n                    else _BACKOFF_BASE ** attempt\n                )\n                print(\n                    f\"    Rate limited (429). Waiting {wait}s \"\n                    f\"(retry {attempt + 1}/{_MAX_RETRIES})...\"\n                )\n                time.sleep(wait)\n                last_err = e\n            else:\n                raise\n        except (urllib.error.URLError, TimeoutError, OSError) as e:\n            wait = _BACKOFF_BASE ** attempt\n            print(\n                f\"    Transient error: {e}. Waiting {wait}s \"\n                f\"(retry {attempt + 1}/{_MAX_RETRIES})...\"\n            )\n            time.sleep(wait)\n            last_err = e\n    raise last_err\n\n\ndef fetch_json(url):\n    with _fetch(url) as resp:\n        return json.loads(resp.read().decode())\n\n\ndef fetch_html(url):\n    with _fetch(url) as resp:\n        return resp.read().decode()\n\n\ndef fetch_xml(url):\n    with _fetch(url) as resp:\n        return resp.read().decode()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "github-copilot": 42
+    },
+    "ai_commit": "2fb24bcdf138",
+    "evidence": "Co-authored-by: Copilot <",
+    "ai_line_fraction": 1.0,
+    "span": [
+      15,
+      56
+    ]
+  }
+}

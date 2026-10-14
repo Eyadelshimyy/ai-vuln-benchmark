@@ -1,0 +1,400 @@
+from unittest.mock import MagicMock
+
+from homeassistant.const import CONF_DOMAIN, STATE_ON, EntityCategory
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.area_registry import AreaRegistry
+from homeassistant.helpers.entity_registry import RegistryEntry
+from homeassistant.helpers.floor_registry import FloorRegistry
+from homeassistant.helpers.label_registry import LabelRegistry
+import pytest
+from pytest_homeassistant_custom_component.common import RegistryEntryWithDefaults
+
+from custom_components.powercalc.const import CONF_AND, CONF_AREA, CONF_FILTER, CONF_OR, CONF_WILDCARD
+from custom_components.powercalc.errors import SensorConfigurationError
+from custom_components.powercalc.group_include.filter import (
+    AreaFilter,
+    CategoryFilter,
+    CompositeFilter,
+    DeviceFilter,
+    DomainFilter,
+    FilterOperator,
+    FloorFilter,
+    GroupFilter,
+    LabelFilter,
+    LambdaFilter,
+    NotFilter,
+    NullFilter,
+    WildcardFilter,
+    create_composite_filter,
+    create_filter,
+)
+from tests.common import mock_device, mock_entities_in_registry, set_states
+
+
+@pytest.mark.parametrize(
+    "filter_return_values,operator,expected_result",
+    [
+        ([True, False], FilterOperator.AND, False),
+        ([False, False], FilterOperator.AND, False),
+        ([True, True], FilterOperator.AND, True),
+        ([True, False], FilterOperator.OR, True),
+        ([False, False], FilterOperator.OR, False),
+    ],
+)
+def test_composite_filter(
+    filter_return_values: list,
+    operator: FilterOperator,
+    expected_result: bool,
+) -> None:
+    filter_mocks = []
+    for value in filter_return_values:
+        entity_filter = NullFilter()
+        entity_filter.is_valid = MagicMock(return_value=value)
+        filter_mocks.append(entity_filter)
+
+    registry_entry = _create_registry_entry()
+    assert CompositeFilter(filter_mocks, operator).is_valid(registry_entry) == expected_result
+
+
+@pytest.mark.parametrize(
+    "domain,expected_result",
+    [
+        ("switch", True),
+        ("light", False),
+        (["switch", "light"], True),
+    ],
+)
+def test_domain_filter(domain: str | list, expected_result: bool) -> None:
+    assert DomainFilter(domain).is_valid(_create_registry_entry()) is expected_result
+
+
+@pytest.mark.parametrize(
+    "pattern,expected_result",
+    [
+        ("switch.*", True),
+        ("sensor.*", False),
+        ("switch.t?st", True),
+        ("switch.t??st", False),
+    ],
+)
+def test_wildcard_filter(pattern: str, expected_result: bool) -> None:
+    assert WildcardFilter(pattern).is_valid(_create_registry_entry()) == expected_result
+
+
+@pytest.mark.parametrize(
+    "label,expected_result,expect_exception",
+    [
+        ("test", True, False),
+        ("test2", False, False),
+        (["test"], True, False),
+        (["test2"], False, False),
+        (["test", "test2"], True, False),
+        (["test2", "test3"], False, False),
+        ("device_label", True, False),
+        ("My Label with Spaces", True, False),
+        ("unknown", False, True),
+    ],
+)
+def test_label_filter(
+    hass: HomeAssistant,
+    label_registry: LabelRegistry,
+    label: str | list[str],
+    expected_result: bool,
+    expect_exception: bool,
+) -> None:
+    mock_device(hass, "my-device", "Mock", "Device", name="My device", labels=["device_label"])
+
+    for label_name in ["test", "test2", "test3", "device-label", "My Label with Spaces"]:
+        label_registry.async_create(label_name)
+
+    entry = RegistryEntryWithDefaults(
+        entity_id="sensor.test",
+        unique_id="abc",
+        platform="test",
+        labels=["test", "my_label_with_spaces"],
+        device_id="my-device",
+    )
+
+    if expect_exception:
+        with pytest.raises(SensorConfigurationError):
+            LabelFilter(hass, label)
+        return
+
+    assert LabelFilter(hass, label).is_valid(entry) == expected_result
+
+
+@pytest.mark.parametrize(
+    "entity_device,entity_area,floor,expected_result,expect_exception",
+    [
+        ("my-device", None, "first_floor", True, False),
+        ("my-device", None, "First Floor", True, False),
+        (None, "bathroom", "Second Floor", True, False),
+        ("my_device", None, "floor2", False, True),
+        # Test with list of floors
+        ("my-device", None, ["first_floor", "Second Floor"], True, False),
+        (None, "bathroom", ["first_floor", "Second Floor"], True, False),
+        (None, "kitchen", ["Second Floor"], False, False),
+        ("my_device", None, ["floor2", "another_floor"], False, True),
+    ],
+)
+def test_floor_filter(
+    hass: HomeAssistant,
+    floor_registry: FloorRegistry,
+    area_registry: AreaRegistry,
+    entity_device: str | None,
+    entity_area: str | None,
+    floor: str | list[str],
+    expected_result: bool,
+    expect_exception: bool,
+) -> None:
+    floor_entry1 = floor_registry.async_create("First floor")
+    floor_entry2 = floor_registry.async_create("Second floor")
+
+    area_entry1 = area_registry.async_get_or_create("Kitchen")
+    area_registry.async_update(area_id=area_entry1.id, floor_id=floor_entry1.floor_id)
+    area_entry2 = area_registry.async_get_or_create("Living room")
+    area_registry.async_update(area_id=area_entry2.id, floor_id=floor_entry1.floor_id)
+    area_entry3 = area_registry.async_get_or_create("Bathroom")
+    area_registry.async_update(area_id=area_entry3.id, floor_id=floor_entry2.floor_id)
+    area_entry4 = area_registry.async_get_or_create("Bedroom1")
+    area_registry.async_update(area_id=area_entry4.id, floor_id=floor_entry2.floor_id)
+
+    mock_device(hass, "my-device", "Mock", "Device", name="My device", area_id="kitchen")
+
+    entry = RegistryEntryWithDefaults(
+        entity_id="switch.test",
+        unique_id="abc",
+        platform="test",
+        device_id=entity_device,
+        area_id=entity_area,
+    )
+    if expect_exception:
+        with pytest.raises(SensorConfigurationError):
+            FloorFilter(hass, floor)
+        return
+
+    assert FloorFilter(hass, floor).is_valid(entry) == expected_result
+
+
+@pytest.mark.parametrize(
+    "device,expected_result",
+    [
+        ("my-device", True),
+        ("other-device", False),
+        ({"my-device", "other-device"}, True),
+        ({"my-device2", "other-device"}, False),
+    ],
+)
+def test_device_filter(device: str | set[str], expected_result: bool) -> None:
+    assert DeviceFilter(device).is_valid(_create_registry_entry()) == expected_result
+
+
+def test_null_filter() -> None:
+    assert NullFilter().is_valid(_create_registry_entry()) is True
+
+
+@pytest.mark.parametrize(
+    "category,filter_categories,expected_result,expect_exception",
+    [
+        # Single EntityCategory
+        (EntityCategory.DIAGNOSTIC, EntityCategory.DIAGNOSTIC, True, False),
+        (EntityCategory.DIAGNOSTIC, EntityCategory.CONFIG, False, False),
+        # Single string category
+        (EntityCategory.DIAGNOSTIC, "diagnostic", True, False),
+        (EntityCategory.DIAGNOSTIC, "config", False, False),
+        # List with multiple EntityCategory objects
+        (EntityCategory.DIAGNOSTIC, [EntityCategory.DIAGNOSTIC, EntityCategory.CONFIG], True, False),
+        (EntityCategory.CONFIG, [EntityCategory.DIAGNOSTIC, EntityCategory.CONFIG], True, False),
+        (None, [EntityCategory.DIAGNOSTIC, EntityCategory.CONFIG], False, False),
+        # List with multiple string categories
+        (EntityCategory.DIAGNOSTIC, ["diagnostic", "config"], True, False),
+        (EntityCategory.CONFIG, ["diagnostic", "config"], True, False),
+        (None, ["diagnostic", "config"], False, False),
+        # List with mixed EntityCategory and string categories
+        (EntityCategory.DIAGNOSTIC, [EntityCategory.DIAGNOSTIC, "config"], True, False),
+        (EntityCategory.CONFIG, ["diagnostic", EntityCategory.CONFIG], True, False),
+        (None, [EntityCategory.DIAGNOSTIC, "config"], False, False),
+        # Invalid string category
+        (EntityCategory.DIAGNOSTIC, "invalid_category", False, True),
+    ],
+)
+def test_category_filter(
+    category: EntityCategory,
+    filter_categories: EntityCategory | str | list[EntityCategory | str],
+    expected_result: bool,
+    expect_exception: bool,
+) -> None:
+    entry = RegistryEntryWithDefaults(
+        entity_id="sensor.test",
+        unique_id="abc",
+        platform="test",
+        entity_category=category,
+    )
+
+    if expect_exception:
+        with pytest.raises(SensorConfigurationError):
+            CategoryFilter(filter_categories)
+        return
+
+    assert CategoryFilter(filter_categories).is_valid(entry) == expected_result
+
+
+def test_lambda_filter() -> None:
+    entity_filter = LambdaFilter(lambda entity: entity.entity_id == "sensor.test")
+
+    entry = RegistryEntryWithDefaults(entity_id="sensor.test", unique_id="abc", platform="test")
+    assert entity_filter.is_valid(entry) is True
+
+    entry = RegistryEntryWithDefaults(entity_id="sensor.test2", unique_id="abc", platform="test")
+    assert entity_filter.is_valid(entry) is False
+
+
+def test_not_filter() -> None:
+    assert NotFilter(NullFilter()).is_valid(_create_registry_entry()) is False
+
+
+@pytest.mark.parametrize(
+    "filter_type,filter_config,expected_type",
+    [
+        ("unknown", {}, NullFilter),
+        (CONF_DOMAIN, {}, DomainFilter),
+    ],
+)
+def test_create_filter(hass: HomeAssistant, filter_type: str, filter_config: dict, expected_type: type) -> None:
+    filter_instance = create_filter(filter_type, filter_config, hass)
+    assert isinstance(filter_instance, expected_type)
+
+
+def test_create_composite_filter_with_nested_and_or_conditions(hass: HomeAssistant) -> None:
+    entity_filter = create_composite_filter(
+        {
+            CONF_DOMAIN: "switch",
+            CONF_OR: [
+                {CONF_WILDCARD: "switch.humidifier"},
+                {CONF_WILDCARD: "switch.tv"},
+                {
+                    CONF_AND: [
+                        {CONF_WILDCARD: "switch.some?"},
+                        {CONF_WILDCARD: "switch.other?"},
+                    ],
+                },
+            ],
+        },
+        hass,
+        FilterOperator.AND,
+    )
+    assert entity_filter.is_valid(_create_registry_entry("switch.humidifier"))
+    assert not entity_filter.is_valid(_create_registry_entry("switch.humidifier2"))
+    assert not entity_filter.is_valid(_create_registry_entry("switch.some1"))
+
+
+def test_create_composite_filter_combines_area_and_nested_filter(
+    hass: HomeAssistant,
+    area_registry: AreaRegistry,
+) -> None:
+    area_registry.async_get_or_create("kitchen")
+    entity_filter = create_composite_filter(
+        {
+            CONF_AREA: "kitchen",
+            CONF_FILTER: {
+                CONF_DOMAIN: "light",
+            },
+        },
+        hass,
+        FilterOperator.AND,
+    )
+    assert isinstance(entity_filter, CompositeFilter)
+    assert len(entity_filter.filters) == 2
+    assert isinstance(entity_filter.filters[0], AreaFilter)
+    assert isinstance(entity_filter.filters[1], DomainFilter)
+
+
+@pytest.mark.parametrize(
+    "entity_device,entity_area,area,expected_result,expect_exception",
+    [
+        ("my-device", None, "kitchen", True, False),
+        ("my-device", None, "Kitchen", True, False),
+        (None, "bathroom", "bathroom", True, False),
+        ("my_device", None, "nonexistent_area", False, True),
+        # Test with list of areas
+        ("my-device", None, ["kitchen", "bathroom"], True, False),
+        (None, "bathroom", ["kitchen", "bathroom"], True, False),
+        (None, "kitchen", ["bathroom"], False, False),
+        ("my_device", None, ["nonexistent_area", "another_nonexistent"], False, True),
+    ],
+)
+def test_area_filter(
+    hass: HomeAssistant,
+    area_registry: AreaRegistry,
+    entity_device: str | None,
+    entity_area: str | None,
+    area: str | list[str],
+    expected_result: bool,
+    expect_exception: bool,
+) -> None:
+    area_registry.async_get_or_create("Kitchen")
+    area_registry.async_get_or_create("Bathroom")
+
+    mock_device(hass, "my-device", "Mock", "Device", name="My device", area_id="kitchen")
+
+    entry = RegistryEntryWithDefaults(
+        entity_id="switch.test",
+        unique_id="abc",
+        platform="test",
+        device_id=entity_device,
+        area_id=entity_area,
+    )
+    if expect_exception:
+        with pytest.raises(SensorConfigurationError):
+            AreaFilter(hass, area)
+        return
+
+    assert AreaFilter(hass, area).is_valid(entry) == expected_result
+
+
+@pytest.mark.parametrize(
+    "group_id,entity_id,expected_result",
+    [
+        ("group.some_group", "light.test_light", True),
+        ("group.some_group", "light.other_light", False),
+        (["group.some_group", "group.other_group"], "light.test_light", True),
+        (["group.some_group", "group.other_group"], "light.other_light", True),
+        (["group.some_group", "group.other_group"], "light.unrelated_light", False),
+    ],
+)
+async def test_group_filter(
+    hass: HomeAssistant,
+    group_id: str | list[str],
+    entity_id: str,
+    expected_result: bool,
+) -> None:
+    mock_entities_in_registry(
+        hass,
+        {
+            "group.some_group": {"unique_id": "def", "platform": "test"},
+            "group.other_group": {"unique_id": "ghi", "platform": "test"},
+        },
+    )
+
+    await set_states(
+        hass,
+        [
+            (
+                "group.some_group",
+                STATE_ON,
+                {"entity_id": ["light.test_light"]},
+            ),
+            (
+                "group.other_group",
+                STATE_ON,
+                {"entity_id": ["light.other_light"]},
+            ),
+        ],
+    )
+    entry = RegistryEntryWithDefaults(entity_id=entity_id, unique_id="abc", platform="test")
+
+    assert GroupFilter(hass, group_id).is_valid(entry) == expected_result
+
+
+def _create_registry_entry(entity_id: str = "switch.test") -> RegistryEntry:
+    return RegistryEntryWithDefaults(entity_id=entity_id, unique_id="abc", platform="test", device_id="my-device")

@@ -1,0 +1,548 @@
+from measure.cli.const import QUESTION_ENTITY_ID, QUESTION_MEASURE_DEVICE, QUESTION_MODE
+from measure.cli.request_adapter import request_from_answers
+from measure.const import PARAMETER_LIMITS, MeasureType
+from measure.controller.light.const import LightControllerType, LutMode
+from measure.controller.light.spec import HassMultiLightControllerSpec
+from measure.controller.switch.spec import HassMultiSwitchControllerSpec
+from measure.powermeter.const import PowerMeterType
+from measure.powermeter.spec import DummyPowerMeterSpec, ShellyPowerMeterSpec
+from measure.request import (
+    _BASE_PARAMETER_FIELDS,
+    _LIGHT_PARAMETER_FIELDS,
+    AverageMeasurementRequest,
+    DummyLoadCalibrationRequest,
+    DummyLoadReuseRequest,
+    FixedMeasurementRequest,
+    LightMeasurementRequest,
+    RecorderMeasurementRequest,
+    RecorderProfileRecipe,
+    RecorderPurpose,
+    SmartSwitchMeasurementRequest,
+    parse_measurement_request,
+    validate_export_filename,
+)
+from pydantic import ValidationError
+import pytest
+
+from tests.conftest import MockConfigFactory
+
+
+def valid_request() -> dict[str, object]:
+    return {
+        "model_id": "LCT010",
+        "product_name": "Test light",
+        "measure_device": "Test meter",
+        "controller": {"type": "hass", "entity_id": "light.test"},
+        "power_meter": {"type": "hass", "entity_id": "sensor.test_power"},
+    }
+
+
+@pytest.mark.parametrize("channel", [None, 0, 3])
+def test_shelly_request_round_trip_preserves_channel(channel: int | None) -> None:
+    request = AverageMeasurementRequest(power_meter=ShellyPowerMeterSpec(device_ip="192.168.1.50", channel=channel))
+
+    assert parse_measurement_request(request.model_dump(mode="json")) == request
+
+
+@pytest.mark.parametrize("channel", [-1, True, 1.5, "1"])
+def test_shelly_request_rejects_invalid_channel(channel: object) -> None:
+    with pytest.raises(ValidationError):
+        ShellyPowerMeterSpec.model_validate({"device_ip": "192.168.1.50", "channel": channel})
+
+
+def test_smart_switch_request_round_trip_preserves_multi_relay_configuration() -> None:
+    request = SmartSwitchMeasurementRequest.model_validate(
+        {
+            "power_meter": {"type": "hass", "entity_id": "sensor.external_power"},
+            "controller": {"type": "hass_multi", "entity_ids": ["switch.one", "switch.two"]},
+            "power_monitoring": True,
+        }
+    )
+
+    restored = parse_measurement_request(request.model_dump(mode="json"))
+
+    assert restored == request
+    assert isinstance(restored.controller, HassMultiSwitchControllerSpec)
+    assert restored.controlled_entity_ids == ["switch.one", "switch.two"]
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"controller": {"type": "hass_multi", "entity_ids": ["switch.one", "switch.one"]}},
+        {"controller": {"type": "hass_multi", "entity_ids": ["switch.one", "light.two"]}},
+        {"controller": {"type": "hass_multi", "entity_ids": ["switch.one"]}},
+        {"power_meter": {"type": "manual"}},
+        {"power_monitoring": "unknown"},
+        {"samples_per_state": 4},
+        {"repeat_cycles": 1},
+    ],
+)
+def test_smart_switch_request_rejects_unusable_input(changes: dict[str, object]) -> None:
+    payload = {
+        "power_meter": {"type": "hass", "entity_id": "sensor.external_power"},
+        "controller": {"type": "hass", "entity_id": "switch.one"},
+        "power_monitoring": False,
+    }
+
+    with pytest.raises(ValidationError):
+        SmartSwitchMeasurementRequest.model_validate(payload | changes)
+
+
+@pytest.mark.parametrize(
+    "entity_ids, power_monitoring",
+    [(["switch.one"], False), (["switch.one", "switch.two"], True)],
+)
+def test_cli_smart_switch_answers_create_typed_request(
+    mock_config_factory: MockConfigFactory, entity_ids: list[str], power_monitoring: bool
+) -> None:
+    environment = mock_config_factory()
+    environment.selected_power_meter = PowerMeterType.DUMMY
+
+    request = request_from_answers(
+        MeasureType.SMART_SWITCH,
+        {"switch_entity_ids": entity_ids, "power_monitoring": power_monitoring},
+        environment,
+    )
+
+    assert isinstance(request, SmartSwitchMeasurementRequest)
+    assert request.controller.entity_ids == entity_ids
+    assert request.power_monitoring is power_monitoring
+
+
+def test_cli_smart_switch_requires_a_selected_relay(mock_config_factory: MockConfigFactory) -> None:
+    with pytest.raises(ValueError, match="Select at least one switch relay"):
+        request_from_answers(
+            MeasureType.SMART_SWITCH,
+            {"switch_entity_ids": [], "power_monitoring": False},
+            mock_config_factory(),
+        )
+
+
+def test_request_round_trip_preserves_typed_input() -> None:
+    request = LightMeasurementRequest.model_validate(
+        valid_request()
+        | {
+            "parameters": {"sleep_time": 0.5, "sample_count": 3},
+            "dummy_load": {"mode": "reuse", "description": "60 W incandescent bulb", "resistance": 812.4},
+        },
+    )
+
+    restored = parse_measurement_request(request.model_dump(mode="json"))
+
+    assert restored == request
+    assert isinstance(restored.dummy_load, DummyLoadReuseRequest)
+
+
+def test_request_exposes_the_controlled_entities_only_when_the_controller_drives_them() -> None:
+    controlled = LightMeasurementRequest.model_validate(valid_request())
+    uncontrolled = AverageMeasurementRequest.model_validate(
+        {"power_meter": {"type": "hass", "entity_id": "sensor.test_power"}},
+    )
+
+    assert controlled.controlled_entity_ids == ["light.test"]
+    assert uncontrolled.controlled_entity_ids == []
+
+
+def test_request_exposes_all_controlled_entities_for_multi_light_controller() -> None:
+    request = LightMeasurementRequest.model_validate(
+        valid_request()
+        | {"controller": {"type": "hass_multi", "entity_ids": ["light.one", "light.two"]}, "multiple_light_count": 2},
+    )
+
+    assert isinstance(request.controller, HassMultiLightControllerSpec)
+    assert request.controlled_entity_ids == ["light.one", "light.two"]
+    entity_ids = request.controlled_entity_ids
+    entity_ids.clear()
+    assert request.controlled_entity_ids == ["light.one", "light.two"]
+
+
+@pytest.mark.parametrize(
+    "entity_ids",
+    [["light.one"], ["light.one", "light.one"], ["light.one", "switch.two"]],
+)
+def test_multi_light_controller_requires_multiple_unique_light_entities(entity_ids: list[str]) -> None:
+    with pytest.raises(ValidationError):
+        LightMeasurementRequest.model_validate(
+            valid_request() | {"controller": {"type": "hass_multi", "entity_ids": entity_ids}},
+        )
+
+
+def test_request_normalizes_profile_metadata() -> None:
+    request = LightMeasurementRequest.model_validate(
+        valid_request() | {"product_name": "  Test light  ", "measure_device": "  Test meter  "},
+    )
+
+    assert request.product_name == "Test light"
+    assert request.measure_device == "Test meter"
+
+
+@pytest.mark.parametrize("field", ["measure_device"])
+def test_request_rejects_blank_required_profile_metadata(field: str) -> None:
+    payload = valid_request() | {field: "   "}
+    with pytest.raises(ValidationError, match=field):
+        LightMeasurementRequest.model_validate(payload)
+
+
+def fixed_request(duration: int) -> dict[str, object]:
+    return {
+        "power_meter": {"type": "dummy"},
+        "device_id": "router-device",
+        "profile_device_type": "network",
+        "duration": duration,
+    }
+
+
+def test_fixed_request_accepts_a_one_minute_average() -> None:
+    assert FixedMeasurementRequest.model_validate(fixed_request(60)).duration == 60
+
+
+def test_fixed_request_rejects_averages_shorter_than_a_minute() -> None:
+    with pytest.raises(ValidationError, match="duration"):
+        FixedMeasurementRequest.model_validate(fixed_request(59))
+
+
+def test_request_defers_unknown_product_details_until_preparation() -> None:
+    payload = valid_request()
+    del payload["model_id"]
+    del payload["product_name"]
+    request = LightMeasurementRequest.model_validate(payload | {"session_name": " Desk lamp "})
+    assert request.model_id == ""
+    assert request.product_name == ""
+    assert request.session_name == "Desk lamp"
+
+
+def test_request_accepts_dummy_load_calibration() -> None:
+    request = LightMeasurementRequest.model_validate(
+        valid_request() | {"dummy_load": {"mode": "calibrate", "description": "60 W incandescent bulb"}},
+    )
+
+    assert request.dummy_load == DummyLoadCalibrationRequest(description="60 W incandescent bulb")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        valid_request() | {"measure_type": "light"},
+        {"measure_type": "average"},
+        {"measure_type": "recorder"},
+        {"measure_type": "speaker", "controller": {"type": "dummy"}},
+        {
+            "measure_type": "charging",
+            "controller": {"type": "dummy"},
+            "charging_device_type": "vacuum_robot",
+        },
+        {"measure_type": "fan", "controller": {"type": "dummy"}},
+    ],
+)
+def test_all_measurement_types_accept_dummy_load(payload: dict[str, object]) -> None:
+    request = parse_measurement_request(
+        payload
+        | {
+            "power_meter": {
+                "type": "hass",
+                "entity_id": "sensor.test_power",
+                "voltage_entity_id": "sensor.test_voltage",
+            },
+            "dummy_load": {
+                "mode": "reuse",
+                "description": "60 W incandescent bulb",
+                "resistance": 812.4,
+            },
+        },
+    )
+
+    assert request.dummy_load == DummyLoadReuseRequest(
+        description="60 W incandescent bulb",
+        resistance=812.4,
+    )
+
+
+def test_request_normalizes_and_requires_dummy_load_description() -> None:
+    assert DummyLoadCalibrationRequest(description="  reference load  ").description == "reference load"
+    with pytest.raises(ValidationError, match="description"):
+        DummyLoadCalibrationRequest(description=" ")
+
+
+@pytest.mark.parametrize("resistance", [0, -1])
+def test_request_rejects_non_positive_dummy_load_resistance(resistance: float) -> None:
+    payload = valid_request() | {
+        "dummy_load": {
+            "mode": "reuse",
+            "description": "60 W incandescent bulb",
+            "resistance": resistance,
+        },
+    }
+    with pytest.raises(ValidationError, match="resistance"):
+        LightMeasurementRequest.model_validate(payload)
+
+
+def test_request_rejects_dummy_load_with_synthetic_power_meter() -> None:
+    power_meter = DummyPowerMeterSpec()
+    dummy_load = DummyLoadCalibrationRequest(description="test load")
+    with pytest.raises(ValidationError, match="synthetic"):
+        AverageMeasurementRequest(power_meter=power_meter, dummy_load=dummy_load)
+
+
+def test_cli_request_contains_only_resolved_measurement_input(mock_config_factory: MockConfigFactory) -> None:
+    environment = mock_config_factory()
+    environment.selected_power_meter = PowerMeterType.DUMMY
+    environment.selected_light_controller = LightControllerType.DUMMY
+    environment.resume = True
+    answers = {
+        QUESTION_ENTITY_ID: "light.hue_test",
+        QUESTION_MEASURE_DEVICE: "Test meter",
+        QUESTION_MODE: {LutMode.BRIGHTNESS},
+        "hue_group": "Kitchen",
+    }
+
+    request = request_from_answers(MeasureType.LIGHT, answers, environment)
+
+    assert request.power_meter.type == PowerMeterType.DUMMY
+    assert "hue_group" not in request.model_dump()
+    assert request.model_id == ""
+    assert request.product_name == ""
+    assert request.resume_policy == "new"
+    existing = request_from_answers(MeasureType.LIGHT, answers | {"model_id": "LCT010"}, environment)
+    assert existing.model_id == "LCT010"
+    assert existing.resume_policy == "resume"
+
+
+@pytest.mark.parametrize("model_id", ["../secret", "/unsafe/file", "a/b", ".."])
+def test_request_rejects_unsafe_model_id(model_id: str) -> None:
+    payload = valid_request() | {"model_id": model_id}
+
+    with pytest.raises(ValidationError):
+        LightMeasurementRequest.model_validate(payload)
+
+
+def test_request_rejects_unknown_fields() -> None:
+    payload = valid_request() | {"token": "secret"}
+
+    with pytest.raises(ValidationError):
+        LightMeasurementRequest.model_validate(payload)
+
+
+def test_playbook_recorder_uses_a_fixed_export_filename() -> None:
+    request = RecorderMeasurementRequest(power_meter=DummyPowerMeterSpec(), export_filename="custom.csv")
+
+    assert request.export_filename == "record.csv"
+
+
+def test_recorder_defaults_to_legacy_playbook_recording() -> None:
+    request = RecorderMeasurementRequest(power_meter=DummyPowerMeterSpec())
+
+    assert request.recorder_purpose == RecorderPurpose.PLAYBOOK
+    assert request.recorded_entity_ids == []
+
+
+@pytest.mark.parametrize("payload", [None, [], "record.jsonl"])
+def test_recorder_rejects_non_object_payloads(payload: object) -> None:
+    with pytest.raises(ValidationError) as error:
+        RecorderMeasurementRequest.model_validate(payload)
+
+    assert error.value.errors()[0]["type"] == "model_type"
+
+
+def test_generic_recorder_preserves_tracked_entity_order() -> None:
+    request = RecorderMeasurementRequest(
+        power_meter=DummyPowerMeterSpec(),
+        recorder_purpose=RecorderPurpose.COMPLEX_PROFILE,
+        profile_recipe=RecorderProfileRecipe.GENERIC,
+        tracked_entity_ids=("switch.plug", "sensor.mode"),
+    )
+
+    assert request.recorded_entity_ids == ["switch.plug", "sensor.mode"]
+    assert request.export_filename == "record.jsonl"
+    entity_ids = request.recorded_entity_ids
+    entity_ids.reverse()
+    assert request.recorded_entity_ids == ["switch.plug", "sensor.mode"]
+
+
+def test_complex_recorder_uses_a_fixed_export_filename() -> None:
+    request = RecorderMeasurementRequest(
+        power_meter=DummyPowerMeterSpec(),
+        recorder_purpose=RecorderPurpose.COMPLEX_PROFILE,
+        profile_recipe=RecorderProfileRecipe.GENERIC,
+        tracked_entity_ids=("switch.plug",),
+        export_filename="custom.csv",
+    )
+
+    assert request.export_filename == "record.jsonl"
+
+
+def test_vacuum_recorder_orders_required_roles_before_additional_entities() -> None:
+    request = RecorderMeasurementRequest(
+        power_meter=DummyPowerMeterSpec(),
+        recorder_purpose=RecorderPurpose.COMPLEX_PROFILE,
+        profile_recipe=RecorderProfileRecipe.VACUUM_ROBOT,
+        vacuum_entity_id="vacuum.robot",
+        battery_entity_id="sensor.robot_battery",
+        additional_entity_ids=("sensor.dock_state",),
+    )
+
+    assert request.recorded_entity_ids == ["vacuum.robot", "sensor.robot_battery", "sensor.dock_state"]
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"profile_recipe": "generic", "tracked_entity_ids": ["switch.plug"]},
+        {"recorder_purpose": "complex_profile"},
+        {"recorder_purpose": "complex_profile", "profile_recipe": "generic"},
+        {
+            "recorder_purpose": "complex_profile",
+            "profile_recipe": "generic",
+            "tracked_entity_ids": ["switch.plug"],
+            "vacuum_entity_id": "vacuum.robot",
+        },
+        {"recorder_purpose": "complex_profile", "profile_recipe": "vacuum_robot"},
+        {
+            "recorder_purpose": "complex_profile",
+            "profile_recipe": "vacuum_robot",
+            "tracked_entity_ids": ["switch.plug"],
+            "vacuum_entity_id": "vacuum.robot",
+            "battery_entity_id": "sensor.robot_battery",
+        },
+        {
+            "recorder_purpose": "complex_profile",
+            "profile_recipe": "vacuum_robot",
+            "vacuum_entity_id": "switch.robot",
+            "battery_entity_id": "sensor.robot_battery",
+        },
+        {
+            "recorder_purpose": "complex_profile",
+            "profile_recipe": "vacuum_robot",
+            "vacuum_entity_id": "vacuum.robot",
+            "battery_entity_id": "binary_sensor.robot_battery",
+        },
+        {
+            "recorder_purpose": "complex_profile",
+            "profile_recipe": "vacuum_robot",
+            "vacuum_entity_id": "vacuum.robot",
+            "battery_entity_id": "sensor.robot_battery",
+            "additional_entity_ids": ["sensor.robot_battery"],
+        },
+        {
+            "recorder_purpose": "complex_profile",
+            "profile_recipe": "generic",
+            "tracked_entity_ids": ["invalid entity"],
+        },
+    ],
+)
+def test_recorder_rejects_inconsistent_profile_selections(values: dict[str, object]) -> None:
+    payload = {"power_meter": DummyPowerMeterSpec(), **values}
+    with pytest.raises(ValidationError):
+        RecorderMeasurementRequest.model_validate(payload)
+
+
+def test_recorder_rejects_more_than_one_hundred_combined_entities() -> None:
+    additional_entities = tuple(f"sensor.extra_{index}" for index in range(99))
+    power_meter = DummyPowerMeterSpec()
+
+    with pytest.raises(ValidationError, match="at most 100 entities"):
+        RecorderMeasurementRequest(
+            power_meter=power_meter,
+            recorder_purpose=RecorderPurpose.COMPLEX_PROFILE,
+            profile_recipe=RecorderProfileRecipe.VACUUM_ROBOT,
+            vacuum_entity_id="vacuum.robot",
+            battery_entity_id="sensor.robot_battery",
+            additional_entity_ids=additional_entities,
+        )
+
+
+def test_cli_recorder_request_uses_fixed_export_filename(mock_config_factory: MockConfigFactory) -> None:
+    environment = mock_config_factory()
+    environment.selected_power_meter = PowerMeterType.DUMMY
+    request = request_from_answers(MeasureType.RECORDER, {}, environment)
+
+    assert request.export_filename == "record.csv"
+
+
+def test_request_preserves_subsecond_sleep_time() -> None:
+    request = AverageMeasurementRequest(
+        power_meter=DummyPowerMeterSpec(),
+        parameters={"sleep_time": 0.25},
+    )
+
+    assert request.parameters.sleep_time == pytest.approx(0.25)
+
+
+@pytest.mark.parametrize(
+    "parameters, message",
+    [
+        ({"sleep_time_sample": -1}, "sleep_time_sample"),
+        ({"max_retries": 101}, "max_retries"),
+        ({"max_nudges": 21}, "max_nudges"),
+        ({"min_brightness": 0}, "min_brightness"),
+        ({"min_sat": 0}, "min_sat"),
+        ({"max_hue": 65_536}, "max_hue"),
+        ({"bri_bri_steps": 0}, "bri_bri_steps"),
+        ({"ct_bri_steps": 11}, "ct_bri_steps"),
+        ({"ct_mired_steps": 11}, "ct_mired_steps"),
+        ({"hs_hue_steps": 65_536}, "hs_hue_steps"),
+        ({"measure_time_effect": 10, "measure_time_effect_min": 20}, "measure_time_effect_min"),
+        ({"min_sat": 200, "max_sat": 50}, "min_sat must not exceed max_sat"),
+        ({"min_hue": 500, "max_hue": 100}, "min_hue must not exceed max_hue"),
+    ],
+)
+def test_request_rejects_invalid_exposed_tuning(parameters: dict[str, int], message: str) -> None:
+    payload = valid_request() | {"parameters": parameters}
+
+    with pytest.raises(ValidationError, match=message):
+        LightMeasurementRequest.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "power_meter, accepted",
+    [
+        ({"type": "manual"}, True),
+        ({"type": "hass", "entity_id": "sensor.test_power"}, False),
+    ],
+)
+def test_manual_power_meter_allows_coarser_ct_grid(power_meter: dict[str, str], accepted: bool) -> None:
+    payload = valid_request() | {
+        "power_meter": power_meter,
+        "parameters": {"ct_bri_steps": 15, "ct_mired_steps": 50},
+    }
+
+    if accepted:
+        request = LightMeasurementRequest.model_validate(payload)
+        assert request.parameters.ct_bri_steps == 15
+        assert request.parameters.ct_mired_steps == 50
+    else:
+        with pytest.raises(ValidationError, match="ct_bri_steps"):
+            LightMeasurementRequest.model_validate(payload)
+
+
+def test_parameter_limits_cover_exactly_the_validated_fields() -> None:
+    assert set(_BASE_PARAMETER_FIELDS) | set(_LIGHT_PARAMETER_FIELDS) == set(PARAMETER_LIMITS)
+
+
+def test_reused_dummy_load_description_is_trimmed_and_required() -> None:
+    assert DummyLoadReuseRequest(description="  Calibration bulb  ", resistance=529).description == "Calibration bulb"
+    with pytest.raises(ValidationError, match="dummy-load description is required"):
+        DummyLoadReuseRequest(description="   ", resistance=529)
+
+
+def test_light_request_rejects_white_mode_as_an_unsupported_measurement_mode() -> None:
+    with pytest.raises(ValidationError, match="Unsupported measurement modes: white"):
+        LightMeasurementRequest.model_validate(valid_request() | {"modes": {LutMode.WHITE}})
+
+
+@pytest.mark.parametrize(
+    "filename", ["", " ", ".", "..", "../record.csv", "/record.csv", "folder/record.csv", "folder\\record.csv"]
+)
+def test_export_filename_rejects_directory_components(filename: str) -> None:
+    with pytest.raises(ValueError, match="file name without directory components"):
+        validate_export_filename(filename)
+
+
+@pytest.mark.parametrize("filename", ["record?.csv", "record:1.csv", "record\n.csv", "record*.csv"])
+def test_export_filename_rejects_unsafe_characters(filename: str) -> None:
+    with pytest.raises(ValueError, match="contains unsafe characters"):
+        validate_export_filename(filename)
+
+
+def test_export_filename_preserves_safe_basename_and_trims_whitespace() -> None:
+    assert validate_export_filename("  Record (run-1)+2.csv  ") == "Record (run-1)+2.csv"

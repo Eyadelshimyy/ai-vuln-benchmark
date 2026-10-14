@@ -1,0 +1,28 @@
+{
+  "repo": "danielreuter__research-notes",
+  "file": "campaigns/pouw/rtx-pro/workers/pouw-mvp-e2e/prio.py",
+  "function": "record",
+  "line": 35,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `record` function.",
+  "prompt_source": "def record():\n    \"\"\"Implement the `record` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def record():\n    out = os.environ.get(\"RESEARCH_RUN_DIR\")\n    doc = {\"priority_range\": {\"least\": least, \"greatest\": greatest}, \"stream_priority\": stream.priority,\n           \"stream\": stream.cuda_stream, \"raw_streams_seen\": sorted(seen), \"calls_watched\": calls[0],\n           \"only_the_greatest_stream\": seen == {stream.cuda_stream}}\n    print(\"prio.py: \" + json.dumps(doc), flush=True)\n    if out:\n        Path(out, \"stream.json\").write_text(json.dumps(doc, indent=1))",
+  "module_source": "\"\"\"Run a script with torch's current CUDA stream at the device's greatest priority: the pre-fix profile's stand-in for the\nreview's ``main_priority = \"greatest\"`` on #564 at 9acf562b, whose tree has no such switch.  Every kernel vLLM and the\nPearl-C main lane launch from this thread goes to that stream, and #564's side stream stays at priority 0, the least.\n\n  python prio.py SCRIPT ARGS...\n\nWrites $RESEARCH_RUN_DIR/stream.json: the priority range, the stream's priority and handle, and the raw handles the first\ncalls of torch's current-stream accessor returned (which is where the device run reads its stream).\n\"\"\"\nimport atexit\nimport json\nimport os\nimport runpy\nimport sys\nfrom pathlib import Path\n\nimport torch\n\nleast, greatest = torch.cuda.Stream.priority_range()\nstream = torch.cuda.Stream(priority=greatest)\nseen: set[int] = set()\noriginal = torch._C._cuda_getCurrentRawStream\ncalls = [0]\n\n\ndef watched(device):\n    raw = original(device)\n    seen.add(raw)\n    calls[0] += 1\n    if calls[0] >= 5000:\n        torch._C._cuda_getCurrentRawStream = original\n    return raw\n\n\ndef record():\n    out = os.environ.get(\"RESEARCH_RUN_DIR\")\n    doc = {\"priority_range\": {\"least\": least, \"greatest\": greatest}, \"stream_priority\": stream.priority,\n           \"stream\": stream.cuda_stream, \"raw_streams_seen\": sorted(seen), \"calls_watched\": calls[0],\n           \"only_the_greatest_stream\": seen == {stream.cuda_stream}}\n    print(\"prio.py: \" + json.dumps(doc), flush=True)\n    if out:\n        Path(out, \"stream.json\").write_text(json.dumps(doc, indent=1))\n\n\ntorch._C._cuda_getCurrentRawStream = watched\natexit.register(record)\nsys.argv = sys.argv[1:]\nwith torch.cuda.stream(stream):\n    runpy.run_path(sys.argv[0], run_name=\"__main__\")\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 8
+    },
+    "ai_commit": "a3ee1273f367",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      35,
+      42
+    ]
+  }
+}

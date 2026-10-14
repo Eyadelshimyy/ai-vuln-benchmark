@@ -1,0 +1,1297 @@
+"""Accept/Reject/restore/cap contracts for WinWert layout import."""
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from mf4_analyzer.ui.main_window.wwt_import_coordinator import (
+    ACCEPT_TEXT,
+    APPLY_TO_REMAINING_TEXT,
+    REJECT_TEXT,
+    WwtBatchChoice,
+    WwtLayoutPromptResult,
+    coerce_layout_prompt,
+    layout_dialog_text,
+)
+from mf4_analyzer.ui.view_state import MAX_VIEWS, ViewManager, ViewState, is_reusable_blank_view
+from tests._helpers import wwt_factory as wwt
+from tests._helpers.wwt_record_tree import record_binding_count, record_binding_roles
+
+_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _stub_wwt_ui(mw, monkeypatch, accept=True, *, apply_to_remaining=False):
+    asked = []
+
+    def fake_ask(body, informative=""):
+        asked.append((body, informative))
+        if apply_to_remaining:
+            return WwtLayoutPromptResult(
+                accepted=bool(accept), apply_to_remaining=True,
+            )
+        return accept
+
+    monkeypatch.setattr(mw._wwt_import, "_ask_layout", fake_ask)
+    monkeypatch.setattr(mw, "plot_time", lambda *a, **k: None)
+    monkeypatch.setattr(mw, "_apply_active_view", lambda *a, **k: None)
+    return asked
+
+
+def _stub_layout_prompt_only(mw, monkeypatch, accept=True):
+    """Stub the WinWert confirm dialog without shielding restore or plot."""
+    asked = []
+
+    def fake_ask(body, informative=""):
+        asked.append((body, informative))
+        return accept
+
+    monkeypatch.setattr(mw._wwt_import, "_ask_layout", fake_ask)
+    return asked
+
+
+def _load_wwt_accepting_layout(qtbot, qapp, monkeypatch, path):
+    pytest.importorskip("pytestqt")
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    mw = MainWindow()
+    qtbot.addWidget(mw)
+    mw.resize(1400, 820)
+    mw.show()
+    qapp.processEvents()
+    asked = _stub_layout_prompt_only(mw, monkeypatch, accept=True)
+    mw._load_one(str(path))
+    qapp.processEvents()
+    assert asked
+    return mw
+
+
+def _view_xaxis_spec(state):
+    from mf4_analyzer.ui.time_xaxis import CustomXAxisSpec
+
+    return CustomXAxisSpec.from_axis_opts((state.axis_opts or {}).get("x_axis"))
+
+
+def _plot_x_by_name(mw):
+    result = mw._build_time_plot_data()
+    return {row[0]: np.asarray(row[2]) for row in result.rows}, result
+
+
+def _canvas_xlabel(mw):
+    canvas = mw.chart_stack.focused_canvas() or mw.canvas_time
+    axes = getattr(canvas, "axes_list", None) or ()
+    if axes:
+        return axes[0].get_xlabel()
+    return str(getattr(canvas, "_selection_xlabel", "") or "")
+
+
+def _click_auto_time(qtbot, top):
+    from PyQt5.QtCore import Qt
+
+    qtbot.mouseClick(top.choice_xaxis.buttons()[0], Qt.LeftButton)
+
+
+def _type_xlabel(edit, text):
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtTest import QTest
+
+    edit.setFocus()
+    edit.selectAll()
+    QTest.keyClick(edit, Qt.Key_Backspace)
+    QTest.keyClicks(edit, text)
+
+
+def _store_of(fd):
+    return (getattr(fd, "source_metadata", None) or {}).get("wwt_record_store")
+
+
+def _array_sig(values):
+    array = np.ascontiguousarray(np.asarray(values, dtype=np.float64))
+    return (
+        int(array.shape[0]),
+        hashlib.sha1(array.tobytes()).hexdigest(),
+    )
+
+
+def _assert_store_on_every_file(mw):
+    stores = [_store_of(fd) for fd in mw.files.values()]
+    assert stores and all(store is not None for store in stores)
+    first = stores[0]
+    assert all(store is first for store in stores)
+    return first
+
+
+def test_layout_dialog_text_matches_multi_window_copy(tmp_path):
+    from mf4_analyzer.io.wwt_document import load_wwt_document
+    from mf4_analyzer.ui.wwt_view_import import (
+        build_wwt_view_proposals,
+        register_groups_for_test,
+    )
+
+    loaded = load_wwt_document(
+        wwt.multi_window_overlap_and_formula(tmp_path / "multi.wwt")
+    )
+    registered = register_groups_for_test(loaded.groups, owner_fid="f1")
+    proposals = build_wwt_view_proposals(loaded.document, registered)
+    body, informative = layout_dialog_text(
+        loaded.document, proposals, available=MAX_VIEWS
+    )
+    visible_y_windows = sum(
+        1
+        for window in loaded.document.windows
+        if any(row.visible for row in window.curves[1:])
+    )
+    assert visible_y_windows == wwt.MULTI_WINDOW_COUNT
+    assert (
+        f"检测到 {wwt.MULTI_WINDOW_COUNT} 个 WinWert 数据窗口和 "
+        f"{wwt.MULTI_FORMULA_COUNT} 个可用计算通道。"
+    ) in body
+    assert (
+        f"可按 WinWert 窗口创建 {wwt.MULTI_WINDOW_COUNT} 个时域 View 并绘图。"
+    ) in body
+    assert "Board" not in body
+    assert "UltraView" not in body
+    assert "重叠" not in body
+    assert informative == ""
+    capped, info = layout_dialog_text(
+        loaded.document, proposals, available=1
+    )
+    assert "可按 WinWert 窗口创建 1 个时域 View 并绘图。" in capped
+    assert "Board" not in capped
+    assert "UltraView" not in capped
+    assert info == f"检测到 {wwt.MULTI_WINDOW_COUNT} 个，可创建 1 个"
+
+
+def test_layout_dialog_text_single_window_describes_ordinary_time_view(tmp_path):
+    from mf4_analyzer.io.wwt_document import load_wwt_document
+    from mf4_analyzer.ui.wwt_view_import import (
+        build_wwt_view_proposals,
+        register_groups_for_test,
+    )
+
+    loaded = load_wwt_document(
+        wwt.channel_xy_with_auxiliaries(tmp_path / "one.wwt")
+    )
+    proposals = build_wwt_view_proposals(
+        loaded.document, register_groups_for_test(loaded.groups, owner_fid="f1")
+    )
+    body, informative = layout_dialog_text(
+        loaded.document, proposals, available=MAX_VIEWS
+    )
+    assert "可按 WinWert 窗口创建 1 个时域 View 并绘图。" in body
+    assert "Board" not in body
+    assert "UltraView" not in body
+    assert informative == ""
+
+
+def test_layout_dialog_text_counts_visible_y_windows_not_kept_proposals(tmp_path):
+    from mf4_analyzer.io.wwt_document import load_wwt_document
+    from mf4_analyzer.ui.wwt_view_import import (
+        build_wwt_view_proposals,
+        register_groups_for_test,
+    )
+
+    loaded = load_wwt_document(
+        wwt.multi_window_overlap_and_formula(tmp_path / "multi.wwt")
+    )
+    proposals = build_wwt_view_proposals(
+        loaded.document, register_groups_for_test(loaded.groups, owner_fid="f1")
+    )
+    body, _info = layout_dialog_text(
+        loaded.document, proposals[:1], available=MAX_VIEWS
+    )
+    assert f"检测到 {wwt.MULTI_WINDOW_COUNT} 个 WinWert 数据窗口" in body
+
+
+def test_insert_states_reuses_blank_and_emits_once():
+    manager = ViewManager()
+    emissions = []
+    manager.views_changed.connect(lambda: emissions.append("views"))
+    manager.active_changed.connect(lambda idx: emissions.append(("active", idx)))
+    first = ViewState(name="WinWert 1", tab_color="#2d7ff9")
+    rest = [
+        ViewState(name=f"WinWert {i}", tab_color="#2d7ff9")
+        for i in range(2, 4)
+    ]
+    assert is_reusable_blank_view(manager.get(0))
+    indexes = manager.insert_states([first, *rest], reuse_blank=True)
+    assert indexes == list(range(3))
+    assert manager.views[0] is first
+    assert len(manager.views) == 3
+    assert emissions.count("views") == 1
+
+
+def test_non_empty_view_is_not_reused():
+    manager = ViewManager()
+    manager.views[0].checked = [("f1", "x")]
+    incoming = [ViewState(name="WinWert 1", tab_color="#2d7ff9")]
+    reuse = is_reusable_blank_view(manager.views[0])
+    assert reuse is False
+    indexes = manager.insert_states(incoming, reuse_blank=reuse)
+    assert indexes == [1]
+    assert manager.views[0].checked == [("f1", "x")]
+    assert manager.views[1].name == "WinWert 1"
+
+
+def test_accept_creates_views_and_reject_keeps_data_only(qapp, tmp_path, monkeypatch):
+    pytest.importorskip("pytestqt")
+    from mf4_analyzer.ui.main_window import MainWindow
+    from mf4_analyzer.ui.time_xaxis import (
+        CHANNEL_MODE,
+        PER_SOURCE_NAME,
+        CustomXAxisSpec,
+    )
+
+    path = wwt.multi_window_overlap_and_formula(tmp_path / "multi.wwt")
+    mw = MainWindow()
+    mw.show()
+    qapp.processEvents()
+    apply_active_view = mw._apply_active_view
+    asked = _stub_wwt_ui(mw, monkeypatch, accept=True)
+    mw._load_one(str(path))
+    qapp.processEvents()
+    assert asked
+    assert (
+        f"检测到 {wwt.MULTI_WINDOW_COUNT} 个 WinWert 数据窗口和 "
+        f"{wwt.MULTI_FORMULA_COUNT} 个可用计算通道。"
+    ) in asked[0][0]
+    assert len(mw.view_manager.views) == wwt.MULTI_WINDOW_COUNT
+    assert mw.files
+    derived = any(wwt.FORM_Y in fd.data.columns for fd in mw.files.values())
+    assert derived
+    assert mw.view_manager.active == 0
+    assert mw.view_manager.views[0].name.startswith("WinWert 1")
+    active = mw.view_manager.views[0]
+    expected_y_keys = {
+        json.dumps(
+            [fid, mw.files[fid].get_prefixed_channel(channel)],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        for fid, channel in active.checked
+    }
+    assert set(active.ylims) == expected_y_keys
+    x_axis = CustomXAxisSpec.from_axis_opts(
+        active.axis_opts["x_axis"]
+    )
+    assert x_axis.mode == CHANNEL_MODE
+    assert x_axis.resolver == PER_SOURCE_NAME
+    assert x_axis.source_fid is None
+    assert x_axis.channel == wwt.CHAN_X
+    apply_active_view(mw.view_manager.active)
+    assert mw._custom_xaxis_spec == x_axis
+
+    mw2 = MainWindow()
+    mw2.show()
+    qapp.processEvents()
+    _stub_wwt_ui(mw2, monkeypatch, accept=False)
+    before_views = len(mw2.view_manager.views)
+    mw2._load_one(str(path))
+    qapp.processEvents()
+    assert len(mw2.view_manager.views) == before_views
+    assert mw2.files
+    assert any(wwt.FORM_Y in fd.data.columns for fd in mw2.files.values())
+    _assert_store_on_every_file(mw)
+    _assert_store_on_every_file(mw2)
+
+
+def test_multiple_wwt_windows_create_views_without_native_board_projection(
+    qapp, qtbot, tmp_path, monkeypatch,
+):
+    """WWT import creates ordinary Views; it never owns a Board placement."""
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    path = wwt.two_window_non_overlap(tmp_path / "two.wwt")
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    qapp.processEvents()
+    monkeypatch.setattr(
+        window._wwt_import, "_ask_layout", lambda *_args, **_kwargs: True,
+    )
+    window._load_one(str(path))
+    qapp.processEvents()
+
+    assert len(_winwert_views(window)) == 2
+
+
+def test_fresh_wwt_view_uses_later_sources_own_same_name_x(
+    qapp, qtbot, tmp_path, monkeypatch,
+):
+    """A WWT binding stays exact while later ordinary curves resolve X locally."""
+    import pandas as pd
+
+    from mf4_analyzer.ui.main_window import MainWindow
+    from mf4_analyzer.ui.time_xaxis import PER_SOURCE_NAME, CustomXAxisSpec
+
+    source_path = wwt.sfns_like_custom_x_native_viewport(
+        tmp_path / "native.wwt"
+    )
+    window = MainWindow()
+    qtbot.addWidget(window)
+    apply_active_view = window._apply_active_view
+    _stub_wwt_ui(window, monkeypatch, accept=True)
+    window._load_one(str(source_path))
+    qapp.processEvents()
+
+    state = window.view_manager.views[0]
+    original_fid = state.checked[0][0]
+    original_x = window.files[original_fid].data[
+        wwt.SFNS_RACK_TRAVEL
+    ].to_numpy(copy=False)
+    original_n = len(original_x)
+
+    same_x = np.linspace(500.0, 900.0, original_n)
+    short_x = np.linspace(-45.0, 65.0, max(8, original_n // 2))
+    expected_for_path = {}
+    for name, x_values, offset in (
+        ("same-length.csv", same_x, 1000.0),
+        ("shorter.csv", short_x, 2000.0),
+    ):
+        path = tmp_path / name
+        pd.DataFrame({
+            "time": np.arange(len(x_values), dtype=float),
+            wwt.SFNS_RACK_TRAVEL: x_values,
+            wwt.SFNS_RACK_FORCE: np.arange(len(x_values), dtype=float) + offset,
+        }).to_csv(path, index=False)
+        expected_for_path[path] = x_values
+        window._load_one(str(path))
+
+    added_fids = [
+        fid for fid, fd in window.files.items()
+        if fd.filepath in expected_for_path
+    ]
+    assert len(added_fids) == 2
+    expected_x = {
+        original_fid: np.asarray(original_x, dtype=float),
+        **{
+            fid: expected_for_path[window.files[fid].filepath]
+            for fid in added_fids
+        },
+    }
+    for fid in added_fids:
+        window.files[fid].channel_units[wwt.SFNS_RACK_TRAVEL] = (
+            wwt.SFNS_RACK_TRAVEL_UNIT
+        )
+        if fid not in state.attached_file_ids:
+            state.attached_file_ids.append(fid)
+        key = (fid, wwt.SFNS_RACK_FORCE)
+        if key not in state.checked:
+            state.checked.append(key)
+
+    apply_active_view(0)
+    qapp.processEvents()
+
+    applied = CustomXAxisSpec.from_axis_opts(state.axis_opts["x_axis"])
+    assert applied.resolver == PER_SOURCE_NAME
+    assert applied.source_fid is None
+    combo = window.inspector.top._combo_xaxis_ch
+    texts = [combo.itemText(index) for index in range(combo.count())]
+    assert any(
+        combo.itemData(index)
+        == (PER_SOURCE_NAME, None, wwt.SFNS_RACK_TRAVEL)
+        for index in range(combo.count())
+    )
+    assert all("历史精确来源" not in text for text in texts)
+    result = window._build_time_plot_data()
+    expected_keys = {
+        (fid, wwt.SFNS_RACK_FORCE) for fid in expected_x
+    }
+    assert result.attempted_channel_keys == expected_keys
+    assert result.successful_channel_keys == expected_keys
+    assert result.issues == []
+    x_by_fid = {
+        row[6]: np.asarray(row[2], dtype=float)
+        for row in result.rows
+        if row[6] in expected_x
+    }
+    assert set(x_by_fid) == set(expected_x)
+    for fid, values in expected_x.items():
+        np.testing.assert_allclose(x_by_fid[fid], values)
+
+
+def test_project_restore_does_not_prompt(qapp, tmp_path, monkeypatch):
+    from mf4_analyzer.io.wwt_document import load_wwt_document
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    path = wwt.multi_window_overlap_and_formula(tmp_path / "multi.wwt")
+    mw = MainWindow()
+    asked = []
+    monkeypatch.setattr(
+        mw._wwt_import, "_ask_layout", lambda *a, **k: asked.append(True) or True
+    )
+    mw._restoring_project = True
+    loaded = load_wwt_document(path)
+    mw._wwt_import.offer_layout(loaded.document, [])
+    assert asked == []
+
+
+def test_cap_truncates_with_visible_copy(tmp_path):
+    from mf4_analyzer.io.wwt_document import load_wwt_document
+    from mf4_analyzer.ui.wwt_view_import import (
+        build_wwt_view_proposals,
+        register_groups_for_test,
+    )
+
+    loaded = load_wwt_document(
+        wwt.multi_window_overlap_and_formula(tmp_path / "multi.wwt")
+    )
+    proposals = build_wwt_view_proposals(
+        loaded.document, register_groups_for_test(loaded.groups)
+    )
+    _body, info = layout_dialog_text(loaded.document, proposals, available=1)
+    assert info == f"检测到 {wwt.MULTI_WINDOW_COUNT} 个，可创建 1 个"
+    assert ACCEPT_TEXT == "创建时域 View 并绘图"
+    assert REJECT_TEXT == "仅加载数据"
+
+
+def test_save_reopen_keeps_record_only_y_bindings(qapp, tmp_path, monkeypatch):
+    """Restore skips offer_layout and keeps record-only Y bindings."""
+    from mf4_analyzer.ui.main_window import MainWindow
+    from mf4_analyzer.ui.time_curve_bindings import resolve_time_curve_binding
+
+    path = wwt.measurement_plus_record_only_tolerance(path=tmp_path / "tol.wwt")
+    mw = MainWindow()
+    mw.show()
+    qapp.processEvents()
+    asked = _stub_wwt_ui(mw, monkeypatch, accept=True)
+    mw._load_one(str(path))
+    qapp.processEvents()
+    assert asked
+    bindings = [
+        item for view in mw.view_manager.views for item in view.curve_bindings
+    ]
+    assert bindings
+    assert any(item.y_ref.kind == "wwt_record" for item in bindings)
+    record_binding = next(
+        item for item in bindings if item.y_ref.kind == "wwt_record"
+    )
+    x, y, issue = resolve_time_curve_binding(record_binding, mw.files)
+    assert issue is None and y is not None and x is not None
+    original = (_array_sig(x), _array_sig(y), None if issue is None else issue.code)
+
+    proj = tmp_path / "wwt.tlproj"
+    assert mw.save_project(proj) is True
+    payload = proj.read_text(encoding="utf-8")
+    assert "wwt_record_store" not in payload
+    session = json.loads(payload)
+
+    def _walk(node):
+        if isinstance(node, dict):
+            assert "wwt_record_store" not in node
+            for value in node.values():
+                _walk(value)
+        elif isinstance(node, list):
+            if (
+                len(node) >= wwt.CHANNEL_N
+                and all(isinstance(item, (int, float)) for item in node[:8])
+            ):
+                pytest.fail("session JSON dumped a numeric array")
+            for item in node:
+                _walk(item)
+
+    _walk(session)
+
+    restored = MainWindow()
+    restored.show()
+    qapp.processEvents()
+    restore_toasts = []
+
+    def fail_if_called(*_a, **_k):
+        pytest.fail("layout dialog must not run during project restore")
+
+    monkeypatch.setattr(restored._wwt_import, "_ask_layout", fail_if_called)
+    monkeypatch.setattr(restored, "plot_time", lambda *a, **k: None)
+    monkeypatch.setattr(restored, "_apply_active_view", lambda *a, **k: None)
+    monkeypatch.setattr(
+        restored, "toast",
+        lambda msg, level="info": restore_toasts.append((msg, level)),
+    )
+    restored.open_project(proj)
+    qapp.processEvents()
+
+    _assert_store_on_every_file(restored)
+    restored_bindings = [
+        item
+        for view in restored.view_manager.views
+        for item in view.curve_bindings
+    ]
+    assert restored_bindings
+    assert any(item.y_ref.kind == "wwt_record" for item in restored_bindings)
+    restored_binding = next(
+        item for item in restored_bindings if item.y_ref.kind == "wwt_record"
+    )
+    x, y, issue = resolve_time_curve_binding(restored_binding, restored.files)
+    assert issue is None, issue
+    assert y is not None
+    restored_sig = (
+        _array_sig(x), _array_sig(y), None if issue is None else issue.code,
+    )
+    assert restored_sig == original
+    warn = [(m, lv) for m, lv in restore_toasts if lv in {"warning", "warn"}]
+    assert warn == [], warn
+
+
+def test_reject_and_no_display_still_attach_record_store(
+    qapp, tmp_path, monkeypatch,
+):
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    path = wwt.measurement_plus_record_only_tolerance(path=tmp_path / "tol.wwt")
+    mw = MainWindow()
+    _stub_wwt_ui(mw, monkeypatch, accept=False)
+    mw._load_one(str(path))
+    store = _assert_store_on_every_file(mw)
+    names = [getattr(item, "name", None) for item in store]
+    assert wwt.TOL_Y in names
+    assert wwt.LINE_X in names
+
+    n = wwt.CHANNEL_N
+    bare = wwt.write_wwt_file(
+        tmp_path / "bare.wwt",
+        (
+            wwt.WwtRecordSpec("Zeit", wwt.TIME_NAME, "s", n=n, dt=wwt.DT, t0=wwt.T0),
+            wwt.WwtRecordSpec(
+                "Real", wwt.CHAN_Y, wwt.CHAN_Y_UNIT, n=n,
+                values=np.linspace(wwt.CHAN_Y_LO, wwt.CHAN_Y_HI, n),
+            ),
+        ),
+    )
+    mw2 = MainWindow()
+
+    def fail_if_called(*_a, **_k):
+        pytest.fail("layout dialog must not run when the file has no display")
+
+    monkeypatch.setattr(mw2._wwt_import, "_ask_layout", fail_if_called)
+    monkeypatch.setattr(mw2, "plot_time", lambda *a, **k: None)
+    monkeypatch.setattr(mw2, "_apply_active_view", lambda *a, **k: None)
+    mw2._load_one(str(bare))
+    _assert_store_on_every_file(mw2)
+
+
+def test_window_position_overlap_does_not_block_ordinary_view_creation(
+    qapp, tmp_path, monkeypatch,
+):
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    path = wwt.multi_window_overlap_and_formula(tmp_path / "overlap.wwt")
+    mw = MainWindow()
+    toasts = []
+    monkeypatch.setattr(
+        mw, "toast", lambda msg, level="info": toasts.append((msg, level)),
+    )
+    asked = _stub_wwt_ui(mw, monkeypatch, accept=True)
+    mw._load_one(str(path))
+    assert asked
+    assert "重叠" not in asked[0][0]
+    assert len(_winwert_views(mw)) == wwt.MULTI_WINDOW_COUNT
+    warn = [(m, lv) for m, lv in toasts if lv in {"warning", "warn"}]
+    leaked = [
+        msg for msg, _lv in warn
+        if "exact_overlap" in str(msg)
+        or "quantized_collision" in str(msg)
+        or "placed_limit" in str(msg)
+        or "duplicate_ref" in str(msg)
+    ]
+    assert leaked == [], warn
+
+
+def _assert_formula_user_copy(text):
+    blob = str(text)
+    assert wwt.PARS_ABTRIEB in blob
+    assert wwt.PARS_F_SPUST in blob
+    assert "k51" in blob and "k52" in blob
+    assert "record 16" not in blob
+    assert "record 17" not in blob
+    assert "missing_formula_ref" not in blob
+    assert "abs(" not in blob
+    assert "exact_overlap_relocated" not in blob
+
+
+def _user_warning_blob(toasts) -> str:
+    return " ".join(
+        str(msg) for msg, level in toasts if level in {"warning", "warn"}
+    )
+
+
+def _sync_record_tree(mw, state=None):
+    fn = getattr(mw, "_sync_record_curve_tree", None)
+    assert callable(fn), "MainWindow._sync_record_curve_tree is the single sync entry"
+    fn(state)
+
+
+def test_wwt_inspector_lists_record_only_and_hide_does_not_touch_navigator(
+    qapp, tmp_path, monkeypatch,
+):
+    from mf4_analyzer.ui.inspector_sections.contextual_time import TimeContextual
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    panel = TimeContextual()
+    assert not hasattr(panel, "set_record_curves")
+    assert not hasattr(panel, "_record_curves")
+    assert not hasattr(panel, "record_curve_visibility_toggled")
+
+    path = wwt.measurement_plus_record_only_tolerance(path=tmp_path / "tol.wwt")
+    mw = MainWindow()
+    _stub_wwt_ui(mw, monkeypatch, accept=True)
+    mw._load_one(str(path))
+    qapp.processEvents()
+    assert not hasattr(mw.inspector, "record_curve_visibility_toggled")
+    assert hasattr(mw.navigator, "record_curve_visibility_toggled")
+    _sync_record_tree(mw)
+    qapp.processEvents()
+    state = mw.view_manager.get(mw.view_manager.active)
+    record_ids = [
+        binding.binding_id
+        for binding in state.curve_bindings
+        if binding.y_ref.kind == "wwt_record"
+    ]
+    assert len(record_ids) == 1
+    assert record_binding_count(mw.navigator) == 1
+    checked_before = mw.navigator.get_checked_channels()
+    bindings_before = list(state.curve_bindings)
+    hidden_before = list(state.hidden_curve_binding_ids)
+    mw._on_record_curve_visibility_toggled(
+        state.view_id, record_ids[0], False,
+    )
+    qapp.processEvents()
+    assert record_ids[0] in state.hidden_curve_binding_ids
+    assert mw.navigator.get_checked_channels() == checked_before
+    assert state.curve_bindings == bindings_before
+    assert hidden_before != list(state.hidden_curve_binding_ids)
+
+
+def test_wwt_record_rows_follow_active_time_view_and_not_sibling_hidden(
+    qapp, tmp_path, monkeypatch,
+):
+    from dataclasses import replace
+
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    path = wwt.measurement_plus_record_only_tolerance(path=tmp_path / "tol.wwt")
+    mw = MainWindow()
+    _stub_wwt_ui(mw, monkeypatch, accept=True)
+    mw._load_one(str(path))
+    qapp.processEvents()
+    src = mw.view_manager.get(mw.view_manager.active)
+    record = next(
+        binding for binding in src.curve_bindings
+        if binding.y_ref.kind == "wwt_record"
+    )
+    src.hidden_curve_binding_ids = [record.binding_id]
+    copied = mw.view_manager.duplicate(mw.view_manager.active)
+    other = mw.view_manager.get(copied)
+    other.curve_bindings = [
+        replace(binding, binding_id=f"{binding.binding_id}-v2")
+        if binding.y_ref.kind == "wwt_record" else binding
+        for binding in other.curve_bindings
+    ]
+    other.hidden_curve_binding_ids = []
+    mw.view_manager.set_active(0)
+    _sync_record_tree(mw, src)
+    qapp.processEvents()
+    roles_a = record_binding_roles(mw.navigator)
+    assert len(roles_a) == 1
+    assert roles_a[0][1] == src.view_id
+    assert roles_a[0][2] == record.binding_id
+    mw.view_manager.set_active(copied)
+    _sync_record_tree(mw, other)
+    qapp.processEvents()
+    roles_b = record_binding_roles(mw.navigator)
+    assert len(roles_b) == 1
+    assert roles_b[0][1] == other.view_id
+    assert roles_b[0][2] == f"{record.binding_id}-v2"
+    assert roles_b[0][2] != roles_a[0][2]
+
+
+def test_switching_to_analysis_hides_record_rows_and_time_restores_them(
+    qapp, tmp_path, monkeypatch,
+):
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    path = wwt.measurement_plus_record_only_tolerance(path=tmp_path / "tol.wwt")
+    mw = MainWindow()
+    _stub_wwt_ui(mw, monkeypatch, accept=True)
+    mw._load_one(str(path))
+    qapp.processEvents()
+    _sync_record_tree(mw)
+    qapp.processEvents()
+    assert record_binding_count(mw.navigator) == 1
+    mw.toolbar._set_mode("fft")
+    qapp.processEvents()
+    assert record_binding_count(mw.navigator) == 0
+    mw.toolbar._set_mode("time")
+    qapp.processEvents()
+    assert record_binding_count(mw.navigator) == 1
+
+
+def test_two_missing_formula_refs_emit_one_grouped_chinese_summary(
+    qapp, tmp_path, monkeypatch,
+):
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    path = wwt.catalog_32_unresolved_k51_k52(tmp_path / "eo3.wwt")
+    mw = MainWindow()
+    toasts = []
+    monkeypatch.setattr(
+        mw, "toast", lambda msg, level="info": toasts.append((msg, level)),
+    )
+    _stub_wwt_ui(mw, monkeypatch, accept=True)
+    mw._load_one(str(path))
+    qapp.processEvents()
+    warn = _user_warning_blob(toasts)
+    assert warn
+    _assert_formula_user_copy(warn)
+
+
+def test_optional_customer_wwt_import_smoke_when_present(qapp, tmp_path, monkeypatch):
+    pytest.importorskip("pytestqt")
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    folder = _ROOT / "testdoc" / "WWT"
+    samples = sorted(folder.glob("*.wwt")) if folder.is_dir() else []
+    if not samples:
+        pytest.skip(f"optional customer WWT sample missing: {folder}")
+    mw = MainWindow()
+    _stub_wwt_ui(mw, monkeypatch, accept=False)
+    mw._load_one(str(samples[0]))
+    qapp.processEvents()
+    assert mw.files
+
+
+def _winwert_views(mw):
+    return [
+        view for view in mw.view_manager.views
+        if (view.name or "").startswith("WinWert")
+    ]
+
+
+def _checked_fids(views):
+    fids = set()
+    for view in views:
+        for fid, _channel in view.checked or ():
+            fids.add(fid)
+    return fids
+
+
+def _write_simple_csv(path, n=40):
+    with open(path, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["time", "rpm"])
+        for index in range(n):
+            writer.writerow([index / 100.0, float(index)])
+    return path
+
+
+def _no_display_wwt(path):
+    n = wwt.CHANNEL_N
+    return wwt.write_wwt_file(
+        path,
+        (
+            wwt.WwtRecordSpec("Zeit", wwt.TIME_NAME, "s", n=n, dt=wwt.DT, t0=wwt.T0),
+            wwt.WwtRecordSpec(
+                "Real", wwt.CHAN_Y, wwt.CHAN_Y_UNIT, n=n,
+                values=np.linspace(wwt.CHAN_Y_LO, wwt.CHAN_Y_HI, n),
+            ),
+        ),
+    )
+
+
+def test_coerce_layout_prompt_bool_means_do_not_remember():
+    from_bool = coerce_layout_prompt(True)
+    assert from_bool == WwtLayoutPromptResult(accepted=True, apply_to_remaining=False)
+    typed = WwtLayoutPromptResult(accepted=False, apply_to_remaining=True)
+    assert coerce_layout_prompt(typed) is typed
+
+    class Duck:
+        accepted = True
+        apply_to_remaining = True
+
+    assert coerce_layout_prompt(Duck()) == WwtLayoutPromptResult(
+        accepted=True, apply_to_remaining=True,
+    )
+
+
+def test_ask_layout_checkbox_default_unchecked_and_wires_result(qapp, monkeypatch):
+    from PyQt5.QtWidgets import QMessageBox
+    from mf4_analyzer.ui.main_window.wwt_import_coordinator import (
+        WwtImportCoordinator,
+    )
+
+    captured = {}
+
+    def fake_exec(self):
+        checkbox = self.checkBox()
+        captured["text"] = checkbox.text() if checkbox is not None else None
+        captured["checked"] = None if checkbox is None else checkbox.isChecked()
+        captured["buttons"] = [button.text() for button in self.buttons()]
+        checkbox.setChecked(True)
+        for button in self.buttons():
+            if button.text() == ACCEPT_TEXT:
+                button.click()
+                break
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "exec_", fake_exec)
+    result = WwtImportCoordinator(None)._ask_layout("body", "info")
+    assert captured["text"] == APPLY_TO_REMAINING_TEXT
+    assert captured["checked"] is False
+    assert ACCEPT_TEXT in captured["buttons"]
+    assert REJECT_TEXT in captured["buttons"]
+    assert result == WwtLayoutPromptResult(accepted=True, apply_to_remaining=True)
+
+
+def test_empty_fids_and_restore_do_not_consume_remembered_choice(tmp_path):
+    from mf4_analyzer.io.wwt_document import load_wwt_document
+    from mf4_analyzer.ui.main_window.wwt_import_coordinator import (
+        WwtImportCoordinator,
+    )
+
+    class Dummy:
+        _restoring_project = False
+        files = {}
+
+    loaded = load_wwt_document(_no_display_wwt(tmp_path / "bare.wwt"))
+    coord = WwtImportCoordinator(Dummy())
+    coord.begin_open_batch()
+    coord._batch_choice = WwtBatchChoice.APPLY_LAYOUT
+    empty = coord.offer_layout(loaded.document, [])
+    assert empty.created == 0
+    assert empty.accepted is False
+    assert coord._batch_choice is WwtBatchChoice.APPLY_LAYOUT
+
+    no_proposals = coord.offer_layout(loaded.document, ["missing-fid"])
+    assert no_proposals.created == 0
+    assert no_proposals.accepted is False
+    assert coord._batch_choice is WwtBatchChoice.APPLY_LAYOUT
+
+    Dummy._restoring_project = True
+    assert coord.offer_layout(loaded.document, ["missing-fid"]) is None
+    assert coord._batch_choice is WwtBatchChoice.APPLY_LAYOUT
+    coord.end_open_batch()
+    assert coord._batch_choice is WwtBatchChoice.ASK
+    assert coord._batch_active is False
+
+
+def test_open_batch_remember_layout_asks_once_and_creates_each_file(
+    qapp, tmp_path, monkeypatch,
+):
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    paths = [
+        wwt.two_window_non_overlap(tmp_path / f"layout_{index}.wwt")
+        for index in range(3)
+    ]
+    mw = MainWindow()
+    asked = _stub_wwt_ui(
+        mw, monkeypatch, accept=True, apply_to_remaining=True,
+    )
+    mw._open_data_paths([str(path) for path in paths])
+    qapp.processEvents()
+    assert len(asked) == 1
+    views = _winwert_views(mw)
+    assert len(views) == 6
+    assert len(mw.files) == 3
+    assert _checked_fids(views) == set(mw.files)
+    assert mw._wwt_import._batch_choice is WwtBatchChoice.ASK
+    assert mw._wwt_import._batch_active is False
+
+
+def test_open_batch_remember_data_only_asks_once_and_keeps_records(
+    qapp, tmp_path, monkeypatch,
+):
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    paths = [
+        wwt.two_window_non_overlap(tmp_path / f"data_{index}.wwt")
+        for index in range(3)
+    ]
+    mw = MainWindow()
+    asked = _stub_wwt_ui(
+        mw, monkeypatch, accept=False, apply_to_remaining=True,
+    )
+    before = len(mw.view_manager.views)
+    mw._open_data_paths([str(path) for path in paths])
+    qapp.processEvents()
+    assert len(asked) == 1
+    assert _winwert_views(mw) == []
+    assert len(mw.view_manager.views) == before
+    assert len(mw.files) == 3
+    assert all(_store_of(fd) is not None for fd in mw.files.values())
+
+
+def test_open_batch_second_remember_reused_by_third(qapp, tmp_path, monkeypatch):
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    paths = [
+        wwt.two_window_non_overlap(tmp_path / f"seq_{index}.wwt")
+        for index in range(3)
+    ]
+    mw = MainWindow()
+    asked = []
+    answers = [
+        WwtLayoutPromptResult(accepted=True, apply_to_remaining=False),
+        WwtLayoutPromptResult(accepted=False, apply_to_remaining=True),
+    ]
+
+    def fake_ask(body, informative=""):
+        asked.append((body, informative))
+        if not answers:
+            pytest.fail("layout dialog must not run for the remembered third file")
+        return answers.pop(0)
+
+    monkeypatch.setattr(mw._wwt_import, "_ask_layout", fake_ask)
+    monkeypatch.setattr(mw, "plot_time", lambda *a, **k: None)
+    monkeypatch.setattr(mw, "_apply_active_view", lambda *a, **k: None)
+    mw._open_data_paths([str(path) for path in paths])
+    qapp.processEvents()
+    assert len(asked) == 2
+    assert answers == []
+    assert len(mw.files) == 3
+    assert len(_winwert_views(mw)) == 2
+
+
+def test_open_batch_mixed_csv_does_not_consume_wwt_choice(
+    qapp, tmp_path, monkeypatch,
+):
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    first = wwt.two_window_non_overlap(tmp_path / "mixed_a.wwt")
+    csv_path = _write_simple_csv(tmp_path / "mixed.csv")
+    second = wwt.two_window_non_overlap(tmp_path / "mixed_b.wwt")
+    mw = MainWindow()
+    asked = _stub_wwt_ui(
+        mw, monkeypatch, accept=True, apply_to_remaining=True,
+    )
+    mw._open_data_paths([str(first), str(csv_path), str(second)])
+    qapp.processEvents()
+    assert len(asked) == 1
+    names = {fd.filename for fd in mw.files.values()}
+    assert "mixed.csv" in names
+    assert "mixed_a.wwt" in names
+    assert "mixed_b.wwt" in names
+    assert len(_winwert_views(mw)) == 4
+
+
+def test_open_batch_no_display_does_not_establish_choice(
+    qapp, tmp_path, monkeypatch,
+):
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    bare = _no_display_wwt(tmp_path / "bare.wwt")
+    first = wwt.two_window_non_overlap(tmp_path / "valid_a.wwt")
+    second = wwt.two_window_non_overlap(tmp_path / "valid_b.wwt")
+    mw = MainWindow()
+    asked = _stub_wwt_ui(
+        mw, monkeypatch, accept=True, apply_to_remaining=True,
+    )
+    mw._open_data_paths([str(bare), str(first), str(second)])
+    qapp.processEvents()
+    assert len(asked) == 1
+    assert len(_winwert_views(mw)) == 4
+    assert any(fd.filename == "bare.wwt" for fd in mw.files.values())
+
+
+def test_open_batch_middle_failure_keeps_remembered_choice(
+    qapp, tmp_path, monkeypatch,
+):
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    first = wwt.two_window_non_overlap(tmp_path / "ok_a.wwt")
+    bad = tmp_path / "bad.wwt"
+    bad.write_bytes(b"not a WinWert file")
+    second = wwt.two_window_non_overlap(tmp_path / "ok_b.wwt")
+    errors = []
+
+    def _critical(_parent, title, text, *args, **kwargs):
+        errors.append((title, str(text)))
+        return 0
+
+    monkeypatch.setattr(
+        "mf4_analyzer.ui.main_window._project_io_mixin.QMessageBox.critical",
+        _critical,
+    )
+    mw = MainWindow()
+    asked = _stub_wwt_ui(
+        mw, monkeypatch, accept=True, apply_to_remaining=True,
+    )
+    mw._open_data_paths([str(first), str(bad), str(second)])
+    qapp.processEvents()
+    assert len(asked) == 1
+    assert errors
+    assert errors[0][0] == "错误"
+    names = {fd.filename for fd in mw.files.values()}
+    assert "ok_a.wwt" in names
+    assert "ok_b.wwt" in names
+    assert "bad.wwt" not in names
+    assert len(_winwert_views(mw)) == 4
+
+
+def test_open_batch_new_open_asks_again(qapp, tmp_path, monkeypatch):
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    first_batch = [
+        wwt.two_window_non_overlap(tmp_path / f"batch1_{index}.wwt")
+        for index in range(2)
+    ]
+    later = wwt.two_window_non_overlap(tmp_path / "batch2.wwt")
+    mw = MainWindow()
+    asked = _stub_wwt_ui(
+        mw, monkeypatch, accept=True, apply_to_remaining=True,
+    )
+    mw._open_data_paths([str(path) for path in first_batch])
+    qapp.processEvents()
+    assert len(asked) == 1
+    mw._open_data_paths([str(later)])
+    qapp.processEvents()
+    assert len(asked) == 2
+
+
+def test_open_batch_exception_clears_remembered_choice(qapp, tmp_path, monkeypatch):
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    path = wwt.two_window_non_overlap(tmp_path / "boom.wwt")
+    mw = MainWindow()
+    _stub_wwt_ui(mw, monkeypatch, accept=True, apply_to_remaining=True)
+
+    def boom(*_a, **_k):
+        mw._wwt_import._batch_choice = WwtBatchChoice.APPLY_LAYOUT
+        raise RuntimeError("load failed")
+
+    monkeypatch.setattr(mw, "_load_one", boom)
+    with pytest.raises(RuntimeError, match="load failed"):
+        mw._open_data_paths([str(path)])
+    assert mw._wwt_import._batch_choice is WwtBatchChoice.ASK
+    assert mw._wwt_import._batch_active is False
+
+
+def test_open_batch_bool_monkeypatch_still_asks_each_file(
+    qapp, tmp_path, monkeypatch,
+):
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    paths = [
+        wwt.two_window_non_overlap(tmp_path / f"bool_{index}.wwt")
+        for index in range(3)
+    ]
+    mw = MainWindow()
+    asked = _stub_wwt_ui(mw, monkeypatch, accept=True)
+    mw._open_data_paths([str(path) for path in paths])
+    qapp.processEvents()
+    assert len(asked) == 3
+    assert len(_winwert_views(mw)) == 6
+
+
+def test_open_batch_project_restore_asks_zero_times(qapp, tmp_path, monkeypatch):
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    path = wwt.two_window_non_overlap(tmp_path / "restore.wwt")
+    mw = MainWindow()
+    asked = _stub_wwt_ui(mw, monkeypatch, accept=True, apply_to_remaining=True)
+    mw._open_data_paths([str(path)])
+    qapp.processEvents()
+    assert asked
+    proj = tmp_path / "batch.tlproj"
+    assert mw.save_project(proj) is True
+
+    restored = MainWindow()
+
+    def fail_if_called(*_a, **_k):
+        pytest.fail("layout dialog must not run during project restore")
+
+    monkeypatch.setattr(restored._wwt_import, "_ask_layout", fail_if_called)
+    monkeypatch.setattr(restored, "plot_time", lambda *a, **k: None)
+    monkeypatch.setattr(restored, "_apply_active_view", lambda *a, **k: None)
+    restored.open_project(proj)
+    qapp.processEvents()
+    assert restored.files
+    assert _winwert_views(restored)
+
+
+def test_wwt_layout_import_first_time_switch_clears_auto_draft_then_apply_uses_time(
+    qtbot, qapp, tmp_path, monkeypatch,
+):
+    from mf4_analyzer.ui.time_xaxis import (
+        CHANNEL_MODE,
+        LABEL_ORIGIN_AUTO,
+        PER_SOURCE_NAME,
+        CustomXAxisSpec,
+    )
+
+    path = wwt.multi_window_overlap_and_formula(tmp_path / "origin.wwt")
+    mw = _load_wwt_accepting_layout(qtbot, qapp, monkeypatch, path)
+    top = mw.inspector.top
+    layout_label = f"{wwt.WIN_A} [{wwt.CHAN_X_UNIT}]"
+    applied = mw._custom_xaxis_spec
+    view_opts = dict(mw.view_manager.views[0].axis_opts["x_axis"])
+    plotted_before, _result_before = _plot_x_by_name(mw)
+    fid, channel = mw.view_manager.views[0].checked[0]
+    fd = mw.files[fid]
+    ordinary_name = fd.get_prefixed_channel(channel)
+
+    assert applied == CustomXAxisSpec(
+        mode=CHANNEL_MODE,
+        resolver=PER_SOURCE_NAME,
+        source_fid=None,
+        channel=wwt.CHAN_X,
+        label=layout_label,
+        label_origin=LABEL_ORIGIN_AUTO,
+    )
+    assert top.xaxis_label() == layout_label
+    assert top._xlabel_auto_from_channel is True
+    assert top.edit_xlabel.placeholderText() == "Time (s)"
+    assert "Time (s)" not in _canvas_xlabel(mw)
+    np.testing.assert_array_equal(
+        plotted_before[ordinary_name],
+        np.asarray(fd.data[wwt.CHAN_X]),
+    )
+
+    _click_auto_time(qtbot, top)
+    qapp.processEvents()
+    assert top.xaxis_mode() == "time"
+    assert top.xaxis_label() == ""
+    assert top.edit_xlabel.placeholderText() == "Time (s)"
+    assert mw._custom_xaxis_spec == applied
+    assert mw.view_manager.views[0].axis_opts["x_axis"] == view_opts
+    plotted_draft, _result_draft = _plot_x_by_name(mw)
+    np.testing.assert_array_equal(
+        plotted_draft[ordinary_name], plotted_before[ordinary_name],
+    )
+
+    top.btn_apply_xaxis.click()
+    qapp.processEvents()
+    assert mw._custom_xaxis_spec == CustomXAxisSpec(mode="time", label="")
+    assert _view_xaxis_spec(mw.view_manager.views[0]) == CustomXAxisSpec(
+        mode="time", label="",
+    )
+    plotted_time, _result_time = _plot_x_by_name(mw)
+    np.testing.assert_array_equal(
+        plotted_time[ordinary_name], np.asarray(fd.time_array),
+    )
+    assert _canvas_xlabel(mw) == "Time (s)"
+
+
+@pytest.mark.parametrize(
+    "typed",
+    (
+        "Manual title",
+        wwt.CHAN_X,
+        f"{wwt.WIN_A} [{wwt.CHAN_X_UNIT}]",
+    ),
+)
+def test_wwt_imported_auto_label_becomes_user_after_edit_and_survives_time_switch(
+    qtbot, qapp, tmp_path, monkeypatch, typed,
+):
+    from mf4_analyzer.ui.time_xaxis import LABEL_ORIGIN_USER
+
+    path = wwt.multi_window_overlap_and_formula(tmp_path / "user-origin.wwt")
+    mw = _load_wwt_accepting_layout(qtbot, qapp, monkeypatch, path)
+    top = mw.inspector.top
+    if typed == "Manual title":
+        _type_xlabel(top.edit_xlabel, typed)
+    else:
+        top.set_xaxis_label(typed, auto_from_channel=True)
+        top.edit_xlabel.textEdited.emit(typed)
+    qapp.processEvents()
+    assert top.xaxis_label() == typed
+    assert top.xaxis_label_origin() == LABEL_ORIGIN_USER
+
+    top.btn_apply_xaxis.click()
+    qapp.processEvents()
+    assert mw._custom_xaxis_spec.label == typed
+    assert mw._custom_xaxis_spec.label_origin == LABEL_ORIGIN_USER
+    top.set_xaxis_mode("time")
+    assert top.xaxis_label() == typed
+    assert _view_xaxis_spec(mw.view_manager.views[0]).label_origin == (
+        LABEL_ORIGIN_USER
+    )
+
+
+def test_wwt_unapplied_time_draft_does_not_commit_when_switching_views(
+    qtbot, qapp, tmp_path, monkeypatch,
+):
+    from mf4_analyzer.ui.time_xaxis import CHANNEL_MODE, LABEL_ORIGIN_AUTO
+
+    path = wwt.multi_window_overlap_and_formula(tmp_path / "draft-switch.wwt")
+    mw = _load_wwt_accepting_layout(qtbot, qapp, monkeypatch, path)
+    layout_label = f"{wwt.WIN_A} [{wwt.CHAN_X_UNIT}]"
+    top = mw.inspector.top
+    _click_auto_time(qtbot, top)
+    qapp.processEvents()
+    assert top.xaxis_label() == ""
+
+    mw._switch_view(1)
+    qapp.processEvents()
+    mw._switch_view(0)
+    qapp.processEvents()
+    spec = _view_xaxis_spec(mw.view_manager.views[0])
+    assert spec.mode == CHANNEL_MODE
+    assert spec.label == layout_label
+    assert spec.label_origin == LABEL_ORIGIN_AUTO
+    assert mw._custom_xaxis_spec == spec
+    assert top.xaxis_label() == layout_label
+    assert top._xlabel_auto_from_channel is True
+
+
+def test_wwt_mixed_exact_binding_keeps_curve_x_when_view_applies_time(
+    qtbot, qapp, tmp_path, monkeypatch,
+):
+    from mf4_analyzer.ui.time_xaxis import LABEL_ORIGIN_AUTO
+
+    path = wwt.channel_exception_with_header_x(tmp_path / "mixed-x.wwt")
+    mw = _load_wwt_accepting_layout(qtbot, qapp, monkeypatch, path)
+    state = mw.view_manager.views[0]
+    binding_before = state.curve_bindings[0]
+    assert binding_before.x_ref.channel == "X_Wheel input torque"
+    assert binding_before.y_ref.channel == "Diff.Limit A"
+    binding_id = binding_before.binding_id
+    x_ref = binding_before.x_ref
+    y_ref = binding_before.y_ref
+    assert _view_xaxis_spec(state).label_origin == LABEL_ORIGIN_AUTO
+
+    top = mw.inspector.top
+    top.set_xaxis_mode("time")
+    top.btn_apply_xaxis.click()
+    qapp.processEvents()
+
+    state = mw.view_manager.views[0]
+    binding = state.curve_bindings[0]
+    assert binding.binding_id == binding_id
+    assert binding.x_ref == x_ref
+    assert binding.y_ref == y_ref
+    fid = state.checked[0][0]
+    fd = mw.files[fid]
+    plotted, _result = _plot_x_by_name(mw)
+    np.testing.assert_array_equal(
+        plotted[fd.get_prefixed_channel("Diff.Moment A")],
+        np.asarray(fd.time_array),
+    )
+    np.testing.assert_array_equal(
+        plotted[fd.get_prefixed_channel("Diff.Limit A")],
+        np.asarray(fd.data["X_Wheel input torque"]),
+    )
+
+
+def test_wwt_record_only_view_keeps_curve_bound_readonly_controls(
+    qtbot, qapp, tmp_path, monkeypatch,
+):
+    path = wwt.record_only_gap_curves(tmp_path / "gap-readonly.wwt")
+    mw = _load_wwt_accepting_layout(qtbot, qapp, monkeypatch, path)
+    top = mw.inspector.top
+    state = mw.view_manager.views[0]
+    bindings_before = [binding.to_dict() for binding in state.curve_bindings]
+    assert top.curve_bound_xaxis_summary()
+    assert not top.choice_xaxis.isEnabled()
+    assert not top.btn_apply_xaxis.isEnabled()
+    assert _view_xaxis_spec(state).mode == "time"
+    assert "label_origin" not in (state.axis_opts or {}).get("x_axis", {})
+    _click_auto_time(qtbot, top)
+    qapp.processEvents()
+    assert not top.choice_xaxis.isEnabled()
+    assert [binding.to_dict() for binding in state.curve_bindings] == (
+        bindings_before
+    )

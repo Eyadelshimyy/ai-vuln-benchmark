@@ -1,35 +1,7 @@
-# Python
 __pycache__/
 *.pyc
-*.pyo
-.venv/
-venv/
-*.egg-info/
-.DS_Store
-*.class
-
-# Legacy result dirs (from the original layout)
-generation/samples/
-results/raw/*.json
-results/confirmed/*.json
-!results/raw/.gitkeep
-!results/confirmed/.gitkeep
-juliet_java/
-
-# VULCAN generated outputs -- regenerated every run, NOT tracked.
-# Exact filenames, so mined candidates named like ..._load_results.json are kept.
-**/benchmark_results.json
-**/auto_harness_results.json
-**/tier2_results.json
-**/detection_results.json
-**/rq4_results.json
-**/synth_results.json
-
-# Delivery archives and generated figures
-*.tar.gz
-figures/*.png
-figures/*.pdf
-
-# Local scratch / cloned target repos if placed in-tree
-/_scratch/
-/tmp_clone/
+/tmp/
+mine_prompts_*/
+*.log
+.env
+*token*

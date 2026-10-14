@@ -1,0 +1,231 @@
+from homeassistant import data_entry_flow
+from homeassistant.components.light import ATTR_COLOR_MODE, ATTR_SUPPORTED_COLOR_MODES, ColorMode
+from homeassistant.const import CONF_ENTITY_ID, STATE_ON
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.selector import SelectSelector
+import voluptuous as vol
+
+from custom_components.powercalc.config_flow import Step
+from custom_components.powercalc.const import (
+    CONF_CREATE_ENERGY_SENSOR,
+    CONF_MANUFACTURER,
+    CONF_MODE,
+    CONF_MODEL,
+    CONF_SENSOR_TYPE,
+    CONF_SUB_PROFILE,
+    CalculationStrategy,
+    SensorType,
+)
+from custom_components.powercalc.flow_helper.flows.library import CONF_CONFIRM_AUTODISCOVERED_MODEL
+from tests.common import create_mock_config_entry, mock_device_with_entities, mock_entities_in_registry, set_states
+from tests.config_flow.common import (
+    DEFAULT_UNIQUE_ID,
+    assert_default_virtual_power_entry_data,
+    confirm_auto_discovered_model,
+    goto_virtual_power_strategy_step,
+    handle_options_flow_update,
+    set_virtual_power_configuration,
+)
+
+
+async def test_lut_manual_flow(hass: HomeAssistant) -> None:
+    mock_entities_in_registry(hass, {"light.test": {"unique_id": DEFAULT_UNIQUE_ID}})
+    await set_states(
+        hass,
+        [
+            (
+                "light.test",
+                STATE_ON,
+                {
+                    ATTR_SUPPORTED_COLOR_MODES: [ColorMode.COLOR_TEMP, ColorMode.HS],
+                    ATTR_COLOR_MODE: ColorMode.COLOR_TEMP,
+                },
+            ),
+        ],
+    )
+
+    result = await goto_virtual_power_strategy_step(hass, CalculationStrategy.LUT)
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == Step.MANUFACTURER
+    data_schema: vol.Schema = result["data_schema"]
+    manufacturer_select: SelectSelector = data_schema.schema["manufacturer"]
+    manufacturer_options = manufacturer_select.config["options"]
+    assert {"value": "belkin", "label": "Belkin"} in manufacturer_options
+    assert {"value": "signify", "label": "Signify"} in manufacturer_options
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_MANUFACTURER: "signify"},
+    )
+
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == Step.MODEL
+    data_schema: vol.Schema = result["data_schema"]
+    model_select: SelectSelector = data_schema.schema["model"]
+    model_options = model_select.config["options"]
+    assert {"value": "LCT010", "label": "LCT010 (Hue White and Color Ambiance A19 E26 (Gen 3))"} in model_options
+    assert {"value": "LWB010", "label": "LWB010 (Hue White Bulb A60 B22 806lm)"} in model_options
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_MODEL: "LCT010"},
+    )
+
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+
+    # Advanced options step
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+
+    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+
+    assert_default_virtual_power_entry_data(
+        CalculationStrategy.LUT,
+        result["data"],
+        {CONF_MANUFACTURER: "signify", CONF_MODEL: "LCT010"},
+    )
+
+    assert hass.states.get("sensor.test_power")
+    assert hass.states.get("sensor.test_energy")
+
+
+async def test_lut_autodiscover_flow(
+    hass: HomeAssistant,
+) -> None:
+    manufacturer = "ikea"
+    model = "LED1545G12"
+    mock_device_with_entities(
+        hass,
+        "light.test",
+        manufacturer,
+        model,
+        unique_id=DEFAULT_UNIQUE_ID,
+    )
+
+    result = await goto_virtual_power_strategy_step(hass, CalculationStrategy.LUT)
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == Step.LIBRARY
+    assert result["description_placeholders"] == {
+        "manufacturer": "ikea",
+        "model": "LED1545G12",
+        "profile_details": ("\n\n[View measurement details](https://library.powercalc.nl/profiles/ikea/led1545g12)"),
+        "remarks": None,
+        "source": "Source entity: light.test",
+    }
+
+    result = await set_virtual_power_configuration(
+        hass,
+        result,
+        {CONF_CONFIRM_AUTODISCOVERED_MODEL: True},
+    )
+
+    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert_default_virtual_power_entry_data(
+        CalculationStrategy.LUT,
+        result["data"],
+        {CONF_MANUFACTURER: manufacturer, CONF_MODEL: model},
+    )
+
+    await hass.async_block_till_done()
+    assert hass.states.get("sensor.test_power")
+    assert hass.states.get("sensor.test_energy")
+
+
+async def test_lut_not_autodiscovered_model_unsupported(
+    hass: HomeAssistant,
+) -> None:
+    mock_device_with_entities(hass, "light.test", "ikea", "unknown_model")
+
+    result = await goto_virtual_power_strategy_step(hass, CalculationStrategy.LUT)
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == Step.MANUFACTURER
+
+
+async def test_lut_not_autodiscovered(hass: HomeAssistant) -> None:
+    # Without a unique id the light cannot be autodiscovered.
+    mock_entities_in_registry(hass, {"light.test": {"unique_id": None}})
+    await set_states(hass, [("light.test", STATE_ON)])
+
+    result = await goto_virtual_power_strategy_step(hass, CalculationStrategy.LUT)
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == Step.MANUFACTURER
+
+
+async def test_lut_autodiscover_flow_not_confirmed(
+    hass: HomeAssistant,
+) -> None:
+    """
+    When manufacturer and model are auto detected and user chooses to not accept it,
+    make sure he/she is forwarded to the manufacturer listing
+    """
+    mock_device_with_entities(
+        hass,
+        "light.test",
+        "ikea",
+        "LED1545G12",
+        unique_id="234438",
+    )
+
+    result = await goto_virtual_power_strategy_step(hass, CalculationStrategy.LUT)
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == Step.LIBRARY
+
+    result = await confirm_auto_discovered_model(hass, result, confirmed=False)
+
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == Step.MANUFACTURER
+
+
+async def test_lut_flow_with_sub_profiles(
+    hass: HomeAssistant,
+) -> None:
+    mock_device_with_entities(hass, "light.test", "", "")
+
+    result = await goto_virtual_power_strategy_step(hass, CalculationStrategy.LUT)
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_MANUFACTURER: "yeelight"},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_MODEL: "YLDL01YL"},
+    )
+
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == Step.SUB_PROFILE
+    data_schema: vol.Schema = result["data_schema"]
+    model_select: SelectSelector = data_schema.schema["sub_profile"]
+    select_options = model_select.config["options"]
+    assert {"value": "ambilight", "label": "ambilight"} in select_options
+    assert {"value": "downlight", "label": "downlight"} in select_options
+
+    result = await set_virtual_power_configuration(
+        hass,
+        result,
+        {CONF_SUB_PROFILE: "ambilight"},
+    )
+
+    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert_default_virtual_power_entry_data(
+        CalculationStrategy.LUT,
+        result["data"],
+        {CONF_MANUFACTURER: "yeelight", CONF_MODEL: "YLDL01YL/ambilight"},
+    )
+
+
+async def test_lut_options_flow(hass: HomeAssistant) -> None:
+    entry = await create_mock_config_entry(
+        hass,
+        {
+            CONF_ENTITY_ID: "light.spots_kitchen",
+            CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
+            CONF_MODE: CalculationStrategy.LUT,
+            CONF_CREATE_ENERGY_SENSOR: True,
+            CONF_MANUFACTURER: "signify",
+            CONF_MODEL: "LCT010",
+        },
+    )
+
+    await handle_options_flow_update(hass, entry, Step.BASIC_OPTIONS, {CONF_CREATE_ENERGY_SENSOR: False})
+
+    assert not entry.data[CONF_CREATE_ENERGY_SENSOR]

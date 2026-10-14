@@ -1,0 +1,142 @@
+from homeassistant import data_entry_flow
+from homeassistant.components import sensor
+from homeassistant.components.sensor import SensorDeviceClass
+from homeassistant.const import CONF_ENTITY_ID, CONF_PLATFORM, STATE_ON, UnitOfElectricCurrent
+from homeassistant.core import HomeAssistant
+from homeassistant.setup import async_setup_component
+from pytest_homeassistant_custom_component.common import setup_test_component_platform
+
+from custom_components.powercalc.config_flow import Step
+from custom_components.powercalc.const import (
+    CONF_CURRENT_ENTITY,
+    CONF_MANUFACTURER,
+    CONF_MODE,
+    CONF_MODEL,
+    CONF_POWER_FACTOR,
+    CONF_SENSOR_TYPE,
+    CONF_VOLTAGE,
+    CONF_WLED,
+    CalculationStrategy,
+    SensorType,
+)
+from custom_components.powercalc.flow_helper.flows.virtual_power import SCHEMA_POWER_WLED
+import custom_components.test.sensor as test_sensor_platform
+from tests.common import create_mock_config_entry, mock_entities_in_registry, set_states
+from tests.config_flow.common import (
+    DEFAULT_UNIQUE_ID,
+    assert_default_virtual_power_entry_data,
+    goto_virtual_power_strategy_step,
+    handle_options_flow_update,
+    set_virtual_power_configuration,
+)
+
+
+def test_wled_current_entity_selector_is_limited_to_milliamperes() -> None:
+    current_entity_selector = next(
+        value for key, value in SCHEMA_POWER_WLED.schema.items() if key.schema == CONF_CURRENT_ENTITY
+    )
+
+    assert current_entity_selector.serialize()["selector"]["entity"]["filter"] == [
+        {
+            "domain": ["sensor"],
+            "device_class": [SensorDeviceClass.CURRENT],
+            "unit_of_measurement": [UnitOfElectricCurrent.MILLIAMPERE],
+        },
+    ]
+
+
+async def test_create_wled_sensor_entry(hass: HomeAssistant) -> None:
+    await _create_wled_entities(hass)
+
+    result = await goto_virtual_power_strategy_step(hass, CalculationStrategy.WLED)
+    result = await set_virtual_power_configuration(
+        hass,
+        result,
+        {CONF_VOLTAGE: 12, CONF_POWER_FACTOR: 0.8},
+    )
+
+    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert_default_virtual_power_entry_data(
+        CalculationStrategy.WLED,
+        result["data"],
+        {CONF_WLED: {CONF_VOLTAGE: 12, CONF_POWER_FACTOR: 0.8}},
+    )
+
+    assert hass.states.get("sensor.test_power")
+    assert hass.states.get("sensor.test_energy")
+
+
+async def test_create_wled_sensor_entry_with_custom_current_entity(hass: HomeAssistant) -> None:
+    """The user can point Powercalc to their own current entity. See #4545"""
+    await _create_wled_entities(hass)
+    await set_states(hass, [("sensor.custom_current", "500")])
+
+    result = await goto_virtual_power_strategy_step(hass, CalculationStrategy.WLED)
+    result = await set_virtual_power_configuration(
+        hass,
+        result,
+        {CONF_VOLTAGE: 12, CONF_POWER_FACTOR: 1, CONF_CURRENT_ENTITY: "sensor.custom_current"},
+    )
+
+    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert_default_virtual_power_entry_data(
+        CalculationStrategy.WLED,
+        result["data"],
+        {
+            CONF_WLED: {
+                CONF_VOLTAGE: 12,
+                CONF_POWER_FACTOR: 1,
+                CONF_CURRENT_ENTITY: "sensor.custom_current",
+            },
+        },
+    )
+
+    await set_states(hass, [("sensor.custom_current", "500")])
+    assert hass.states.get("sensor.test_power").state == "6.00"
+
+
+async def test_wled_options_flow(hass: HomeAssistant) -> None:
+    await _create_wled_entities(hass)
+
+    entry = await create_mock_config_entry(
+        hass,
+        {
+            CONF_ENTITY_ID: "light.test",
+            CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
+            CONF_MODE: CalculationStrategy.WLED,
+            CONF_MANUFACTURER: "WLED",
+            CONF_MODEL: "FOSS",
+            CONF_WLED: {CONF_VOLTAGE: 5},
+        },
+    )
+
+    await handle_options_flow_update(
+        hass,
+        entry,
+        Step.WLED,
+        {CONF_VOLTAGE: 12, CONF_CURRENT_ENTITY: "sensor.custom_current"},
+    )
+
+    assert entry.data[CONF_WLED][CONF_VOLTAGE] == 12
+    assert entry.data[CONF_WLED][CONF_CURRENT_ENTITY] == "sensor.custom_current"
+
+
+async def _create_wled_entities(hass: HomeAssistant) -> None:
+    mock_entities_in_registry(hass, {"light.test": {"unique_id": DEFAULT_UNIQUE_ID}})
+    await set_states(hass, [("light.test", STATE_ON)])
+
+    estimated_current_entity = test_sensor_platform.MockSensor(
+        name="test_estimated_current",
+        native_value="5.0",
+        unique_id=DEFAULT_UNIQUE_ID,
+    )
+    entities = [estimated_current_entity]
+
+    setup_test_component_platform(hass, sensor.DOMAIN, entities)
+
+    assert await async_setup_component(
+        hass,
+        sensor.DOMAIN,
+        {sensor.DOMAIN: {CONF_PLATFORM: "test"}},
+    )
+    await hass.async_block_till_done()

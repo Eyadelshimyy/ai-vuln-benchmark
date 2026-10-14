@@ -1,0 +1,1143 @@
+"""
+Aplicacion principal FastAPI
+"""
+import os
+import re
+import time
+import logging
+import warnings
+from datetime import datetime, timezone
+from typing import List, Tuple
+from urllib.parse import parse_qsl, urlencode
+
+# Evitar ruido en logs por versiones de urllib3/chardet (dependencias de requests)
+warnings.filterwarnings("ignore", message=".*urllib3.*chardet.*", category=UserWarning, module="requests")
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse
+from app.core.config import settings
+from app.api.v1 import api_router
+from app.middleware.audit_middleware import AuditMiddleware
+from app.middleware.validador_sobre_aplicacion import ValidadorSobreAplicacionMiddleware
+
+# Importar middlewares de seguridad FASE 1
+from app.middleware.security_headers import (
+    SecurityHeadersMiddleware,
+    ContentSecurityPolicyMiddleware,
+    RequestIdMiddleware,
+)
+from app.api.v1.endpoints import auth_csrf_cookies
+
+# Configurar logging con UTF-8 para tildes/caracteres en Render
+import sys
+import io
+_log_stream = io.TextIOWrapper(getattr(sys.stderr, "buffer", sys.stderr), encoding="utf-8", errors="replace")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    stream=_log_stream,
+    force=True,
+)
+for _noisy_logger in (
+    "httpx",
+    "httpcore",
+    "httpcore.http11",
+    "httpcore.connection",
+    "google_genai",
+    "google.genai",
+    # Access log de Uvicorn/Gunicorn duplica cada request y puede filtrar JWT en query.
+    "uvicorn.access",
+    "gunicorn.access",
+):
+    logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
+# Rutas que no aportan a operación (evitan ruido en Render).
+_REQUEST_LOG_SKIP_PATHS = frozenset({"/favicon.ico", "/robots.txt"})
+
+# Claves cuyo valor no debe aparecer en logs (JWT en query, OTP, etc.).
+_QUERY_KEYS_SENSIBLE_LOG = frozenset(
+    {
+        "token",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "password",
+        "code",
+        "codigo",
+        "otp",
+        "authorization",
+    }
+)
+
+
+def _path_para_log(request: Request) -> str:
+    """
+    path + query string con valores sensibles enmascarados (p. ej. recibo-cuota?token=...).
+    Si la query falla al parsear, no vuelca el valor crudo.
+    """
+    url = request.url
+    path = url.path
+    raw_q = url.query
+    if not raw_q:
+        return path
+    try:
+        pairs = parse_qsl(str(raw_q), keep_blank_values=True)
+        masked: List[Tuple[str, str]] = []
+        for k, v in pairs:
+            lk = k.lower()
+            if lk in _QUERY_KEYS_SENSIBLE_LOG or lk.endswith("_token"):
+                masked.append((k, "[REDACTED]"))
+            else:
+                masked.append((k, v))
+        return f"{path}?{urlencode(masked, doseq=True)}"
+    except Exception:
+        return f"{path}?[query_omitida]"
+
+
+_PAGOS_PUT_RE = re.compile(r"^/api/v1/pagos/\d+$")
+
+
+def _is_long_job_path(path: str, method: str = "GET") -> bool:
+    """
+    Rutas que suelen superar 5 s (Gemini, PDF, SMTP, agregados).
+    No se marcan como (slow) en logs; el umbral sigue aplicando a errores 5xx.
+    """
+    path_norm = path.rstrip("/") or "/"
+    if method == "PUT" and _PAGOS_PUT_RE.match(path_norm):
+        return True
+    if "gmail/run-now" in path:
+        return True
+    if "revision-manual/" in path and "guardar-y-cerrar-bg" in path:
+        return True
+    if path.endswith("/cobros/public/digitalizar-comprobante"):
+        return True
+    if "cobros/public/enviar-reporte" in path:
+        return True
+    if "cobros/public/infopagos/enviar-reporte" in path:
+        return True
+    if "cobros/public/solicitar-codigo" in path:
+        return True
+    if "cobros/escaner/extraer-comprobante" in path:
+        return True
+    if "estado-cuenta/public/verificar-codigo" in path:
+        return True
+    if "estado-cuenta/public/solicitar-codigo" in path:
+        return True
+    if "estado-cuenta/public/comprobante-imagen" in path:
+        return True
+    if "estado-cuenta/public/recibo-cuota" in path:
+        return True
+    if "estado-cuenta/public/recibo-pago" in path:
+        return True
+    if "finiquito/admin/casos" in path:
+        return True
+    if "dashboard/pagos-inicial" in path:
+        return True
+    if "listado-y-kpis" in path:
+        return True
+    if "notificaciones-prejudicial" in path:
+        return True
+    if "pagos-reportados" in path and (
+        "comprobante" in path
+        or "recibo.pdf" in path
+        or "enviar-recibo" in path
+        or "aprobar" in path
+        or "rechazar" in path
+    ):
+        return True
+    return False
+
+
+class RequestLogMiddleware(BaseHTTPMiddleware):
+    """Registra metodo, ruta, codigo de estado y tiempo para correlacionar con logs de Render."""
+    async def dispatch(self, request: Request, call_next):
+        start = time.perf_counter()
+        path = request.url.path
+        if path in _REQUEST_LOG_SKIP_PATHS:
+            return await call_next(request)
+        path_for_log = _path_para_log(request)
+        request_id = (
+            getattr(request.state, "request_id", None)
+            or request.headers.get("X-Request-ID")
+            or request.headers.get("X-Request-Id")
+            or "n/a"
+        )
+        client_ip = request.client.host if request.client else "n/a"
+
+        try:
+            response = await call_next(request)
+        except Exception:
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            logger.exception(
+                "request method=%s path=%s status=%s elapsed_ms=%s request_id=%s client_ip=%s",
+                request.method,
+                path_for_log,
+                500,
+                elapsed_ms,
+                request_id,
+                client_ip,
+            )
+            raise
+
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        status = response.status_code
+        request_id = response.headers.get("X-Request-ID") or request_id
+        msg = "request method=%s path=%s status=%s elapsed_ms=%s request_id=%s client_ip=%s"
+
+        is_long_job_path = _is_long_job_path(path, request.method)
+        if status >= 500:
+            logger.warning(msg + " (error)", request.method, path_for_log, status, elapsed_ms, request_id, client_ip)
+        elif not is_long_job_path and elapsed_ms >= 5000:
+            logger.warning(msg + " (slow)", request.method, path_for_log, status, elapsed_ms, request_id, client_ip)
+        elif request.method == "POST" and path.rstrip("/").endswith("/api/v1/pagos") and status == 409:
+            # 409 documento duplicado en carga masiva: muchos por lote; solo DEBUG para no saturar logs
+            logger.debug(msg, request.method, path_for_log, status, elapsed_ms, request_id, client_ip)
+        else:
+            logger.info(msg, request.method, path_for_log, status, elapsed_ms, request_id, client_ip)
+
+        return response
+
+# Crear aplicacion FastAPI (documentacion OpenAPI solo si DEBUG o ENABLE_OPENAPI_DOCS)
+_show_api_docs = bool(getattr(settings, "DEBUG", False) or getattr(settings, "ENABLE_OPENAPI_DOCS", False))
+
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    version=settings.VERSION,
+    docs_url="/docs" if _show_api_docs else None,
+    redoc_url="/redoc" if _show_api_docs else None,
+    openapi_url="/openapi.json" if _show_api_docs else None,
+)
+
+def _cors_headers_for_request(request: Request):
+    """Cabeceras CORS para respuestas de error (500, etc.) que el navegador pueda leer."""
+    origin = request.headers.get("origin")
+    allowed = settings.cors_origins_list
+    if origin and origin in allowed:
+        return {"Access-Control-Allow-Origin": origin}
+    if allowed:
+        return {"Access-Control-Allow-Origin": allowed[0]}
+    return {}
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Respuesta de error unificada: detail + code para el frontend. Incluye CORS para evitar bloqueo en 4xx/5xx."""
+    from app.core.exceptions import error_response_body
+    headers = _cors_headers_for_request(request)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=error_response_body(exc.detail, exc.status_code),
+        headers=headers,
+    )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Captura excepciones no controladas y devuelve 500 con CORS para que el frontend reciba el error."""
+    from sqlalchemy.exc import OperationalError as SAOperationalError
+
+    if isinstance(exc, SAOperationalError):
+        logger.warning(
+            "BD no disponible (OperationalError) en %s %s: %s",
+            request.method,
+            request.url.path,
+            exc,
+        )
+        headers = {
+            **_cors_headers_for_request(request),
+            "Retry-After": "3",
+        }
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "Base de datos temporalmente no disponible. Reintente en unos segundos.",
+                "code": 503,
+            },
+            headers=headers,
+        )
+
+    logger.exception("Excepcion no controlada: %s", exc)
+    headers = _cors_headers_for_request(request)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Error interno del servidor", "code": 500},
+        headers=headers,
+    )
+
+
+# Log de cada request (metodo, ruta, status, tiempo) para depuracion en Render
+app.add_middleware(RequestLogMiddleware)
+
+# Request ID para correlación entre frontend/backend
+app.add_middleware(RequestIdMiddleware)
+
+# Middleware: Validacion en tiempo real de sobre-aplicaciones
+app.add_middleware(ValidadorSobreAplicacionMiddleware)
+
+# Auditoria automatica: registra todos los POST/PUT/DELETE/PATCH en tabla auditoria
+app.add_middleware(AuditMiddleware)
+
+# Configurar CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins_list,
+    allow_credentials=True,
+    allow_methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+        "Accept",
+        "Accept-Language",
+        "X-Requested-With",
+        "X-CSRF-Token",
+        "X-Request-Id",
+    ],
+    expose_headers=["X-Total-Count", "X-Page-Count"],
+    max_age=3600,
+)
+
+# Incluir routers
+app.include_router(api_router, prefix=settings.API_V1_STR)
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> PlainTextResponse:
+    """Evita 404 ruidoso en logs cuando el navegador pide favicon al API."""
+    return PlainTextResponse(status_code=204)
+
+# ========== ROUTER DE AUTENTICACION CON CSRF (FASE 1) ==========
+# Endpoints: GET /api/v1/auth/login-form, POST /api/v1/auth/login, POST /api/v1/auth/logout
+app.include_router(auth_csrf_cookies.router, prefix=settings.API_V1_STR)
+# ================================================================
+
+# Incluir endpoint del scheduler de LIQUIDADO
+from app.api.v1.endpoints import prestamos_liquidado_automatico
+app.include_router(prestamos_liquidado_automatico.router)
+# Incluir endpoint de conciliacion automatica
+from app.api.v1.endpoints import conciliacion
+app.include_router(conciliacion.router)
+# Incluir endpoint de referencia de estados de cuota
+from app.api.v1.endpoints import referencia_estados_cuota
+app.include_router(referencia_estados_cuota.router)
+# Incluir endpoint de auditoria de conciliacion
+from app.api.v1.endpoints import auditoria_conciliacion
+app.include_router(auditoria_conciliacion.router)
+# Incluir endpoint de problemas criticos (diagnostico y correccion)
+from app.api.v1.endpoints import criticos
+app.include_router(criticos.router)
+# Incluir dashboard de monitoreo
+from app.api.v1.endpoints import dashboard_conciliacion
+from app.api.v1.endpoints import admin_tasas_cambio
+app.include_router(dashboard_conciliacion.router)
+app.include_router(admin_tasas_cambio.router)
+
+
+def _startup_db_with_retry(engine, max_attempts: int = 10, delay_sec: float = 3.0):
+    """Intenta crear tablas y verificar BD con reintentos (evita fallo por BD no lista en Render).
+    
+    Mejorado:
+    - Aumentados intentos de 5 a 10
+    - Delay inicial de 3 segundos con backoff exponencial
+    - Verificacion explicita de que la tabla 'prestamos' existe
+    - Logging mas detallado para debugging en Render
+    """
+    from sqlalchemy import text, inspect
+    # Importar todos los modelos para que Base.metadata tenga todas las tablas (pagos_reportados, usuarios, etc.)
+    import app.models as _  # noqa: F401
+    from app.models import Base
+    last_error = None
+    current_delay = delay_sec
+    
+    for attempt in range(1, max_attempts + 1):
+        try:
+            logger.info(f"[DB Startup {attempt}/{max_attempts}] Conectando a base de datos...")
+            
+            # Crear tablas
+            Base.metadata.create_all(bind=engine)
+            logger.info("[DB Startup] Tablas creadas o ya existentes.")
+            
+            # Verificar conexion basica
+            with engine.connect() as conn:
+                result = conn.execute(text("SELECT 1"))
+                if not result.fetchone():
+                    raise Exception("SELECT 1 no retorno resultado")
+            logger.info("[DB Startup] Conexion basica verificada.")
+            
+            # Verificar que tabla critica 'prestamos' existe
+            inspector = inspect(engine)
+            tables = inspector.get_table_names()
+            logger.info(f"[DB Startup] Tablas en BD: {tables}")
+            
+            if 'prestamos' not in tables:
+                raise Exception("Tabla critica 'prestamos' no fue creada. Tablas disponibles: " + str(tables))
+
+            logger.info("[DB Startup] Tabla 'prestamos' verificada correctamente.")
+            
+            # Contar registros en tabla critica para verificar acceso
+            with engine.connect() as conn:
+                result = conn.execute(text("SELECT COUNT(*) FROM prestamos"))
+                count = result.scalar()
+                logger.info(f"[DB Startup] Tabla 'prestamos' contiene {count} registros.")
+
+            logger.info("[DB Startup] BASE DE DATOS INICIALIZADA CORRECTAMENTE")
+
+            # Migracion en caliente: columna drive_email_link (link al .eml en Drive) si no existe
+            try:
+                with engine.connect() as conn:
+                    r = conn.execute(text("""
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'pagos_gmail_sync_item' AND column_name = 'drive_email_link'
+                    """))
+                    if r.fetchone() is None:
+                        conn.execute(text(
+                            "ALTER TABLE pagos_gmail_sync_item ADD COLUMN drive_email_link VARCHAR(500) NULL"
+                        ))
+                        conn.commit()
+                        logger.info("[DB Startup] Columna pagos_gmail_sync_item.drive_email_link anadida.")
+            except Exception as col_err:
+                logger.warning("[DB Startup] drive_email_link (no critico): %s", col_err)
+
+            try:
+                with engine.connect() as conn:
+                    r = conn.execute(text("""
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'pagos_gmail_sync' AND column_name = 'correos_marcados_revision'
+                    """))
+                    if r.fetchone() is None:
+                        conn.execute(text(
+                            "ALTER TABLE pagos_gmail_sync ADD COLUMN correos_marcados_revision INTEGER NOT NULL DEFAULT 0"
+                        ))
+                        conn.commit()
+                        logger.info("[DB Startup] Columna pagos_gmail_sync.correos_marcados_revision anadida.")
+            except Exception as col_err2:
+                logger.warning("[DB Startup] correos_marcados_revision (no critico): %s", col_err2)
+
+            for tbl in ("pagos_gmail_sync_item", "gmail_temporal"):
+                try:
+                    with engine.connect() as conn:
+                        r = conn.execute(
+                            text(
+                                """
+                                SELECT 1 FROM information_schema.columns
+                                WHERE table_name = :t AND column_name = 'banco'
+                                """
+                            ),
+                            {"t": tbl},
+                        )
+                        if r.fetchone() is None:
+                            conn.execute(
+                                text(f"ALTER TABLE {tbl} ADD COLUMN banco VARCHAR(50) NULL")
+                            )
+                            conn.commit()
+                            logger.info("[DB Startup] Columna %s.banco anadida.", tbl)
+                except Exception as col_banco:
+                    logger.warning("[DB Startup] banco %s (no critico): %s", tbl, col_banco)
+
+            try:
+                with engine.connect() as conn:
+                    r = conn.execute(
+                        text(
+                            """
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name = 'pagos' AND column_name = 'link_comprobante'
+                            """
+                        )
+                    )
+                    if r.fetchone() is None:
+                        conn.execute(
+                            text("ALTER TABLE pagos ADD COLUMN link_comprobante TEXT NULL")
+                        )
+                        conn.commit()
+                        logger.info("[DB Startup] Columna pagos.link_comprobante anadida.")
+            except Exception as col_lc:
+                logger.warning("[DB Startup] link_comprobante (no critico): %s", col_lc)
+
+            try:
+                from app.core.cobranzas_schema_startup import ensure_cobranzas_schema
+
+                ensure_cobranzas_schema(engine)
+            except Exception as cob_err:
+                logger.warning("[DB Startup] cobranzas schema (revisar migracion): %s", cob_err)
+
+            try:
+                from app.core.auditoria_email_schema_startup import (
+                    ensure_auditoria_email_schema,
+                )
+
+                ensure_auditoria_email_schema(engine)
+            except Exception as ae_err:
+                logger.warning(
+                    "[DB Startup] auditoria_email schema (revisar migracion): %s",
+                    ae_err,
+                )
+
+            try:
+                from app.core.clientes_email_historial_schema_startup import (
+                    ensure_clientes_email_historial_schema,
+                )
+
+                ensure_clientes_email_historial_schema(engine)
+            except Exception as hist_err:
+                logger.warning(
+                    "[DB Startup] cliente_emails_historial (revisar migracion): %s",
+                    hist_err,
+                )
+
+            return
+
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                f"[DB Startup {attempt}/{max_attempts}] Error: {type(e).__name__}: {str(e)[:200]}"
+            )
+            
+            if attempt < max_attempts:
+                logger.info(f"[DB Startup] Reintentando en {current_delay:.1f}s...")
+                time.sleep(current_delay)
+                current_delay *= 1.5  # Backoff exponencial: 3s, 4.5s, 6.75s, etc.
+    
+    logger.error(
+        f"[DB Startup] FALLO CRITICO tras {max_attempts} intentos. "
+        f"Ultima excepcion: {type(last_error).__name__}: {str(last_error)}"
+    )
+    raise RuntimeError(
+        f"No se pudo inicializar la base de datos tras {max_attempts} intentos. "
+        f"Error final: {str(last_error)}"
+    ) from last_error
+
+
+def _log_runtime_startcmd_diagnostics() -> None:
+    """
+    Inspecciona el cmdline del proceso master Gunicorn y avisa si difiere de los valores
+    recomendados en `render.yaml`. Pensado para detectar overrides manuales del Start Command
+    en Render Dashboard (los más peligrosos: `--workers 2`, `--timeout < 600`, sin `--graceful-timeout`).
+
+    No bloquea ni cambia comportamiento. Solo deja constancia en logs para que un revisor
+    encuentre la causa raíz cuando aparezcan 502/restart espontáneos por OOM o worker timeout.
+
+    Sólo funciona en Linux (Render). En desarrollo (Windows, macOS) sale sin hacer nada.
+    """
+    import re
+    import sys
+
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        ppid = os.getppid()
+        cmdline_path = f"/proc/{ppid}/cmdline"
+        if not os.path.exists(cmdline_path):
+            return
+        with open(cmdline_path, "rb") as f:
+            raw = f.read()
+        cmd = raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+        if not cmd or "gunicorn" not in cmd:
+            # Otro proceso padre (uvicorn directo en local, supervisord, etc.). No interesa.
+            return
+
+        avisos: List[str] = []
+
+        m_workers = re.search(r"--workers\s+(\d+)", cmd)
+        if m_workers:
+            n_workers = int(m_workers.group(1))
+            if n_workers > 1:
+                avisos.append(
+                    f"--workers={n_workers}: recomendado 1. workers>1 duplica RAM de imports "
+                    "(SDKs Google/Gemini, ORM 90+ tablas, plantillas Excel/PDF) y caches en proceso "
+                    "(listado-y-kpis, autorizados_bs, cedulas_en_clientes); riesgo de OOM en planes "
+                    "con RAM ajustada"
+                )
+
+        m_timeout = re.search(r"--timeout\s+(\d+)", cmd)
+        if m_timeout:
+            t = int(m_timeout.group(1))
+            if t < 600:
+                avisos.append(
+                    f"--timeout={t}s: recomendado 920. El proxy Express espera 180-900s en flujos "
+                    "largos (notificaciones masivas, Drive bulk, exports, escaner Gemini); con "
+                    f"timeout={t}s gunicorn mata al worker antes y el usuario ve 502 falso"
+                )
+
+        m_grace = re.search(r"--graceful-timeout\s+(\d+)", cmd)
+        if not m_grace:
+            avisos.append(
+                "sin --graceful-timeout: default 30s; recomendado 900. En deploys/SIGTERM "
+                "el shutdown debe esperar lotes BG de notificaciones (SMTP secuencial)"
+            )
+        else:
+            g = int(m_grace.group(1))
+            if g < 300:
+                avisos.append(
+                    f"--graceful-timeout={g}s: recomendado 900. Con valores bajos el worker "
+                    "mata hilos BG de notificaciones a mitad de lote"
+                )
+
+        if re.search(r"--max-requests\b", cmd):
+            avisos.append(
+                "tiene --max-requests: reciclado de worker corta lotes BG de notificaciones "
+                "(COBRANZAS_EXCEL). Quitar max-requests del Start Command en Dashboard"
+            )
+
+        if avisos:
+            logger.warning(
+                "[RuntimeConfig] Start Command difiere de render.yaml. "
+                "Editar en Render Dashboard > pagos-backend > Settings > Build & Deploy > Start Command. "
+                "Diferencias: %s. cmdline=%r",
+                " | ".join(avisos),
+                cmd,
+            )
+        else:
+            logger.info("[RuntimeConfig] Start Command alineado con render.yaml.")
+    except Exception as e:
+        # Inspección puramente diagnóstica: nunca debe abortar el startup.
+        logger.debug("[RuntimeConfig] No se pudo inspeccionar cmdline del master: %s", e)
+
+
+def _try_claim_startup_lock(engine) -> bool:
+    """
+    Intenta reclamar un lock global de startup en PostgreSQL.
+
+    - True: este worker ejecuta inicialización pesada (create_all, migraciones en caliente, limpieza running).
+    - False: otro worker ya la está ejecutando; este worker debe omitir esa sección.
+    """
+    try:
+        dialect = getattr(engine, "dialect", None)
+        if getattr(dialect, "name", "") != "postgresql":
+            # En otros motores no usamos advisory lock; mantener comportamiento actual.
+            return True
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            # Namespace fijo + clave fija para lock de startup de app.
+            claimed = conn.execute(
+                text("SELECT pg_try_advisory_lock(91827364, 11223344)")
+            ).scalar()
+        return bool(claimed)
+    except Exception as e:
+        logger.warning(
+            "[StartupLock] No se pudo reclamar advisory lock; se continúa sin lock: %s",
+            e,
+        )
+        return True
+
+
+def _release_startup_lock(engine) -> None:
+    """Libera advisory lock de startup (si este worker lo tenía)."""
+    try:
+        dialect = getattr(engine, "dialect", None)
+        if getattr(dialect, "name", "") != "postgresql":
+            return
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            conn.execute(text("SELECT pg_advisory_unlock(91827364, 11223344)"))
+    except Exception as e:
+        logger.warning("[StartupLock] No se pudo liberar advisory lock: %s", e)
+
+
+@app.on_event("startup")
+def on_startup():
+    """Crear tablas en la BD si no existen. Inicializar email desde .env. Jobs programados solo si ENABLE_AUTOMATIC_SCHEDULED_JOBS."""
+    from app.core.database import engine
+    from app.core.email_config_holder import init_from_settings as init_email_config
+
+    init_email_config()
+    logger.info("Configuracion de email (SMTP/tickets) inicializada desde variables de entorno.")
+
+    # Evitar trabajo pesado duplicado cuando Gunicorn levanta múltiples workers.
+    # Solo un worker ejecuta init DB + limpiezas; los demás continúan startup normal.
+    startup_lock_claimed = _try_claim_startup_lock(engine)
+    # Diagnóstico del Start Command real (detecta override del Dashboard de Render).
+    # Solo el worker que reclama el lock loguea, para no duplicar la advertencia en cada arranque.
+    if startup_lock_claimed:
+        _log_runtime_startcmd_diagnostics()
+    if startup_lock_claimed:
+        try:
+            # Crear tablas y verificar BD con reintentos (Render puede tener la BD aun no lista en el primer worker).
+            # En Render: menos reintentos y backoff mas corto — el health check no responde hasta terminar startup (timeout de deploy).
+            _on_render = (os.environ.get("RENDER") or "").lower() in ("true", "1", "yes")
+            _startup_db_with_retry(
+                engine,
+                max_attempts=6 if _on_render else 10,
+                delay_sec=2.0 if _on_render else 3.0,
+            )
+
+            # Gmail Pagos: filas status='running' huérfanas tras SIGTERM/deploy bloquean POST .../gmail/run-now (409)
+            # y entonces no corre el pipeline (extracción + etiquetas IMAGEN / estrella). Esto NO es un cron:
+            # debe ejecutarse aunque ENABLE_AUTOMATIC_SCHEDULED_JOBS=false.
+            try:
+                from app.core.database import SessionLocal
+                from app.models.pagos_gmail_sync import PagosGmailSync
+                from sqlalchemy import select, update as sa_update
+
+                db_gmail = SessionLocal()
+                try:
+                    orphan_ids = list(
+                        db_gmail.execute(
+                            select(PagosGmailSync.id).where(PagosGmailSync.status == "running")
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    if orphan_ids:
+                        result = db_gmail.execute(
+                            sa_update(PagosGmailSync)
+                            .where(PagosGmailSync.status == "running")
+                            .values(
+                                status="error",
+                                finished_at=datetime.now(timezone.utc),
+                                error_message="Reinicio del servidor (SIGTERM) mientras el pipeline estaba en curso.",
+                            )
+                        )
+                        n = int(result.rowcount or 0)
+                        preview = orphan_ids[:25]
+                        suffix = " …" if len(orphan_ids) > 25 else ""
+                        logger.info(
+                            "[PAGOS_GMAIL] Startup: %d sync(s) en 'running' pasan a 'error' "
+                            "(esperado tras redeploy/SIGTERM; evita 409 en run-now si started_at < 2 h). "
+                            "sync_ids=%s%s",
+                            n,
+                            preview,
+                            suffix,
+                        )
+                    db_gmail.commit()
+                finally:
+                    db_gmail.close()
+            except Exception as e:
+                logger.warning("[PAGOS_GMAIL] No se pudieron limpiar syncs huérfanas al iniciar: %s", e)
+
+            # Anti-limbo OCR: drenar `aprobado` histórico en background (no bloquea health check).
+            # No inventa datos: colisión→importado; cargable→import real; resto→en_revision.
+            try:
+                import threading
+
+                def _drain_aprobado_limbo_startup() -> None:
+                    try:
+                        from app.core.database import SessionLocal as _SL
+                        from app.services.cobros.saneamiento_aprobado_limbo import (
+                            sanear_aprobados_en_limbo,
+                        )
+
+                        total_scanned = 0
+                        for loop_i in range(20):
+                            db_limbo = _SL()
+                            try:
+                                res = sanear_aprobados_en_limbo(
+                                    db_limbo,
+                                    max_ids=100,
+                                    dry_run=False,
+                                    oldest_first=True,
+                                    include_detalle=False,
+                                )
+                            finally:
+                                db_limbo.close()
+                            total_scanned += int(res.scanned or 0)
+                            logger.info(
+                                "[SANEAMIENTO_LIMBO] startup loop=%s scanned=%s "
+                                "colision=%s import=%s revision=%s",
+                                loop_i + 1,
+                                res.scanned,
+                                res.marcado_importado_colision,
+                                res.importado_auto,
+                                res.a_en_revision,
+                            )
+                            if int(res.scanned or 0) == 0:
+                                break
+                        logger.info(
+                            "[SANEAMIENTO_LIMBO] startup drain fin total_scanned=%s",
+                            total_scanned,
+                        )
+                        try:
+                            from app.services.cobros.saneamiento_aprobado_limbo import (
+                                drenar_importados_fantasma_en_lotes as _drenar_fant,
+                            )
+
+                            _fant_loops = int(
+                                getattr(settings, "COBROS_FANTASMA_STARTUP_MAX_LOOPS", 1)
+                                or 0
+                            )
+                            if _fant_loops > 0:
+                                _drenar_fant(
+                                    _SL,
+                                    max_loops=_fant_loops,
+                                    max_ids=int(
+                                        getattr(settings, "COBROS_FANTASMA_BATCH_SIZE", 300)
+                                    ),
+                                    dry_run=False,
+                                    log_prefix="[SANEAMIENTO_LIMBO] startup",
+                                )
+                        except Exception as fant_err:
+                            logger.warning(
+                                "[SANEAMIENTO_LIMBO] startup importado-fantasma fallo: %s",
+                                fant_err,
+                            )
+                        try:
+                            from app.services.cobros.saneamiento_aprobado_limbo import (
+                                sanear_en_revision_recuperables as _san_rev,
+                            )
+
+                            db_rev = _SL()
+                            try:
+                                rev = _san_rev(
+                                    db_rev,
+                                    max_ids=80,
+                                    dry_run=False,
+                                    include_detalle=False,
+                                    solo_bug_current_user=True,
+                                )
+                            finally:
+                                db_rev.close()
+                            if rev.scanned:
+                                logger.info(
+                                    "[SANEAMIENTO_LIMBO] startup en_revision recuperables: %s",
+                                    rev.as_dict(),
+                                )
+                        except Exception as rev_err:
+                            logger.warning(
+                                "[SANEAMIENTO_LIMBO] startup en_revision fallo: %s",
+                                rev_err,
+                            )
+                        try:
+                            from app.services.pagos_gmail.gmail_abcd_cuotas_traza import (
+                                reconciliar_cuotas_ok_sin_pago_id as _rec_gmail,
+                            )
+
+                            db_g = _SL()
+                            try:
+                                gmail_rec = _rec_gmail(
+                                    db_g, max_ids=300, dry_run=False
+                                )
+                            finally:
+                                db_g.close()
+                            if gmail_rec.get("linked"):
+                                logger.info(
+                                    "[SANEAMIENTO_LIMBO] startup gmail reconciliar: %s",
+                                    gmail_rec,
+                                )
+                        except Exception as g_err:
+                            logger.warning(
+                                "[SANEAMIENTO_LIMBO] startup gmail reconciliar fallo: %s",
+                                g_err,
+                            )
+                        try:
+                            from app.services.cobros.infopagos_escaner_borrador_service import (
+                                purgar_borradores_huerfanos_antiguos,
+                            )
+
+                            db_purge = _SL()
+                            try:
+                                purge = purgar_borradores_huerfanos_antiguos(
+                                    db_purge,
+                                    older_than_days=7,
+                                    max_rows=400,
+                                    dry_run=False,
+                                )
+                            finally:
+                                db_purge.close()
+                            if purge.get("eliminados"):
+                                logger.info(
+                                    "[SANEAMIENTO_LIMBO] startup purge borradores Infopagos: %s",
+                                    purge,
+                                )
+                        except Exception as purge_err:
+                            logger.warning(
+                                "[SANEAMIENTO_LIMBO] startup purge borradores fallo: %s",
+                                purge_err,
+                            )
+                        try:
+                            from app.api.v1.endpoints.cobros.routes import (
+                                _invalidate_cobros_listado_kpis_cache,
+                            )
+
+                            _invalidate_cobros_listado_kpis_cache()
+                        except Exception:
+                            pass
+                    except Exception as drain_err:
+                        logger.warning(
+                            "[SANEAMIENTO_LIMBO] startup drain fallo: %s", drain_err
+                        )
+
+                threading.Thread(
+                    target=_drain_aprobado_limbo_startup,
+                    name="sanear-aprobado-limbo-startup",
+                    daemon=True,
+                ).start()
+            except Exception as e:
+                logger.warning("[SANEAMIENTO_LIMBO] No se pudo lanzar drain al iniciar: %s", e)
+        except Exception as e:
+            logger.exception("Startup BD fallo tras reintentos: %s", e)
+            raise
+        finally:
+            _release_startup_lock(engine)
+    else:
+        logger.info(
+            "[StartupLock] Inicialización pesada ya en curso en otro worker; este worker omite init DB pesada."
+        )
+
+    _auto_jobs = bool(getattr(settings, "ENABLE_AUTOMATIC_SCHEDULED_JOBS", False))
+    if _auto_jobs:
+        from app.core.scheduler import start_scheduler
+
+        # Scheduler: un proceso lider ejecuta APScheduler (con varios workers, solo uno es lider en BD).
+        try:
+            from app.core.database import SessionLocal
+            from app.core.scheduler_leader import (
+                start_scheduler_leader_heartbeat_if_needed,
+                try_claim_scheduler_leader,
+            )
+            db = SessionLocal()
+            try:
+                if try_claim_scheduler_leader(db):
+                    start_scheduler()
+                    start_scheduler_leader_heartbeat_if_needed()
+                    from app.core.scheduler_leader_sidecars import (
+                        start_scheduler_leader_sidecars_once,
+                    )
+
+                    start_scheduler_leader_sidecars_once()
+                    app.state._scheduler_leader = True
+                else:
+                    app.state._scheduler_leader = False
+            finally:
+                db.close()
+        except Exception as e:
+            logger.exception("No se pudo iniciar el scheduler (APScheduler): %s", e)
+        try:
+            from app.core.scheduler_leader import start_scheduler_leader_watcher
+
+            start_scheduler_leader_watcher()
+        except Exception as e:
+            logger.exception("No se pudo iniciar scheduler leader watcher: %s", e)
+
+        if not getattr(app.state, "_scheduler_leader", False):
+            logger.info(
+                "Worker no es scheduler lider: sidecars (dashboard/LIQUIDADO) los arranca el watcher si reclama liderazgo."
+            )
+    else:
+        logger.info(
+            "Tareas programadas en segundo plano deshabilitadas (ENABLE_AUTOMATIC_SCHEDULED_JOBS=false). "
+            "No se inician APScheduler, liquidado automatico ni refresco de cache del dashboard. "
+            "Guarde configuracion sin disparar procesos; ejecute acciones manualmente desde la aplicacion. "
+            "Para activar cron de servidor, ponga ENABLE_AUTOMATIC_SCHEDULED_JOBS=true en el entorno."
+        )
+        app.state._scheduler_leader = False
+
+    # Reanuda un lote de notificaciones que quedo a medias por muerte del worker.
+    # No inicia lotes nuevos: solo continua envios que un humano lanzo por API.
+    try:
+        from app.services.notificaciones_lote_watchdog import (
+            iniciar_watchdog_lotes_notificacion,
+        )
+
+        iniciar_watchdog_lotes_notificacion()
+    except Exception as e:
+        logger.warning("No se pudo iniciar watchdog de lotes de notificacion: %s", e)
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    """Detener scheduler y esperar lotes BG de notificaciones antes de morir el worker."""
+    # Primero el watchdog, para que no relance un lote mientras cerramos.
+    try:
+        from app.services.notificaciones_lote_watchdog import (
+            detener_watchdog_lotes_notificacion,
+        )
+
+        detener_watchdog_lotes_notificacion()
+    except Exception as e:
+        logger.warning("[Shutdown] Al detener watchdog de lotes: %s", e)
+
+    try:
+        from app.services.notificaciones_envio_bg_runner import (
+            claves_activas,
+            marcar_lotes_interrumpidos_por_shutdown,
+            wait_envios_activos,
+        )
+
+        vivos = claves_activas()
+        if vivos:
+            logger.warning(
+                "[Shutdown] Esperando lotes notif BG activos=%s (hasta ~850s)",
+                vivos,
+            )
+            terminaron = wait_envios_activos()
+            if not terminaron:
+                logger.error(
+                    "[Shutdown] Timeout esperando notif BG; se marca lote interrumpido"
+                )
+                marcar_lotes_interrumpidos_por_shutdown()
+            # Si terminaron ok, el propio envio ya cerro el resumen.
+        # No marcar sin hilos locales (deploy zero-downtime).
+    except Exception as e:
+        logger.warning("[Shutdown] Al drenar notif BG: %s", e)
+
+    try:
+        from app.core.scheduler_leader import (
+            stop_scheduler_leader_heartbeat,
+            stop_scheduler_leader_watcher,
+        )
+        from app.core.scheduler import stop_scheduler
+        from app.core.scheduler_leader_sidecars import stop_scheduler_leader_sidecars
+
+        stop_scheduler_leader_sidecars()
+        stop_scheduler_leader_watcher()
+        stop_scheduler_leader_heartbeat()
+        stop_scheduler()
+    except Exception as e:
+        logger.warning("Al detener scheduler: %s", e)
+
+
+@app.get("/")
+async def root():
+    """Endpoint raiz"""
+    _docs = (
+        "/docs"
+        if bool(getattr(settings, "DEBUG", False) or getattr(settings, "ENABLE_OPENAPI_DOCS", False))
+        else None
+    )
+    return {
+        "message": f"Bienvenido a {settings.PROJECT_NAME}",
+        "version": settings.VERSION,
+        "docs": _docs,
+    }
+
+
+@app.head("/")
+async def root_head():
+    """Endpoint raiz para HEAD requests (health checks)"""
+    return
+
+
+@app.get("/health")
+async def health_check():
+    """Endpoint de salud"""
+    import os
+    return {
+        "status": "healthy",
+        "git": (os.environ.get("RENDER_GIT_COMMIT") or os.environ.get("GIT_COMMIT") or "")[:12],
+        "build": "email-audit-v6-notif-bcc-itmaster",
+        "email_audit": "v6-notif-bcc-itmaster",
+    }
+
+
+@app.post("/api/admin/run-migration-auditoria-fk")
+async def run_migration_auditoria_fk(request: Request):
+    """
+    Ejecuta la migracion auditoria.usuario_id FK -> usuarios(id).
+    Requiere header: X-Migration-Secret = MIGRATION_AUDITORIA_SECRET (env).
+    Ejecutar una sola vez para corregir el error 500 en aprobacion manual.
+    """
+    from fastapi import HTTPException
+    from sqlalchemy import text
+    from app.core.database import engine
+
+    secret = settings.MIGRATION_AUDITORIA_SECRET
+    if not secret:
+        raise HTTPException(status_code=404, detail="Endpoint no configurado")
+    header_secret = request.headers.get("X-Migration-Secret")
+    if header_secret != secret:
+        raise HTTPException(status_code=403, detail="Secreto invalido")
+
+    try:
+        with engine.connect() as conn:
+            with conn.begin():
+                conn.execute(text("""
+                    ALTER TABLE auditoria DROP CONSTRAINT IF EXISTS auditoria_usuario_id_fkey
+                """))
+                conn.execute(text("""
+                    ALTER TABLE auditoria ADD CONSTRAINT auditoria_usuario_id_fkey
+                    FOREIGN KEY (usuario_id) REFERENCES usuarios(id) NOT VALID
+                """))
+        return {"success": True, "message": "Migracion auditoria FK completada. La aprobacion manual deberia funcionar."}
+    except Exception as e:
+        logger.exception("Migracion auditoria FK fallo: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health/gemini")
+async def health_check_gemini_root():
+    """Test indirecto de Gemini (API key y servicio). Disponible tambien en GET /api/v1/health/gemini."""
+    from fastapi import HTTPException
+    from app.services.pagos_gmail.gemini_service import check_gemini_available
+    result = check_gemini_available()
+    if not result.get("ok"):
+        raise HTTPException(status_code=503, detail=result)
+    return result
+
+
+@app.get("/health/db")
+async def health_check_db():
+    """Verifica que la conexion a la BD responde (SELECT 1)."""
+    from sqlalchemy import text
+    from fastapi.responses import JSONResponse
+    from app.core.database import engine
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return {"status": "healthy", "database": "connected"}
+    except Exception as e:
+        logger.exception("Health check DB failed")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "database": "disconnected", "error": str(e)},
+        )
+
+
+@app.head("/health")
+async def health_check_head():
+    """Endpoint de salud para HEAD requests"""
+    return
+
+
+@app.get("/robots.txt", response_class=PlainTextResponse)
+async def robots_txt():
+    """Sirve robots.txt para indicarle a los bots que no indexen APIs sensibles."""
+    return """# Bloquear bots (incluido Google) de acceder a APIs públicas sensibles
+# Razón: tokens JWT y datos personales no deben ser indexados
+
+User-agent: *
+Disallow: /api/v1/estado-cuenta/public/
+Disallow: /api/v1/cobros/public/
+Disallow: /admin/
+Disallow: /health/
+Disallow: /docs
+Disallow: /openapi.json
+Disallow: /redoc
+
+# Google-specific
+User-agent: Googlebot
+Disallow: /api/v1/estado-cuenta/public/
+Disallow: /api/v1/cobros/public/
+
+User-agent: Bingbot
+Disallow: /api/
+
+User-agent: DuckDuckBot
+Disallow: /api/
+
+User-agent: Mediapartners-Google
+Disallow: /
+
+User-agent: *-bot
+Disallow: /api/
+
+Crawl-delay: 10
+Request-rate: 1/10s
+"""
+
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=settings.DEBUG
+    )
+
+
+
+
+
+

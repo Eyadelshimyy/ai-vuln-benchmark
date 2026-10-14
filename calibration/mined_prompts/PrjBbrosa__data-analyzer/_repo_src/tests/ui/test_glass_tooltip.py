@@ -1,0 +1,99 @@
+import pytest
+from PyQt5 import sip
+from PyQt5.QtCore import QCoreApplication, QEvent, QPoint
+from PyQt5.QtWidgets import QStyle, QWidget
+
+from mf4_analyzer.ui_kit.dialog_geometry import IntRect, SCREEN_MARGIN, as_rect
+from mf4_analyzer.ui_kit.glass_tooltip import (
+    _GlassTooltipPopup,
+    _TooltipEventFilter,
+    _install_tooltip_wake_policy,
+)
+
+
+def _discard_popup():
+    popup = _GlassTooltipPopup._instance
+    if popup is not None and not sip.isdeleted(popup):
+        sip.delete(popup)
+    _GlassTooltipPopup._instance = None
+
+
+@pytest.fixture(autouse=True)
+def clean_popup_singleton():
+    _discard_popup()
+    yield
+    _discard_popup()
+
+
+def test_popup_singleton_recreates_deleted_qt_object(qapp):
+    popup = _GlassTooltipPopup.instance()
+    sip.delete(popup)
+
+    assert _GlassTooltipPopup._instance is None
+
+    replacement = _GlassTooltipPopup.instance()
+
+    assert replacement is not popup
+    assert not sip.isdeleted(replacement)
+
+
+def test_hide_event_ignores_deleted_popup_without_recreating(qapp):
+    popup = _GlassTooltipPopup.instance()
+    sip.delete(popup)
+
+    event_filter = _TooltipEventFilter()
+    watched = QWidget()
+
+    assert event_filter.eventFilter(watched, QEvent(QEvent.Hide)) is False
+    assert _GlassTooltipPopup._instance is None
+
+
+def test_shutdown_stops_hide_timer_and_rejects_late_show(qapp):
+    popup = _GlassTooltipPopup.instance()
+    popup.show_for("提示", QPoint(100, 100))
+    popup.schedule_hide()
+    assert popup._hide_timer.isActive()
+
+    popup._shutdown()
+    popup.show_for("退出期间的迟到提示", QPoint(100, 100))
+    popup.schedule_hide()
+    assert not popup.isVisible()
+    assert not popup._hide_timer.isActive()
+
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    assert sip.isdeleted(popup)
+    assert _GlassTooltipPopup.existing() is None
+
+
+def test_tooltip_wake_policy_is_shared_and_preserves_fall_asleep_delay(qapp):
+    qapp.setStyle("Fusion")
+    style_name_before = qapp.style().objectName()
+    fall_asleep_before = qapp.style().styleHint(
+        QStyle.SH_ToolTip_FallAsleepDelay,
+    )
+
+    style = _install_tooltip_wake_policy(qapp)
+
+    assert style.styleHint(QStyle.SH_ToolTip_WakeUpDelay) == 350
+    assert style.styleHint(QStyle.SH_ToolTip_FallAsleepDelay) == fall_asleep_before
+    assert style.objectName() == style_name_before
+    assert _install_tooltip_wake_policy(qapp) is style
+
+
+def test_long_tooltip_stays_inside_injected_work_area(qapp, qtbot, monkeypatch):
+    available = IntRect(0, 0, 800, 600)
+    monkeypatch.setattr(
+        "mf4_analyzer.ui_kit.dialog_geometry.resolve_available_rect",
+        lambda **_kwargs: available,
+    )
+    popup = _GlassTooltipPopup.instance()
+    qtbot.addWidget(popup)
+    text = "C:/" + ("很长路径段" * 24) + "/file.mf4"
+    popup.show_for(text, QPoint(760, 560))
+    qapp.processEvents()
+    frame = as_rect(popup.frameGeometry())
+    safe = available.adjusted(
+        SCREEN_MARGIN, SCREEN_MARGIN, -SCREEN_MARGIN, -SCREEN_MARGIN,
+    )
+    assert safe.contains_rect(frame)
+    assert popup._label.text()

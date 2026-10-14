@@ -1,0 +1,4589 @@
+"""AnalysisMixin: per-section analysis view routing + cross-cutting helpers.
+
+This mixin owns the V7 per-section view pipeline (capture → switch → apply →
+render) for the FFT / Order / FFT-vs-Time analysis sections, plus the
+cross-cutting helpers (``_pane_time_range_for``, ``_mask_time_range``,
+``_analysis_page``, ``_analysis_cache_key``, ``_analysis_channel_color_map``,
+``_capture_active_analysis_view``) that FFTMixin / OrderMixin / FFTTimeMixin
+call through ``self.``.  Method-resolution order makes those calls find this
+copy regardless of base-class order — there are no name collisions.
+"""
+
+import logging
+import math
+from contextlib import nullcontext
+from dataclasses import replace
+from functools import partial
+
+import numpy as np
+
+from PyQt5.QtWidgets import QApplication, QColorDialog, QMessageBox
+from PyQt5.QtCore import QSignalBlocker, QTimer
+
+from .ultraview_coordinator import notify_ultraview_plot
+from . import view_activation
+from ._state_holders import (
+    HeatmapRevealBook,
+    finish_heatmap_render_inputs,
+    heatmap_level_writeback_blocks_retain,
+    heatmap_render_signature,
+    optional_float_pair,
+    widget_raster_metrics,
+)
+
+from ...ui_kit.message_box_buttons import (
+    fit_message_box_buttons_to_text,
+    prepare_message_box_buttons,
+)
+
+
+def _clear_viewbox_link(viewbox) -> None:
+    try:
+        viewbox.setXLink(None)
+    except RuntimeError:
+        return
+    try:
+        viewbox.setYLink(None)
+    except RuntimeError:
+        return
+
+
+def _disconnect_signal(signal, slot) -> None:
+    try:
+        signal.disconnect(slot)
+    except (TypeError, RuntimeError):
+        return
+
+from ... import db_reference
+from ..compute_feedback import summarize_compute
+from ..analysis_result_state import mark_pending
+from .analysis_comparison import AnalysisViewTarget
+from .analysis_context import AnalysisContext
+from .analysis_time_range import (
+    common_range,
+    covered_range_adjustment,
+    display_ranges_equal,
+    enabled_covers_sources,
+    make_source_signature,
+    parse_span,
+    validate_requested_span,
+)
+
+logger = logging.getLogger(__name__)
+
+# Explicit ``time_range=None`` means "full span"; omit the kwarg to read the
+# active pane.  Inactive cache identity must not use the latter.
+_ANALYSIS_CACHE_RANGE_UNSET = object()
+
+
+def _format_seconds_endpoint(value):
+    # Shortest round-trip form distinguishes real boundaries without adding
+    # the binary tails of fixed 17-digit formatting.
+    text = repr(float(value))
+    return text[:-2] if text.endswith(".0") else text
+
+
+def _format_time_difference(seconds):
+    """Readable physical boundary delta without small scientific notation."""
+    if seconds < 0.001:
+        return f"{seconds * 1e6:.6g} 微秒"
+    if seconds < 1:
+        return f"{seconds * 1e3:.6g} 毫秒"
+    return f"{seconds:.6g} 秒"
+
+
+def _format_span_seconds(span):
+    pair, _valid = parse_span(span) if span is not None else (None, False)
+    if pair is None:
+        try:
+            return (
+                f"{_format_seconds_endpoint(span[0])}"
+                f"–{_format_seconds_endpoint(span[1])} 秒"
+            )
+        except (TypeError, ValueError, IndexError):
+            return "无效范围"
+    return (
+        f"{_format_seconds_endpoint(pair[0])}"
+        f"–{_format_seconds_endpoint(pair[1])} 秒"
+    )
+
+
+# dB-reference-defaults Task 5 (spec §8.2 source tokens). Presentation-only
+# mapping for the compound control's source line -- kept local to this UI
+# wiring layer rather than in the pure ``db_reference`` module (which owns
+# resolution/validation, not Chinese UI copy).
+_DB_REFERENCE_SOURCE_LABELS = {
+    'manual': '手动覆盖',
+    'metadata': '通道 metadata',
+    'user': '用户默认',
+    'system': '系统默认',
+    'generic': '通用默认',
+    'fallback': '解析失败回退',
+}
+
+
+def _format_db_reference_source_line(resolution):
+    """Spec §10.3 source-line text: ``自动 · <来源> · <quantity>/<unit>``.
+
+    ``generic``/``fallback`` show ``dB re 1 <unit>`` instead of quantity/unit
+    (generic is the neutral EPS-unit common case; fallback carries the
+    resolver's own warning in the tooltip)."""
+    token = _DB_REFERENCE_SOURCE_LABELS.get(resolution.source, resolution.source)
+    if resolution.source in ('generic', 'fallback'):
+        unit = resolution.unit or ''
+        detail = f"dB re 1 {unit}" if unit else "dB re 1"
+    else:
+        detail = f"{resolution.quantity} / {resolution.unit}".strip(' /')
+    text = f"自动 · {token} · {detail}" if detail else f"自动 · {token}"
+    tooltip = text
+    if resolution.warning:
+        tooltip = f"{text}\n{resolution.warning}"
+    return text, tooltip
+
+
+class AnalysisMixin:
+    #: Re-entrancy guard: while a view switch is applying state to the UI,
+    #: suppress the inspector signal handlers that would otherwise capture the
+    #: half-applied controls back into the outgoing view. Owned entirely by
+    #: this mixin, so the default lives here rather than in window.__init__
+    #: (spec D-E2) -- that keeps the guard to exactly one writing file.
+    _applying_analysis_view = False
+
+    # -- helpers delegated to AnalysisContext (spec D-E1) ------------------
+    # These bodies moved verbatim onto ``analysis_context.AnalysisContext``,
+    # which takes its collaborators as named constructor arguments and is
+    # therefore unit-testable without a MainWindow.  The method names stay
+    # here so the MRO and all three calling mixins are untouched.
+
+    def _analysis_ctx(self, section):
+        return self._analysis_context.section_ctx(section)
+
+    def _analysis_page(self, section):
+        return self._analysis_context.page(section)
+
+    def _emit_compute_feedback(self, outcome, *, busy=False, section_label="计算"):
+        res = summarize_compute(
+            outcome,
+            busy=busy,
+            section_label=section_label,
+        )
+        if res is None:
+            return False
+        level, msg = res
+        self.toast(msg, level)
+        self.statusBar.showMessage(msg)
+        return True
+
+    # -- tab-bar intent handlers (capture outgoing view first) ----------
+    def _analysis_page_transition_section_enabled(self, section) -> bool:
+        enabled = getattr(
+            self.chart_stack, "_page_transition_enabled_sections", frozenset(),
+        )
+        return str(section) in enabled
+
+    def _canvas_has_page_transition_protocol(self, canvas) -> bool:
+        """True when a managed canvas can arm paint-ack and content invalidation."""
+        return (
+            getattr(canvas, "presentation_paint_acknowledged", None) is not None
+            and callable(getattr(canvas, "request_presentation_paint_ack", None))
+            and getattr(canvas, "presentation_content_invalidated", None) is not None
+        )
+
+    def _section_has_page_transition_protocol(self, section) -> bool:
+        if section == "time":
+            return self._canvas_has_page_transition_protocol(
+                getattr(self, "canvas_time", None),
+            )
+        page = self._analysis_page(section)
+        if page is None or page.pane_count() < 1:
+            return False
+        return self._canvas_has_page_transition_protocol(page.pane_canvas(0))
+
+    def _fft_view_is_uncomputed(self, state) -> bool:
+        """True when the View has sources but no cached FFT result."""
+        panes = tuple(getattr(state, "panes", ()) or ())
+        if not panes or not tuple(getattr(panes[0], "sources", ()) or ()):
+            return False
+        return not self._fft_any_source_cached(state)
+
+    def _analysis_view_is_uncomputed(self, section, state) -> bool:
+        if section == "fft":
+            return self._fft_view_is_uncomputed(state)
+        if section == "frf":
+            return self._frf_view_is_uncomputed(state)
+        if section == "fft_time":
+            return self._fft_time_view_is_uncomputed(state)
+        if section == "order":
+            return self._order_view_is_uncomputed(state)
+        return False
+
+    def _page_transition_lifecycle_blocks_animation(self) -> bool:
+        dirty = getattr(self, "_project_dirty", None)
+        return bool(
+            getattr(self, "_opening_project", False)
+            or getattr(self, "_restoring_project", False)
+            or (dirty is not None and dirty.close_teardown_started)
+        )
+
+    def _should_begin_analysis_page_transition(self, section, idx) -> bool:
+        """Begin only for protocol-ready single-Pane analysis navigation.
+
+        An uncomputed target is not captured: cache miss stays
+        direct-terminal and must not compute for the animation.
+        Policy, enabled sections, and split are decided before any
+        animation-only cache-key or signal preparation.
+        """
+        if not self.chart_stack.page_transition_presentation_admitted(
+            section, section,
+        ):
+            return False
+        if self._page_transition_lifecycle_blocks_animation():
+            return False
+        if self.chart_stack.current_mode() != section:
+            return False
+        page = self._analysis_page(section)
+        if page is None or page.pane_count() != 1:
+            return False
+        canvas = page.pane_canvas(0)
+        if not self._canvas_has_page_transition_protocol(canvas):
+            return False
+        mgr = self.analysis_managers.get(section)
+        if mgr is None or not (0 <= idx < len(mgr.views)):
+            return False
+        target = mgr.get(idx)
+        if len(getattr(target, "panes", ()) or ()) != 1:
+            return False
+        if self._analysis_view_is_uncomputed(section, target):
+            return False
+        return True
+
+    def _request_analysis_page_transition_ready(self, section, state) -> bool:
+        """Arm paint-ack after an analysis restore/reveal transaction finished.
+
+        Independent of ``_render_analysis_view_from_cache`` facts sync.
+        FRF's three visible rows share one host ``_glw`` fence.  Heatmap
+        map + in-scene colorbar + visible slice share one host fence;
+        a collapsed slice is not an extra waiter.
+        """
+        if self.chart_stack.current_mode() != section:
+            return False
+        page = self._analysis_page(section)
+        if page is None or page.pane_count() != 1:
+            return False
+        canvas = page.pane_canvas(0)
+        if not self._canvas_has_page_transition_protocol(canvas):
+            return False
+        view_id = getattr(state, "view_id", None)
+        if not view_id:
+            return False
+        return self.chart_stack.request_page_transition_target_for(
+            section, view_id, (canvas,),
+        )
+
+    def _request_fft_page_transition_ready(self, state) -> bool:
+        """FFT retained-reveal / mode-entry arm; same analysis paint fence."""
+        return self._request_analysis_page_transition_ready("fft", state)
+
+    def _on_analysis_switch(self, section, idx):
+        mgr = self.analysis_managers[section]
+        if not 0 <= idx < len(mgr.views) or idx == mgr.active:
+            return
+        self._capture_active_analysis_view(section)
+        if self._should_begin_analysis_page_transition(section, idx):
+            source = mgr.get(mgr.active)
+            target = mgr.get(idx)
+            self.chart_stack.begin_page_transition(
+                source_section=section,
+                source_view_id=source.view_id,
+                target_section=section,
+                target_view_id=target.view_id,
+                pane_signature=(section, "single"),
+            )
+        # A tab selects a page, even when that View is already a visible peer.
+        # Capture while the old binding is alive; suspend preserves host→peer.
+        self._suspend_comparison_display(section)
+        mgr.set_active(idx)
+
+    def _on_analysis_view_rename(self, section, idx, name):
+        """F10: rename then refresh navigator empty-state for the active View."""
+        mgr = self.analysis_managers[section]
+        mgr.rename(idx, name)
+        if self.chart_stack.current_mode() != section:
+            return
+        if not (0 <= idx < len(mgr.views)):
+            return
+        state = mgr.get(idx)
+        target = self._analysis_state_for_dispatch(section)
+        if state.view_id != target.view_id:
+            return
+        pane_idx = self._dispatch_focus_index(section, state)
+        self.inspector.set_analysis_target(section, state.name, pane_idx)
+        attachment_context = getattr(self.navigator, 'set_attachment_context', None)
+        if callable(attachment_context):
+            attachment_context(
+                section_label=self._analysis_section_label(section),
+                view_name=state.name,
+            )
+        empty = getattr(self.navigator, 'set_empty_state_context', None)
+        if callable(empty):
+            empty(
+                section_label=self._analysis_section_label(section),
+                view_name=state.name,
+            )
+
+    def _on_analysis_new(self, section):
+        self._capture_active_analysis_view(section)
+        prefs = self.navigator.follow_prefs()
+        inherit = (
+            prefs.inherit_on_new_view
+            and not getattr(self, "_opening_project", False)
+            and not getattr(self, "_restoring_project", False)
+        )
+        template_fids = []
+        template_name = ""
+        if inherit:
+            from .file_scope_follow import resolve_new_view_template
+
+            mgr = self.analysis_managers[section]
+            section_state = mgr.get(mgr.active) if mgr.views else None
+            section_att = (
+                list(section_state.attached_file_ids)
+                if section_state is not None
+                else []
+            )
+            time_resolved = self._focused_time_view_state()
+            time_att = (
+                list(time_resolved[1].attached_file_ids)
+                if time_resolved is not None
+                else []
+            )
+            template_fids = resolve_new_view_template(
+                section_att, time_att, self.files
+            )
+            section_only = resolve_new_view_template(
+                section_att, [], self.files
+            )
+            if section_only and section_state is not None:
+                template_name = section_state.name
+            elif time_resolved is not None:
+                template_name = time_resolved[1].name
+        manager = self.analysis_managers[section]
+        defer_activation = view_activation.defer_new_view_activation_after_pointer_release()
+        idx = manager.new_view(activate=not defer_activation)
+        if idx < 0:
+            return
+        if defer_activation:
+            view_id = manager.get(idx).view_id
+            QTimer.singleShot(
+                0,
+                partial(
+                    self._activate_new_analysis_view_after_pointer_release,
+                    section,
+                    view_id,
+                    tuple(template_fids),
+                    template_name,
+                ),
+            )
+            return
+        if inherit and template_fids:
+            added = self._attach_files_to_active_analysis_view(
+                section, template_fids
+            )
+            if added:
+                self.toast(
+                    f"已继承 {len(added)} 个文件 · 来自 {template_name}",
+                    "success",
+                )
+
+    def _activate_new_analysis_view_after_pointer_release(
+        self, section, view_id, template_fids, template_name,
+    ):
+        """Finish a frozen-Windows analysis-View action after pointer release."""
+        manager = self.analysis_managers.get(section)
+        if manager is None:
+            return
+        idx = next(
+            (
+                index
+                for index, state in enumerate(manager.views)
+                if state.view_id == view_id
+            ),
+            None,
+        )
+        if idx is None:
+            return
+        manager.set_active(idx)
+        if template_fids:
+            added = self._attach_files_to_active_analysis_view(
+                section, template_fids
+            )
+            if added:
+                self.toast(
+                    f"已继承 {len(added)} 个文件 · 来自 {template_name}",
+                    "success",
+                )
+
+    def _on_analysis_delete(self, section, idx):
+        self._capture_active_analysis_view(section)
+        mgr = self.analysis_managers[section]
+        if len(mgr.views) > 1 and 0 <= idx < len(mgr.views):
+            state = mgr.get(idx)
+            self._forget_analysis_view(
+                section, state.view_id, len(getattr(state, "panes", ()))
+            )
+        mgr.delete_view(idx)
+
+    def _forget_analysis_view(self, section, view_id, pane_count=1):
+        self.chart_stack.invalidate_page_transition_identity(
+            section, view_id, reason="analysis-view-deleted",
+        )
+        self._analysis_restore_pending.discard((section, view_id))
+        self._drop_analysis_view_pins(section, view_id)
+        ctrl = getattr(getattr(self, "_analysis_context", None), "time_range", None)
+        if ctrl is not None:
+            ctrl.clear_view(section, view_id)
+        if section == "frf":
+            for pane_idx in range(max(1, int(pane_count or 1))):
+                self._frf_coordinator.invalidate_pane(view_id, pane_idx)
+        comp = self._comparison()
+        peer_held_focus = self._comparison_peer_holds_focus(section, view_id)
+        if comp is not None:
+            before = set(comp.relations_payload(section))
+            ended_display = comp.forget_view(section, view_id)
+            after = set(comp.relations_payload(section))
+            if ended_display:
+                self._hide_comparison_widgets(section)
+            if before != after:
+                self._announce_comparison_ended()
+        if peer_held_focus:
+            self._project_analysis_inspector(section)
+
+    def _comparison(self):
+        ctx = getattr(self, "_analysis_context", None)
+        return getattr(ctx, "comparison", None)
+
+    def _comparison_routes(self, section) -> bool:
+        """True when this section's comparison is on screen and current."""
+        comp = self._comparison()
+        if comp is None or not comp.is_open(section):
+            return False
+        stack = getattr(self, "chart_stack", None)
+        current = getattr(stack, "current_mode", None)
+        mode = current() if callable(current) else None
+        return mode == section
+
+    def _analysis_state_for_dispatch(self, section):
+        """Focused comparison view, or the active view on the single-view path."""
+        if self._comparison_routes(section):
+            comp = self._comparison()
+            focus = comp.focused(section) if comp is not None else None
+            if focus is not None:
+                state = self._analysis_state_by_id(section, focus[0])
+                if state is not None:
+                    return state
+        mgr = self.analysis_managers[section]
+        return mgr.get(mgr.active)
+
+    def _analysis_state_for_capture(self, section):
+        """The section controls retain their owner while another section is shown."""
+        comp = self._comparison()
+        focus = comp.focused(section) if comp is not None else None
+        if focus is not None:
+            state = self._analysis_state_by_id(section, focus[0])
+            if state is not None:
+                return state
+        mgr = self.analysis_managers[section]
+        return mgr.get(mgr.active)
+
+    def _heatmap_color_coordinator(self, section):
+        if section not in {"fft_time", "order"}:
+            return None
+        context = getattr(self, "_analysis_context", None)
+        coordinator = getattr(context, "heatmap_color", None)
+        if coordinator is not None:
+            coordinator.set_comparison_compatibility_checker(
+                self._comparison_levels_compatible,
+            )
+        return coordinator
+
+    def _heatmap_color_policy_for_canvas(
+        self, section, canvas, params, resolution, source, amplitude_mode,
+    ):
+        coordinator = self._heatmap_color_coordinator(section)
+        if coordinator is None:
+            return None
+        return coordinator.prepare(
+            section, canvas, params, resolution, source, amplitude_mode,
+        )
+
+    def _reject_heatmap_color_render(self, section, canvas, source, error):
+        coordinator = self._heatmap_color_coordinator(section)
+        if coordinator is None or not coordinator.has_current_picture(section, canvas, source):
+            self._clear_analysis_canvas(canvas)
+            canvas.show_empty_hint("色阶范围无效，请调整上下限")
+        if self._analysis_canvas_updates_controls(section, canvas):
+            self.statusBar.showMessage("色阶范围无效，请设置有限数值且下限小于上限")
+        logging.getLogger(__name__).warning(
+            "Rejected heatmap color policy: section=%s source=%r: %s",
+            section, source, error,
+        )
+
+    def _complete_heatmap_color_render(self, section, canvas, policy):
+        coordinator = self._heatmap_color_coordinator(section)
+        if coordinator is not None and policy is not None:
+            coordinator.complete(section, canvas, policy)
+
+    def _finish_heatmap_color_presentation(self, section, canvas, inputs, result):
+        coordinator = self._heatmap_color_coordinator(section)
+        callback = partial(
+            self._publish_settled_heatmap, section, canvas, inputs, result,
+        )
+        if coordinator is not None:
+            coordinator.defer_after_settle(section, callback)
+        else:
+            callback()
+
+    def _publish_settled_heatmap(self, section, canvas, inputs, result):
+        self._commit_heatmap_reveal(section, canvas, inputs, result)
+        notify_ultraview_plot(self, section, "heatmap-settled")
+
+    def _settle_heatmap_color(self, section):
+        coordinator = self._heatmap_color_coordinator(section)
+        if coordinator is not None:
+            coordinator.settle(section)
+
+    def _commit_heatmap_color_edit(self, section, canvas, edit, origin):
+        coordinator = self._heatmap_color_coordinator(section)
+        if coordinator is None:
+            return False
+        committed = coordinator.commit(section, canvas, edit, origin=origin)
+        if committed:
+            holder = getattr(self, "_project_dirty", None)
+            if holder is not None:
+                holder.mark_user_mutation()
+        return committed
+
+    def _analysis_params_for_canvas(self, section, canvas, fallback):
+        """Resolve presentation and accepted compute labels for this canvas."""
+        comp = self._comparison()
+        target = comp.target_for_canvas(canvas) if comp is not None else None
+        if target is not None and target.section == section:
+            state = self._analysis_state_by_id(section, target.view_id)
+            if state is not None and 0 <= target.pane_index < len(state.panes):
+                return self._analysis_bound_display_params(
+                    section, state, state.panes[target.pane_index],
+                )
+        mgr = self.analysis_managers.get(section)
+        if mgr is not None and mgr.views:
+            state = mgr.get(mgr.active)
+            page = self._analysis_page(section)
+            if page is not None:
+                for idx, pane in enumerate(state.panes):
+                    if idx < page.pane_count() and page.pane_canvas(idx) is canvas:
+                        return self._analysis_bound_display_params(section, state, pane)
+        return fallback
+
+    def _analysis_canvas_updates_controls(self, section, canvas):
+        """A background comparison paint cannot echo into the focused Inspector."""
+        comp = self._comparison()
+        target = comp.target_for_canvas(canvas) if comp is not None else None
+        if target is None:
+            if section in {"fft_time", "order"} and hasattr(self, "_analysis_context"):
+                page = self._analysis_page(section)
+                return (self.chart_stack.current_mode() == section
+                        and page.pane_canvas(page.focused_index()) is canvas)
+            return True
+        focus = comp.focused(section)
+        return (
+            self.chart_stack.current_mode() == section
+            and focus == (str(target.view_id), int(target.pane_index))
+        )
+
+    def _dispatch_focus_index(self, section, state) -> int:
+        panes = getattr(state, "panes", None) or ()
+        if not panes:
+            return 0
+        if self._comparison_routes(section):
+            comp = self._comparison()
+            focus = comp.focused(section) if comp is not None else None
+            if focus is not None and str(focus[0]) == str(state.view_id):
+                return min(int(focus[1]), len(panes) - 1)
+        page = self._analysis_page(section)
+        return min(page.focused_index(), len(panes) - 1)
+
+    def _dispatch_pane_indices(self, section, state):
+        routed = False
+        if self._comparison_routes(section):
+            comp = self._comparison()
+            focus = comp.focused(section) if comp is not None else None
+            routed = focus is not None and str(focus[0]) == str(state.view_id)
+        if routed:
+            count = len(state.panes)
+            if count <= 0:
+                return []
+            if str(section) == "frf":
+                return [self._dispatch_focus_index(section, state)]
+            return list(range(count))
+        page = self._analysis_page(section)
+        count = min(page.pane_count(), len(state.panes))
+        if count <= 0:
+            return []
+        if str(section) == "frf":
+            return [min(page.focused_index(), count - 1)]
+        return list(range(count))
+
+    def _dispatch_time_range(self, section, state, pane_idx):
+        comp = self._comparison()
+        if comp is not None and comp.is_open(section):
+            return self._normalize_analysis_time_range(state.panes[int(pane_idx)].time_range)
+        return self._pane_time_range_for(section, pane_idx)
+
+    def _qt_widget_alive(self, widget) -> bool:
+        if widget is None:
+            return False
+        try:
+            widget.objectName()
+        except RuntimeError:
+            return False
+        return True
+
+    def _canvas_for_view_pane(self, section, state, pane_idx):
+        comp = self._comparison()
+        if comp is not None and state is not None:
+            canvas = comp.canvas_for(section, state.view_id, pane_idx)
+            if canvas is not None and self._qt_widget_alive(canvas):
+                return canvas
+        mgr = (getattr(self, "analysis_managers", None) or {}).get(section)
+        if mgr is None or not getattr(mgr, "views", None) or state is None:
+            return None
+        active = mgr.get(mgr.active)
+        if str(getattr(active, "view_id", "")) != str(getattr(state, "view_id", "")):
+            return None
+        page = self._analysis_page(section)
+        if not (0 <= int(pane_idx) < page.pane_count()):
+            return None
+        return page.pane_canvas(int(pane_idx))
+
+    def _dispatch_canvas(self, section, state, pane_idx):
+        return self._canvas_for_view_pane(section, state, pane_idx)
+
+    def _target_from_sender(self, section, widget=None):
+        comp = self._comparison()
+        if comp is None:
+            return None
+        sender = widget
+        if sender is None and hasattr(self, "sender"):
+            sender = self.sender()
+        target = comp.target_for_canvas(sender)
+        if target is None or target.section != section:
+            return None
+        return target
+
+    def _comparison_peer_holds_focus(self, section, view_id) -> bool:
+        """True when ``view_id`` belongs to the open pair and the peer is focused."""
+        comp = self._comparison()
+        if comp is None:
+            return False
+        focus = comp.focused(section)
+        pair = comp.displayed(section)
+        if focus is None or pair is None:
+            return False
+        if str(focus[0]) != str(pair[1]):
+            return False
+        return str(view_id) in {str(pair[0]), str(pair[1])}
+
+    def _project_analysis_inspector(self, section) -> None:
+        """Put the active view on the Inspector without waiting for active_changed.
+
+        ``ViewManager`` emits ``active_changed`` only when the active index
+        moves. Deleting a higher-index peer, or closing other views while the
+        host is already index 0, leaves the index alone, so the peer's live
+        controls would otherwise be captured into the host.
+        """
+        mgr = (getattr(self, "analysis_managers", None) or {}).get(section)
+        if mgr is None or not getattr(mgr, "views", None):
+            return
+        self._on_analysis_view_switched(section, mgr.active, render=False)
+
+    def _analysis_completion_is_visible(self, section, ctx) -> bool:
+        """Draw gate: the active view, or a view currently beside it.
+
+        ``_analysis_ctx_targets_active_view`` stays the active-view check.
+        A late result for a hidden view is still kept, not drawn.
+        """
+        if self._analysis_ctx_targets_active_view(section, ctx):
+            return True
+        comp = self._comparison()
+        if comp is None or not comp.is_open(section):
+            return False
+        pair = comp.displayed(section)
+        if pair is None:
+            return False
+        vid = str(ctx.get("view_id") or "")
+        return vid in {str(pair[0]), str(pair[1])}
+
+    def _completion_updates_focus(self, section, ctx) -> bool:
+        if not self._comparison_routes(section):
+            return True
+        comp = self._comparison()
+        focus = comp.focused(section) if comp is not None else None
+        if focus is None:
+            return False
+        return (
+            str(ctx.get("view_id") or "") == str(focus[0])
+            and int(ctx.get("pane_idx", 0)) == int(focus[1])
+        )
+
+    def _canvas_for_completion(self, section, view_id, pane_idx):
+        comp = self._comparison()
+        if comp is not None:
+            canvas = comp.canvas_for(section, view_id, pane_idx)
+            if canvas is not None and self._qt_widget_alive(canvas):
+                return canvas
+        state = self._analysis_state_by_id(section, view_id)
+        if state is None:
+            return None
+        return self._canvas_for_view_pane(section, state, pane_idx)
+
+    def _comparison_render_bound(self, section, state) -> bool:
+        comp = self._comparison()
+        if comp is None or not comp.is_open(section) or state is None:
+            return False
+        canvas = comp.canvas_for(section, state.view_id, 0)
+        return canvas is not None and self._qt_widget_alive(canvas)
+
+    def _hide_comparison_widgets(self, section) -> None:
+        page = self._analysis_page(section)
+        hide = getattr(page, "hide_comparison_peer", None)
+        if callable(hide):
+            hide()
+
+    def _on_comparison_focus_requested(self, section, view_id, pane_index):
+        self.focus_comparison(section, view_id, pane_index)
+
+    def _on_cross_view_compare(self, section, host_id, peer_id, host_pane, _peer_pane):
+        """Menu: open the named host beside the named peer. Does not submit."""
+        if self.chart_stack.current_mode() == section:
+            self._capture_active_analysis_view(section)
+        if not self.open_comparison(section, host_id, peer_id):
+            return
+        try:
+            pane = int(host_pane)
+        except (TypeError, ValueError):
+            pane = 0
+        self.focus_comparison(section, host_id, pane)
+
+    def _on_end_view_comparison(self, section, _view_id, _pane_index):
+        """Menu: drop the display relation. Views and panes stay."""
+        self.close_comparison(section)
+
+    def _on_comparison_display_toggled(self, section, key, on):
+        """Cross-view link controls. Does not write AnalysisViewState.compare."""
+        if getattr(self, "_applying_analysis_view", False):
+            return
+        comp = self._comparison()
+        if comp is None:
+            return
+        if key == "axis_linked":
+            if not self.set_comparison_axis_linked(section, bool(on)):
+                self._analysis_page(section).sync_comparison_display_buttons(
+                    axis_linked=comp.axis_linked(section),
+                    levels_locked=comp.levels_locked(section),
+                )
+                if on:
+                    self.toast("频率轴尺度不一致，未联动", "warning")
+            return
+        if key != "levels_locked":
+            return
+        ok = self.set_comparison_levels_locked(section, bool(on))
+        if ok:
+            return
+        page = self._analysis_page(section)
+        sync = getattr(page, "sync_comparison_display_buttons", None)
+        if callable(sync):
+            sync(
+                axis_linked=comp.axis_linked(section),
+                levels_locked=comp.levels_locked(section),
+            )
+        if bool(on):
+            self.toast("色阶不一致，未锁定", "warning")
+            bar = getattr(self, "statusBar", None)
+            show = getattr(bar, "showMessage", None)
+            if callable(show):
+                show("两个热图色阶不一致，未锁定")
+
+    def _comparison_relations(self, section) -> dict:
+        comp = self._comparison()
+        if comp is None:
+            return {}
+        return comp.relations_payload(section)
+
+    def _note_comparison_mutation(self, section, before) -> None:
+        if self._comparison_relations(section) == before:
+            return
+        self._analysis_page(section).tabbar.refresh_comparison_presentation()
+        self._mark_comparison_user_change()
+
+    def _mark_comparison_user_change(self) -> None:
+        if getattr(self, "_opening_project", False):
+            return
+        if getattr(self, "_restoring_project", False):
+            return
+        if getattr(self, "_applying_analysis_view", False):
+            return
+        holder = getattr(self, "_project_dirty", None)
+        if holder is not None:
+            holder.mark_user_mutation()
+
+    def _announce_comparison_ended(self, *, explicit=False, missing=False) -> None:
+        if getattr(self, "_opening_project", False) or getattr(self, "_restoring_project", False):
+            return
+        bar = getattr(self, "statusBar", None)
+        show = getattr(bar, "showMessage", None)
+        if callable(show):
+            show("已结束 View 对比" if explicit else "View 对比已结束")
+        if explicit:
+            return
+        if missing:
+            self.toast("View 对比已结束：目标 View 不在此项目中", "warning")
+        else:
+            self.toast("View 对比已结束", "info")
+
+    def _restore_remembered_comparison(self, section, state, *, already_rendered=()) -> None:
+        """Mount a remembered peer only while this section is the current mode."""
+        comp = self._comparison()
+        if comp is None or state is None:
+            return
+        stack = getattr(self, "chart_stack", None)
+        current = getattr(stack, "current_mode", None)
+        mode = current() if callable(current) else None
+        if mode != section:
+            return
+        mgr = self.analysis_managers.get(section)
+        if mgr is None or not mgr.views:
+            return
+        if str(mgr.get(mgr.active).view_id) != str(state.view_id):
+            return
+        peer_id = comp.peer_of(section, state.view_id)
+        if not peer_id:
+            return
+        if self._analysis_state_by_id(section, peer_id) is None:
+            comp.drop_host(section, state.view_id)
+            self._announce_comparison_ended(missing=True)
+            return
+        self._present_comparison(
+            section, state.view_id, peer_id, already_rendered=already_rendered,
+        )
+
+    def _install_analysis_comparisons(self, section, block):
+        """Read one section's comparison rows after its views exist."""
+        comp = self._comparison()
+        if comp is None:
+            return {}, []
+        from ..project_io import normalize_analysis_comparisons
+
+        mgr = self.analysis_managers[section]
+        view_ids = [str(item.view_id) for item in mgr.views]
+        if "comparisons" not in (block or {}):
+            comp.replace_relations(section, {})
+            self._analysis_page(section).tabbar.refresh_comparison_presentation()
+            return {}, []
+        payload, dropped = normalize_analysis_comparisons(
+            block.get("comparisons"), view_ids,
+        )
+        comp.replace_relations(section, payload)
+        self._analysis_page(section).tabbar.refresh_comparison_presentation()
+        return payload, dropped
+
+    def open_comparison(self, section, host_id, peer_id) -> bool:
+        """Show ``peer_id`` beside ``host_id``. Does not submit a job."""
+        host = self._analysis_state_by_id(section, host_id)
+        peer = self._analysis_state_by_id(section, peer_id)
+        comp = self._comparison()
+        if host is None or peer is None or comp is None or host is peer:
+            return False
+        mgr = self.analysis_managers[section]
+        host_idx = next(i for i, state in enumerate(mgr.views)
+                        if state.view_id == host.view_id)
+        before = comp.relations_payload(section)
+        if comp.is_open(section):
+            shown = comp.displayed(section)
+            if shown is not None and (
+                str(shown[0]) != str(host.view_id) or str(shown[1]) != str(peer.view_id)
+            ):
+                self._capture_active_analysis_view(section)
+                comp.suspend(section)
+                self._hide_comparison_widgets(section)
+        elif mgr.active != host_idx:
+            self._capture_active_analysis_view(section)
+        if not comp.begin(section, host.view_id, peer.view_id):
+            return False
+        if mgr.active != host_idx:
+            mgr.set_active(host_idx)
+        self._present_comparison(section, host.view_id, peer.view_id)
+        self._note_comparison_mutation(section, before)
+        return True
+
+    def close_comparison(self, section) -> None:
+        """Drop the on-screen pair. Cache pins stay with their owning views."""
+        comp = self._comparison()
+        if comp is None:
+            return
+        before = comp.relations_payload(section)
+        was_open = comp.is_open(section)
+        if was_open:
+            self._capture_active_analysis_view(section)
+        comp.close(section)
+        self._hide_comparison_widgets(section)
+        if was_open:
+            mgr = self.analysis_managers[section]
+            self._on_analysis_view_switched(section, mgr.active)
+        self._note_comparison_mutation(section, before)
+        if was_open:
+            self._announce_comparison_ended(explicit=True)
+
+    def focus_comparison(self, section, view_id, pane_index=0) -> bool:
+        """Move inspector, sources, and cursors onto one on-screen pane.
+
+        Opening or moving focus is presentation. It does not submit a job.
+        A pending inspector edit is captured into the view that was focused.
+        """
+        from ..analysis_view_bridge import apply_params_from_state, capture_params_to_state
+
+        comp = self._comparison()
+        if comp is None or not comp.is_open(section):
+            return False
+        state = self._analysis_state_by_id(section, view_id)
+        if state is None or not state.panes:
+            return False
+        pane_index = min(int(pane_index), len(state.panes) - 1)
+        pair = comp.displayed(section)
+        if pair is None or str(state.view_id) not in {str(pair[0]), str(pair[1])}:
+            return False
+        previous = comp.focused(section)
+        same = (
+            previous is not None
+            and str(previous[0]) == str(state.view_id)
+            and int(previous[1]) == pane_index
+        )
+        if previous is not None and not same:
+            old_state = self._analysis_state_by_id(section, previous[0])
+            if old_state is not None and self.chart_stack.current_mode() == section:
+                self._flush_pending_analysis_param_edit(section)
+                capture_params_to_state(self._analysis_ctx(section), old_state)
+                self._capture_analysis_sources(
+                    section, old_state, pane_idx=int(previous[1]),
+                )
+                self._capture_analysis_time_range(
+                    section, old_state, pane_idx=int(previous[1]),
+                )
+                self._capture_analysis_xy_viewports(section, old_state)
+                if section == "frf":
+                    self._capture_frf_canvas_ranges(old_state)
+                self._capture_analysis_overlay(section, old_state)
+        if not comp.focus(section, state.view_id, pane_index):
+            return False
+        self._project_comparison_focus(section, state, pane_index)
+        return True
+
+    def _project_comparison_focus(self, section, state, pane_index) -> None:
+        from ..analysis_view_bridge import apply_params_from_state
+
+        self._applying_analysis_view = True
+        dirty = getattr(self, "_project_dirty", None)
+        if dirty is not None:
+            dirty.begin_restore()
+        try:
+            if self.chart_stack.current_mode() == section:
+                self._project_analysis_attachments(section, state)
+            refresh = getattr(self, "_refresh_analysis_candidates", None)
+            if callable(refresh):
+                refresh(section)
+            # Restoring the shared Inspector must not emit the legacy FFT
+            # remark toggle and overwrite the target card's live gesture mode.
+            ctx = self._analysis_ctx(section)
+            with QSignalBlocker(ctx):
+                apply_params_from_state(ctx, state)
+            if section in {"fft", "frf"}:
+                self._apply_frequency_cursor_controls(section, state)
+            self._apply_analysis_sources(section, state)
+            self._apply_analysis_time_range(section, state)
+            self.inspector.set_analysis_target(section, state.name, pane_index)
+            page = self._analysis_page(section)
+            marker = getattr(page, "mark_comparison_focus", None)
+            if callable(marker):
+                marker(state.view_id, pane_index)
+            self._on_annotation_enabled_changed(
+                section, page.focused_card().annotation_enabled(),
+            )
+            x_linked = bool((state.compare or {}).get("x_linked", True))
+            levels_locked = bool((state.compare or {}).get("levels_locked", True))
+            page.sync_compare_buttons(x_linked=x_linked, levels_locked=levels_locked)
+        finally:
+            self._applying_analysis_view = False
+            if dirty is not None:
+                dirty.end_restore()
+        self._sync_section_effective_facts(section, state)
+        self._settle_heatmap_color(section)
+
+    def _present_comparison(self, section, host_id, peer_id, *, already_rendered=()) -> None:
+        """Mount both regions and paint cached results. Never submits a job."""
+        comp = self._comparison()
+        host = self._analysis_state_by_id(section, host_id)
+        peer = self._analysis_state_by_id(section, peer_id)
+        if comp is None or host is None or peer is None:
+            return
+        comp.begin(section, host.view_id, peer.view_id)
+        ensure = getattr(self.chart_stack, "ensure_analysis_page_ready", None)
+        if callable(ensure):
+            ensure(section)
+        self._align_host_panes(section, host)
+        page = self._analysis_page(section)
+        page.show_comparison_peer(host.view_id, peer.view_id, len(peer.panes))
+        comp.unbind_section(section)
+        for pane_idx, card in enumerate(page._cards):
+            if pane_idx >= len(host.panes):
+                break
+            canvas = getattr(card, "canvas", None)
+            comp.bind_canvas(
+                canvas,
+                AnalysisViewTarget(section, host.view_id, pane_idx),
+            )
+            self._bind_analysis_range_adapter(canvas, section, pane_idx)
+        for pane_idx, card in enumerate(page.peer_cards()):
+            if pane_idx >= len(peer.panes):
+                break
+            canvas = getattr(card, "canvas", None)
+            newly_bound = not getattr(canvas, "_comparison_peer_wired", False)
+            comp.bind_canvas(
+                canvas,
+                AnalysisViewTarget(section, peer.view_id, pane_idx),
+            )
+            self._wire_peer_card(section, card, pane_idx)
+            if canvas is not None and newly_bound:
+                # A fresh peer has no live overlays yet. Rebind persisted pins
+                # before painting cached data, just like a normal View restore;
+                # an existing canvas keeps any not-yet-captured live edits.
+                self._rebind_pane_overlay(canvas, peer.panes[pane_idx])
+        page.set_linked(bool((host.compare or {}).get("x_linked", True)))
+        page.set_levels_locked(bool((host.compare or {}).get("levels_locked", True)))
+        peer_host = getattr(page, "_peer_host", None)
+        if peer_host is not None:
+            peer_host.set_linked(bool((peer.compare or {}).get("x_linked", True)))
+            peer_host.set_levels_locked(
+                bool((peer.compare or {}).get("levels_locked", True))
+            )
+        focus = comp.focused(section) or (host.view_id, 0)
+        focus_state = host if str(focus[0]) == str(host.view_id) else peer
+        pane = min(int(focus[1]), len(focus_state.panes) - 1)
+        comp.focus(section, focus_state.view_id, pane)
+        self._project_comparison_focus(section, focus_state, pane)
+        if comp.axis_linked(section):
+            self._link_comparison_cameras(section)
+        else:
+            comp.unlink(section)
+        if comp.levels_locked(section):
+            self._link_comparison_levels(section)
+        sync_display = getattr(page, "sync_comparison_display_buttons", None)
+        if callable(sync_display):
+            sync_display(
+                axis_linked=comp.axis_linked(section),
+                levels_locked=comp.levels_locked(section),
+            )
+        coordinator = self._heatmap_color_coordinator(section)
+        transaction = coordinator.transaction(section) if coordinator else nullcontext()
+        rendered = {str(item) for item in already_rendered}
+        with transaction:
+            if str(host.view_id) not in rendered:
+                self._render_comparison_view(section, host)
+            if str(peer.view_id) not in rendered:
+                self._render_comparison_view(section, peer)
+
+    def _align_host_panes(self, section, state) -> None:
+        page = self._analysis_page(section)
+        ensure = getattr(page, "ensure_ready", None)
+        if callable(ensure):
+            ensure()
+        if len(state.panes) >= 2 and page.pane_count() < 2:
+            page.enter_split()
+            self._connect_new_pane(section, page)
+        elif len(state.panes) < 2 and page.pane_count() > 1:
+            page.exit_split()
+
+    def _wire_peer_card(self, section, card, pane_idx=0) -> None:
+        canvas = getattr(card, "canvas", None)
+        if canvas is None:
+            return
+        self._bind_analysis_range_adapter(canvas, section, pane_idx)
+        if getattr(canvas, "_comparison_peer_wired", False):
+            return
+        connect = getattr(self.chart_stack, "_connect_analysis_card_signals", None)
+        if callable(connect):
+            connect(card)
+        if section in {"fft", "fft_time", "order", "frf"}:
+            signal = getattr(canvas, "viewport_action_committed", None)
+            if (
+                section in {"fft", "fft_time", "order"}
+                and signal is not None
+                and not getattr(canvas, "_viewport_intent_wired", False)
+            ):
+                signal.connect(partial(self._on_bound_viewport_intent, section))
+                canvas._viewport_intent_wired = True
+            self._wire_analysis_chart_appearance(canvas, section, pane_idx)
+        if section in {"fft_time", "order"} and not getattr(canvas, "_levels_echo_wired", False):
+            canvas.levels_changed.connect(partial(self._on_bound_levels, section))
+            restored = getattr(canvas, "colorbar_restored", None)
+            if restored is not None:
+                restored.connect(partial(self._on_bound_levels, section))
+            canvas._levels_echo_wired = True
+        canvas._comparison_peer_wired = True
+
+    def _on_bound_viewport_intent(self, section, action="user", axes=("x", "y")):
+        target = self._target_from_sender(section)
+        if target is None:
+            return
+        state = self._analysis_state_by_id(section, target.view_id)
+        if state is None:
+            return
+        self._commit_analysis_pane_viewport(
+            section, state, target.pane_index, action, axes,
+        )
+
+    def _on_bound_levels(self, section, lo, hi):
+        if self._applying_analysis_view:
+            return
+        target = self._target_from_sender(section)
+        comp = self._comparison()
+        if target is None or comp is None:
+            return
+        focus = comp.focused(section)
+        if focus is None:
+            return
+        if str(focus[0]) != str(target.view_id) or int(focus[1]) != int(target.pane_index):
+            return
+        state = self._analysis_state_by_id(section, target.view_id)
+        canvas = self._canvas_for_view_pane(section, state, target.pane_index)
+        self._commit_heatmap_color_edit(section, canvas, {
+            "z_auto": False, "z_floor": float(lo), "z_ceiling": float(hi),
+        }, "colorbar")
+
+    def _suspend_comparison_display(self, section) -> None:
+        comp = self._comparison()
+        if comp is None or not comp.is_open(section):
+            return
+        comp.suspend(section)
+        self._hide_comparison_widgets(section)
+
+    def set_comparison_axis_linked(self, section, on) -> bool:
+        """Link compatible cameras. Does not write time range or numeric params."""
+        comp = self._comparison()
+        if comp is None:
+            return False
+        if on and not self._comparison_axes_compatible(section):
+            return False
+        before = comp.relations_payload(section)
+        if not comp.set_axis_linked(section, bool(on)):
+            return False
+        self._note_comparison_mutation(section, before)
+        if on:
+            return self._link_comparison_cameras(section)
+        if comp.levels_locked(section):
+            self._connect_comparison_level_signals(section)
+        return True
+
+    def _comparison_axes_compatible(self, section) -> bool:
+        comp = self._comparison()
+        pair = comp.displayed(section) if comp is not None else None
+        if pair is None:
+            return False
+        states = [self._analysis_state_by_id(section, vid) for vid in pair]
+        if any(state is None for state in states):
+            return False
+        # The other sections have fixed physical X/Y axes. FRF supports both
+        # log10 and linear ViewBox coordinates, which cannot be directly linked.
+        if section == "frf":
+            return len({str(s.params.get("frequency_scale", "log")).lower()
+                        for s in states}) == 1
+        return True
+
+    def _validate_comparison_links(self, section) -> None:
+        """Recheck saved links after source/display changes and before painting."""
+        comp = self._comparison()
+        if comp is None or not comp.is_open(section):
+            return
+        changed = False
+        if comp.axis_linked(section) and not self._comparison_axes_compatible(section):
+            self.set_comparison_axis_linked(section, False)
+            changed = True
+        if comp.levels_locked(section) and not self._comparison_levels_compatible(section):
+            self.set_comparison_levels_locked(section, False)
+            changed = True
+        if changed:
+            self._analysis_page(section).sync_comparison_display_buttons(
+                axis_linked=comp.axis_linked(section),
+                levels_locked=comp.levels_locked(section),
+            )
+            self.statusBar.showMessage("对比尺度已改变，已解除不兼容的联动")
+
+    def set_comparison_levels_locked(self, section, on) -> bool:
+        """Lock color scales only for compatible heatmaps."""
+        comp = self._comparison()
+        if comp is None:
+            return False
+        before = comp.relations_payload(section)
+        if section not in {"fft_time", "order"}:
+            comp.set_levels_locked(section, False)
+            self._note_comparison_mutation(section, before)
+            return False
+        if on and not self._comparison_levels_compatible(section):
+            return False
+        if not comp.set_levels_locked(section, bool(on)):
+            return False
+        self._note_comparison_mutation(section, before)
+        if on:
+            self._link_comparison_levels(section)
+            self._settle_heatmap_color(section)
+            return True
+        if comp.axis_linked(section):
+            self._link_comparison_cameras(section)
+        else:
+            comp.unlink(section)
+        self._settle_heatmap_color(section)
+        return True
+
+    def _comparison_levels_compatible(self, section) -> bool:
+        comp = self._comparison()
+        pair = comp.displayed(section) if comp is not None else None
+        if pair is None:
+            return False
+        host = self._analysis_state_by_id(section, pair[0])
+        peer = self._analysis_state_by_id(section, pair[1])
+        if host is None or peer is None:
+            return False
+        left = dict(host.params or {})
+        right = dict(peer.params or {})
+        keys = ("amplitude_mode", "weighting")
+        if any(left.get(key) != right.get(key) for key in keys):
+            return False
+        identities = set()
+        for state in (host, peer):
+            for pane in state.panes:
+                if not pane.sources:
+                    return False
+                resolution = self._resolve_db_reference_for_source(
+                    section, pane.sources[0], params=state.params,
+                )
+                identities.add((resolution.quantity, resolution.unit, resolution.value))
+        return len(identities) == 1
+
+    def _link_comparison_cameras(self, section) -> bool:
+        from ..analysis_section_page import _primary_vb
+
+        comp = self._comparison()
+        pair = comp.displayed(section) if comp is not None else None
+        if pair is None:
+            return False
+        if not self._comparison_axes_compatible(section):
+            comp.set_axis_linked(section, False)
+            comp.unlink(section)
+            return False
+        comp.unlink(section)
+        host = self._analysis_state_by_id(section, pair[0])
+        peer = self._analysis_state_by_id(section, pair[1])
+        if host is None or peer is None:
+            return False
+        linked = False
+        count = min(len(host.panes), len(peer.panes))
+        for pane_idx in range(count):
+            left = comp.canvas_for(section, host.view_id, pane_idx)
+            right = comp.canvas_for(section, peer.view_id, pane_idx)
+            if left is None or right is None:
+                continue
+            vb0 = _primary_vb(left)
+            vb1 = _primary_vb(right)
+            if vb0 is None or vb1 is None:
+                continue
+            vb1.setXLink(vb0)
+            comp.add_unlink(section, partial(_clear_viewbox_link, vb1))
+            if section in {"fft_time", "order"} and hasattr(left, "_img") and hasattr(right, "_img"):
+                vb1.setYLink(vb0)
+            linked = True
+        if comp.levels_locked(section):
+            self._connect_comparison_level_signals(section)
+        return linked
+
+    def _link_comparison_levels(self, section) -> None:
+        comp = self._comparison()
+        if comp is None or not comp.is_open(section):
+            return
+        if comp.axis_linked(section):
+            self._link_comparison_cameras(section)
+            return
+        comp.unlink(section)
+        self._connect_comparison_level_signals(section)
+
+    def _connect_comparison_level_signals(self, section) -> None:
+        comp = self._comparison()
+        pair = comp.displayed(section) if comp is not None else None
+        if pair is None or section not in {"fft_time", "order"}:
+            return
+        host = self._analysis_state_by_id(section, pair[0])
+        peer = self._analysis_state_by_id(section, pair[1])
+        if host is None or peer is None:
+            return
+        slot = partial(self._on_comparison_levels_propagated, section)
+        count = min(len(host.panes), len(peer.panes))
+        for pane_idx in range(count):
+            for view_id in (host.view_id, peer.view_id):
+                canvas = comp.canvas_for(section, view_id, pane_idx)
+                signal = getattr(canvas, "levels_changed", None) if canvas is not None else None
+                if signal is None or not hasattr(canvas, "_img"):
+                    continue
+                signal.connect(slot)
+                comp.add_unlink(
+                    section, partial(_disconnect_signal, signal, slot),
+                )
+
+    def _on_comparison_levels_propagated(self, section, lo, hi):
+        self._validate_comparison_links(section)
+        comp = self._comparison()
+        if comp is None or comp.propagating_levels or not comp.levels_locked(section):
+            return
+        pair = comp.displayed(section)
+        if pair is None:
+            return
+        comp.propagating_levels = True
+        try:
+            for view_id in pair:
+                state = self._analysis_state_by_id(section, view_id)
+                if state is None:
+                    continue
+                for pane_idx in range(len(state.panes)):
+                    canvas = comp.canvas_for(section, view_id, pane_idx)
+                    img = getattr(canvas, "_img", None) if canvas is not None else None
+                    if img is None:
+                        continue
+                    img.setLevels((float(lo), float(hi)))
+        finally:
+            comp.propagating_levels = False
+
+    def _render_comparison_view(self, section, state):
+        """Restore only this View's explicitly accepted results."""
+        comp = self._comparison()
+        if comp is None or state is None:
+            return False
+        self._validate_comparison_links(section)
+        focus = comp.focused(section)
+        is_focus = focus is not None and str(focus[0]) == str(state.view_id)
+        self._render_bound_analysis_panes(section, state, sync_facts=is_focus)
+        return bool(is_focus)
+
+    def _render_frf_comparison_view(self, state, *, sync_facts) -> None:
+        self._render_bound_analysis_panes("frf", state, sync_facts=sync_facts)
+
+    def _teardown_comparison_display(self) -> None:
+        comp = self._comparison()
+        if comp is None:
+            return
+        sections = list(getattr(self, "analysis_managers", {}) or {})
+        peer_focused = []
+        for section in sections:
+            pair = comp.displayed(section)
+            if pair is not None and self._comparison_peer_holds_focus(section, pair[1]):
+                peer_focused.append(section)
+        comp.teardown()
+        for section in sections:
+            page_get = getattr(self, "_analysis_page", None)
+            if not callable(page_get):
+                continue
+            page = page_get(section)
+            hide = getattr(page, "hide_comparison_peer", None)
+            if callable(hide):
+                hide()
+        for section in peer_focused:
+            self._project_analysis_inspector(section)
+
+    def _on_analysis_close_others(self, section, keep_view_id):
+        mgr = self.analysis_managers[section]
+        keep_idx = next(
+            (
+                idx
+                for idx, state in enumerate(mgr.views)
+                if str(state.view_id) == str(keep_view_id)
+            ),
+            -1,
+        )
+        if keep_idx < 0 or len(mgr.views) <= 1:
+            return
+        keep = mgr.get(keep_idx)
+        if not self._confirm_close_other_views(
+            len(mgr.views) - 1, keep_idx + 1, keep.name
+        ):
+            return
+        self._capture_active_analysis_view(section)
+        removed_meta = [
+            (state.view_id, len(getattr(state, "panes", ())))
+            for state in mgr.views
+            if str(state.view_id) != str(keep.view_id)
+        ]
+        for view_id, pane_count in removed_meta:
+            self._forget_analysis_view(section, view_id, pane_count)
+        mgr.retain_only_view(str(keep.view_id))
+
+    def _on_analysis_close_all(self, section):
+        mgr = self.analysis_managers[section]
+        count = len(mgr.views)
+        if count <= 1:
+            return
+        if not self._confirm_close_all_views(count):
+            return
+        for state in list(mgr.views):
+            self._forget_analysis_view(
+                section, state.view_id, len(getattr(state, "panes", ()))
+            )
+        mgr.reset_to_single_default()
+
+    def _on_analysis_duplicate(self, section, idx):
+        self._capture_active_analysis_view(section)
+        self.analysis_managers[section].duplicate(idx)
+
+    def _on_analysis_color(self, section, idx):
+        mgr = self.analysis_managers[section]
+        if not (0 <= idx < len(mgr.views)):
+            return
+        from PyQt5.QtGui import QColor
+        current = QColor(mgr.get(idx).tab_color)
+        color = QColorDialog.getColor(current, self, "选择标签颜色")
+        if color.isValid():
+            mgr.set_color(idx, color.name())
+
+    def _on_analysis_split(self, section, on):
+        """split_requested / clear_split_requested → add / remove pane 2 of the
+        ACTIVE view of this section."""
+        mgr = self.analysis_managers[section]
+        state = mgr.get(mgr.active)
+        page = self._analysis_page(section)
+        comp = self._comparison()
+        pair = comp.displayed(section) if comp is not None else None
+        if pair is not None:
+            self._capture_active_analysis_view(section)
+        if on:
+            if state.add_pane():
+                page.enter_split()
+                self._connect_new_pane(section, page)
+        else:
+            if len(state.panes) > 1:
+                # Drop pane-1 residency before the pane disappears from state
+                # (F13). FRF also bumps its coordinator generation so an
+                # in-flight pane-1 completion cannot repopulate cache.
+                if section == 'frf':
+                    self._frf_coordinator.invalidate_pane(state.view_id, 1)
+                if section in {'fft', 'fft_time', 'order', 'frf'}:
+                    self._replace_analysis_pane_pins(
+                        section, state.view_id, 1, ())
+                ctrl = getattr(
+                    getattr(self, "_analysis_context", None), "time_range", None,
+                )
+                if ctrl is not None:
+                    ctrl.clear_pane(section, state.view_id, 1)
+            state.remove_second_pane()
+            page.exit_split()
+        if pair is not None:
+            self._present_comparison(section, *pair)
+
+    def _connect_new_pane(self, section, page):
+        """Wire copy/annotation relays for a freshly split pane card so the
+        compare pane behaves like pane 0."""
+        if page.pane_count() < 2:
+            return
+        self.chart_stack._connect_analysis_card_signals(page._cards[1])
+        if section == 'fft':
+            self._connect_fft_preview_range_signal(page.pane_canvas(1), 1)
+        if section in {'fft', 'fft_time', 'order'}:
+            self._wire_analysis_viewport_intent(page.pane_canvas(0), section, 0)
+            self._wire_analysis_viewport_intent(page.pane_canvas(1), section, 1)
+        # V8: pane 1's colorbar-drag → inspector Z echo (heatmap sections).
+        # Guarded against double-wiring across repeated splits via a marker on
+        # the canvas (enter_split builds a fresh card each time, so a stale
+        # connection on a destroyed canvas is never reused — but a duplicate
+        # connect on the same long-lived canvas would double-fire).
+        if section in {'fft_time', 'order'}:
+            self._wire_heatmap_levels_echo(page.pane_canvas(1), section, 1)
+
+    def _wire_heatmap_levels_echo(self, canvas, section, pane_idx):
+        """Echo colorbar drag and double-click restore into the inspector.
+
+        ``partial`` rather than ``lambda`` so the connect-lambda ratchet
+        stays shrink-only. Both signals share the same handler: restore is
+        a finished window, not an in-progress drag, but the inspector write
+        (silent ``apply_params``) is identical.
+        """
+        if canvas is None or getattr(canvas, '_levels_echo_wired', False):
+            return
+        echo = partial(self._on_analysis_levels_dragged, section, pane_idx)
+        canvas.levels_changed.connect(echo)
+        restored = getattr(canvas, 'colorbar_restored', None)
+        if restored is not None:
+            restored.connect(echo)
+        policy = getattr(canvas, 'color_policy_committed', None)
+        if policy is not None:
+            policy.connect(partial(
+                self._on_analysis_color_policy, section, pane_idx, canvas=canvas,
+            ))
+        self._wrap_heatmap_chart_options(canvas, section, pane_idx)
+        canvas._levels_echo_wired = True
+
+    def _analysis_xy_fingerprint(self, params):
+        params = params or {}
+        return (
+            bool(params.get("x_auto", params.get("autoscale", True))),
+            params.get("x_min"),
+            params.get("x_max"),
+            bool(params.get("y_auto", True)),
+            params.get("y_min"),
+            params.get("y_max"),
+        )
+
+    def _clear_analysis_view_viewports(self, state, axes=("x", "y")):
+        for pane in state.panes:
+            for axis in axes:
+                setattr(pane, axis + "lim", None)
+                pane.viewport_origin[axis] = "auto"
+
+    def _bind_analysis_range_adapter(self, canvas, section, pane_idx):
+        """Chart-options range edits address this canvas, not the focused tab."""
+        if canvas is None:
+            return
+        canvas.analysis_range_adapter = (
+            partial(self._analysis_range_policy, section, pane_idx, canvas=canvas),
+            partial(
+                self._apply_analysis_range_policy, section, pane_idx, canvas=canvas,
+            ),
+        )
+
+    def _wire_analysis_viewport_intent(self, canvas, section, pane_idx):
+        """Consume the axis-aware event only; old signal remains public compatibility."""
+        self._bind_analysis_range_adapter(canvas, section, pane_idx)
+        self._wire_analysis_chart_appearance(canvas, section, pane_idx)
+        signal = getattr(canvas, "viewport_action_committed", None)
+        if signal is None or getattr(canvas, "_viewport_intent_wired", False):
+            return
+        signal.connect(partial(self._on_analysis_viewport_intent, section, pane_idx))
+        canvas._viewport_intent_wired = True
+
+    def _analysis_range_owner(self, section, pane_idx, canvas=None):
+        """State and pane the range adapter is editing."""
+        if canvas is not None:
+            target = self._target_from_sender(section, canvas)
+            if target is not None:
+                state = self._analysis_state_by_id(section, target.view_id)
+                if state is not None and state.panes:
+                    idx = min(int(target.pane_index), len(state.panes) - 1)
+                    return state, idx
+            page = self._analysis_page(section)
+            mgr = self.analysis_managers.get(section)
+            if mgr is not None and mgr.views:
+                active = mgr.get(mgr.active)
+                for idx in range(min(page.pane_count(), len(active.panes))):
+                    if page.pane_canvas(idx) is canvas:
+                        return active, idx
+        mgr = self.analysis_managers[section]
+        state = mgr.get(mgr.active)
+        idx = min(int(pane_idx), max(len(state.panes) - 1, 0))
+        return state, idx
+
+    def _analysis_range_policy(self, section, pane_idx, canvas=None):
+        state, pane_idx = self._analysis_range_owner(section, pane_idx, canvas)
+        if self._analysis_state_for_capture(section) is state:
+            from ..analysis_view_bridge import requested_params_from_context
+
+            params = requested_params_from_context(self._analysis_ctx(section), state)
+        else:
+            params = dict(state.params or {})
+        origin = {}
+        if state.panes and 0 <= pane_idx < len(state.panes):
+            origin = dict(state.panes[pane_idx].viewport_origin)
+        return {**params, "viewport_origin": origin}
+
+    def _apply_analysis_range_policy(self, section, pane_idx, policies, canvas=None):
+        state, _pane_idx = self._analysis_range_owner(section, pane_idx, canvas)
+        patch = {}
+        for axis, (auto, limits) in policies.items():
+            patch[axis + "_auto"] = bool(auto)
+            if not auto:
+                patch[axis + "_min"], patch[axis + "_max"] = limits
+        if str(section) == "fft_time" and "y" in policies:
+            if "y_auto" in patch:
+                patch["freq_auto"] = patch["y_auto"]
+            if "y_min" in patch:
+                patch["freq_min"] = patch["y_min"]
+            if "y_max" in patch:
+                patch["freq_max"] = patch["y_max"]
+        focused = self._analysis_state_for_capture(section) is state
+        if focused:
+            ctx = self._analysis_ctx(section)
+            ctx.apply_params(patch)
+            if str(section) == "fft_time" and "y" in policies:
+                current = ctx.current_params()
+                for key in ("freq_auto", "freq_min", "freq_max"):
+                    if key in current:
+                        patch[key] = current[key]
+        params = dict(state.params or {})
+        for key, value in patch.items():
+            if key.startswith(("x_", "y_", "freq_")):
+                params[key] = value
+        state.params = params
+        if self._project_dirty is not None:
+            self._project_dirty.mark_user_mutation()
+        self._clear_analysis_view_viewports(state, tuple(policies))
+        self._render_analysis_view_from_cache(section, state)
+
+    def _on_analysis_viewport_intent(self, section, pane_idx, action="user", axes=("x", "y")):
+        if action not in {"user", "home"} or any(axis not in {"x", "y"} for axis in axes):
+            raise ValueError("Invalid analysis viewport action")
+        if self._applying_analysis_view or self.chart_stack.current_mode() != section:
+            return
+        mgr = self.analysis_managers.get(section)
+        if mgr is None or not mgr.views:
+            return
+        state = mgr.get(mgr.active)
+        self._commit_analysis_pane_viewport(section, state, pane_idx, action, axes)
+        if self._project_dirty is not None:
+            self._project_dirty.mark_user_mutation()
+        page = self._analysis_page(section)
+        sibling = 1 - int(pane_idx)
+        if "x" in axes and state.compare.get("x_linked", True) and sibling < page.pane_count() and sibling < len(state.panes):
+            self._commit_analysis_pane_viewport(section, state, sibling, action, ("x",))
+
+    def _commit_analysis_pane_viewport(self, section, state, pane_idx, action=None, axes=("x", "y")):
+        if pane_idx >= len(state.panes):
+            return
+        canvas = self._canvas_for_view_pane(section, state, pane_idx)
+        if canvas is None or not hasattr(canvas, "capture_xy_viewport"):
+            return
+        captured = canvas.capture_xy_viewport()
+        if captured is None:
+            return
+        pane = state.panes[pane_idx]
+        for axis, limits in zip(("x", "y"), captured):
+            if axis in axes:
+                setattr(pane, axis + "lim", limits)
+                if action is not None:
+                    pane.viewport_origin[axis] = action
+
+    def _capture_analysis_xy_viewports(self, section, state):
+        if section in {"fft", "fft_time", "order"}:
+            for pane_idx in range(len(state.panes)):
+                self._commit_analysis_pane_viewport(section, state, pane_idx)
+
+    def _restore_analysis_pane_viewport(self, section, state, pane_idx, canvas):
+        from ...ui_kit.ticks_math import finite_non_degenerate_range, ranges_overlap
+
+        if section not in {"fft", "fft_time", "order"} or canvas is None or pane_idx >= len(state.panes):
+            return
+        pane = state.panes[pane_idx]
+        current = canvas.capture_xy_viewport()
+        if current is None:
+            return
+        data = canvas.data_xy_extents()
+        target = list(current)
+        changed = False
+        for index, axis in enumerate(("x", "y")):
+            if pane.viewport_origin[axis] == "auto":
+                continue
+            saved = getattr(pane, axis + "lim")
+            extent = data[index] if data else None
+            try:
+                valid = saved is not None and finite_non_degenerate_range(*saved) is not None and (extent is None or ranges_overlap(saved, extent))
+            except (TypeError, ValueError, IndexError):
+                valid = False
+            if valid:
+                target[index] = saved
+                changed = True
+            else:
+                setattr(pane, axis + "lim", None)
+                pane.viewport_origin[axis] = "auto"
+        if changed:
+            canvas.restore_xy_viewport(*target)
+
+    def _restore_analysis_canvas_viewport(self, section, canvas):
+        managers = getattr(self, "analysis_managers", None) or {}
+        mgr = managers.get(section)
+        if mgr is None or not mgr.views or canvas is None:
+            return
+        comp = self._comparison()
+        if comp is not None:
+            target = comp.target_for_canvas(canvas)
+            if target is not None and target.section == section:
+                state = self._analysis_state_by_id(section, target.view_id)
+                if state is not None:
+                    self._restore_analysis_pane_viewport(
+                        section, state, target.pane_index, canvas,
+                    )
+                    return
+        page = self._analysis_page(section)
+        state = mgr.get(mgr.active)
+        for pane_idx in range(min(page.pane_count(), len(state.panes))):
+            if page.pane_canvas(pane_idx) is canvas:
+                self._restore_analysis_pane_viewport(
+                    section, state, pane_idx, canvas
+                )
+                return
+
+    def _connect_fft_preview_range_signal(self, canvas, pane_idx):
+        signal = getattr(canvas, 'time_preview_range_changed', None)
+        if signal is None or getattr(canvas, '_fft_preview_range_wired', False):
+            return
+        signal.connect(
+            lambda lo, hi, idx=pane_idx: self._on_fft_preview_range_changed(
+                idx, lo, hi))
+        canvas._fft_preview_range_wired = True
+
+    # -- view-switch pipeline (capture → switch → apply → render) -------
+    def _flush_pending_analysis_param_edit(self, section):
+        """Commit the old Inspector editor before changing its View binding.
+
+        Saving via a shortcut does not send FocusOut. Use the editor's normal
+        focus-out path so custom validation (notably the dB reference editor)
+        runs before reading current_params, without interpreting raw text here.
+        """
+        focused = QApplication.focusWidget()
+        ctx = self._analysis_ctx(section)
+        if focused is not None and ctx.isAncestorOf(focused):
+            focused.clearFocus()
+
+    def _capture_active_analysis_view(self, section, *, capture_sources=True):
+        from ..analysis_view_bridge import capture_params_to_state
+        mgr = self.analysis_managers[section]
+        self._flush_pending_analysis_param_edit(section)
+        state = self._analysis_state_for_capture(section)
+        capture_params_to_state(self._analysis_ctx(section), state)
+        routed_pane = None
+        if self._comparison_routes(section):
+            routed_pane = self._dispatch_focus_index(section, state)
+        if section == 'frf':
+            self._capture_frf_canvas_ranges(state)
+        elif section in {'fft', 'fft_time', 'order'}:
+            self._capture_analysis_xy_viewports(section, state)
+        # The shared range widgets only represent the visible section.  Saving
+        # a project flushes every analysis section, so reading them for an
+        # inactive section would overwrite that section's retained range with
+        # whichever mode happens to be on screen.
+        if self.chart_stack.current_mode() == section:
+            self._capture_analysis_time_range(section, state, pane_idx=routed_pane)
+        if section in {'fft', 'frf'}:
+            self._capture_frequency_cursor_controls(section, state)
+        self._capture_analysis_overlay(section, state)
+        if capture_sources:
+            self._capture_analysis_sources(section, state, pane_idx=routed_pane)
+
+    def _capture_analysis_overlay(self, section, state):
+        from ..analysis_view_bridge import capture_overlay_from_canvas
+
+        page = self._analysis_page(section)
+        if not getattr(page, "_overlay_session_bound", False):
+            return
+        for pane_idx in range(len(state.panes)):
+            canvas = self._canvas_for_view_pane(section, state, pane_idx)
+            if canvas is None:
+                continue
+            capture_overlay_from_canvas(
+                canvas, state.panes[pane_idx],
+                chart_stack=self.chart_stack,
+            )
+
+    def _apply_analysis_overlay(self, section, state):
+        from ..analysis_view_bridge import apply_overlay_to_canvas
+
+        page = self._analysis_page(section)
+        page._overlay_session_bound = True
+        for pane_idx in range(min(page.pane_count(), len(state.panes))):
+            apply_overlay_to_canvas(
+                page.pane_canvas(pane_idx), state.panes[pane_idx],
+                chart_stack=self.chart_stack,
+            )
+
+    def _sync_active_analysis_params(self, section):
+        """Persist the active contextual's full View payload immediately.
+
+        The shared Inspector is a projection.  A user edit must therefore
+        update the focused View's complete ledger at the event boundary rather
+        than waiting for the next View switch or project save to capture it.
+        """
+        if self._applying_analysis_view:
+            return None
+        # Shared Inspector controls may be updated by another section while
+        # this analysis page is hidden (for example, source/default routing).
+        # Only the visible section represents an intentional edit to its
+        # active View; a hidden projection must be restored from that View on
+        # re-entry rather than overwriting its ledger.
+        if self.chart_stack.current_mode() != section:
+            return None
+        # Lightweight mixin probes from older tests/extensions predate
+        # AnalysisContext.  Preserve their inspector-only seam while real
+        # MainWindow instances continue through the owning context facade.
+        if hasattr(self, '_analysis_context'):
+            ctx = self._analysis_ctx(section)
+        else:
+            ctx = getattr(self.inspector, f'{section}_ctx')
+        if getattr(ctx, '_applying_preset', False):
+            return None
+        bar = getattr(ctx, 'preset_bar', None)
+        if getattr(bar, 'is_transaction_open', False):
+            return None
+        mgr = self.analysis_managers[section]
+        if not mgr.views:
+            return None
+        params_getter = getattr(ctx, 'current_params', ctx.get_params)
+        state = self._analysis_state_for_dispatch(section)
+        from ..analysis_view_bridge import requested_params_from_context
+
+        consume = getattr(ctx, "consume_color_policy_edit", None)
+        edit = consume() if callable(consume) else None
+        if edit is not None:
+            pane_idx = self._dispatch_focus_index(section, state)
+            canvas = self._canvas_for_view_pane(section, state, pane_idx)
+            from ...heatmap_color_policy import HeatmapColorPolicyError
+
+            try:
+                self._commit_heatmap_color_edit(section, canvas, edit, "inspector")
+            except HeatmapColorPolicyError as error:
+                # A half-entered boundary remains an editor draft, never a
+                # persistent request or a render input. Keep the valid plot.
+                # Returning the untouched state distinguishes this rejection
+                # from the None early-exits above, which mean "no edit".
+                logger.warning(
+                    "Rejected heatmap color edit: section=%s: %s",
+                    section, error,
+                )
+                self.statusBar.showMessage("色阶下限必须小于上限，且两个值均为有限数")
+                return state
+        state.params = requested_params_from_context(ctx, state)
+        holder = getattr(self, "_project_dirty", None)
+        if holder is not None:
+            holder.mark_user_mutation()
+        return state
+
+    def _on_preset_committed(self, section, _baseline=None):
+        """Sync complete View payload after a successful user preset transaction."""
+        if getattr(self, '_applying_analysis_view', False):
+            return
+        if hasattr(self, '_analysis_context'):
+            ctx = self._analysis_ctx(section)
+            sync = self._analysis_context.sync_committed_preset
+        else:
+            ctx_name = 'fft_time_ctx' if section == 'fft_time' else f'{section}_ctx'
+            ctx = getattr(getattr(self, 'inspector', None), ctx_name, None)
+            if ctx is None:
+                return
+            from ..analysis_view_bridge import capture_params_to_state
+
+            def sync(_section, state, _ctx=ctx):
+                capture_params_to_state(_ctx, state)
+
+        mgr = (getattr(self, 'analysis_managers', None) or {}).get(section)
+        if mgr is None or not getattr(mgr, 'views', None):
+            return
+        if self._comparison_routes(section):
+            state = self._analysis_state_for_dispatch(section)
+        else:
+            state = mgr.get(mgr.active)
+        before_params = dict(state.params or {})
+        sync(section, state)
+        holder = getattr(self, '_project_dirty', None)
+        if holder is not None:
+            holder.mark_user_mutation()
+        after_params = dict(state.params or {})
+        compute_changed = (
+            self._requested_compute_projection(section, before_params)
+            != self._requested_compute_projection(section, after_params)
+        )
+        display_changed = before_params != after_params
+        chart_stack = getattr(self, 'chart_stack', None)
+        visible = (
+            chart_stack is not None and chart_stack.current_mode() == section
+        )
+        if compute_changed:
+            # A preset rename or a new baseline with the same numbers does not
+            # reach here. Source capture stays on the real compute edit only.
+            if section == 'order':
+                self._commit_live_analysis_sources(section)
+            self._reconcile_section_result_validity(section, visible=visible)
+        if not visible or compute_changed or not display_changed:
+            return
+        self._reproject_analysis_display(section, state, ctx, before_params, after_params)
+
+    def _requested_compute_projection(self, section, params):
+        """Requested compute intent, without source-specific effective facts.
+
+        Cache projections still carry analysis Fs, prepared NFFT signatures,
+        and pane range/RPM. Those are result identity, not preset intent, so
+        a display-only payload must not look like a new DSP request.
+        """
+        values = dict(params or {})
+        if section == 'frf':
+            from .frf_coordinator import frf_compute_cache_params
+
+            projected = frf_compute_cache_params(values)
+            projected.pop('fs', None)
+            return projected
+        if section == 'fft':
+            projected = self._fft_compute_cache_params(values)
+            projected.pop('fs', None)
+            projected.pop('nfft_facts_signature', None)
+            projected['t_win_s'] = values.get('t_win_s')
+            projected['nfft_mode'] = values.get('nfft_mode')
+            return projected
+        if section == 'fft_time':
+            from .fft_time_coordinator import fft_time_compute_cache_params
+
+            projected = fft_time_compute_cache_params(values, None)
+            projected.pop('time_range', None)
+            projected.pop('nfft_facts_signature', None)
+            projected['t_win_s'] = values.get('t_win_s')
+            projected['nfft_mode'] = values.get('nfft_mode')
+            return projected
+        if section == 'order':
+            projected = self._order_compute_cache_params(values, None, None)
+            projected.pop('time_range', None)
+            projected.pop('rpm_source', None)
+            return projected
+        return values
+
+    def _reproject_analysis_display(self, section, state, ctx, before_params, after_params):
+        """Redraw the current result the same way a direct display edit does."""
+        if (section, getattr(state, 'view_id', None)) in getattr(
+            self, '_analysis_restore_pending', (),
+        ):
+            return
+        if section == 'frf' and hasattr(ctx, 'display_params'):
+            display = ctx.display_params()
+            for idx in range(len(state.panes)):
+                canvas = self._canvas_for_view_pane(section, state, idx)
+                if canvas is not None:
+                    canvas.set_display_params(display)
+            return
+        if section not in {'fft', 'fft_time', 'order'}:
+            return
+        axes = self._analysis_changed_range_axes(before_params, after_params, section)
+        if axes:
+            self._clear_analysis_view_viewports(state, axes)
+        self._render_analysis_view_from_cache(section, state)
+
+    def _analysis_preset_transaction_open(self, section) -> bool:
+        """True while PresetBar still owns the apply, before commit."""
+        if hasattr(self, '_analysis_context'):
+            ctx = self._analysis_ctx(section)
+        else:
+            ctx_name = 'fft_time_ctx' if section == 'fft_time' else f'{section}_ctx'
+            ctx = getattr(getattr(self, 'inspector', None), ctx_name, None)
+        bar = getattr(ctx, 'preset_bar', None) if ctx is not None else None
+        if bar is None:
+            return False
+        return bool(bar.is_transaction_open)
+
+    def _on_analysis_compute_params_changed(self, section, _params):
+        """Record a compute edit without implicitly submitting a new job."""
+        if getattr(self, '_applying_analysis_view', False):
+            return
+        # Preset apply can emit a compute signal while the transaction is
+        # still open. Commit compares the requested projection and is the
+        # only owner of validity for that apply.
+        if self._analysis_preset_transaction_open(section):
+            return
+        state = self._sync_active_analysis_params(section)
+        if section == 'order':
+            self._commit_live_analysis_sources(section)
+        chart_stack = getattr(self, 'chart_stack', None)
+        visible = chart_stack is not None and chart_stack.current_mode() == section
+        if state is None or not visible:
+            self._mark_section_effective_facts_stale(section)
+            return
+        self._reconcile_section_result_validity(section, visible=True)
+
+    def _reconcile_section_result_validity(self, section, *, visible):
+        """Editing changes intent, never permission to publish a cache entry."""
+        mgr = (getattr(self, 'analysis_managers', None) or {}).get(section)
+        if mgr is None or not mgr.views:
+            return
+        state = self._analysis_state_for_dispatch(section)
+        if section == 'frf':
+            self._reconcile_frf_result_validity(state)
+            return
+        self._mark_retained_analysis_result_stale(section, state)
+
+    def _analysis_focused_request_is_cached(self, section, state) -> bool:
+        page = self._analysis_page(section)
+        if page is None or not getattr(state, 'panes', None):
+            return False
+        idx = self._dispatch_focus_index(section, state)
+        if not (0 <= idx < len(state.panes)):
+            return False
+        pane = state.panes[idx]
+        sources = list(pane.sources or [])
+        if not sources:
+            return False
+        cache = self.analysis_caches[section]
+        if section == 'fft':
+            return all(
+                cache.get(self._analysis_cache_key_for_view_source(
+                    section, state, pane, idx, fid, ch,
+                )) is not None
+                for fid, ch in sources
+            )
+        fid, ch = sources[0]
+        key = self._analysis_cache_key_for_view_source(
+            section, state, pane, idx, fid, ch,
+        )
+        return cache.get(key) is not None
+
+    def _mark_analysis_pane_pending(self, section, state, pane_idx):
+        if section == 'frf':
+            self._dirty_frf_pane(state, pane_idx, clear_effective=True)
+            return
+        mark_pending(state.panes[pane_idx])
+        if self._dispatch_focus_index(section, state) == pane_idx:
+            self._mark_section_effective_facts_stale(section)
+        canvas = self._canvas_for_view_pane(section, state, pane_idx)
+        if section == 'fft' and canvas is not None:
+            canvas.mark_spectrum_stale()
+
+    def _mark_retained_analysis_result_stale(self, section, state):
+        """Keep the previous picture and say the numbers are the last result."""
+        for pane in state.panes:
+            mark_pending(pane)
+        self._mark_section_effective_facts_stale(section)
+        if section != 'fft':
+            return
+        page = self._analysis_page(section)
+        if page is None:
+            return
+        for pane_idx in range(len(state.panes)):
+            canvas = self._canvas_for_view_pane(section, state, pane_idx)
+            marker = getattr(canvas, 'mark_spectrum_stale', None)
+            if callable(marker):
+                marker()
+
+    def _unpublish_analysis_completion(self, section, ctx):
+        """Drop a late completion's pin without removing its cache entry.
+
+        The coordinator may already have stored the old identity. That entry
+        stays addressable. It must not remain the pane's current binding.
+        """
+        view_id = ctx.get('view_id')
+        if view_id is None:
+            return
+        if self._analysis_state_by_id(section, view_id) is None:
+            self._drop_analysis_view_pins(section, view_id)
+            return
+        key = ctx.get('analysis_key')
+        if key is None:
+            return
+        try:
+            pane_idx = int(ctx.get('pane_idx', 0))
+        except (TypeError, ValueError):
+            return
+        pins = getattr(self, '_analysis_pins', None)
+        slot = (section, str(view_id), pane_idx)
+        if pins is None or slot not in pins:
+            return
+        state = self._analysis_state_by_id(section, view_id)
+        binding = state.panes[pane_idx].result_binding if 0 <= pane_idx < len(state.panes) else None
+        self._replace_analysis_pane_pins(
+            section, view_id, pane_idx, binding.keys if binding is not None else (),
+        )
+
+    def _effective_facts_health(self, sig, fid=None, sources=None):
+        """Caller-filled health fields for an effective-facts dataclass."""
+        arr = np.asarray(sig, dtype=float) if sig is not None else np.array([])
+        nan_count = int(arr.size - np.count_nonzero(np.isfinite(arr))) if arr.size else 0
+        finite = arr[np.isfinite(arr)] if arr.size else arr
+        is_constant = bool(finite.size > 0 and float(np.ptp(finite)) == 0.0)
+        time_axis = None
+        fd = self.files.get(fid) if fid is not None else None
+        prov = getattr(fd, "time_axis_provenance", None) if fd is not None else None
+        if prov is not None and getattr(prov, "reason", None) == "auto_nonuniform":
+            time_axis = prov.to_dict() if hasattr(prov, "to_dict") else dict(prov)
+        fs_values = []
+        for src in sources or ():
+            if not src:
+                continue
+            sfd = self.files.get(src[0])
+            if sfd is None:
+                continue
+            try:
+                fs_v = float(sfd.fs)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if np.isfinite(fs_v) and fs_v > 0:
+                fs_values.append(fs_v)
+        fs_conflict = False
+        if len(fs_values) > 1:
+            ref = fs_values[0]
+            scale = max(abs(ref), 1.0)
+            fs_conflict = any(
+                abs(v - ref) > 1e-9 * max(scale, abs(v)) for v in fs_values[1:]
+            )
+        return {
+            "nan_count": nan_count,
+            "is_constant": is_constant,
+            "time_axis": time_axis,
+            "fs_conflict": fs_conflict,
+        }, fs_values
+
+    def _publish_analysis_effective_facts(
+        self, ctx, facts, *, sig=None, fid=None, sources=(), extra_warnings=(),
+    ):
+        """Stamp health onto ``facts`` and push to the Inspector card."""
+        if ctx is None or not hasattr(ctx, "set_effective_facts"):
+            return
+        if facts is None:
+            ctx.clear_effective_facts()
+            return
+        from dataclasses import replace
+
+        health, fs_values = self._effective_facts_health(
+            sig, fid=fid, sources=sources,
+        )
+        health["time_axis"] = getattr(facts, "time_axis", None)
+        try:
+            facts = replace(facts, **health)
+        except TypeError:
+            pass
+        warnings = list(extra_warnings)
+        if getattr(facts, "fs_conflict", False) and fs_values:
+            pretty = ", ".join(f"{v:g} Hz" for v in fs_values)
+            warnings.append(f"多源 Fs 冲突：{pretty}")
+        ctx.set_effective_facts(facts, warnings)
+
+    def _sync_section_effective_facts(self, section, state=None):
+        sync = getattr(self, f"_sync_{section}_effective_facts", None)
+        if callable(sync):
+            sync(state)
+
+    def _mark_section_effective_facts_stale(self, section):
+        ctx_name = "fft_time_ctx" if section == "fft_time" else f"{section}_ctx"
+        ctx = getattr(self.inspector, ctx_name, None)
+        marker = getattr(ctx, "mark_effective_facts_stale", None)
+        if callable(marker):
+            marker()
+
+    def _analysis_changed_range_axes(self, before, after, section="fft"):
+        old, new = self._analysis_xy_fingerprint(before), self._analysis_xy_fingerprint(after)
+        axes = [axis for axis, start in (("x", 0), ("y", 3)) if old[start:start+3] != new[start:start+3]]
+        if section == "fft" and any(before.get(key) != after.get(key) for key in ("amp_y", "amplitude_mode", "db_reference", "db_reference_mode", "unit", "unit_mode")) and "y" not in axes:
+            axes.append("y")
+        return tuple(axes)
+
+    def _on_analysis_display_params_changed(self, section, _params):
+        """Clear only changed axis policy; presentation redraw retains intent."""
+        axes = ()
+        if section in {"fft", "fft_time", "order"} and not self._applying_analysis_view and self.chart_stack.current_mode() == section:
+            mgr = self.analysis_managers.get(section)
+            if mgr is not None and mgr.views:
+                axes = self._analysis_changed_range_axes(
+                    self._analysis_state_for_dispatch(section).params, _params, section,
+                )
+        state = self._sync_active_analysis_params(section)
+        if state is not None and axes:
+            self._clear_analysis_view_viewports(state, axes)
+        if state is not None and self.chart_stack.current_mode() == section:
+            self._render_analysis_view_from_cache(section, state)
+
+    def _on_fft_display_params_changed(self, value):
+        """Compatibility slot for the original FFT amplitude-unit wiring."""
+        self._on_analysis_display_params_changed('fft', value)
+
+    def _on_analysis_view_switched(self, section, idx, *, render=True,
+                                   apply_params=True):
+        """manager.active_changed → apply the new view's structure, params and
+        sources, then render whatever the cache already holds (never compute).
+
+        ``render`` / ``apply_params`` let FFT *mode entry* apply the target
+        View's params/sources while deferring canvas restore to
+        ``_enter_fft_mode`` (signature-aware reuse). Params must always be
+        applied on mode entry so live Inspector values cannot overwrite the
+        destination View.
+        """
+        from ..analysis_view_bridge import apply_params_from_state
+        comp = self._comparison()
+        if comp is not None and comp.hold_switch:
+            return
+        mgr = self.analysis_managers[section]
+        if not (0 <= idx < len(mgr.views)):
+            return
+        state = mgr.get(idx)
+        if comp is not None and comp.is_open(section):
+            pair = comp.displayed(section)
+            if pair is not None and str(state.view_id) != str(pair[0]):
+                # Direct manager activation also leaves the old comparison.
+                # The comparison focus still identifies the outgoing editor
+                # even though manager.active already names the destination.
+                self._capture_active_analysis_view(section)
+                self._suspend_comparison_display(section)
+        page = self._analysis_page(section)
+        self._applying_analysis_view = True
+        dirty = getattr(self, "_project_dirty", None)
+        if dirty is not None:
+            dirty.begin_restore()
+        try:
+            # 1. Align the pane structure to the view (1 or 2 panes).
+            if len(state.panes) == 2 and page.pane_count() == 1:
+                page.enter_split()
+                self._connect_new_pane(section, page)
+            elif len(state.panes) == 1 and page.pane_count() == 2:
+                page.exit_split()
+            # 2. Compare options (state is the source of truth; enter_split
+            #    above may have emitted a non-edge link_toggled — we ignore
+            #    that signal entirely and drive set_linked from state here).
+            #    V8 closes the loop: set_levels_locked is now also state-driven,
+            #    and the toggle buttons are re-seeded from state.compare (under
+            #    _applying_analysis_view, so the resulting button edges do not
+            #    write back onto the state we just read).
+            x_linked = bool(state.compare.get('x_linked', True))
+            levels_locked = bool(state.compare.get('levels_locked', True))
+            page.set_linked(x_linked)
+            page.set_levels_locked(levels_locked)
+            page.sync_compare_buttons(
+                x_linked=x_linked, levels_locked=levels_locked)
+            # 3. Project this View's attachments + section-local candidates
+            #    before echoing sources into live controls.
+            if self.chart_stack.current_mode() == section:
+                self._project_analysis_attachments(section, state)
+            self._refresh_analysis_candidates(section)
+            # 4. Params + focused-pane source echo.
+            if apply_params:
+                apply_params_from_state(self._analysis_ctx(section), state)
+            if section in {'fft', 'frf'}:
+                self._apply_frequency_cursor_controls(section, state)
+            self._apply_analysis_sources(
+                section, state, sync_effective_facts=False,
+            )
+            self._apply_analysis_time_range(section, state)
+            self._apply_analysis_overlay(section, state)
+            self.inspector.set_analysis_target(
+                section, state.name, page.focused_index(),
+            )
+        finally:
+            self._applying_analysis_view = False
+            if dirty is not None:
+                dirty.end_restore()
+        # 5. Render from cache only (spec §4: switching never auto-computes).
+        # A completed cache restore already synchronizes its final effective
+        # facts.  ``render=False`` and a deferred restore do not, so they keep
+        # this outer sync as their one owner.  This is transaction-local: no
+        # prepared navigator/inspector data survives the call.
+        #
+        # The facts bool is *not* paint-ready.  It only says whether this
+        # render already synced Inspector effective facts.  Page-transition
+        # arming is a separate presentation-complete notification.
+        facts_synced_by_render = False
+        rendered_ids = []
+        if render:
+            facts_synced_by_render = bool(
+                self._render_analysis_view_from_cache(
+                    section, state, rendered_ids,
+                )
+            )
+        if not facts_synced_by_render:
+            self._sync_section_effective_facts(section, state)
+        else:
+            self._request_analysis_page_transition_ready(section, state)
+        self._restore_remembered_comparison(
+            section, state, already_rendered=rendered_ids,
+        )
+
+    def _project_analysis_attachments(self, section, state):
+        """Project one analysis View's file range onto the shared navigator."""
+        invalidate = getattr(self.navigator, "invalidate_channel_filter_context", None)
+        if callable(invalidate):
+            invalidate()
+        attached = [
+            fid for fid in state.attached_file_ids if fid in self.files
+        ]
+        setter = getattr(self.navigator, 'set_attached_file_ids', None)
+        if callable(setter):
+            setter(attached)
+        label = self._analysis_section_label(section)
+        set_attachment_context = getattr(
+            self.navigator, "set_attachment_context", None,
+        )
+        if callable(set_attachment_context):
+            set_attachment_context(section_label=label, view_name=state.name)
+        empty = getattr(self.navigator, 'set_empty_state_context', None)
+        if callable(empty):
+            empty(section_label=label, view_name=state.name)
+        if section != 'fft':
+            # Candidate roles do not own checkbox selection.
+            self.navigator.set_checked_channels([])
+
+    def _apply_active_analysis_context(self, section, *, render=True,
+                                       apply_params=True):
+        """Full-apply the active View of ``section`` after a mode switch."""
+        mgr = self.analysis_managers[section]
+        if not mgr.views:
+            return
+        # Reuse the view-switch pipeline against the already-active index so
+        # mode entry and View switch stay byte-equivalent for the target.
+        self._on_analysis_view_switched(
+            section, mgr.active, render=render, apply_params=apply_params
+        )
+
+    def _on_analysis_focus_changed(self, section, idx):
+        """A pane click changed the focused pane: capture the source selection
+        into the PREVIOUS focused pane, then echo the now-focused pane's
+        source back into the inspector / navigator."""
+        if self._applying_analysis_view:
+            return
+        if self._comparison_routes(section):
+            comp = self._comparison()
+            focus = comp.focused(section) if comp is not None else None
+            host = self.analysis_managers[section].get(
+                self.analysis_managers[section].active
+            )
+            if focus is None or str(focus[0]) != str(host.view_id):
+                return
+            self.focus_comparison(section, host.view_id, idx)
+            return
+        mgr = self.analysis_managers[section]
+        state = mgr.get(mgr.active)
+        page = self._analysis_page(section)
+        old_idx = min(page.previous_focused_index(), len(state.panes) - 1)
+        self._capture_analysis_sources(section, state, pane_idx=old_idx)
+        self._capture_analysis_time_range(section, state, pane_idx=old_idx)
+        self._apply_analysis_sources(section, state)
+        self._apply_analysis_time_range(section, state)
+        self.inspector.set_analysis_target(section, state.name, idx)
+        if section in {'fft', 'frf'}:
+            self._apply_frequency_cursor_controls(section, state)
+        self._sync_section_effective_facts(section, state)
+        self._settle_heatmap_color(section)
+
+    def _on_analysis_compare_toggled(self, section, key, on):
+        """A page compare toggle (联动缩放 / 锁定色阶) flipped → persist it onto
+        the active view's ``state.compare`` so a later view switch reads it
+        back (V8 write-back loop: toggle → state → _on_analysis_view_switched
+        reads state to drive set_linked / set_levels_locked)."""
+        if self._applying_analysis_view:
+            return
+        mgr = self.analysis_managers[section]
+        state = self._analysis_state_for_dispatch(section)
+        state.compare[key] = bool(on)
+        if key == "levels_locked":
+            self._settle_heatmap_color(section)
+        holder = getattr(self, "_project_dirty", None)
+        if holder is not None:
+            holder.mark_user_mutation()
+
+    def _on_analysis_levels_dragged(self, section, pane_idx, lo, hi):
+        """User dragged a heatmap colorbar → echo (lo, hi) into the inspector
+        Z controls (manual range). Only the FOCUSED pane's drag drives the
+        inspector, since the inspector mirrors the focused pane. fft (line
+        section) has no colorbar so it never reaches here.
+
+        The two-pane *canvas* sync under a level lock is handled entirely
+        inside the page (_on_locked_levels_changed); this path is strictly
+        canvas → inspector, so the two never fight: the page mutates the
+        sibling canvas's levels, MainWindow mutates the inspector spinboxes.
+        apply_params here is an existing inspector API called with corrected
+        args — no algorithm/loader is touched."""
+        if self._applying_analysis_view:
+            return
+        page = self._analysis_page(section)
+        if not self._analysis_canvas_updates_controls(section, page.pane_canvas(pane_idx)):
+            return
+        if pane_idx != page.focused_index():
+            return
+        canvas = page.pane_canvas(pane_idx)
+        if getattr(canvas, "_cbar_drag_open", False):
+            return
+        self._commit_heatmap_color_edit(section, canvas, {
+            "z_auto": False, "z_floor": float(lo), "z_ceiling": float(hi),
+        }, "colorbar")
+
+    def _wire_analysis_chart_appearance(self, canvas, section, pane_idx):
+        """PaneState owns appearance. The canvas only projects the current spec."""
+        if canvas is None or getattr(canvas, "_chart_appearance_wired", False):
+            return
+        signal = getattr(canvas, "user_appearance_committed", None)
+        if signal is not None:
+            signal.connect(partial(
+                self._on_analysis_chart_appearance, section, pane_idx,
+            ))
+        canvas._chart_appearance_wired = True
+
+    def _on_analysis_chart_appearance(self, section, pane_idx, role, spec):
+        if getattr(self, "_applying_analysis_view", False):
+            return
+        mgr = self.analysis_managers.get(section)
+        if mgr is None or not mgr.views:
+            return
+        target = self._target_from_sender(section)
+        if target is not None:
+            state = self._analysis_state_by_id(section, target.view_id)
+            pane_idx = target.pane_index
+        else:
+            state = mgr.get(mgr.active)
+        if state is None or pane_idx >= len(state.panes):
+            return
+        from ..analysis_view_state import normalize_pane_chart_appearances
+
+        pane = state.panes[pane_idx]
+        appearances = dict(getattr(pane, "chart_appearances", None) or {})
+        cleaned = normalize_pane_chart_appearances({str(role): spec}).get(str(role))
+        if cleaned:
+            appearances[str(role)] = cleaned
+        else:
+            appearances.pop(str(role), None)
+        pane.chart_appearances = appearances
+        holder = getattr(self, "_project_dirty", None)
+        if holder is not None:
+            holder.mark_user_mutation()
+
+    def _on_analysis_color_policy(self, section, pane_idx, z_auto, lo, hi, *, canvas=None):
+        """Chart-options colour policy. Distinct from a colorbar drag."""
+        if self._applying_analysis_view:
+            return
+        if canvas is None:
+            canvas = self._analysis_page(section).pane_canvas(pane_idx)
+        self._commit_heatmap_color_edit(section, canvas, {
+            "z_auto": bool(z_auto), "z_floor": float(lo), "z_ceiling": float(hi),
+        }, "chart_options")
+
+    def _wrap_heatmap_chart_options(self, canvas, section, pane_idx):
+        if canvas is None or getattr(canvas, "_heatmap_chart_options_wrapped", False):
+            return
+        opener = getattr(canvas, "open_chart_options_dialog", None)
+        if not callable(opener):
+            return
+        canvas.open_chart_options_dialog = partial(
+            self._open_captured_heatmap_chart_options,
+            section,
+            pane_idx,
+            canvas,
+            opener,
+        )
+        canvas._heatmap_chart_options_wrapped = True
+
+    def _open_captured_heatmap_chart_options(
+        self, section, pane_idx, canvas, opener, parent=None,
+    ):
+        coordinator = self._heatmap_color_coordinator(section)
+        snapshot = coordinator.snapshot(section, canvas) if coordinator else None
+        if snapshot is not None:
+            with coordinator.edit_session(section, canvas):
+                applied = bool(opener(
+                    parent, color_policy_restore_callback=partial(
+                        coordinator.restore, section, canvas, snapshot,
+                    ),
+                ))
+        else:
+            applied = bool(opener(parent))
+        if applied and (snapshot is None or coordinator.target(section, canvas) == snapshot["target"]):
+            self._capture_heatmap_chart_options(section, pane_idx, canvas)
+        return applied
+
+    def _capture_heatmap_chart_options(self, section, pane_idx, canvas):
+        """Snapshot the dialog the user just closed on this view.
+
+        Render/restore does not read ``canvas._cmap_name``. This read happens
+        only at the commit, after chart options wrote the current view.
+        """
+        from .._axis_handle import PgAxisHandle, _plain_axis_text
+        from ..analysis_view_state import normalize_pane_chart_appearances
+        from ...qt_analysis_shared import DEFAULT_HEATMAP_CMAP
+
+        spec = {}
+        plot = getattr(canvas, "_plot", None)
+        if plot is not None:
+            handle = PgAxisHandle(plot, owner_canvas=canvas)
+            title = _plain_axis_text(handle.get_title()).strip()
+            label = getattr(plot, "titleLabel", None)
+            visible = False
+            if label is not None:
+                try:
+                    visible = bool(label.isVisible())
+                except RuntimeError:
+                    visible = False
+            if title:
+                spec["title"] = title
+            elif visible:
+                spec["title"] = ""
+            x_default = str(getattr(canvas, "_default_x_label", "") or "")
+            y_default = str(getattr(canvas, "_default_y_label", "") or "")
+            x_label = _plain_axis_text(handle.get_xlabel())
+            y_label = _plain_axis_text(handle.get_ylabel())
+            if x_default and x_label != x_default:
+                spec["x_label"] = x_label
+            if y_default and y_label != y_default:
+                spec["y_label"] = y_label
+            try:
+                grid = bool(handle.is_grid_enabled())
+            except (AttributeError, RuntimeError):
+                grid = True
+            if grid is not True:
+                spec["grid"] = grid
+        cmap = getattr(canvas, "_cmap_name", None)
+        if isinstance(cmap, str) and cmap.strip() and cmap.strip() != DEFAULT_HEATMAP_CMAP:
+            spec["cmap"] = cmap.strip()
+        pane = self._analysis_pane_for_canvas(section, canvas)
+        if pane is None:
+            return
+        # z_auto / z_min / z_max belong to the heatmap color coordinator.
+        appearances = dict(getattr(pane, "chart_appearances", None) or {})
+        cleaned = normalize_pane_chart_appearances({"heatmap": spec}).get("heatmap")
+        if cleaned:
+            appearances["heatmap"] = cleaned
+        else:
+            appearances.pop("heatmap", None)
+        pane.chart_appearances = appearances
+        holder = getattr(self, "_project_dirty", None)
+        if holder is not None:
+            holder.mark_user_mutation()
+
+    def _analysis_pane_for_canvas(self, section, canvas):
+        managers = getattr(self, "analysis_managers", None) or {}
+        mgr = managers.get(section)
+        if mgr is None or not getattr(mgr, "views", None) or canvas is None:
+            return None
+        comp = self._comparison()
+        target = comp.target_for_canvas(canvas) if comp is not None else None
+        if target is not None and target.section == section:
+            state = self._analysis_state_by_id(section, target.view_id)
+            if state is not None and target.pane_index < len(state.panes):
+                return state.panes[target.pane_index]
+        page = self._analysis_page(section)
+        if page is None or not hasattr(page, "pane_canvas"):
+            return None
+        state = mgr.get(mgr.active)
+        panes = getattr(state, "panes", ()) or ()
+        for pane_idx in range(min(page.pane_count(), len(panes))):
+            if page.pane_canvas(pane_idx) is canvas:
+                return panes[pane_idx]
+        return None
+
+    def _heatmap_cmap_for_canvas(self, section, canvas) -> str:
+        from ...qt_analysis_shared import DEFAULT_HEATMAP_CMAP
+
+        pane = self._analysis_pane_for_canvas(section, canvas)
+        if pane is None:
+            fallback = getattr(canvas, "_cmap_name", DEFAULT_HEATMAP_CMAP)
+            text = str(fallback or DEFAULT_HEATMAP_CMAP).strip()
+            return text or DEFAULT_HEATMAP_CMAP
+        spec = (getattr(pane, "chart_appearances", None) or {}).get("heatmap") or {}
+        cmap = spec.get("cmap") if isinstance(spec, dict) else None
+        if isinstance(cmap, str) and cmap.strip():
+            return cmap.strip()
+        return DEFAULT_HEATMAP_CMAP
+
+    def _publish_line_chart_appearance(self, canvas, pane) -> None:
+        setter = getattr(canvas, "set_user_appearances", None)
+        if callable(setter):
+            setter(getattr(pane, "chart_appearances", None) or {})
+
+    def _project_heatmap_pane_appearance(self, section, canvas, pane=None) -> None:
+        """Project the pane spec after a redraw. Missing method is tolerated."""
+        if pane is None:
+            pane = self._analysis_pane_for_canvas(section, canvas)
+        spec = {}
+        if pane is not None:
+            raw = (getattr(pane, "chart_appearances", None) or {}).get("heatmap") or {}
+            if isinstance(raw, dict):
+                spec = dict(raw)
+            if hasattr(canvas, "_cmap_name"):
+                canvas._cmap_name = self._heatmap_cmap_for_canvas(section, canvas)
+        if self._heatmap_color_coordinator(section) is not None:
+            for key in ("z_auto", "z_min", "z_max"):
+                spec.pop(key, None)
+        apply = getattr(canvas, "apply_user_appearance", None)
+        if callable(apply):
+            apply(spec)
+
+    # -- source routing (Step 4) ----------------------------------------
+    @staticmethod
+    def _normalize_analysis_time_range(value):
+        return AnalysisContext.normalize_time_range(value)
+
+    def _mask_time_range(self, t, *arrays, time_range=None):
+        return self._analysis_context.mask_time_range(
+            t, *arrays, time_range=time_range
+        )
+
+    @staticmethod
+    def _analysis_section_uses_time_range(section):
+        return AnalysisContext.section_uses_time_range(section)
+
+    def _analysis_time_range_draft_is_local(self, section=None, pane_idx=None):
+        """Return ``(lo, hi)`` for a matching-signature user draft on one pane.
+
+        Programmatic ``set_range_values`` is not a draft. The retired 1%
+        plotted-extent heuristic must not be used. Invalid drafts are
+        reported by the compute preflight, not this facade.
+        """
+        mode = section or self.chart_stack.current_mode()
+        if not self._analysis_section_uses_time_range(mode):
+            return None
+        mgr = self.analysis_managers.get(mode)
+        if mgr is None or not mgr.views:
+            return None
+        state, idx = self._analysis_range_target(mode, pane_idx=pane_idx)
+        pane = state.panes[idx]
+        if pane.time_range is not None:
+            return None
+        page = self._analysis_page(mode)
+        if (
+            idx == page.focused_index()
+            and self.inspector.top.range_enabled()
+        ):
+            return None
+        ctrl = self._analysis_context.time_range
+        draft = ctrl.draft_for(mode, state.view_id, idx)
+        if draft is None or draft.range is None or not draft.valid:
+            return None
+        signature = self._analysis_source_signature_for_pane(mode, pane, state)
+        if draft.source_signature != signature:
+            return None
+        bounds = ctrl.source_bounds_for(mode, state.view_id, idx)
+        if (
+            bounds.display_range is not None
+            and display_ranges_equal(draft.range, bounds.display_range)
+        ):
+            return None
+        coverage = validate_requested_span(
+            bounds.per_source,
+            draft.range,
+            bounds_status=bounds.status,
+            bounds_errors=bounds.errors,
+        )
+        if not coverage.ok:
+            return None
+        return draft.range
+
+    def _analysis_time_range_confirm_text(self, items, *, review_only):
+        lines = []
+        multi = len(items) > 1
+        for item in items:
+            span = _format_span_seconds(item.get("range"))
+            display = item.get("available_range", item.get("display_range"))
+            kind = item.get("kind")
+            prefix = (
+                f"窗格 {int(item.get('pane_idx', 0)) + 1}：" if multi else ""
+            )
+            if kind == "invalid_enabled":
+                lines.append(f"{prefix}已启用时间范围无效。")
+            elif kind == "review":
+                available = (
+                    f"可用范围 {_format_span_seconds(display)}"
+                    if display is not None
+                    else "当前来源可用范围"
+                )
+                lines.append(f"{prefix}已启用范围 {span} 超出{available}。")
+            elif kind == "invalid_draft":
+                if multi:
+                    lines.append(f"{prefix}{span}（草稿无效，不能直接启用）")
+                else:
+                    lines.append(
+                        f"你调整了时间范围为 {span}，但尚未启用。"
+                        "当前草稿无效，不能直接启用。"
+                    )
+            elif kind == "uncovered_draft":
+                available = (
+                    f"可用范围 {_format_span_seconds(display)}"
+                    if display is not None
+                    else "当前来源可用范围"
+                )
+                lines.append(f"{prefix}选定范围 {span} 超出{available}。")
+            elif multi:
+                lines.append(f"{prefix}{span}")
+            else:
+                lines.append(
+                    f"你调整了时间范围为 {span}，但尚未启用。"
+                    "此次计算使用哪个范围？"
+                )
+            available_pair, _ = parse_span(item.get("available_range", display))
+            requested_pair, requested_valid = parse_span(item.get("range"))
+            if kind in {"review", "uncovered_draft"} and requested_valid and available_pair:
+                if requested_pair[0] < available_pair[0]:
+                    delta = available_pair[0] - requested_pair[0]
+                    lines.append(f"{prefix}起点早于可用起点 {_format_time_difference(delta)}。")
+                if requested_pair[1] > available_pair[1]:
+                    delta = requested_pair[1] - available_pair[1]
+                    lines.append(f"{prefix}终点晚于可用终点 {_format_time_difference(delta)}。")
+            if (
+                item.get("aligned_range") is not None
+                and item["aligned_range"] != item.get("range")
+            ):
+                lines.append(
+                    f"{prefix}对齐后：{_format_span_seconds(item['aligned_range'])}"
+                    "（仅调整超出的端点）。"
+                )
+        if review_only:
+            lines.append("请选择此次计算使用的范围，或返回调整。")
+        elif multi:
+            lines.append("此次计算使用哪个范围？")
+        return "\n".join(line for line in lines if line)
+
+    def _ask_use_local_time_range(self, lo, hi, conflicts=None):
+        """Modal confirm for drafts / out-of-coverage enabled ranges.
+
+        Returns ``'local'`` / ``'align'`` / ``'full'`` / ``'adjust'`` / ``'cancel'``.
+        Tests monkeypatch this seam. Default button is cancel. Full span
+        is a normal role, never ``DestructiveRole``.
+        """
+        items = list(conflicts or ())
+        if not items:
+            items = [{
+                "pane_idx": 0,
+                "kind": "draft",
+                "range": (lo, hi),
+                "display_range": None,
+            }]
+        kinds = {item.get("kind") for item in items}
+        review_only = kinds <= {"review", "invalid_enabled"}
+        local_ok = kinds == {"draft"}
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle(
+            "已启用范围需要复核" if review_only else "未启用选定时间范围"
+        )
+        box.setText(self._analysis_time_range_confirm_text(
+            items, review_only=review_only,
+        ))
+        local_btn = None
+        adjust_btn = None
+        align_btn = None
+        if (
+            kinds & {"review", "uncovered_draft"}
+            and all(item.get("aligned_range") is not None for item in items)
+        ):
+            align_btn = box.addButton("对齐到可用范围", QMessageBox.AcceptRole)
+        if review_only:
+            full_btn = box.addButton("使用当前来源全时段", QMessageBox.ActionRole)
+            adjust_btn = box.addButton("返回调整", QMessageBox.AcceptRole)
+        else:
+            local_btn = box.addButton("用选定范围", QMessageBox.AcceptRole)
+            local_btn.setEnabled(bool(local_ok))
+            full_btn = box.addButton("用全时段", QMessageBox.ActionRole)
+        cancel_btn = box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(cancel_btn)
+        box.setEscapeButton(cancel_btn)
+        # Role polish applies the shared QSS minimum width; fit afterwards
+        # so showing the dialog cannot reset our text-sized outer widths.
+        prepare_message_box_buttons(box)
+        fit_message_box_buttons_to_text(box)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is local_btn:
+            return "local"
+        if align_btn is not None and clicked is align_btn:
+            return "align"
+        if clicked is full_btn:
+            return "full"
+        if clicked is adjust_btn:
+            return "adjust"
+        return "cancel"
+
+    def _iter_analysis_compute_pane_indices(self, section, state):
+        return self._dispatch_pane_indices(section, state)
+
+    @staticmethod
+    def _pane_has_compute_source(section, pane):
+        if str(section) == "frf":
+            return (
+                getattr(pane, "input_source", None) is not None
+                and getattr(pane, "output_source", None) is not None
+            )
+        return bool(getattr(pane, "sources", None))
+
+    def _analysis_compute_live_identity(self, section):
+        if section == "fft":
+            checked = []
+            getter = getattr(self.navigator, "get_checked_channels", None)
+            if callable(getter):
+                for item in getter() or ():
+                    if len(item) >= 2:
+                        checked.append((item[0], item[1]))
+            return ("fft", tuple(checked))
+        if section in {"fft_time", "order"}:
+            ctx = self._analysis_ctx(section)
+            getter = getattr(ctx, "current_signal", None)
+            sig = getter() if callable(getter) else None
+            return (section, tuple(sig) if sig else None)
+        if section == "frf":
+            ctx = self._analysis_ctx(section)
+            pair_fn = getattr(ctx, "pair", None)
+            pair = pair_fn() if callable(pair_fn) else (None, None)
+            inp, out = pair if pair is not None else (None, None)
+            return (
+                "frf",
+                tuple(inp) if inp else None,
+                tuple(out) if out else None,
+            )
+        return (section,)
+
+    def _analysis_compute_fingerprint(self, section, state, targets):
+        mgr = self.analysis_managers[section]
+        return (
+            str(getattr(state, "view_id", "")),
+            getattr(mgr, "active", None),
+            self._analysis_compute_live_identity(section),
+            tuple(
+                (
+                    item["pane_idx"],
+                    item["signature"],
+                    tuple(item["sources"]),
+                    item["input_source"],
+                    item["output_source"],
+                    item["rpm_source"],
+                )
+                for item in targets
+            ),
+        )
+
+    def _snapshot_analysis_compute_targets(self, section):
+        mgr = self.analysis_managers.get(section)
+        if mgr is None or not mgr.views:
+            return None
+        state = self._analysis_state_for_dispatch(section)
+        ctrl = self._analysis_context.time_range
+        targets = []
+        for idx in self._iter_analysis_compute_pane_indices(section, state):
+            pane = state.panes[idx]
+            signature = self._analysis_source_signature_for_pane(
+                section, pane, state
+            )
+            draft = ctrl.draft_for(section, state.view_id, idx)
+            if not (
+                self._pane_has_compute_source(section, pane)
+                or draft is not None
+                or pane.time_range is not None
+            ):
+                continue
+            targets.append({
+                "pane_idx": idx,
+                "signature": signature,
+                "sources": [tuple(item) for item in (pane.sources or ())],
+                "input_source": getattr(pane, "input_source", None),
+                "output_source": getattr(pane, "output_source", None),
+                "rpm_source": getattr(pane, "rpm_source", None),
+            })
+        return state, targets, self._analysis_compute_fingerprint(
+            section, state, targets
+        )
+
+    def _analysis_time_range_conflicts(self, section, state, targets):
+        ctrl = self._analysis_context.time_range
+        conflicts = []
+        for target in targets:
+            idx = target["pane_idx"]
+            pane = state.panes[idx]
+            signature = target["signature"]
+            bounds = ctrl.source_bounds_for(section, state.view_id, idx)
+            draft = ctrl.draft_for(section, state.view_id, idx)
+            if (
+                draft is not None
+                and draft.source_signature == signature
+                and (draft.range is None or not draft.valid)
+            ):
+                conflicts.append({
+                    "pane_idx": idx,
+                    "kind": "invalid_draft",
+                    "range": draft.range,
+                    "display_range": bounds.display_range,
+                    "signature": signature,
+                    "reason": "invalid_draft",
+                    "errors": ("invalid draft range",),
+                })
+                continue
+            enabled = pane.time_range
+            if enabled is not None:
+                validation = validate_requested_span(
+                    bounds.per_source,
+                    enabled,
+                    bounds_status=bounds.status,
+                    bounds_errors=bounds.errors,
+                )
+                if validation.reason in {"unparseable", "unordered", "missing"}:
+                    conflicts.append({
+                        "pane_idx": idx,
+                        "kind": "invalid_enabled",
+                        "range": validation.span if validation.span is not None else enabled,
+                        "display_range": bounds.display_range,
+                        "signature": signature,
+                        "reason": validation.reason,
+                        "errors": validation.errors,
+                    })
+                    continue
+                intent = ctrl.intent_for(
+                    section,
+                    state.view_id,
+                    idx,
+                    enabled_range=enabled,
+                    source_signature=signature,
+                )
+                if intent.needs_review or not validation.ok:
+                    conflicts.append({
+                        "pane_idx": idx,
+                        "kind": "review",
+                        "range": validation.span,
+                        "display_range": bounds.display_range,
+                        "signature": signature,
+                        "reason": validation.reason,
+                        "errors": validation.errors or intent.errors,
+                    })
+                continue
+            if draft is None or draft.source_signature != signature:
+                continue
+            if (
+                bounds.display_range is not None
+                and display_ranges_equal(draft.range, bounds.display_range)
+            ):
+                continue
+            validation = validate_requested_span(
+                bounds.per_source,
+                draft.range,
+                bounds_status=bounds.status,
+                bounds_errors=bounds.errors,
+            )
+            if not validation.ok:
+                conflicts.append({
+                    "pane_idx": idx,
+                    "kind": "uncovered_draft",
+                    "range": draft.range,
+                    "display_range": bounds.display_range,
+                    "signature": signature,
+                    "reason": validation.reason,
+                    "errors": validation.errors,
+                })
+                continue
+            conflicts.append({
+                "pane_idx": idx,
+                "kind": "draft",
+                "range": draft.range,
+                "display_range": bounds.display_range,
+                "signature": signature,
+                "reason": "ok",
+                "errors": (),
+            })
+        for item in conflicts:
+            bounds = ctrl.source_bounds_for(section, state.view_id, item["pane_idx"])
+            item["available_range"] = common_range(bounds.per_source.values())
+            if item["kind"] in {"review", "uncovered_draft", "draft"}:
+                item["aligned_range"] = covered_range_adjustment(bounds, item["range"])
+        return conflicts
+
+    def _freeze_analysis_time_range_candidates(
+        self, section, state, conflicts, choice,
+    ):
+        """Validate every target before the first pane write."""
+        ctrl = self._analysis_context.time_range
+        candidates = []
+        for item in conflicts:
+            idx = item["pane_idx"]
+            pane = state.panes[idx]
+            signature = item.get("signature")
+            if signature is None:
+                signature = self._analysis_source_signature_for_pane(
+                    section, pane, state
+                )
+            bounds = ctrl.source_bounds_for(section, state.view_id, idx)
+            if choice in {"local", "align"}:
+                requested = item.get("range")
+                if choice == "align":
+                    requested = covered_range_adjustment(bounds, requested)
+                    # Modal re-entry must not change the displayed proposal.
+                    if requested is None or requested != item.get("aligned_range"):
+                        return None
+                validation = validate_requested_span(
+                    bounds.per_source,
+                    requested,
+                    bounds_status=bounds.status,
+                    bounds_errors=bounds.errors,
+                )
+                if not validation.ok:
+                    return None
+                candidates.append({
+                    "pane_idx": idx,
+                    "pane": pane,
+                    "signature": signature,
+                    "new_range": validation.span,
+                    "action": "enable",
+                })
+                continue
+            if bounds.status == "unavailable":
+                return None
+            candidates.append({
+                "pane_idx": idx,
+                "pane": pane,
+                "signature": signature,
+                "new_range": None,
+                "action": "full",
+            })
+        return candidates
+
+    def _commit_analysis_time_range_choice(
+        self, section, state, conflicts, choice,
+    ):
+        candidates = self._freeze_analysis_time_range_candidates(
+            section, state, conflicts, choice,
+        )
+        if candidates is None:
+            return False
+        ctrl = self._analysis_context.time_range
+        for item in candidates:
+            pane = item["pane"]
+            idx = item["pane_idx"]
+            signature = item["signature"]
+            before = pane.time_range
+            if item["action"] == "enable":
+                pane.time_range = item["new_range"]
+                ctrl.note_enabled(
+                    section, state.view_id, idx, item["new_range"], signature
+                )
+            else:
+                pane.time_range = None
+                ctrl.convert_to_full(section, state.view_id, idx)
+            if pane.time_range != before:
+                self._mark_analysis_pane_pending(section, state, idx)
+        self._apply_analysis_time_range(section, state)
+        return True
+
+    def _offer_analysis_time_range_before_compute(self, section):
+        """User-click preflight: flush, freeze targets, one confirm, commit.
+
+        Restore auto-recompute and Batch must not call this. Workers keep
+        consuming ``pane.time_range`` after the transaction.
+        """
+        if not self._analysis_section_uses_time_range(section):
+            return True
+        self._flush_pending_analysis_range_edit(section)
+        snapshot = self._snapshot_analysis_compute_targets(section)
+        if snapshot is None:
+            return True
+        state, targets, fingerprint = snapshot
+        conflicts = self._analysis_time_range_conflicts(section, state, targets)
+        if not conflicts:
+            return True
+        first = conflicts[0].get("range") or (0.0, 0.0)
+        try:
+            lo, hi = float(first[0]), float(first[1])
+        except (TypeError, ValueError, IndexError):
+            lo, hi = 0.0, 0.0
+        choice = self._ask_use_local_time_range(lo, hi, conflicts)
+        if choice in (None, "cancel", "adjust"):
+            return False
+        now = self._snapshot_analysis_compute_targets(section)
+        if now is None or now[2] != fingerprint:
+            return False
+        state = now[0]
+        if choice == "local":
+            if any(item.get("kind") != "draft" for item in conflicts):
+                return False
+            return self._commit_analysis_time_range_choice(
+                section, state, conflicts, "local"
+            )
+        if choice == "align":
+            if any(item.get("aligned_range") is None for item in conflicts):
+                return False
+            return self._commit_analysis_time_range_choice(
+                section, state, conflicts, "align"
+            )
+        if choice == "full":
+            return self._commit_analysis_time_range_choice(
+                section, state, conflicts, "full"
+            )
+        return False
+
+    def _analysis_restore_time_range_block_reason(self, section, state, pane_idx):
+        """Reason to skip restore recompute, or ``None``.
+
+        Ignores drafts and never opens a confirm dialog. Invalid or
+        out-of-coverage enabled spans must not silently become full.
+        """
+        if not self._analysis_section_uses_time_range(section):
+            return None
+        pane = state.panes[pane_idx]
+        if pane.time_range is None:
+            return None
+        parsed, valid = parse_span(pane.time_range)
+        if not valid:
+            return "已启用时间范围无效，已停止自动计算"
+        ctrl = self._analysis_context.time_range
+        bounds = ctrl.source_bounds_for(section, state.view_id, pane_idx)
+        if bounds.status == "unavailable":
+            return "当前来源时间范围不可用，已停止自动计算"
+        if not enabled_covers_sources(bounds.per_source, parsed):
+            return "已启用时间范围超出当前来源，已停止自动计算"
+        return None
+
+    def _resolve_job_time_range(self, section, time_range, pane_idx=None):
+        """Workers consume ``pane.time_range``, never an unchecked spin draft."""
+        from ._sentinel import _INSPECTOR_TIME_RANGE
+        if time_range is not _INSPECTOR_TIME_RANGE:
+            return time_range
+        return self._pane_time_range_for(section, pane_idx)
+
+    def _analysis_range_target(self, section, state=None, pane_idx=None):
+        mgr = self.analysis_managers[section]
+        if state is None:
+            state = self._analysis_state_for_dispatch(section)
+        if pane_idx is None:
+            pane_idx = self._dispatch_focus_index(section, state)
+        idx = min(int(pane_idx), max(len(state.panes) - 1, 0))
+        return state, idx
+
+    def _axis_facts_for_sources(self, sources):
+        ctx = getattr(self, "_analysis_context", None)
+        getter = getattr(ctx, "axis_facts_for_sources", None)
+        if callable(getter):
+            return getter(sources)
+        from .analysis_time_range import axis_facts_from_files
+        return axis_facts_from_files(getattr(self, "files", None) or {}, sources)
+
+    def _analysis_source_signature_for_pane(self, section, pane, state=None):
+        sources = list(getattr(pane, "sources", None) or ())
+        input_source = getattr(pane, "input_source", None)
+        output_source = getattr(pane, "output_source", None)
+        rpm_source = getattr(pane, "rpm_source", None)
+        named = list(sources)
+        for extra in (input_source, output_source, rpm_source):
+            if extra is not None:
+                named.append(extra)
+        rpm_mode = None
+        if str(section) == "order":
+            if state is not None:
+                rpm_mode = (getattr(state, "params", None) or {}).get("rpm_mode")
+            if rpm_mode is None:
+                ctx = self._analysis_ctx(section)
+                getter = getattr(ctx, "rpm_mode", None)
+                rpm_mode = getter() if callable(getter) else None
+        return make_source_signature(
+            section,
+            sources=sources,
+            rpm_mode=rpm_mode,
+            rpm_source=rpm_source,
+            input_source=input_source,
+            output_source=output_source,
+            axis_facts=self._axis_facts_for_sources(named),
+        )
+
+    def _silent_project_range_values(self, lo, hi):
+        top = self.inspector.top
+        try:
+            lo_f = float(lo)
+            hi_f = float(hi)
+        except (TypeError, ValueError):
+            return
+        cur_min = min(top.spin_start.minimum(), top.spin_end.minimum())
+        cur_max = max(top.spin_start.maximum(), top.spin_end.maximum())
+        # Expand only so a longer source is not clamped back to a stale max
+        # (R1 leftover 43.061). Do not shrink to the source span.
+        top.set_range_limits(min(cur_min, lo_f, hi_f), max(cur_max, lo_f, hi_f))
+        top.set_range_values(lo_f, hi_f)
+
+    def _project_top_from_time_range_intent(self, section, intent, *, enabled=False):
+        kind = intent.kind
+        top = self.inspector.top
+        if kind == "unavailable":
+            self._set_top_range_enabled_silently(False, mode=section)
+            top.set_range_values(0.0, 0.0)
+        elif kind == "enabled":
+            if intent.range is not None:
+                self._silent_project_range_values(*intent.range)
+            self._set_top_range_enabled_silently(True, mode=section)
+        elif kind == "draft":
+            if intent.range is not None:
+                self._silent_project_range_values(*intent.range)
+            self._set_top_range_enabled_silently(False, mode=section)
+        elif kind == "invalid":
+            if intent.range is not None:
+                self._silent_project_range_values(*intent.range)
+            self._set_top_range_enabled_silently(bool(enabled), mode=section)
+        else:
+            self._set_top_range_enabled_silently(False, mode=section)
+            if intent.display_range is not None:
+                self._silent_project_range_values(*intent.display_range)
+        top.set_range_intent_status(
+            kind,
+            needs_review=bool(getattr(intent, "needs_review", False)),
+            errors=tuple(getattr(intent, "errors", ()) or ()),
+            notes=tuple(getattr(intent, "notes", ()) or ()),
+        )
+
+    def _project_committed_time_range_intent(self, section, intent):
+        if intent is None or not self._analysis_section_uses_time_range(section):
+            return
+        state, idx = self._analysis_range_target(section)
+        pane = state.panes[idx]
+        self._project_top_from_time_range_intent(
+            section, intent, enabled=pane.time_range is not None,
+        )
+
+    def _apply_user_range_commit(self, span):
+        if getattr(self, "_applying_analysis_view", False):
+            return None
+        if getattr(self, "_applying_view", False):
+            return None
+        mode = self.chart_stack.current_mode()
+        if mode not in getattr(self, "analysis_managers", {}):
+            return None
+        intent = self._commit_analysis_user_range(mode, span)
+        self._project_committed_time_range_intent(mode, intent)
+        return intent
+
+    def _commit_analysis_user_range(
+        self, section, span, *, state=None, pane_idx=None,
+    ):
+        if not self._analysis_section_uses_time_range(section):
+            return None
+        state, idx = self._analysis_range_target(section, state, pane_idx)
+        pane = state.panes[idx]
+        view_id = state.view_id
+        signature = self._analysis_source_signature_for_pane(section, pane, state)
+        ctrl = self._analysis_context.time_range
+        intent = ctrl.apply_user_edit(section, view_id, idx, span, signature)
+        parsed, valid = parse_span(span)
+        if not valid:
+            return intent
+        # Checkbox-on is owned by ``_enable_focused_analysis_time_range``.
+        # A just-checked box during flush must not write the pane here, or
+        # enable would then treat "no draft" as source-full and overwrite.
+        if pane.time_range is None:
+            return intent
+        before = pane.time_range
+        pane.time_range = parsed
+        intent = ctrl.note_enabled(
+            section, view_id, idx, pane.time_range, signature,
+        )
+        if pane.time_range != before:
+            self._mark_analysis_pane_pending(section, state, idx)
+        return intent
+
+    def _flush_pending_analysis_range_edit(
+        self, section=None, *, state=None, pane_idx=None,
+    ):
+        top = getattr(getattr(self, "inspector", None), "top", None)
+        flush = getattr(top, "flush_pending_range_edit", None)
+        if not callable(flush):
+            return None
+        query_fn = getattr(top, "query_range_edit", None)
+        query = query_fn() if callable(query_fn) else None
+        pending = flush(emit=False)
+        mode = section or self.chart_stack.current_mode()
+        if mode not in getattr(self, "analysis_managers", {}):
+            return pending
+        if query is not None and getattr(query, "status", None) == "invalid_edit":
+            self._commit_analysis_user_range(
+                mode, query.span, state=state, pane_idx=pane_idx,
+            )
+            return None
+        if pending is None:
+            return None
+        self._commit_analysis_user_range(
+            mode, pending, state=state, pane_idx=pane_idx,
+        )
+        return pending
+
+    def _convert_analysis_time_range_to_full(
+        self, section, state=None, pane_idx=None,
+    ):
+        state, idx = self._analysis_range_target(section, state, pane_idx)
+        state.panes[idx].time_range = None
+        self._analysis_context.time_range.convert_to_full(
+            section, state.view_id, idx,
+        )
+        self._apply_analysis_time_range(section, state)
+
+    def _source_unavailable_range_coverage(self, coverage):
+        return getattr(coverage, "reason", None) in {
+            "unavailable", "no_sources", "missing",
+        }
+
+    def _keep_specified_analysis_range_with_errors(
+        self, section, state, pane_idx, *, span, signature, coverage,
+    ):
+        """Keep 指定范围 when sources exist but do not cover ``span``."""
+        pane = state.panes[pane_idx]
+        ctrl = self._analysis_context.time_range
+        pane.time_range = span
+        intent = ctrl.note_enabled(
+            section, state.view_id, pane_idx, span, signature,
+            needs_review=True,
+        )
+        extra = tuple(getattr(coverage, "errors", ()) or ())
+        if extra:
+            intent = replace(
+                intent,
+                errors=tuple(intent.errors or ()) + extra,
+            )
+        self._project_top_from_time_range_intent(
+            section, intent, enabled=True,
+        )
+
+    def _enable_focused_analysis_time_range(self, section, state, pane_idx):
+        """指定范围: valid draft, else exact source full. Invalid stays draft.
+
+        Unavailable sources refuse the selection. A parseable span that the
+        current sources do not cover stays specified with errors so the UI
+        cannot show 指定范围 while the model silently falls back to full.
+        """
+        self._flush_pending_analysis_range_edit(
+            section, state=state, pane_idx=pane_idx,
+        )
+        pane = state.panes[pane_idx]
+        ctrl = self._analysis_context.time_range
+        view_id = state.view_id
+        draft = ctrl.draft_for(section, view_id, pane_idx)
+        if draft is not None and (not draft.valid or draft.range is None):
+            self._set_top_range_enabled_silently(False, mode=section)
+            intent = ctrl.intent_for(
+                section,
+                view_id,
+                pane_idx,
+                enabled_range=pane.time_range,
+                source_signature=draft.source_signature,
+            )
+            self._project_top_from_time_range_intent(
+                section, intent, enabled=False,
+            )
+            return
+        if draft is not None and draft.valid and draft.range is not None:
+            bounds = ctrl.source_bounds_for(section, view_id, pane_idx)
+            coverage = validate_requested_span(
+                bounds.per_source,
+                draft.range,
+                bounds_status=bounds.status,
+                bounds_errors=bounds.errors,
+            )
+            if not coverage.ok:
+                if self._source_unavailable_range_coverage(coverage):
+                    self._set_top_range_enabled_silently(False, mode=section)
+                    intent = ctrl.intent_for(
+                        section,
+                        view_id,
+                        pane_idx,
+                        enabled_range=pane.time_range,
+                        source_signature=draft.source_signature,
+                    )
+                    self._project_top_from_time_range_intent(
+                        section, intent, enabled=False,
+                    )
+                    return
+                self._keep_specified_analysis_range_with_errors(
+                    section, state, pane_idx,
+                    span=draft.range,
+                    signature=draft.source_signature,
+                    coverage=coverage,
+                )
+                return
+            pane.time_range = draft.range
+            intent = ctrl.note_enabled(
+                section, view_id, pane_idx, draft.range, draft.source_signature,
+            )
+            self._project_top_from_time_range_intent(
+                section, intent, enabled=True,
+            )
+            return
+        if pane.time_range is not None:
+            signature = self._analysis_source_signature_for_pane(
+                section, pane, state
+            )
+            intent = ctrl.intent_for(
+                section,
+                view_id,
+                pane_idx,
+                enabled_range=pane.time_range,
+                source_signature=signature,
+            )
+            self._project_top_from_time_range_intent(
+                section, intent, enabled=True,
+            )
+            return
+        bounds = ctrl.source_bounds_for(section, view_id, pane_idx)
+        parsed, valid = parse_span(bounds.display_range)
+        if valid:
+            coverage = validate_requested_span(
+                bounds.per_source,
+                parsed,
+                bounds_status=bounds.status,
+                bounds_errors=bounds.errors,
+            )
+            signature = self._analysis_source_signature_for_pane(
+                section, pane, state
+            )
+            if not coverage.ok:
+                if self._source_unavailable_range_coverage(coverage):
+                    self._set_top_range_enabled_silently(False, mode=section)
+                    intent = ctrl.intent_for(section, view_id, pane_idx)
+                    self._project_top_from_time_range_intent(
+                        section, intent, enabled=False,
+                    )
+                    return
+                self._keep_specified_analysis_range_with_errors(
+                    section, state, pane_idx,
+                    span=parsed,
+                    signature=signature,
+                    coverage=coverage,
+                )
+                return
+            pane.time_range = parsed
+            intent = ctrl.note_enabled(
+                section, view_id, pane_idx, parsed, signature,
+            )
+            self._project_top_from_time_range_intent(
+                section, intent, enabled=True,
+            )
+            return
+        pane.time_range = None
+        self._set_top_range_enabled_silently(False, mode=section)
+        intent = ctrl.intent_for(section, view_id, pane_idx)
+        self._project_top_from_time_range_intent(
+            section, intent, enabled=False,
+        )
+
+    def _capture_analysis_time_range(self, section, state, pane_idx=None):
+        if not self._analysis_section_uses_time_range(section):
+            return
+        page = self._analysis_page(section)
+        if pane_idx is None:
+            pane_idx = page.focused_index()
+        idx = min(int(pane_idx), len(state.panes) - 1)
+        self._flush_pending_analysis_range_edit(
+            section, state=state, pane_idx=idx,
+        )
+        pane = state.panes[idx]
+        top = self.inspector.top
+        if top.range_enabled():
+            # Already-enabled model keeps its exact tuple. Do not write
+            # display-rounded spin.value() back. set_range_from_span arms
+            # the checkbox without a model yet — persist that span once.
+            if pane.time_range is not None:
+                return
+            parsed, valid = parse_span(top.range_values())
+            if not valid:
+                return
+            pane.time_range = parsed
+            self._mark_analysis_pane_pending(section, state, idx)
+            signature = self._analysis_source_signature_for_pane(
+                section, pane, state
+            )
+            self._analysis_context.time_range.note_enabled(
+                section, state.view_id, idx, pane.time_range, signature,
+            )
+            return
+        if pane.time_range is not None:
+            pane.time_range = None
+            self._mark_analysis_pane_pending(section, state, idx)
+
+    def _set_top_range_enabled_silently(self, enabled, *, mode=None):
+        top = self.inspector.top
+        target_mode = mode or top._range_mode
+        top._range_checked_by_mode[target_mode] = bool(enabled)
+        # Project restore can apply an analysis view before the toolbar has
+        # switched the Inspector into that mode.  Remember that mode's intent
+        # without clobbering the visible Time-mode checkbox; checkout later
+        # restores the right state as the shared group is reparented.
+        if target_mode != top._range_mode:
+            return
+        top.set_range_enabled(enabled, silent=True)
+
+    def _sync_analysis_time_range_after_sources(
+        self, section, state, pane_idx=None, *, project=True,
+    ):
+        """Record a pane source signature. Project only the focused visible pane.
+
+        Signature changes drop a stale draft and flag enabled spans that the
+        new source does not cover. Never clamps ``pane.time_range`` and never
+        opens the compute confirm dialog.
+        """
+        if not self._analysis_section_uses_time_range(section):
+            return None
+        ctrl = getattr(getattr(self, "_analysis_context", None), "time_range", None)
+        if ctrl is None or not getattr(state, "panes", None):
+            return None
+        if pane_idx is None:
+            pane_idx = self._dispatch_focus_index(section, state)
+        idx = min(int(pane_idx), len(state.panes) - 1)
+        pane = state.panes[idx]
+        signature = self._analysis_source_signature_for_pane(section, pane, state)
+        intent = ctrl.on_source_signature_changed(
+            section,
+            state.view_id,
+            idx,
+            signature,
+            enabled_range=pane.time_range,
+        )
+        if not project:
+            return intent
+        if self.chart_stack.current_mode() != section:
+            return intent
+        focused = self._dispatch_focus_index(section, state)
+        if idx != focused:
+            return intent
+        self._project_top_from_time_range_intent(
+            section, intent, enabled=pane.time_range is not None,
+        )
+        return intent
+
+    def _commit_live_analysis_sources(self, section, state=None, pane_idx=None):
+        """Capture the live source widgets and project the focused pane."""
+        if getattr(self, "_applying_analysis_view", False):
+            return
+        if getattr(self, "_opening_project", False):
+            return
+        if getattr(self, "_restoring_project", False):
+            return
+        if not self._analysis_section_uses_time_range(section):
+            return
+        if self.chart_stack.current_mode() != section:
+            return
+        mgr = self.analysis_managers[section]
+        if not mgr.views:
+            return
+        if state is None:
+            state = self._analysis_state_for_dispatch(section)
+        if pane_idx is None and self._comparison_routes(section):
+            focus = self._comparison().focused(section)
+            if focus is not None and str(focus[0]) == str(state.view_id):
+                pane_idx = int(focus[1])
+        self._capture_analysis_sources(section, state, pane_idx=pane_idx)
+        self._apply_analysis_time_range(section, state)
+
+    def _refresh_analysis_time_range_after_source_loss(
+        self, section=None, state=None,
+    ):
+        """Re-validate every affected pane after a file/channel drop."""
+        ctrl = getattr(getattr(self, "_analysis_context", None), "time_range", None)
+        if ctrl is None:
+            return
+        if section is not None and state is not None:
+            for idx in range(len(getattr(state, "panes", ()) or ())):
+                self._sync_analysis_time_range_after_sources(
+                    section, state, idx, project=False,
+                )
+            if self.chart_stack.current_mode() == section:
+                self._apply_analysis_time_range(section, state)
+            return
+        for sec, mgr in (getattr(self, "analysis_managers", None) or {}).items():
+            if not self._analysis_section_uses_time_range(sec):
+                continue
+            for view in mgr.views:
+                for idx in range(len(getattr(view, "panes", ()) or ())):
+                    self._sync_analysis_time_range_after_sources(
+                        sec, view, idx, project=False,
+                    )
+        mode = self.chart_stack.current_mode()
+        if mode in (getattr(self, "analysis_managers", None) or {}):
+            mgr = self.analysis_managers[mode]
+            if mgr.views:
+                self._apply_analysis_time_range(mode, mgr.get(mgr.active))
+
+    def _apply_analysis_time_range(self, section, state):
+        if not self._analysis_section_uses_time_range(section):
+            return
+        self._sync_analysis_time_range_after_sources(
+            section, state, project=True,
+        )
+
+    def _pane_time_range_for(self, section, pane_idx=None):
+        return self._analysis_context.pane_time_range_for(section, pane_idx)
+
+    def _capture_analysis_sources(self, section, state, pane_idx=None):
+        if section == 'fft' and getattr(self, '_opening_project', False):
+            # A post-load auto-recompute (QTimer.singleShot(0, ...) queued by
+            # open_project) can be drained mid-restore by a LATER
+            # QApplication.processEvents() in the SAME open_project() call
+            # chain (entering 'time' mode -> _plot_time_on_canvas ->
+            # _begin_compute_progress(process_events=True)). By then the
+            # shared Time/FFT navigator already holds the Time view's own
+            # restored checked channels, not FFT's -- AnalysisViewState.
+            # panes[*].sources is the source of truth for a not-yet-focused
+            # section while a project is still opening, never the live
+            # navigator selection. See docs/lessons-learned/signal-
+            # processing/2026-07-12-processevents-drains-queued-recompute-
+            # during-restore.md.
+            return
+        page = self._analysis_page(section)
+        if pane_idx is None:
+            pane_idx = page.focused_index()
+        idx = min(int(pane_idx), len(state.panes) - 1)
+        pane = state.panes[idx]
+        before_sources = (tuple(pane.sources), pane.rpm_source)
+        if section == 'frf':
+            self._capture_frf_sources(state, idx)
+            self._sync_analysis_time_range_after_sources(
+                section, state, idx, project=False,
+            )
+            return
+        if section == 'fft':
+            checked = self.navigator.get_checked_channels()
+            if checked:
+                pane.sources = [(fid, ch) for fid, ch, _color in checked]
+            else:
+                ctx = self._analysis_ctx(section)
+                sig = ctx.current_signal() if hasattr(ctx, 'current_signal') else None
+                try:
+                    fid, ch = sig[0], sig[1]
+                except (TypeError, ValueError, IndexError):
+                    pane.sources = []
+                else:
+                    pane.sources = [(fid, ch)] if fid in self.files else []
+            self._sync_fft_source_summary(checked)
+        else:
+            ctx = self._analysis_ctx(section)
+            sig = ctx.current_signal()
+            pane.sources = [tuple(sig)] if sig else []
+            basis = pane.heatmap_color_basis
+            if basis is not None and tuple(basis["source"]) not in pane.sources:
+                pane.heatmap_color_basis = None
+            if section == 'order':
+                rpm = ctx.current_rpm()
+                pane.rpm_source = tuple(rpm) if rpm else None
+        if before_sources != (tuple(pane.sources), pane.rpm_source):
+            self._mark_analysis_pane_pending(section, state, idx)
+        self._sync_analysis_time_range_after_sources(
+            section, state, idx, project=False,
+        )
+
+    def _analysis_channel_color_map(self):
+        colors = {}
+        getter = getattr(self.navigator, 'get_channel_colors', None)
+        if callable(getter):
+            for key, color in getter().items():
+                try:
+                    fid, ch = key[:2]
+                except (TypeError, ValueError):
+                    continue
+                colors[(fid, ch)] = color
+        for row in self.navigator.get_checked_channels():
+            try:
+                fid, ch, color = row[:3]
+            except (TypeError, ValueError):
+                continue
+            colors[(fid, ch)] = color
+        return colors
+
+    def _apply_analysis_sources(self, section, state, *,
+                                sync_effective_facts=True):
+        idx = self._dispatch_focus_index(section, state)
+        pane = state.panes[idx]
+        if section == 'frf':
+            self._apply_frf_sources(
+                state, pane_idx=idx, sync_effective_facts=sync_effective_facts,
+            )
+            return
+        if section == 'fft':
+            self.navigator.set_checked_channels(list(pane.sources))
+            self._sync_fft_source_summary()
+            return
+        ctx = self._analysis_ctx(section)
+        if pane.sources:
+            self._echo_combo_signal(ctx.combo_sig, pane.sources[0])
+        else:
+            self._clear_combo_selection(ctx.combo_sig)
+        if section == 'order':
+            if pane.rpm_source is not None:
+                self._echo_combo_signal(ctx.combo_rpm, pane.rpm_source)
+            else:
+                self._clear_combo_selection(ctx.combo_rpm)
+
+    @staticmethod
+    def _echo_combo_signal(combo, key):
+        """Select ``key`` (a (fid, ch) tuple) in a SearchableComboBox by its
+        userData, tolerating list/tuple shape drift."""
+        if key is None:
+            return
+        target = tuple(key)
+        for i in range(combo.count()):
+            data = combo.itemData(i)
+            if data is not None and tuple(data) == target:
+                combo.setCurrentIndex(i)
+                return
+
+    @staticmethod
+    def _clear_combo_selection(combo):
+        """Clear a signal/RPM combo without emitting into PaneState."""
+        old = combo.blockSignals(True)
+        try:
+            # Prefer the explicit "none" row when present; else leave unselected.
+            none_idx = -1
+            for i in range(combo.count()):
+                if combo.itemData(i) is None:
+                    none_idx = i
+                    break
+            combo.setCurrentIndex(none_idx if none_idx >= 0 else -1)
+        finally:
+            combo.blockSignals(old)
+
+    # -- cache-backed render on switch (Step 3) -------------------------
+    def _analysis_compute_params(self, section):
+        """Compute-relevant params (cache-key inputs) for the active inspector
+        state of ``section``. Display-only knobs are excluded so toggling them
+        does not invalidate the cache."""
+        if hasattr(self, '_analysis_context'):
+            ctx = self._analysis_ctx(section)
+        else:
+            ctx = getattr(self.inspector, f'{section}_ctx')
+        compute_params = getattr(ctx, 'compute_params', None)
+        p = compute_params() if callable(compute_params) else ctx.get_params()
+        if section == 'frf':
+            from .frf_coordinator import frf_compute_cache_params
+            return frf_compute_cache_params(p)
+        return p
+
+    def _analysis_cache_key(
+        self, section, fid, ch, rpm_source=None, pane_idx=None, *,
+        params=None, time_range=_ANALYSIS_CACHE_RANGE_UNSET,
+    ):
+        cache = self.analysis_caches[section]
+        if time_range is _ANALYSIS_CACHE_RANGE_UNSET:
+            resolved_range = self._pane_time_range_for(section, pane_idx)
+        else:
+            resolved_range = time_range
+        if section == 'fft_time':
+            p = dict(
+                self._analysis_compute_params('fft_time')
+                if params is None else params
+            )
+            prepared = self._fft_time_effective_params_for_source(
+                p, fid, ch, resolved_range)
+            if prepared is not None:
+                effective_p, _effective_time_range = prepared
+                return self._fft_time_analysis_cache_key(
+                    fid, ch, effective_p, resolved_range)
+            # Fallback: signal not yet available (< 2 samples). Delegate to
+            # the primary key function so the key is always byte-identical to
+            # the one that will be stored on compute — no field-shape divergence.
+            # A synthetic params dict built here previously omitted `weighting`,
+            # which caused A-weighted results to share a cache slot with
+            # unweighted ones (问题④).
+            #
+            # Auto-nfft without samples: do not disguise nfft_preview as an
+            # actual NFFT. Keep nfft None and put intent on the facts signature
+            # so different targets still miss, and int(None) is no longer used.
+            p_fb = dict(p)
+            auto_unresolved = (
+                p_fb.get('nfft_mode') == 'auto'
+                and p_fb.get('nfft_effective') is None
+                and p_fb.get('nfft') is None
+            )
+            if auto_unresolved and p_fb.get('nfft_facts_signature') is None:
+                from ...signal import nfft_facts_signature, requested_auto_nfft
+                from ...signal.analysis_defaults import (
+                    AUTO_NFFT_POLICY_VERSION,
+                    DEFAULT_FFT_T_WIN_S,
+                )
+                t_win = p_fb.get('t_win_s', DEFAULT_FFT_T_WIN_S)
+                requested = p_fb.get('nfft_preview')
+                if requested is None:
+                    try:
+                        requested = requested_auto_nfft(
+                            p_fb.get('fs'), t_win, purpose='fft_time',
+                        )
+                    except (TypeError, ValueError):
+                        requested = None
+                p_fb['nfft_facts_signature'] = nfft_facts_signature(
+                    nfft_mode='auto',
+                    policy_version=AUTO_NFFT_POLICY_VERSION,
+                    t_win_s=t_win,
+                    requested_nfft=requested,
+                    effective_nfft=None,
+                    n_samples=None,
+                )
+            return self._fft_time_analysis_cache_key(
+                fid, ch, p_fb, resolved_range)
+        if section == 'fft':
+            live_params = (
+                self._analysis_compute_params(section)
+                if params is None else params
+            )
+            effective = self._fft_effective_params_for_source(
+                live_params,
+                fid,
+                ch,
+                resolved_range,
+            )
+            return self._fft_analysis_cache_key(
+                fid, ch, effective, resolved_range)
+        if section == 'order':
+            live_params = (
+                self._analysis_compute_params(section)
+                if params is None else params
+            )
+            effective = self._order_effective_params_for_source(
+                live_params,
+                fid,
+                ch,
+                rpm_source,
+                resolved_range,
+            )
+            if effective is not None:
+                live_params = effective
+            return self._order_analysis_cache_key(
+                fid,
+                ch,
+                live_params,
+                rpm_source,
+                resolved_range,
+            )
+        live_params = dict(
+            self._analysis_compute_params(section)
+            if params is None else params
+        )
+        if section in {'fft', 'fft_time', 'order'}:
+            live_params['time_range'] = resolved_range
+        return cache.make_key(fid, ch, live_params)
+
+    def _analysis_cache_key_for_view_source(
+        self, section, state, pane, pane_idx, fid, ch,
+    ):
+        """Build the restore key from a View's stored params/range/RPM.
+
+        Inactive admission must not read the live Inspector or the current
+        active pane. Overlay keeps identity aligned with inactive restore.
+        """
+        params = self._compute_params_overlay_state(section, state)
+        time_range = self._normalize_analysis_time_range(
+            getattr(pane, "time_range", None),
+        )
+        rpm_source = (
+            getattr(pane, "rpm_source", None) if section == "order" else None
+        )
+        return self._analysis_cache_key(
+            section,
+            fid,
+            ch,
+            rpm_source=rpm_source,
+            pane_idx=pane_idx,
+            params=params,
+            time_range=time_range,
+        )
+
+    def _recompute_analysis_section(self, section):
+        """Dispatch the active view's compute for ``section``.
+
+        Used by tests and as a fallback for an explicit section-wide
+        compute action. Project restore never invokes this entry point.
+        """
+        try:
+            if section == 'fft':
+                self.do_fft()
+            elif section == 'order':
+                self.do_order_time()
+            elif section == 'fft_time':
+                self.do_fft_time()
+            elif section == 'frf':
+                self.do_frf()
+        except Exception:
+            self.toast("恢复渲染失败，请手动点计算", "warning")
+
+    def _analysis_state_by_id(self, section, view_id):
+        mgr = self.analysis_managers.get(section)
+        if mgr is None:
+            return None
+        target = str(view_id or "")
+        for state in mgr.views:
+            if state.view_id == target:
+                return state
+        return None
+
+    def _compute_params_overlay_state(self, section, state):
+        """Merge persisted View params onto the live compute-params schema.
+
+        Inactive restore must not ``apply_params`` onto the shared Inspector.
+        Overlaying saved keys onto the current schema keeps cache identity
+        aligned with a later apply/get round-trip of the same View.
+        """
+        live = dict(self._analysis_compute_params(section))
+        saved = dict(getattr(state, "params", None) or {})
+        live.update({key: saved[key] for key in live if key in saved})
+        return live
+
+    def _analysis_restore_widgets_alive(self):
+        from PyQt5 import sip
+        try:
+            if sip.isdeleted(self):
+                return False
+            bar = getattr(self, "_compute_progress", None)
+            if bar is None or sip.isdeleted(bar):
+                return False
+        except (RuntimeError, TypeError):
+            return False
+        return True
+
+    def _abort_analysis_restore(self):
+        """Drop the restore pump so a closing window cannot paint a dead bar."""
+        self._analysis_restore_queue = []
+        self._analysis_restore_total = 0
+        jobs = getattr(self, "_analysis_jobs", None)
+        if jobs is not None:
+            jobs.clear_progress_token("restore")
+
+    def _dispatch_pending_analysis_restore(self):
+        """Recompute queued Views one event-loop turn at a time.
+
+        Scheduling every View as ``singleShot(0)`` made them all run in one
+        drained burst (nested inside time-plot ``processEvents``), which froze
+        the GUI and showed the macOS beachball. One View per timer tick lets
+        Cocoa run, and one restore progress token owns the status bar.
+        """
+        pending = list(self._analysis_restore_pending)
+        if not pending:
+            return
+
+        def _is_active(section, view_id):
+            mgr = self.analysis_managers.get(section)
+            if mgr is None or not mgr.views:
+                return False
+            return str(mgr.get(mgr.active).view_id) == str(view_id)
+
+        pending.sort(
+            key=lambda item: (0 if _is_active(*item) else 1, item[0], item[1])
+        )
+        self._analysis_restore_queue = pending
+        self._analysis_restore_total = len(pending)
+        token = self._begin_compute_progress(
+            "正在恢复分析 0/%d" % len(pending),
+            total=len(pending),
+            process_events=False,
+        )
+        self._analysis_jobs.set_progress_token("restore", token)
+        self._compute_progress.repaint()
+        QTimer.singleShot(0, self._pump_analysis_restore)
+
+    def _analysis_restore_workers_busy(self):
+        jobs = getattr(self, "_analysis_jobs", None)
+        if jobs is None:
+            return False
+        return any(
+            jobs.is_busy(section)
+            for section in ("fft_time", "order", "frf")
+        )
+
+    def _update_analysis_restore_progress(self, *, flush_events=False):
+        if not self._analysis_restore_widgets_alive():
+            self._abort_analysis_restore()
+            return
+        token = self._restore_progress_token()
+        if token is None:
+            return
+        total = int(getattr(self, "_analysis_restore_total", 0) or 0)
+        remaining = len(getattr(self, "_analysis_restore_queue", None) or [])
+        done = max(0, total - remaining)
+        if total <= 0:
+            return
+        self._update_compute_progress(
+            done,
+            total,
+            label="正在恢复分析 %d/%d" % (done, total),
+            token=token,
+            flush_events=flush_events,
+        )
+
+    def _pump_analysis_restore(self):
+        if not self._analysis_restore_widgets_alive():
+            self._abort_analysis_restore()
+            return
+        queue = getattr(self, "_analysis_restore_queue", None)
+        if not queue:
+            self._finish_analysis_restore_if_idle()
+            return
+        section, view_id = queue.pop(0)
+        self._recompute_restored_analysis_view(section, view_id)
+        self._update_analysis_restore_progress()
+        QTimer.singleShot(0, self._pump_analysis_restore)
+
+    def _finish_analysis_restore_if_idle(self):
+        if not self._analysis_restore_widgets_alive():
+            self._abort_analysis_restore()
+            return
+        queue = getattr(self, "_analysis_restore_queue", None)
+        if queue:
+            return
+        if self._analysis_restore_workers_busy():
+            return
+        token = self._analysis_jobs.clear_progress_token("restore")
+        self._analysis_restore_queue = []
+        self._analysis_restore_total = 0
+        if token is None:
+            return
+        # Token was gated in `_finish_compute_progress` while registered.
+        self._finish_compute_progress(token=token)
+
+    def _recompute_restored_analysis_view(self, section, view_id):
+        """Restore one View from persisted pane state, never live capture."""
+        key = (section, view_id)
+        if key not in self._analysis_restore_pending:
+            return
+        self._analysis_restore_pending.discard(key)
+        try:
+            if section == 'frf':
+                self._recompute_restored_frf_view(view_id)
+            elif section == 'fft':
+                self._recompute_restored_fft_view(view_id)
+            elif section == 'fft_time':
+                self._recompute_restored_fft_time_view(view_id)
+            elif section == 'order':
+                self._recompute_restored_order_view(view_id)
+        except Exception:
+            self.toast("恢复渲染失败，请手动点计算", "warning")
+
+    # -- analysis cache pinning (spec 2026-08-11) -----------------------------
+    # Pin bookkeeping records the *real* cache keys that render/put already
+    # hold. Never re-derive keys from state.params alone (Qt round-trip can
+    # diverge). Pinning is residency only — invalidate_fid still deletes
+    # pinned entries, and dead pin keys are left to the next render replace.
+    # Mutations go through AnalysisPinBook methods (holder), not bare dict
+    # writes on self._analysis_pins.
+
+    def _pinned_keys_for_section(self, section):
+        return self._analysis_pins.pinned_keys(section)
+
+    def _analysis_ctx_targets_active_view(self, section, ctx) -> bool:
+        """True when ``ctx['view_id']`` is still this section's active View.
+
+        Async completions always cache/pin under the *dispatch-time*
+        ``view_id`` (see ``fft_time_coordinator`` / order job ctx).  Drawing
+        onto the live page, however, must only happen while that View is
+        still active — otherwise a slow job finishing after a tab switch
+        paints the wrong chart (A7).  Callers keep ``_store_analysis_result``
+        outside this gate so the inactive View can restore from cache.
+        """
+        mgr = self.analysis_managers.get(section)
+        if mgr is None or not mgr.views:
+            return False
+        active = mgr.get(mgr.active)
+        return str(ctx.get("view_id") or "") == str(active.view_id)
+
+    def _ensure_heatmap_reveal(self):
+        """The one construction site for order / FFT-vs-Time reveal signatures.
+
+        ``HeatmapRevealBook`` starts with epoch 0 and an empty signature map.
+        ``getattr`` only covers a window whose holder has not been built yet;
+        the signature slots themselves are initialized inside the holder.
+        """
+        book = getattr(self, "_heatmap_reveal", None)
+        if book is None:
+            book = HeatmapRevealBook()
+            self._heatmap_reveal = book
+        return book
+
+    def _heatmap_tick_counts(self):
+        xt, yt = self.inspector.top.tick_density()
+        return int(xt), int(yt)
+
+    def _heatmap_viewport_snapshot(self, section, canvas):
+        """Pane viewport the heatmap restore path will apply.
+
+        A canvas that is not a live pane (render-test doubles) contributes
+        the untouched auto/None viewport so two paints of the same double
+        still compare equal.
+        """
+        default = ("auto", None, "auto", None)
+        try:
+            page = self._analysis_page(section)
+            managers = getattr(self, "analysis_managers", None) or {}
+            mgr = managers.get(section)
+            if page is None or mgr is None or not mgr.views or canvas is None:
+                return default
+            state = mgr.get(mgr.active)
+            count = min(page.pane_count(), len(state.panes))
+            for pane_idx in range(count):
+                if page.pane_canvas(pane_idx) is not canvas:
+                    continue
+                pane = state.panes[pane_idx]
+                origin = pane.viewport_origin or {}
+                return (
+                    str(origin.get("x", "auto")),
+                    optional_float_pair(getattr(pane, "xlim", None)),
+                    str(origin.get("y", "auto")),
+                    optional_float_pair(getattr(pane, "ylim", None)),
+                )
+        except (AttributeError, IndexError, TypeError, RuntimeError):
+            return default
+        return default
+
+    def _canvas_holds_heatmap(self, canvas) -> bool:
+        has = getattr(canvas, "has_result", None)
+        if not callable(has):
+            return False
+        try:
+            return bool(has())
+        except RuntimeError:
+            return False
+
+    def _clear_heatmap_picture_token(self, canvas) -> None:
+        try:
+            canvas._tracelab_heatmap_picture = None
+        except (AttributeError, TypeError):
+            pass
+
+    def _commit_heatmap_reveal(self, section, canvas, inputs, result) -> None:
+        """Remember the picture this paint left, when a later entry can reuse it.
+
+        A paint that rewrites the Inspector Z spins is not remembered: the
+        next entry applies the saved View params first, and those spins would
+        no longer describe the picture.
+        """
+        book = self._ensure_heatmap_reveal()
+        if heatmap_level_writeback_blocks_retain(inputs):
+            book.forget_canvas(canvas)
+            self._clear_heatmap_picture_token(canvas)
+            return
+        finished = finish_heatmap_render_inputs(inputs, canvas)
+        x_origin, x_lim, y_origin, y_lim = self._heatmap_viewport_snapshot(
+            section, canvas,
+        )
+        width, height, dpr = widget_raster_metrics(canvas)
+        finished = replace(
+            finished,
+            x_origin=x_origin,
+            x_lim=x_lim,
+            y_origin=y_origin,
+            y_lim=y_lim,
+            canvas_width=width,
+            canvas_height=height,
+            canvas_dpr=dpr,
+        )
+        if not self._canvas_holds_heatmap(canvas):
+            book.forget_canvas(canvas)
+            self._clear_heatmap_picture_token(canvas)
+            return
+        identity = book.result_identity(result)
+        book.remember(section, canvas, heatmap_render_signature(finished, identity))
+        try:
+            canvas._tracelab_heatmap_picture = (str(section), identity)
+        except (AttributeError, TypeError):
+            book.forget_canvas(canvas)
+            return
+        self._watch_heatmap_canvas(section, canvas)
+
+    def _watch_heatmap_canvas(self, section, canvas) -> None:
+        if getattr(canvas, "_heatmap_reveal_destroy_wired", False):
+            return
+        destroyed = getattr(canvas, "destroyed", None)
+        connect = getattr(destroyed, "connect", None)
+        if not callable(connect):
+            return
+        connect(partial(
+            self._on_heatmap_canvas_destroyed, str(section), id(canvas),
+        ))
+        canvas._heatmap_reveal_destroy_wired = True
+
+    def _on_heatmap_canvas_destroyed(self, section, canvas_id, *_args) -> None:
+        book = getattr(self, "_heatmap_reveal", None)
+        if book is not None:
+            book.forget_id(section, canvas_id)
+
+    def _heatmap_picture_is_current(self, section, page, canvas, result, source) -> bool:
+        """True when this single pane already shows ``result`` for the current inputs.
+
+        Split panes are excluded: level lock and linked viewboxes write pixels
+        outside this input object. A pending Z-spin writeback is excluded too.
+
+        The check resolves color policy as a dry run. Order still goes through
+        its render-input builder, so that builder's ``prepare`` is forced to
+        ``dry_run`` for the duration of the probe and restored afterwards.
+        """
+        if page is None or page.pane_count() != 1:
+            return False
+        coordinator = None
+        original_prepare = None
+        if section == "order":
+            getter = getattr(self, "_heatmap_color_coordinator", None)
+            coordinator = getter(section) if callable(getter) else None
+            if coordinator is not None:
+                original_prepare = coordinator.prepare
+
+                def _dry_prepare(*args, **kwargs):
+                    kwargs["dry_run"] = True
+                    return original_prepare(*args, **kwargs)
+
+                coordinator.prepare = _dry_prepare
+        try:
+            try:
+                if section == "order":
+                    inputs = self._current_order_heatmap_inputs(canvas, result, source)
+                elif section == "fft_time":
+                    params = self.inspector.fft_time_ctx.get_params()
+                    inputs = self._current_fft_time_heatmap_inputs(
+                        canvas, result, params, source,
+                    )
+                else:
+                    return False
+            except (AttributeError, TypeError, ValueError, IndexError):
+                # A result the painter cannot snapshot is not a reason to skip.
+                # The existing render path still runs, including test doubles.
+                return False
+            if heatmap_level_writeback_blocks_retain(inputs):
+                return False
+            book = self._ensure_heatmap_reveal()
+            identity = book.result_identity(result)
+            signature = heatmap_render_signature(inputs, identity)
+            return book.keeps(section, canvas, signature, identity)
+        finally:
+            if coordinator is not None and original_prepare is not None:
+                coordinator.prepare = original_prepare
+
+    def _store_analysis_result(self, section, view_id, pane_idx, key, result):
+        """Single write funnel: cache put always, pin append only when
+        ``view_id`` names a real View (spec §4.1/§4.1 footnote).
+
+        A ``None`` view_id means the dispatch path that produced this result
+        never attached a real View identity to its ctx/candidate dict — pin
+        bookkeeping keys off ``str(view_id)``, so pinning here would wedge
+        the result into a permanent ``('<section>', 'None', pane_idx)`` slot
+        that render-time replace can never reach (it only ever replaces real
+        view_id slots). Cache the result anyway so it is not lost, skip the
+        pin, and log so a future dispatch path that forgets to carry
+        view_id is not a silent permanent-pin leak.
+        """
+        if section in ("order", "fft_time"):
+            book = self._ensure_heatmap_reveal()
+            book.bump_result(result)
+            book.forget_section(section)
+        self.analysis_caches[section].put(key, result)
+        if view_id is None:
+            logger.warning(
+                "_store_analysis_result: view_id is None for section=%r "
+                "pane_idx=%r key=%r -- result cached but not pinned",
+                section, pane_idx, key,
+            )
+        else:
+            self._analysis_pins.add(section, view_id, pane_idx, key)
+        uv = getattr(self, "_ultraview", None)
+        if uv is not None:
+            uv.notify_result_stored(section, view_id, pane_idx, key, result)
+
+    def _replace_analysis_pane_pins(self, section, view_id, pane_idx, keys):
+        """Replace one pane's pin set with the keys enumerated at render time."""
+        self._analysis_pins.replace(section, view_id, pane_idx, keys)
+
+    def _drop_analysis_view_pins(self, section, view_id):
+        self._analysis_pins.drop_view(section, view_id)
+        coordinator = self._heatmap_color_coordinator(section)
+        if coordinator is not None:
+            coordinator.forget(section, view_id)
+
+    def _clear_analysis_section_pins(self, section):
+        self._analysis_pins.clear_section(section)
+        coordinator = self._heatmap_color_coordinator(section)
+        if coordinator is not None:
+            coordinator.forget(section)
+        if section in ("order", "fft_time"):
+            book = getattr(self, "_heatmap_reveal", None)
+            if book is not None:
+                book.forget_section(section)
+
+    def _render_analysis_view_from_cache(self, section, state, rendered_ids=None):
+        coordinator = self._heatmap_color_coordinator(section)
+        transaction = coordinator.transaction(section) if coordinator else nullcontext()
+        with transaction:
+            return self._render_analysis_view_from_cache_impl(
+                section, state, rendered_ids,
+            )
+
+    def _render_analysis_view_from_cache_impl(self, section, state, rendered_ids=None):
+        """Restore accepted bindings only; a render never queues computation."""
+        ensure = getattr(self.chart_stack, "ensure_analysis_page_ready", None)
+        if callable(ensure):
+            ensure(section)
+        if self._comparison_render_bound(section, state):
+            if rendered_ids is not None:
+                rendered_ids.append(state.view_id)
+            return self._render_comparison_view(section, state)
+        self._render_bound_analysis_panes(section, state, sync_facts=True)
+        return True
+
+    def _render_bound_analysis_panes(self, section, state, *, sync_facts):
+        """One cache/display path for ordinary and cross-View canvases.
+
+        Keys and source labels belong to the last accepted request. Display
+        intent belongs to the current View. A shared-cache hit alone never
+        creates a binding, including on mode entry and after project restore.
+        """
+        page = self._analysis_page(section)
+        missing = False
+        changed = False
+        colors = self._analysis_channel_color_map() if section == 'fft' else {}
+        for pane_idx, pane in enumerate(state.panes):
+            canvas = self._canvas_for_view_pane(section, state, pane_idx)
+            if canvas is None:
+                continue
+            if section == 'frf':
+                missing |= not self._render_bound_frf_pane(state, pane_idx, canvas)
+                continue
+            if section == 'fft':
+                self._publish_line_chart_appearance(canvas, pane)
+            binding = pane.result_binding
+            pairs = () if binding is None else zip(binding.request.sources, binding.keys)
+            results = [
+                (source, key, self.analysis_caches[section].get(key))
+                for source, key in pairs
+            ]
+            found = [(source, key, result) for source, key, result in results
+                     if result is not None]
+            self._replace_analysis_pane_pins(
+                section, state.view_id, pane_idx, [key for _, key, _ in found],
+            )
+            if not found:
+                self._clear_analysis_canvas(canvas)
+                if section in {'fft_time', 'order'}:
+                    self._project_heatmap_pane_appearance(section, canvas, pane)
+                self._rebind_pane_overlay(canvas, pane)
+                if pane.sources or binding is not None:
+                    missing = True
+                    if section == 'fft' and sync_facts and pane_idx == self._dispatch_focus_index(section, state):
+                        self._refresh_fft_time_preview(clear_spectrum=False)
+                    self._show_analysis_empty_hint(canvas)
+                changed = True
+                continue
+            if section == 'fft':
+                params = self._analysis_bound_display_params(section, state, pane)
+                entries = [self._fft_entry_from_cache(
+                    result, source[0], source[1], colors.get(source),
+                    time_range=binding.request.time_range, display_params=params,
+                ) for source, _key, result in found]
+                self._plot_fft_entries(entries, canvas)
+                if binding.stale:
+                    canvas.mark_spectrum_stale()
+                changed = True
+            else:
+                source, _key, result = found[0]
+                if self._heatmap_picture_is_current(section, page, canvas, result, source):
+                    self._project_heatmap_pane_appearance(section, canvas, pane)
+                else:
+                    self._render_cached_heatmap(section, canvas, result, source=source)
+                    changed = True
+            self._restore_analysis_pane_viewport(section, state, pane_idx, canvas)
+        if sync_facts:
+            self._sync_section_effective_facts(section, state)
+            if missing:
+                self.statusBar.showMessage("参数/源已就绪，点击计算")
+        if changed:
+            notify_ultraview_plot(self, section, "analysis-restore-plot")
+
+    def _analysis_bound_display_params(self, section, state, pane):
+        """Combine current presentation with the calculation behind the picture."""
+        params = dict(state.params)
+        binding = pane.result_binding
+        if binding is not None:
+            requested = binding.request.params
+            for key in self._requested_compute_projection(section, requested):
+                if key in requested:
+                    params[key] = requested[key]
+        return params
+
+    def _rebind_pane_overlay(self, canvas, pane) -> None:
+        from ..analysis_view_bridge import apply_overlay_to_canvas
+
+        apply_overlay_to_canvas(canvas, pane, chart_stack=self.chart_stack)
+
+    def _show_analysis_empty_hint(self, canvas):
+        canvas.show_empty_hint("点击『计算』生成")
+
+    def _clear_analysis_canvas(self, canvas):
+        context = getattr(self, "_analysis_context", None)
+        coordinator = getattr(context, "heatmap_color", None)
+        if coordinator is not None:
+            coordinator.forget_canvas(canvas)
+        book = getattr(self, "_heatmap_reveal", None)
+        if book is not None:
+            book.forget_canvas(canvas)
+        self._clear_heatmap_picture_token(canvas)
+        if hasattr(canvas, 'full_reset'):
+            try:
+                canvas.full_reset()
+            except Exception:
+                pass
+        if hasattr(canvas, 'clear_empty_hint'):
+            try:
+                canvas.clear_empty_hint()
+            except Exception:
+                pass
+
+    # -- dB reference defaults (Task 5): facts adapter + Auto propagation --
+    # Spec: docs/analyzer/specs/2026-07-12-db-reference-defaults-and-labeling-spec.md §8.
+    # Plan: docs/analyzer/plans/2026-07-12-db-reference-defaults-and-labeling-implementation.md
+    # Task 5. Full per-entry/mixed-source conversion + axis labels are Task 6/7 --
+    # this only keeps the ONE shared compound control (pre-Task-6 status quo) in
+    # sync with the focused pane's source + the shared catalog service.
+
+    def _channel_reference_facts(self, fid, ch):
+        return self._analysis_context.channel_reference_facts(fid, ch)
+
+    def _focused_source_for_section(self, section):
+        """The ``(fid, ch)`` the section's Inspector control should resolve
+        against right now. FFT's checked-channel overlay has no single
+        "focused source" pre-Task-6 (mixed per-entry reference is Task 6's
+        job) -- fall back to the first checked channel, then the legacy
+        single-signal combo. Order/FFT-vs-Time always have exactly one
+        live-selected source (``combo_sig``)."""
+        if section == 'fft':
+            checked = self.navigator.get_checked_channels()
+            if checked:
+                fid, ch, _color = checked[0]
+                return (fid, ch)
+            return self.inspector.fft_ctx.current_signal()
+        return self._analysis_ctx(section).current_signal()
+
+    def _resolve_db_reference_for_source(self, section, source, *, params=None):
+        """Resolve ``section``'s dB reference for ONE specific ``(fid, ch)``
+        source, honoring the section's CURRENT View mode (spec §15 C1 /
+        plan Task 6 Step 6.2) -- unlike :meth:`_resolve_and_apply_db_reference`
+        (which only ever targets the section's single "focused" source and
+        writes the result back onto the compound control), this is a PURE
+        resolution with no widget side effect, so FFT's checked-channel
+        overlay can call it once per (fid, ch) ENTRY -- including sources
+        other than the section's focused one -- to convert/label each curve
+        with its own reference rather than one global control value (Task 5's
+        deferred "Auto-resolve-on-selection-change is NOT yet wired" note).
+
+        Manual mode reuses the single View-level value for every source
+        (still resolved through :func:`db_reference.resolve_db_reference` so
+        an invalid manual value falls through to the same catalog chain);
+        Auto mode resolves fresh per source against the live catalog
+        snapshot. Both branches read the SAME snapshot/control so this and
+        :meth:`_resolve_and_apply_db_reference` can never silently drift
+        apart on the resolution rule itself."""
+        if params is None:
+            return self._analysis_context.resolve_db_reference_for_source(section, source)
+        return self._analysis_context.resolve_db_reference_for_source(section, source, params=params)
+
+    def _stamp_db_reference_nudge_facts(self, section):
+        """Additive metadata stamp feeding the ``nudge.db_ref_manual_default``
+        footer nudge (spec 2026-07-12 S5 / A17).
+
+        Attaches ``section``'s CURRENT dB-reference View mode + compound-
+        control value, plus whether the section's focused source would
+        resolve (under Auto) to a real non-1.0 catalog/metadata reference,
+        as a plain ``dict`` attribute on the section's focused-pane canvas.
+        ``_ChartCard._nudge_signals`` (chart_stack/cards.py) reads this
+        attribute -- never written anywhere else -- to populate
+        ``hints.HintState.db_reference_*``. Pure fact carrier: it never
+        mutates the control, the cache, or any rendered pixel."""
+        ctx = self._analysis_ctx(section)
+        control = ctx.db_reference_control
+        mode = control.mode()
+        value = control.editor.value()
+        source = self._focused_source_for_section(section)
+        facts = (
+            self._channel_reference_facts(*source) if source
+            else db_reference.ChannelReferenceFacts(quantity="", unit="")
+        )
+        snapshot = self.db_reference_store.snapshot()
+        # Always probe the AUTO resolution regardless of the section's own
+        # current mode -- the nudge's whole point is "here is what Auto would
+        # give you", independent of whether the user is currently in Manual.
+        auto_resolution = db_reference.resolve_db_reference(
+            mode='auto',
+            facts=facts,
+            user_catalog=snapshot.user_catalog,
+            system_catalog=snapshot.system_catalog,
+            prefer_channel_metadata=snapshot.prefer_channel_metadata,
+        )
+        source_resolvable = bool(
+            auto_resolution.source in ('metadata', 'user', 'system')
+            and not math.isclose(
+                auto_resolution.value, 1.0, rel_tol=1e-9, abs_tol=1e-9,
+            )
+        )
+        page = self._analysis_page(section)
+        if page is None or not page.is_ready():
+            # Deferred pages keep nudge facts on View/inspector authority until
+            # the chart exists; stamping a missing canvas must not construct.
+            return
+        idx = page.focused_index()
+        canvas = page.peek_pane_canvas(idx)
+        if canvas is None:
+            return
+        canvas.db_reference_nudge_facts = {
+            'mode': mode,
+            'value': float(value),
+            'source_resolvable': source_resolvable,
+        }
+        # Unlike the pre-existing situational nudges (colorbar_dead/
+        # amp_disparate/...), which refresh the visible footer via a
+        # canvas-emitted render signal the card already listens to
+        # (chart_rebuilt / levels_rebased), this fact is stamped from
+        # OUTSIDE any such signal -- force the same footer refresh here so
+        # it never lags a stamp that happens without an accompanying
+        # re-render (e.g. a plain View-mode toggle).
+        cards = page.peek_cards()
+        card = cards[idx] if 0 <= idx < len(cards) else None
+        refresh = getattr(card, 'refresh_nudge_state', None)
+        if callable(refresh):
+            refresh()
+
+    def _resolve_and_apply_db_reference(self, section, *, rerender=False):
+        """Auto-resolve ``section``'s dB reference from its currently
+        focused/live source + the shared catalog service snapshot, and
+        refresh the control's value + source line.
+
+        A Manual View ignores this entirely (spec §8.1 step 1 / §8.4: manual
+        is View-level and never re-derives from source/catalog). Never
+        dispatches a compute worker -- ``rerender`` only replays the
+        section's own existing cache-hit render path so a catalog save (or
+        an Auto commit from the shared dialog) can force an immediate
+        redraw for the CURRENTLY VISIBLE section without recomputing."""
+        ctx = self._analysis_ctx(section)
+        control = ctx.db_reference_control
+        if control.mode() != 'auto':
+            # Manual (or any non-auto) View still needs its nudge facts kept
+            # live -- e.g. a focused-source change while the section stays
+            # Manual can flip source_resolvable without touching the control.
+            self._stamp_db_reference_nudge_facts(section)
+            return
+        source = self._focused_source_for_section(section)
+        resolution = self._resolve_db_reference_for_source(section, source)
+        # Widget signals blocked: this is a PROGRAMMATIC Auto refresh, never
+        # a user commit, and must not trip the editor's own valueChanged ->
+        # cache-hit-rerender wiring (window._connect) nor any preset-changed
+        # handler (Task 4's existing blocking pattern, e.g. set_fs's
+        # spin_fs.blockSignals around a programmatic setValue).
+        control.editor.blockSignals(True)
+        try:
+            control.editor.setValue(resolution.value)
+        finally:
+            control.editor.blockSignals(False)
+        text, tooltip = _format_db_reference_source_line(resolution)
+        control.set_source_text(text, tooltip=tooltip)
+        # Nudge facts stamped AFTER the auto value settles so the carried
+        # ``value`` matches what is actually shown (the predicate only fires
+        # for mode == 'manual' so this is inert while Auto, but keeps the
+        # attribute honest for any future consumer).
+        self._stamp_db_reference_nudge_facts(section)
+        if rerender:
+            self._rerender_analysis_section_from_cache(section)
+
+    def _rerender_analysis_section_from_cache(self, section):
+        """Display-only refresh; never call a calculation entry point."""
+        state = self._sync_active_analysis_params(section)
+        if state is not None and self.chart_stack.current_mode() == section:
+            self._render_analysis_view_from_cache(section, state)
+
+    def _on_db_reference_catalog_saved(self, section=None):
+        """The shared ``DbReferenceDefaultsDialog`` committed a catalog save
+        (spec §8.3): every Auto section re-resolves against the new
+        snapshot, but only the CURRENTLY VISIBLE one redraws its canvas --
+        the other (hidden) Auto sections just get their control's value/
+        source line refreshed with zero canvas touch, so their render
+        signature naturally goes stale without a compute dispatch."""
+        visible = self.chart_stack.current_mode()
+        for sec in ('fft', 'fft_time', 'order'):
+            self._resolve_and_apply_db_reference(sec, rerender=(sec == visible))
+
+    def _on_db_reference_view_mode_committed(self, section, mode):
+        """The dialog's '当前 View' toggle targets ONLY the section/View that
+        was focused when its manage button opened the dialog (spec §11.1)."""
+        ctx = self._analysis_ctx(section)
+        ctx.db_reference_control.set_mode(mode)
+        if mode == 'auto':
+            self._resolve_and_apply_db_reference(
+                section, rerender=(self.chart_stack.current_mode() == section)
+            )
+        else:
+            # Auto's branch above stamps via _resolve_and_apply_db_reference;
+            # a commit BACK to Manual needs the same live nudge-fact refresh
+            # (spec S5's self-clear-on-Auto/edit-away needs the reverse too).
+            self._stamp_db_reference_nudge_facts(section)

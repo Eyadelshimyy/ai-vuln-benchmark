@@ -1,0 +1,639 @@
+import json
+
+from sqlalchemy import func
+from sqlalchemy.orm import Session, selectinload
+
+from app.models import IndustryDonation, KeyVote, PromiseAlignment, Senator, StockTrade
+
+# Promise quality rules are shared with the pipeline (which now cleans
+# promises before scoring/persisting); the read path keeps applying them
+# only as a safety net for rows persisted before 2026-07.
+from app.pipeline.analyze.promise_quality import (
+    _FILLER_RE,
+    clean_promises,
+)
+from app.pipeline.analyze.score_calculator import NON_INDUSTRY_CODES, compute_overall_score
+from app.pipeline.analyze.sponsorship_analysis import (
+    describe_senator_position,
+    party_ideology_bounds,
+)
+from app.services._scorecard_common import pac_share_pct, party_line_counts, score_breakdown, vote_search
+from app.services.constituent_survey import constituent_approval
+from app.services.bill_record import roll_call_summaries
+from app.services.pagination import paginate_bounds
+from app.services.score_trends import compute_score_trend_map
+from app.schemas import (
+    CampaignPromiseSchema,
+    PaginatedVotesSchema,
+    PartisanDepthSchema,
+    PolicyAlignmentSchema,
+    PolicyAreaDetail,
+    RepresentationScoreSchema,
+    DonorSchema,
+    FundingSchema,
+    IndustryDonationSchema,
+    KeyVoteSchema,
+    LeaderboardEntrySchema,
+    ScoreTrendSchema,
+    LobbyingMatchSchema,
+    PaginatedStockTradesSchema,
+    SenatorSchema,
+    SponsoredBillSchema,
+    StateCountSchema,
+    StockTradeSchema,
+    STOCK_ACT_DISCLOSURE_DEADLINE_DAYS,
+    VoteCountsSchema,
+    VotingRecordSchema,
+)
+
+from app.state_names import STATE_NAMES  # noqa: E402  (re-exported: callers import it from here)
+
+
+
+
+_USELESS_SPONSOR = {"unclear", "unknown", "n/a", "none", ""}
+
+
+def _clean_pac_sponsor(sponsor: str | None, donor_name: str) -> str | None:
+    """Return None for useless or self-referential PAC sponsors."""
+    if not sponsor or sponsor.lower().strip() in _USELESS_SPONSOR:
+        return None
+    if len(sponsor.strip()) <= 2:
+        return None
+    if sponsor.lower().strip() == donor_name.lower().strip():
+        return None
+    return sponsor
+
+
+def _compute_initials(name: str) -> str:
+    """Compute initials from 'First [Middle] Last' display name."""
+    parts = name.split()
+    if len(parts) >= 2:
+        return parts[0][0].upper() + parts[-1][0].upper()
+    if parts:
+        return parts[0][0].upper()
+    return ""
+
+
+def _fixup_donor_type(donor_name: str, donor_type: str, senator_name: str) -> str:
+    """Read-time safety net for donor types.
+
+    Lightweight string-only checks that avoid loading the embedding model.
+    Full semantic classification happens at pipeline write time; this only
+    catches obvious cases where a company name was persisted as "PAC".
+    """
+    if donor_type != "PAC":
+        return donor_type
+
+    name_upper = donor_name.upper()
+    if any(sig in name_upper for sig in ("PAC", "COMMITTEE", "FUND", "LEAGUE", "CAUCUS")):
+        return donor_type
+
+    if senator_name:
+        last = senator_name.split()[-1].upper()
+        if last in name_upper:
+            return "CandidateAffiliated"
+
+    return "Org/Employees"
+
+
+def _filter_promises(campaign_promises: list) -> list[CampaignPromiseSchema]:
+    """Filter and correct campaign promise quality issues in persisted data.
+
+    Delegates to the shared pipeline rules (promise_quality.clean_promises)
+    so displayed alignments always match what the scoring path would
+    produce. For rows written by pipelines after 2026-07 this is a no-op;
+    it corrects legacy rows persisted before cleaning moved upstream.
+    """
+    as_dicts = [
+        {
+            "promiseText": cp.promise_text or "",
+            "category": cp.category,
+            "alignment": cp.alignment or PromiseAlignment.UNCLEAR,
+            "relatedVotes": json.loads(cp.related_votes) if cp.related_votes else [],
+            "relatedBills": json.loads(cp.related_bills) if cp.related_bills else [],
+            "analysis": cp.analysis or "",
+            "partyAlignment": cp.party_alignment,
+        }
+        for cp in campaign_promises
+    ]
+
+    return [
+        CampaignPromiseSchema(
+            promise_text=p["promiseText"],
+            category=p["category"],
+            alignment=p["alignment"],
+            related_votes=p["relatedVotes"],
+            related_bills=p["relatedBills"],
+            analysis=p["analysis"],
+            party_alignment=p["partyAlignment"],
+        )
+        for p in clean_promises(as_dicts)
+    ]
+
+
+def _build_sponsored_bills(sponsored_bills: list) -> list[SponsoredBillSchema]:
+    """Convert ORM SponsoredBill records to schema objects, sorted by date."""
+    result: list[SponsoredBillSchema] = []
+    for sb in sponsored_bills:
+        raw_areas = []
+        if getattr(sb, "policy_areas", None):
+            try:
+                raw_areas = json.loads(sb.policy_areas)
+            except (json.JSONDecodeError, TypeError):
+                raw_areas = []
+        areas = [
+            PolicyAreaDetail(
+                area=a.get("area", ""),
+                confidence=a.get("confidence", 0.0),
+                party=a.get("party", "bipartisan"),
+            )
+            for a in raw_areas
+            if a.get("area")
+        ]
+        result.append(SponsoredBillSchema(
+            bill_id=sb.bill_id,
+            title=sb.title,
+            introduced_date=sb.introduced_date or "",
+            latest_action=sb.latest_action or "",
+            latest_action_date=sb.latest_action_date or "",
+            policy_area=sb.policy_area or "",
+            policy_areas=areas,
+            party_leaning=sb.party_leaning,
+            congress=sb.congress or 0,
+            bill_type=sb.bill_type or "",
+            is_law=sb.is_law or False,
+            stage=sb.stage or "",
+            commemorative=bool(sb.commemorative),
+        ))
+    result.sort(key=lambda x: x.introduced_date, reverse=True)
+    return result
+
+
+def _parse_partisan_depth(raw: str | None) -> PartisanDepthSchema | None:
+    """Deserialize JSON partisan depth profile stored on the senator row."""
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        return PartisanDepthSchema(
+            overall_lean=data.get("overallLean", 0.0),
+            overall_party=data.get("overallParty", "centrist"),
+            depth=data.get("depth", "centrist"),
+            cross_party_count=data.get("crossPartyCount", 0),
+            total_positions=data.get("totalPositions", 0),
+            policy_breakdown=[
+                PolicyAlignmentSchema(
+                    area=p["area"],
+                    alignment=p["alignment"],
+                    strength=p["strength"],
+                )
+                for p in data.get("policyBreakdown", [])
+            ],
+        )
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+
+def _senator_eager_options() -> list:
+    """SQLAlchemy options to eager-load all senator relationships in one round-trip."""
+    return [
+        selectinload(Senator.donors),
+        selectinload(Senator.industry_donations),
+        selectinload(Senator.key_votes),
+        selectinload(Senator.lobbying_matches),
+        selectinload(Senator.campaign_promises),
+        selectinload(Senator.sponsored_bills),
+    ]
+
+
+def build_senator_response(senator: Senator, db: Session) -> SenatorSchema:
+    """Assemble a full SenatorSchema from the ORM model and related records.
+
+    Expects senator to be loaded with eager-loaded relationships via
+    ``_senator_eager_options()``.
+    """
+    donors = sorted(senator.donors, key=lambda d: d.rank)
+    industry_donations = sorted(senator.industry_donations, key=lambda d: d.total, reverse=True)
+    key_votes = senator.key_votes
+    lobbying_matches = senator.lobbying_matches
+    campaign_promises = senator.campaign_promises
+
+    # 5. Split votes by category
+    recent_votes_db = [v for v in key_votes if v.vote_category == "recent"]
+    key_votes_db = [v for v in key_votes if v.vote_category == "key"]
+
+    total_votes = len(key_votes)
+    # Party-line counts as Constituent Alignment scores them, not the
+    # stored sample's: the drawer and the column must agree.
+    voted_with, voted_against, party_loyalty_pct = party_line_counts(senator)
+
+    # 6. Assemble the nested schema
+    initials = _compute_initials(senator.name) or senator.initials
+    return SenatorSchema(
+        id=senator.id,
+        name=senator.name,
+        bioguide_id=senator.bioguide_id,
+        state=senator.state,
+        party=senator.party,
+        years_in_office=senator.years_in_office,
+        initials=initials,
+        leadership_title=senator.leadership_title,
+        committees=json.loads(senator.committees or "[]"),
+        representation_score=RepresentationScoreSchema(
+            funding_independence=senator.score_funding_independence,
+            promise_persistence=None,  # not measured: RepresentationScoreSchema
+            constituent_alignment=senator.score_constituent_alignment,
+            funding_diversity=senator.score_funding_diversity,
+            legislative_effectiveness=senator.score_legislative_effectiveness,
+            overall=compute_overall_score(senator),
+            confidence=json.loads(senator.score_confidence or "{}") or None,
+        ),
+        funding=FundingSchema(
+            total_raised=senator.total_raised,
+            total_contributions=senator.total_contributions,
+            total_from_pacs=senator.total_from_pacs,
+            pac_share_pct=pac_share_pct(senator),
+            small_donor_percentage=senator.small_donor_percentage,
+            top_donors=[
+                DonorSchema(
+                    name=d.name,
+                    total=d.total,
+                    type=_fixup_donor_type(d.name, d.type, senator.name),
+                    industry=d.industry or "OTHER",
+                    pac_sponsor=_clean_pac_sponsor(d.pac_sponsor, d.name),
+                    pac_industry=(
+                        None if d.pac_industry and d.pac_industry.lower().strip() in _USELESS_SPONSOR
+                        else d.pac_industry
+                    ),
+                    pac_analysis="" if (d.pac_analysis and _FILLER_RE.search(d.pac_analysis)) else d.pac_analysis,
+                    committee_type=d.committee_type,
+                )
+                for d in donors
+            ],
+            industry_breakdown=[
+                IndustryDonationSchema(
+                    industry=ind.industry,
+                    name=ind.name,
+                    total=ind.total,
+                    percentage=ind.percentage,
+                )
+                for ind in industry_donations
+            ],
+        ),
+        voting_record=VotingRecordSchema(
+            total_votes=total_votes,
+            voted_with_party_count=voted_with,
+            voted_against_party_count=voted_against,
+            party_loyalty_pct=party_loyalty_pct,
+            recent_vote_count=len(recent_votes_db),
+            key_vote_count=len(key_votes_db),
+        ),
+        lobbying_matches=[
+            LobbyingMatchSchema(
+                lobbyist_org=lm.lobbyist_org,
+                industry=lm.industry,
+                lobbying_spend=lm.lobbying_spend,
+                donation_to_senator=lm.donation_to_senator,
+                bills_influenced=json.loads(lm.bills_influenced) if lm.bills_influenced else [],
+                senator_vote_aligned=lm.senator_vote_aligned,
+                description=lm.description,
+                lobbied_bills=json.loads(lm.lobbied_bills) if lm.lobbied_bills else [],
+                lobbying_clients=json.loads(lm.lobbying_clients) if lm.lobbying_clients else [],
+                lobbying_checked=lm.lobbying_checked,
+            )
+            for lm in lobbying_matches
+        ],
+        campaign_promises=_filter_promises(campaign_promises),
+        partisan_depth=_parse_partisan_depth(senator.partisan_depth),
+        sponsored_bills=_build_sponsored_bills(senator.sponsored_bills),
+        leadership_score=senator.leadership_score,
+        bipartisanship_score=senator.bipartisanship_score,
+        ideology_score=senator.ideology_score,
+        sponsorship_description=getattr(senator, "sponsorship_description", "") or "",
+        constituent_approval=constituent_approval(
+            "senate", senator.state, senator.name, senator.party, senator.years_in_office or 0,
+        ),
+        website_url=getattr(senator, "website_url", "") or "",
+        contact_form_url=getattr(senator, "contact_form_url", "") or "",
+        office_phone=getattr(senator, "office_phone", "") or "",
+        office_address=getattr(senator, "office_address", "") or "",
+    )
+
+
+def get_senators_by_state(db: Session, state: str) -> list[SenatorSchema]:
+    """The state's serving senators. A departed senator's row stays through
+    the retirement grace period (member_lifecycle), and listing it gave a
+    state with a seated successor three senators, the departed one
+    unmarked (the compare page's picker reads this)."""
+    senators = (
+        db.query(Senator)
+        .options(*_senator_eager_options())
+        .filter(Senator.state == state.upper(), Senator.is_current == True)  # noqa: E712
+        .all()
+    )
+    return [build_senator_response(s, db) for s in senators]
+
+
+def get_senator_by_id(db: Session, senator_id: str) -> SenatorSchema | None:
+    """Return a single senator by ID, or None if not found."""
+    senator = (
+        db.query(Senator)
+        .options(*_senator_eager_options())
+        .filter(Senator.id == senator_id)
+        .first()
+    )
+    if senator is None:
+        return None
+    return build_senator_response(senator, db)
+
+
+def get_senator_score_breakdown(db: Session, senator_id: str) -> dict | None:
+    """Recompute a senator's full score-derivation breakdown on-demand.
+
+    Builds the same dict shape score_calculator.calculate_scores() consumes
+    during the pipeline (funding, votingRecord with full per-vote keyVotes/
+    recentVotes, lobbyingMatches, sponsoredBills) directly from the ORM
+    relationships — NOT from build_senator_response()'s SenatorSchema, which
+    only exposes vote *counts* (totalVotes, votedWithPartyCount, ...), not
+    the per-vote votedWithParty fields the scoring formulas actually read.
+    """
+
+    senator = (
+        db.query(Senator)
+        .options(*_senator_eager_options())
+        .filter(Senator.id == senator_id)
+        .first()
+    )
+    if senator is None:
+        return None
+
+    return score_breakdown(db, senator, lobbying_donation_attr="donation_to_senator")
+
+
+def get_states_with_counts(db: Session) -> list[StateCountSchema]:
+    """States with serving senators, and how many each has. A departed
+    senator's row stays through the retirement grace period
+    (member_lifecycle), so counting every row gave a state with a newly
+    seated successor three senators."""
+    rows = (
+        db.query(Senator.state, func.count(Senator.id).label("cnt"))
+        .filter(Senator.is_current == True)  # noqa: E712
+        .group_by(Senator.state)
+        .order_by(Senator.state)
+        .all()
+    )
+    return [
+        StateCountSchema(
+            code=row.state,
+            name=STATE_NAMES.get(row.state, row.state),
+            senator_count=row.cnt,
+        )
+        for row in rows
+    ]
+
+
+def _compute_trend_map(db: Session) -> dict[str, ScoreTrendSchema]:
+    """Compare latest snapshots to the best available prior snapshot.
+
+    Prefers a snapshot from ~7 days ago; falls back to the oldest available
+    snapshot that is at least 1 day older than the latest.
+    """
+    raw = compute_score_trend_map(db, "senator")
+    return {
+        sid: ScoreTrendSchema(
+            direction=d["direction"], change=d["change"], previous_score=d["previousScore"],
+        )
+        for sid, d in raw.items()
+    }
+
+
+def get_leaderboard(db: Session) -> list[LeaderboardEntrySchema]:
+    """Currently-serving senators ranked by weighted representation score
+    (higher = better representative).
+
+    Departed members are excluded on principle: a ranking of how well the
+    Senate represents constituents right now is a statement about people
+    who hold the office, and a member who left mid-term keeps a rank they
+    can no longer act on. They stay fully browsable on their profile and
+    in the directory (marked as a former member) until member_lifecycle.py
+    removes them for good. Presidents are the deliberate exception — the
+    only meaningful presidential comparison is against the historical
+    field, so that leaderboard ranks former presidents and excludes the
+    sitting one (see president_service.get_president_leaderboard)."""
+    senators = db.query(Senator).filter(Senator.is_current == True).all()  # noqa: E712
+
+    top_industry_map: dict[str, str] = {}
+    ind_rows = (
+        db.query(IndustryDonation.senator_id, IndustryDonation.name)
+        # An industry, not small donors, unattributed individuals or
+        # unclassified money: the leaderboard and public API read this as
+        # the member's top industry.
+        .filter(IndustryDonation.industry.notin_(NON_INDUSTRY_CODES))
+        .order_by(IndustryDonation.senator_id, IndustryDonation.total.desc())
+        .all()
+    )
+    for senator_id, name in ind_rows:
+        if senator_id not in top_industry_map:
+            top_industry_map[senator_id] = name
+
+    trend_map = _compute_trend_map(db)
+
+    # Name tiebreaker: overall scores tie often (int sub-scores), and
+    # Python's sort is stable over an UNORDERED query result — without
+    # a secondary key, tied members can swap ranks between requests.
+    senators.sort(key=lambda m: (-compute_overall_score(m), m.name))
+
+    # Party-relative ideology label thresholds over the full cohort (this
+    # query is .all(), so no pagination skew) — keeps progressive/moderate/
+    # centrist meaningful within a party. See party_ideology_bounds.
+    ideology_bounds_by_party = party_ideology_bounds(
+        [(s.ideology_score, s.party) for s in senators]
+    )
+
+    return [
+        LeaderboardEntrySchema(
+            id=s.id,
+            name=s.name,
+            state=s.state,
+            party=s.party,
+            years_in_office=s.years_in_office,
+            initials=_compute_initials(s.name) or s.initials,
+            representation_score=RepresentationScoreSchema(
+                funding_independence=s.score_funding_independence,
+                promise_persistence=None,
+                constituent_alignment=s.score_constituent_alignment,
+                funding_diversity=s.score_funding_diversity,
+                legislative_effectiveness=s.score_legislative_effectiveness,
+                overall=compute_overall_score(s),
+                confidence=json.loads(s.score_confidence or "{}") or None,
+            ),
+            total_raised=s.total_raised,
+            total_contributions=s.total_contributions,
+            total_from_pacs=s.total_from_pacs,
+            pac_share_pct=pac_share_pct(s),
+            small_donor_percentage=s.small_donor_percentage,
+            top_industry=top_industry_map.get(s.id),
+            trend=trend_map.get(s.id, ScoreTrendSchema()),
+            ideology_score=s.ideology_score,
+            ideology_label=(
+                describe_senator_position(
+                    s.ideology_score, s.leadership_score, s.party,
+                    years_in_office=s.years_in_office,
+                    ideology_bounds=ideology_bounds_by_party.get(s.party),
+                )
+                if s.ideology_score is not None and s.leadership_score is not None
+                else None
+            ),
+            leadership_score=s.leadership_score,
+        )
+        for s in senators
+    ]
+
+
+def get_senator_votes(
+    db: Session,
+    senator_id: str,
+    category: str = "recent",
+    page: int = 1,
+    per_page: int = 15,
+    vote_filter: str = "all",
+    q: str | None = None,
+) -> PaginatedVotesSchema | None:
+    """Return paginated, filterable votes for a senator."""
+    senator = db.query(Senator).filter(Senator.id == senator_id).first()
+    if senator is None:
+        return None
+
+    base_q = db.query(KeyVote).filter(KeyVote.senator_id == senator_id)
+    if category != "all":
+        base_q = base_q.filter(KeyVote.vote_category == category)
+    # A reader's search narrows the list and its counts alike.
+    if q and q.strip():
+        base_q = base_q.filter(vote_search(KeyVote, q))
+
+    count_all = base_q.count()
+    count_yea = base_q.filter(KeyVote.vote == "Yea").count()
+    count_nay = base_q.filter(KeyVote.vote == "Nay").count()
+    count_against = base_q.filter(KeyVote.voted_with_party == False).count()  # noqa: E712
+    counts = VoteCountsSchema(all=count_all, yea=count_yea, nay=count_nay, against_party=count_against)
+
+    query = base_q
+    if vote_filter == "yea":
+        query = query.filter(KeyVote.vote == "Yea")
+    elif vote_filter == "nay":
+        query = query.filter(KeyVote.vote == "Nay")
+    elif vote_filter == "against-party":
+        query = query.filter(KeyVote.voted_with_party == False)  # noqa: E712
+
+    total = query.count()
+    total_pages, page = paginate_bounds(total, page, per_page)
+
+    # id tiebreaker: many votes share one date string, and SQL row order
+    # among ties is unstable — without it the same vote can appear on two
+    # pages (or neither) across requests.
+    votes_db = query.order_by(KeyVote.date.desc(), KeyVote.id.desc()).offset((page - 1) * per_page).limit(per_page).all()
+    roll_calls = roll_call_summaries(db, [v.roll_call for v in votes_db])
+
+    def _build(v: KeyVote) -> KeyVoteSchema:
+        raw_areas = []
+        if getattr(v, "policy_areas", None):
+            try:
+                raw_areas = json.loads(v.policy_areas)
+            except (json.JSONDecodeError, TypeError):
+                raw_areas = []
+
+        policy_area_details = [
+            PolicyAreaDetail(
+                area=a.get("area", ""),
+                confidence=a.get("confidence", 0.0),
+                party=a.get("party", "bipartisan"),
+            )
+            for a in raw_areas
+            if isinstance(a, dict)
+        ]
+
+        return KeyVoteSchema(
+            bill_name=v.bill_name,
+            bill_id=v.bill_id,
+            date=v.date,
+            vote=v.vote,
+            policy_area=v.policy_area or "PROCEDURAL",
+            policy_areas=policy_area_details,
+            party_alignment_weight=getattr(v, "party_alignment_weight", 0.0) or 0.0,
+            stance=v.stance or "neutral",
+            description=v.description or "",
+            party_leaning=v.party_leaning,
+            voted_with_party=v.voted_with_party,
+            vote_category=v.vote_category or "key",
+            roll_call=roll_calls.get(v.roll_call),
+        )
+
+    return PaginatedVotesSchema(
+        votes=[_build(v) for v in votes_db],
+        total=total,
+        page=page,
+        per_page=per_page,
+        total_pages=total_pages,
+        category=category,
+        filter=vote_filter,
+        counts=counts,
+    )
+
+
+def get_senator_stock_trades(
+    db: Session,
+    senator_id: str,
+    page: int = 1,
+    per_page: int = 15,
+) -> PaginatedStockTradesSchema | None:
+    """Return paginated STOCK Act trade disclosures for a senator.
+
+    Informational only — not part of the weighted score dimensions, since
+    trade-disclosure completeness varies too much per member to score
+    fairly (see issue #45).
+    """
+    senator = db.query(Senator).filter(Senator.id == senator_id).first()
+    if senator is None:
+        return None
+
+    query = db.query(StockTrade).filter(StockTrade.senator_id == senator_id)
+    total = query.count()
+    # Only trades whose timeliness is known (StockTradeSchema).
+    late_count = query.filter(
+        StockTrade.days_to_disclose > STOCK_ACT_DISCLOSURE_DEADLINE_DAYS, StockTrade.parse_confidence == "text",
+    ).count()
+    total_pages, page = paginate_bounds(total, page, per_page)
+
+    trades_db = (
+        # Undated rows (a scan's illegible dates) after the dated ones.
+        query.order_by(StockTrade.transaction_date.desc().nulls_last(), StockTrade.id.desc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+        .all()
+    )
+
+    return PaginatedStockTradesSchema(
+        trades=[
+            StockTradeSchema(
+                ticker=t.ticker,
+                asset_name=t.asset_name,
+                owner=t.owner,
+                transaction_type=t.transaction_type,
+                transaction_date=t.transaction_date,
+                disclosure_date=t.disclosure_date,
+                days_to_disclose=t.days_to_disclose,
+                amount_low=t.amount_low,
+                amount_high=t.amount_high,
+                industry=t.industry,
+                source_url=t.source_url,
+                parse_confidence=t.parse_confidence,
+            )
+            for t in trades_db
+        ],
+        total=total,
+        page=page,
+        per_page=per_page,
+        total_pages=total_pages,
+        late_count=late_count,
+    )

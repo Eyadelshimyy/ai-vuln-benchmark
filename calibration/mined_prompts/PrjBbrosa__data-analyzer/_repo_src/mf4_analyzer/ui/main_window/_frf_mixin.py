@@ -1,0 +1,1123 @@
+"""Main-window adapter for directional SISO frequency-response analysis."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import ClassVar
+
+import numpy as np
+
+from ...signal.frf import (
+    FrfParams,
+    FrfRequestValidationError,
+    compute_frf,
+    plan_frf_request,
+)
+from ...signal.spectrogram import DEFAULT_TIME_JITTER_TOLERANCE
+from ..time_xaxis import CHANNEL_MODE, CustomXAxisSpec
+from ..analysis_result_state import bind_result, mark_pending, snapshot_request
+from .frf_coordinator import frf_compute_cache_params
+from .ultraview_coordinator import notify_ultraview_plot
+
+
+@dataclass
+class FrfPreflightError(ValueError):
+    """A user/data issue that must be shown without starting a worker.
+
+    ``code`` is the structured dispatch key (NO_CAN_FRAMES_MESSAGE pattern):
+    adapters branch on ``code``, never on Chinese substrings in ``message``.
+    """
+
+    message: str
+    code: str = "generic"
+
+    #: Selected-range time axis failed the uniformity gate; recoverable via
+    #: one automatic rebuild pass.
+    CODE_NONUNIFORM_TIME_AXIS: ClassVar[str] = "nonuniform_time_axis"
+
+    def __str__(self) -> str:
+        return self.message
+
+
+class FrfMixin:
+    """Collect pair intent, validate real timebases, dispatch, and render FRF."""
+
+    _FRF_Y_PANELS = ("magnitude", "phase", "coherence")
+
+    def _active_frf_state(self):
+        manager = self.analysis_managers["frf"]
+        if self._comparison_routes("frf"):
+            state = self._analysis_state_for_dispatch("frf")
+            page = self._analysis_page("frf")
+            pane_idx = self._dispatch_focus_index("frf", state)
+            return manager, state, page, pane_idx, state.panes[pane_idx]
+        state = manager.get(manager.active)
+        page = self._analysis_page("frf")
+        pane_idx = min(page.focused_index(), len(state.panes) - 1)
+        return manager, state, page, pane_idx, state.panes[pane_idx]
+
+    def _capture_frf_sources(self, state, pane_idx=None):
+        page = self._analysis_page("frf")
+        if pane_idx is None:
+            pane_idx = page.focused_index()
+        idx = min(int(pane_idx), len(state.panes) - 1)
+        pane = state.panes[idx]
+        input_source, output_source = self.inspector.frf_ctx.pair()
+        pane.sources = []
+        pane.input_source = tuple(input_source) if input_source else None
+        pane.output_source = tuple(output_source) if output_source else None
+
+    def _apply_frf_sources(self, state, *, pane_idx=None, sync_effective_facts=True):
+        page = self._analysis_page("frf")
+        if pane_idx is None:
+            pane_idx = page.focused_index()
+        idx = min(int(pane_idx), len(state.panes) - 1)
+        pane = state.panes[idx]
+        ctx = self.inspector.frf_ctx
+        old_input = ctx.combo_input.blockSignals(True)
+        old_output = ctx.combo_output.blockSignals(True)
+        try:
+            ctx.set_input_source(pane.input_source)
+            ctx.set_output_source(pane.output_source)
+        finally:
+            ctx.combo_output.blockSignals(old_output)
+            ctx.combo_input.blockSignals(old_input)
+        self._sync_frf_validation_context(state, idx)
+        ctx._refresh_validation()
+        # A focused-pane echo owns its immediate facts refresh.  The full View
+        # restore has a later cache-render sync after all final source, range,
+        # and canvas state is in place, so it suppresses this provisional one.
+        if sync_effective_facts:
+            self._sync_frf_effective_facts(state)
+
+    def _sync_frf_validation_context(self, state, pane_idx):
+        pane = state.panes[pane_idx]
+        self.inspector.frf_ctx.set_validation_context((
+            state.view_id, int(pane_idx),
+            self._analysis_source_signature_for_pane("frf", pane, state),
+            pane.time_range,
+            tuple(sorted(self._frf_compute_values_for_state(state).items())),
+        ))
+
+    def _frf_focused_pane_index(self, state):
+        """Focused pane index while ``state`` is the one on screen, else None."""
+        if self._comparison_routes("frf"):
+            comp = self._comparison()
+            focus = comp.focused("frf") if comp is not None else None
+            if focus is None or str(focus[0]) != str(state.view_id):
+                return None
+            idx = int(focus[1])
+            if not (0 <= idx < len(state.panes)):
+                return None
+            return idx
+        manager = self.analysis_managers["frf"]
+        if manager.get(manager.active) is not state:
+            return None
+        page = self._analysis_page("frf")
+        idx = page.focused_index()
+        if not (0 <= idx < min(page.pane_count(), len(state.panes))):
+            return None
+        return idx
+
+    def _frf_cached_result_for_pane(self, state, pane):
+        key = self._frf_cache_key_for_pane(state, pane)
+        if key is None:
+            return None
+        return self.analysis_caches["frf"].get(key)
+
+    def _frf_bound_result_for_pane(self, state, pane):
+        """Only this pane's accepted explicit request may provide its picture."""
+        binding = pane.result_binding
+        if binding is None or not binding.keys:
+            return None
+        return self.analysis_caches["frf"].get(binding.keys[0])
+
+    def _frf_bound_context_for_pane(self, pane):
+        binding = pane.result_binding
+        if binding is None:
+            return {}
+        return self._frf_render_context_for_pane(binding.request)
+
+    def _render_bound_frf_pane(self, state, pane_idx, canvas):
+        pane = state.panes[pane_idx]
+        result = self._frf_bound_result_for_pane(state, pane)
+        if result is None:
+            canvas.full_reset()
+            self._rebind_pane_overlay(canvas, pane)
+            self._replace_analysis_pane_pins("frf", state.view_id, pane_idx, ())
+            if pane.input_source is not None or pane.output_source is not None:
+                canvas.show_empty_hint("点击『计算频响』生成")
+            return False
+        self._replace_analysis_pane_pins(
+            "frf", state.view_id, pane_idx, pane.result_binding.keys,
+        )
+        canvas.set_result(
+            result, display_params=self._frf_display_params_for_state(state),
+            context=self._frf_bound_context_for_pane(pane),
+        )
+        self._restore_frf_canvas_ranges(canvas, pane)
+        if pane.result_binding.stale:
+            canvas.mark_stale()
+        return True
+
+    def _frf_view_is_uncomputed(self, state) -> bool:
+        """True when the View has an I/O pair but no cached FRF result."""
+        panes = tuple(getattr(state, "panes", ()) or ())
+        if not panes:
+            return False
+        pane = panes[0]
+        if pane.input_source is None or pane.output_source is None:
+            return False
+        return self._frf_bound_result_for_pane(state, pane) is None
+
+    def _cancel_frf_page_transition_cover(self, view_id=None) -> None:
+        """Drop a pending FRF cover before a live result or status replaces it."""
+        token = getattr(self.chart_stack, "_page_transition_target", None)
+        if token is None or token.section != "frf":
+            return
+        if view_id is not None and str(token.view_id) != str(view_id):
+            return
+        self.chart_stack.cancel_page_transition("frf-live-result")
+
+    def _publish_frf_effective_facts(self, result):
+        self.inspector.frf_ctx.set_effective_facts(
+            result.effective, getattr(result, "warnings", ()) or ()
+        )
+
+    def _sync_frf_effective_facts(self, state):
+        """Re-fill the Inspector facts card from the focused pane's result.
+
+        The completed-result cache is the same source the canvases render
+        from, so the facts card can never disagree with the curve beside it,
+        and no derived copy has to be parked on PaneState to make the focus
+        follow work.
+        """
+        idx = self._frf_focused_pane_index(state)
+        canvas = None if idx is None else self._canvas_for_view_pane("frf", state, idx)
+        result = (
+            None if canvas is None or not canvas.has_result()
+            else self._frf_bound_result_for_pane(state, state.panes[idx])
+        )
+        if result is None:
+            self.inspector.frf_ctx.clear_effective_facts()
+            return
+        self._publish_frf_effective_facts(result)
+        if state.panes[idx].result_binding.stale:
+            self.inspector.frf_ctx.mark_effective_facts_stale()
+
+    def _capture_frf_canvas_ranges(self, state):
+        for pane_idx in range(len(state.panes)):
+            pane = state.panes[pane_idx]
+            canvas = self._canvas_for_view_pane("frf", state, pane_idx)
+            if canvas is None or not canvas.has_result():
+                continue
+            xlim = canvas.get_xlim()
+            if xlim is not None:
+                pane.xlim = tuple(float(value) for value in xlim)
+            pane.ylims = {
+                name: tuple(float(value) for value in limits)
+                for name, limits in canvas.get_ylims().items()
+                if name in self._FRF_Y_PANELS
+            }
+            pane.ylim = pane.ylims.get("magnitude")
+
+    def _cursor_cards_for_state(self, section, state):
+        page = self._analysis_page(section)
+        comp = self._comparison()
+        if comp is not None and comp.is_open(section):
+            cards = []
+            for pane_idx in range(len(state.panes)):
+                card = page.card_for_view_pane(state.view_id, pane_idx)
+                if card is not None:
+                    cards.append((pane_idx, card))
+            if cards:
+                return cards
+        return [
+            (pane_idx, page._cards[pane_idx])
+            for pane_idx in range(min(page.pane_count(), len(state.panes)))
+        ]
+
+    def _capture_frequency_cursor_controls(self, section, state):
+        """Capture the shared off/single/dual cursor state for FFT or FRF."""
+        for pane_idx, card in self._cursor_cards_for_state(section, state):
+            getter = getattr(card, "cursor_mode", None)
+            if callable(getter):
+                state.panes[pane_idx].cursor_mode = getter()
+
+    def _apply_frequency_cursor_controls(self, section, state):
+        """Restore FFT/FRF pane cursor states without emitting a user edge."""
+        page = self._analysis_page(section)
+        for pane_idx, card in self._cursor_cards_for_state(section, state):
+            setter = getattr(card, "set_cursor_mode", None)
+            if callable(setter):
+                setter(
+                    state.panes[pane_idx].cursor_mode,
+                    notify=False,
+                )
+        sync = getattr(page, "_sync_frequency_cursor_control", None)
+        if callable(sync):
+            sync()
+
+    def _on_analysis_cursor_mode_changed(self, section, canvas, mode):
+        """Persist a frequency cursor selection onto exactly its owning pane."""
+        if section not in {"fft", "frf"}:
+            return
+        comp = self._comparison()
+        if comp is not None:
+            target = comp.target_for_canvas(canvas)
+            if target is not None and target.section == section:
+                state = self._analysis_state_by_id(section, target.view_id)
+                if state is not None and 0 <= target.pane_index < len(state.panes):
+                    state.panes[target.pane_index].cursor_mode = mode
+                    return
+        manager = self.analysis_managers[section]
+        state = manager.get(manager.active)
+        page = self._analysis_page(section)
+        for pane_idx in range(min(page.pane_count(), len(state.panes))):
+            if page.pane_canvas(pane_idx) is canvas:
+                state.panes[pane_idx].cursor_mode = mode
+                break
+
+    def _restore_frf_canvas_ranges(self, canvas, pane):
+        if pane.xlim is not None:
+            canvas.set_xlim(*pane.xlim)
+        ylims = dict(pane.ylims or {})
+        if not ylims and pane.ylim is not None:
+            ylims["magnitude"] = pane.ylim
+        for panel in self._FRF_Y_PANELS:
+            limits = ylims.get(panel)
+            if limits is not None:
+                canvas.set_ylim(panel, *limits)
+
+    def _mark_frf_pane_stale(self, state, pane_idx):
+        canvas = self._canvas_for_view_pane("frf", state, int(pane_idx))
+        if canvas is not None:
+            canvas.mark_stale()
+
+    def _dirty_frf_pane(self, state, pane_idx, *, clear_effective=False):
+        """Invalidate one pane's in-flight generation and stale its canvas."""
+
+        idx = int(pane_idx)
+        if not (0 <= idx < len(state.panes)):
+            return
+        if clear_effective and state.panes[idx].result_binding is None:
+            state.panes[idx].effective_time_range = None
+        self._reconcile_frf_result_validity(state, pane_indices=(idx,))
+
+    def _on_frf_pair_changed(self, input_source, output_source):
+        if self._applying_analysis_view:
+            return
+        _manager, state, _page, pane_idx, pane = self._active_frf_state()
+        pane.sources = []
+        pane.input_source = tuple(input_source) if input_source else None
+        pane.output_source = tuple(output_source) if output_source else None
+        self.inspector.frf_ctx.set_validation_message("")
+        self._dirty_frf_pane(state, pane_idx, clear_effective=True)
+        apply_range = getattr(self, "_apply_analysis_time_range", None)
+        if callable(apply_range):
+            apply_range("frf", state)
+
+    def _on_frf_compute_params_changed(self, params):
+        if self._applying_analysis_view:
+            return
+        _manager, state, _page, _pane_idx, _pane = self._active_frf_state()
+        state.params.update(dict(params or {}))
+        self._reconcile_frf_result_validity(state)
+
+    def _reconcile_frf_result_validity(self, state, *, pane_indices=None):
+        """An intent edit marks the accepted result pending; cache is not consent."""
+        focused = self._frf_focused_pane_index(state)
+        indices = range(len(state.panes)) if pane_indices is None else pane_indices
+        for pane_idx in indices:
+            if pane_idx == focused:
+                self._sync_frf_validation_context(state, pane_idx)
+            self._frf_coordinator.invalidate_pane(state.view_id, pane_idx)
+            mark_pending(state.panes[pane_idx])
+            self._mark_frf_pane_stale(state, pane_idx)
+        self._sync_frf_effective_facts(state)
+
+    def _on_frf_display_params_changed(self, params):
+        if self._applying_analysis_view:
+            return
+        _manager, state, page, _pane_idx, _pane = self._active_frf_state()
+        state.params.update(dict(params or {}))
+        self._validate_comparison_links("frf")
+        for idx in range(len(state.panes)):
+            canvas = self._canvas_for_view_pane("frf", state, idx)
+            if canvas is not None:
+                canvas.set_display_params(params)
+
+    @staticmethod
+    def _frf_validate_array_shapes(time, signal, role):
+        if time.ndim != 1 or signal.ndim != 1:
+            raise FrfPreflightError(f"{role}通道与时间轴必须是一维数组")
+        if len(time) != len(signal):
+            raise FrfPreflightError(f"{role}通道与真实时间轴长度不一致")
+
+    @classmethod
+    def _frf_validate_time_axis(cls, time, signal, fs, role):
+        cls._frf_validate_array_shapes(time, signal, role)
+        if len(time) < 2:
+            raise FrfPreflightError(f"{role}通道样本不足")
+        if not np.isfinite(time).all() or not np.isfinite(signal).all():
+            raise FrfPreflightError(f"{role}通道或时间轴包含非有限值")
+        differences = np.diff(time)
+        if np.any(differences <= 0):
+            raise FrfPreflightError(f"{role}真实时间轴必须严格递增")
+        nominal_dt = 1.0 / fs
+        jitter = float(np.max(np.abs(differences - nominal_dt)) / nominal_dt)
+        if jitter > DEFAULT_TIME_JITTER_TOLERANCE:
+            raise FrfPreflightError(
+                f"{role}真实时间轴不均匀（相对抖动 {jitter:.6g}）",
+                code=FrfPreflightError.CODE_NONUNIFORM_TIME_AXIS,
+            )
+
+    @staticmethod
+    def _frf_relative_jitter(time, fs):
+        """Return max relative jitter vs ``1/fs``, or ``None`` if undefined."""
+        arr = np.asarray(time, dtype=float)
+        if arr.size < 2:
+            return None
+        try:
+            sample_rate = float(fs)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(sample_rate) or sample_rate <= 0:
+            return None
+        differences = np.diff(arr)
+        if differences.size == 0 or np.any(differences <= 0):
+            return None
+        nominal_dt = 1.0 / sample_rate
+        return float(np.max(np.abs(differences - nominal_dt)) / nominal_dt)
+
+    def _frf_source_time(self, source, role):
+        """Time, file Fs, and unit for one endpoint. Does not read samples."""
+        if source is None:
+            raise FrfPreflightError(f"请选择{role}通道")
+        fid, channel = (str(source[0]), str(source[1]))
+        fd = self.files.get(fid)
+        if fd is None or channel not in fd.data.columns:
+            raise FrfPreflightError(f"{role}来源或通道已不可用")
+        try:
+            fs = float(fd.fs)
+        except (TypeError, ValueError) as exc:
+            raise FrfPreflightError(f"{role}采样率无效") from exc
+        if not np.isfinite(fs) or fs <= 0:
+            raise FrfPreflightError(f"{role}采样率必须大于 0")
+        time_source = str(getattr(fd, "_time_source", "") or "").lower()
+        time_values = getattr(fd, "time_array", None)
+        if time_values is None or time_source == "generated":
+            raise FrfPreflightError(
+                "FRF 需要真实时间轴，不能使用缺失或自动生成的时间轴；"
+                "请加载带物理时间列的来源。"
+            )
+        try:
+            time = np.asarray(time_values, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise FrfPreflightError(f"{role}真实时间轴必须是一维数值数组") from exc
+        if getattr(time, "ndim", None) != 1:
+            raise FrfPreflightError(f"{role}通道与时间轴必须是一维数组")
+        unit = str((getattr(fd, "channel_units", None) or {}).get(channel, "") or "")
+        return (fid, channel), fd, time, fs, unit
+
+    def _frf_source_arrays(self, source, role):
+        key, fd, time, fs, unit = self._frf_source_time(source, role)
+        _fid, channel = key
+        raw_signal = fd.data[channel].to_numpy(copy=False)
+        if np.iscomplexobj(raw_signal) or np.issubdtype(raw_signal.dtype, np.bool_):
+            raise FrfPreflightError(f"{role}通道必须是实数数值")
+        try:
+            signal = np.asarray(raw_signal, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise FrfPreflightError(f"{role}通道必须是实数数值") from exc
+        self._frf_validate_array_shapes(time, signal, role)
+        return key, fd, time, signal, fs, unit
+
+    def _frf_requested_range_for_pane(self, state, pane):
+        """Requested range for this pane, never another view's Inspector."""
+        return self._normalize_analysis_time_range(pane.time_range)
+
+    @staticmethod
+    def _frf_rebuilt_span(cropped_time, analysis_fs):
+        """Endpoints of the analysis grid without allocating ``arange(n)``.
+
+        ``prepare_analysis_time_axis`` builds ``origin + arange(n) / fs`` only
+        when materializing. The last sample of that grid is this scalar, which
+        is what the job stores in the cache key.
+        """
+        count = int(getattr(cropped_time, "size", 0) or 0)
+        origin = float(cropped_time[0]) if count else 0.0
+        if count <= 1:
+            return (origin, origin)
+        end = float(origin + np.float64(count - 1) / np.float64(analysis_fs))
+        return (origin, end)
+
+    def _frf_prepare_pair_samples(
+        self, state, pane, *, validate_selected=True, _auto_rebuilt=False,
+        materialize=True,
+    ):
+        """Crop on original time and describe this analysis request.
+
+        ``materialize=False`` is the lookup description: same crop, alignment,
+        and planned rate as the job, but no signal copies and no rebuilt grid.
+        The job path keeps ``materialize=True``. Imported sources stay unchanged.
+        """
+
+        if materialize:
+            input_key, input_fd, input_time, input_values, input_fs, input_unit = (
+                self._frf_source_arrays(pane.input_source, "输入")
+            )
+            (
+                output_key, output_fd, output_time, output_values, output_fs,
+                output_unit,
+            ) = self._frf_source_arrays(pane.output_source, "输出")
+        else:
+            input_key, input_fd, input_time, input_fs, input_unit = (
+                self._frf_source_time(pane.input_source, "输入")
+            )
+            output_key, output_fd, output_time, output_fs, output_unit = (
+                self._frf_source_time(pane.output_source, "输出")
+            )
+            input_values = None
+            output_values = None
+        if input_key == output_key:
+            raise FrfPreflightError("输入和输出不能是同一通道")
+        if input_key[0] != output_key[0]:
+            raise FrfPreflightError("输入和输出必须来自同一个逻辑来源")
+        if not np.isclose(input_fs, output_fs, rtol=1e-9, atol=0.0):
+            raise FrfPreflightError("输入和输出采样率不一致")
+        if len(input_time) == 0 or len(output_time) == 0:
+            raise FrfPreflightError("输入和输出没有共同的物理时间样本")
+
+        requested_range = self._frf_requested_range_for_pane(state, pane)
+        common_lo = max(float(input_time[0]), float(output_time[0]))
+        common_hi = min(float(input_time[-1]), float(output_time[-1]))
+        if requested_range is not None:
+            common_lo = max(common_lo, float(requested_range[0]))
+            common_hi = min(common_hi, float(requested_range[1]))
+        if common_hi < common_lo:
+            raise FrfPreflightError("输入和输出在当前范围内没有共同的物理时间样本")
+
+        input_mask = (input_time >= common_lo) & (input_time <= common_hi)
+        output_mask = (output_time >= common_lo) & (output_time <= common_hi)
+        input_time = input_time[input_mask]
+        output_time = output_time[output_mask]
+        if materialize:
+            input_values = input_values[input_mask]
+            output_values = output_values[output_mask]
+        if len(input_time) == 0 or len(output_time) == 0:
+            raise FrfPreflightError("输入和输出在当前范围内没有共同的物理时间样本")
+
+        time_facts = None
+        cropped_input_time = input_time
+        if validate_selected:
+            # Selected-data validation intentionally follows the common
+            # physical mask so jitter outside an explicitly requested range
+            # stays irrelevant. Lookup passes the time crop in the signal
+            # slot so the same jitter gate runs without reading samples.
+            try:
+                if materialize:
+                    self._frf_validate_time_axis(
+                        input_time, input_values, input_fs, "输入"
+                    )
+                    self._frf_validate_time_axis(
+                        output_time, output_values, output_fs, "输出"
+                    )
+                else:
+                    self._frf_validate_time_axis(
+                        input_time, input_time, input_fs, "输入"
+                    )
+                    self._frf_validate_time_axis(
+                        output_time, output_time, output_fs, "输出"
+                    )
+            except FrfPreflightError as issue:
+                if (
+                    issue.code != FrfPreflightError.CODE_NONUNIFORM_TIME_AXIS
+                    or _auto_rebuilt
+                ):
+                    raise
+                # Prove original pair alignment before assigning a common grid;
+                # rebuilding independently could conceal a true timing mismatch.
+                if len(input_time) != len(output_time) or not np.allclose(
+                    input_time, output_time, rtol=0,
+                    atol=DEFAULT_TIME_JITTER_TOLERANCE / input_fs,
+                ):
+                    raise FrfPreflightError("输入和输出真实时间轴未逐点对齐")
+                from ...analysis_time_axis import prepare_analysis_time_axis
+                prepared_time, input_fs, time_facts = prepare_analysis_time_axis(
+                    input_time, input_fs,
+                    time_source=getattr(input_fd, "_time_source", "column"),
+                    materialize=materialize,
+                )
+                if materialize:
+                    input_time = prepared_time
+                    output_time = input_time.copy()
+                    self._frf_validate_time_axis(
+                        input_time, input_values, input_fs, "输入"
+                    )
+                    self._frf_validate_time_axis(
+                        output_time, output_values, input_fs, "输出"
+                    )
+            if materialize or time_facts is None:
+                if len(input_time) != len(output_time):
+                    raise FrfPreflightError(
+                        "应用同一物理范围后输入和输出样本数不一致"
+                    )
+                alignment_tolerance = DEFAULT_TIME_JITTER_TOLERANCE / input_fs
+                max_difference = float(np.max(np.abs(input_time - output_time)))
+                if max_difference > alignment_tolerance:
+                    raise FrfPreflightError("输入和输出真实时间轴未逐点对齐")
+
+        if time_facts is None or materialize:
+            effective_range = (float(input_time[0]), float(input_time[-1]))
+        else:
+            effective_range = self._frf_rebuilt_span(cropped_input_time, input_fs)
+        return {
+            "input_key": input_key,
+            "output_key": output_key,
+            "input_fd": input_fd,
+            "output_fd": output_fd,
+            "input_time": input_time,
+            "output_time": output_time,
+            "input_values": input_values,
+            "output_values": output_values,
+            "input_fs": input_fs,
+            "input_unit": input_unit,
+            "output_unit": output_unit,
+            "requested_range": requested_range,
+            "effective_range": effective_range,
+            "time_axis": time_facts,
+        }
+
+    def _frf_display_params_for_state(self, state):
+        values = dict(self.inspector.frf_ctx.display_params())
+        values.update({
+            key: state.params[key]
+            for key in values
+            if key in state.params
+        })
+        return values
+
+    def _frf_compute_values_for_state(self, state):
+        """Compute fields for this view. Inactive views do not read Inspector."""
+        stored = getattr(state, "params", None) or {}
+        if self._analysis_state_for_capture("frf") is state:
+            values = self.inspector.frf_ctx.compute_params()
+        else:
+            defaults = FrfParams()
+            values = {
+                "estimator": defaults.estimator,
+                "t_win_s": defaults.t_win_s,
+                "overlap": defaults.overlap,
+                "nfft_mode": defaults.nfft_mode,
+                "nfft": defaults.nfft,
+                "window": defaults.window,
+                "periodic_window": defaults.periodic_window,
+                "detrend": defaults.detrend,
+            }
+        values.update({
+            key: stored[key]
+            for key in values
+            if key in stored
+        })
+        return values
+
+    def _frf_canonical_params(self, state, analysis_fs):
+        """Normalized compute params plus the analysis Fs the job will store."""
+        try:
+            params = FrfParams(**self._frf_compute_values_for_state(state))
+        except ValueError as exc:
+            raise FrfPreflightError(str(exc)) from exc
+        return params, {"fs": float(analysis_fs), **params.__dict__}
+
+    def _build_frf_candidate(self, state, pane_idx, *, force=False):
+        idx = min(int(pane_idx), len(state.panes) - 1)
+        pane = state.panes[idx]
+        prepared = self._frf_prepare_pair_samples(state, pane)
+        input_key = prepared["input_key"]
+        output_key = prepared["output_key"]
+        input_fd = prepared["input_fd"]
+        output_fd = prepared["output_fd"]
+        input_time = prepared["input_time"]
+        output_time = prepared["output_time"]
+        input_values = prepared["input_values"]
+        output_values = prepared["output_values"]
+        input_fs = prepared["input_fs"]
+        input_unit = prepared["input_unit"]
+        output_unit = prepared["output_unit"]
+
+        params, canonical = self._frf_canonical_params(state, input_fs)
+        # Single source of truth for nperseg/noverlap/hop/segments shape and
+        # its viability gates: ``plan_frf_request`` (compute_frf runs the
+        # same call again once the job actually dispatches). Do not
+        # re-derive those four formulas here; that duplication is exactly
+        # what let this preflight and the real validator drift apart.
+        try:
+            plan_frf_request(
+                n_samples=len(input_values), fs=input_fs, params=params
+            )
+        except FrfRequestValidationError as exc:
+            message = str(exc)
+            # Literal matches translate plan_frf_request's stable English
+            # identifiers to this preflight's existing Chinese copy. An
+            # unrecognized message (future wording change, or a new gate
+            # added upstream) falls back to showing it verbatim rather than
+            # silently swallowing the failure.
+            if message == "segment length must be at least 2 samples":
+                raise FrfPreflightError("FRF 段长必须至少包含 2 个样本") from exc
+            if message == (
+                "FRF averaging requires at least 2 complete segments; "
+                "shorten the window or enlarge the time range"
+            ):
+                raise FrfPreflightError(
+                    "FRF 平均至少需要 2 个完整段；请缩短段长或扩大时间范围"
+                ) from exc
+            if message == "nfft must be greater than or equal to segment length":
+                raise FrfPreflightError("NFFT 不能小于段长样本数") from exc
+            if message == (
+                "temporary complex-array memory exceeds the 64 MiB ceiling; "
+                "reduce nfft"
+            ):
+                raise FrfPreflightError(
+                    "临时频谱缓冲区将超过 64 MiB 上限；请减小 NFFT"
+                ) from exc
+            raise FrfPreflightError(message) from exc
+
+        effective_range = prepared["effective_range"]
+        render_params = self._frf_display_params_for_state(state)
+        input_copy = np.array(input_values, dtype=np.float64, copy=True)
+        output_copy = np.array(output_values, dtype=np.float64, copy=True)
+        input_time_copy = np.array(input_time, dtype=np.float64, copy=True)
+        output_time_copy = np.array(output_time, dtype=np.float64, copy=True)
+
+        def job(worker):
+            result = compute_frf(
+                input_copy,
+                output_copy,
+                fs=input_fs,
+                params=params,
+                input_time=input_time_copy,
+                output_time=output_time_copy,
+                cancel_check=worker.cancelled,
+                progress=worker.progress.emit,
+            )
+            if prepared['time_axis'] is not None:
+                from dataclasses import replace
+                result = replace(result, effective=replace(
+                    result.effective, time_axis=prepared['time_axis']))
+            return result
+
+        return {
+            "view_id": state.view_id,
+            "pane_idx": idx,
+            "request_snapshot": snapshot_request(state, pane),
+            "request_pane": pane,
+            "input_source": input_key,
+            "output_source": output_key,
+            "params": canonical,
+            "time_range": effective_range,
+            "render_params": render_params,
+            "input_unit": input_unit,
+            "output_unit": output_unit,
+            "input_label": f"{input_fd.short_name} · {input_key[1]}",
+            "output_label": f"{output_fd.short_name} · {output_key[1]}",
+            "force": bool(force),
+            "job": job,
+        }
+
+    def do_frf(self, force=False):
+        if not self._offer_analysis_time_range_before_compute("frf"):
+            return False
+        self._capture_active_analysis_view("frf")
+        _manager, state, page, pane_idx, pane = self._active_frf_state()
+        # A retry supersedes the accepted request even when preflight fails
+        # or the service suppresses terminal callbacks after cancellation.
+        # Keep the coordinator's cross-pane queue/replacement policy intact.
+        mark_pending(pane)
+        self._mark_frf_pane_stale(state, pane_idx)
+        self._sync_frf_effective_facts(state)
+        try:
+            candidate = self._build_frf_candidate(state, pane_idx, force=force)
+        except FrfPreflightError as issue:
+            context = {"view_id": state.view_id, "pane_idx": pane_idx}
+            self._frf_coordinator.request({
+                **context,
+                "preflight_error": issue,
+            })
+            return False
+        self.inspector.frf_ctx.set_validation_message("")
+        self._cancel_frf_page_transition_cover(state.view_id)
+        canvas = self._dispatch_canvas("frf", state, pane_idx)
+        if canvas is not None:
+            canvas.show_progress()
+        return self._frf_coordinator.request(candidate)
+
+    def _recompute_restored_frf_view(self, view_id):
+        """Dispatch every complete persisted pane without reading live combos."""
+
+        state = self._frf_state_by_id(view_id)
+        if state is None:
+            return 0
+        manager = self.analysis_managers["frf"]
+        is_active = manager.get(manager.active) is state
+        if is_active:
+            self.chart_stack.ensure_analysis_page_ready("frf")
+        page = self._analysis_page("frf")
+        submitted = 0
+        for pane_idx, pane in enumerate(state.panes):
+            if pane.input_source is None or pane.output_source is None:
+                continue
+            blocker = getattr(self, "_analysis_restore_time_range_block_reason", None)
+            if callable(blocker):
+                reason = blocker("frf", state, pane_idx)
+                if reason:
+                    self._frf_coordinator.request({
+                        "view_id": state.view_id,
+                        "pane_idx": pane_idx,
+                        "preflight_error": FrfPreflightError(reason),
+                    })
+                    continue
+            try:
+                candidate = self._build_frf_candidate(state, pane_idx)
+            except FrfPreflightError as issue:
+                self._frf_coordinator.request({
+                    "view_id": state.view_id,
+                    "pane_idx": pane_idx,
+                    "preflight_error": issue,
+                })
+                continue
+            if is_active and pane_idx < page.pane_count():
+                self._cancel_frf_page_transition_cover(state.view_id)
+                page.pane_canvas(pane_idx).show_progress()
+            submitted += bool(self._frf_coordinator.request(candidate))
+        return submitted
+
+    def _on_frf_job_queued(self, context):
+        if self._analysis_jobs.progress_token("frf") is None:
+            token = self._begin_compute_progress(
+                "频响计算中", total=1000, process_events=False
+            )
+            self._analysis_jobs.set_progress_token("frf", token)
+        state = self._frf_state_by_id(context.get("view_id"))
+        if state is self.analysis_managers["frf"].get(
+            self.analysis_managers["frf"].active
+        ):
+            pane_idx = int(context.get("pane_idx", 0))
+            page = self._analysis_page("frf")
+            if 0 <= pane_idx < page.pane_count():
+                self._cancel_frf_page_transition_cover(state.view_id)
+                page.pane_canvas(pane_idx).show_progress()
+
+    def _on_frf_job_progress(self, done, total):
+        token = self._analysis_jobs.progress_token("frf")
+        if token is None:
+            return
+        self._update_compute_progress(done, total, label="频响计算中", token=token)
+        if done == total and not self._analysis_jobs.is_running("frf"):
+            self._finish_compute_progress(token=token)
+            self._analysis_jobs.clear_progress_token("frf")
+            self._finish_analysis_restore_if_idle()
+
+    def _frf_state_by_id(self, view_id):
+        target = str(view_id or "")
+        for state in self.analysis_managers["frf"].views:
+            if state.view_id == target:
+                return state
+        return None
+
+    def _frf_render_context_for_pane(self, pane):
+        input_source = pane.input_source
+        output_source = pane.output_source
+        if input_source is None or output_source is None:
+            return {}
+        input_fd = self.files.get(input_source[0])
+        output_fd = self.files.get(output_source[0])
+        return {
+            "input_source": input_source,
+            "output_source": output_source,
+            "input_unit": "" if input_fd is None else str(
+                input_fd.channel_units.get(input_source[1], "") or ""
+            ),
+            "output_unit": "" if output_fd is None else str(
+                output_fd.channel_units.get(output_source[1], "") or ""
+            ),
+            "input_label": input_source[1],
+            "output_label": output_source[1],
+        }
+
+    def _on_frf_render_requested(self, context, result, cache_hit):
+        state = self._frf_state_by_id(context.get("view_id"))
+        if state is None:
+            self._unpublish_analysis_completion("frf", context)
+            return
+        pane_idx = int(context.get("pane_idx", 0))
+        if not (0 <= pane_idx < len(state.panes)):
+            self._unpublish_analysis_completion("frf", context)
+            return
+        pane = state.panes[pane_idx]
+        request = context.get("request_snapshot")
+        key = context.get("analysis_key")
+        if (
+            context.get("request_pane") is not pane
+            or request is None or key is None
+            or not bind_result(pane, request, (key,))
+        ):
+            self._unpublish_analysis_completion("frf", context)
+            return
+        self._replace_analysis_pane_pins("frf", state.view_id, pane_idx, (key,))
+        pane.effective_time_range = (
+            float(result.effective.time_start),
+            float(result.effective.time_end),
+        )
+        if not self._analysis_completion_is_visible("frf", context):
+            return
+        canvas = self._canvas_for_completion("frf", state.view_id, pane_idx)
+        if canvas is None:
+            return
+        render_context = self._frf_bound_context_for_pane(pane)
+        render_context.update({
+            key: context[key]
+            for key in (
+                "input_unit", "output_unit", "input_label", "output_label"
+            )
+            if key in context
+        })
+        self._cancel_frf_page_transition_cover(state.view_id)
+        canvas.set_result(
+            result,
+            # Presentation controls do not invalidate compute. A job may
+            # complete after the user changed them, so render with the current
+            # persisted View values rather than the submission snapshot.
+            display_params=self._frf_display_params_for_state(state),
+            context=render_context,
+        )
+        self._restore_frf_canvas_ranges(canvas, pane)
+        notify_ultraview_plot(self, "frf", "frf-plot")
+        focus_pane = (
+            self._dispatch_focus_index("frf", state)
+            if self._comparison_routes("frf")
+            else self._analysis_page("frf").focused_index()
+        )
+        if pane_idx == focus_pane and self._completion_updates_focus("frf", context):
+            self.inspector.frf_ctx.set_validation_message("")
+            # Both the worker completion and the synchronous cache hit land
+            # here, so the resident facts are filled exactly once per render.
+            self._publish_frf_effective_facts(result)
+        if (
+            self.chart_stack.current_mode() == "frf"
+            and self._frf_focused_pane_index(state) == pane_idx
+        ):
+            suffix = "（缓存）" if cache_hit else ""
+            self.statusBar.showMessage(
+                f"频响完成{suffix} · {result.effective.segments} 段 · "
+                f"df {result.effective.df:g} Hz"
+            )
+
+    def _on_frf_failed(self, context, issue):
+        message = str(issue)
+        state = self._frf_state_by_id(context.get("view_id"))
+        pane_idx = int(context.get("pane_idx", 0))
+        if state is None or not 0 <= pane_idx < len(state.panes):
+            return
+        pane = state.panes[pane_idx]
+        request = context.get("request_snapshot")
+        if request is not None and (
+            context.get("request_pane") is not pane
+            or request.revision != pane.request_revision
+        ):
+            return
+        mark_pending(pane)
+        if self._frf_focused_pane_index(state) == pane_idx:
+            self._sync_frf_effective_facts(state)
+        if state is not None and self._analysis_completion_is_visible("frf", context):
+            pane_idx = int(context.get("pane_idx", 0))
+            canvas = self._canvas_for_completion("frf", state.view_id, pane_idx)
+            if canvas is not None:
+                self._cancel_frf_page_transition_cover(state.view_id)
+                canvas.show_error(message)
+            focus_pane = (
+                self._dispatch_focus_index("frf", state)
+                if self._comparison_routes("frf")
+                else self._analysis_page("frf").focused_index()
+            )
+            if pane_idx == focus_pane and self._completion_updates_focus("frf", context):
+                self._sync_frf_validation_context(state, pane_idx)
+                self.inspector.frf_ctx.set_validation_message(message, retryable=True)
+        if (
+            self.chart_stack.current_mode() == "frf"
+            and self._frf_focused_pane_index(state) == pane_idx
+        ):
+            self.statusBar.showMessage(f"频响错误: {message}")
+            self.toast(message, "error")
+
+    def _frf_cache_key_for_pane(self, state, pane):
+        """Same key the job stored: analysis Fs plus the prepared span.
+
+        Lookup uses current intent, including before a pane has run or after
+        its range/pair changed back. The light time description does not
+        copy either signal or allocate the rebuilt grid.
+        """
+        if (
+            pane.input_source is None
+            or pane.output_source is None
+        ):
+            return None
+        try:
+            described = self._frf_prepare_pair_samples(
+                state, pane, materialize=False,
+            )
+            _params, canonical = self._frf_canonical_params(
+                state, described["input_fs"],
+            )
+        except FrfPreflightError:
+            return None
+        return self.analysis_caches["frf"].make_key(
+            described["input_key"],
+            described["output_key"],
+            frf_compute_cache_params(canonical),
+            described["effective_range"],
+        )
+
+    def _render_frf_view_from_cache(self, state):
+        page = self._analysis_page("frf")
+        missing = False
+        for pane_idx in range(min(page.pane_count(), len(state.panes))):
+            restored = self._render_bound_frf_pane(
+                state, pane_idx, page.pane_canvas(pane_idx),
+            )
+            missing = missing or not restored
+        self._sync_frf_effective_facts(state)
+        notify_ultraview_plot(self, "frf", "frf-restore-plot")
+        if missing:
+            self.statusBar.showMessage("参数/输入输出已就绪，点击计算频响")
+
+    def _frf_pair_effective_range(self, state, pane, *, lightweight=False):
+        return self._frf_prepare_pair_samples(
+            state, pane, validate_selected=not lightweight
+        )["effective_range"]
+
+    @staticmethod
+    def _same_range(left, right):
+        return (
+            left is not None
+            and right is not None
+            and np.allclose(left, right, rtol=0.0, atol=1e-12)
+        )
+
+    @staticmethod
+    def _frf_time_view_signature(input_source, output_source, effective_range):
+        return {
+            "input": [str(input_source[0]), str(input_source[1])],
+            "output": [str(output_source[0]), str(output_source[1])],
+            "effective_time_range": [
+                float(effective_range[0]), float(effective_range[1])
+            ],
+        }
+
+    def _time_view_has_frf_signature(
+        self, view, input_source, output_source, effective_range
+    ):
+        raw = (view.axis_opts or {}).get("frf_source_signature")
+        if not isinstance(raw, dict):
+            return False
+        try:
+            stored_input = tuple(str(value) for value in raw["input"])
+            stored_output = tuple(str(value) for value in raw["output"])
+            stored_range = tuple(float(value) for value in raw["effective_time_range"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return (
+            stored_input == tuple(str(value) for value in input_source)
+            and stored_output == tuple(str(value) for value in output_source)
+            and self._same_range(stored_range, effective_range)
+        )
+
+    def _view_frf_pair_in_time_domain(self):
+        _manager, state, _page, _pane_idx, pane = self._active_frf_state()
+        if pane.input_source is None or pane.output_source is None:
+            self.toast("请先选择 FRF 输入和输出", "warning")
+            return -1
+        try:
+            effective_range = self._frf_pair_effective_range(state, pane)
+        except FrfPreflightError as issue:
+            self.toast(str(issue), "warning")
+            return -1
+        input_source = tuple(pane.input_source)
+        output_source = tuple(pane.output_source)
+        title = f"频响 · {output_source[1]}/{input_source[1]}"
+        target = None
+        for idx, view in enumerate(self.view_manager.views):
+            spec = CustomXAxisSpec.from_axis_opts(
+                (view.axis_opts or {}).get("x_axis")
+            )
+            if (
+                self._time_view_has_frf_signature(
+                    view, input_source, output_source, effective_range
+                )
+                and spec.mode != CHANNEL_MODE
+            ):
+                target = idx
+                break
+        if target is None:
+            target = self.view_manager.new_view()
+            if target < 0:
+                cap = self.view_manager.max_views
+                self.toast(
+                    f"时域 View 已达 {cap} 个；请先关闭一个 View 再重试",
+                    "warning",
+                )
+                return -1
+            view = self.view_manager.get(target)
+            view.name = title
+            view.attached_file_ids = list(dict.fromkeys(
+                [str(input_source[0]), str(output_source[0])]
+            ))
+            view.checked = [input_source, output_source]
+            view.hidden_channels = []
+            colors = self._analysis_channel_color_map()
+            view.colors = {
+                key: colors[key] for key in view.checked if key in colors
+            }
+            view.plot_mode = "overlay"
+            view.xlim = tuple(effective_range)
+            axis_opts = dict(view.axis_opts or {})
+            axis_opts.update({
+                "x_axis": CustomXAxisSpec(mode="time").to_axis_opts(),
+                "range_filter": {
+                    "enabled": True,
+                    "start": float(effective_range[0]),
+                    "end": float(effective_range[1]),
+                },
+                "frf_source_signature": self._frf_time_view_signature(
+                    input_source, output_source, effective_range
+                ),
+            })
+            view.axis_opts = axis_opts
+            self.view_manager.views_changed.emit()
+        else:
+            view = self.view_manager.get(target)
+            # Re-assert the dedicated contract if the user panned or temporarily
+            # edited the view after it was created; the canonical signature,
+            # not the presentation name, determines reuse.
+            view.attached_file_ids = list(dict.fromkeys(
+                [str(input_source[0]), str(output_source[0])]
+            ))
+            view.checked = [input_source, output_source]
+            view.hidden_channels = []
+            view.xlim = tuple(effective_range)
+            axis_opts = dict(view.axis_opts or {})
+            axis_opts["x_axis"] = CustomXAxisSpec(mode="time").to_axis_opts()
+            axis_opts["range_filter"] = {
+                "enabled": True,
+                "start": float(effective_range[0]),
+                "end": float(effective_range[1]),
+            }
+            view.axis_opts = axis_opts
+            self.view_manager.views_changed.emit()
+        if self.view_manager.active != target:
+            self.view_manager.set_active(target)
+        self.toolbar._set_mode("time")
+        self._apply_active_view(target)
+        return target
+
+
+__all__ = ["FrfMixin", "FrfPreflightError"]

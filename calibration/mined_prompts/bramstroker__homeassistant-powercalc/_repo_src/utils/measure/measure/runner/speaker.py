@@ -1,0 +1,162 @@
+import logging
+import time
+
+from measure.controller.media.controller import MediaController
+from measure.powermeter.errors import ZeroReadingError
+from measure.request import SpeakerMeasurementRequest
+from measure.runner.interaction import ImmediateInteraction, RunInteraction, SpeakerOperatingPoint
+from measure.runner.runner import MeasurementRunner, RunnerResult
+from measure.tuning import MeasurementParameters
+from measure.utils.sampling import MeasurementResult, PowerSampler
+
+DURATION_PER_VOLUME_LEVEL = 20
+STREAM_URL = "https://powercalc.s3.eu-west-1.amazonaws.com/g_pink.mp3"
+SLEEP_PRE_MEASURE = 2
+SLEEP_MUTE = 5
+FAST_TEST_VOLUMES = (10, 100)
+VOLUME_MEASUREMENT_PHASE = "Measuring volume levels"
+
+_LOGGER = logging.getLogger("measure")
+
+
+class SpeakerRunner(MeasurementRunner[SpeakerMeasurementRequest]):
+    def __init__(
+        self,
+        sampler: PowerSampler,
+        parameters: MeasurementParameters,
+        media_controller: MediaController,
+        interaction: RunInteraction | None = None,
+    ) -> None:
+        self.sampler = sampler
+        self.config = parameters
+        self.media_controller = media_controller
+        self.interaction = interaction or ImmediateInteraction()
+
+    def run(
+        self,
+        request: SpeakerMeasurementRequest,
+        export_directory: str,
+    ) -> RunnerResult:
+        summary = {}
+        voltages: list[float] = []
+        fast_test_mode = self.config.fast_test_mode
+        duration = DURATION_PER_VOLUME_LEVEL
+        volumes = FAST_TEST_VOLUMES if fast_test_mode else tuple(range(10, 101, 10))
+        total_steps = len(volumes) + 1  # every volume level plus the muted baseline
+
+        self.interaction.notify(
+            f"Measuring power for {duration} seconds on each volume level "
+            "starting with 10 until 100 (with steps of 10 between)",
+        )
+        self.interaction.phase("Starting speaker measurement")
+        self.interaction.progress(
+            0,
+            total_steps,
+            phase=VOLUME_MEASUREMENT_PHASE,
+            remaining_seconds=self._estimate_remaining_seconds(0, len(volumes), fast_test_mode),
+        )
+
+        disable_streaming = request.disable_streaming
+
+        # A previous run (or the user) may have left the speaker muted; setting the
+        # volume does not unmute it, so the volume steps would measure silence.
+        # Speakers without the VOLUME_MUTE feature reject the call; that must not
+        # stop the volume levels from being measured.
+        try:
+            self.media_controller.unmute_volume()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Could not unmute the speaker before measuring, continuing: %s", err)
+
+        for completed_steps, volume in enumerate(volumes, start=1):
+            _LOGGER.info("Setting volume to %d", volume)
+            self.media_controller.set_volume(volume)
+            self.interaction.operating_point(SpeakerOperatingPoint(type="speaker", volume=volume, muted=False))
+            if not disable_streaming:
+                _LOGGER.info("Start streaming noise")
+                self.media_controller.play_audio(STREAM_URL)
+            self.interaction.phase(f"Stabilizing speaker at {volume}% volume")
+            if not fast_test_mode:
+                self.interaction.wait(SLEEP_PRE_MEASURE)
+            self.interaction.phase(f"Measuring speaker at {volume}% volume")
+            result = self._measure(duration, fast_test_mode)
+            summary[volume] = result.power
+            voltages.extend(result.voltages)
+            self.interaction.progress(
+                completed_steps,
+                total_steps,
+                phase=VOLUME_MEASUREMENT_PHASE,
+                remaining_seconds=self._estimate_remaining_seconds(completed_steps, len(volumes), fast_test_mode),
+            )
+
+        _LOGGER.info("Muting volume and waiting for %d seconds", SLEEP_MUTE)
+        self.media_controller.mute_volume()
+        self.interaction.operating_point(SpeakerOperatingPoint(type="speaker", volume=0, muted=True))
+        self.interaction.phase("Stabilizing muted speaker")
+        if not fast_test_mode:
+            self.interaction.wait(SLEEP_MUTE)
+        self.interaction.phase("Measuring muted speaker")
+        result = self._measure(duration, fast_test_mode)
+        summary[0] = result.power
+        voltages.extend(result.voltages)
+        self.interaction.progress(total_steps, total_steps, phase=VOLUME_MEASUREMENT_PHASE, remaining_seconds=0)
+
+        self.media_controller.unmute_volume()
+        self.media_controller.set_volume(10)
+        self.interaction.operating_point(SpeakerOperatingPoint(type="speaker", volume=10, muted=False))
+
+        self.interaction.notify("Summary of all average measurements:")
+        for volume in summary:
+            self.interaction.notify(f"{volume} : {summary[volume]}")
+
+        return RunnerResult(model_json_data=self._build_model_json_data(summary), voltages=voltages)
+
+    def _measure(self, duration: int, fast_test_mode: bool) -> MeasurementResult:
+        """Take an instant sample in fast-test mode, otherwise average over the full duration."""
+        if fast_test_mode:
+            return self.sampler.take_measurement(time.time())
+        return self.sampler.take_average_measurement(duration)
+
+    @staticmethod
+    def _estimate_remaining_seconds(completed_levels: int, total_levels: int, fast_test_mode: bool = False) -> float:
+        """Estimated time for the remaining volume levels plus the muted baseline."""
+        if fast_test_mode:
+            return 0
+        remaining_levels = total_levels - completed_levels
+        return (
+            remaining_levels * (SLEEP_PRE_MEASURE + DURATION_PER_VOLUME_LEVEL) + SLEEP_MUTE + DURATION_PER_VOLUME_LEVEL
+        )
+
+    @staticmethod
+    def _build_model_json_data(summary: dict[int, float]) -> dict[str, object]:
+        calibrate_list = [f"{volume} -> {summary[volume]}" for volume in summary]
+
+        return {
+            "device_type": "smart_speaker",
+            "calculation_strategy": "linear",
+            "calculation_enabled_condition": "{{ is_state('[[entity]]', 'playing') }}",
+            "linear_config": {"calibrate": calibrate_list},
+        }
+
+    def measure_standby_power(self) -> MeasurementResult:
+        self.media_controller.turn_off()
+        self.interaction.operating_point(SpeakerOperatingPoint(type="speaker", volume=0, muted=True))
+        start_time = time.time()
+        if not self.config.fast_test_mode:
+            _LOGGER.info(
+                "Measuring standby power. Waiting for %d seconds...",
+                self.config.sleep_standby,
+            )
+            self.interaction.wait(self.config.sleep_standby)
+        try:
+            return self.sampler.take_measurement(start_time)
+        except ZeroReadingError:
+            _LOGGER.error("Measured 0 watt as standby power.")
+            return MeasurementResult(power=0, voltages=[])
+
+    def cleanup(self) -> None:
+        """Stop playback after success, failure, or cancellation."""
+
+        try:
+            self.media_controller.turn_off()
+        except Exception:  # cleanup must not mask the measurement outcome
+            _LOGGER.warning("Could not turn off speaker during cleanup", exc_info=True)

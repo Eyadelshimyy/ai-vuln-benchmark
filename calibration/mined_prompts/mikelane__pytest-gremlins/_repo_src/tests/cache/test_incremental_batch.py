@@ -1,0 +1,54 @@
+"""Tests for batch operations in IncrementalCache."""
+
+from pathlib import Path
+import time
+
+import pytest
+
+from pytest_gremlins.cache.incremental import IncrementalCache
+
+
+@pytest.mark.medium
+class DescribeIncrementalCacheBatchOperations:
+    """Tests for batch cache write support."""
+
+    def it_batches_writes_in_deferred_cache_results(self, tmp_path: Path) -> None:
+        """cache_result_deferred batches writes for better performance."""
+        cache_dir = tmp_path / '.gremlins_cache'
+        num_gremlins = 100
+
+        with IncrementalCache(cache_dir) as cache:
+            # Time deferred writes
+            start = time.perf_counter()
+            for i in range(num_gremlins):
+                cache.cache_result_deferred(
+                    f'gremlin_{i}',
+                    'source_hash',
+                    {'test': 'hash'},
+                    {'status': 'zapped'},
+                )
+            cache.flush()
+            deferred_time = time.perf_counter() - start
+
+        # Verify all writes persisted
+        with IncrementalCache(cache_dir) as cache:
+            for i in range(num_gremlins):
+                result = cache.get_cached_result(f'gremlin_{i}', 'source_hash', {'test': 'hash'})
+                assert result == {'status': 'zapped'}
+
+        # Deferred writes should be fast (< 500ms for 100 entries)
+        # Note: Windows CI (especially Python 3.14) can be significantly slower
+        assert deferred_time < 0.5, f'Deferred writes took {deferred_time * 1000:.1f}ms for {num_gremlins} entries'
+
+    def it_close_flushes_deferred_writes(self, tmp_path: Path) -> None:
+        """Closing the cache flushes any pending deferred writes."""
+        cache_dir = tmp_path / '.gremlins_cache'
+
+        with IncrementalCache(cache_dir) as cache:
+            cache.cache_result_deferred('g1', 'src', {'t': 'h'}, {'status': 'zapped'})
+            # No explicit flush
+
+        # Data should be persisted
+        with IncrementalCache(cache_dir) as cache:
+            result = cache.get_cached_result('g1', 'src', {'t': 'h'})
+            assert result == {'status': 'zapped'}

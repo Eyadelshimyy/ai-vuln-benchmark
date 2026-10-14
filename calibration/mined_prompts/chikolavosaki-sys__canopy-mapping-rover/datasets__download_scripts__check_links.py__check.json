@@ -1,0 +1,28 @@
+{
+  "repo": "chikolavosaki-sys__canopy-mapping-rover",
+  "file": "datasets/download_scripts/check_links.py",
+  "function": "check",
+  "line": 19,
+  "candidate_cwes": [
+    "CWE-918"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Return a short status, retrying with GET when HEAD is rejected.",
+  "prompt_source": "def check(url: str) -> str:\n    \"\"\"Return a short status, retrying with GET when HEAD is rejected.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def check(url: str) -> str:\n    \"\"\"Return a short status, retrying with GET when HEAD is rejected.\"\"\"\n    headers = {\"User-Agent\": \"Mozilla/5.0 (compatible; canopy-mapping-rover-link-checker/1.0)\"}\n    for method in (\"HEAD\", \"GET\"):\n        for _attempt in range(3):\n            try:\n                request = Request(url, method=method, headers=headers)\n                with urlopen(request, timeout=15) as response:\n                    if method == \"GET\":\n                        response.read(1)\n                    suffix = \", GET fallback\" if method == \"GET\" else \"\"\n                    return f\"OK ({response.status}{suffix})\"\n            except Exception as error:\n                last_error = error\n    return f\"BROKEN ({type(last_error).__name__}: {last_error})\"",
+  "module_source": "\"\"\"Check dataset web links without downloading dataset files.\"\"\"\n\nfrom pathlib import Path\nimport re\nfrom urllib.request import Request, urlopen\n\n\nREADME = Path(__file__).parents[1] / \"README.md\"\nURL_PATTERN = re.compile(r\"https?://[^\\s|)]+\")\nTRAILING_PUNCTUATION = \".,;:'\\\"\"\n\n\ndef read_links() -> list[str]:\n    \"\"\"Return unique HTTP links written in the dataset table.\"\"\"\n    links = (link.rstrip(TRAILING_PUNCTUATION) for link in URL_PATTERN.findall(README.read_text()))\n    return list(dict.fromkeys(links))\n\n\ndef check(url: str) -> str:\n    \"\"\"Return a short status, retrying with GET when HEAD is rejected.\"\"\"\n    headers = {\"User-Agent\": \"Mozilla/5.0 (compatible; canopy-mapping-rover-link-checker/1.0)\"}\n    for method in (\"HEAD\", \"GET\"):\n        for _attempt in range(3):\n            try:\n                request = Request(url, method=method, headers=headers)\n                with urlopen(request, timeout=15) as response:\n                    if method == \"GET\":\n                        response.read(1)\n                    suffix = \", GET fallback\" if method == \"GET\" else \"\"\n                    return f\"OK ({response.status}{suffix})\"\n            except Exception as error:\n                last_error = error\n    return f\"BROKEN ({type(last_error).__name__}: {last_error})\"\n\n\ndef main() -> None:\n    \"\"\"Print one result per link.\"\"\"\n    for link in read_links():\n        print(f\"{check(link)} {link}\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "github-copilot": 15
+    },
+    "ai_commit": "9e9172a2148a",
+    "evidence": "Co-authored-by: Copilot <",
+    "ai_line_fraction": 1.0,
+    "span": [
+      19,
+      33
+    ]
+  }
+}

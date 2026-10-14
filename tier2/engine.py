@@ -102,9 +102,30 @@ def classify_diag(attempts: list) -> str:
     This is what turns an opaque NOT_CONFIRMED into a root cause, so a real
     harness/oracle miss can be told apart from a legitimate negative.
 
+    The buckets are grouped by CWE family; the SQL ones are kept exactly as
+    before, and path (CWE-22) / command (CWE-78) ones were added so those
+    classes stop collapsing to the misleading SQL-only "no SQL executed".
+
       NOT_ENTERED            the candidate function never ran in live mode
                              (construction / import / CLI-interface failure)
-      NO_SQL_EXECUTED        it ran but executed no SQL at all
+      EXECUTED_NO_SINK       it ran to completion but touched no tracked
+                             injection sink at all (SQL, filesystem, or process)
+                             -- for a flagged function this points at a likely
+                             LLM false positive or an un-instrumented sink
+      SINK_REACHED_INPUT_ABSENT  a filesystem/process sink ran, but our payload
+                             was not in its argument -> taint did not propagate
+                             from the parameter to the sink (flow broke / the
+                             value was sanitised or replaced before the sink)
+      PATH_TRAVERSAL_NO_OBSERVABLE  our payload reached open()/Path.write_* AND
+                             the resolved path escaped the sandbox cwd, yet the
+                             observable did not fire -> almost certainly a real
+                             traversal the oracle missed -> ORACLE GAP, FIX
+      PATH_SINK_INPUT_BOUNDED  payload reached a filesystem sink but the path
+                             stayed inside the sandbox -> input accepted but
+                             neutralised -> LIKELY A GENUINE NEGATIVE
+      CMD_SINK_REACHED_NO_OBSERVABLE  payload reached os.system/os.popen/Popen
+                             but no observable effect fired -> oracle/payload gap
+                             for this command context
       INPUT_NOT_IN_SQL       SQL ran, but no payload's marker ever reached the
                              executed SQL (payload broke the query / was bound
                              as a parameter) -- often a context-mismatch or a
@@ -124,11 +145,26 @@ def classify_diag(attempts: list) -> str:
       INPUT_IN_SQL_NO_PROOF  marker reached SQL but execution outcome unknown
       PROOF_EVALUATED        the injected expression WAS evaluated but the
                              oracle still didn't confirm (oracle gap to fix)
-      NO_DIAG                no live diagnostic captured (older path)
+      LIVE_RUN_FAILED        no execution-chain diag was captured because the
+                             candidate could not be run in live mode at all
+                             (timeout, child crash, construction/interface gap)
+                             -- a harness/interface gap to fix, never a pass
+      NO_DIAG                no diag and no verdict to explain it (should be rare)
     """
     diags = [a.get("diag") for a in attempts if a.get("diag")]
     if not diags:
+        # No execution-chain diag means nothing ran in live mode. A live
+        # NOT_TRIGGERED / TRIGGERED always attaches a diag, so the only way here
+        # is a COULD_NOT_EXECUTE (timeout, child crash, un-runnable interface).
+        # Surface that as a real root cause instead of the old blank NO_DIAG --
+        # it is a harness gap to close, not a silent pass, and crucially it is
+        # still NOT a confirmation: nothing here is counted exploited.
+        if any(a.get("tier1_verdict") == "COULD_NOT_EXECUTE" for a in attempts):
+            return "LIVE_RUN_FAILED"
+        if any(a.get("source") == "agent" and a.get("error") for a in attempts):
+            return "LIVE_RUN_FAILED"
         return "NO_DIAG"
+    # --- SQL (CWE-89) chain, strongest signal first ---
     if any(d.get("proof_evaluated") for d in diags):
         return "PROOF_EVALUATED"
     if any(d.get("proof_conn_mismatch") for d in diags):
@@ -144,8 +180,32 @@ def classify_diag(attempts: list) -> str:
         if any(d.get("marker_ran_ok") for d in diags):
             return "INPUT_IN_SQL_RAN_SAFE"
         return "INPUT_IN_SQL_NO_PROOF"
+    # --- path traversal (CWE-22): did our payload reach a filesystem sink? ---
+    if any(d.get("marker_in_path_sink") for d in diags):
+        # Payload reached open()/Path.write_*. If the resolved path escaped the
+        # sandbox cwd, this is almost certainly a real traversal the observable
+        # just didn't capture -> an ORACLE GAP to fix. If it stayed in-bounds,
+        # the input was accepted but neutralised -> likely a genuine negative.
+        if any(d.get("path_escaped") for d in diags):
+            return "PATH_TRAVERSAL_NO_OBSERVABLE"
+        return "PATH_SINK_INPUT_BOUNDED"
+    # --- command injection (CWE-78): did our payload reach a process sink? ---
+    if any(d.get("marker_in_cmd_sink") for d in diags):
+        # A shell context (os.system/os.popen/Popen shell=True) ran our input
+        # but the injected command left no effect -> the breakout did not fire
+        # -> a payload/oracle gap worth a better breakout (FIXABLE). Reaching a
+        # NON-shell Popen means our input was an argv element, never parsed as a
+        # command -> not an injection for this call shape -> a genuine negative.
+        if any(d.get("cmd_shell_reached") for d in diags):
+            return "CMD_SHELL_NO_EFFECT"
+        return "CMD_ARGV_NOT_SHELL"
     if any(d.get("n_sql_executed", 0) > 0 for d in diags):
         return "INPUT_NOT_IN_SQL"
+    # A dangerous sink ran but our payload was not in it -> taint did not
+    # propagate from the parameter to the sink (broke flow / sanitised early).
+    if any(d.get("n_path_sinks", 0) > 0 or d.get("n_cmd_sinks", 0) > 0 for d in diags):
+        return "SINK_REACHED_INPUT_ABSENT"
     if any(d.get("function_entered") for d in diags):
-        return "NO_SQL_EXECUTED"
+        # Ran to completion but touched no tracked injection sink at all.
+        return "EXECUTED_NO_SINK"
     return "NOT_ENTERED"

@@ -1,0 +1,5467 @@
+"""PgLineCanvas: FFT amplitude overlay plus FFT-source time preview.
+
+The top row draws overlaid FFT amplitude curves after computation. The lower
+row shows the time-domain input sources immediately when they are selected,
+and remains an overlay when multiple FFT sources are active. NO OpenGL: it
+breaks grab_pixmap exports on this project.
+"""
+from __future__ import annotations
+
+from html import escape
+from contextlib import contextmanager
+from functools import partial
+from time import monotonic
+import logging
+import math
+
+import numpy as np
+from PyQt5 import sip
+from PyQt5.QtCore import QEvent, QPointF, QRect, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QPixmap
+from PyQt5.QtWidgets import QApplication, QVBoxLayout, QWidget
+import pyqtgraph as pg
+
+from mf4_analyzer.ui._axis_handle import (
+    PG_AXIS_NEUTRAL_COLOR,
+    PG_AXIS_NEUTRAL_WIDTH,
+    PgAxisHandle,
+    _engineering_to_view_limits,
+    _plain_axis_text,
+    _view_to_engineering_limits,
+)
+from mf4_analyzer.ui.analysis_view_state import normalize_pane_chart_appearances
+from mf4_analyzer.ui.chart_appearance_model import appearance_channel_key
+from mf4_analyzer.signal.envelope import build_envelope, build_peak_trace
+from mf4_analyzer.signal.display_ranges import (
+    line_amplitude_limits,
+    prepare_line_range,
+    visible_line_values,  # probe/T0 monkeypatch seam; Batch/slices keep this helper
+)
+# The ink metric itself is UI-neutral (spec 2026-08-08 §2): it is the same pure
+# function the time-domain renderer bills its frames with, so the analysis rows
+# cannot drift into a second definition of "how much does this cost to paint".
+from mf4_analyzer.render_profile import envelope_ink_dev_px
+from mf4_analyzer.ui.cursor_display_model import (
+    FrequencyCursorChannel,
+    PinnedCursorSample,
+)
+
+# Overlay AA point-density budget, shared with TimeDomainCanvasPG (canvas.py:
+# 145-146): ON=5000 / OFF=7000 with hysteresis. Imported (not re-defined) so
+# the two renderers cannot drift — the time preview's AA must gate on the same
+# per-frame drawn-point SUM economics as the main time-domain overlay.
+from .canvas import (
+    _AA_OVERLAY_SEGMENT_OFF,
+    _AA_OVERLAY_SEGMENT_ON,
+    _OVERLAY_GRID_ALPHA,
+)
+# The time preview's ink band is the TIME-DOMAIN band, imported rather than
+# re-declared: the preview draws build_envelope output of the very same
+# signals TimeDomainCanvasPG overlays, and the 2026-08-15 calibration measured
+# its slope at 0.93 ms/k dev-px against the time-domain band's implied 0.83
+# (1.12×, well inside the 2× "split the band" threshold — spec §5).
+from .renderer import _INK_AA_OFF, _INK_AA_ON, _quantize_y_span_key
+# Backstop ceilings are USER PATIENCE limits, not canvas physics, so line /
+# frf / time-domain share one calibration (spec §5). AaFrameLatch is likewise
+# shared: three hand-written copies of a calibrated state machine is exactly
+# what CLAUDE.md forbids.
+from .quality import (
+    _BACKSTOP_BLACKLIST_MAX,
+    _BACKSTOP_EPOCH_PROPERTY,
+    _BACKSTOP_FIRST_AA_MS,
+    _BACKSTOP_STEADY_AA_MS,
+    _BACKSTOP_STEADY_EMA_ALPHA,
+    install_frame_paint_timer,
+)
+from .quality_backstop import AaFrameLatch
+
+from .analysis_axes import (
+    _apply_axis_tick_density,
+    _apply_neutral_axis_frame,
+    _apply_target_bottom_ticks,
+    _make_analysis_plot,
+    _tick_counts_to_density,
+    _visual_padded_bounds,
+)
+from .context_menu import redesign_pg_context_menu
+from .empty_hint import EmptyHintOverlay
+from .fonts import _apply_pg_axis_font
+from .spectrum_display import (
+    SpectrumCurveIndex,
+    SpectrumDisplayRequest,
+    build_spectrum_trace_cache,
+    plan_spectrum_display,
+)
+from .remarks import (
+    RemarkArtist,
+    RemarkInteraction,
+    RemarkPoint,
+    remark_at_viewport_pos,
+    viewport_pos_to_scene,
+)
+from .overlay_intent import AnalysisRemarkStore, snapshot_frequency_cursor
+from .pinned_cursor_overlay import PinnedCursorOverlay
+from mf4_analyzer.ui.view_overlay_state import normalize_cursor_placement
+from ._shared import show_major_grid_left_bottom_only
+from ._split_mixin import (
+    _CollapsedRail,
+    _SPLIT_ROW_SPACING,
+    _SplitDivider,
+    _StackedSplitMixin,
+)
+from .ticks_math import (
+    _adjacent_nice_step,
+    _fmt_tick,
+    _frame_to_nice,
+    _nice_per_div,
+    finite_non_degenerate_range,
+)
+from mf4_analyzer.ui.chart_defaults import DEFAULT_CHART_TICK_DENSITY
+from mf4_analyzer.ui.plot_helpers import _middle_ellipsis
+from mf4_analyzer.ui.ultraview_capture_facts import (
+    analysis_idle_timer_is_busy,
+    build_capture_facts,
+    dual_cursor_geometry,
+    iter_axes_rubberband_items,
+    quality_settled_from_status,
+    widget_visible_and_sized,
+)
+from .viewbox import _ModifierWheelViewBox, _WheelDeltaGraphicsLayoutWidget
+from mf4_analyzer.ui_kit.axis_metrics import (
+    activate_item_layouts,
+    left_axis_width_for_ticks,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+class _IdleQualityActivity:
+    """Canvas-local interaction state for idle-AA recovery.
+
+    Pointer buttons and ViewBox drag depth are the only sticky "busy"
+    conditions (``is_busy()``). Wheel, gesture, and kinetic activity are
+    recorded for symmetry with press/release but carry no timer effect of
+    their own here: any idle-timer delay/re-arm is driven explicitly by the
+    call sites (``schedule_idle_quality``, ``_begin_view_interaction`` /
+    ``_end_view_interaction``), never by a timestamp on this object.
+    """
+
+    __slots__ = (
+        "_held_buttons",
+        "_drag_depth",
+    )
+
+    def __init__(self):
+        self._held_buttons = set()
+        self._drag_depth = 0
+
+    def note_press(self, button=Qt.LeftButton) -> None:
+        self._held_buttons.add(button)
+
+    def note_move(self) -> None:
+        pass
+
+    def note_release(self, button=Qt.LeftButton) -> None:
+        self._held_buttons.discard(button)
+
+    def note_drag_begin(self) -> None:
+        self._drag_depth += 1
+
+    def note_drag_end(self) -> None:
+        self._drag_depth = max(0, self._drag_depth - 1)
+
+    def note_pulse(self) -> None:
+        pass
+
+    def clear(self) -> None:
+        self._held_buttons.clear()
+        self._drag_depth = 0
+
+    def is_busy(self) -> bool:
+        return bool(self._held_buttons) or self._drag_depth > 0
+
+
+_DUAL_CURSOR_DELTA_STYLE = (
+    "color:#0b7af3; background-color:#e8f1ff; font-weight:700;"
+)
+_CURSOR_HTML_SEP = '<span style="color:#cbd5e1;">  &nbsp;│&nbsp;  </span>'
+
+
+# Fallback envelope bucket count used when the time-preview plot area has no
+# realized geometry yet (canvas not shown / mid-build). Generous so a trace
+# of up to ~2x this many points still renders untouched (build_envelope's
+# small-visible shortcut returns the input when n <= 2*pixel_width); the win
+# only matters for multi-million-point sources, which always exceed it.
+_PREVIEW_FALLBACK_PIXEL_WIDTH = 2000
+
+# Minimum believable realized plot-area width (px). Below this the
+# GraphicsLayout has not been laid out yet (an un-shown / collapsed canvas
+# reports ~45 px), so a measured width under the floor is treated as
+# unrealized and routed to the generous fallback — otherwise a small source
+# would be needlessly decimated against a phantom 46-px viewport.
+_PREVIEW_MIN_REALIZED_PIXEL_WIDTH = 200
+_SPECTRUM_FALLBACK_PIXEL_WIDTH = 2400
+_SPECTRUM_MIN_REALIZED_PIXEL_WIDTH = 200
+# Coalesced spectrum data+Y period. Timeout rechecks monotonic time because
+# QTimer is not exact; QTimer.start(int) rewrites interval, so fire/stop
+# paths restore this value.
+_SPECTRUM_REFRESH_MS = 16
+
+# FFT amplitude overlays keep a local AA budget. After peak-hold (one max
+# per pixel, not min/max ribbons) a 4-curve screenshot-width overlay is
+# ~4×1100 ≈ 4400 drawn points and must stay crisp. The time preview still
+# uses the shared TimeDomainCanvasPG ON=5000/OFF=7000 policy imported above.
+_SPECTRUM_AA_SEGMENT_ON = 5000
+_SPECTRUM_AA_SEGMENT_OFF = 8000
+
+# Spectrum-row AA INK budget (spec 2026-08-15 §3.4 / §5, defect C).
+#
+# The point budget above is NOT a cost gate on its own. Peak-hold pins every
+# spectrum to ~1 drawn point per pixel, so a 3-curve overlay is ~4095 points
+# whether it is a clean peak or a full-height noise floor — yet the measured AA
+# frame goes from 71 ms to 1652 ms between those two. What actually varies is
+# the VERTICAL INK, the same quantity the time-domain canvas has billed frames
+# with since 2026-08-08. The two legs are AND'd, not swapped: "too many points"
+# stays a real, orthogonal constraint (spec §5 explicitly warns that the FRF
+# "clean" shape holds ink flat while the frame time triples with bin count).
+#
+# Calibrated 2026-08-15 on the real machine (macOS Cocoa, dpr 2.0, canvas
+# 1400×900, spectrum row 669 px tall): 7-point sweep at a fixed 4095 drawn
+# points, varying only peak/floor ratio — 55k→119 ms, 120k→216 ms, 212k→320 ms,
+# 336k→599 ms. Fitting the NEAR-TARGET段 only (≤600 ms, n=4; the curve turns
+# steeper past ~350k and a global fit would push the intercept to −138 ms)
+# gives 1.68 ms per k dev-px, intercept 9.0 ms, crossing the 250 ms steady-AA
+# ceiling at 143k → OFF 145k, ON = OFF×2/3 = 95k for the hysteresis dead band.
+#
+# These are STANDARDS-CALIBRATED VALUES, not tuning knobs. To change one:
+# edit spec §5 first, then re-measure on real hardware with
+# ``scripts/probe_view_switch_quality.py analysis-calibrate`` (offscreen cannot
+# measure paint cost at all), then change the number here.
+_SPECTRUM_INK_AA_ON = 95_000
+_SPECTRUM_INK_AA_OFF = 145_000
+
+# Minimum vertical room per Y tick label on the short time-preview strip.
+# Inspector Y-density still *requests* up to 20 divisions, but labelling every
+# division in ~170 px stacks the text; nicestep itself is fine (e.g. 0.25) —
+# the failure mode is uncapped label count, not a broken nice-step picker.
+_TIME_PREVIEW_MIN_TICK_LABEL_PX = 16.0
+_TIME_EMPHASIS_LW = 1.9
+_TIME_DEEMPHASIS_LW = 1.35
+_TIME_DEEMPHASIS_ALPHA = 0.42
+_TIME_AXIS_LABEL_MAX_CHARS = 14
+
+# Stale-state chrome for the already-computed spectrum when the source
+# selection changed but the user has not re-clicked 计算. Deliberately a
+# desaturated neutral so it can NEVER be mistaken for a data-series line
+# (file palette: blues/greens/reds/oranges/cyans/purples/slate) nor for the
+# red remark dot (#dc2626). The marker text is fixed by product copy.
+_STALE_MARKER_TEXT = "结果已过期，请重新计算"
+_STALE_MARKER_TEXT_COLOR = "#6b7280"      # neutral slate-500, UI chrome
+_STALE_MARKER_FILL = (243, 244, 246, 235)  # gray-100 translucent banner
+_STALE_MARKER_BORDER = "#9ca3af"          # gray-400 hairline
+# Opacity applied to the amp curves while stale (dim, not hidden).
+_STALE_CURVE_OPACITY = 0.28
+
+# Default axis titles. Both plots carry titles AT ALL TIMES (incl. the empty
+# pre-compute state) so the FFT panel never shows one labelled plot beside one
+# bare plot. plot_spectra overrides the amp-left title with the chosen
+# amplitude label (Amplitude / dB); everything else falls back to these.
+_AMP_LEFT_LABEL = 'Amplitude'
+_AMP_BOTTOM_LABEL = 'Frequency (Hz)'
+_TIME_LEFT_LABEL = 'Amplitude'
+_TIME_BOTTOM_LABEL = 'Time (s)'
+
+
+class _AxisShim:
+    """Minimal axis handle exposing ``view_box`` for ``PgNavigationToolbar``."""
+
+    __slots__ = ("view_box",)
+
+    def __init__(self, view_box):
+        self.view_box = view_box
+
+
+class _HistoryHandle:
+    """Lightweight view-history handle for ``PgNavigationToolbar``.
+
+    ``_snapshot_view``/``_restore_view`` (chart_stack) iterate the canvas's
+    ``_channel_lines`` and call ``pair[0].get_xlim()/get_ylim()`` to snapshot
+    and ``set_xlim()/set_ylim()`` to restore. This shell reads/writes the
+    wrapped ViewBox's ``viewRange()``/``setRange`` directly.
+
+    Both amp and time-preview handles restore X and Y: the preview Y is
+    user-draggable (and Shift-wheel zoomable), so history must rewind it too.
+    """
+
+    __slots__ = ("_vb", "_y")
+
+    def __init__(self, view_box, with_y=True):
+        self._vb = view_box
+        self._y = bool(with_y)
+
+    def get_xlim(self):
+        (lo, hi), _ = self._vb.viewRange()
+        return (lo, hi)
+
+    def set_xlim(self, lo, hi):
+        self._vb.setXRange(lo, hi, padding=0)
+
+    def get_ylim(self):
+        _, (lo, hi) = self._vb.viewRange()
+        return (lo, hi)
+
+    def set_ylim(self, lo, hi):
+        if self._y:
+            self._vb.setYRange(lo, hi, padding=0)
+
+
+def _min_positive(values) -> float | None:
+    """Smallest finite value above 0, or None when the sample has none."""
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return None
+    positive = arr[np.isfinite(arr) & (arr > 0.0)]
+    if positive.size == 0:
+        return None
+    return float(np.min(positive))
+
+
+def _xy_from_viewbox(view_box):
+    """Finite non-degenerate ``((x0, x1), (y0, y1))`` from a ViewBox, else None."""
+    try:
+        (x0, x1), (y0, y1) = view_box.viewRange()
+    except Exception:
+        return None
+    xr = finite_non_degenerate_range(x0, x1)
+    yr = finite_non_degenerate_range(y0, y1)
+    if xr is None or yr is None:
+        return None
+    return xr, yr
+
+
+def _xy_break_indices(prepared):
+    """Absolute NaN-gap indices, computed once at ingest — not on every pan."""
+    finite_xy = prepared.finite_xy
+    if finite_xy.all():
+        return ()
+    return tuple(int(i) for i in np.flatnonzero(~finite_xy))
+
+
+class PgLineCanvas(_StackedSplitMixin, QWidget):
+    cursor_info = pyqtSignal(str)
+    dual_cursor_info = pyqtSignal(str)
+    # Frequency-domain counterpart of TimeDomainCanvasPG.dual_cursor_rows.
+    # It carries (label, A, B, B-minus-A, unit, color) rows so CursorPill can
+    # switch between its full A/B table and a compact delta view without
+    # attempting to reconstruct data from already-rendered HTML.
+    frequency_cursor_rows = pyqtSignal(object)
+    frequency_cursor_channels = pyqtSignal(object)
+    context_menu_requested = pyqtSignal()
+    layout_geometry_changed = pyqtSignal()
+    # role, override spec. Emitted after a chart-options commit so the pane
+    # owner can store it. The canvas slot is only the projection of that spec.
+    user_appearance_committed = pyqtSignal(str, object)
+    time_preview_range_changed = pyqtSignal(float, float)
+    manual_zoom_changed = pyqtSignal(bool)
+    # User pan/box/modifier-wheel/View-All on the spectrum row only.
+    # plot_spectra / empty preview View-All / full_reset must not emit this.
+    viewport_intent_committed = pyqtSignal()
+    viewport_action_committed = pyqtSignal(str, object)
+    # Hidden-gesture discovery: emitted when the user clicks a spectrum curve to
+    # pick the time-preview source. The chart card retires the "click a curve to
+    # choose the source" tip once this fires.
+    time_source_selected = pyqtSignal()
+    # AA status traffic-light (mirrors TimeDomainCanvasPG). _ChartCard wires
+    # this signal + quality_status() into the bottom-right quality dot, so the
+    # FFT card shows the same red/yellow/green antialiasing indicator the
+    # time-domain card does.
+    quality_status_changed = pyqtSignal(object)
+    markup_revision_changed = pyqtSignal()
+    # A presentation transition may retire its cover only after this canvas'
+    # GraphicsView has naturally painted the requested final content.  This is
+    # deliberately separate from retained Section reveal / AA settlement.
+    presentation_paint_acknowledged = pyqtSignal(object)
+    # Semantic replacement of the admitted FFT target (spectra, time preview
+    # including stale, full_reset / explicit clear).  Ordinary expose, quality
+    # settle, AA, and layout_geometry_changed must not emit this.
+    presentation_content_invalidated = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.analysis_range_adapter = None
+        self._glw = _WheelDeltaGraphicsLayoutWidget(self, owner_canvas=self)
+        self._glw.setBackground("#ffffff")
+        self._glw.ci.setContentsMargins(2, 2, 2, 2)
+        self._glw.ci.setSpacing(2)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self._glw)
+
+        self._plot_amp = _make_analysis_plot(
+            self._glw, 0, 0, _ModifierWheelViewBox(owner_canvas=self))
+        self._plot_time = _make_analysis_plot(
+            self._glw, 1, 0, _ModifierWheelViewBox(owner_canvas=self))
+        for p in (self._plot_amp, self._plot_time):
+            _apply_neutral_axis_frame(p)
+            show_major_grid_left_bottom_only(p, alpha=0.25)
+            for _ax in ('left', 'bottom', 'top', 'right'):
+                try:
+                    p.getAxis(_ax).setStyle(maxTickLevel=0)
+                except Exception:
+                    pass
+        # Time-preview mirrors TimeDomain overlay: native left-axis Y grid is
+        # OFF because each overlay curve has its own Y scale — a shared
+        # fractional graticule (_build_time_y_grid) is the only horizontal
+        # anchor. Keeping both native + custom grids stacks lines and desyncs
+        # labels after a Y pan (lesson: overlay_graticule_wheel_contract).
+        show_major_grid_left_bottom_only(self._plot_time, x=True, y=False, alpha=0.25)
+        self._plot_amp.addLegend(offset=(8, 8))
+        # Open up the gap between the two stacked plots so the draggable divider
+        # line sits in clear whitespace instead of merging with the plot frames.
+        try:
+            self._glw.ci.layout.setVerticalSpacing(_SPLIT_ROW_SPACING)
+        except Exception:
+            pass
+        # Bottom (time-preview) plot height when expanded. Stateful so the
+        # divider drag can resize it and fold/restore can remember the size.
+        self._bottom_split_default = 170.0
+        self._bottom_split_h = self._bottom_split_default
+        self._drag_start_bottom_h = self._bottom_split_h
+        self._plot_time.setMaximumHeight(int(self._bottom_split_h))
+        self._apply_default_axis_labels()
+
+        self.axes_list = [
+            _AxisShim(self._plot_amp.vb),
+            _AxisShim(self._plot_time.vb),
+        ]
+
+        self._amp_curves = []
+        self._time_curves = []
+        self._cursor_lines = self._make_frequency_cursor_lines("#64748b")
+        self._cursor_a_lines = self._make_frequency_cursor_lines("#1769e0")
+        self._cursor_b_lines = self._make_frequency_cursor_lines("#d97706")
+        self._pinned_overlay = PinnedCursorOverlay(self, kind="frequency")
+        self._cursor_mode = "off"
+        self._cursor_a_frequency = None
+        self._cursor_b_frequency = None
+        self._next_dual_cursor = "a"
+        # Multi-Y overlay for the time preview: when >1 source is overlaid each
+        # extra curve gets its own auto-scaled aux ViewBox + a colour-coded
+        # right axis (mirrors TimeDomainCanvasPG overlay). The first curve stays
+        # on _plot_time's own left axis.
+        self._time_overlay_vbs = []
+        self._time_overlay_axes = []
+        # Shared horizontal grid for the time-preview overlay. Each aux right
+        # axis lives in its own ViewBox with its own Y range, so the built-in
+        # left-axis Y grid alone cannot be a common visual anchor (and it is
+        # cleared whenever a refresh path pushes plain density onto the left
+        # axis). A dedicated grid ViewBox locked to Y=[0,1] and X-linked to the
+        # main vb draws n-1 InfiniteLines at i/n — the single graticule every
+        # axis's k/n ticks must coincide with (mirrors TimeDomainCanvasPG's
+        # _build_overlay_y_grid). Created lazily on first frame.
+        self._time_grid_vb = None
+        self._time_grid_lines = []
+        # Time-preview Y graticule division count (mirrors the time-domain
+        # overlay's divisions). Driven by the Y tick density; the left axis and
+        # every aux right axis are framed to this many equal nice divisions so
+        # all their ticks land on the SAME set of horizontal grid lines.
+        # Default follows the shared interactive Y tick count.
+        self._time_divisions = DEFAULT_CHART_TICK_DENSITY[1]
+        # Set when the user pans/zooms the time preview; cleared after idle
+        # repin so tick labels realign to the shared graticule (overlay snap).
+        self._time_y_needs_repin = False
+        self._entries = []
+        self._selected_time_entry_idx = None
+        self._remarks = []
+        self._remark_intent = AnalysisRemarkStore()
+        self._remark_enabled = False
+        self.markup_revision = 0
+        self._remark_artist = RemarkArtist(on_moved=self._bump_markup_revision)
+        self._remark_interaction = RemarkInteraction(
+            add_at_viewport_pos=lambda pos: self._add_remark_at_viewport_pos(pos),
+            remove_at_viewport_pos=lambda pos: self._remove_remark_at_viewport_pos(pos),
+            remark_at_viewport_pos=lambda pos: self._remark_item_at_viewport_pos(pos),
+        )
+        self._raw_spectrum_xlim = None
+        self._spectrum_trace_cache = None
+        self._spectrum_rebuild_plan = None
+        self._spectrum_refresh_busy = False
+        self._spectrum_display_generation = 0
+        self._spectrum_refresh_armed_generation = 0
+        self._spectrum_curves_dirty = False
+        self._spectrum_y_dirty = False
+        self._spectrum_refresh_interactive = False
+        self._spectrum_program_range_depth = 0
+        self._spectrum_last_refresh_at = 0.0
+        self._spectrum_monotonic = monotonic
+        self._manual_amp_viewport = None
+        self._spectrum_db = False
+        self._spectrum_display_revision = 0
+        self._prepared_by_identity = {}
+        self._spectrum_y_auto = True
+        self._last_xlim = None
+        self._last_yrange = None
+        self._mouse_mode_controller = None
+        self._copy_image_handler = None
+        # Replot callbacks: the card registers the toolbar's
+        # apply_current_mouse_mode + rebind_history_capture here (chart_stack
+        # gates registration on register_replot_callback being present), and
+        # they fire at the end of every plot_spectra/plot_time_preview/full_reset
+        # so the view-history capture re-binds to the live ViewBoxes and seeds a
+        # baseline after each rebuild (Task C).
+        self._replot_callbacks = []
+        self._raw_amp_title = ''
+        self._raw_time_title = ''
+        self._user_appearances = {}
+        # Scale edits that chart options apply before the pane spec is committed.
+        # A replot in that same click must see them; full_reset drops the session.
+        self._axis_scale_session = {}
+        self._spectrum_amp_label = _AMP_LEFT_LABEL
+        self._chart_title_commit = None
+        self._split_title_width = None
+        self._spectrum_stale = False
+        self._stale_banner = None
+        self._empty_hint_text = ''
+        self._empty_hint_item = None
+        # The overlay owns the behaviour; the two attributes above stay the
+        # public read surface (main_window and several tests read them).
+        self._empty_hint = EmptyHintOverlay(
+            viewbox_getter=lambda: self._plot_amp.vb,
+            reposition_slot=self._reposition_empty_hint,
+            on_state=self._store_empty_hint_state,
+        )
+        self._bottom_tick_target = None
+        self._bottom_tick_density = None
+
+        # Interactive curve-AA policy (mirrors the time-domain canvas): drop
+        # antialiasing while the user pans/zooms so each frame is a cheap
+        # non-AA raster, then restore crisp AA after a short hands-off idle.
+        self._aa_on = True
+        # Time-preview AA density-budget hysteresis (mirrors QualityManager's
+        # density_seeded/density_allowed for the overlay branch). Re-seeded
+        # against the OFF budget whenever the curve set is rebuilt; thereafter
+        # metric<=ON→on, metric>OFF→off, dead band holds last.
+        self._time_aa_density_allowed = False
+        self._time_aa_density_seeded = False
+        # Spectrum-row AA has its own, lower drawn-point SUM budget.  It is
+        # reset only when a fresh FFT curve collection replaces the old one;
+        # keeping an already-computed spectrum stale must preserve the
+        # hysteresis state so selection changes do not make quality flicker.
+        self._spectrum_aa_density_allowed = False
+        self._spectrum_aa_density_seeded = False
+        # Ink legs, one per row, AND'd with the point legs above. Same
+        # double-threshold hysteresis shape (seed against OFF, then ON→allow /
+        # >OFF→refuse, dead band holds), re-seeded wherever the point leg is.
+        self._spectrum_aa_ink_allowed = False
+        self._spectrum_aa_ink_seeded = False
+        self._time_aa_ink_allowed = False
+        self._time_aa_ink_seeded = False
+        self._section_reveal_generation = 0
+        self._section_reveal_waiting = False
+        self._section_reveal_painted_generation = -1
+        self._section_reveal_geometry = None
+        self._presentation_paint_ack_generation = 0
+        self._presentation_paint_ack_pending = False
+        self._presentation_paint_ack_request_id = None
+        self._presentation_paint_ack_geometry = None
+        self._last_quality_status = None
+        self._idle_activity = _IdleQualityActivity()
+        self._mouse_buttons_provider = QApplication.mouseButtons
+        self._aa_idle_timer = QTimer(self)
+        self._aa_idle_timer.setSingleShot(True)
+        self._aa_idle_timer.setInterval(150)
+        self._aa_idle_timer.timeout.connect(self._enable_idle_quality)
+        # Discrete-render settlement (spec §3.2/§3.4, defect B). A View switch
+        # / a fresh compute is a ONE-SHOT event with no follow-up input, so the
+        # 150 ms quiet window above — which exists to merge the frames of a
+        # CONTINUOUS drag — is pure latency plus one visible 锯齿→平滑 swap.
+        # This is a SEPARATE QTimer on purpose: ``QTimer.start(int)``
+        # permanently rewrites the interval, so re-using _aa_idle_timer with
+        # start(0) would silently delete the interactive path's quiet window.
+        self._discrete_aa_timer = QTimer(self)
+        self._discrete_aa_timer.setSingleShot(True)
+        self._discrete_aa_timer.setInterval(0)
+        self._discrete_aa_timer.timeout.connect(self._enable_idle_quality)
+        self._discrete_quality_hold = None
+        self._discrete_quality_deferred = False
+        # Measured backstop (spec §3.3/§3.4). Everything above is a
+        # PREDICTION; this is the layer that measures what the frame actually
+        # cost, so a prediction that was wrong costs at most ONE bad frame per
+        # view signature instead of repeating on every settle.
+        self._aa_latch = AaFrameLatch(
+            _BACKSTOP_FIRST_AA_MS,
+            _BACKSTOP_STEADY_AA_MS,
+            _BACKSTOP_STEADY_EMA_ALPHA,
+            _BACKSTOP_BLACKLIST_MAX,
+        )
+        # Pairing token read on EVERY paint, so it stays a bare attribute.
+        self._aa_backstop_armed = False
+        self._last_frame_paint_ms = None
+        self._backstop_timer = QTimer(self)
+        self._backstop_timer.setSingleShot(True)
+        self._backstop_timer.setInterval(0)
+        self._backstop_timer.timeout.connect(self._on_aa_backstop_timeout)
+        if not install_frame_paint_timer(self):
+            # Without the paint timer the ink gate has no measured fallback:
+            # a mis-prediction would repeat every settle instead of latching
+            # after one frame. Never silent — the operator has to be able to
+            # tell "backstop disabled" from "backstop never trips".
+            logger.warning(
+                "frame paint timer not installed on PgLineCanvas; "
+                "measured AA backstop is inactive on this canvas",
+            )
+        self.destroyed.connect(self._stop_aa_idle_timer)
+        self.destroyed.connect(self._stop_discrete_aa_timer)
+        self.destroyed.connect(self._stop_spectrum_refresh_timer)
+        self.destroyed.connect(self._on_presentation_paint_destroyed)
+        for _p in (self._plot_amp, self._plot_time):
+            # Pan / box-zoom / plain wheel emit sigRangeChangedManually (a
+            # programmatic setRange, e.g. plot_spectra, does NOT — so a fresh
+            # plot stays crisp). The custom ctrl/shift wheel zoom is hooked
+            # separately in _handle_wheel_dispatch.
+            _p.vb.sigRangeChangedManually.connect(
+                partial(self._on_interactive_range_changed, _p))
+
+        self._spectrum_refresh_timer = QTimer(self)
+        self._spectrum_refresh_timer.setSingleShot(True)
+        self._spectrum_refresh_timer.setInterval(_SPECTRUM_REFRESH_MS)
+        self._spectrum_refresh_timer.timeout.connect(
+            self._on_spectrum_refresh_timeout)
+        self._plot_amp.vb.sigXRangeChanged.connect(self._request_spectrum_refresh)
+        self._plot_amp.vb.sigResized.connect(self._refresh_spectrum_display)
+        self._glw.scene().sigMouseMoved.connect(self._on_hover)
+        self._glw.scene().sigMouseClicked.connect(self._on_click)
+        try:
+            viewport = self._glw.viewport()
+            if viewport is not None:
+                viewport.setMouseTracking(True)
+                viewport.installEventFilter(self)
+        except Exception:
+            pass
+        # Keep the overlay aux ViewBoxes glued to the time plot's main ViewBox
+        # (geometry on resize, X range on pan/zoom) so the extra Y axes track.
+        self._plot_time.vb.sigResized.connect(self._sync_time_overlay_vbs)
+        self._plot_time.vb.sigXRangeChanged.connect(self._sync_time_overlay_vbs)
+        # Native Y grid is off on the time preview; install the shared
+        # fractional graticule immediately so an empty chart still has
+        # horizontal lines (selection with no checked channels).
+        self._repin_time_y_to_grid()
+        for _p in (self._plot_amp, self._plot_time):
+            _p.vb.sigXRangeChanged.connect(self._refresh_bottom_x_ticks)
+            _p.vb.sigResized.connect(self._refresh_bottom_x_ticks)
+
+        # Draggable split divider (resize) + drawer-style collapsed rail.
+        # Drag the divider near the bottom to collapse the time preview; click
+        # the rail's ▴ to bring it back. (Replaces the old gutter triangle.)
+        self._bottom_collapsed = False
+        self._split_divider = _SplitDivider(self)
+        self._split_divider.drag_started.connect(self._on_split_drag_started)
+        self._split_divider.drag_delta.connect(self._on_split_drag_delta)
+        self._split_divider.drag_finished.connect(self._on_split_drag_finished)
+        self._split_divider.reset_requested.connect(self._on_split_reset)
+        self._collapsed_rail = _CollapsedRail(self)
+        self._collapsed_rail.setVisible(False)
+        self.layout().addWidget(self._collapsed_rail)
+        self._collapsed_rail.expand_requested.connect(
+            lambda: self._set_bottom_collapsed(False))
+        self._plot_amp.vb.sigResized.connect(self._position_collapse_ctrl)
+
+        # Preview pan/zoom emits `_emit_time_preview_range` (via
+        # sigRangeChangedManually) so the inspector start/end spinboxes track
+        # the visible X as a draft. The analysis window is gated by the
+        # shared「使用选定时间范围」checkbox (manual, same as Time-Domain) —
+        # zoom alone does not arm it. There is no separate left-drag region
+        # selector anymore — it collided with pan.
+
+        # View-history contract for PgNavigationToolbar (Task C). The toolbar's
+        # _snapshot_view/_restore_view walk this map and call pair[0]'s
+        # get/set_xlim/ylim. Both rows restore X and Y: the time preview is
+        # user-draggable on Y (and Shift-wheel zoomable). The two PlotItems are
+        # fixed (never rebuilt), so these handles are built once here.
+        self._channel_lines = {
+            '__amp__': (_HistoryHandle(self._plot_amp.vb, with_y=True), None),
+            '__time__': (_HistoryHandle(self._plot_time.vb, with_y=True), None),
+        }
+
+    # ------------------------------------------------------------------
+    # Interactive vs idle curve antialiasing
+    # ------------------------------------------------------------------
+    # FFT curves are few but can be dense (nfft/2 bins × overlaid sources), and
+    # overlaying multiple antialiased curves is CPU-raster bound (project
+    # lesson: TimeDomain 卡顿=CPU 光栅, 随 overlay 通道数超线性). Re-rasterizing
+    # AA on every drag frame is the dominant pan/zoom cost, so AA is dropped for
+    # the interactive path and restored once the view settles.
+    def _interactive_curves(self):
+        return [*self._amp_curves, *self._time_curves]
+
+    @staticmethod
+    def _set_curve_aa(curve, on):
+        on = bool(on)
+        try:
+            curve.opts["antialias"] = on
+        except Exception:
+            pass
+        # pyqtgraph 0.14: PlotDataItem 的 antialias 只在 updateItems() 经
+        # curve.setData(...) 流到子 PlotCurveItem；FFT 预览平移不重新 setData，
+        # 故直接落到被渲染的子 curve 并触发重绘（不重新 setData，便宜）。
+        child = getattr(curve, "curve", None)
+        if child is not None:
+            try:
+                child.opts["antialias"] = on
+                child.update()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Ink (vertical draw量) — the cost axis the point budgets cannot see
+    # ------------------------------------------------------------------
+
+    def _device_pixel_ratio(self) -> float:
+        try:
+            return float(self._glw.devicePixelRatioF())
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return 1.0
+
+    @staticmethod
+    def _curve_y_data(curve):
+        """Return a curve's rendered Y samples, or ``None`` if unreadable."""
+        try:
+            _x_data, y_data = curve.getData()
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+        return y_data
+
+    @staticmethod
+    def _row_ink_geometry(view_box):
+        """``(y_span, row_height_px)`` for one row, or ``None`` if unknown.
+
+        ``updateAutoRange()`` FIRST: pyqtgraph applies ``enableAutoRange``
+        lazily, and the discrete 0 ms settle can run BEFORE the first paint of
+        a freshly plotted row — without the flush this would bill the new
+        curves against the PREVIOUS render's Y window (spec §3.4).
+        """
+        try:
+            view_box.updateAutoRange()
+            y_range = view_box.viewRange()[1]
+            y_span = abs(float(y_range[1]) - float(y_range[0]))
+            row_height_px = float(view_box.sceneBoundingRect().height())
+        except (AttributeError, IndexError, RuntimeError, TypeError,
+                ValueError):
+            return None
+        return (y_span, row_height_px)
+
+    def _view_box_for_curve(self, curve):
+        """The ViewBox a preview curve actually lives in.
+
+        Asked of the item rather than derived from its index: an entry with
+        empty data is skipped while building, so ``_time_curves[i]`` does not
+        line up with ``_time_overlay_vbs[i-1]`` in general.
+        """
+        try:
+            view_box = curve.getViewBox()
+        except (AttributeError, RuntimeError, TypeError):
+            view_box = None
+        if view_box is not None:
+            return view_box
+        return self._plot_time.vb
+
+    def _spectrum_ink_total(self):
+        """Total device-pixel ink the amplitude row will paint, or ``None``.
+
+        ``None`` means UNKNOWN, and unknown is not zero: the caller refuses
+        the frame and leaves the hysteresis state untouched rather than
+        recording a 0 that would read as "free" forever after.
+        """
+        curves = list(self._amp_curves)
+        if not curves:
+            return 0.0
+        geometry = self._row_ink_geometry(self._plot_amp.vb)
+        if geometry is None:
+            return None
+        y_span, row_height_px = geometry
+        dpr = self._device_pixel_ratio()
+        total = 0.0
+        for curve in curves:
+            y_data = self._curve_y_data(curve)
+            if y_data is None:
+                return None
+            total += envelope_ink_dev_px(
+                y_data, y_span=y_span, row_height_px=row_height_px, dpr=dpr)
+        return total
+
+    def _time_preview_ink_total(self):
+        """Total device-pixel ink the preview row will paint, or ``None``.
+
+        Summed PER CURVE against the ViewBox that curve is drawn in: every
+        extra overlay source gets its own auto-scaled aux ViewBox, so they do
+        not share a Y span and a single row-wide span would misprice all but
+        the first trace.
+        """
+        curves = list(self._time_curves)
+        if not curves:
+            return 0.0
+        dpr = self._device_pixel_ratio()
+        geometries = {}
+        total = 0.0
+        for curve in curves:
+            y_data = self._curve_y_data(curve)
+            if y_data is None:
+                return None
+            view_box = self._view_box_for_curve(curve)
+            key = id(view_box)
+            geometry = geometries.get(key)
+            if geometry is None:
+                geometry = self._row_ink_geometry(view_box)
+                if geometry is None:
+                    return None
+                geometries[key] = geometry
+            y_span, row_height_px = geometry
+            total += envelope_ink_dev_px(
+                y_data, y_span=y_span, row_height_px=row_height_px, dpr=dpr)
+        return total
+
+    def _spectrum_ink_allowed(self) -> bool:
+        """Hysteresis ink leg for the amplitude row (ON 95k / OFF 145k)."""
+        total = self._spectrum_ink_total()
+        if total is None:
+            # Unknown ≠ 0. Refuse this frame WITHOUT writing the latch, so a
+            # transient read failure cannot pin the row into a decision.
+            return False
+        if not self._spectrum_aa_ink_seeded:
+            self._spectrum_aa_ink_allowed = total <= _SPECTRUM_INK_AA_OFF
+            self._spectrum_aa_ink_seeded = True
+        elif total <= _SPECTRUM_INK_AA_ON:
+            self._spectrum_aa_ink_allowed = True
+        elif total > _SPECTRUM_INK_AA_OFF:
+            self._spectrum_aa_ink_allowed = False
+        return bool(self._spectrum_aa_ink_allowed)
+
+    def _time_preview_ink_allowed(self) -> bool:
+        """Hysteresis ink leg for the preview row (time-domain band)."""
+        total = self._time_preview_ink_total()
+        if total is None:
+            return False
+        if not self._time_aa_ink_seeded:
+            self._time_aa_ink_allowed = total <= _INK_AA_OFF
+            self._time_aa_ink_seeded = True
+        elif total <= _INK_AA_ON:
+            self._time_aa_ink_allowed = True
+        elif total > _INK_AA_OFF:
+            self._time_aa_ink_allowed = False
+        return bool(self._time_aa_ink_allowed)
+
+    def _time_preview_aa_allowed(self) -> bool:
+        """Hysteresis AA gate for the time preview, keyed to drawn-point SUM.
+
+        Replaces the old ``len(entries) <= 1`` one-cut kill: the overlaid
+        time traces share one full-plot raster region (like TimeDomainCanvasPG
+        overlay), so AA cost is linear in the SUM of points across all
+        ``_time_curves``. Gate on the same ON=5000 / OFF=7000 budget with
+        hysteresis: an empty/single curve set is always AA-on; otherwise seed
+        against OFF, then metric<=ON→on, metric>OFF→off, dead band holds. The
+        result is cached on ``_time_aa_density_allowed`` and reused as the
+        conservative fallback if ``getData()`` is unavailable / raises.
+
+        AND'd with an ink leg, evaluated FIRST — same decision order as
+        ``QualityManager._idle_aa_density_ok`` (spec §3.4). A single
+        full-height trace is one curve and a handful of points and would sail
+        through the point budget below while costing hundreds of milliseconds
+        to rasterize; only ink sees that.
+        """
+        if not self._time_preview_ink_allowed():
+            return False
+        curves = list(self._time_curves)
+        if len(curves) <= 1:
+            # A single trace (or none) is one cheap region — always crisp.
+            self._time_aa_density_allowed = True
+            return True
+        try:
+            total = 0
+            for c in curves:
+                xd, _yd = c.getData()
+                total += 0 if xd is None else len(xd)
+        except Exception:
+            # Defensive: keep the last settled allowance rather than crash.
+            return bool(self._time_aa_density_allowed)
+        if not self._time_aa_density_seeded:
+            self._time_aa_density_allowed = total <= int(_AA_OVERLAY_SEGMENT_OFF)
+            self._time_aa_density_seeded = True
+        elif total <= int(_AA_OVERLAY_SEGMENT_ON):
+            self._time_aa_density_allowed = True
+        elif total > int(_AA_OVERLAY_SEGMENT_OFF):
+            self._time_aa_density_allowed = False
+        return bool(self._time_aa_density_allowed)
+
+    def _spectrum_drawn_point_total(self):
+        """Return the total currently rasterized spectrum points, or ``None``.
+
+        The FFT row has already passed through ``_spectrum_plot_arrays()``, so
+        ``getData()`` measures the actual peak-hold curves handed to pyqtgraph,
+        not the raw FFT-bin arrays retained in ``_entries``.
+        """
+        try:
+            total = 0
+            for curve in self._amp_curves:
+                x_data, _y_data = curve.getData()
+                total += 0 if x_data is None else len(x_data)
+            return total
+        except Exception:
+            return None
+
+    def _spectrum_aa_allowed(self) -> bool:
+        """Hysteresis AA gate for the FFT amplitude overlay's point SUM.
+
+        A new spectrum is seeded against the OFF budget, so it is AA-on only
+        at ``<= 8000`` drawn points.  Once rejected, it recovers only below
+        ``<= 5000``; while allowed it turns back off only above ``> 8000``.
+        Peak-hold keeps a screenshot-scale 4-curve overlay under that OFF
+        ceiling so the settled spectrum stays crisp.
+
+        AND'd with an ink leg, evaluated FIRST so the reported reason matches
+        the decision order (same shape as
+        ``QualityManager._idle_aa_density_ok``). Peak-hold pins the point
+        count near one per pixel, so on this row the point budget alone cannot
+        tell a 71 ms peak from a 1652 ms noise floor — ink can.
+        """
+        if not self._spectrum_ink_allowed():
+            return False
+        total = self._spectrum_drawn_point_total()
+        if total is None:
+            # Defensive: preserve the last settled decision rather than
+            # crashing a redraw if a third-party curve cannot provide data.
+            return bool(self._spectrum_aa_density_allowed)
+        if not self._spectrum_aa_density_seeded:
+            self._spectrum_aa_density_allowed = (
+                total <= _SPECTRUM_AA_SEGMENT_OFF)
+            self._spectrum_aa_density_seeded = True
+        elif total <= _SPECTRUM_AA_SEGMENT_ON:
+            self._spectrum_aa_density_allowed = True
+        elif total > _SPECTRUM_AA_SEGMENT_OFF:
+            self._spectrum_aa_density_allowed = False
+        return bool(self._spectrum_aa_density_allowed)
+
+    def _reset_spectrum_aa_density_gate(self) -> None:
+        """Seed a replacement FFT curve collection from its own density.
+
+        Both legs, not just the point one: a replacement collection has a new
+        ink total too, and leaving the ink latch behind would judge the new
+        spectrum by the old one's dead-band decision.
+        """
+        self._spectrum_aa_density_allowed = False
+        self._spectrum_aa_density_seeded = False
+        self._spectrum_aa_ink_allowed = False
+        self._spectrum_aa_ink_seeded = False
+
+    def _apply_idle_curve_aa(self) -> bool:
+        """Restore each curve's settled-state AA from its row-local budget.
+
+        Returns whether ANY curve actually came back antialiased — the caller
+        uses it to decide whether there is an AA session worth measuring.
+        """
+        spectrum_idle_aa = self._spectrum_aa_allowed()
+        time_idle_aa = self._time_preview_aa_allowed()
+        for c in self._amp_curves:
+            self._set_curve_aa(c, spectrum_idle_aa)
+        for c in self._time_curves:
+            self._set_curve_aa(c, time_idle_aa)
+        return bool(
+            (spectrum_idle_aa and self._amp_curves)
+            or (time_idle_aa and self._time_curves)
+        )
+
+    def _cancel_section_reveal(self) -> None:
+        self._section_reveal_generation += 1
+        self._section_reveal_waiting = False
+        self._section_reveal_geometry = None
+        self._stop_aa_idle_timer()
+        self._stop_discrete_aa_timer()
+
+    # Structural cap on layout-settling rounds, not a timed calibration.
+    # Kept on this canvas: ack state is pending/request-id/generation, and
+    # the geometry key is host size, viewport size, DPR, then the amplitude
+    # and time-preview plots. FRF pre-aligns three plots, heatmap appends a
+    # colorbar, and the time-domain canvas stores one epoch tuple.
+    _PAINT_ACK_MAX_REARMS = 2
+
+    def _cancel_presentation_paint_ack(self) -> None:
+        """Invalidate a pending presentation-paint acknowledgement."""
+        self._presentation_paint_ack_generation += 1
+        self._presentation_paint_ack_pending = False
+        self._presentation_paint_ack_request_id = None
+        self._presentation_paint_ack_geometry = None
+        self._presentation_paint_ack_rearms = 0
+        self._presentation_paint_ack_rearm_warned = False
+
+    def _prepare_presentation_paint_ack_scene(self) -> None:
+        """Settle delayed ViewBox autorange before the geometry snapshot.
+
+        The viewport paint calls ``prepareForPaint`` only after the ack
+        token is sampled, so a freshly added curve would change viewRange
+        during that paint and void the handshake. A deleted GraphicsView
+        during teardown raises RuntimeError; the request then fails closed
+        on the geometry key.
+        """
+        try:
+            self._glw.scene().prepareForPaint()
+        except (AttributeError, RuntimeError):
+            return
+
+    def _presentation_paint_ack_geometry_delta(self, previous, current) -> str:
+        """Name which snapshot component moved. Plots are amplitude, then time."""
+        if not isinstance(previous, tuple) or not isinstance(current, tuple):
+            return f"geometry {previous!r} -> {current!r}"
+        parts = []
+        for index, name in (
+            (0, "host-width"),
+            (1, "host-height"),
+            (2, "viewport-width"),
+            (3, "viewport-height"),
+            (4, "dpr"),
+        ):
+            if index >= len(previous) or index >= len(current):
+                parts.append(f"{name} missing")
+                continue
+            if previous[index] != current[index]:
+                parts.append(f"{name} {previous[index]!r} -> {current[index]!r}")
+        prev_plots = previous[5] if len(previous) > 5 else ()
+        curr_plots = current[5] if len(current) > 5 else ()
+        names = ("amp", "time")
+        for index in range(max(len(prev_plots), len(curr_plots))):
+            label = names[index] if index < len(names) else f"plot-{index}"
+            if index >= len(prev_plots) or index >= len(curr_plots):
+                parts.append(f"{label} plot membership changed")
+                continue
+            prev_item = prev_plots[index]
+            curr_item = curr_plots[index]
+            if prev_item == curr_item:
+                continue
+            if prev_item[0] != curr_item[0]:
+                parts.append(
+                    f"{label} sceneRect {prev_item[0]!r} -> {curr_item[0]!r}"
+                )
+            prev_range = (prev_item[1], prev_item[2])
+            curr_range = (curr_item[1], curr_item[2])
+            if prev_range != curr_range:
+                parts.append(
+                    f"{label} viewRange x {prev_item[1]!r} -> {curr_item[1]!r}, "
+                    f"y {prev_item[2]!r} -> {curr_item[2]!r}"
+                )
+        return "; ".join(parts) if parts else f"geometry {previous!r} -> {current!r}"
+
+    def _warn_presentation_paint_ack_geometry(self, previous, current) -> None:
+        """Log one geometry-give-up warning for this request."""
+        if getattr(self, "_presentation_paint_ack_rearm_warned", False):
+            return
+        self._presentation_paint_ack_rearm_warned = True
+        import logging
+
+        from mf4_analyzer.diagnostics import throttled
+
+        throttled(
+            logger,
+            "presentation-paint-ack-geometry",
+            logging.WARNING,
+            "presentation paint ack cancelled after %s rearms; geometry changed: %s",
+            self._PAINT_ACK_MAX_REARMS,
+            self._presentation_paint_ack_geometry_delta(previous, current),
+        )
+
+    def _rearm_presentation_paint_ack(self, previous, current) -> None:
+        """Snapshot ``current`` and schedule one more paint, or cancel.
+
+        Visibility loss and a changed generation take the cancel path.
+        Generation stays put across a rearm; ``_cancel_presentation_paint_ack``
+        is what bumps it.
+        """
+        if (
+            not self._presentation_paint_ack_pending
+            or not self._presentation_paint_ack_visible()
+            or current is None
+        ):
+            self._cancel_presentation_paint_ack()
+            return
+        rearms = int(getattr(self, "_presentation_paint_ack_rearms", 0))
+        if rearms >= self._PAINT_ACK_MAX_REARMS:
+            self._warn_presentation_paint_ack_geometry(previous, current)
+            self._cancel_presentation_paint_ack()
+            return
+        self._presentation_paint_ack_rearms = rearms + 1
+        self._presentation_paint_ack_geometry = current
+        try:
+            self._glw.viewport().update()
+        except RuntimeError:
+            self._cancel_presentation_paint_ack()
+
+    def _note_presentation_content_invalidated(self) -> None:
+        """Tell a covering page transition that this chart is no longer B.
+
+        Emit at semantic mutation start, before freeze / the next paint.
+        Ordinary expose/paint and quality/AA convergence must not call this.
+        """
+        self.presentation_content_invalidated.emit()
+
+    def _on_presentation_paint_destroyed(self, *_args) -> None:
+        """Destroyed is a lifecycle boundary, never a paint acknowledgement."""
+        self._cancel_presentation_paint_ack()
+
+    def _presentation_paint_ack_visible(self) -> bool:
+        """Whether the real GraphicsView viewport can naturally paint."""
+        try:
+            viewport = self._glw.viewport()
+            return bool(
+                viewport is not None
+                and self.isVisible()
+                and self._glw.isVisible()
+                and viewport.isVisible()
+            )
+        except RuntimeError:
+            return False
+
+    def _presentation_paint_ack_geometry_key(self):
+        """Geometry/DPR facts that must survive through one viewport paint."""
+        try:
+            viewport = self._glw.viewport()
+            if viewport is None or viewport.width() <= 0 or viewport.height() <= 0:
+                return None
+            dpr = (
+                float(self.devicePixelRatioF()),
+                float(self._glw.devicePixelRatioF()),
+                float(viewport.devicePixelRatioF()),
+            )
+            plots = []
+            for plot in (self._plot_amp, self._plot_time):
+                rect = plot.vb.sceneBoundingRect()
+                x_range, y_range = plot.vb.viewRange()
+                plots.append((
+                    tuple(float(value) for value in rect.getRect()),
+                    tuple(float(value) for value in x_range),
+                    tuple(float(value) for value in y_range),
+                ))
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+        return (
+            self.width(), self.height(),
+            viewport.width(), viewport.height(),
+            dpr,
+            tuple(plots),
+        )
+
+    def request_presentation_paint_ack(self, request_id) -> bool:
+        """Request one acknowledgement after the next natural viewport paint.
+
+        The transition owner calls this only after it has applied the target
+        state.  A hidden or unrealized canvas cannot produce valid presentation
+        evidence, so the request is invalidated instead of being deferred.
+        """
+        self._cancel_presentation_paint_ack()
+        if not self._presentation_paint_ack_visible():
+            return False
+        # Line canvas does not pre-align. Settle autorange here so the
+        # snapshot matches the paint that follows.
+        self._prepare_presentation_paint_ack_scene()
+        geometry = self._presentation_paint_ack_geometry_key()
+        if geometry is None:
+            return False
+        self._presentation_paint_ack_pending = True
+        self._presentation_paint_ack_request_id = request_id
+        self._presentation_paint_ack_geometry = geometry
+        try:
+            self._glw.viewport().update()
+        except RuntimeError:
+            self._cancel_presentation_paint_ack()
+            return False
+        return True
+
+    def _presentation_paint_ack_token(self):
+        """Token sampled immediately before an actual GraphicsView paint."""
+        if not self._presentation_paint_ack_pending:
+            return None
+        if not self._presentation_paint_ack_visible():
+            self._cancel_presentation_paint_ack()
+            return None
+        geometry = self._presentation_paint_ack_geometry_key()
+        if geometry != self._presentation_paint_ack_geometry:
+            self._rearm_presentation_paint_ack(
+                self._presentation_paint_ack_geometry, geometry,
+            )
+            return None
+        return (
+            self._presentation_paint_ack_generation,
+            self._presentation_paint_ack_request_id,
+            geometry,
+        )
+
+    def _presentation_paint_acked(self, token) -> None:
+        """Emit exactly once, after the sampled natural viewport paint."""
+        if token is None or not self._presentation_paint_ack_pending:
+            return
+        generation, request_id, geometry = token
+        if (
+            generation != self._presentation_paint_ack_generation
+            or not self._presentation_paint_ack_visible()
+        ):
+            self._cancel_presentation_paint_ack()
+            return
+        current = self._presentation_paint_ack_geometry_key()
+        if (
+            geometry != current
+            or geometry != self._presentation_paint_ack_geometry
+        ):
+            self._rearm_presentation_paint_ack(geometry, current)
+            return
+        self._presentation_paint_ack_rearms = 0
+        self._presentation_paint_ack_rearm_warned = False
+        self._presentation_paint_ack_pending = False
+        self._presentation_paint_ack_request_id = None
+        self._presentation_paint_ack_geometry = None
+        self.presentation_paint_acknowledged.emit(request_id)
+
+    def begin_section_reveal(self) -> None:
+        """Prepare existing curves before their Section page becomes visible.
+
+        No replot callback or range/history mutation is part of this hook.
+        A rebuilt result supersedes it through the normal render lifecycle.
+        """
+        self._cancel_section_reveal()
+        if not (self._amp_curves or self._time_curves):
+            return
+        self.disable_interactive_quality()
+        self._section_reveal_waiting = True
+        self._emit_quality_status()
+        self._glw.viewport().update()
+
+    def _section_reveal_geometry_key(self):
+        viewport = self._glw.viewport()
+        return (
+            viewport.width(), viewport.height(), self.devicePixelRatioF(),
+            tuple((p.vb.sceneBoundingRect().getRect(),
+                   tuple(tuple(r) for r in p.vb.viewRange()))
+                  for p in (self._plot_amp, self._plot_time)),
+        )
+
+    def _section_reveal_paint_token(self):
+        if not self._section_reveal_waiting or not self.isVisible():
+            return None
+        return self._section_reveal_generation, self._section_reveal_geometry_key()
+
+    def _section_reveal_painted(self, token) -> None:
+        """Receive completion from the actual GraphicsView paint override."""
+        if token is None or not self._section_reveal_waiting:
+            return
+        generation, geometry = token
+        if generation != self._section_reveal_generation or not self.isVisible():
+            return
+        if (geometry != self._section_reveal_geometry_key()
+                or self._spectrum_curves_dirty or self._spectrum_y_dirty):
+            self._glw.viewport().update()
+            return
+        self._section_reveal_painted_generation = generation
+        self._section_reveal_geometry = geometry
+        self._arm_discrete_aa()
+
+    def _arm_discrete_aa(self) -> None:
+        """Settle AA for a DISCRETE render on the next event-loop turn.
+
+        A fresh compute / a View switch is a one-shot event with no follow-up
+        input, so the 150 ms interactive quiet window is pure latency here.
+        Curves were built AA-off provisionally (their real point and ink
+        totals are only knowable once the whole collection is in place), so
+        the switch call itself returns without ever painting an AA frame —
+        that was the 245 ms ``plot_spectra`` measured in spec §1.4.
+        """
+        self._aa_on = False
+        timer = self._timer_alive(self._discrete_aa_timer)
+        if timer is None:
+            self._discrete_quality_deferred = False
+            return
+        if self._discrete_quality_hold is not None:
+            timer.stop()
+            self._discrete_quality_deferred = True
+            return
+        self._discrete_quality_deferred = False
+        timer.start()
+
+    def hold_discrete_quality(self, token) -> None:
+        """Defer the discrete AA upgrade while a page transition holds ``token``."""
+        self._discrete_quality_hold = token
+        timer = self._timer_alive(self._discrete_aa_timer)
+        if timer is not None and timer.isActive():
+            timer.stop()
+            self._discrete_quality_deferred = True
+
+    def release_discrete_quality(self, token) -> None:
+        """Arm one deferred discrete settle after the matching transition."""
+        if self._discrete_quality_hold != token:
+            return
+        self._discrete_quality_hold = None
+        deferred = self._discrete_quality_deferred
+        self._discrete_quality_deferred = False
+        if not deferred:
+            return
+        timer = self._timer_alive(self._discrete_aa_timer)
+        if timer is not None:
+            timer.start()
+
+    def disable_interactive_quality(self):
+        """Drop curve AA for the interactive (pan/zoom) path and cancel any
+        pending idle upgrade. Also invoked by the ViewBox drag hook
+        (``_ModifierWheelViewBox.mouseDragEvent``)."""
+        # Cancelling a pending upgrade moves the reader-facing dot from yellow
+        # to red, so that transition has to be emitted even on the hot path
+        # below where AA was already off and nothing else changes.
+        settle_was_pending = self._aa_settle_pending()
+        self._discrete_quality_deferred = False
+        self._stop_aa_idle_timer()
+        self._stop_discrete_aa_timer()
+        if self._aa_backstop_armed:
+            # End the measurement session so a trip still queued against it
+            # cannot tear AA off whatever session comes next.
+            self._aa_backstop_armed = False
+            self._aa_latch.close()
+        if not self._aa_on:
+            if settle_was_pending:
+                self._emit_quality_status()
+            return
+        for c in self._interactive_curves():
+            self._set_curve_aa(c, False)
+        self._aa_on = False
+        try:
+            self._glw.update()
+        except Exception:
+            pass
+        self._emit_quality_status()
+
+    def schedule_idle_quality(self):
+        """Re-arm the idle-AA timer after a settled interaction."""
+        self._start_aa_idle_timer()
+        self._emit_quality_status()
+
+    def _timer_alive(self, timer):
+        """Return ``timer`` if both it and this canvas still exist in C++."""
+        if timer is None:
+            return None
+        try:
+            if sip.isdeleted(self) or sip.isdeleted(timer):
+                return None
+        except RuntimeError:
+            # sip wrapper already gone; nothing left to start/stop.
+            return None
+        return timer
+
+    def _aa_idle_timer_alive(self):
+        return self._timer_alive(getattr(self, "_aa_idle_timer", None))
+
+    def _discrete_aa_timer_alive(self):
+        return self._timer_alive(getattr(self, "_discrete_aa_timer", None))
+
+    def _aa_settle_pending(self) -> bool:
+        """Whether an AA upgrade is armed on EITHER fuse.
+
+        The discrete settle is the same upgrade as the 150 ms idle one, just
+        on a shorter fuse, so anything that asks "is quality still coming?"
+        has to look at both or it will report red on a canvas that is one
+        event-loop turn away from green.
+        """
+        if self._section_reveal_waiting:
+            return True
+        for timer in (self._aa_idle_timer_alive(),
+                      self._discrete_aa_timer_alive()):
+            if timer is None:
+                continue
+            try:
+                if timer.isActive():
+                    return True
+            except RuntimeError:
+                continue
+        return False
+
+    def _start_aa_idle_timer(self) -> None:
+        timer = self._aa_idle_timer_alive()
+        if timer is None:
+            return
+        timer.start()
+
+    def _stop_aa_idle_timer(self, *_args) -> None:
+        timer = self._aa_idle_timer_alive()
+        if timer is None:
+            return
+        try:
+            timer.stop()
+        except RuntimeError:
+            # QTimer C++ object already deleted with the canvas.
+            return
+
+    def _stop_discrete_aa_timer(self, *_args) -> None:
+        timer = self._discrete_aa_timer_alive()
+        if timer is None:
+            return
+        try:
+            timer.stop()
+        except RuntimeError:
+            return
+
+    def _spectrum_refresh_timer_alive(self):
+        return self._timer_alive(getattr(self, "_spectrum_refresh_timer", None))
+
+    def _stop_spectrum_refresh_timer(self, *_args) -> None:
+        timer = self._spectrum_refresh_timer_alive()
+        if timer is None:
+            return
+        try:
+            timer.stop()
+            # start(int) rewrites interval; keep the 16 ms coalescer period.
+            timer.setInterval(_SPECTRUM_REFRESH_MS)
+        except RuntimeError:
+            return
+
+    def _query_idle_mouse_buttons(self):
+        """Defensive injectable query; failures are logged and treated as unknown.
+
+        The result never solely blocks idle recovery. Local canvas activity
+        owns that decision; a press in another window must not pin this
+        canvas pending.
+        """
+        provider = getattr(self, "_mouse_buttons_provider", None)
+        if provider is None:
+            provider = QApplication.mouseButtons
+        try:
+            return provider()
+        except Exception:
+            logger.warning(
+                "idle-quality mouse-buttons provider failed",
+                exc_info=True,
+            )
+            return None
+
+    # ------------------------------------------------------------------
+    # Measured AA backstop (spec §3.3/§3.4) — the layer that bills reality
+    # ------------------------------------------------------------------
+
+    def _spectrum_view_signature(self):
+        """Identity of the amplitude row's AA cost, or ``None`` if unknown.
+
+        The four inputs that move the frame cost: WHICH curves (labels), how
+        tall the data is relative to the window (quantized Y span — the log
+        bucket keeps float jitter on a static window inside one key while a
+        real Y zoom always crosses a boundary), and the row's pixel box.
+        """
+        try:
+            labels = tuple(
+                str(getattr(c, "_channel_name", "") or c.name() or "")
+                for c in self._amp_curves
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+        view_box = self._plot_amp.vb
+        try:
+            y_range = view_box.viewRange()[1]
+            y_span = abs(float(y_range[1]) - float(y_range[0]))
+            rect = view_box.sceneBoundingRect()
+            return (
+                labels,
+                _quantize_y_span_key(y_span),
+                int(rect.height()),
+                int(rect.width()),
+            )
+        except (AttributeError, IndexError, RuntimeError, TypeError,
+                ValueError):
+            return None
+
+    def _note_aa_frame(self, frame_ms) -> None:
+        """Feed one measured AA frame to the latch. Called FROM ``paintEvent``.
+
+        Stays on the hot path, so it does exactly two things beyond the
+        delegation: read the armed token (False on every non-AA frame, so an
+        interleaved interaction frame can never be miscounted as "the first AA
+        frame") and hand a trip to the Qt-side half. Mutating QGraphicsItems
+        mid-paint is not safe, so the actual AA drop is deferred.
+        """
+        if not self._aa_backstop_armed:
+            return
+        trip = self._aa_latch.note_frame(frame_ms)
+        if trip is not None:
+            self._trip_aa_backstop(trip[0], trip[1])
+
+    def _trip_aa_backstop(self, reason, measured_ms) -> None:
+        """Qt half of a trip: disarm and queue the epoch-tagged AA disable."""
+        # Disarm FIRST: further frames of this session must not re-trip while
+        # the deferred disable is still in flight.
+        self._aa_backstop_armed = False
+        self._aa_latch.reason = (str(reason), float(measured_ms))
+        timer = self._timer_alive(getattr(self, "_backstop_timer", None))
+        if timer is None:
+            return
+        try:
+            timer.setProperty(
+                _BACKSTOP_EPOCH_PROPERTY, int(self._aa_latch.epoch))
+            timer.start(0)
+        except RuntimeError:
+            return
+
+    def _on_aa_backstop_timeout(self):
+        """Deferred half of a trip: drop AA, but only for the epoch measured.
+
+        The epoch travels on the timer as a Qt dynamic property and is checked
+        against the live one before anything is mutated, so a trip raised for
+        a session that a rebuild has already superseded is a no-op instead of
+        tearing AA off the CURRENT session.
+        """
+        timer = self._timer_alive(getattr(self, "_backstop_timer", None))
+        if timer is None:
+            return
+        try:
+            epoch = int(timer.property(_BACKSTOP_EPOCH_PROPERTY))
+        except (TypeError, ValueError):
+            return
+        if epoch != int(self._aa_latch.epoch):
+            return
+        self.disable_interactive_quality()
+
+    def _enable_idle_quality(self):
+        """Idle-timer slot: restore crisp AA once THIS canvas is hands-off."""
+        if sip.isdeleted(self):
+            return
+        if self._section_reveal_waiting:
+            if (self._section_reveal_painted_generation != self._section_reveal_generation
+                    or self._section_reveal_geometry != self._section_reveal_geometry_key()
+                    or self._spectrum_curves_dirty or self._spectrum_y_dirty):
+                self._stop_aa_idle_timer()
+                self._stop_discrete_aa_timer()
+                self._glw.viewport().update()
+                return
+            self._section_reveal_waiting = False
+        if self._aa_on:
+            self._stop_aa_idle_timer()
+            self._stop_discrete_aa_timer()
+            return
+        # Consult the provider so injected failures stay observable, but do
+        # not use global mouseButtons as the idle gate.
+        self._query_idle_mouse_buttons()
+        if self._idle_activity.is_busy():
+            self.schedule_idle_quality()
+            return
+        self._stop_aa_idle_timer()
+        self._stop_discrete_aa_timer()
+        if self._time_y_needs_repin:
+            self._time_y_needs_repin = False
+            try:
+                self._snap_time_axes_to_grid()
+            except Exception:
+                pass
+        signature = self._spectrum_view_signature()
+        if self._aa_latch.blocked(signature):
+            # This geometry already paid its one bad AA frame. The prediction
+            # said it was affordable and reality disagreed; re-asking costs
+            # another second of frozen UI for a foregone conclusion.
+            self._emit_quality_status()
+            return
+        armed = self._apply_idle_curve_aa()
+        self._aa_on = True
+        if armed:
+            self._aa_latch.open(signature)
+            self._aa_backstop_armed = True
+        try:
+            self._glw.update()
+        except Exception:
+            pass
+        self._emit_quality_status()
+
+    def _note_idle_quality_event(self, event) -> None:
+        """Track press/move/release/wheel/gesture without consuming the event."""
+        etype = event.type()
+        if etype == QEvent.MouseButtonPress:
+            self._idle_activity.note_press(event.button())
+        elif etype == QEvent.MouseMove:
+            if self._idle_activity.is_busy():
+                self._idle_activity.note_move()
+        elif etype == QEvent.MouseButtonRelease:
+            self._idle_activity.note_release(event.button())
+            if not self._idle_activity.is_busy() and not self._aa_on:
+                self.schedule_idle_quality()
+        elif etype == QEvent.Wheel:
+            self._idle_activity.note_pulse()
+        elif etype in (QEvent.Gesture, QEvent.GestureOverride):
+            self._idle_activity.note_pulse()
+
+    # ------------------------------------------------------------------
+    # AA status (reader-facing traffic light) — mirrors QualityManager on the
+    # time-domain canvas but scoped to this canvas's own AA hysteresis state.
+    # ------------------------------------------------------------------
+    def quality_status(self):
+        """Return the {state, tooltip} dict consumed by the chart quality dot.
+
+        Judged on the amplitude spectrum curves (the primary FFT trace); the
+        time-preview curves gate their AA on a drawn-point density budget
+        (light overlays stay crisp, dense ones drop AA), so they are not a
+        reliable signal for the green/red readiness state and are excluded.
+        """
+        judged = self._amp_curves or self._time_curves
+        if not judged:
+            return {"state": "idle", "tooltip": "无曲线"}
+
+        def _aa(curve):
+            try:
+                return bool(curve.opts.get("antialias", False))
+            except Exception:
+                return False
+
+        actual_on = all(_aa(c) for c in judged)
+        if self._aa_on and actual_on:
+            return {"state": "green", "tooltip": "精细显示"}
+        if self._aa_settle_pending():
+            return {"state": "yellow", "tooltip": "正在细化：等待空闲刷新"}
+        # Measured backstop first: it OVERRIDES both predictions. When it has
+        # fired, "why is AA off" is no longer a budget question — this
+        # geometry was timed and it did not fit. Guarded on a non-empty
+        # blacklist so the common case never pays for the signature read.
+        if self._aa_latch.blacklist and self._aa_latch.blocked(
+                self._spectrum_view_signature()):
+            return {
+                "state": "red",
+                "block_reason": "aa-backstop",
+                "tooltip": "绘制异常：实测帧超时",
+            }
+        # Then ink, then point count — reported in the SAME order the decision
+        # is made in _spectrum_aa_allowed / _time_preview_aa_allowed, so the
+        # tooltip always names the leg that actually refused the frame. Reads
+        # the LATCHED state rather than recomputing, so the dead band is
+        # honored and this reporting path stays non-mutating.
+        if (self._aa_on and self._amp_curves
+                and self._spectrum_aa_ink_seeded
+                and not self._spectrum_aa_ink_allowed):
+            return {
+                "state": "preview",
+                "block_reason": "high-ink",
+                "tooltip": (
+                    "流畅预览：谱线填满绘图区，绘制量超预算"
+                    "（已按墨迹预算关闭抗锯齿）"
+                ),
+            }
+        if (self._aa_on and not self._amp_curves and self._time_curves
+                and self._time_aa_ink_seeded
+                and not self._time_aa_ink_allowed):
+            # Preview-only state (sources selected, 计算 not pressed yet):
+            # the preview curves ARE the judged set here, so their ink is the
+            # reader-facing reason.
+            return {
+                "state": "preview",
+                "block_reason": "high-ink",
+                "tooltip": (
+                    "流畅预览：波形填满绘图区，绘制量超预算"
+                    "（已按墨迹预算关闭抗锯齿）"
+                ),
+            }
+        if (self._aa_on and self._amp_curves
+                and not self._spectrum_aa_density_allowed):
+            total = self._spectrum_drawn_point_total()
+            if total is not None:
+                return {
+                    "state": "preview",
+                    "tooltip": (
+                        "流畅预览："
+                        f"频谱叠加密度 {total} > {_SPECTRUM_AA_SEGMENT_OFF}"
+                        "（已按墨迹预算关闭抗锯齿）"
+                    ),
+                }
+        return {"state": "red", "tooltip": "绘制异常：抗锯齿未激活"}
+
+    def _emit_quality_status(self):
+        """Emit quality_status_changed only when the status actually changes."""
+        try:
+            status = self.quality_status()
+            if status == self._last_quality_status:
+                return
+            self._last_quality_status = status
+            self.quality_status_changed.emit(status)
+        except Exception:
+            pass
+
+    def _on_interactive_range_changed(self, plot=None, *_args):
+        self._idle_activity.note_pulse()
+        self.disable_interactive_quality()
+        self.schedule_idle_quality()
+        if plot is self._plot_time:
+            self._time_y_needs_repin = True
+            self._emit_time_preview_range()
+        elif plot is self._plot_amp:
+            self.manual_zoom_changed.emit(True)
+            current = self.capture_xy_viewport()
+            before = self._manual_amp_viewport
+            self._manual_amp_viewport = current
+            if before is None or current is None:
+                return
+            axes = tuple(
+                axis for axis, old, new in zip(('x', 'y'), before, current)
+                if old != new
+            )
+            if self._spectrum_program_range_depth:
+                axes = tuple(axis for axis in axes if axis != 'y')
+            if axes:
+                self._emit_viewport_intent(axes=axes)
+                self._manual_amp_viewport = self.capture_xy_viewport()
+
+    def _emit_viewport_intent(self, action='user', axes=('x', 'y')) -> None:
+        if not self._amp_curves:
+            return
+        if 'y' in axes:
+            self._spectrum_y_auto = False
+        self.viewport_action_committed.emit(action, axes)
+        self.viewport_intent_committed.emit()
+        if 'x' in axes:
+            self._spectrum_curves_dirty = True
+            self._spectrum_y_dirty = True
+            # Record the latest target only. Raw Y-scan belongs on the
+            # coalesced tick, not this mouse/wheel callback stack.
+            self._schedule_spectrum_refresh()
+
+    def capture_xy_viewport(self):
+        """Return the spectrum row's finite X/Y window, else ``None``.
+
+        Does not read the time-preview ViewBox. Empty / stale-preview state
+        has no spectrum curves and therefore no viewport to persist.
+        """
+        if not self._amp_curves:
+            return None
+        raw = _xy_from_viewbox(self._plot_amp.vb)
+        if raw is None:
+            return None
+        # Linear view coordinates already are engineering units. Log mode
+        # stores log10 in the ViewBox; callers persist the engineering pair.
+        if (
+            not self._plot_axis_is_log(self._plot_amp, "x")
+            and not self._plot_axis_is_log(self._plot_amp, "y")
+        ):
+            return raw
+        (x0, x1), (y0, y1) = raw
+        try:
+            xr = self._view_limits_as_engineering(self._plot_amp, "x", x0, x1)
+            yr = self._view_limits_as_engineering(self._plot_amp, "y", y0, y1)
+        except ValueError:
+            return None
+        xr = finite_non_degenerate_range(*xr)
+        yr = finite_non_degenerate_range(*yr)
+        if xr is None or yr is None:
+            return None
+        return xr, yr
+
+    def data_xy_extents(self):
+        """Full raw result extents, independent of the current viewport."""
+        xr = self._raw_spectrum_xlim
+        if xr is None:
+            return None
+        yr = self._auto_amplitude_y_range(self._entries, xr)
+        return (xr, yr) if yr is not None else None
+
+    def restore_xy_viewport(self, xlim, ylim) -> bool:
+        """Apply a saved spectrum X/Y window. Does not touch the time preview."""
+        if not self._amp_curves:
+            return False
+        try:
+            xr = finite_non_degenerate_range(xlim[0], xlim[1])
+            yr = finite_non_degenerate_range(ylim[0], ylim[1])
+        except (TypeError, ValueError, IndexError):
+            return False
+        if xr is None or yr is None:
+            return False
+        self._spectrum_y_auto = False
+        with self._program_spectrum_range():
+            self._write_amp_engineering_limits(xr, yr)
+        self._drop_spectrum_trace_cache()
+        self.flush_pending_spectrum_display()
+        self._arm_discrete_aa()
+        return True
+
+    def get_time_preview_xlim(self):
+        """Return the time-preview ViewBox visible X as ``(lo, hi)`` or None."""
+        try:
+            (lo, hi), _yr = self._plot_time.vb.viewRange()
+            lo = float(lo)
+            hi = float(hi)
+        except Exception:
+            return None
+        if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+            return None
+        return (lo, hi)
+
+    def _emit_time_preview_range(self) -> bool:
+        xlim = self.get_time_preview_xlim()
+        if xlim is None:
+            return False
+        lo, hi = xlim
+        self.time_preview_range_changed.emit(lo, hi)
+        return True
+
+    def register_mouse_mode_controller(self, controller) -> None:
+        self._mouse_mode_controller = controller
+
+    def register_copy_image_handler(self, handler) -> None:
+        self._copy_image_handler = handler
+
+    def register_replot_callback(self, cb) -> None:
+        """Register a callback fired after every chart rebuild.
+
+        The card registers the toolbar's ``apply_current_mouse_mode`` and
+        ``rebind_history_capture`` (chart_stack only does so when this method
+        exists), so back/forward history works on the FFT canvas (Task C)."""
+        if callable(cb):
+            self._replot_callbacks.append(cb)
+
+    def _run_replot_callbacks(self) -> None:
+        for cb in list(self._replot_callbacks):
+            try:
+                cb()
+            except Exception:
+                logger.debug("replot callback %r failed", cb, exc_info=True)
+
+    def _plot_item_for_view_box(self, view_box):
+        if view_box is self._plot_amp.vb:
+            return self._plot_amp
+        if view_box is self._plot_time.vb or view_box in self._time_overlay_vbs:
+            return self._plot_time
+        return self._plot_amp
+
+    def _fit_y_to_visible_x(self, plot) -> None:
+        """Right-click 「Y 轴自适应」: keep the CURRENT X window fixed and
+        autoscale Y to just the curve samples inside it.
+
+        Mirrors ``TimeDomainCanvasPG.fit_y_to_visible_x`` but for the FFT line
+        plots. Distinct from ``reset_view_to_data_extents`` (查看全部), which
+        restores BOTH axes to the full data extent. Unlike the time-domain hot
+        path the line curves hold their full (non-decimated) samples, so we can
+        fit directly on ``getData()`` rather than re-slicing a raw signal.
+        """
+        if plot is self._plot_amp:
+            limits = self._spectrum_y_limits(
+                self._entries, self._amp_view_x_as_engineering(),
+            )
+            if limits is not None:
+                with self._program_spectrum_range():
+                    self._write_amp_engineering_limits(None, limits)
+                self._emit_viewport_intent(axes=('y',))
+                self._arm_discrete_aa()
+            return
+        if plot is self._plot_time:
+            curves = self._time_curves
+        else:
+            plot = self._plot_amp
+            curves = self._amp_curves
+        try:
+            (x0, x1), _ = plot.vb.viewRange()
+        except Exception:
+            return
+        lo, hi = np.inf, -np.inf
+        for c in curves:
+            try:
+                xs, ys = c.getData()
+            except Exception:
+                continue
+            if xs is None or ys is None or len(xs) == 0:
+                continue
+            xs = np.asarray(xs)
+            ys = np.asarray(ys)
+            mask = (xs >= x0) & (xs <= x1) & np.isfinite(ys)
+            if not np.any(mask):
+                continue
+            yv = ys[mask]
+            lo = min(lo, float(np.min(yv)))
+            hi = max(hi, float(np.max(yv)))
+        if not (np.isfinite(lo) and np.isfinite(hi)) or hi < lo:
+            return
+        pad = (hi - lo) * 0.05 if hi > lo else (abs(hi) * 0.05 or 1.0)
+        self.disable_interactive_quality()
+        plot.setYRange(lo - pad, hi + pad, padding=0)
+        # Time preview: repin the *fitted* window onto the shared graticule
+        # (TimeDomain overlay contract). Do NOT full-data reframe — that undoes
+        # the visible-X fit. Spectrum row has no graticule.
+        if plot is self._plot_time:
+            self._repin_time_y_to_grid()
+        self.schedule_idle_quality()
+
+    def _redesign_context_menu_for_viewbox(self, view_box, menu) -> None:
+        plot = self._plot_item_for_view_box(view_box)
+        redesign_pg_context_menu(
+            menu,
+            plot,
+            self._mouse_mode_controller,
+            view_all_handler=self.reset_view_to_data_extents,
+            # Per-viewbox: fit Y on whichever plot (amp / time preview) was
+            # right-clicked — matches the time-domain 「Y 轴自适应」 entry.
+            y_autofit_handler=lambda: self._fit_y_to_visible_x(plot),
+            copy_image_handler=self._copy_image_handler,
+            allow_y_grid=True,
+            # Plot Options hidden for now in the fft section (per request).
+            # Default is already False; set explicitly so the intentional
+            # "off for now" reads clearly and is easy to flip back.
+            keep_plot_options=False,
+            view_box=view_box,
+        )
+        self._maybe_add_time_preview_left_axis_action(view_box, menu)
+
+    def _maybe_add_time_preview_left_axis_action(self, view_box, menu) -> None:
+        """Overlay-style 「设为左轴」 for multi-source time preview.
+
+        TimeDomain's channel-tree action only rewrites the TD overlay primary;
+        it does not reorder FFT preview sources. When the user right-clicks a
+        non-left preview curve (or its right axis ViewBox), offer the same
+        label and promote that entry to the left axis.
+        """
+        time_vbs = {self._plot_time.vb, *self._time_overlay_vbs}
+        if view_box not in time_vbs or len(self._entries) < 2:
+            return
+        idx = 0
+        if view_box is not self._plot_time.vb:
+            try:
+                idx = 1 + self._time_overlay_vbs.index(view_box)
+            except ValueError:
+                idx = self._nearest_time_entry_for_menu()
+        else:
+            idx = self._nearest_time_entry_for_menu()
+        if idx is None or idx <= 0 or idx >= len(self._entries):
+            return
+        from PyQt5.QtWidgets import QAction
+
+        action = QAction("设为左轴", menu)
+        action.triggered.connect(lambda *_a, i=idx: self.promote_time_entry_to_left(i))
+        try:
+            menu.insertAction(menu.actions()[0] if menu.actions() else None, action)
+        except Exception:
+            menu.addAction(action)
+
+    def _nearest_time_entry_for_menu(self):
+        """Best-effort curve index under the last right-click, else selection."""
+        scene_pos = getattr(self, "_last_rclick_scene_pos", None)
+        if scene_pos is not None:
+            try:
+                if self._plot_time.vb.sceneBoundingRect().contains(scene_pos):
+                    v = self._plot_time.vb.mapSceneToView(scene_pos)
+                    idx = self._nearest_time_entry_index(float(v.x()), float(v.y()))
+                    if idx is not None:
+                        return idx
+            except Exception:
+                pass
+        sel = self._selected_time_entry_idx
+        if sel is not None and int(sel) > 0:
+            return int(sel)
+        return None
+
+    def _nearest_time_entry_index(self, x, y):
+        """Nearest overlay curve to ``(x, y)`` in the main time ViewBox."""
+        best_i = None
+        best_d = None
+        for i, (_curve, vb, _plot) in enumerate(self._time_curve_owners()):
+            try:
+                xs, ys = _curve.getData()
+            except Exception:
+                continue
+            if xs is None or ys is None or len(xs) == 0:
+                continue
+            xs = np.asarray(xs, dtype=float)
+            ys = np.asarray(ys, dtype=float)
+            if vb is not self._plot_time.vb:
+                # Map aux data Y into the main view's scene, then to main data
+                # so distance is screen-comparable.
+                try:
+                    # Compare in scene pixels via each vb.
+                    scene_pts = []
+                    for xi, yi in zip(xs[::max(1, len(xs)//200)], ys[::max(1, len(ys)//200)]):
+                        if not (np.isfinite(xi) and np.isfinite(yi)):
+                            continue
+                        sp = vb.mapViewToScene(QPointF(float(xi), float(yi)))
+                        mp = self._plot_time.vb.mapSceneToView(sp)
+                        scene_pts.append((float(mp.x()), float(mp.y())))
+                    if not scene_pts:
+                        continue
+                    arr = np.asarray(scene_pts, dtype=float)
+                    d = float(np.min((arr[:, 0] - x) ** 2 + (arr[:, 1] - y) ** 2))
+                except Exception:
+                    continue
+            else:
+                mask = np.isfinite(xs) & np.isfinite(ys)
+                if not np.any(mask):
+                    continue
+                d = float(np.min((xs[mask] - x) ** 2 + (ys[mask] - y) ** 2))
+            if best_d is None or d < best_d:
+                best_d = d
+                best_i = i
+        return best_i
+
+    def promote_time_entry_to_left(self, idx: int) -> None:
+        """Move ``entries[idx]`` to the left axis (index 0) and rebuild preview."""
+        try:
+            idx = int(idx)
+        except (TypeError, ValueError):
+            return
+        if idx <= 0 or idx >= len(self._entries):
+            return
+        entries = list(self._entries)
+        entry = entries.pop(idx)
+        entries.insert(0, entry)
+        self._entries = entries
+        try:
+            (x0, x1), _ = self._plot_time.vb.viewRange()
+        except Exception:
+            x0 = x1 = None
+        title = "时域预览"
+        self._plot_time_preview_entries(entries, selected_idx=0, title=title)
+        if x0 is not None and x1 is not None and np.isfinite(x0) and np.isfinite(x1) and x1 > x0:
+            try:
+                self._plot_time.setXRange(x0, x1, padding=0)
+            except Exception:
+                pass
+        self._selected_time_entry_idx = 0
+        self.time_source_selected.emit()
+        self.layout_geometry_changed.emit()
+
+    def _handle_wheel_dispatch(self, *, delta, modifiers, x_pos, y_pos,
+                               view_box=None, scene_pos=None, axis=None):
+        """Wheel contract aligned with TimeDomain overlay + analysis footer.
+
+        * Ctrl → X zoom (any plot)
+        * Time preview, no Ctrl:
+          - plain wheel → Y pan by one division (overlay sign)
+          - Shift → nice-step Y zoom
+          - ``axis == 1`` (Y gutter) → only that ViewBox; else all time VBs
+        * Spectrum row: Shift → Y zoom; plain wheel consumed (no native zoom)
+        """
+        self._idle_activity.note_pulse()
+        step = 1 if delta > 0 else -1 if delta < 0 else 0
+        if step == 0 or view_box is None:
+            return False
+        ctrl = bool(modifiers & Qt.ControlModifier)
+        shift = bool(modifiers & Qt.ShiftModifier)
+        time_vbs = [self._plot_time.vb, *self._time_overlay_vbs]
+        on_time = view_box in time_vbs and bool(self._time_curves)
+
+        if not ctrl and not on_time and not shift:
+            if not self._aa_on:
+                self.schedule_idle_quality()
+            return True  # spectrum plain wheel: consume, no zoom
+
+        factor = 0.85 if step > 0 else 1.0 / 0.85
+        try:
+            x_range, y_range = view_box.viewRange()
+            if ctrl:
+                lo, hi = x_range
+                center = float(x_pos) if np.isfinite(x_pos) else (lo + hi) / 2.0
+                spectrum_x = view_box is self._plot_amp.vb
+                if spectrum_x:
+                    # note_pulse() does not set busy; latch before setXRange
+                    # so sigXRangeChanged coalesces instead of idle-immediate.
+                    self._spectrum_refresh_interactive = True
+                view_box.setXRange(
+                    center - (center - lo) * factor,
+                    center + (hi - center) * factor,
+                    padding=0,
+                )
+                if on_time:
+                    self._emit_time_preview_range()
+                elif spectrum_x:
+                    self.manual_zoom_changed.emit(True)
+                    self._emit_viewport_intent(axes=('x',))
+            elif on_time:
+                pairs = self._time_axis_pairs()
+                if axis == 1:
+                    targets = [(vb, ax) for vb, ax in pairs if vb is view_box]
+                    if not targets:
+                        targets = pairs
+                else:
+                    targets = pairs
+                n = self._effective_time_divisions()
+                lo, hi = y_range
+                span = hi - lo
+                if not (np.isfinite(span) and span > 0):
+                    return True
+                if np.isfinite(y_pos):
+                    cursor_fraction = (float(y_pos) - lo) / span
+                    cursor_fraction = max(0.0, min(1.0, cursor_fraction))
+                else:
+                    cursor_fraction = 0.5
+                for target_vb, target_axis in targets:
+                    try:
+                        target_lo, target_hi = target_vb.viewRange()[1]
+                        target_span = target_hi - target_lo
+                        if not (np.isfinite(target_span) and target_span > 0):
+                            continue
+                        current_per_div = target_span / n
+                        if shift:
+                            next_per_div = _adjacent_nice_step(
+                                current_per_div, -1 if step > 0 else 1
+                            )
+                            if next_per_div is None:
+                                next_per_div = current_per_div * factor
+                            anchor = target_lo + cursor_fraction * target_span
+                            next_span = n * next_per_div
+                            raw_bottom = anchor - cursor_fraction * next_span
+                            bottom = round(raw_bottom / next_per_div) * next_per_div
+                            top = bottom + next_span
+                            tick_per_div = next_per_div
+                        else:
+                            # Plain-wheel vertical pan (Windows-traditional sign).
+                            bottom = target_lo - step * current_per_div
+                            top = target_hi - step * current_per_div
+                            tick_per_div = current_per_div
+                        ticks = [
+                            bottom + k * tick_per_div for k in range(n + 1)
+                        ]
+                        target_vb.enableAutoRange(axis='y', enable=False)
+                        target_vb.setYRange(bottom, top, padding=0)
+                        target_axis.setStyle(maxTickLevel=0)
+                        target_axis.setTickDensity(1.0)
+                        target_axis.setTicks([[
+                            (value, _fmt_tick(value, tick_per_div))
+                            for value in ticks
+                        ], []])
+                    except Exception:
+                        continue
+                self._build_time_y_grid(n)
+            elif shift:
+                lo, hi = y_range
+                center = float(y_pos) if np.isfinite(y_pos) else (lo + hi) / 2.0
+                view_box.setYRange(
+                    center - (center - lo) * factor,
+                    center + (hi - center) * factor,
+                    padding=0,
+                )
+                if view_box is self._plot_amp.vb:
+                    self.manual_zoom_changed.emit(True)
+                    self._emit_viewport_intent(axes=('y',))
+            else:
+                return True
+        except Exception:
+            return False
+        self.disable_interactive_quality()
+        self.schedule_idle_quality()
+        self.layout_geometry_changed.emit()
+        return True
+
+    # ------------------------------------------------------------------
+    # empty hint (source/params selected, result cache not ready)
+    # ------------------------------------------------------------------
+    def _store_empty_hint_state(self, item, text: str) -> None:
+        self._empty_hint_item = item
+        self._empty_hint_text = text
+
+    def show_empty_hint(self, text: str) -> None:
+        self._empty_hint.show(text)
+
+    def _reposition_empty_hint(self, *_args) -> None:
+        self._empty_hint.reposition()
+
+    def clear_empty_hint(self) -> None:
+        self._empty_hint.clear()
+
+    # ------------------------------------------------------------------
+    def plot_spectra(self, entries, *, xlim, amp_label, title,
+                     y_auto=True, y_min=0.0, y_max=0.0):
+        """Plot FFT curves and show all source time traces below."""
+        from ._shared import notify_content_replacement
+
+        notify_content_replacement(self)
+        entries = list(entries)
+        db = self._is_db_amp_label(amp_label)
+        prepared_ranges = [
+            prepare_line_range(
+                entry['freq'], entry['amp'],
+                valid_mask=self._entry_valid_mask(entry, db),
+            )
+            for entry in entries
+        ]
+        self._note_presentation_content_invalidated()
+        self._invalidate_spectrum_display_generation()
+        self.clear_empty_hint()
+        self._hide_frequency_cursor_items()
+        for p, curves in ((self._plot_amp, self._amp_curves),
+                          (self._plot_time, self._time_curves)):
+            for c in curves:
+                p.removeItem(c)
+            curves.clear()
+        # A newly calculated FFT replaces the amplitude collection, so begin
+        # its AA hysteresis from the actual combined drawn-point density.
+        self._reset_spectrum_aa_density_gate()
+        self._drop_remark_projection()
+        # A fresh compute supersedes any stale marker; restore the NORMAL
+        # visual state (full-opacity curves rebuilt below + marker removed).
+        self._clear_spectrum_stale()
+        self._drop_prepared_line_ranges()
+        self._entries = list(entries)
+        self._spectrum_db = db
+        self._store_prepared_line_ranges(self._entries, prepared_ranges)
+        self._spectrum_y_auto = bool(y_auto)
+        bounds = []
+        for entry in self._entries:
+            freq = np.asarray(entry['freq'], dtype=float)
+            freq = freq[np.isfinite(freq) & (freq >= 0)]
+            if freq.size:
+                bounds.append((float(freq.min()), float(freq.max())))
+        self._raw_spectrum_xlim = (
+            (min(b[0] for b in bounds), max(b[1] for b in bounds)) if bounds else None
+        )
+        for e, prepared in zip(self._entries, prepared_ranges):
+            pen = pg.mkPen(e.get('color', '#2563eb'), width=1.5)
+            # Peak-hold spectra are 1 pt/px polylines. Round joins fatten the
+            # vertices into a filled look; mitre/flat keeps the stroke a line.
+            pen.setJoinStyle(Qt.MiterJoin)
+            pen.setCapStyle(Qt.FlatCap)
+            freq, amp = self._spectrum_plot_arrays(
+                e['freq'], e['amp'], xlim=xlim, prepared=prepared)
+            # dB-reference-defaults Task 6 (spec §15 C1): a mixed-reference
+            # FFT overlay attaches a per-curve 'legend_label' (base label +
+            # a compact 'dB[A] re ...' disclosure) distinct from the base
+            # 'label' -- fall back to 'label' for entries that never went
+            # through the per-entry resolver (single/exact-reference axis,
+            # or a legacy hand-built entry).
+            curve = self._plot_amp.plot(
+                freq, amp, pen=pen, name=e.get('legend_label', e['label']),
+                # Build provisionally AA-off.  Once every overlay curve is
+                # present, the spectrum's combined point budget decides
+                # whether this settled render may turn AA back on.
+                antialias=False)
+            curve.setOpacity(1.0)
+            curve._spectrum_entry = e
+            curve._source_color = str(e.get('color') or '#2563eb')
+            curve._appearance_key = self._appearance_key_for_entry(e)
+            curve._prepared_line_range = prepared
+            curve._prepared_display_revision = self._spectrum_display_revision
+            curve._spectrum_xy_break_indices = _xy_break_indices(prepared)
+            self._amp_curves.append(curve)
+
+        self._raw_amp_title = title or ''
+        self._spectrum_amp_label = str(amp_label or _AMP_LEFT_LABEL)
+        self._apply_title_texts()
+        self._plot_amp.setLabel('left', amp_label)
+        self._plot_amp.setLabel('bottom', 'Frequency (Hz)')
+        self._last_xlim = (float(xlim[0]), float(xlim[1]))
+        manual_y = (not y_auto) and y_max > y_min
+        self._last_yrange = (float(y_min), float(y_max)) if manual_y else None
+
+        with self._program_spectrum_range():
+            # Sync before the window is chosen: a log axis must not receive 0,
+            # and setXRange/setYRange would store engineering numbers as log10.
+            self._sync_role_log_mode("spectrum")
+            x_limits = self._spectrum_x_limits(xlim)
+            y_limits = self._spectrum_y_limits(
+                self._entries, xlim,
+                manual=(float(y_min), float(y_max)) if manual_y else None,
+            )
+            self._write_amp_engineering_limits(x_limits, y_limits)
+        self._refresh_spectrum_display()
+        self.manual_zoom_changed.emit(False)
+
+        self._plot_time_preview_entries(
+            self._entries, selected_idx=0 if self._entries else None,
+            title="时域预览",
+        )
+        # Both rows are in place and both Y windows are set, so the budgets
+        # can finally be evaluated on the FINAL geometry — on the next
+        # event-loop turn, not inside this call (spec §3.4, defect C).
+        self._arm_discrete_aa()
+        # Surface the settled spectrum-density decision on the quality dot
+        # immediately (yellow while the settle is pending; an explained red
+        # once it lands and refuses).
+        self._emit_quality_status()
+        # Re-bind history capture + re-apply mouse mode on the rebuilt view
+        # (Task C: lets the toolbar's back/forward seed a baseline).
+        self._run_replot_callbacks()
+        self._project_remarks()
+        self._project_frequency_cursors()
+
+    def plot_time_preview(self, entries, *, title="时域预览",
+                          clear_spectrum=True) -> None:
+        """Show selected FFT input sources before spectrum computation.
+
+        ``clear_spectrum=True`` (genuine reset: mode entry / file close) wipes
+        the upper amplitude row. ``clear_spectrum=False`` (selection change on
+        an already-computed spectrum) KEEPS the amplitude curves visible but
+        DIMS them and overlays a "结果已过期" marker, while the lower time row
+        still updates live to the new selection. The next ``plot_spectra``
+        restores the normal visual state."""
+        self._note_presentation_content_invalidated()
+        self._cancel_section_reveal()
+        self._cancel_presentation_paint_ack()
+        self.clear_empty_hint()
+        if clear_spectrum:
+            self._invalidate_spectrum_display_generation()
+            for c in self._amp_curves:
+                self._plot_amp.removeItem(c)
+            self._amp_curves.clear()
+            self._reset_spectrum_aa_density_gate()
+            self._drop_remark_projection()
+            self._clear_spectrum_stale()
+            self._entries = []
+            self._selected_time_entry_idx = None
+            self._raw_spectrum_xlim = None
+            self._manual_amp_viewport = None
+            self._spectrum_db = False
+            self._drop_prepared_line_ranges()
+            self._spectrum_y_auto = True
+            self._last_xlim = None
+            self._last_yrange = None
+            self._raw_amp_title = ''
+            self._spectrum_amp_label = _AMP_LEFT_LABEL
+            self._apply_title_texts()
+            # Keep the amp plot labelled (default titles) so it never goes bare
+            # while the time-preview row below stays labelled.
+            self._plot_amp.setLabel('left', _AMP_LEFT_LABEL)
+            self._plot_amp.setLabel('bottom', _AMP_BOTTOM_LABEL)
+        elif self._amp_curves:
+            # Keep the computed spectrum but flag it stale. Nothing to flag
+            # when no spectrum exists yet (behaves like a plain preview).
+            self.mark_spectrum_stale()
+        self._plot_time_preview_entries(list(entries or []), title=title)
+        # Task C: re-bind history capture + re-apply mouse mode after rebuild.
+        self._run_replot_callbacks()
+        self._project_remarks()
+
+    # ------------------------------------------------------------------
+    # stale spectrum state (selection changed, awaiting re-compute)
+    # ------------------------------------------------------------------
+    def mark_spectrum_stale(self) -> None:
+        """Dim the computed amplitude curves and show the over-stale marker.
+
+        Idempotent and a no-op when there is no computed spectrum."""
+        if not self._amp_curves:
+            return
+        self._spectrum_stale = True
+        for c in self._amp_curves:
+            try:
+                c.setOpacity(_STALE_CURVE_OPACITY)
+            except Exception:
+                pass
+        self._show_stale_banner()
+
+    def _clear_spectrum_stale(self) -> None:
+        """Restore full-opacity curves and remove the stale marker."""
+        self._spectrum_stale = False
+        for c in self._amp_curves:
+            try:
+                c.setOpacity(1.0)
+            except Exception:
+                pass
+        self._remove_stale_banner()
+
+    def is_spectrum_stale(self) -> bool:
+        return bool(self._spectrum_stale)
+
+    def _show_stale_banner(self) -> None:
+        if self._stale_banner is None:
+            # pg.TextItem already renders at a constant on-screen size
+            # (it does not scale with the view transform), so only its
+            # data-space POSITION must be re-pinned on range/resize changes.
+            banner = pg.TextItem(
+                _STALE_MARKER_TEXT,
+                color=_STALE_MARKER_TEXT_COLOR,
+                fill=pg.mkBrush(*_STALE_MARKER_FILL),
+                border=pg.mkPen(_STALE_MARKER_BORDER, width=1),
+                anchor=(0.5, 0.0),
+            )
+            banner.setZValue(1000)
+            self._stale_banner = banner
+        if self._stale_banner.scene() is None:
+            self._plot_amp.vb.addItem(self._stale_banner, ignoreBounds=True)
+        self._stale_banner.setVisible(True)
+        # Keep the banner pinned to the top-center of the ViewBox through
+        # resize AND pan/zoom (range changes remap scene→view coords).
+        # Disconnect-before-connect avoids stacking duplicate handlers when
+        # mark_spectrum_stale is called repeatedly across selection changes.
+        for sig in (self._plot_amp.vb.sigResized,
+                    self._plot_amp.vb.sigRangeChanged):
+            try:
+                sig.disconnect(self._reposition_stale_banner)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                sig.connect(self._reposition_stale_banner)
+            except Exception:
+                pass
+        self._reposition_stale_banner()
+
+    def _reposition_stale_banner(self, *_args) -> None:
+        if self._stale_banner is None or not self._spectrum_stale:
+            return
+        try:
+            rect = self._plot_amp.vb.sceneBoundingRect()
+            top_center_scene = QPointF(rect.center().x(), rect.top() + 8.0)
+            self._stale_banner.setPos(
+                self._plot_amp.vb.mapSceneToView(top_center_scene))
+        except Exception:
+            pass
+
+    def _remove_stale_banner(self) -> None:
+        if self._stale_banner is None:
+            return
+        for sig in (self._plot_amp.vb.sigResized,
+                    self._plot_amp.vb.sigRangeChanged):
+            try:
+                sig.disconnect(self._reposition_stale_banner)
+            except (TypeError, RuntimeError):
+                pass
+        try:
+            self._plot_amp.vb.removeItem(self._stale_banner)
+        except Exception:
+            pass
+        self._stale_banner = None
+
+    def reset_view_to_data_extents(self) -> None:
+        if self._last_xlim is None:
+            self._reset_time_preview_to_extents()
+            self.manual_zoom_changed.emit(False)
+            return
+        bounds = self._raw_spectrum_xlim or self._last_xlim
+        x0, x1 = _visual_padded_bounds(*bounds)
+        with self._program_spectrum_range():
+            self._sync_role_log_mode("spectrum")
+            self._write_amp_engineering_limits(
+                self._spectrum_x_limits((x0, x1)),
+                self._spectrum_y_limits(self._entries, bounds),
+            )
+        self._drop_spectrum_trace_cache()
+        self.flush_pending_spectrum_display()
+        self._arm_discrete_aa()
+        self.select_time_entry(self._selected_time_entry_idx)
+        bounds = self._combined_time_bounds()
+        if bounds is not None:
+            tx0, tx1 = _visual_padded_bounds(bounds[0], bounds[1])
+            self._sync_role_log_mode("preview")
+            self._write_engineering_x(
+                self._plot_time, tx0, tx1, self._time_axis_samples(self._entries),
+            )
+        # Re-frame Y to the shared graticule after the X reset so the left +
+        # aux right axes stay aligned on the same horizontal grid lines.
+        self._reframe_time_y_to_grid()
+        self.manual_zoom_changed.emit(False)
+        self._emit_viewport_intent(action='home')
+
+    def _reset_time_preview_to_extents(self) -> None:
+        bounds = self._combined_time_bounds()
+        if bounds is None:
+            return
+        tx0, tx1 = _visual_padded_bounds(bounds[0], bounds[1])
+        self._sync_role_log_mode("preview")
+        self._write_engineering_x(
+            self._plot_time, tx0, tx1, self._time_axis_samples(self._entries),
+        )
+        # Re-frame Y to the shared graticule (was per-axis autoRange).
+        self._reframe_time_y_to_grid()
+
+    def full_reset(self) -> None:
+        from ._shared import notify_history_reset
+
+        notify_history_reset(self)
+        self._note_presentation_content_invalidated()
+        self._invalidate_spectrum_display_generation()
+        self._stop_aa_idle_timer()
+        self._stop_discrete_aa_timer()
+        if self._aa_backstop_armed:
+            self._aa_backstop_armed = False
+            self._aa_latch.close()
+        self._idle_activity.clear()
+        self.clear_empty_hint()
+        self._clear_frequency_cursor_readout()
+        for p, curves in ((self._plot_amp, self._amp_curves),
+                          (self._plot_time, self._time_curves)):
+            for c in curves:
+                try:
+                    p.removeItem(c)
+                except Exception:
+                    pass
+            curves.clear()
+        self._reset_spectrum_aa_density_gate()
+        # Aux overlay curves live in their own ViewBoxes, not in _plot_time —
+        # tear those down too so no orphan axes/curves linger.
+        self._clear_time_overlay_axes()
+        self.clear_remarks()
+        self._clear_spectrum_stale()
+        self._entries = []
+        self._selected_time_entry_idx = None
+        self._raw_spectrum_xlim = None
+        self._manual_amp_viewport = None
+        self._spectrum_db = False
+        self._drop_prepared_line_ranges()
+        self._spectrum_y_auto = True
+        self._last_xlim = None
+        self._last_yrange = None
+        self._raw_amp_title = ''
+        self._raw_time_title = ''
+        self._apply_title_texts()
+        # Keep both plots labelled in the empty state (consistency fix).
+        self._spectrum_amp_label = _AMP_LEFT_LABEL
+        self._apply_default_axis_labels()
+        self._axis_scale_session = {}
+        self._reapply_user_appearances()
+        # full_reset must not hand the next View a log ViewBox. The stored
+        # spec is applied again on the next plot, after this linear baseline.
+        self._set_plot_log_mode(self._plot_amp, False, False)
+        self._set_plot_log_mode(self._plot_time, False, False)
+        # Spectrum still uses native Y grid, so pad empty auto-range to keep
+        # the top tick line off the frame (historical spec R2). Time preview
+        # Y grid is the shared k/N graticule (internal i/n lines only); pin
+        # it with padding=0 so empty and with-data charts share one look.
+        self._plot_amp.setYRange(0.0, 1.0, padding=0.08)
+        self._plot_time.setYRange(0.0, 1.0, padding=0)
+        self._repin_time_y_to_grid()
+        self.layout_geometry_changed.emit()
+        # Curves are gone → the AA dot must fall back to red ("no curves")
+        # instead of showing the previous render's stale green.
+        self._emit_quality_status()
+        # Task C: re-bind history capture after the reset rebuild.
+        self._run_replot_callbacks()
+
+    def _apply_default_axis_labels(self) -> None:
+        """Pin both plots' axis titles to their defaults so neither row ever
+        renders bare. Called at construction and on full_reset; plot_spectra
+        later overrides the amp-left title with the chosen amplitude label."""
+        self._plot_amp.setLabel('left', _AMP_LEFT_LABEL)
+        self._plot_amp.setLabel('bottom', _AMP_BOTTOM_LABEL)
+        self._plot_time.setLabel('left', _TIME_LEFT_LABEL)
+        self._plot_time.setLabel('bottom', _TIME_BOTTOM_LABEL)
+
+    # ------------------------------------------------------------------
+    # collapse divider (spectrum vs time-preview)
+    # ------------------------------------------------------------------
+    def _split_top_plot(self):
+        return self._plot_amp
+
+    def _split_bottom_plot(self):
+        return self._plot_time
+
+    def resizeEvent(self, event):
+        self._cancel_presentation_paint_ack()
+        super().resizeEvent(event)
+        self._position_collapse_ctrl()
+        self._refresh_bottom_x_ticks()
+
+    def hideEvent(self, event):
+        self._cancel_presentation_paint_ack()
+        if self._section_reveal_waiting:
+            self._cancel_section_reveal()
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._position_collapse_ctrl()
+        self._refresh_bottom_x_ticks()
+
+    def has_result(self) -> bool:
+        return bool(self._entries)
+
+    def has_plotted_result(self) -> bool:
+        return self.has_result()
+
+    def capture_quality_settled(self) -> bool:
+        return quality_settled_from_status(self.quality_status() or {})
+
+    def capture_interaction_idle(self) -> bool:
+        return not analysis_idle_timer_is_busy(self._aa_idle_timer_alive())
+
+    def capture_cursor_facts(self):
+        dual = self.cursor_mode() == "dual"
+        geometry = dual_cursor_geometry(
+            dual=dual,
+            ax=self._cursor_a_frequency,
+            bx=self._cursor_b_frequency,
+        )
+        return dual, geometry
+
+    def capture_markup_revision(self) -> int:
+        return int(self.markup_revision or 0)
+
+    def iter_transient_overlay_items(self, *, section: str = "unknown"):
+        yield from self._cursor_lines or ()
+        yield from iter_axes_rubberband_items(self)
+
+    def presentation_capture_facts(self):
+        dual, geometry = self.capture_cursor_facts()
+        return build_capture_facts(
+            host_kind="fft",
+            visible_and_sized=widget_visible_and_sized(self),
+            has_real_result=self.has_plotted_result(),
+            quality_settled=self.capture_quality_settled(),
+            interaction_idle=self.capture_interaction_idle(),
+            cursor_dual=dual,
+            cursor_geometry=geometry,
+            markup_revision=self.capture_markup_revision(),
+        )
+
+    def set_tick_density(self, x, y) -> None:
+        try:
+            x_n = max(3, int(x))
+            y_n = max(3, int(y))
+        except (TypeError, ValueError):
+            return
+        x_d, y_d = _tick_counts_to_density(x_n, y_n)
+        self._bottom_tick_target = x_n
+        self._bottom_tick_density = x_d
+        self._refresh_bottom_x_ticks()
+        # Spectrum Y keeps plain density. Time-preview Y drives the shared
+        # graticule divisions so the left axis AND every aux right axis re-tick
+        # together (fixes "Y tick density had no effect on the right axes").
+        _apply_axis_tick_density(self._plot_amp.getAxis('left'), y_d)
+        self._time_divisions = max(3, min(20, y_n))
+        # Density only changes division count / tick pin — keep the current Y
+        # window (TimeDomain overlay: set_tick_density → _repin, not full reframe).
+        self._repin_time_y_to_grid()
+        self.layout_geometry_changed.emit()
+
+    def set_user_appearances(self, appearances) -> None:
+        """Install the current pane's overrides. Plot/reset reapplies them."""
+        self._user_appearances = normalize_pane_chart_appearances(appearances)
+        self._merge_axis_scale_session()
+
+    def note_chart_axis_scale(self, role: str, axis: str, scale: str) -> None:
+        """Remember a scale the open chart-options dialog just applied.
+
+        The analysis range policy replots before the dialog commits the pane
+        spec. This does not emit; ``_commit_chart_options`` publishes the spec.
+        """
+        if role not in {"spectrum", "preview"} or axis not in {"x", "y"}:
+            return
+        normalized = "log" if scale == "log" else "linear"
+        session = dict(self._axis_scale_session)
+        axes = dict(session.get(role) or {})
+        axes[axis] = normalized
+        session[role] = axes
+        self._axis_scale_session = session
+        spec = dict(self._role_spec(role))
+        key = f"{axis}_scale"
+        if normalized == "log":
+            spec[key] = "log"
+        else:
+            spec.pop(key, None)
+        cleaned = normalize_pane_chart_appearances({role: spec}).get(role, {})
+        appearances = dict(self._user_appearances)
+        if cleaned:
+            appearances[role] = cleaned
+        else:
+            appearances.pop(role, None)
+        self._user_appearances = appearances
+
+    def _merge_axis_scale_session(self) -> None:
+        session = self._axis_scale_session
+        if not session:
+            return
+        appearances = dict(self._user_appearances)
+        for role, axes in session.items():
+            if role not in {"spectrum", "preview"} or not isinstance(axes, dict):
+                continue
+            spec = dict(appearances.get(role) or {})
+            for axis, scale in axes.items():
+                if axis not in {"x", "y"}:
+                    continue
+                key = f"{axis}_scale"
+                if scale == "log":
+                    spec[key] = "log"
+                else:
+                    spec.pop(key, None)
+            cleaned = normalize_pane_chart_appearances({role: spec}).get(role, {})
+            if cleaned:
+                appearances[role] = cleaned
+            else:
+                appearances.pop(role, None)
+        self._user_appearances = appearances
+
+    def _plot_axis_is_log(self, plot, axis: str) -> bool:
+        ctrl = getattr(plot, "ctrl", None)
+        name = "logXCheck" if axis == "x" else "logYCheck"
+        check = getattr(ctrl, name, None)
+        is_checked = getattr(check, "isChecked", None)
+        return bool(callable(is_checked) and is_checked())
+
+    def _set_plot_log_mode(self, plot, x_log: bool, y_log: bool) -> None:
+        """Apply log flags. Skip ``setLogMode`` when they already match.
+
+        ``PlotItem.setLogMode`` always enables auto-range, which would wipe a
+        range that was just written in engineering units.
+        """
+        current = (
+            self._plot_axis_is_log(plot, "x"),
+            self._plot_axis_is_log(plot, "y"),
+        )
+        if current == (bool(x_log), bool(y_log)):
+            return
+        plot.setLogMode(x=bool(x_log), y=bool(y_log))
+
+    def _sync_role_log_mode(self, role: str) -> None:
+        """Make the plot match the stored spec. A missing key means linear."""
+        spec = self._role_spec(role)
+        self._set_plot_log_mode(
+            self._role_plot(role),
+            spec.get("x_scale") == "log",
+            spec.get("y_scale") == "log",
+        )
+
+    def _view_limits_as_engineering(self, plot, axis: str, lo, hi):
+        lo_f, hi_f = float(lo), float(hi)
+        if not self._plot_axis_is_log(plot, axis):
+            return lo_f, hi_f
+        return _view_to_engineering_limits("log", lo_f, hi_f)
+
+    def _amp_view_x_as_engineering(self) -> tuple[float, float]:
+        lo, hi = self._plot_amp.vb.viewRange()[0]
+        try:
+            return self._view_limits_as_engineering(
+                self._plot_amp, "x", float(lo), float(hi),
+            )
+        except ValueError:
+            return float(lo), float(hi)
+
+    def _window_for_axis(self, plot, axis: str, lo, hi, samples):
+        """Engineering window for one axis.
+
+        Linear values pass through, including a negative lower bound. Log
+        mode keeps a positive manual window and, when the requested lower
+        bound is not positive, uses the smallest positive sample instead of 0.
+        """
+        try:
+            lo_f, hi_f = float(lo), float(hi)
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(lo_f) and math.isfinite(hi_f)):
+            return None
+        if hi_f < lo_f:
+            lo_f, hi_f = hi_f, lo_f
+        if hi_f <= lo_f:
+            return None
+        if not self._plot_axis_is_log(plot, axis):
+            return (lo_f, hi_f)
+        if lo_f > 0.0:
+            return (lo_f, hi_f)
+        floor = _min_positive(samples)
+        if floor is None:
+            return None
+        if hi_f > floor:
+            return (floor, hi_f)
+        return (floor, floor * 10.0)
+
+    def _samples_in_x_window(self, entries, xlim, *, x_key: str, y_key: str):
+        try:
+            lo, hi = float(xlim[0]), float(xlim[1])
+        except (TypeError, ValueError, IndexError):
+            return np.array([], dtype=float)
+        if hi < lo:
+            lo, hi = hi, lo
+        pieces = []
+        for entry in entries or ():
+            if not isinstance(entry, dict):
+                continue
+            xs = np.asarray(entry.get(x_key, []), dtype=float)
+            ys = np.asarray(entry.get(y_key, []), dtype=float)
+            n = min(xs.size, ys.size)
+            if n == 0:
+                continue
+            xs = xs[:n]
+            ys = ys[:n]
+            mask = np.isfinite(xs) & np.isfinite(ys) & (xs >= lo) & (xs <= hi)
+            if np.any(mask):
+                pieces.append(ys[mask])
+        if not pieces:
+            return np.array([], dtype=float)
+        return np.concatenate(pieces)
+
+    def _amplitude_samples(self, entries, xlim) -> np.ndarray:
+        return self._samples_in_x_window(entries, xlim, x_key="freq", y_key="amp")
+
+    def _frequency_samples(self, entries) -> np.ndarray:
+        pieces = []
+        for entry in entries or ():
+            if not isinstance(entry, dict):
+                continue
+            freq = np.asarray(entry.get("freq", []), dtype=float)
+            finite = freq[np.isfinite(freq)]
+            if finite.size:
+                pieces.append(finite)
+        if not pieces:
+            return np.array([], dtype=float)
+        return np.concatenate(pieces)
+
+    def _time_axis_samples(self, entries) -> np.ndarray:
+        pieces = []
+        for entry in entries or ():
+            if not isinstance(entry, dict):
+                continue
+            time = np.asarray(entry.get("time", []), dtype=float)
+            finite = time[np.isfinite(time)]
+            if finite.size:
+                pieces.append(finite)
+        if not pieces:
+            return np.array([], dtype=float)
+        return np.concatenate(pieces)
+
+    def _spectrum_x_limits(self, xlim):
+        try:
+            lo, hi = float(xlim[0]), float(xlim[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+        window = self._window_for_axis(
+            self._plot_amp, "x", lo, hi, self._frequency_samples(self._entries),
+        )
+        if window is not None:
+            return window
+        if self._plot_axis_is_log(self._plot_amp, "x"):
+            return (1.0, 10.0)
+        if hi > lo:
+            return (lo, hi)
+        return None
+
+    def _spectrum_y_limits(self, entries, xlim, *, manual=None):
+        samples = self._amplitude_samples(entries, xlim)
+        log_y = self._plot_axis_is_log(self._plot_amp, "y")
+        if manual is not None:
+            window = self._window_for_axis(
+                self._plot_amp, "y", manual[0], manual[1], samples,
+            )
+            if window is not None:
+                return window
+            return (1.0, 10.0) if log_y else None
+        linear = self._auto_amplitude_y_range(entries, xlim)
+        if linear is None:
+            if not log_y:
+                return (0.0, 1.0)
+            floor = _min_positive(samples)
+            if floor is None:
+                return (1.0, 10.0)
+            return (floor, floor * 10.0)
+        window = self._window_for_axis(
+            self._plot_amp, "y", linear[0], linear[1], samples,
+        )
+        if window is not None:
+            return window
+        return (1.0, 10.0) if log_y else (0.0, 1.0)
+
+    def _write_amp_engineering_limits(self, x_limits, y_limits) -> None:
+        """Write spectrum ranges in engineering units for the current log mode."""
+        handle = PgAxisHandle(self._plot_amp, owner_canvas=self)
+        if x_limits is not None:
+            handle.set_engineering_xlim(float(x_limits[0]), float(x_limits[1]))
+        if y_limits is not None:
+            handle.set_engineering_ylim(float(y_limits[0]), float(y_limits[1]))
+
+    def _write_engineering_x(self, plot, lo, hi, samples) -> None:
+        window = self._window_for_axis(plot, "x", lo, hi, samples)
+        if window is not None:
+            PgAxisHandle(plot, owner_canvas=self).set_engineering_xlim(
+                float(window[0]), float(window[1]),
+            )
+            return
+        if self._plot_axis_is_log(plot, "x"):
+            return
+        try:
+            lo_f, hi_f = float(lo), float(hi)
+        except (TypeError, ValueError):
+            return
+        plot.setXRange(lo_f, hi_f, padding=0)
+
+    def _role_spec(self, role: str) -> dict:
+        spec = self._user_appearances.get(role)
+        return dict(spec) if isinstance(spec, dict) else {}
+
+    def _appearance_key_for_entry(self, entry) -> str:
+        if not isinstance(entry, dict):
+            return ""
+        fid = entry.get("fid", entry.get("file_id"))
+        channel = entry.get("channel") or entry.get("name")
+        if not fid or not channel:
+            return ""
+        return appearance_channel_key(fid, channel)
+
+    def _curve_appearance_key(self, curve) -> str:
+        key = str(getattr(curve, "_appearance_key", "") or "")
+        if key:
+            return key
+        return self._appearance_key_for_entry(getattr(curve, "_spectrum_entry", None))
+
+    def _role_plot(self, role: str):
+        return self._plot_amp if role == "spectrum" else self._plot_time
+
+    def _role_curves(self, role: str):
+        return self._amp_curves if role == "spectrum" else self._time_curves
+
+    def _role_default_labels(self, role: str) -> tuple[str, str]:
+        if role == "spectrum":
+            return (_AMP_BOTTOM_LABEL, str(self._spectrum_amp_label or _AMP_LEFT_LABEL))
+        return (_TIME_BOTTOM_LABEL, _TIME_LEFT_LABEL)
+
+    def _restore_role_defaults(self, role: str) -> None:
+        plot = self._role_plot(role)
+        self._apply_title_text(plot, "")
+        x_label, y_label = self._role_default_labels(role)
+        plot.setLabel("bottom", x_label)
+        plot.setLabel("left", y_label)
+        if role == "spectrum":
+            show_major_grid_left_bottom_only(plot, x=True, y=True, alpha=0.25)
+        else:
+            show_major_grid_left_bottom_only(plot, x=True, y=False, alpha=0.25)
+        for curve in self._role_curves(role):
+            source = getattr(curve, "_source_color", None)
+            if source:
+                self._recolor_curve(curve, str(source))
+
+    def _recolor_curve(self, curve, color: str) -> None:
+        width = 1.5
+        pen = curve.opts.get("pen") if hasattr(curve, "opts") else None
+        try:
+            if pen is not None and hasattr(pen, "widthF"):
+                width = float(pen.widthF() or width)
+        except (TypeError, ValueError):
+            width = 1.5
+        new_pen = pg.mkPen(color, width=width)
+        new_pen.setJoinStyle(Qt.MiterJoin)
+        new_pen.setCapStyle(Qt.FlatCap)
+        curve.setPen(new_pen)
+
+    def apply_user_appearance(self, spec, *, role: str = "spectrum") -> None:
+        """Apply one role's user overrides. Does not touch browse ranges."""
+        if role not in {"spectrum", "preview"}:
+            return
+        cleaned = normalize_pane_chart_appearances({role: spec or {}}).get(role, {})
+        plot = self._role_plot(role)
+        title = cleaned.get("title")
+        if isinstance(title, str) and title:
+            plot.setTitle(title)
+        elif "title" in cleaned:
+            self._apply_title_text(plot, "")
+        if "x_label" in cleaned:
+            plot.setLabel("bottom", cleaned["x_label"])
+        if "y_label" in cleaned:
+            plot.setLabel("left", cleaned["y_label"])
+        if "grid" in cleaned:
+            enabled = bool(cleaned["grid"])
+            show_major_grid_left_bottom_only(
+                plot, x=enabled, y=enabled, alpha=0.25,
+            )
+        colors = cleaned.get("line_colors") or {}
+        if isinstance(colors, dict):
+            for curve in self._role_curves(role):
+                color = colors.get(self._curve_appearance_key(curve))
+                if isinstance(color, str) and color:
+                    self._recolor_curve(curve, color)
+        # A partial spec (title only) must not reset scale. Only keys that
+        # are present change that axis; a missing key keeps the current flag.
+        if "x_scale" in cleaned or "y_scale" in cleaned:
+            x_log = self._plot_axis_is_log(plot, "x")
+            y_log = self._plot_axis_is_log(plot, "y")
+            if "x_scale" in cleaned:
+                x_log = cleaned.get("x_scale") == "log"
+            if "y_scale" in cleaned:
+                y_log = cleaned.get("y_scale") == "log"
+            self._set_plot_log_mode(plot, x_log, y_log)
+
+    def _reapply_user_appearances(self) -> None:
+        """Default projection, then the current pane overrides. No range change."""
+        for role in ("spectrum", "preview"):
+            self._restore_role_defaults(role)
+            self.apply_user_appearance(self._role_spec(role), role=role)
+            # Absent scale keys mean linear, including after a log View.
+            self._sync_role_log_mode(role)
+
+    def _note_chart_title(self, _handle, title) -> None:
+        self._chart_title_commit = "" if title is None else str(title)
+
+    def _commit_chart_options(self, role: str, handle, opening_title: str) -> None:
+        spec: dict = {}
+        previous = self._role_spec(role)
+        if self._chart_title_commit is not None:
+            title = self._chart_title_commit.strip()
+            title_committed = True
+        else:
+            title = _plain_axis_text(handle.get_title()).strip()
+            title_committed = False
+        if title:
+            spec["title"] = title
+        elif title_committed and ("title" in previous or opening_title):
+            # The dialog cleared a title that was actually present. An
+            # untouched empty chart leaves the key absent.
+            spec["title"] = ""
+        x_default, y_default = self._role_default_labels(role)
+        x_label = _plain_axis_text(handle.get_xlabel())
+        y_label = _plain_axis_text(handle.get_ylabel())
+        if x_label != x_default:
+            spec["x_label"] = x_label
+        if y_label != y_default:
+            spec["y_label"] = y_label
+        try:
+            grid = bool(handle.is_grid_enabled())
+        except (AttributeError, RuntimeError):
+            grid = True
+        if grid is not True:
+            spec["grid"] = grid
+        try:
+            if handle.get_xscale() == "log":
+                spec["x_scale"] = "log"
+            if handle.get_yscale() == "log":
+                spec["y_scale"] = "log"
+        except (AttributeError, RuntimeError):
+            pass
+        colors = {}
+        for line in handle.get_lines():
+            item = getattr(line, "plot_data_item", None)
+            key = self._curve_appearance_key(item) if item is not None else ""
+            source = str(getattr(item, "_source_color", "") or "").lower()
+            try:
+                color = str(line.get_color() or "")
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                color = ""
+            if key and color and color.lower() != source:
+                colors[key] = color
+        if colors:
+            spec["line_colors"] = colors
+        spec = normalize_pane_chart_appearances({role: spec}).get(role, {})
+        appearances = dict(self._user_appearances)
+        if spec:
+            appearances[role] = spec
+        else:
+            appearances.pop(role, None)
+        self._user_appearances = appearances
+        self._axis_scale_session = {}
+        self.user_appearance_committed.emit(role, dict(spec))
+
+    def _commit_preview_curve_color(self, curve, color: str) -> None:
+        key = self._curve_appearance_key(curve)
+        if not key or not color:
+            return
+        spec = dict(self._role_spec("preview"))
+        colors = dict(spec.get("line_colors") or {})
+        source = str(getattr(curve, "_source_color", "") or "").lower()
+        if color.lower() == source:
+            colors.pop(key, None)
+        else:
+            colors[key] = color
+        if colors:
+            spec["line_colors"] = colors
+        else:
+            spec.pop("line_colors", None)
+        spec = normalize_pane_chart_appearances({"preview": spec}).get("preview", {})
+        appearances = dict(self._user_appearances)
+        if spec:
+            appearances["preview"] = spec
+        else:
+            appearances.pop("preview", None)
+        self._user_appearances = appearances
+        self.user_appearance_committed.emit("preview", dict(spec))
+
+    def _open_role_chart_options(self, role: str, plot, parent=None) -> bool:
+        from mf4_analyzer.ui import _axis_interaction
+
+        handle = PgAxisHandle(plot, owner_canvas=self)
+        handle._chart_options_target = role
+        handle.add_title_changed_callback(self._note_chart_title)
+        opening_title = _plain_axis_text(handle.get_title()).strip()
+        self._chart_title_commit = None
+        target_parent = parent if parent is not None else self.window()
+        applied = bool(_axis_interaction.edit_chart_options_dialog(
+            target_parent, handle))
+        if applied:
+            self._commit_chart_options(role, handle, opening_title)
+        return applied
+
+    def open_chart_options_dialog(self, parent=None):
+        """Open chart options for the main FFT axis."""
+        return self._open_role_chart_options("spectrum", self._plot_amp, parent)
+
+    def _refresh_bottom_x_ticks(self, *_args) -> None:
+        if self._bottom_tick_target is None or self._bottom_tick_density is None:
+            return
+        # Bottom X axes use TimeDomain-style target-count ticks once the plot
+        # geometry is realized; before layout, fall back to native density.
+        for plot in (self._plot_amp, self._plot_time):
+            bottom = plot.getAxis('bottom')
+            if not _apply_target_bottom_ticks(
+                bottom, plot.vb, self._bottom_tick_target, self
+            ):
+                _apply_axis_tick_density(bottom, self._bottom_tick_density)
+
+    # ------------------------------------------------------------------
+    def select_time_entry(self, idx) -> None:
+        self._plot_time_preview_entries(self._entries, selected_idx=idx,
+                                        title="时域预览")
+        self._apply_time_preview_emphasis()
+
+    def _apply_time_preview_emphasis(self) -> None:
+        """Dim non-selected preview curves (TimeDomain overlay emphasis)."""
+        sel = self._selected_time_entry_idx
+        for i, curve in enumerate(self._time_curves):
+            try:
+                pen = curve.opts.get("pen")
+                if pen is None:
+                    continue
+                if sel is None or i == int(sel):
+                    pen.setWidthF(_TIME_EMPHASIS_LW if sel is not None else 1.5)
+                    curve.setPen(pen)
+                    curve.setOpacity(1.0)
+                else:
+                    pen.setWidthF(_TIME_DEEMPHASIS_LW)
+                    curve.setPen(pen)
+                    curve.setOpacity(_TIME_DEEMPHASIS_ALPHA)
+            except Exception:
+                continue
+
+    def promote_time_entry_to_left_by_channel(self, fid, channel) -> bool:
+        """Promote preview entry matching ``(fid, channel)`` to the left axis.
+
+        Used when the navigator 「设为左轴」 fires while FFT mode is active.
+        Matching is by channel name against entry ``label`` / ``channel`` /
+        trailing segment after ``] `` (file-prefixed display names).
+        """
+        ch = str(channel or "").strip()
+        if not ch or len(self._entries) < 2:
+            return False
+        fid_s = None if fid is None else str(fid)
+
+        def _matches(entry) -> bool:
+            if fid_s is not None:
+                ef = entry.get("file_id", entry.get("fid", entry.get("data_id")))
+                if ef is not None and str(ef) != fid_s:
+                    return False
+            for key in ("channel", "name", "label"):
+                val = entry.get(key)
+                if val is None:
+                    continue
+                text = str(val)
+                if text == ch or text.endswith(ch) or text.endswith(f"] {ch}"):
+                    return True
+                if "]" in text and text.rsplit("]", 1)[-1].strip() == ch:
+                    return True
+            return False
+
+        for i, entry in enumerate(self._entries):
+            if i > 0 and _matches(entry):
+                self.promote_time_entry_to_left(i)
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Time-preview multi-Y overlay (one colour-coded right axis per extra curve)
+    # ------------------------------------------------------------------
+    def _clear_time_overlay_axes(self) -> None:
+        """Tear down every aux overlay ViewBox + right axis on the time plot."""
+        for vb in self._time_overlay_vbs:
+            try:
+                vb.clear()
+            except Exception:
+                pass
+            try:
+                sc = vb.scene()
+                if sc is not None:
+                    sc.removeItem(vb)
+            except Exception:
+                pass
+        for ax in self._time_overlay_axes:
+            try:
+                self._plot_time.layout.removeItem(ax)
+            except Exception:
+                pass
+            try:
+                sc = ax.scene()
+                if sc is not None:
+                    sc.removeItem(ax)
+            except Exception:
+                pass
+        self._time_overlay_vbs = []
+        self._time_overlay_axes = []
+        # Also tear down the shared horizontal graticule lines so an empty or
+        # rebuilt preview leaves no orphaned InfiniteLines in the scene. The
+        # grid ViewBox itself is reused (lazily created once); only its lines
+        # are rebuilt per division-count by _build_time_y_grid.
+        for line in list(self._time_grid_lines):
+            try:
+                if self._time_grid_vb is not None:
+                    self._time_grid_vb.removeItem(line)
+            except Exception:
+                pass
+        self._time_grid_lines = []
+
+    def _add_time_overlay_axis(self, color, position, *, label=""):
+        """Create one aux ViewBox + colour-coded right axis for an overlay
+        curve. ``position`` is the 1-based overlay slot (2nd curve → 1, …)."""
+        # AxisItem forwards gutter wheel events to its linked ViewBox. Use the
+        # modifier-aware subclass so aux gutters share the main preview's
+        # synchronized Shift-wheel behavior instead of native single-axis zoom.
+        aux_vb = _ModifierWheelViewBox(owner_canvas=self)
+        axis = pg.AxisItem('right')
+        # Keep auto SI prefix OFF so a large-range right axis never renders
+        # '1k'/'1m', which would clash with the left axis's _fmt_tick style
+        # (mirrors _add_overlay_axis_handle in overlay_axes.py).
+        try:
+            axis.enableAutoSIPrefix(False)
+        except Exception:
+            pass
+        _apply_pg_axis_font(axis)
+        # Frame line stays neutral; the tick TEXT follows the curve colour so a
+        # glance maps each right axis to its trace (no channel-name clutter).
+        axis.setPen(pg.mkPen(color=PG_AXIS_NEUTRAL_COLOR, width=PG_AXIS_NEUTRAL_WIDTH))
+        axis.setTextPen(pg.mkPen(color=color))
+        text = _middle_ellipsis(str(label or "").strip(), max_chars=_TIME_AXIS_LABEL_MAX_CHARS)
+        if text:
+            try:
+                axis.setLabel(text)
+            except Exception:
+                pass
+        # Occupy a real right-hand column immediately. A 0-width item is
+        # still painted by AxisItem, but at the layout origin — coloured
+        # ticks then stack on the left axis.
+        try:
+            axis.setWidth(48.0)
+        except Exception:
+            pass
+        self._plot_time.layout.addItem(axis, 2, 2 + position)
+        self._plot_time.layout.setHorizontalSpacing(8)
+        self._plot_time.scene().addItem(aux_vb)
+        axis.linkToView(aux_vb)
+        aux_vb.setXLink(self._plot_time.vb)
+        # Y-only on the aux ViewBox so the colour-coded RIGHT axis gutter can
+        # pan/zoom that channel (TimeDomain overlay: gutter owns per-channel Y;
+        # plot body stays on the main vb). X stays linked / non-interactive.
+        aux_vb.setMouseEnabled(x=False, y=True)
+        aux_vb.setZValue(-10000)
+        aux_vb.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
+        try:
+            aux_vb.sigRangeChangedManually.connect(
+                lambda *_args: self._on_interactive_range_changed(
+                    self._plot_time))
+        except Exception:
+            pass
+        self._time_overlay_vbs.append(aux_vb)
+        self._time_overlay_axes.append(axis)
+        return aux_vb
+
+    def _realize_time_overlay_axis_columns(self) -> None:
+        """Give each colour-coded right axis a measured column on the RIGHT.
+
+        Overlay ``AxisItem``s live in PlotItem grid columns 3+. If those
+        columns collapse, pyqtgraph still paints the tick text — but the
+        item sits at the origin, so the coloured numbers stack on the left
+        axis. Measure the pinned tick strings, clamp a real width, then
+        activate the layout so the time ViewBox shrinks instead of covering
+        the gutters.
+        """
+        for axis in self._time_overlay_axes:
+            try:
+                axis.setWidth(None)
+            except Exception:
+                pass
+            try:
+                need = float(left_axis_width_for_ticks(axis))
+                axis.setWidth(max(36.0, need))
+            except Exception:
+                try:
+                    axis.setWidth(48.0)
+                except Exception:
+                    pass
+        self._activate_graphics_layout()
+        self._sync_time_overlay_vbs()
+
+    def _ensure_time_grid_vb(self):
+        """Lazily create the dedicated grid ViewBox (Y locked to [0,1], X-linked
+        to the main time vb) that hosts the shared horizontal graticule lines.
+
+        Sits BELOW every aux ViewBox (z = -20000 vs the aux -10000) so the grid
+        lines never paint over the curves, and is read-only/non-interactive —
+        it only supplies a common visual anchor while the main preview ViewBox
+        remains the pan/zoom surface."""
+        if self._time_grid_vb is not None:
+            return self._time_grid_vb
+        grid_vb = pg.ViewBox()
+        try:
+            self._plot_time.scene().addItem(grid_vb)
+            grid_vb.setXLink(self._plot_time.vb)
+            grid_vb.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
+            grid_vb.setYRange(0.0, 1.0, padding=0)
+            grid_vb.setMouseEnabled(x=False, y=False)
+            grid_vb.setZValue(-20000)
+        except Exception:
+            pass
+        self._time_grid_vb = grid_vb
+        return grid_vb
+
+    def _build_time_y_grid(self, n: int) -> None:
+        """(Re)build the n-1 shared horizontal grid lines at i/n (i = 1..n-1).
+
+        Rebuilt whenever the division count changes; old lines are removed from
+        the grid ViewBox first so scene items never accumulate across rebuilds
+        (mirrors _clear_time_overlay_axes' detach discipline). Empty previews
+        keep the same internal graticule — native Y grid is off, so skipping
+        this path leaves the chart with only vertical lines.
+        """
+        grid_vb = self._ensure_time_grid_vb()
+        for line in list(self._time_grid_lines):
+            try:
+                grid_vb.removeItem(line)
+            except Exception:
+                pass
+        self._time_grid_lines = []
+        alpha_int = max(1, min(255, int(round(_OVERLAY_GRID_ALPHA * 255))))
+        pen = pg.mkPen(color=(180, 180, 180, alpha_int), width=1)
+        lines = []
+        for i in range(1, n):
+            line = pg.InfiniteLine(pos=i / n, angle=0, movable=False, pen=pen)
+            try:
+                grid_vb.addItem(line)
+                lines.append(line)
+            except Exception:
+                pass
+        self._time_grid_lines = lines
+        self._sync_time_grid_vb()
+
+    def _sync_time_grid_vb(self, *_args) -> None:
+        """Glue the grid ViewBox geometry to the main time ViewBox so the shared
+        graticule tracks resize/pan exactly like the aux overlay ViewBoxes."""
+        if self._time_grid_vb is None:
+            return
+        try:
+            self._time_grid_vb.setGeometry(
+                self._plot_time.vb.sceneBoundingRect())
+        except Exception:
+            pass
+
+    def _effective_time_divisions(self) -> int:
+        """Return the graticule division count that still fits the preview height.
+
+        ``_time_divisions`` is the inspector request (3..20). On the short
+        time-preview strip, labelling every requested division stacks tick
+        text even when ``_frame_to_nice`` picks a clean step — so cap by the
+        realized ViewBox height (fallback: current bottom-split height).
+        """
+        requested = max(3, min(20, int(self._time_divisions)))
+        height = 0.0
+        try:
+            height = float(self._plot_time.vb.sceneBoundingRect().height())
+        except Exception:
+            height = 0.0
+        if height <= 1.0:
+            try:
+                height = float(self._bottom_split_h or 0.0)
+            except Exception:
+                height = 0.0
+        if height <= 1.0:
+            return requested
+        max_labels = max(4, int(height // _TIME_PREVIEW_MIN_TICK_LABEL_PX))
+        max_divs = max(3, max_labels - 1)
+        return max(3, min(requested, max_divs))
+
+    def _time_axis_triples(self):
+        """(vb, axis, curve) for main left + every aux right overlay axis."""
+        if not self._time_curves:
+            return []
+        triples = [(self._plot_time.vb,
+                    self._plot_time.getAxis('left'),
+                    self._time_curves[0])]
+        triples.extend(zip(self._time_overlay_vbs,
+                           self._time_overlay_axes,
+                           self._time_curves[1:]))
+        return triples
+
+    def _pin_time_axis_y(self, vb, axis, bottom, top, ticks, per_div) -> None:
+        """Write one preview axis to an explicit nice Y window + pinned ticks."""
+        try:
+            vb.enableAutoRange(axis='y', enable=False)
+            vb.setYRange(bottom, top, padding=0)
+            try:
+                axis.enableAutoSIPrefix(False)
+            except Exception:
+                pass
+            axis.setStyle(maxTickLevel=0)
+            axis.setTickDensity(1.0)
+            axis.setTicks([[
+                (value, _fmt_tick(value, per_div)) for value in ticks
+            ], []])
+        except Exception:
+            pass
+
+    def _enable_time_preview_mouse(self) -> None:
+        # Main vb keeps y=True so the LEFT axis gutter can pan/zoom Y (AxisItem
+        # forwards with axis=1 and ViewBox still gates on mouseEnabled[y]).
+        # Plot-body 2D drags are forced X-only in ``_ModifierWheelViewBox`` —
+        # same end state as TimeDomain X-master y=False + per-channel gutters.
+        try:
+            self._plot_time.vb.setMouseEnabled(x=True, y=True)
+        except Exception:
+            pass
+        for vb in self._time_overlay_vbs:
+            try:
+                vb.setMouseEnabled(x=False, y=True)
+            except Exception:
+                pass
+
+    def _time_axis_pairs(self):
+        """``(vb, axis)`` for left + every aux right axis."""
+        return [
+            (self._plot_time.vb, self._plot_time.getAxis('left')),
+            *zip(self._time_overlay_vbs, self._time_overlay_axes),
+        ]
+
+    def _begin_view_interaction(self) -> None:
+        self._manual_amp_viewport = self.capture_xy_viewport()
+        self._idle_activity.note_drag_begin()
+        self.disable_interactive_quality()
+        baselines = {}
+        for vb, _axis in self._time_axis_pairs():
+            try:
+                baselines[id(vb)] = tuple(vb.viewRange()[1])
+            except Exception:
+                continue
+        self._box_zoom_y_baselines = baselines
+
+    def _end_view_interaction(self) -> None:
+        self._idle_activity.note_drag_end()
+        self.flush_pending_spectrum_display()
+        self._time_y_needs_repin = True
+        self.schedule_idle_quality()
+
+    def _snap_time_axes_to_grid(self) -> None:
+        """Phase-snap every preview Y window onto the current graticule span."""
+        n = self._effective_time_divisions()
+        for vb, axis in self._time_axis_pairs():
+            try:
+                lo, hi = vb.viewRange()[1]
+                lo, hi = float(lo), float(hi)
+            except Exception:
+                continue
+            span = hi - lo
+            if not (math.isfinite(span) and span > 0):
+                continue
+            per_div = span / n
+            if not (math.isfinite(per_div) and per_div > 0):
+                continue
+            bottom = round(lo / per_div) * per_div
+            if abs(bottom) < per_div * 1e-10:
+                bottom = 0.0
+            top = bottom + span
+            ticks = [bottom + k * per_div for k in range(n + 1)]
+            self._pin_time_axis_y(vb, axis, bottom, top, ticks, per_div)
+        self._build_time_y_grid(n)
+        self._enable_time_preview_mouse()
+
+    def _apply_time_preview_box_zoom_y(self) -> None:
+        """After RectMode on the time preview, map the box Y fraction onto every channel."""
+        baselines = getattr(self, "_box_zoom_y_baselines", None) or {}
+        main = self._plot_time.vb
+        base = baselines.get(id(main))
+        n = self._effective_time_divisions()
+        if base is None:
+            self._repin_time_y_to_grid()
+            return
+        try:
+            new_lo, new_hi = main.viewRange()[1]
+            new_lo, new_hi = float(new_lo), float(new_hi)
+        except Exception:
+            return
+        blo, bhi = float(base[0]), float(base[1])
+        bspan = bhi - blo
+        if not (math.isfinite(bspan) and bspan > 0):
+            return
+        f0 = (new_lo - blo) / bspan
+        f1 = (new_hi - blo) / bspan
+        if abs(f1 - f0) < 1e-6:
+            # X-only box — restore main Y to baseline then repin.
+            try:
+                main.setYRange(blo, bhi, padding=0)
+            except Exception:
+                pass
+            self._repin_time_y_to_grid()
+            return
+        for vb, axis in self._time_axis_pairs():
+            try:
+                if vb is main:
+                    lo, hi = new_lo, new_hi
+                else:
+                    clo, chi = baselines.get(id(vb), vb.viewRange()[1])
+                    clo, chi = float(clo), float(chi)
+                    cspan = chi - clo
+                    if not (math.isfinite(cspan) and cspan > 0):
+                        continue
+                    lo = clo + f0 * cspan
+                    hi = clo + f1 * cspan
+                bottom, top, ticks = _frame_to_nice(lo, hi, n)
+                per_div = (top - bottom) / n
+                self._pin_time_axis_y(vb, axis, bottom, top, ticks, per_div)
+            except Exception:
+                continue
+        self._build_time_y_grid(n)
+        self._enable_time_preview_mouse()
+        self._box_zoom_y_baselines = {}
+        self.layout_geometry_changed.emit()
+
+    def _reframe_time_y_to_grid(self) -> None:
+        """Frame every time-preview axis from **full curve Y** to ``n`` nice divisions.
+
+        Used for new data / view-all / explicit reset — the TimeDomain analogue
+        of fitting to the full signal then pinning the overlay graticule.
+        Density changes and Y-adapt must NOT call this; they use
+        ``_repin_time_y_to_grid`` so the current window survives.
+        """
+        n = self._effective_time_divisions()
+        triples = self._time_axis_triples()
+        if not triples:
+            self._repin_time_y_to_grid()
+            return
+        for vb, axis, curve in triples:
+            try:
+                _xs, ys = curve.getData()
+                ys = np.asarray(ys, dtype=float)
+                ys = ys[np.isfinite(ys)]
+                if ys.size == 0:
+                    continue
+                lo, hi = float(ys.min()), float(ys.max())
+            except Exception:
+                continue
+            bottom, top, ticks = _frame_to_nice(lo, hi, n)
+            per_div = (top - bottom) / n
+            self._pin_time_axis_y(vb, axis, bottom, top, ticks, per_div)
+        self._build_time_y_grid(n)
+        self._enable_time_preview_mouse()
+
+    def _repin_time_y_to_grid(self) -> None:
+        """Repin ticks/graticule from each axis's **current** Y range.
+
+        Mirrors ``OverlayAxisManager._repin_overlay_channel_ticks``: keep the
+        live window when it already sits on a nice per-division; otherwise
+        expand slightly via ``_frame_to_nice`` without rebuilding from full
+        curve extents.
+        """
+        n = self._effective_time_divisions()
+        for vb, axis in self._time_axis_pairs():
+            try:
+                lo, hi = vb.viewRange()[1]
+                lo, hi = float(lo), float(hi)
+            except Exception:
+                continue
+            span = hi - lo
+            if not (math.isfinite(span) and span > 0):
+                continue
+            current_per_div = span / n
+            nice_per_div = _nice_per_div(current_per_div)
+            lower_nice_per_div = (
+                _adjacent_nice_step(nice_per_div, -1)
+                if nice_per_div is not None
+                else None
+            )
+            if any(
+                candidate is not None
+                and math.isclose(
+                    current_per_div,
+                    candidate,
+                    rel_tol=1e-9,
+                    abs_tol=0.0,
+                )
+                for candidate in (nice_per_div, lower_nice_per_div)
+            ):
+                bottom, top, per_div = lo, hi, current_per_div
+                ticks = [bottom + k * per_div for k in range(n + 1)]
+            else:
+                bottom, top, ticks = _frame_to_nice(lo, hi, n)
+                per_div = (top - bottom) / n
+            self._pin_time_axis_y(vb, axis, bottom, top, ticks, per_div)
+        self._build_time_y_grid(n)
+        self._enable_time_preview_mouse()
+
+    def _sync_time_overlay_vbs(self, *_args) -> None:
+        """Glue every aux ViewBox + the shared grid ViewBox geometry to the time
+        plot's main ViewBox so the right axes and graticule track resize/pan."""
+        # The grid ViewBox is independent of the aux axes (it exists even for a
+        # single source), so sync it unconditionally before the early return.
+        self._sync_time_grid_vb()
+        if not self._time_overlay_vbs:
+            return
+        try:
+            rect = self._plot_time.vb.sceneBoundingRect()
+        except Exception:
+            return
+        for vb in self._time_overlay_vbs:
+            try:
+                vb.setGeometry(rect)
+            except Exception:
+                pass
+
+    def _plot_time_preview_entries(self, entries, selected_idx=None,
+                                   title="时域预览") -> None:
+        for c in self._time_curves:
+            try:
+                self._plot_time.removeItem(c)
+            except Exception:
+                pass
+        self._time_curves.clear()
+        # New curve set → re-seed BOTH AA hysteresis legs against their OFF
+        # budgets so a fresh overlay is judged on its own drawn-point sum and
+        # its own ink, not on the previous selection's dead-band decision.
+        self._time_aa_density_seeded = False
+        self._time_aa_ink_seeded = False
+        self._time_aa_ink_allowed = False
+        self._clear_time_overlay_axes()
+        entries = list(entries or [])
+        if not entries:
+            self._selected_time_entry_idx = None
+            self._raw_time_title = title or ''
+            self._apply_title_texts()
+            self._plot_time.setLabel('left', 'Amplitude')
+            self._plot_time.setLabel('bottom', 'Time (s)')
+            # Native left-axis Y grid stays off; rebuild the shared k/N
+            # graticule so an empty preview still has horizontal lines.
+            self._repin_time_y_to_grid()
+            self._reapply_user_appearances()
+            self.layout_geometry_changed.emit()
+            return
+        if selected_idx is None:
+            self._selected_time_entry_idx = None
+        else:
+            self._selected_time_entry_idx = int(
+                np.clip(int(selected_idx), 0, len(entries) - 1))
+        if len(entries) > 1:
+            self._raw_time_title = f"{title} · {len(entries)} 条曲线"
+        else:
+            self._raw_time_title = f"{title} - {entries[0].get('label', '')}"
+        self._apply_title_texts()
+        self._plot_time.setLabel('left', 'Amplitude')
+        self._plot_time.setLabel('bottom', 'Time (s)')
+        # Overlaying multiple full-resolution antialiased traces is CPU-raster
+        # bound (project lesson: TimeDomain 卡顿=CPU 光栅,随 overlay 通道数超
+        # 线性). The win comes from cutting points-rasterized × channels, so we
+        # (1) decimate each source to a viewport-pixel-width min/max envelope
+        # via the same build_envelope used by TimeDomainCanvasPG, and (2) gate
+        # antialias on the overlay drawn-point density budget (ON=5000/OFF=7000,
+        # imported from canvas.py). The curves are built AA-off provisionally —
+        # their real point counts are only known once every curve is appended —
+        # then ``_apply_idle_curve_aa`` lands the budgeted AA below.
+        pixel_width = self._preview_pixel_width()
+        antialias = False
+        x_bounds = []
+        for i, e in enumerate(entries):
+            t = np.asarray(e.get('time', []), dtype=float)
+            sig = np.asarray(e.get('signal', []), dtype=float)
+            if t.size == 0 or sig.size == 0:
+                continue
+            n = min(t.size, sig.size)
+            t = t[:n]
+            sig = sig[:n]
+            # Full-range envelope: the preview always shows the whole trace
+            # (the view is reset to data extents below), so xlim=None is the
+            # correct viewport. build_envelope preserves peaks (min/max per
+            # bucket), passes small/single-point traces through untouched, and
+            # emits NaN breaks for gaps.
+            t_env, sig_env = build_envelope(
+                t, sig, xlim=None, pixel_width=pixel_width)
+            width = 1.9 if i == self._selected_time_entry_idx else 1.5
+            color = e.get('color', '#2563eb')
+            pen = pg.mkPen(color, width=width)
+            if i == 0:
+                # First source keeps the plot's own left axis.
+                curve = self._plot_time.plot(t_env, sig_env, pen=pen,
+                                             antialias=antialias)
+            else:
+                # Each extra source gets its own auto-scaled aux ViewBox + a
+                # colour-coded right axis so traces with different amplitude
+                # ranges are not squashed onto one shared scale.
+                aux_vb = self._add_time_overlay_axis(
+                    color, i, label=e.get('label', ''))
+                curve = pg.PlotDataItem(t_env, sig_env, pen=pen,
+                                        antialias=antialias)
+                aux_vb.addItem(curve)
+            curve._channel_name = e.get('label', '')
+            curve._overlay_source = self._entry_source(e)
+            curve._source_color = str(e.get('color') or '#2563eb')
+            curve._appearance_key = self._appearance_key_for_entry(e)
+            self._time_curves.append(curve)
+            x_bounds.append((float(t[0]), float(t[-1])))
+        self._sync_role_log_mode("preview")
+        if x_bounds:
+            lo = min(a for a, _b in x_bounds)
+            hi = max(b for _a, b in x_bounds)
+            if not (hi > lo):
+                lo, hi = lo - 0.5, hi + 0.5
+            self._write_engineering_x(
+                self._plot_time, lo, hi, self._time_axis_samples(entries),
+            )
+        # Frame the left + each aux right Y axis to a shared nice graticule so
+        # every axis's ticks land on the same horizontal grid lines (replaces
+        # per-axis autoRange, which let each right axis pick its own scale).
+        self._reframe_time_y_to_grid()
+        # Pin overlay-axis column widths and activate the PlotItem layout
+        # BEFORE emitting geometry-changed. Without this, extra right axes
+        # stay at the origin and their tick text paints over the left gutter.
+        self._realize_time_overlay_axis_columns()
+        # Default projection was written above. Reapply this pane's overrides
+        # before the single geometry settlement so a custom title occupies its
+        # row in that same pass.
+        self._reapply_user_appearances()
+        self._apply_time_preview_emphasis()
+        self.layout_geometry_changed.emit()
+        # Curves were built AA-off provisionally; their real drawn-point sum
+        # and ink total are only knowable now that every curve is in
+        # _time_curves AND every Y window has been framed. Settle on the next
+        # event-loop turn instead of painting an AA frame inside this call —
+        # a rebuild mid pan/zoom is caught by _enable_idle_quality's busy
+        # check, which hands it back to the 150 ms interactive path.
+        self._arm_discrete_aa()
+        # Time-preview-only updates (source selection before 计算) rebuild the
+        # curve set, so refresh the AA dot here too — otherwise it keeps the
+        # previous render's state until the next pan/zoom.
+        self._emit_quality_status()
+
+    def _preview_pixel_width(self) -> int:
+        """Bucket count for the time-preview envelope: the pixel width of the
+        time plot's ViewBox (≈ one bucket per pixel, like TimeDomainCanvasPG),
+        with a generous fallback when geometry is not yet realized."""
+        try:
+            rect = self._plot_time.vb.sceneBoundingRect()
+            w = int(round(rect.width()))
+            if w >= _PREVIEW_MIN_REALIZED_PIXEL_WIDTH:
+                return w
+        except Exception:
+            pass
+        return _PREVIEW_FALLBACK_PIXEL_WIDTH
+
+    def _spectrum_pixel_width(self) -> int:
+        try:
+            rect = self._plot_amp.vb.sceneBoundingRect()
+            w = int(round(rect.width()))
+            if w >= _SPECTRUM_MIN_REALIZED_PIXEL_WIDTH:
+                return w
+        except Exception:
+            pass
+        return _SPECTRUM_FALLBACK_PIXEL_WIDTH
+
+    def _spectrum_plot_arrays(self, freq, amp, *, xlim=None, prepared=None):
+        if prepared is None:
+            prepared = self._lookup_prepared_for_arrays(freq, amp)
+        if prepared is None:
+            freq_arr = np.asarray(freq, dtype=float)
+            amp_arr = np.asarray(amp, dtype=float)
+            if freq_arr.ndim != 1 or amp_arr.ndim != 1 or freq_arr.shape != amp_arr.shape:
+                raise ValueError('Spectrum X/Y must have equal one-dimensional shapes')
+            prepared = prepare_line_range(freq_arr, amp_arr)
+        freq_arr = prepared.x
+        amp_arr = prepared.y
+        if not freq_arr.size:
+            return freq_arr, amp_arr
+        if xlim is None:
+            if prepared.finite_x_min is None:
+                return freq_arr[:0], amp_arr[:0]
+            xlim = (prepared.finite_x_min, prepared.finite_x_max)
+        lo, hi = sorted(xlim)
+        rebuild = self._spectrum_rebuild_plan
+        if rebuild is not None:
+            # Transaction passes the viewport xlim (T2 wrappers record it)
+            # and expands to the planned cover internally.
+            lo, hi = float(rebuild.cover_lo), float(rebuild.cover_hi)
+            if hi < lo:
+                lo, hi = hi, lo
+        first, last = prepared.plot_source_slice((lo, hi))
+        if last < first:
+            return freq_arr[:0], amp_arr[:0]
+        # Keep intervening source positions: a NaN X is a real break, not
+        # an out-of-window point to filter away and bridge across.
+        selected = slice(first, last + 1)
+        selected_x, selected_y = freq_arr[selected], amp_arr[selected]
+        # Preserve gaps through peak selection by reducing each finite run.
+        valid = prepared.finite_xy[selected]
+        breaks = np.flatnonzero(~valid)
+        if breaks.size:
+            pieces_x, pieces_y = [], []
+            start = 0
+            for stop in [*breaks, len(selected_x)]:
+                if stop > start:
+                    xx, yy = build_peak_trace(
+                        selected_x[start:stop], selected_y[start:stop],
+                        xlim=None,
+                        pixel_width=self._spectrum_leg_pixel_width(
+                            selected_x[start], selected_x[stop - 1], lo, hi),
+                    )
+                    # Each finite leg must reach its original endpoints;
+                    # otherwise a peak bucket can trim away the line entering
+                    # the viewport or the edge immediately before a gap.
+                    if xx[0] != selected_x[start]:
+                        xx = np.concatenate((selected_x[start:start + 1], xx))
+                        yy = np.concatenate((selected_y[start:start + 1], yy))
+                    if xx[-1] != selected_x[stop - 1]:
+                        xx = np.concatenate((xx, selected_x[stop - 1:stop]))
+                        yy = np.concatenate((yy, selected_y[stop - 1:stop]))
+                    pieces_x.append(xx)
+                    pieces_y.append(yy)
+                if stop < len(selected_x):
+                    pieces_x.append(selected_x[stop:stop + 1])
+                    pieces_y.append(np.array([np.nan]))
+                start = stop + 1
+            return np.concatenate(pieces_x), np.concatenate(pieces_y)
+        xx, yy = build_peak_trace(
+            selected_x, selected_y, xlim=None,
+            pixel_width=self._spectrum_leg_pixel_width(
+                selected_x[0], selected_x[-1], lo, hi),
+        )
+        # The peak bucket may not select the outside edge sample.
+        if len(xx) < len(selected_x):
+            if selected_x[0] < lo:
+                xx = np.concatenate((selected_x[:1], xx))
+                yy = np.concatenate((selected_y[:1], yy))
+            if selected_x[-1] > hi:
+                xx = np.concatenate((xx, selected_x[-1:]))
+                yy = np.concatenate((yy, selected_y[-1:]))
+        return xx, yy
+
+    @contextmanager
+    def _program_spectrum_range(self):
+        """Ignore Y on interactive range callbacks during programmatic setRange."""
+        self._spectrum_program_range_depth += 1
+        try:
+            yield
+        finally:
+            self._spectrum_program_range_depth = max(
+                0, self._spectrum_program_range_depth - 1)
+            if self._spectrum_program_range_depth == 0 and self._amp_curves:
+                captured = self.capture_xy_viewport()
+                if captured is not None:
+                    self._manual_amp_viewport = captured
+
+    def _invalidate_spectrum_display_generation(self) -> None:
+        self._cancel_section_reveal()
+        self._cancel_presentation_paint_ack()
+        self._spectrum_display_generation += 1
+        self._stop_spectrum_refresh_timer()
+        self._spectrum_curves_dirty = False
+        self._spectrum_y_dirty = False
+        self._spectrum_refresh_interactive = False
+        self._drop_spectrum_trace_cache()
+        self._spectrum_refresh_busy = False
+        self._spectrum_last_refresh_at = 0.0
+        self._spectrum_program_range_depth = 0
+
+    def _spectrum_refresh_remaining_ms(self) -> int:
+        last = self._spectrum_last_refresh_at
+        if last <= 0.0:
+            return _SPECTRUM_REFRESH_MS
+        elapsed_ms = (self._spectrum_monotonic() - last) * 1000.0
+        remaining = float(_SPECTRUM_REFRESH_MS) - elapsed_ms
+        if remaining <= 0.0:
+            return 0
+        return max(1, int(math.ceil(remaining)))
+
+    def _spectrum_refresh_timer_is_active(self) -> bool:
+        timer = self._spectrum_refresh_timer_alive()
+        if timer is None:
+            return False
+        try:
+            return bool(timer.isActive())
+        except RuntimeError:
+            return False
+
+    def _start_spectrum_refresh_timer(self, delay_ms: int) -> None:
+        timer = self._spectrum_refresh_timer_alive()
+        if timer is None:
+            return
+        self._spectrum_refresh_armed_generation = self._spectrum_display_generation
+        try:
+            timer.start(max(1, int(delay_ms)))
+        except RuntimeError:
+            return
+
+    def _schedule_spectrum_refresh(self) -> None:
+        if self._spectrum_refresh_timer_is_active():
+            return
+        delay = self._spectrum_refresh_remaining_ms()
+        if delay <= 0:
+            delay = 1
+        self._start_spectrum_refresh_timer(delay)
+
+    def _should_coalesce_spectrum_refresh(self) -> bool:
+        return (
+            self._idle_activity.is_busy()
+            or self._spectrum_refresh_interactive
+            or self._spectrum_refresh_timer_is_active()
+        )
+
+    def _fit_active_spectrum_y(self):
+        """Refit amplitude Y when auto-Y is live. Returns whether Y changed."""
+        active = self._spectrum_y_auto
+        if self.analysis_range_adapter is not None:
+            policy = self.analysis_range_adapter[0]()
+            active = (bool(policy.get('y_auto', True))
+                      and policy.get('viewport_origin', {}).get('y', 'auto') == 'auto')
+        if not (active and self._amp_curves):
+            return False
+        x_window = self._amp_view_x_as_engineering()
+        target = self._spectrum_y_limits(self._entries, x_window)
+        if target is None:
+            return False
+        scale = "log" if self._plot_axis_is_log(self._plot_amp, "y") else "linear"
+        view_target = _engineering_to_view_limits(scale, target[0], target[1])
+        if view_target is None:
+            return False
+        current = tuple(map(float, self._plot_amp.vb.viewRange()[1]))
+        if current == (float(view_target[0]), float(view_target[1])):
+            return False
+        with self._program_spectrum_range():
+            self._write_amp_engineering_limits(None, target)
+        return True
+
+    def _request_spectrum_refresh(self, *_args):
+        if not self._amp_curves:
+            return
+        self._spectrum_curves_dirty = True
+        self._spectrum_y_dirty = True
+        if self._spectrum_program_range_depth:
+            return
+        if self._should_coalesce_spectrum_refresh():
+            self._schedule_spectrum_refresh()
+            return
+        self._run_spectrum_display_transaction(schedule_quality=True)
+
+    def _on_spectrum_refresh_timeout(self) -> None:
+        timer = self._spectrum_refresh_timer_alive()
+        if timer is not None:
+            try:
+                if not timer.isActive():
+                    timer.setInterval(_SPECTRUM_REFRESH_MS)
+            except RuntimeError:
+                return
+        if (
+            self._spectrum_refresh_armed_generation
+            != self._spectrum_display_generation
+        ):
+            return
+        remaining = self._spectrum_refresh_remaining_ms()
+        if remaining > 0:
+            self._start_spectrum_refresh_timer(remaining)
+            return
+        self._run_spectrum_display_transaction(schedule_quality=True)
+
+    def flush_pending_spectrum_display(self) -> None:
+        """Apply the latest curve/Y request now. Does not rewrite the 150 ms AA idle timer."""
+        self._stop_spectrum_refresh_timer()
+        self._spectrum_refresh_interactive = False
+        self._run_spectrum_display_transaction(schedule_quality=False)
+
+    def _refresh_spectrum_display(self, *_args):
+        self._run_spectrum_display_transaction(schedule_quality=True)
+
+    def _drop_spectrum_trace_cache(self) -> None:
+        self._spectrum_trace_cache = None
+        self._spectrum_rebuild_plan = None
+
+    def _spectrum_leg_pixel_width(self, x0, x1, cover_lo, cover_hi) -> int:
+        rebuild = self._spectrum_rebuild_plan
+        base = (
+            rebuild.bucket_width if rebuild is not None
+            else self._spectrum_pixel_width()
+        )
+        base = max(1, int(base))
+        cover_span = float(cover_hi) - float(cover_lo)
+        leg_span = float(x1) - float(x0)
+        if not (cover_span > 0.0 and np.isfinite(leg_span) and leg_span > 0.0):
+            return base
+        return max(1, int(round(base * min(leg_span, cover_span) / cover_span)))
+
+    def _spectrum_breaks_in_slice(self, entry, first, last):
+        stored = ()
+        for curve in self._amp_curves:
+            if getattr(curve, '_spectrum_entry', None) is entry:
+                stored = getattr(curve, '_spectrum_xy_break_indices', ())
+                break
+        if last < first or not stored:
+            return ()
+        return tuple(i for i in stored if first <= i <= last)
+
+    def _spectrum_curve_index(self, entry, xlim) -> SpectrumCurveIndex:
+        prepared = self._prepared_for_entry(entry)
+        lo, hi = float(xlim[0]), float(xlim[1])
+        if hi < lo:
+            lo, hi = hi, lo
+        fx_lo = prepared.finite_x_min
+        fx_hi = prepared.finite_x_max
+        fully = fx_lo is None or (lo <= fx_lo and hi >= fx_hi)
+        first, last = prepared.plot_source_slice((lo, hi))
+        return SpectrumCurveIndex(
+            first=first,
+            last=last,
+            fully_covered=fully,
+            break_key=self._spectrum_breaks_in_slice(entry, first, last),
+        )
+
+    def _spectrum_data_x_extents(self):
+        lo = hi = None
+        for entry in self._entries:
+            prepared = self._prepared_for_entry(entry)
+            fx_lo = prepared.finite_x_min
+            fx_hi = prepared.finite_x_max
+            if fx_lo is None:
+                continue
+            lo = fx_lo if lo is None else min(lo, fx_lo)
+            hi = fx_hi if hi is None else max(hi, fx_hi)
+        return lo, hi
+
+    def _spectrum_display_request(self, xlim) -> SpectrumDisplayRequest:
+        lo, hi = float(xlim[0]), float(xlim[1])
+        if hi < lo:
+            lo, hi = hi, lo
+        identities = []
+        curves = []
+        for curve in self._amp_curves:
+            entry = curve._spectrum_entry
+            identities.append(self._entry_display_identity(entry))
+            curves.append(self._spectrum_curve_index(entry, (lo, hi)))
+        data_lo, data_hi = self._spectrum_data_x_extents()
+        return SpectrumDisplayRequest(
+            revision=self._spectrum_display_revision,
+            identities=tuple(identities),
+            target_lo=lo,
+            target_hi=hi,
+            pixel_width=self._spectrum_pixel_width(),
+            curves=tuple(curves),
+            data_lo=data_lo,
+            data_hi=data_hi,
+        )
+
+    def _spectrum_cache_from_plan(self, request, plan):
+        cover = (plan.cover_lo, plan.cover_hi)
+        cover_curves = []
+        for curve in self._amp_curves:
+            cover_curves.append(
+                self._spectrum_curve_index(curve._spectrum_entry, cover),
+            )
+        return build_spectrum_trace_cache(request, plan, tuple(cover_curves))
+
+    def _run_spectrum_display_transaction(self, *, schedule_quality=True):
+        try:
+            if sip.isdeleted(self):
+                return
+        except RuntimeError:
+            return
+        if self._spectrum_refresh_busy or not self._amp_curves:
+            return
+        xlim = self._amp_view_x_as_engineering()
+        request = self._spectrum_display_request(xlim)
+        plan = plan_spectrum_display(request, self._spectrum_trace_cache)
+        curves_changed = not plan.reuse
+        y_dirty = self._spectrum_y_dirty or curves_changed
+        if not curves_changed and not self._spectrum_y_dirty:
+            self._spectrum_curves_dirty = False
+            self._spectrum_refresh_interactive = False
+            return
+        self._spectrum_refresh_busy = True
+        try:
+            y_changed = False
+            if curves_changed:
+                if schedule_quality:
+                    self.disable_interactive_quality()
+                self._spectrum_rebuild_plan = plan
+                try:
+                    for curve in self._amp_curves:
+                        entry = curve._spectrum_entry
+                        x, y = self._spectrum_plot_arrays(
+                            entry['freq'], entry['amp'], xlim=xlim)
+                        curve.setData(x, y, antialias=False, connect='finite')
+                finally:
+                    self._spectrum_rebuild_plan = None
+                self._spectrum_trace_cache = self._spectrum_cache_from_plan(
+                    request, plan)
+            if y_dirty:
+                y_changed = bool(self._fit_active_spectrum_y())
+            self._spectrum_curves_dirty = False
+            self._spectrum_y_dirty = False
+            self._spectrum_last_refresh_at = self._spectrum_monotonic()
+            # HIT + unchanged Y: keep the 16 ms coalescer, but do not
+            # setYRange / disable AA / restart the idle or 0 ms discrete timer.
+            if schedule_quality and (curves_changed or y_changed):
+                if not curves_changed:
+                    self.disable_interactive_quality()
+                if (
+                    self._idle_activity.is_busy()
+                    or self._spectrum_refresh_interactive
+                ):
+                    self.schedule_idle_quality()
+                else:
+                    self._arm_discrete_aa()
+        finally:
+            self._spectrum_rebuild_plan = None
+            self._spectrum_refresh_busy = False
+            self._spectrum_refresh_interactive = False
+
+    @staticmethod
+    def _is_db_amp_label(label: str) -> bool:
+        return 'db' in str(label or '').lower()
+
+    @staticmethod
+    def _entry_valid_mask(entry, db):
+        raw = entry.get('amp_for_xlim')
+        if raw is None:
+            return None
+        raw = np.asarray(raw)
+        if raw.shape != np.asarray(entry['amp']).shape or raw.ndim != 1:
+            raise ValueError('Spectrum raw amplitude must match displayed amplitude')
+        return np.isfinite(raw) & (raw > 0) if db else np.isfinite(raw)
+
+    def _drop_prepared_line_ranges(self):
+        self._spectrum_display_revision += 1
+        self._prepared_by_identity = {}
+        self._drop_spectrum_trace_cache()
+
+    def _entry_display_identity(self, entry):
+        # Revision plus the live array identities, not the entry dict id
+        # alone: dB/Linear/reference/weighting replace displayed Y in place
+        # of the same result object.
+        freq = entry.get('freq')
+        amp = entry.get('amp')
+        raw = entry.get('amp_for_xlim')
+        return (
+            self._spectrum_display_revision,
+            id(freq) if freq is not None else 0,
+            id(amp) if amp is not None else 0,
+            id(raw) if raw is not None else 0,
+            bool(self._spectrum_db),
+        )
+
+    def _store_prepared_line_ranges(self, entries, prepared_ranges):
+        stored = {}
+        for entry, prepared in zip(entries, prepared_ranges):
+            stored[self._entry_display_identity(entry)] = prepared
+        self._prepared_by_identity = stored
+
+    def _lookup_prepared_for_entry(self, entry):
+        return self._prepared_by_identity.get(self._entry_display_identity(entry))
+
+    def _lookup_prepared_for_arrays(self, freq, amp):
+        for entry in self._entries:
+            if entry.get('freq') is freq and entry.get('amp') is amp:
+                prepared = self._lookup_prepared_for_entry(entry)
+                if prepared is not None:
+                    return prepared
+        return None
+
+    def _prepared_for_entry(self, entry):
+        prepared = self._lookup_prepared_for_entry(entry)
+        if prepared is not None:
+            return prepared
+        prepared = prepare_line_range(
+            entry['freq'], entry['amp'],
+            valid_mask=self._entry_valid_mask(entry, self._spectrum_db),
+        )
+        self._prepared_by_identity[self._entry_display_identity(entry)] = prepared
+        return prepared
+
+    def _visible_entry_values(self, entry, xlim):
+        result = self._prepared_for_entry(entry).query(xlim)
+        if result.y_min is None:
+            return np.array([], dtype=float)
+        return np.array([result.y_min, result.y_max], dtype=float)
+
+    def _auto_amplitude_y_range(self, entries, xlim):
+        values = [self._visible_entry_values(entry, xlim) for entry in entries]
+        return line_amplitude_limits(np.concatenate(values) if values else np.array([]),
+                                     amplitude_mode='amplitude_db' if self._spectrum_db else 'amplitude')
+
+    def _auto_db_y_range(self, entries, xlim):
+        return self._auto_amplitude_y_range(entries, xlim)
+
+    def _combined_time_bounds(self):
+        bounds = []
+        for e in self._entries:
+            t = np.asarray(e.get('time', []), dtype=float)
+            if t.size == 0:
+                continue
+            finite = t[np.isfinite(t)]
+            if finite.size:
+                bounds.append((float(finite.min()), float(finite.max())))
+        if not bounds:
+            for curve in self._time_curves:
+                try:
+                    t, _sig = curve.getData()
+                except Exception:
+                    continue
+                t = np.asarray(t, dtype=float)
+                finite = t[np.isfinite(t)]
+                if finite.size:
+                    bounds.append((float(finite.min()), float(finite.max())))
+        if not bounds:
+            return None
+        return min(lo for lo, _hi in bounds), max(hi for _lo, hi in bounds)
+
+    # ------------------------------------------------------------------
+    # split-pane layout alignment
+    # ------------------------------------------------------------------
+    def recommended_split_title_width(self) -> float:
+        viewport_w = 0.0
+        try:
+            viewport_w = float(self._glw.viewport().width())
+        except Exception:
+            viewport_w = float(self._glw.width())
+        return max(120.0, viewport_w - 140.0)
+
+    def _release_split_right_spacers(self) -> None:
+        self._set_right_spacer(self._plot_amp, None)
+        self._set_right_spacer(self._plot_time, None)
+
+    def _release_split_titles(self) -> None:
+        self._apply_title_texts()
+
+    def _layout_owners(self):
+        """Graphics items whose own ``QGraphicsLayout`` assigns axis geometry.
+
+        Each ``AxisItem``'s cell is sized by its owning PlotItem's layout, NOT
+        by the enclosing ``GraphicsLayout`` grid, so both have to be activated
+        or a width change never reaches realized geometry.
+        """
+        return [self._glw.ci, self._plot_amp, self._plot_time]
+
+    def line_layout_metrics(self) -> dict:
+        left_widths = []
+        for axis in self._alignment_left_axes():
+            try:
+                # Same max() as the pin: the font-metric term is the only
+                # honest one before the axis has been painted, and the realized
+                # term keeps an already-sized axis from being narrowed. Reading
+                # width() alone would feed the page-level cross-pane max from
+                # the very numbers the pin is meant to correct.
+                left_widths.append(max(
+                    float(left_axis_width_for_ticks(axis)),
+                    float(axis.width()),
+                ))
+            except Exception:
+                pass
+        bottom_heights = []
+        for axis in self._alignment_bottom_axes():
+            try:
+                bottom_heights.append(float(axis.height()))
+            except Exception:
+                pass
+        return {
+            'left_axis_width': max(left_widths) if left_widths else 0.0,
+            'amp_bottom_axis_height': (
+                bottom_heights[0] if bottom_heights else 0.0
+            ),
+            'time_bottom_axis_height': (
+                bottom_heights[1] if len(bottom_heights) > 1 else 0.0
+            ),
+            'amp_right_reserve': self._right_reserve(self._plot_amp),
+            'time_right_reserve': self._right_reserve(self._plot_time),
+        }
+
+    def apply_split_layout_alignment(
+        self,
+        *,
+        left_axis_width: float,
+        amp_bottom_axis_height: float | None = None,
+        time_bottom_axis_height: float | None = None,
+        amp_right_reserve: float | None = None,
+        time_right_reserve: float | None = None,
+    ) -> None:
+        self._pin_split_left_axes(left_axis_width)
+        self._pin_split_bottom_heights((
+            (self._plot_amp, amp_bottom_axis_height),
+            (self._plot_time, time_bottom_axis_height),
+        ))
+        if amp_right_reserve is not None:
+            self._set_right_spacer(self._plot_amp, float(amp_right_reserve))
+        if time_right_reserve is not None:
+            self._set_right_spacer(self._plot_time, float(time_right_reserve))
+        self._activate_graphics_layout()
+
+    def _alignment_left_axes(self):
+        return [self._plot_amp.getAxis('left'), self._plot_time.getAxis('left')]
+
+    def _alignment_bottom_axes(self):
+        return [
+            self._plot_amp.getAxis('bottom'),
+            self._plot_time.getAxis('bottom'),
+        ]
+
+    def _right_reserve(self, plot) -> float:
+        try:
+            return max(
+                0.0,
+                float(plot.sceneBoundingRect().right()
+                      - plot.vb.sceneBoundingRect().right()),
+            )
+        except Exception:
+            return 0.0
+
+    def _set_right_spacer(self, plot, width: float | None) -> None:
+        axis = plot.getAxis('right')
+        if width is None or width <= 0:
+            # No split reserve (single-pane): keep a thin VISIBLE right frame so
+            # the plot reads as a closed rectangle, matching the top/left/bottom
+            # frame from _apply_neutral_axis_frame. Previously this hid the right
+            # axis entirely, leaving the time-preview plot's right edge open
+            # (user-reported missing border).
+            try:
+                plot.showAxis('right', True)
+                frame_pen = pg.mkPen(
+                    color=PG_AXIS_NEUTRAL_COLOR, width=PG_AXIS_NEUTRAL_WIDTH)
+                axis.setPen(frame_pen)
+                axis.setStyle(showValues=False, tickLength=0)
+                axis.setWidth(1)
+            except Exception:
+                pass
+            return
+        try:
+            plot.showAxis('right', True)
+            transparent = pg.mkPen((0, 0, 0, 0))
+            axis.setPen(transparent)
+            axis.setTextPen(transparent)
+            axis.setStyle(showValues=False, tickLength=0)
+            axis.setWidth(float(width))
+        except Exception:
+            pass
+
+    def _apply_title_texts(self) -> None:
+        self._apply_title_text(self._plot_amp, self._raw_amp_title)
+        self._apply_title_text(self._plot_time, self._raw_time_title)
+
+    def _apply_title_text(self, plot, title: str) -> None:
+        """Hide the title row and wipe leftover text so the next dialog cannot
+        read the previous view's title."""
+        del title
+        # The graphics wrapper may already be deleted.
+        try:
+            plot.setTitle(None)
+        except RuntimeError:
+            try:
+                plot.setTitle("")
+            except RuntimeError:
+                pass
+        label = plot.titleLabel
+        try:
+            label.setText("")
+        except RuntimeError:
+            try:
+                label.text = ""
+            except RuntimeError:
+                pass
+        try:
+            plot.setTitle(None)
+        except RuntimeError:
+            pass
+        for name, value in (
+            ("setMinimumHeight", 0),
+            ("setMaximumHeight", 0),
+            ("setPreferredHeight", 0),
+        ):
+            setter = getattr(label, name, None)
+            if callable(setter):
+                try:
+                    setter(value)
+                except RuntimeError:
+                    pass
+        try:
+            label.setVisible(False)
+        except RuntimeError:
+            pass
+        try:
+            label.updateMin()
+            label.updateGeometry()
+        except RuntimeError:
+            pass
+
+    def _activate_graphics_layout(self) -> None:
+        """Realize pending geometry for the outer grid AND both PlotItems.
+
+        Activating only ``self._glw.ci.layout`` re-flows the rows without ever
+        re-sizing the ``AxisItem`` cells inside them, because those cells belong
+        to each PlotItem's own layout. That is why releasing a left-axis pin
+        here used to have no observable effect at all. Mirrors the traversal
+        ``heatmap_canvas._activate_graphics_layout`` already did.
+        """
+        activate_item_layouts(self._layout_owners())
+
+    def readout_at(self, freq: float):
+        rows = []
+        for e in self._entries:
+            freq_arr = np.asarray(e['freq'])
+            amp_arr = np.asarray(e['amp'])
+            if freq_arr.size == 0 or amp_arr.size == 0:
+                continue
+            idx = int(np.argmin(np.abs(freq_arr - freq)))
+            # Same 'legend_label'-over-'label' preference as the curve name
+            # in plot_spectra (Task 6): a mixed-reference axis discloses each
+            # curve's own dB[A] re ... in the hover readout too.
+            rows.append((
+                e.get('legend_label', e['label']),
+                float(freq_arr[idx]), float(amp_arr[idx]),
+            ))
+        return rows
+
+    def frequency_cursor_host_rect(self):
+        """Spectrum data viewport in this canvas's widget coordinates.
+
+        Returns ``None`` when the amplitude ViewBox has no usable layout yet.
+        Coordinates are Qt logical pixels of this widget, not scene or device
+        pixels, and they exclude the time-preview row.
+        """
+        try:
+            if sip.isdeleted(self):
+                return None
+            if self.width() <= 0 or self.height() <= 0:
+                return None
+            view_box = self._plot_amp.vb
+            scene_rect = view_box.sceneBoundingRect()
+            if (
+                scene_rect is None
+                or scene_rect.isNull()
+                or scene_rect.width() <= 1
+                or scene_rect.height() <= 1
+            ):
+                return None
+            glw = self._glw
+            top_left = glw.mapFromScene(scene_rect.topLeft())
+            bottom_right = glw.mapFromScene(scene_rect.bottomRight())
+            view_rect = QRect(
+                int(min(top_left.x(), bottom_right.x())),
+                int(min(top_left.y(), bottom_right.y())),
+                max(1, int(abs(bottom_right.x() - top_left.x()))),
+                max(1, int(abs(bottom_right.y() - top_left.y()))),
+            )
+            mapped = QRect(
+                glw.mapTo(self, view_rect.topLeft()),
+                glw.mapTo(self, view_rect.bottomRight()),
+            ).intersected(self.rect())
+            if not mapped.isValid() or mapped.width() <= 1 or mapped.height() <= 1:
+                return None
+            return mapped
+        except (RuntimeError, TypeError, AttributeError, ValueError):
+            return None
+
+    def _make_frequency_cursor_lines(self, color):
+        line = pg.InfiniteLine(
+            angle=90, movable=False, pen=pg.mkPen(color, width=1.2)
+        )
+        line.setZValue(50)
+        line.hide()
+        self._plot_amp.addItem(line, ignoreBounds=True)
+        return [line]
+
+    @staticmethod
+    def _hide_frequency_cursor_lines(lines) -> None:
+        for line in lines:
+            line.hide()
+
+    @staticmethod
+    def _show_frequency_cursor_lines(lines, frequency) -> None:
+        for line in lines:
+            line.setValue(float(frequency))
+            line.show()
+
+    def _hide_frequency_cursor_items(self, *, emit_empty: bool = True) -> None:
+        for lines in (
+            self._cursor_lines, self._cursor_a_lines, self._cursor_b_lines,
+        ):
+            self._hide_frequency_cursor_lines(lines)
+        if emit_empty:
+            self.cursor_info.emit("")
+            self.dual_cursor_info.emit("")
+            self.frequency_cursor_rows.emit([])
+            self.frequency_cursor_channels.emit(())
+
+    def _clear_frequency_cursor_readout(self) -> None:
+        """Wipe A/B placement and hide lines. File-close / empty-canvas path."""
+        self._cursor_a_frequency = None
+        self._cursor_b_frequency = None
+        self._next_dual_cursor = "a"
+        self._hide_frequency_cursor_items()
+
+    def _project_frequency_cursors(self) -> None:
+        if self._cursor_mode == "dual" and self._cursor_a_frequency is not None:
+            self.set_dual_cursor_frequencies(
+                self._cursor_a_frequency, self._cursor_b_frequency,
+            )
+            return
+        self._hide_frequency_cursor_items()
+
+    def cursor_mode(self) -> str:
+        return self._cursor_mode
+
+    def set_cursor_mode(self, mode: str) -> None:
+        if mode not in {"off", "single", "dual"}:
+            return
+        self._cursor_mode = mode
+        self._project_frequency_cursors()
+
+    def snapshot_cursor_placement(self):
+        return snapshot_frequency_cursor(
+            self._cursor_a_frequency,
+            self._cursor_b_frequency,
+            cursor_mode=self._cursor_mode,
+        )
+
+    def current_single_cursor_x(self):
+        """Visible single-cursor frequency in Hz, or None if none is shown.
+
+        ``set_cursor_frequency`` updates ``_cursor_lines`` only. Dual A/B
+        placement is a different owner and must not be treated as hover.
+        """
+        if self._cursor_mode != "single":
+            return None
+        for line in self._cursor_lines or ():
+            try:
+                if not line.isVisible():
+                    continue
+                value = float(line.value())
+            except (RuntimeError, TypeError, AttributeError, ValueError):
+                continue
+            if math.isfinite(value):
+                return value
+        return None
+
+    def restore_cursor_placement(self, payload) -> None:
+        normalized = normalize_cursor_placement(
+            payload, cursor_mode=self._cursor_mode,
+        )
+        if normalized is None:
+            self._cursor_a_frequency = None
+            self._cursor_b_frequency = None
+            self._next_dual_cursor = "a"
+        else:
+            self._cursor_a_frequency = normalized["ax"]
+            self._cursor_b_frequency = normalized.get("bx")
+        self._project_frequency_cursors()
+
+    def _nearest_frequency(self, frequency):
+        rows = self.readout_at(float(frequency))
+        return float(rows[0][1]) if rows else None
+
+    def evaluate_frequency_cursor(self, frequency):
+        """Return ``(snapped_hz, channels)`` without moving lines or emitting."""
+        try:
+            query = float(frequency)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(query):
+            return None
+        snapped = self._nearest_frequency(query)
+        if snapped is None:
+            return None
+        channels = self._frequency_cursor_channels(mode="single", freq=snapped)
+        return snapped, tuple(channels)
+
+    def evaluate_frequency_cursor_sample(self, frequency):
+        result = self.evaluate_frequency_cursor(frequency)
+        if result is None:
+            return None
+        snapped, channels = result
+        return PinnedCursorSample(
+            binding_generation=int(self._spectrum_display_generation),
+            data_revision=int(self._spectrum_display_revision),
+            domain="frequency",
+            mode="single",
+            x=snapped,
+            channels=channels,
+        )
+
+    def evaluate_dual_frequency_cursor(self, a_frequency, b_frequency):
+        """Return ``(a_hz, b_hz, channels)`` or None. Incomplete B is None."""
+        if b_frequency is None:
+            return None
+        try:
+            a_query = float(a_frequency)
+            b_query = float(b_frequency)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(a_query) or not np.isfinite(b_query):
+            return None
+        a_value = self._nearest_frequency(a_query)
+        b_value = self._nearest_frequency(b_query)
+        if a_value is None or b_value is None:
+            return None
+        channels = self._frequency_cursor_channels(
+            mode="dual", a_value=a_value, b_value=b_value,
+        )
+        return a_value, b_value, tuple(channels)
+
+    def evaluate_dual_frequency_cursor_sample(self, a_frequency, b_frequency):
+        result = self.evaluate_dual_frequency_cursor(a_frequency, b_frequency)
+        if result is None:
+            return None
+        a_value, b_value, channels = result
+        return PinnedCursorSample(
+            binding_generation=int(self._spectrum_display_generation),
+            data_revision=int(self._spectrum_display_revision),
+            domain="frequency",
+            mode="dual",
+            ax=a_value,
+            bx=b_value,
+            channels=channels,
+        )
+
+    def set_cursor_frequency(self, frequency) -> str:
+        result = self.evaluate_frequency_cursor(frequency)
+        if result is None:
+            self.cursor_info.emit("")
+            self.frequency_cursor_channels.emit(())
+            return ""
+        snapped, channels = result
+        self._show_frequency_cursor_lines(self._cursor_lines, snapped)
+        # Keep the public return value's legacy plain-text contract.  Only
+        # the UI signal needs the separator-rich payload that CursorPill uses
+        # to build its time-style vertical detail rows.
+        readout = self.format_readout(snapped)
+        self.cursor_info.emit(self._format_single_cursor_readout(snapped))
+        self.frequency_cursor_channels.emit(channels)
+        return readout
+
+    def _format_single_cursor_readout(self, freq: float) -> str:
+        """Format a FFT hover through the same rich-text contract as time.
+
+        The canvas deliberately keeps :meth:`format_readout` as its plain
+        programmatic/textual readout API.  The interactive pill instead gets
+        the separator-joined form used by TimeDomainCanvasPG, so it can show a
+        short frequency header plus a readable vertical channel list and can
+        safely switch to values-only mode.
+        """
+        rows = self.readout_at(freq)
+        if not rows:
+            return ""
+        base_amp = rows[0][2]
+        parts = [
+            f'<span style="color:#111827;">f={rows[0][1]:.2f} Hz</span>'
+        ]
+        for index, ((label, _snapped, amp), entry) in enumerate(
+            zip(rows, self._entries)
+        ):
+            color = escape(str(entry.get('color', '#2563eb')))
+            value = f'{amp:.4g}'
+            delta = '' if index == 0 else f'  Δ{amp - base_amp:+.4g}'
+            parts.append(
+                f'<span style="color:{color};">{escape(str(label))}='
+                f'<b>{value}{delta}</b></span>'
+            )
+        return _CURSOR_HTML_SEP.join(parts)
+
+    def set_dual_cursor_frequencies(self, a_frequency, b_frequency) -> str:
+        a_value = self._nearest_frequency(a_frequency)
+        if a_value is None:
+            self.cursor_info.emit("")
+            self.dual_cursor_info.emit("")
+            self.frequency_cursor_rows.emit([])
+            self.frequency_cursor_channels.emit(())
+            return ""
+        self._cursor_a_frequency = a_value
+        self._show_frequency_cursor_lines(self._cursor_a_lines, a_value)
+        self._cursor_b_frequency = None
+        self._hide_frequency_cursor_lines(self._cursor_b_lines)
+        if b_frequency is None:
+            primary = f"A: f={a_value:g} Hz | 点击 B 选择第二点"
+            self.cursor_info.emit(primary)
+            self.dual_cursor_info.emit("")
+            self.frequency_cursor_rows.emit([])
+            self.frequency_cursor_channels.emit(())
+            return primary
+        evaluated = self.evaluate_dual_frequency_cursor(a_frequency, b_frequency)
+        if evaluated is None:
+            return ""
+        a_value, b_value, channels = evaluated
+        self._cursor_b_frequency = b_value
+        self._show_frequency_cursor_lines(self._cursor_b_lines, b_value)
+        primary = _CURSOR_HTML_SEP.join((
+            f"A <b>{a_value:g} Hz</b>",
+            f"B <b>{b_value:g} Hz</b>",
+            f'<span style="{_DUAL_CURSOR_DELTA_STYLE}">'
+            f"Δf={b_value - a_value:+g} Hz</span>",
+        ))
+        self.cursor_info.emit(primary)
+        self.dual_cursor_info.emit(self._format_dual_cursor_detail(a_value, b_value))
+        self.frequency_cursor_rows.emit(
+            self._frequency_cursor_rows(a_value, b_value)
+        )
+        self.frequency_cursor_channels.emit(channels)
+        return primary
+
+    def _frequency_cursor_rows(
+        self, a_value: float, b_value: float,
+    ) -> list[tuple[str, float, float, float, str, str]]:
+        """Return per-curve A/B/delta values for the shared cursor pill.
+
+        ``dual_cursor_info`` remains the textual compatibility signal, but
+        the pill must receive values as data.  Parsing its own rich text was
+        why the FFT pill could collapse once and then lose the detail needed
+        to expand again.
+        """
+        rows = []
+        for entry in self._entries:
+            freq = np.asarray(entry.get('freq', ()), dtype=float)
+            amp = np.asarray(entry.get('amp', ()), dtype=float)
+            count = min(freq.size, amp.size)
+            if count <= 0:
+                continue
+            freq = freq[:count]
+            amp = amp[:count]
+            a_index = int(np.argmin(np.abs(freq - a_value)))
+            b_index = int(np.argmin(np.abs(freq - b_value)))
+            a_amp = float(amp[a_index])
+            b_amp = float(amp[b_index])
+            rows.append((
+                str(entry.get('legend_label', entry.get('label', ''))),
+                a_amp,
+                b_amp,
+                b_amp - a_amp,
+                '',
+                str(entry.get('color', '#2563eb')),
+            ))
+        return rows
+
+    def _frequency_cursor_channel_from_entry(self, entry, display_label, **values):
+        identity = self._entry_source(entry)
+        channel_name = entry.get("channel")
+        return FrequencyCursorChannel(
+            identity=identity,
+            source_label="",
+            channel_label=str(channel_name or display_label or ""),
+            color=str(entry.get("color", "#2563eb") or "#2563eb"),
+            unit_suffix="",
+            **values,
+        )
+
+    def _frequency_cursor_channels(
+        self, *, mode, freq=None, a_value=None, b_value=None,
+    ):
+        """Return structured FFT readings without computing new spectrum values."""
+        channels = []
+        if mode == "single":
+            rows = self.readout_at(float(freq))
+            if not rows:
+                return ()
+            base_amp = rows[0][2]
+            usable = []
+            for entry in self._entries:
+                freq_arr = np.asarray(entry.get("freq", ()))
+                amp_arr = np.asarray(entry.get("amp", ()))
+                if freq_arr.size == 0 or amp_arr.size == 0:
+                    continue
+                usable.append(entry)
+            for index, ((label, _snapped, amp), entry) in enumerate(zip(rows, usable)):
+                channels.append(self._frequency_cursor_channel_from_entry(
+                    entry,
+                    label,
+                    value=float(amp),
+                    delta_to_primary=(
+                        None if index == 0 else float(amp) - float(base_amp)
+                    ),
+                ))
+            return tuple(channels)
+        if a_value is None or b_value is None:
+            return ()
+        for entry in self._entries:
+            freq_arr = np.asarray(entry.get("freq", ()), dtype=float)
+            amp_arr = np.asarray(entry.get("amp", ()), dtype=float)
+            count = min(freq_arr.size, amp_arr.size)
+            if count <= 0:
+                continue
+            freq_arr = freq_arr[:count]
+            amp_arr = amp_arr[:count]
+            a_amp = float(amp_arr[int(np.argmin(np.abs(freq_arr - a_value)))])
+            b_amp = float(amp_arr[int(np.argmin(np.abs(freq_arr - b_value)))])
+            display = entry.get("legend_label", entry.get("label", ""))
+            channels.append(self._frequency_cursor_channel_from_entry(
+                entry,
+                display,
+                a_value=a_amp,
+                b_value=b_amp,
+                delta_ab=b_amp - a_amp,
+            ))
+        return tuple(channels)
+
+    def _format_dual_cursor_detail(self, a_value: float, b_value: float) -> str:
+        """Keep A/B values while surfacing every B-minus-A spectrum delta."""
+        a_rows = self.readout_at(a_value)
+        b_rows = self.readout_at(b_value)
+        deltas = []
+        for a_row, b_row in zip(a_rows, b_rows):
+            label = str(b_row[0])
+            delta = float(b_row[2]) - float(a_row[2])
+            deltas.append(f"{escape(label)}={delta:+.4g}")
+        delta_html = " · ".join(deltas) or "—"
+        return (
+            f"A：{escape(self.format_readout(a_value))}<br>"
+            f"B：{escape(self.format_readout(b_value))}<br>"
+            f'<span style="{_DUAL_CURSOR_DELTA_STYLE}">'
+            f"ΔY：{delta_html}</span>"
+        )
+
+    def format_readout(self, freq: float) -> str:
+        rows = self.readout_at(freq)
+        if not rows:
+            return ""
+        parts = []
+        base_amp = rows[0][2]
+        for i, (label, _f, amp) in enumerate(rows):
+            seg = f"{label}: {amp:.4g}"
+            if i > 0:
+                seg += f"  Δ{amp - base_amp:+.4g}"
+            parts.append(seg)
+        return f"f={rows[0][1]:.2f} Hz  " + "  |  ".join(parts)
+
+    def _on_hover(self, pos) -> None:
+        if self._cursor_mode != "single":
+            return
+        if not self._plot_amp.vb.sceneBoundingRect().contains(pos) or not self._entries:
+            self.cursor_info.emit("")
+            self.frequency_cursor_channels.emit(())
+            return
+        x = self._plot_amp.vb.mapSceneToView(pos).x()
+        self.set_cursor_frequency(x)
+
+    def _nearest_entry_index(self, freq: float, amp_y: float) -> int | None:
+        if not self._entries:
+            return None
+        best = None
+        for i, e in enumerate(self._entries):
+            freq_arr = np.asarray(e['freq'])
+            amp_arr = np.asarray(e['amp'])
+            if freq_arr.size == 0 or amp_arr.size == 0:
+                continue
+            idx = int(np.argmin(np.abs(freq_arr - freq)))
+            dy = abs(float(amp_arr[idx]) - float(amp_y))
+            if best is None or dy < best[0]:
+                best = (dy, i)
+        return None if best is None else best[1]
+
+    # ------------------------------------------------------------------
+    def _axis_label_unit(self, label: str) -> str:
+        text = str(label or "")
+        if "dB" in text:
+            return "dB"
+        if "(Hz)" in text:
+            return "Hz"
+        if "(s)" in text:
+            return "s"
+        return ""
+
+    def _amp_y_unit(self) -> str:
+        try:
+            axis = self._plot_amp.getAxis('left')
+            return self._axis_label_unit(getattr(axis, 'labelText', ''))
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _curve_color(curve, fallback="#1769e0") -> str:
+        try:
+            pen = curve.opts.get('pen')
+            color = pen.color()
+            if color.isValid():
+                return color.name()
+        except Exception:
+            pass
+        return fallback
+
+    def set_remark_enabled(self, enabled: bool) -> None:
+        self._remark_enabled = bool(enabled)
+        # Suppress BOTH plots' default right-click ViewBox menu while annotating
+        # so a right-click reaches the delete-nearest slot. ev.accept() in the
+        # click slot is structurally too late to block the menu (the menu is
+        # raised during item dispatch, before sigMouseClicked fires) — the menu's
+        # real gate is menuEnabled(). Lesson: sigmouseclicked-fires-after-viewbox-menu.
+        self._remark_interaction.set_enabled(
+            self._remark_enabled,
+            viewport=self._glw.viewport(),
+            menu_viewboxes=(self._plot_amp.vb, self._plot_time.vb),
+        )
+
+    def clear_remarks(self) -> None:
+        self._remark_intent.clear()
+        if not self._remarks:
+            return
+        self._drop_remark_projection()
+        self._bump_markup_revision()
+
+    def _drop_remark_projection(self) -> None:
+        if not self._remarks:
+            return
+        self._remark_artist.clear(self._remarks)
+
+    def _project_remarks(self) -> None:
+        self._drop_remark_projection()
+        for item in list(self._remark_intent.items):
+            self._restore_one_remark(item)
+
+    def _restore_one_remark(self, item) -> None:
+        if not isinstance(item, dict):
+            return
+        panel = str(item.get("panel") or "amp")
+        x = item.get("x")
+        try:
+            x = float(x)
+        except (TypeError, ValueError):
+            return
+        source = item.get("source")
+        label_dx = item.get("label_dx")
+        label_dy = item.get("label_dy")
+        if panel == "time":
+            self._restore_time_remark(
+                source, x, label_dx=label_dx, label_dy=label_dy,
+            )
+            return
+        self._restore_amp_remark(
+            source, x, label_dx=label_dx, label_dy=label_dy,
+        )
+
+    def _restore_amp_remark(self, source, x, *, label_dx, label_dy) -> None:
+        entry = self._entry_for_source(source)
+        if entry is None:
+            return
+        freq = np.asarray(entry.get("freq", ()), dtype=float)
+        amp = np.asarray(entry.get("amp", ()), dtype=float)
+        n = min(freq.size, amp.size)
+        if n == 0:
+            return
+        idx = int(np.argmin(np.abs(freq[:n] - x)))
+        self._append_remark(
+            vb=self._plot_amp.vb,
+            x=float(freq[idx]),
+            y=float(amp[idx]),
+            color=entry.get("color", "#2563eb"),
+            unit_x="Hz",
+            unit_y=self._amp_y_unit(),
+            plot=self._plot_amp,
+            source=self._entry_source(entry) or source,
+            panel="amp",
+            label_dx=label_dx,
+            label_dy=label_dy,
+            record_intent=False,
+            bump=False,
+        )
+
+    def _restore_time_remark(self, source, x, *, label_dx, label_dy) -> None:
+        parsed = None
+        if isinstance(source, (list, tuple)) and len(source) == 2:
+            parsed = (str(source[0]), str(source[1]))
+        for curve, vb, plot in self._time_curve_owners():
+            curve_source = getattr(curve, "_overlay_source", None)
+            if parsed is not None and curve_source != parsed:
+                continue
+            if parsed is None and curve_source is not None:
+                continue
+            try:
+                xs, ys = curve.getData()
+            except Exception:
+                continue
+            if xs is None or ys is None:
+                continue
+            xs = np.asarray(xs, dtype=float)
+            ys = np.asarray(ys, dtype=float)
+            mask = np.isfinite(xs) & np.isfinite(ys)
+            if not mask.any():
+                continue
+            xs, ys = xs[mask], ys[mask]
+            idx = int(np.argmin(np.abs(xs - x)))
+            self._append_remark(
+                vb=vb,
+                x=float(xs[idx]),
+                y=float(ys[idx]),
+                color=self._curve_color(curve),
+                unit_x="s",
+                unit_y="",
+                plot=plot,
+                source=curve_source or source,
+                panel="time",
+                label_dx=label_dx,
+                label_dy=label_dy,
+                record_intent=False,
+                bump=False,
+            )
+            return
+
+    def snapshot_remarks(self):
+        return self._remark_intent.snapshot(self._remarks)
+
+    def restore_remarks(self, payload) -> None:
+        self._remark_intent.replace(payload)
+        self._project_remarks()
+
+    def _bump_markup_revision(self) -> None:
+        self.markup_revision = int(self.markup_revision) + 1
+        self.markup_revision_changed.emit()
+
+    def remark_count(self) -> int:
+        return len(self._remarks)
+
+    @staticmethod
+    def _entry_source(entry):
+        if not isinstance(entry, dict):
+            return None
+        fid, channel = entry.get("fid"), entry.get("channel")
+        if not fid or not channel:
+            return None
+        binding_id = str(entry.get("binding_id") or "")
+        if binding_id:
+            return (str(fid), str(channel), binding_id)
+        return (str(fid), str(channel))
+
+    def _entry_for_source(self, source):
+        parsed = None
+        binding_id = ""
+        if isinstance(source, (list, tuple)) and len(source) >= 2:
+            parsed = (str(source[0]), str(source[1]))
+            if len(source) >= 3 and source[2]:
+                binding_id = str(source[2])
+        matches = []
+        for entry in self._entries:
+            identity = self._entry_source(entry)
+            if parsed is None:
+                matches.append(entry)
+                continue
+            if identity is None:
+                continue
+            if identity[0] == parsed[0] and identity[1] == parsed[1]:
+                if not binding_id or (
+                    len(identity) >= 3 and identity[2] == binding_id
+                ):
+                    return entry
+        if parsed is None and len(matches) == 1:
+            return matches[0]
+        return None
+
+    def _append_remark(
+        self, *, vb, x: float, y: float, color: str, unit_x: str,
+        unit_y: str = "", plot=None, source=None, panel=None,
+        label_dx=None, label_dy=None, record_intent: bool = True,
+        bump: bool = True,
+    ) -> None:
+        point = RemarkPoint(
+            vb=vb,
+            x=float(x),
+            y=float(y),
+            color=color or "#dc2626",
+            unit_x=unit_x,
+            unit_y=unit_y,
+            label_dx=label_dx,
+            label_dy=label_dy,
+        )
+        remark = self._remark_artist.add(point)
+        remark['plot'] = plot
+        if panel:
+            remark['panel'] = panel
+        if source is not None:
+            remark['source'] = source
+        self._remarks.append(remark)
+        if record_intent:
+            self._remark_intent.record(remark, panel=panel)
+        if bump:
+            self._bump_markup_revision()
+
+    def _remove_remark(self, remark) -> None:
+        self._remark_intent.discard(remark)
+        self._remark_artist.remove(remark)
+        try:
+            self._remarks.remove(remark)
+        except ValueError:
+            return
+        self._bump_markup_revision()
+
+    def add_remark_at(self, which: str, x: float, y: float) -> None:
+        if not self._remark_enabled:
+            return
+        if which == 'time':
+            self._add_time_remark_at(x, y)
+            return
+        if which != 'amp' or not self._entries:
+            return
+        best = None
+        for e in self._entries:
+            freq_arr = np.asarray(e['freq'])
+            amp_arr = np.asarray(e['amp'])
+            if freq_arr.size == 0 or amp_arr.size == 0:
+                continue
+            idx = int(np.argmin(np.abs(freq_arr - x)))
+            sx, sy = float(freq_arr[idx]), float(amp_arr[idx])
+            dy = abs(sy - y)
+            if best is None or dy < best[0]:
+                best = (dy, sx, sy, e.get('color', '#2563eb'), e)
+        if best is None:
+            return
+        _dy, sx, sy, color, entry = best
+        self._append_remark(
+            vb=self._plot_amp.vb,
+            x=sx,
+            y=sy,
+            color=color,
+            unit_x="Hz",
+            unit_y=self._amp_y_unit(),
+            plot=self._plot_amp,
+            source=self._entry_source(entry),
+            panel="amp",
+        )
+
+    def _nearest_amp_remark_candidate(self, scene_pos):
+        if scene_pos is None or not self._entries:
+            return None
+        try:
+            click_data = self._plot_amp.vb.mapSceneToView(scene_pos)
+            x_data = float(click_data.x())
+        except Exception:
+            return None
+        try:
+            x_range, _y_range = self._plot_amp.vb.viewRange()
+            rect = self._plot_amp.vb.sceneBoundingRect()
+            span = abs(float(x_range[1]) - float(x_range[0]))
+            width = max(float(rect.width()), 1.0)
+            half_window = max((span / width) * 48.0, 1e-12)
+        except Exception:
+            half_window = 0.0
+        best = None
+        for e in self._entries:
+            freq_arr = np.asarray(e['freq'], dtype=float)
+            amp_arr = np.asarray(e['amp'], dtype=float)
+            n = min(freq_arr.size, amp_arr.size)
+            if n == 0:
+                continue
+            freq_arr = freq_arr[:n]
+            amp_arr = amp_arr[:n]
+            finite = np.isfinite(freq_arr) & np.isfinite(amp_arr)
+            if not finite.any():
+                continue
+            freq_arr = freq_arr[finite]
+            amp_arr = amp_arr[finite]
+            nearest_idx = int(np.argmin(np.abs(freq_arr - x_data)))
+            lo = max(0, nearest_idx - 32)
+            hi = min(freq_arr.size, nearest_idx + 33)
+            idxs = np.arange(lo, hi, dtype=int)
+            if half_window > 0.0:
+                near_x = np.flatnonzero(np.abs(freq_arr - x_data) <= half_window)
+                if near_x.size:
+                    idxs = np.union1d(idxs, near_x)
+            for idx in idxs:
+                sx, sy = float(freq_arr[idx]), float(amp_arr[idx])
+                try:
+                    pt = self._plot_amp.vb.mapViewToScene(QPointF(sx, sy))
+                except Exception:
+                    continue
+                dx = pt.x() - scene_pos.x()
+                dy = pt.y() - scene_pos.y()
+                d2 = dx * dx + dy * dy
+                if best is None or d2 < best[0]:
+                    best = (d2, sx, sy, e.get('color', '#2563eb'), e)
+        return best
+
+    def _add_amp_remark_at_scene(self, scene_pos) -> None:
+        best = self._nearest_amp_remark_candidate(scene_pos)
+        if best is None:
+            return
+        _d2, sx, sy, color, entry = best
+        self._append_remark(
+            vb=self._plot_amp.vb,
+            x=sx,
+            y=sy,
+            color=color,
+            unit_x="Hz",
+            unit_y=self._amp_y_unit(),
+            plot=self._plot_amp,
+            source=self._entry_source(entry),
+            panel="amp",
+        )
+
+    def _time_curve_owners(self):
+        """Yield ``(curve, vb, plot_or_none)`` for each time-preview curve.
+
+        Curve 0 lives on the main ViewBox (``_plot_time.vb`` / its left axis);
+        each extra curve lives on its own aux ViewBox (``_time_overlay_vbs[i-1]``)
+        with a colour-coded right axis. ``plot_or_none`` is ``_plot_time`` only
+        for curve 0 (annotation items go onto the plot so they share the left
+        axis); aux annotations go straight onto the aux ViewBox."""
+        if not self._time_curves:
+            return
+        yield (self._time_curves[0], self._plot_time.vb, self._plot_time)
+        for curve, vb in zip(self._time_curves[1:], self._time_overlay_vbs):
+            yield (curve, vb, None)
+
+    def _add_time_remark_at(self, x: float, y: float) -> None:
+        if not self._time_curves:
+            return
+        # Each overlay curve sits on a different Y scale (own aux ViewBox), so a
+        # data-space nearest search would always favour the largest-scale curve.
+        # Compare in SCREEN (scene) space: project the clicked point and every
+        # candidate sample through each curve's OWN ViewBox, then pick the
+        # globally nearest sample. The clicked (x, y) is in the MAIN ViewBox's
+        # data space (the click handler maps via _plot_time.vb), so anchor the
+        # scene reference there. Lesson: overlay nearest-point must be screen-space.
+        try:
+            click_scene = self._plot_time.vb.mapViewToScene(QPointF(x, y))
+        except Exception:
+            return
+        best = None  # (dist2, sx, sy, vb, plot_or_none, color, source)
+        for curve, vb, plot in self._time_curve_owners():
+            try:
+                xs, ys = curve.getData()
+            except Exception:
+                continue
+            if xs is None or ys is None:
+                continue
+            xs = np.asarray(xs, dtype=float)
+            ys = np.asarray(ys, dtype=float)
+            mask = np.isfinite(xs) & np.isfinite(ys)
+            if not mask.any():
+                continue
+            xs, ys = xs[mask], ys[mask]
+            # Narrow to the few samples nearest in X first (cheap), then compare
+            # the handful in screen space — projecting every sample is wasteful.
+            xi = int(np.argmin(np.abs(xs - x)))
+            lo = max(0, xi - 2)
+            hi = min(xs.size, xi + 3)
+            for j in range(lo, hi):
+                sx, sy = float(xs[j]), float(ys[j])
+                try:
+                    pt = vb.mapViewToScene(QPointF(sx, sy))
+                except Exception:
+                    continue
+                dx = pt.x() - click_scene.x()
+                dy = pt.y() - click_scene.y()
+                d2 = dx * dx + dy * dy
+                if best is None or d2 < best[0]:
+                    best = (
+                        d2, sx, sy, vb, plot, self._curve_color(curve),
+                        getattr(curve, "_overlay_source", None),
+                    )
+        if best is None:
+            return
+        _d2, sx, sy, vb, plot, color, source = best
+        self._append_remark(
+            vb=vb,
+            x=sx,
+            y=sy,
+            color=color,
+            unit_x="s",
+            unit_y="",
+            plot=plot,
+            source=source,
+            panel="time",
+        )
+
+    def remove_remark_near(self, which: str, x: float) -> None:
+        if which == 'time':
+            time_vbs = {self._plot_time.vb, *self._time_overlay_vbs}
+            cands = [r for r in self._remarks if r.get('vb') in time_vbs]
+            if not cands:
+                return
+            nearest = min(cands, key=lambda r: abs(r['dot'].getData()[0][0] - x))
+            self._remove_remark(nearest)
+            return
+        if which != 'amp':
+            return
+        cands = [
+            r for r in self._remarks
+            if r.get('plot') is self._plot_amp or r.get('vb') is self._plot_amp.vb
+        ]
+        if not cands:
+            return
+        nearest = min(cands, key=lambda r: abs(r['dot'].getData()[0][0] - x))
+        self._remove_remark(nearest)
+
+    def _remove_amp_remark_at_scene(self, scene_pos) -> None:
+        cands = [
+            r for r in self._remarks
+            if r.get('plot') is self._plot_amp or r.get('vb') is self._plot_amp.vb
+        ]
+        if not cands or scene_pos is None:
+            return
+        best = None
+        for remark in cands:
+            try:
+                xs, ys = remark['dot'].getData()
+                pt = self._plot_amp.vb.mapViewToScene(
+                    QPointF(float(xs[0]), float(ys[0])))
+            except Exception:
+                continue
+            dx = pt.x() - scene_pos.x()
+            dy = pt.y() - scene_pos.y()
+            d2 = dx * dx + dy * dy
+            if best is None or d2 < best[0]:
+                best = (d2, remark)
+        if best is not None:
+            self._remove_remark(best[1])
+
+    def _viewport_pos_to_scene(self, viewport_pos):
+        return viewport_pos_to_scene(self._glw, viewport_pos)
+
+    def _add_remark_at_viewport_pos(self, viewport_pos) -> None:
+        scene_pos = self._viewport_pos_to_scene(viewport_pos)
+        if scene_pos is None:
+            return
+        if self._plot_amp.vb.sceneBoundingRect().contains(scene_pos):
+            self._add_amp_remark_at_scene(scene_pos)
+            return
+        if self._plot_time.vb.sceneBoundingRect().contains(scene_pos):
+            v = self._plot_time.vb.mapSceneToView(scene_pos)
+            self.add_remark_at('time', v.x(), v.y())
+
+    def _remove_remark_at_viewport_pos(self, viewport_pos) -> None:
+        scene_pos = self._viewport_pos_to_scene(viewport_pos)
+        if scene_pos is None:
+            return
+        if self._plot_amp.vb.sceneBoundingRect().contains(scene_pos):
+            self._remove_amp_remark_at_scene(scene_pos)
+            return
+        if self._plot_time.vb.sceneBoundingRect().contains(scene_pos):
+            v = self._plot_time.vb.mapSceneToView(scene_pos)
+            self.remove_remark_near('time', v.x())
+
+    def _remark_item_at_viewport_pos(self, viewport_pos):
+        return remark_at_viewport_pos(self._remarks, self._glw, viewport_pos)
+
+    def eventFilter(self, obj, event):
+        try:
+            viewport = self._glw.viewport()
+        except RuntimeError:
+            viewport = None
+        if obj is viewport and event is not None:
+            if event.type() == QEvent.MouseButtonPress:
+                self._manual_amp_viewport = self.capture_xy_viewport()
+            self._note_idle_quality_event(event)
+        try:
+            if obj is viewport and event.type() == QEvent.MouseButtonDblClick:
+                if event.button() == Qt.LeftButton and not self._remark_enabled:
+                    self._handle_time_or_amp_double_click(event.pos())
+                    return True
+            if obj is viewport and self._remark_enabled:
+                if event.type() == QEvent.MouseButtonPress:
+                    result = self._remark_interaction.handle_mouse_press(event)
+                    if result is not None:
+                        return result
+                elif event.type() == QEvent.MouseMove:
+                    result = self._remark_interaction.handle_mouse_move(event)
+                    if result is not None:
+                        return result
+                elif event.type() == QEvent.MouseButtonRelease:
+                    result = self._remark_interaction.handle_mouse_release(event)
+                    if result is not None:
+                        return result
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
+
+    def _handle_time_or_amp_double_click(self, viewport_pos) -> None:
+        """Double-click → chart options (amp) or curve color / time options."""
+        try:
+            scene_pos = self._glw.mapToScene(viewport_pos)
+        except Exception:
+            return
+        # Spectrum row → existing amp chart-options dialog.
+        try:
+            if self._plot_amp.vb.sceneBoundingRect().contains(scene_pos):
+                self.open_chart_options_dialog(parent=self.window())
+                return
+        except Exception:
+            pass
+        # Time-preview row → emphasise nearest curve; left opens full options,
+        # aux opens a colour picker (aux curves are not on the main PlotItem).
+        try:
+            in_time = self._plot_time.vb.sceneBoundingRect().contains(scene_pos)
+        except Exception:
+            in_time = False
+        if not in_time:
+            # Right-axis gutters sit outside the main vb rect.
+            for i, ax in enumerate(self._time_overlay_axes):
+                try:
+                    if ax.sceneBoundingRect().contains(scene_pos):
+                        self._edit_time_curve_appearance(i + 1)
+                        return
+                except Exception:
+                    continue
+            return
+        try:
+            v = self._plot_time.vb.mapSceneToView(scene_pos)
+            idx = self._nearest_time_entry_index(float(v.x()), float(v.y()))
+        except Exception:
+            idx = 0
+        if idx is None:
+            idx = 0
+        self._edit_time_curve_appearance(int(idx))
+
+    def _edit_time_curve_appearance(self, idx: int) -> None:
+        if not self._time_curves:
+            return
+        idx = max(0, min(int(idx), len(self._time_curves) - 1))
+        self._selected_time_entry_idx = idx
+        self._apply_time_preview_emphasis()
+        if idx == 0:
+            self._open_role_chart_options(
+                "preview",
+                self._plot_time,
+                self.window() if self.window() is not None else self,
+            )
+            self._apply_time_preview_emphasis()
+            return
+        from PyQt5.QtGui import QColor
+        from PyQt5.QtWidgets import QColorDialog
+
+        curve = self._time_curves[idx]
+        current = QColor(self._curve_color(curve))
+        color = QColorDialog.getColor(
+            current, self.window() if self.window() is not None else self,
+            "曲线颜色")
+        if not color.isValid():
+            return
+        try:
+            pen = curve.opts.get("pen")
+            if pen is not None:
+                pen.setColor(color)
+                curve.setPen(pen)
+            axis = self._time_overlay_axes[idx - 1]
+            axis.setTextPen(pg.mkPen(color=color))
+        except Exception:
+            pass
+        if idx < len(self._entries):
+            self._entries[idx]['color'] = color.name()
+        self._commit_preview_curve_color(curve, color.name())
+        self.layout_geometry_changed.emit()
+
+    def _on_click(self, ev) -> None:
+        if self._remark_enabled:
+            return
+        scene_pos = ev.scenePos()
+        # Spectrum (amp) row.
+        if self._plot_amp.vb.sceneBoundingRect().contains(scene_pos):
+            v = self._plot_amp.vb.mapSceneToView(scene_pos)
+            if ev.button() == Qt.LeftButton:
+                if self._cursor_mode == "dual":
+                    if self._next_dual_cursor == "a":
+                        self.set_dual_cursor_frequencies(v.x(), None)
+                        self._next_dual_cursor = "b"
+                    else:
+                        self.set_dual_cursor_frequencies(
+                            self._cursor_a_frequency, v.x()
+                        )
+                        self._next_dual_cursor = "a"
+                    ev.accept()
+                    return
+                if self._remark_enabled:
+                    self.add_remark_at('amp', v.x(), v.y())
+                else:
+                    idx = self._nearest_entry_index(v.x(), v.y())
+                    if idx is not None:
+                        self.select_time_entry(idx)
+                        # User picked the preview source by clicking the curve.
+                        self.time_source_selected.emit()
+                return
+            if ev.button() == Qt.RightButton and self._remark_enabled:
+                self.remove_remark_near('amp', v.x())
+                ev.accept()
+            return
+        # Time-preview row: annotations only (no entry-selection here). Coordinates
+        # come from the MAIN ViewBox (curve 0 / left axis); the aux overlay curves
+        # are X-linked to it, and _add_time_remark_at projects each curve through
+        # its own ViewBox to pick the screen-nearest sample.
+        if (self._remark_enabled
+                and self._plot_time.vb.sceneBoundingRect().contains(scene_pos)):
+            v = self._plot_time.vb.mapSceneToView(scene_pos)
+            if ev.button() == Qt.LeftButton:
+                self.add_remark_at('time', v.x(), v.y())
+            elif ev.button() == Qt.RightButton:
+                self.remove_remark_near('time', v.x())
+                ev.accept()
+
+    # ------------------------------------------------------------------
+    def grab_pixmap(self, scale: float = 2.0) -> QPixmap:
+        self.flush_pending_spectrum_display()
+        if self._section_reveal_waiting:
+            # An explicit copy/export cannot rely on a future timer. Realize
+            # layout, paint the retained content, then apply the same gate.
+            # repaint dispatches this viewport only, never the global queue.
+            self._activate_graphics_layout()
+            self._glw.viewport().repaint()
+            self._enable_idle_quality()
+        base = self._glw.grab()
+        if base.isNull() or base.width() <= 0 or base.height() <= 0:
+            fallback = QPixmap(1, 1)
+            fallback.fill(Qt.transparent)
+            return fallback
+        if scale <= 1.0:
+            return base
+        return base.scaled(
+            int(round(base.width() * scale)),
+            int(round(base.height() * scale)),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation,
+        )

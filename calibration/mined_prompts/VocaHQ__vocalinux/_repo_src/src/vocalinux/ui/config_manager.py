@@ -1,0 +1,995 @@
+"""
+Configuration manager for Vocalinux.
+
+This module handles loading, saving, and accessing user preferences.
+"""
+
+import copy
+import json
+import logging
+import os
+import threading
+from typing import Any, Optional
+
+from ..utils.paths import config_dir
+from ..utils.vosk_model_info import SUPPORTED_LANGUAGES
+from ..utils.whispercpp_model_info import MODEL_SIZES as WHISPERCPP_MODEL_SIZES
+from ..utils.whispercpp_model_info import WHISPERCPP_MODEL_INFO, default_variant_for_size
+from ..utils.whispercpp_model_info import get_model_size as get_whispercpp_model_size
+from ..utils.whispercpp_model_info import is_dictation_model
+from ..utils.whispercpp_model_info import is_english_only_model as is_english_only_whispercpp_model
+from ..utils.whispercpp_model_info import on_disk_stand_in
+
+logger = logging.getLogger(__name__)
+
+# Define constants
+CONFIG_DIR = config_dir()
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+
+# Family dictation-tone catalog. Ids and display names are shared with VocaWin.
+# The former "fifth" pair is voca / Voca. Off is a real choice (no start/stop).
+SOUND_EFFECT_TONES: tuple[tuple[str, str], ...] = (
+    ("lift", "Lift"),
+    ("flick", "Flick"),
+    ("ember", "Ember"),
+    ("step", "Step"),
+    ("voca", "Voca"),
+    ("soft", "Soft"),
+    ("chirp", "Chirp"),
+    ("scale", "Scale"),
+    ("drop", "Drop"),
+    ("glass", "Glass"),
+    ("off", "Off"),
+)
+SOUND_EFFECT_TONE_IDS = frozenset(tone_id for tone_id, _label in SOUND_EFFECT_TONES)
+DEFAULT_SOUND_EFFECT_TONE = "voca"
+DEFAULT_PLAYBACK_DUCK_PERCENT = 20
+
+PASTE_SHORTCUTS: tuple[tuple[str, str], ...] = (
+    ("auto", "Auto-detect"),
+    ("ctrl+v", "Ctrl+V"),
+    ("ctrl+shift+v", "Ctrl+Shift+V"),
+)
+PASTE_SHORTCUT_IDS = frozenset(shortcut_id for shortcut_id, _label in PASTE_SHORTCUTS)
+DEFAULT_PASTE_SHORTCUT = "auto"
+DEFAULT_TEXT_INJECTION_BACKEND = "auto"
+_NO_PRESERVED_TEXT_INJECTION_SECTION = object()
+
+
+def normalize_paste_shortcut(shortcut: Any) -> str:
+    """Return a paste-shortcut id. Missing or unknown values become auto."""
+    if isinstance(shortcut, str) and shortcut in PASTE_SHORTCUT_IDS:
+        return shortcut
+    return DEFAULT_PASTE_SHORTCUT
+
+
+def normalize_sound_effect_tone(tone: Any) -> str:
+    """Return a catalog id. Missing, blank, or unknown values become voca."""
+    if isinstance(tone, str) and tone in SOUND_EFFECT_TONE_IDS:
+        return tone
+    return DEFAULT_SOUND_EFFECT_TONE
+
+
+def _backend_from_config(config: Any) -> tuple[bool, Any]:
+    """Return whether ``config`` has a usable text-injection section and its backend.
+
+    A missing section/key means the documented default, ``"auto"``. A
+    non-object section is not loaded into the in-memory defaults; an unrelated
+    save preserves that value verbatim instead of discarding a hand edit.
+    """
+    if not isinstance(config, dict):
+        return False, DEFAULT_TEXT_INJECTION_BACKEND
+
+    if "text_injection" not in config:
+        return True, DEFAULT_TEXT_INJECTION_BACKEND
+    text_injection = config["text_injection"]
+    if not isinstance(text_injection, dict):
+        return False, DEFAULT_TEXT_INJECTION_BACKEND
+    return True, text_injection.get("backend", DEFAULT_TEXT_INJECTION_BACKEND)
+
+
+def clamp_playback_duck_percent(value: Any) -> int:
+    """Return ``value`` as an integer percent in 0..100.
+
+    Missing or unusable values become the default (20). Booleans are rejected
+    because ``bool`` is an ``int`` subclass and must not become 0 or 1.
+    """
+    if isinstance(value, bool) or value is None:
+        return DEFAULT_PLAYBACK_DUCK_PERCENT
+    try:
+        percent = int(round(float(value)))
+    except (TypeError, ValueError, OverflowError):
+        return DEFAULT_PLAYBACK_DUCK_PERCENT
+    return max(0, min(100, percent))
+
+
+# Default configuration
+DEFAULT_CONFIG = {
+    "speech_recognition": {  # Changed section name
+        "engine": "whisper_cpp",  # whisper_cpp is default; vosk/whisper/parakeet/faster_whisper/remote_api are optional
+        # "auto" detects per utterance, "layout" follows the active keyboard
+        # layout (#821), anything else pins one catalog language.
+        "language": "auto",
+        "model_size": "tiny",  # Current model size (for backward compatibility)
+        "vosk_model_size": "small",  # Default model for VOSK engine
+        "whisper_model_size": "tiny",  # Default model for Whisper engine
+        "whisper_cpp_model_size": "tiny",  # Default model for whisper.cpp engine
+        # Variant the user picked explicitly in Settings. Empty means "not pinned":
+        # the variant is then derived from the selected language, because a bare size
+        # name ("medium") is indistinguishable from the multilingual variant id.
+        "whisper_cpp_model_variant": "",
+        # The second language offered once "I also dictate in other languages" is
+        # on. Empty means the main language is pinned on its own (#779).
+        "simple_second_language": "",
+        # Whether the Advanced island under the simple questions is left open.
+        "show_advanced": False,
+        "parakeet_model_size": "v3-european",  # Parakeet TDT 0.6B v3 (25 European languages)
+        "faster_whisper_model_size": "tiny",  # Default model for faster-whisper engine
+        "vad_sensitivity": 3,  # Voice Activity Detection sensitivity (1-5)
+        "silence_timeout": 2.0,  # Seconds of silence before stopping
+        "stop_sound_guard_ms": 200,  # Small tail trim to avoid the stop sound without clipping speech
+        "voice_commands_enabled": None,  # None = auto (enabled for VOSK, disabled for Whisper)
+        "remote_api_url": "",  # Remote speech recognition server URL (e.g. http://192.168.1.100:8080)
+        "remote_api_key": "",  # Remote server API key (optional)
+        "remote_api_endpoint": "/inference",  # Remote server API endpoint format
+        "remote_api_model": "whisper-1",  # Model name sent to compatible remote APIs
+    },
+    "audio": {
+        "device_index": None,  # Audio input device index (None for system default)
+        "device_name": None,  # Saved device name for display/reference
+    },
+    "sound_effects": {
+        "enabled": True,  # Master mute for start/stop/error cues
+        "tone": "voca",  # Family catalog id; missing/unknown also resolve to voca
+    },
+    # Off by default so an upgrade does not change the user's speaker volume.
+    "playback_duck": {
+        "enabled": False,  # Lower the default sink while the microphone is open
+        "percent": 20,  # Percent of the current volume; 0 is silent
+    },
+    "shortcuts": {
+        "toggle_recognition": "right_alt+right_alt",
+        "mode": "push_to_talk",  # "toggle" or "push_to_talk"
+        # When True, the internal evdev/pynput listener is not started; activation
+        # comes in over D-Bus instead (e.g. a KDE Plasma global shortcut running
+        # `vocalinux --toggle`). Avoids /dev/input access and the input group.
+        "disable_internal_hotkey": False,
+        # Pure-modifier gestures: "ctrl+ctrl", "alt+alt", "shift+shift" (and
+        # left_/right_ variants) — double-tap (toggle) or hold (push_to_talk).
+        # Modifier+key combos are also supported, e.g. "alt+r", "ctrl+alt+r",
+        # "super+space" — press (toggle) or hold (push_to_talk).
+        # Per-language shortcuts (#805): each {"shortcut", "language"} entry
+        # starts dictation in that catalog language for one utterance.
+        "language_shortcuts": [],
+    },
+    "ui": {
+        "start_minimized": False,
+        "show_notifications": True,
+        "show_missing_tray_warning": True,
+        "show_overlay": True,  # Floating on-screen dictation indicator
+    },
+    "general": {
+        "autostart": False,
+        "first_run": True,
+    },
+    "auto_pause": {
+        # When enabled, unload the speech model while any listed process is running
+        # so games/apps can use full CPU/GPU/RAM. Model reloads when they exit.
+        "enabled": False,
+        "apps": [],  # Process/executable basenames, e.g. ["overwatch", "steam"]
+        "poll_interval_seconds": 5,  # How often to scan running processes
+    },
+    "model_keepalive": {
+        # Opt-in idle unload so hybrid-GPU laptops can release VRAM/Vulkan and
+        # let the dGPU sleep. Next dictation lazy-reloads the model (cold start).
+        "enabled": False,
+        "idle_timeout_seconds": 300,  # 5 minutes when enabled
+        "buffer_during_reload": False,  # Record while the idle model loads
+    },
+    "text_injection": {
+        "copy_to_clipboard": False,  # Disabled by default; users can enable in Settings
+        "auto_capitalize": True,  # Capitalize first letter of each sentence
+        # Append a trailing space after each completed transcription segment so
+        # the next dictation session (push-to-talk / toggle) continues cleanly
+        # without glueing onto the previous sentence ("Hello.This").
+        "append_trailing_space": True,
+        # Clipboard-paste chord: auto-detect terminals, or force Ctrl+V /
+        # Ctrl+Shift+V when a nested terminal panel is not detected.
+        "paste_shortcut": "auto",
+        # Text-injection backend: "auto" autodetects, or pin "ibus"/"wtype"/
+        # "ydotool"/"xdotool" when autodetection is wrong (#476).
+        # VOCALINUX_FORCE_BACKEND overrides this for a single run.
+        "backend": "auto",
+        # Route dictation into the in-app Dictation Pad window instead of
+        # injecting into other apps — the Wayland-safe fallback (#726).
+        "dictate_to_pad": False,
+    },
+    "history": {
+        "enabled": True,  # Keep recent dictation snippets in the tray menu
+        "max_items": 10,  # How many snippets to retain
+        # Also save snippets to $XDG_DATA_HOME/vocalinux/history.jsonl so they
+        # survive restarts. Off by default: dictated text must not silently
+        # accumulate on disk unless the user asks for it (#758).
+        "persist": False,
+    },
+    "post_processing": {
+        "script_path": "",  # Path to executable; empty = disabled
+    },
+    "dictionary": {
+        # Preserve the custom-dictionary contract used by the accessibility scanner.
+        "enabled": False,
+        "file_path": os.path.join(CONFIG_DIR, "dictionary.txt"),
+        "max_words": 200,
+    },
+    "advanced": {
+        "power_user_mode": False,
+        "debug_logging": False,
+        "wayland_mode": False,
+        "whispercpp_no_timestamps": True,
+        "whispercpp_no_context": True,
+        "whispercpp_initial_prompt": "",
+        "whispercpp_language_candidates": "",
+        "whispercpp_temperature": 0.0,
+        "whispercpp_temperature_inc": -1.0,
+        "whispercpp_entropy_thold": 2.4,
+        "whispercpp_logprob_thold": -1.0,
+        "whispercpp_no_speech_thold": 0.6,
+        "whispercpp_n_threads": 0,  # 0 = auto-detect optimal thread count; set to override
+        "whispercpp_gpu_device": None,  # None = auto-select discrete GPU; int = specific device index
+    },
+    "updates": {
+        # "stable" follows GitHub /releases/latest; "nightly" follows nightly-YYYY-MM-DD tags.
+        "channel": "stable",
+        # Tag last announced via desktop notification (avoids re-notifying every 6h).
+        "last_notified_version": "",
+    },
+    # Outbound proxy for model downloads and update checks (#655). "system"
+    # (the default) is the behavior the app always had: the *_proxy
+    # environment variables apply, with the GNOME org.gnome.system.proxy
+    # manual config as a fallback. "off" forces a direct connection and
+    # "manual" uses the fields below. The password sits in config.json in
+    # plaintext, the same as speech_recognition.remote_api_key.
+    "proxy": {
+        "mode": "system",  # "off", "system", or "manual"
+        "protocol": "socks5",  # "socks5" or "https" (HTTP CONNECT proxy)
+        "host": "",
+        "port": 1080,
+        "username": "",
+        "password": "",
+    },
+    # Optional local VocaGateway (podman/docker). Never flips the default engine.
+    "gateway_embed": {
+        "lan_publish": False,  # VOCAGATEWAY_PUBLISH_HOST=0.0.0.0 when True (Phone on LAN)
+    },
+}
+
+
+def _is_valid_language_shortcut(shortcut: Any) -> bool:
+    """Return whether ``shortcut`` parses as a bindable shortcut string.
+
+    Imported lazily: config_manager loads before the GTK stack in several
+    entry points, and the keyboard package must not become a hard dependency
+    of configuration access.
+    """
+    from .keyboard_backends import is_valid_shortcut
+
+    return isinstance(shortcut, str) and is_valid_shortcut(shortcut)
+
+
+def normalize_language_shortcuts(raw: Any) -> list[dict[str, str]]:
+    """Normalize a ``shortcuts.language_shortcuts`` value (#805).
+
+    Returns ``[{"shortcut": ..., "language": ...}]`` in stored order. Entries
+    that are not objects, lack a valid shortcut, or name a language outside the
+    catalog are dropped; the first binding wins for a duplicated shortcut.
+    ``"auto"`` stays valid (dictate with per-utterance detection); ``"layout"``
+    is not a catalog id and cannot be bound.
+    """
+    if not isinstance(raw, list):
+        return []
+
+    entries: list[dict[str, str]] = []
+    seen_shortcuts: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        shortcut = item.get("shortcut")
+        language = item.get("language")
+        if not isinstance(shortcut, str) or not isinstance(language, str):
+            continue
+        shortcut = shortcut.strip().lower()
+        language = language.strip()
+        if language not in SUPPORTED_LANGUAGES:
+            continue
+        if not _is_valid_language_shortcut(shortcut):
+            continue
+        if shortcut in seen_shortcuts:
+            continue
+        seen_shortcuts.add(shortcut)
+        entries.append({"shortcut": shortcut, "language": language})
+    return entries
+
+
+def _multilingual_sibling(model_name: str) -> str:
+    """Drop the ``.en`` infix so medium.en / medium.en-q5_0 become multilingual."""
+    if ".en" not in model_name:
+        return model_name
+    stripped = model_name.replace(".en", "", 1)
+    if stripped in WHISPERCPP_MODEL_INFO:
+        return stripped
+    size = get_whispercpp_model_size(model_name)
+    derived = default_variant_for_size(size, language_is_english=False)
+    return derived if derived in WHISPERCPP_MODEL_INFO else model_name
+
+
+def resolve_whispercpp_variant(
+    saved_model: str,
+    pinned_variant: str,
+    language_id: str,
+    *,
+    prefer_on_disk: bool = False,
+) -> str:
+    """Resolve the loadable whisper.cpp id for a saved size, pin, and language.
+
+    A pin outranks everything except an English-only id when the language is not
+    English: those weights cannot transcribe Polish (or auto-detect), so the
+    multilingual sibling of the same size is used instead. When unpinned, a
+    plain ``{size}.en`` id is the language-derived default, not a leftover
+    specialization. True leftover specializations (turbo, versioned large,
+    quantized multilingual) are still honoured.
+
+    With ``prefer_on_disk`` a language-derived result stands down for a
+    downloaded same-size weight instead of forcing a fresh download (#916).
+    Pinned and leftover specialization picks are explicit choices: they are
+    returned verbatim and never swapped.
+    """
+    # The "layout" sentinel is deliberately not in the catalog, so it reads as
+    # non-English here and derives the multilingual variant -- which is what a
+    # mode that can land on any language needs (#821).
+    language_is_english = SUPPORTED_LANGUAGES.get(language_id, {}).get("whisper") == "en"
+
+    def stand_in(variant: str) -> str:
+        # Only language-derived results reach this helper; an explicit pick is
+        # returned verbatim below and never comes through here.
+        if not prefer_on_disk:
+            return variant
+        return on_disk_stand_in(variant, get_whispercpp_model_size(variant), language_is_english)
+
+    pinned = pinned_variant.lower() if isinstance(pinned_variant, str) else ""
+    if pinned in WHISPERCPP_MODEL_INFO and is_dictation_model(pinned):
+        if not language_is_english and is_english_only_whispercpp_model(pinned):
+            # English-only weights cannot serve the language, so the pin is
+            # already overridden; the multilingual sibling is language-derived
+            # and a downloaded same-size weight may stand in for it.
+            return stand_in(_multilingual_sibling(pinned))
+        return pinned
+
+    saved = saved_model.lower() if isinstance(saved_model, str) else ""
+    size = saved if saved in WHISPERCPP_MODEL_SIZES else get_whispercpp_model_size(saved or "tiny")
+    if size not in WHISPERCPP_MODEL_SIZES:
+        size = get_whispercpp_model_size("tiny")
+
+    # Honour true leftover specializations, but not a plain English-only id.
+    if (
+        saved in WHISPERCPP_MODEL_INFO
+        and is_dictation_model(saved)
+        and saved not in WHISPERCPP_MODEL_SIZES
+        and saved != f"{size}.en"
+    ):
+        if not language_is_english and is_english_only_whispercpp_model(saved):
+            return stand_in(_multilingual_sibling(saved))
+        return saved
+
+    derived = default_variant_for_size(size, language_is_english)
+    if derived in WHISPERCPP_MODEL_INFO:
+        return stand_in(derived)
+    return stand_in(
+        saved if saved in WHISPERCPP_MODEL_INFO and is_dictation_model(saved) else "tiny"
+    )
+
+
+class ConfigManager:
+    """
+    Manager for user configuration settings.
+
+    This class provides methods for loading, saving, and accessing user
+    preferences for the application.
+    """
+
+    # Valid configuration sections — prevents accidental typos from silently
+    # creating new top-level config keys.
+    _VALID_SECTIONS = frozenset(DEFAULT_CONFIG.keys())
+
+    def __init__(self):
+        """Initialize the configuration manager."""
+        self.config = copy.deepcopy(DEFAULT_CONFIG)
+        # The effective backend at load/save time.  It lets save_config tell an
+        # intentional in-process change from a hand edit made on disk later.
+        self._backend_snapshot: Any = DEFAULT_TEXT_INJECTION_BACKEND
+        self._text_injection_snapshot = copy.deepcopy(DEFAULT_CONFIG["text_injection"])
+        self._ensure_config_dir()
+        self.load_config()
+
+    def _ensure_config_dir(self):
+        """Ensure the configuration directory exists."""
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+
+    def _seed_language_from_system(self) -> None:
+        """Start a first run from the language the system points at (#777).
+
+        Only applied when there is no config file yet, so a saved choice — including
+        a deliberate "auto" — is never overwritten. When nothing decisive is found
+        the packaged default stays in place.
+        """
+        try:
+            from ..utils.system_language import detect_system_language
+            from ..utils.vosk_model_info import SUPPORTED_LANGUAGES
+        except ImportError as exc:  # pragma: no cover - defensive
+            logger.debug(f"Language detection unavailable: {exc}")
+            return
+
+        try:
+            detected = detect_system_language(SUPPORTED_LANGUAGES)
+        except Exception as exc:  # pragma: no cover - detection must never block startup
+            logger.debug(f"Language detection failed: {exc}")
+            return
+
+        if not detected:
+            return
+
+        self.config.setdefault("speech_recognition", {})["language"] = detected
+        logger.info(f"First run: starting with language {detected}")
+
+    def load_config(self):
+        """
+        Load configuration from the config file.
+
+        If the config file doesn't exist, the default configuration is used.
+        """
+        if not os.path.exists(CONFIG_FILE):
+            logger.info(f"Config file not found at {CONFIG_FILE}. Using defaults.")
+            self._seed_language_from_system()
+            return
+
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                user_config = json.load(f)
+
+            valid_backend_shape, backend = _backend_from_config(user_config)
+            if not isinstance(user_config, dict):
+                logger.error("Failed to load config: expected a JSON object")
+                return
+            if not valid_backend_shape:
+                # Keep unrelated valid settings, but do not replace the default
+                # text-injection mapping with a hand-edited scalar or list.
+                logger.error("Failed to load text_injection: expected a JSON object")
+                user_config = copy.deepcopy(user_config)
+                user_config.pop("text_injection", None)
+            self._backend_snapshot = backend
+
+            # Check if migration is needed BEFORE merging with defaults
+            needs_migration = self._check_needs_migration(user_config)
+
+            # Update the default config with user settings
+            self._update_dict_recursive(self.config, user_config)
+            self._text_injection_snapshot = copy.deepcopy(self.config["text_injection"])
+            logger.info(f"Loaded configuration from {CONFIG_FILE}")
+
+            # Migrate old config format if needed
+            if needs_migration:
+                self._migrate_config(user_config)
+
+            self._migrate_shortcuts_config(user_config)
+
+        except (OSError, ValueError) as e:
+            logger.error(f"Failed to load config: {e}")
+
+    def _backend_on_disk(self) -> tuple[bool, Any, Any]:
+        """Read only backend state needed to protect a hand edit during save."""
+        if not os.path.exists(CONFIG_FILE):
+            return True, DEFAULT_TEXT_INJECTION_BACKEND, _NO_PRESERVED_TEXT_INJECTION_SECTION
+
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                disk_config = json.load(f)
+        except (OSError, ValueError) as e:
+            logger.error(f"Failed to save config: could not read existing config: {e}")
+            return False, DEFAULT_TEXT_INJECTION_BACKEND, _NO_PRESERVED_TEXT_INJECTION_SECTION
+
+        if not isinstance(disk_config, dict):
+            logger.error("Failed to save config: existing config is not a JSON object")
+            return False, DEFAULT_TEXT_INJECTION_BACKEND, _NO_PRESERVED_TEXT_INJECTION_SECTION
+
+        valid_backend_shape, backend = _backend_from_config(disk_config)
+        if not valid_backend_shape:
+            # A valid top-level config can still save unrelated settings. Keep
+            # the malformed section verbatim unless this process intentionally
+            # changed its backend, in which case it is explicitly repairing it.
+            return True, DEFAULT_TEXT_INJECTION_BACKEND, disk_config["text_injection"]
+        return True, backend, _NO_PRESERVED_TEXT_INJECTION_SECTION
+
+    def _check_needs_migration(self, user_config: dict) -> bool:
+        """Check if the user config needs migration to add per-engine model sizes."""
+        sr_config = user_config.get("speech_recognition", {})
+        # Need migration if we have model_size but not the per-engine keys
+        return "model_size" in sr_config and (
+            "vosk_model_size" not in sr_config
+            or "whisper_model_size" not in sr_config
+            or "whisper_cpp_model_size" not in sr_config
+        )
+
+    def _migrate_config(self, user_config: dict):
+        """Migrate old config formats to the current format."""
+        sr_config = self.config.get("speech_recognition", {})
+        user_sr_config = user_config.get("speech_recognition", {})
+
+        # Get the current engine and model from the user's original config
+        current_engine = user_sr_config.get("engine", "vosk")
+        current_model = user_sr_config.get("model_size", "small")
+
+        # Set the per-engine model sizes based on the user's original config
+        if "vosk_model_size" not in user_sr_config:
+            # If current engine is vosk, use the current model; otherwise use default
+            sr_config["vosk_model_size"] = current_model if current_engine == "vosk" else "small"
+            logger.info(f"Migrated vosk_model_size to: {sr_config['vosk_model_size']}")
+
+        if "whisper_model_size" not in user_sr_config:
+            # If current engine is whisper, use the current model; otherwise use default
+            sr_config["whisper_model_size"] = (
+                current_model if current_engine == "whisper" else "tiny"
+            )
+            logger.info(f"Migrated whisper_model_size to: {sr_config['whisper_model_size']}")
+
+        if "whisper_cpp_model_size" not in user_sr_config:
+            # DEFAULT_CONFIG already carries whisper_cpp_model_size, so the
+            # generic fallback in get_model_size_for_engine() never fires for
+            # this engine. Without this copy a config that only stores
+            # model_size would silently start on the default instead.
+            sr_config["whisper_cpp_model_size"] = (
+                current_model if current_engine == "whisper_cpp" else "tiny"
+            )
+            logger.info(
+                f"Migrated whisper_cpp_model_size to: {sr_config['whisper_cpp_model_size']}"
+            )
+
+        self.save_config()
+        logger.info("Config migrated to new per-engine model format")
+
+    def _migrate_shortcuts_config(self, user_config: Optional[dict] = None):
+        """Migrate deprecated shortcuts and preserve legacy defaults when omitted."""
+        shortcuts_config = self.config.get("shortcuts")
+        if not isinstance(shortcuts_config, dict):
+            # A hand-edited config can hold a scalar here; rebuild the section
+            # so the migrations below and later readers find a dict.
+            shortcuts_config = {}
+            self.config["shortcuts"] = shortcuts_config
+        shortcut = shortcuts_config.get("toggle_recognition")
+        changed = False
+
+        if shortcut == "super+super":
+            shortcuts_config["toggle_recognition"] = "ctrl+ctrl"
+            changed = True
+            logger.info("Migrated deprecated super+super shortcut to ctrl+ctrl")
+
+        # Existing config files that never stored shortcuts (or only stored the
+        # key) previously inherited ctrl+ctrl + toggle from DEFAULT_CONFIG.
+        # Pin those historical defaults so the new first-install defaults do
+        # not silently change behavior for upgrades.
+        if user_config is not None:
+            user_shortcuts = user_config.get("shortcuts")
+            if not isinstance(user_shortcuts, dict):
+                shortcuts_config["toggle_recognition"] = "ctrl+ctrl"
+                shortcuts_config["mode"] = "toggle"
+                changed = True
+                logger.info(
+                    "Migrated missing shortcuts section to legacy ctrl+ctrl toggle defaults"
+                )
+            elif "mode" not in user_shortcuts:
+                shortcuts_config["mode"] = "toggle"
+                if "toggle_recognition" not in user_shortcuts:
+                    shortcuts_config["toggle_recognition"] = "ctrl+ctrl"
+                changed = True
+                logger.info("Migrated missing shortcuts.mode to toggle for existing config")
+
+        if changed:
+            self.save_config()
+
+    def save_config(self):
+        """Save the current configuration, preserving an unchanged hand-edited backend."""
+        try:
+            # Ensure directory exists before writing
+            self._ensure_config_dir()
+            config_to_save = copy.deepcopy(self.config)
+            text_injection = self.config.get("text_injection")
+            backend_written = False
+            if isinstance(text_injection, dict):
+                disk_ok, disk_backend, preserved_section = self._backend_on_disk()
+                if not disk_ok:
+                    return False
+                in_memory_backend = text_injection.get("backend", DEFAULT_TEXT_INJECTION_BACKEND)
+                backend_snapshot = getattr(
+                    self, "_backend_snapshot", DEFAULT_TEXT_INJECTION_BACKEND
+                )
+                backend_changed = in_memory_backend != backend_snapshot
+                text_injection_changed = text_injection != self._text_injection_snapshot
+
+                if (
+                    preserved_section is not _NO_PRESERVED_TEXT_INJECTION_SECTION
+                    and not text_injection_changed
+                ):
+                    config_to_save["text_injection"] = copy.deepcopy(preserved_section)
+                else:
+                    backend_to_save = in_memory_backend if backend_changed else disk_backend
+                    # Do not mutate live state before json.dump succeeds. A failed
+                    # write must not make an external edit look like our saved state.
+                    config_to_save["text_injection"]["backend"] = backend_to_save
+                    backend_written = True
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(config_to_save, f, indent=4)
+
+            if isinstance(text_injection, dict) and backend_written:
+                text_injection["backend"] = backend_to_save
+                self._backend_snapshot = backend_to_save
+            if isinstance(text_injection, dict):
+                self._text_injection_snapshot = copy.deepcopy(text_injection)
+
+            logger.info(f"Saved configuration to {CONFIG_FILE}")
+            return True
+
+        except (OSError, TypeError) as e:
+            logger.error(f"Failed to save config: {e}")
+            return False
+
+    def save_settings(self):
+        """Save the current configuration to the config file.
+
+        .. deprecated:: Use :meth:`save_config` instead.
+        """
+        import warnings
+
+        warnings.warn(
+            "save_settings() is deprecated, use save_config() instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.save_config()
+
+    def get(self, section: str, key: str, default: Any = None) -> Any:
+        """
+        Get a configuration value.
+
+        Args:
+            section: The configuration section
+            key: The configuration key within the section
+            default: The default value to return if the key doesn't exist
+
+        Returns:
+            The configuration value
+        """
+        try:
+            return self.config[section][key]
+        except KeyError:
+            return default
+
+    # -- Typed accessors -------------------------------------------------------
+    # These provide compile-time type safety for commonly accessed config values,
+    # avoiding the need for callers to cast the Any return from get().
+
+    def get_str(self, section: str, key: str, default: str = "") -> str:
+        """Get a configuration value as a string."""
+        value = self.get(section, key, default)
+        return str(value) if value is not None else default
+
+    def get_bool(self, section: str, key: str, default: bool = False) -> bool:
+        """Get a configuration value as a boolean."""
+        value = self.get(section, key, default)
+        return bool(value)
+
+    def get_int(self, section: str, key: str, default: int = 0) -> int:
+        """Get a configuration value as an integer."""
+        value = self.get(section, key, default)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def get_float(self, section: str, key: str, default: float = 0.0) -> float:
+        """Get a configuration value as a float."""
+        value = self.get(section, key, default)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def get_optional_int(
+        self, section: str, key: str, default: Optional[int] = None
+    ) -> Optional[int]:
+        """Get a configuration value as an optional integer (allows None)."""
+        value = self.get(section, key, default)
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def set(self, section: str, key: str, value: Any) -> bool:
+        """
+        Set a configuration value.
+
+        Args:
+            section: The configuration section (must be a known section)
+            key: The configuration key within the section
+            value: The value to set
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            if section not in self.config:
+                if section not in self._VALID_SECTIONS:
+                    logger.warning(
+                        f"Unknown config section '{section}' — valid sections: "
+                        f"{sorted(self._VALID_SECTIONS)}"
+                    )
+                self.config[section] = {}
+
+            self.config[section][key] = value
+            return True
+
+        except (KeyError, TypeError) as e:
+            logger.error(f"Failed to set config value: {e}")
+            return False
+
+    def get_settings(self) -> dict[str, Any]:
+        """Get the entire configuration dictionary."""
+        return self.config
+
+    def get_model_size_for_engine(self, engine: str) -> str:
+        """Return the model id the engine should load for ``engine``.
+
+        For whisper.cpp an unpinned size is resolved against the saved
+        language so a stored bare size still loads ``{size}.en`` under English,
+        and a leftover plain ``{size}.en`` can re-derive after a language change.
+        """
+        sr_config = self.config.get("speech_recognition", {})
+
+        # Try engine-specific model size first
+        engine_key = f"{engine.lower()}_model_size"
+        if engine_key in sr_config:
+            saved = sr_config[engine_key]
+        else:
+            # Fall back to generic model_size for backward compatibility
+            saved = sr_config.get("model_size", "small" if engine == "vosk" else "tiny")
+
+        if engine.lower() != "whisper_cpp":
+            return saved
+
+        # Unpinned configs store the bare size; the engine still needs the
+        # language-derived loadable id (and leftover ``{size}.en`` must not
+        # block a later language change). The derived default stands down for
+        # a downloaded same-size weight so headless startup does not demand a
+        # sibling download when a usable model is already on disk (#916).
+        return resolve_whispercpp_variant(
+            saved,
+            self.get_model_variant_for_engine(engine),
+            sr_config.get("language", "auto"),
+            prefer_on_disk=True,
+        )
+
+    def set_model_size_for_engine(self, engine: str, model_size: str):
+        """Set the model size for a specific engine.
+
+        Args:
+            engine: The engine name ("vosk" or "whisper")
+            model_size: The model size to save
+        """
+        if "speech_recognition" not in self.config:
+            self.config["speech_recognition"] = {}
+
+        engine_key = f"{engine.lower()}_model_size"
+        self.config["speech_recognition"][engine_key] = model_size
+        # Also update the generic model_size for backward compatibility
+        self.config["speech_recognition"]["model_size"] = model_size
+        logger.info(f"Set {engine} model size to: {model_size}")
+
+    def get_model_variant_for_engine(self, engine: str) -> str:
+        """Return the variant the user pinned for an engine, or "" when unpinned.
+
+        Only whisper.cpp has variants. A pinned value means the user chose that
+        specialization in Settings; an empty value means the variant should be
+        derived from the selected language.
+        """
+        sr_config = self.config.get("speech_recognition", {})
+        return sr_config.get(f"{engine.lower()}_model_variant", "") or ""
+
+    def set_model_variant_for_engine(self, engine: str, model_variant: str) -> None:
+        """Pin the variant the user chose for an engine ("" clears the pin)."""
+        if "speech_recognition" not in self.config:
+            self.config["speech_recognition"] = {}
+
+        self.config["speech_recognition"][f"{engine.lower()}_model_variant"] = model_variant
+        logger.info(f"Set {engine} model variant to: {model_variant!r}")
+
+    def is_voice_commands_enabled(self) -> bool:
+        """Check if voice commands should be enabled.
+
+        Returns:
+            True if voice commands should be enabled, False otherwise.
+            If voice_commands_enabled is None (auto), returns True for VOSK,
+            False for Whisper engines.
+        """
+        sr_config = self.config.get("speech_recognition", {})
+        enabled = sr_config.get("voice_commands_enabled")
+
+        if enabled is None:
+            # Auto mode: enabled for VOSK, disabled for Whisper engines
+            engine = sr_config.get("engine", "whisper_cpp")
+            return engine == "vosk"
+
+        return enabled
+
+    def update_speech_recognition_settings(self, settings: dict[str, Any]) -> None:
+        """Update multiple speech recognition settings at once."""
+        if "speech_recognition" not in self.config:
+            self.config["speech_recognition"] = {}
+
+        # Handle engine-specific model size updates
+        if "engine" in settings and "model_size" in settings:
+            engine = settings["engine"]
+            model_size = settings["model_size"]
+            # Unpinned whisper.cpp: persist the bare size so a later language
+            # change can re-derive. Callers still pass the full loadable id as
+            # settings["model_size"] for reconfigure/download.
+            if engine == "whisper_cpp" and not settings.get("model_variant"):
+                model_size = get_whispercpp_model_size(model_size)
+            self.set_model_size_for_engine(engine, model_size)
+
+        # Empty means unpinned (derive from language). A non-empty value is a
+        # deliberate specialization, including multilingual while English.
+        if "engine" in settings and "model_variant" in settings:
+            self.set_model_variant_for_engine(settings["engine"], settings["model_variant"])
+
+        # Update remaining keys. model_size / model_variant were already applied
+        # through the engine-specific setters above (including bare-size persistence
+        # for an unpinned whisper.cpp selection); writing them again would put the
+        # full derived id back into the generic model_size key.
+        for key, value in settings.items():
+            if key in ("model_size", "model_variant"):
+                continue
+            self.config["speech_recognition"][key] = value
+        logger.info(f"Updated speech recognition settings: {settings}")
+
+    def is_sound_effects_enabled(self) -> bool:
+        """Check if sound effects are enabled."""
+        return bool(self.config.get("sound_effects", {}).get("enabled", True))
+
+    def set_sound_effects_enabled(self, enabled: bool):
+        """Enable or disable sound effects."""
+        if "sound_effects" not in self.config:
+            self.config["sound_effects"] = {}
+        self.config["sound_effects"]["enabled"] = enabled
+
+    def get_sound_effects_tone(self) -> str:
+        """Return the selected dictation tone id (voca when unset or unknown)."""
+        return normalize_sound_effect_tone(self.config.get("sound_effects", {}).get("tone"))
+
+    def set_sound_effects_tone(self, tone: str):
+        """Save a catalog tone id. Unknown ids are stored as voca."""
+        if "sound_effects" not in self.config:
+            self.config["sound_effects"] = {}
+        self.config["sound_effects"]["tone"] = normalize_sound_effect_tone(tone)
+
+    def is_playback_duck_enabled(self) -> bool:
+        """Whether other audio is lowered while dictating. Off when unset."""
+        enabled = self.config.get("playback_duck", {}).get("enabled", False)
+        return enabled if isinstance(enabled, bool) else False
+
+    def set_playback_duck_enabled(self, enabled: bool) -> None:
+        """Enable or disable lowering other audio while dictating."""
+        if "playback_duck" not in self.config:
+            self.config["playback_duck"] = {}
+        self.config["playback_duck"]["enabled"] = bool(enabled)
+
+    def get_playback_duck_percent(self) -> int:
+        """Percent of the current volume to use while dictating, clamped 0–100."""
+        return clamp_playback_duck_percent(
+            self.config.get("playback_duck", {}).get("percent", DEFAULT_PLAYBACK_DUCK_PERCENT)
+        )
+
+    def set_playback_duck_percent(self, percent: int) -> None:
+        """Save the duck level. Values outside 0–100, and non-numbers, are clamped."""
+        if "playback_duck" not in self.config:
+            self.config["playback_duck"] = {}
+        self.config["playback_duck"]["percent"] = clamp_playback_duck_percent(percent)
+
+    def get_paste_shortcut(self) -> str:
+        """Return the clipboard-paste shortcut id (auto when unset or unknown)."""
+        return normalize_paste_shortcut(self.config.get("text_injection", {}).get("paste_shortcut"))
+
+    def set_paste_shortcut(self, shortcut: str) -> None:
+        """Save a paste-shortcut id. Unknown ids are stored as auto."""
+        if "text_injection" not in self.config:
+            self.config["text_injection"] = {}
+        self.config["text_injection"]["paste_shortcut"] = normalize_paste_shortcut(shortcut)
+
+    def get_language_shortcuts(self) -> list[dict[str, str]]:
+        """Return validated ``[{"shortcut", "language"}]`` bindings (#805).
+
+        Malformed or stale entries (unknown language, unparsable shortcut)
+        never reach the listeners: they are filtered out here.
+        """
+        shortcuts = self.config.get("shortcuts")
+        if not isinstance(shortcuts, dict):
+            return []
+        return normalize_language_shortcuts(shortcuts.get("language_shortcuts"))
+
+    def set_language_shortcuts(self, entries: Any) -> None:
+        """Store per-language shortcut bindings after normalization (#805)."""
+        if not isinstance(self.config.get("shortcuts"), dict):
+            self.config["shortcuts"] = {}
+        self.config["shortcuts"]["language_shortcuts"] = normalize_language_shortcuts(entries)
+
+    def is_overlay_enabled(self) -> bool:
+        """Check if the floating dictation overlay is enabled (default True)."""
+        return self.get_bool("ui", "show_overlay", True)
+
+    def set_overlay_enabled(self, enabled: bool) -> None:
+        """Enable or disable the floating dictation overlay."""
+        self.set("ui", "show_overlay", bool(enabled))
+
+    def is_dictate_to_pad_enabled(self) -> bool:
+        """Check if dictation is routed into the in-app pad (default False)."""
+        return self.get_bool("text_injection", "dictate_to_pad", False)
+
+    def set_dictate_to_pad(self, enabled: bool) -> None:
+        """Route dictation into the in-app Dictation Pad instead of injecting."""
+        self.set("text_injection", "dictate_to_pad", bool(enabled))
+
+    def _update_dict_recursive(self, target: dict, source: dict):
+        """
+        Update a dictionary recursively.
+
+        Args:
+            target: The target dictionary to update
+            source: The source dictionary with updates
+        """
+        for key, value in source.items():
+            if key in target and isinstance(target[key], dict) and isinstance(value, dict):
+                self._update_dict_recursive(target[key], value)
+            else:
+                target[key] = value
+
+
+# The one instance the application should share. Every ConfigManager caches the
+# whole config in memory and save_config() writes that whole cache back, so two
+# live instances silently revert each other's saves — the second save wins with
+# whatever stale values it still holds. Tests may still construct ConfigManager
+# directly; application code goes through this accessor.
+_shared_instance: Optional[ConfigManager] = None
+_shared_instance_lock = threading.Lock()
+
+
+def peek_shared_config_manager() -> Optional[ConfigManager]:
+    """Return the process-wide ConfigManager, or None if nothing has created it.
+
+    Callers that only need a setting during dictation use this so a missing
+    config file does not construct a manager (that seeds language and can
+    shell out) just to discover the packaged default.
+    """
+    return _shared_instance
+
+
+def get_shared_config_manager() -> ConfigManager:
+    """Return the process-wide ConfigManager, creating it on first use.
+
+    Creation is locked: __init__ does makedirs() plus a full load_config(),
+    so two threads racing the first call would otherwise each build their own
+    instance and reintroduce the very overwrite this accessor prevents.
+    """
+    global _shared_instance
+    if _shared_instance is None:
+        with _shared_instance_lock:
+            if _shared_instance is None:
+                _shared_instance = ConfigManager()
+    return _shared_instance

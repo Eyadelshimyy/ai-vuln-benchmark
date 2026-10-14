@@ -1,0 +1,259 @@
+"""Programmatic icons used by UltraView's floating narrow rail."""
+from __future__ import annotations
+
+import pytest
+
+from mf4_analyzer.ui_kit.icons import Icons
+
+_DRAW_SUBTOOL_FACTORIES = (
+    "ultraview_draw_pen",
+    "ultraview_draw_highlighter",
+    "ultraview_draw_eraser",
+    "ultraview_draw_lasso",
+)
+
+
+# Every icon-only UltraView surface can render at the compact 20px target or
+# the desktop 24px target.  These must be independently rasterised, rather
+# than relying on Qt to upscale the old 20px source.
+_ULTRAVIEW_ICON_FACTORIES = (
+    "ultraview_library",
+    "ultraview_pin",
+    "ultraview_layout",
+    "ultraview_free_grid",
+    "ultraview_filter",
+    "ultraview_unplaced",
+    "ultraview_author_select",
+    "ultraview_author_laser",
+    "ultraview_author_sticky",
+    "ultraview_author_text",
+    "ultraview_author_shapes",
+    "ultraview_author_draw",
+    "ultraview_author_connector",
+    "ultraview_draw_pen",
+    "ultraview_draw_highlighter",
+    "ultraview_draw_eraser",
+    "ultraview_draw_lasso",
+    "ultraview_display",
+    "ultraview_presentation",
+    "ultraview_overview",
+    "ultraview_fit",
+    "ultraview_fit_to_image",
+    "ultraview_reset_zoom",
+    "ultraview_zoom_out",
+    "ultraview_zoom_in",
+    "ultraview_help",
+    "ultraview_add",
+    "ultraview_open_source",
+    "ultraview_remove_from_board",
+    "ultraview_sync",
+    "ultraview_move_to_tray",
+)
+
+
+def _icon_image(icon, logical_size=20):
+    pixmap = icon.pixmap(logical_size, logical_size)
+    assert not pixmap.isNull()
+    image = pixmap.toImage()
+    scale = image.width() / float(logical_size)
+    return image, scale
+
+
+def _ink_bbox(image, min_alpha=1):
+    min_x, min_y = image.width(), image.height()
+    max_x, max_y = -1, -1
+    for y in range(image.height()):
+        for x in range(image.width()):
+            if image.pixelColor(x, y).alpha() >= min_alpha:
+                min_x = min(min_x, x)
+                min_y = min(min_y, y)
+                max_x = max(max_x, x)
+                max_y = max(max_y, y)
+    return min_x, min_y, max_x, max_y
+
+
+def _alpha_mask(image, min_alpha=1):
+    return bytes(
+        1 if image.pixelColor(x, y).alpha() >= min_alpha else 0
+        for y in range(image.height())
+        for x in range(image.width())
+    )
+
+
+@pytest.mark.parametrize("factory_name", _ULTRAVIEW_ICON_FACTORIES)
+def test_ultraview_icons_ship_native_compact_and_desktop_rasters(qapp, factory_name):
+    """24px rail targets must not scale the old 20px source bitmap."""
+    icon = getattr(Icons, factory_name)()
+    widths = {size.width() for size in icon.availableSizes()}
+
+    # UltraView sources always include 20px, 24px, and Draw's enlarged 28px
+    # logical variants at the helper's minimum 2x DPR.
+    assert {40, 48, 56} <= widths, (factory_name, widths)
+
+
+@pytest.mark.parametrize("factory_name", _ULTRAVIEW_ICON_FACTORIES)
+@pytest.mark.parametrize(("logical_size", "minimum_long_axis"), ((20, 15.0), (24, 17.0)))
+def test_ultraview_icons_use_a_readable_optical_ink_box(
+    qapp, factory_name, logical_size, minimum_long_axis
+):
+    """Icon-only controls need ~16px compact / ~18px desktop visible ink."""
+    icon = getattr(Icons, factory_name)()
+    image, scale = _icon_image(icon, logical_size)
+    min_x, min_y, max_x, max_y = _ink_bbox(image, min_alpha=24)
+    assert max_x >= min_x and max_y >= min_y, factory_name
+    width = (max_x - min_x + 1) / scale
+    height = (max_y - min_y + 1) / scale
+    assert max(width, height) >= minimum_long_axis, (
+        factory_name,
+        logical_size,
+        width,
+        height,
+    )
+
+
+@pytest.mark.parametrize(
+    "factory_name",
+    (
+        "ultraview_author_select",
+        "ultraview_author_laser",
+        "ultraview_author_sticky",
+        "ultraview_author_text",
+        "ultraview_author_shapes",
+        "ultraview_author_draw",
+        "ultraview_library",
+        "ultraview_layout",
+        "ultraview_free_grid",
+        "ultraview_filter",
+        "ultraview_unplaced",
+        "ultraview_display",
+        "ultraview_presentation",
+        "ultraview_overview",
+        "ultraview_fit",
+        "ultraview_fit_to_image",
+        "ultraview_reset_zoom",
+        "ultraview_zoom_out",
+        "ultraview_zoom_in",
+        "ultraview_help",
+        "ultraview_add",
+        "ultraview_open_source",
+        "ultraview_remove_from_board",
+        "ultraview_sync",
+        "ultraview_move_to_tray",
+        "ultraview_pin",
+        "ultraview_draw_pen",
+        "ultraview_draw_highlighter",
+        "ultraview_draw_eraser",
+        "ultraview_draw_lasso",
+    ),
+)
+def test_ultraview_narrow_rail_icons_render_as_real_qicons(qapp, factory_name):
+    """The icon-only chrome must not silently fall back to a text glyph."""
+    icon = getattr(Icons, factory_name)()
+    pixmap = icon.pixmap(20, 20)
+
+    assert not icon.isNull(), factory_name
+    assert not pixmap.isNull(), factory_name
+    image = pixmap.toImage()
+    assert any(
+        image.pixelColor(x, y).alpha() > 0
+        for x in range(image.width())
+        for y in range(image.height())
+    ), factory_name
+
+
+@pytest.mark.parametrize("factory_name", _DRAW_SUBTOOL_FACTORIES)
+def test_ultraview_draw_subtool_icons_are_opaque_qicons(qapp, factory_name):
+    icon = getattr(Icons, factory_name)()
+    image, _scale = _icon_image(icon)
+    assert not icon.isNull(), factory_name
+    assert any(
+        image.pixelColor(x, y).alpha() > 0
+        for x in range(image.width())
+        for y in range(image.height())
+    ), factory_name
+
+
+@pytest.mark.parametrize("factory_name", _DRAW_SUBTOOL_FACTORIES)
+def test_ultraview_draw_subtool_icons_do_not_clip_outer_ring(qapp, factory_name):
+    """Outer 2 logical pixels stay empty — the 3px inset must not clip."""
+    icon = getattr(Icons, factory_name)()
+    image, scale = _icon_image(icon)
+    inset = max(1, int(round(2 * scale)))
+    leaks = [
+        (x, y, image.pixelColor(x, y).alpha())
+        for y in range(image.height())
+        for x in range(image.width())
+        if (
+            x < inset
+            or y < inset
+            or x >= image.width() - inset
+            or y >= image.height() - inset
+        )
+        and image.pixelColor(x, y).alpha() != 0
+    ]
+    assert leaks == [], factory_name
+
+
+def test_ultraview_draw_subtool_icons_have_distinct_alpha_masks(qapp):
+    masks = []
+    for factory_name in _DRAW_SUBTOOL_FACTORIES:
+        icon = getattr(Icons, factory_name)()
+        image, _scale = _icon_image(icon)
+        masks.append(_alpha_mask(image))
+    assert len(set(masks)) == 4
+
+
+@pytest.mark.parametrize("size", (18, 20))
+@pytest.mark.parametrize(
+    "factory_name",
+    (
+        "ultraview_author_select",
+        "ultraview_author_laser",
+        "ultraview_author_sticky",
+        "ultraview_author_text",
+        "ultraview_author_shapes",
+        "ultraview_author_draw",
+    ),
+)
+def test_ultraview_author_icons_share_optical_ink_box(qapp, factory_name, size):
+    icon = getattr(Icons, factory_name)()
+    pixmap = icon.pixmap(size, size)
+    image = pixmap.toImage()
+    scale = image.width() / float(size)
+    min_x, min_y, max_x, max_y = _ink_bbox(image)
+    inset = 2 * scale
+    assert min_x >= inset - 1, (factory_name, size, min_x, inset)
+    assert min_y >= inset - 1, (factory_name, size, min_y, inset)
+    assert max_x < image.width() - inset + 1, (factory_name, size, max_x, inset)
+    assert max_y < image.height() - inset + 1, (factory_name, size, max_y, inset)
+    width = (max_x - min_x + 1) / scale
+    height = (max_y - min_y + 1) / scale
+    assert 10 <= width <= 16.5, (factory_name, size, width)
+    assert 10 <= height <= 16.5, (factory_name, size, height)
+
+
+def test_ultraview_author_laser_icon_is_a_centered_glowing_dot(qapp):
+    from mf4_analyzer.ui_kit.icons import LASER_DOT_CORE_DIAMETER, LASER_DOT_HALO_DIAMETER
+
+    assert LASER_DOT_CORE_DIAMETER / LASER_DOT_HALO_DIAMETER == 8.0 / 20.0
+    icon = Icons.ultraview_author_laser()
+    image, scale = _icon_image(icon, 20)
+    cx, cy = image.width() // 2, image.height() // 2
+    center = image.pixelColor(cx, cy)
+    assert center.red() > 180
+    assert center.alpha() > 160
+    corner = image.pixelColor(1, 1)
+    assert corner.alpha() < 20
+
+
+def test_ultraview_draw_subtool_ink_stays_inside_shared_safe_box(qapp):
+    """Larger subtool glyphs keep the 2px outer ring clear on the 20px canvas."""
+    for factory_name in _DRAW_SUBTOOL_FACTORIES:
+        icon = getattr(Icons, factory_name)()
+        image, scale = _icon_image(icon)
+        min_x, min_y, max_x, max_y = _ink_bbox(image, min_alpha=24)
+        inset = 2 * scale
+        assert min_x >= inset, (factory_name, min_x, inset)
+        assert min_y >= inset, (factory_name, min_y, inset)
+        assert max_x < image.width() - inset, (factory_name, max_x, inset)
+        assert max_y < image.height() - inset, (factory_name, max_y, inset)

@@ -1,0 +1,1261 @@
+"""Challenge paper ledger — ENTRY / HOLD / EXIT with hold-period rules.
+
+Tracks the $1k→$100k same-day sniper sleeve separately from the main signal journal.
+Supports long calls and long puts.
+"""
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import asdict, dataclass, field, fields
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from odte_scanner.json_util import finite_float
+
+logger = logging.getLogger(__name__)
+
+ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_PATH = ROOT / "outputs" / "challenge_ledger.json"
+
+# Hold windows (calendar days) by horizon / style
+# sprint = challenge desk default: same-day / next-session flips
+HOLD_PERIODS: dict[str, dict[str, int]] = {
+    "sprint": {"min_days": 0, "max_days": 1, "ideal_days": 1},
+    "weekly": {"min_days": 5, "max_days": 14, "ideal_days": 8},
+    "swing": {"min_days": 20, "max_days": 60, "ideal_days": 35},
+    "leap": {"min_days": 30, "max_days": 90, "ideal_days": 55},
+}
+
+# Open flips with longer hold / DTE than this are retired when sprint desk is on
+SPRINT_RETIRE_MAX_HOLD_DAYS = 2
+SPRINT_RETIRE_MAX_DTE = 7
+
+# Core megas for challenge sprint — highest liquidity / mover density
+CORE_MEGAS: frozenset[str] = frozenset(
+    {"SPY", "QQQ", "IWM", "NVDA", "TSLA", "AMD", "META", "MU", "AAPL", "MSFT", "AMZN", "GOOGL"}
+)
+
+# Index sniper sleeve — same-day buy→sell on liquid ETF options (SPX traded via SPY)
+# Aligned with config challenge_sniper_* (+20% bank / −20% stop / 4h flatten)
+INDEX_SNIPERS: frozenset[str] = frozenset({"SPY", "QQQ", "IWM"})
+SNIPER_BANK_PCT = 20.0
+SNIPER_STOP_PCT = 20.0
+SNIPER_EARLY_CUT_PCT = 12.0
+SNIPER_FLATTEN_HOURS = 4.0
+SNIPER_TARGET_MULT = 1.20
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def hold_period_for(horizon: str | None, dte: int | None = None) -> dict[str, Any]:
+    hz = (horizon or "swing").lower()
+    if hz in {"sprint", "fast", "1-3d", "1_3d"}:
+        key = "sprint"
+    elif dte is not None and int(dte) >= 180:
+        key = "leap"
+    elif dte is not None and int(dte) <= 10:
+        # Short-dated tickets use sprint holds even if hist horizon was weekly/swing
+        key = "sprint"
+    elif hz == "weekly":
+        key = "weekly"
+    elif hz == "leap":
+        key = "leap"
+    else:
+        key = "swing"
+    cfg = HOLD_PERIODS[key]
+    return {
+        "style": key,
+        "min_days": cfg["min_days"],
+        "max_days": cfg["max_days"],
+        "ideal_days": cfg["ideal_days"],
+        "label": f"{cfg['min_days']}–{cfg['max_days']}d (ideal ~{cfg['ideal_days']}d)",
+    }
+
+
+@dataclass
+class ChallengeTrade:
+    id: str
+    symbol: str
+    right: str  # C | P
+    contract: str
+    expiry: str | None
+    strike: float | None
+    horizon: str | None
+    dte_at_entry: int | None
+    entered_at: str
+    entry_ask: float
+    entry_spot: float | None
+    entry_reason: str
+    hold_min_days: int
+    hold_max_days: int
+    hold_ideal_days: int
+    target_premium_mult: float
+    stop_loss_pct: float = 45.0
+    status: str = "open"  # open | closed
+    exited_at: str | None = None
+    exit_bid: float | None = None
+    exit_reason: str | None = None
+    exit_spot: float | None = None
+    contracts: int = 1
+    cost: float = 0.0
+    proceeds: float | None = None
+    pnl_usd: float | None = None
+    profit_pct: float | None = None
+    hold_days: float | None = None
+    mark: float | None = None
+    unrealized_pct: float | None = None
+    last_action: str = "ENTRY"  # ENTRY | HOLD | EXIT
+    last_action_detail: str = ""
+    # Precision fields for sleeve UI / enter-exit plan
+    hist_win_pct: float | None = None
+    hist_samples: int | None = None
+    hit_1pct: float | None = None
+    hit_2pct: float | None = None
+    target_profit_pct: float | None = None
+    target_ask: float | None = None
+    enter_plan: str = ""
+    exit_plan: str = ""
+    hold_approx_label: str = ""
+    certainty_tier: str | None = None
+    cash_before: float | None = None
+    cash_after: float | None = None
+    equity_after: float | None = None
+    balance_note: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        # Derived helpers for UI
+        tgt = self.target_profit_pct
+        if tgt is None and self.target_premium_mult:
+            tgt = round((self.target_premium_mult - 1.0) * 100.0, 1)
+            d["target_profit_pct"] = tgt
+        if self.target_ask is None and self.entry_ask and self.target_premium_mult:
+            d["target_ask"] = round(self.entry_ask * self.target_premium_mult, 2)
+        return d
+
+
+@dataclass
+class ChallengeBook:
+    starting_cash: float = 1000.0
+    cash: float = 1000.0
+    target_usd: float = 100_000.0
+    flips_closed: int = 0
+    wins: int = 0
+    losses: int = 0
+    trades: list[ChallengeTrade] = field(default_factory=list)
+    balance_log: list[dict[str, Any]] = field(default_factory=list)
+    epoch: str = ""
+    archive: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def equity(self) -> float:
+        """Cash + mark-to-market of open challenge flips."""
+        open_mtm = sum(
+            (t.mark or t.entry_ask or 0) * 100 * int(t.contracts or 1)
+            for t in self.trades
+            if t.status == "open"
+        )
+        return round(float(self.cash) + float(open_mtm), 2)
+
+    def to_dict(self) -> dict[str, Any]:
+        equity = self.equity
+        return {
+            "starting_cash": self.starting_cash,
+            "cash": round(self.cash, 2),
+            "equity": equity,
+            "target_usd": self.target_usd,
+            "progress_pct": round((equity / self.target_usd) * 100.0, 4) if self.target_usd else 0,
+            # Legacy alias (older UI); primary progress is vs target_usd ($100k)
+            "milestone_500k_pct": round((equity / 500_000.0) * 100.0, 4) if equity else 0,
+            "milestone_100k_pct": round((equity / 100_000.0) * 100.0, 4) if equity else 0,
+            "flips_closed": self.flips_closed,
+            "wins": self.wins,
+            "losses": self.losses,
+            "open_trades": sum(1 for t in self.trades if t.status == "open"),
+            "trades": [t.to_dict() for t in self.trades],
+            "balance_log": list(self.balance_log[-40:]),
+            "epoch": self.epoch,
+            "archive": list(self.archive[-5:]),
+            "sniper_bank_pct": SNIPER_BANK_PCT,
+            "sniper_stop_pct": SNIPER_STOP_PCT,
+            "sniper_flatten_hours": SNIPER_FLATTEN_HOURS,
+        }
+
+
+class ChallengeTracker:
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        *,
+        starting_cash: float = 1000.0,
+        epoch: str | None = None,
+        rebuild_seed_usd: float | None = None,
+        rebuild_reason: str | None = None,
+        target_usd: float | None = None,
+    ):
+        self.path = Path(path) if path else DEFAULT_PATH
+        self.epoch = str(epoch or "").strip()
+        self.rebuild_seed_usd = rebuild_seed_usd
+        self.rebuild_reason = rebuild_reason
+        self.target_usd = float(target_usd) if target_usd is not None else 100_000.0
+        self.book = ChallengeBook(
+            starting_cash=starting_cash,
+            cash=starting_cash,
+            target_usd=self.target_usd,
+            epoch=self.epoch,
+        )
+        self.load()
+        self._apply_epoch_rebuild(starting_cash=starting_cash)
+
+    def load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            raw = json.loads(self.path.read_text())
+            known = {f.name for f in fields(ChallengeTrade)}
+            trades: list[ChallengeTrade] = []
+            for t in raw.get("trades") or []:
+                if not isinstance(t, dict):
+                    continue
+                payload = {k: v for k, v in t.items() if k in known}
+                try:
+                    trades.append(ChallengeTrade(**payload))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("skip bad challenge trade: %s", exc)
+            start = float(raw["starting_cash"]) if raw.get("starting_cash") is not None else self.book.starting_cash
+            # Do not treat cash=0 as missing (``or start`` previously reset to $1k)
+            cash = float(raw["cash"]) if raw.get("cash") is not None else start
+            self.book = ChallengeBook(
+                starting_cash=start,
+                cash=cash,
+                target_usd=float(raw["target_usd"])
+                if raw.get("target_usd") is not None
+                else float(self.target_usd),
+                flips_closed=int(raw.get("flips_closed") or 0),
+                wins=int(raw.get("wins") or 0),
+                losses=int(raw.get("losses") or 0),
+                trades=trades,
+                balance_log=list(raw.get("balance_log") or []),
+                epoch=str(raw.get("epoch") or ""),
+                archive=list(raw.get("archive") or []),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("challenge ledger load failed: %s", exc)
+
+    def _apply_epoch_rebuild(self, *, starting_cash: float) -> bool:
+        """Archive death spiral / stale epoch and reseed cash for Oct pace."""
+        if not self.epoch:
+            return False
+        if self.book.epoch == self.epoch:
+            return False
+        seed = float(self.rebuild_seed_usd if self.rebuild_seed_usd is not None else starting_cash)
+        seed = max(100.0, seed)
+        prior = self.book.to_dict()
+        prior_note = {
+            "archived_at": _now(),
+            "from_epoch": self.book.epoch or "legacy",
+            "to_epoch": self.epoch,
+            "prior_cash": prior.get("cash"),
+            "prior_equity": prior.get("equity"),
+            "prior_wins": prior.get("wins"),
+            "prior_losses": prior.get("losses"),
+            "prior_flips": prior.get("flips_closed"),
+            "reason": self.rebuild_reason
+            or "pace rebuild — death spiral / epoch bump",
+            "trades": prior.get("trades") or [],
+            "balance_log": prior.get("balance_log") or [],
+        }
+        archive = list(self.book.archive or [])
+        archive.append(prior_note)
+        target = float(self.target_usd or prior.get("target_usd") or 100_000.0)
+        self.book = ChallengeBook(
+            starting_cash=seed,
+            cash=seed,
+            target_usd=target,
+            flips_closed=0,
+            wins=0,
+            losses=0,
+            trades=[],
+            balance_log=[
+                {
+                    "at": _now(),
+                    "action": "REBUILD",
+                    "symbol": "",
+                    "right": "",
+                    "trade_id": "",
+                    "cash_before": prior.get("cash"),
+                    "cash_after": seed,
+                    "equity_after": seed,
+                    "debit_usd": None,
+                    "pnl_usd": None,
+                    "note": prior_note["reason"],
+                    "epoch": self.epoch,
+                }
+            ],
+            epoch=self.epoch,
+            archive=archive[-5:],
+        )
+        self.save()
+        logger.warning(
+            "challenge sleeve rebuilt epoch=%s seed=$%.2f target=$%.0f (was $%s / %sW-%sL)",
+            self.epoch,
+            seed,
+            target,
+            prior.get("cash"),
+            prior.get("wins"),
+            prior.get("losses"),
+        )
+        return True
+
+    def save(self) -> None:
+        from odte_scanner.json_util import dumps_strict
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self.book.to_dict()
+        # preserve counters explicitly
+        payload["flips_closed"] = self.book.flips_closed
+        payload["wins"] = self.book.wins
+        payload["losses"] = self.book.losses
+        self.path.write_text(dumps_strict(payload, indent=2, default=str))
+
+    def open_trades(self) -> list[ChallengeTrade]:
+        return [t for t in self.book.trades if t.status == "open"]
+
+    def open_by_symbol_right(self, symbol: str, right: str) -> ChallengeTrade | None:
+        for t in self.open_trades():
+            if t.symbol == symbol and t.right == right:
+                return t
+        return None
+
+    def _closed_trade_rows(self) -> list[dict[str, Any]]:
+        """Current-book closed trades plus archived epoch closes (cooldown must survive rebuilds)."""
+        rows: list[dict[str, Any]] = []
+        for t in self.book.trades:
+            if getattr(t, "status", None) == "closed":
+                rows.append(t.to_dict() if hasattr(t, "to_dict") else dict(t))
+        for snap in self.book.archive or []:
+            if not isinstance(snap, dict):
+                continue
+            for t in snap.get("trades") or []:
+                if not isinstance(t, dict):
+                    continue
+                if str(t.get("status") or "").lower() != "closed":
+                    continue
+                rows.append(t)
+        return rows
+
+    def recent_loss_symbols(self, *, cooldown_days: int = 5) -> set[str]:
+        """Symbols with a losing closed flip inside the cooldown window.
+
+        Includes archived epochs — sleeve rebuilds must not wipe loss memory
+        (JPM −76% on Sep 25 was archived, then reappeared as ENTRY the next week).
+        """
+        if cooldown_days <= 0:
+            return set()
+        now = datetime.now(timezone.utc)
+        blocked: set[str] = set()
+        for t in self._closed_trade_rows():
+            exited_raw = t.get("exited_at") if isinstance(t, dict) else getattr(t, "exited_at", None)
+            if not exited_raw:
+                continue
+            try:
+                exited = datetime.fromisoformat(str(exited_raw).replace("Z", "+00:00"))
+            except Exception:  # noqa: BLE001
+                continue
+            age_days = (now - exited).total_seconds() / 86400.0
+            if age_days > float(cooldown_days):
+                continue
+            pnl = t.get("pnl_usd") if isinstance(t, dict) else getattr(t, "pnl_usd", None)
+            pct = t.get("profit_pct") if isinstance(t, dict) else getattr(t, "profit_pct", None)
+            lost = (pnl is not None and float(pnl) < 0) or (pct is not None and float(pct) < 0)
+            if lost:
+                sym = t.get("symbol") if isinstance(t, dict) else getattr(t, "symbol", "")
+                if sym:
+                    blocked.add(str(sym).upper())
+        return blocked
+
+    def lifetime_loss_symbols(self, *, min_losses: int = 2) -> set[str]:
+        """Symbols with ≥min_losses closed losing flips (current book + archive)."""
+        counts: dict[str, int] = {}
+        for t in self._closed_trade_rows():
+            pnl = t.get("pnl_usd") if isinstance(t, dict) else getattr(t, "pnl_usd", None)
+            pct = t.get("profit_pct") if isinstance(t, dict) else getattr(t, "profit_pct", None)
+            lost = (pnl is not None and float(pnl) < 0) or (pct is not None and float(pct) < 0)
+            if not lost:
+                continue
+            sym = str(
+                (t.get("symbol") if isinstance(t, dict) else getattr(t, "symbol", "")) or ""
+            ).upper()
+            if not sym:
+                continue
+            counts[sym] = counts.get(sym, 0) + 1
+        return {s for s, n in counts.items() if n >= int(min_losses)}
+
+    def consecutive_losses(self) -> int:
+        """Trailing closed losses since last win (0 if last closed was a win)."""
+        closed = [t for t in self.book.trades if t.status == "closed"]
+        n = 0
+        for t in reversed(closed):
+            lost = (t.pnl_usd is not None and float(t.pnl_usd) < 0) or (
+                t.profit_pct is not None and float(t.profit_pct) < 0
+            )
+            if lost:
+                n += 1
+            else:
+                break
+        return n
+
+    def days_since_last_closed_loss(self) -> float | None:
+        """Calendar days since the most recent closed losing flip (current book)."""
+        last: datetime | None = None
+        for t in self.book.trades:
+            if t.status != "closed":
+                continue
+            lost = (t.pnl_usd is not None and float(t.pnl_usd) < 0) or (
+                t.profit_pct is not None and float(t.profit_pct) < 0
+            )
+            if not lost or not t.exited_at:
+                continue
+            try:
+                exited = datetime.fromisoformat(str(t.exited_at).replace("Z", "+00:00"))
+            except Exception:  # noqa: BLE001
+                continue
+            if last is None or exited > last:
+                last = exited
+        if last is None:
+            return None
+        return (datetime.now(timezone.utc) - last).total_seconds() / 86400.0
+
+    def auto_enter_mode(
+        self,
+        *,
+        max_consecutive_losses: int = 3,
+        pause_resume_days: float = 2.0,
+    ) -> str:
+        """Return enter mode: ok | paused | quality_only.
+
+        After N consecutive losses the sleeve pauses, then after
+        ``pause_resume_days`` resumes in quality_only (perfect/elite hist,
+        no index snipers) so a 3L sniper spiral cannot freeze the desk forever.
+        """
+        n = self.consecutive_losses()
+        if n < int(max_consecutive_losses):
+            return "ok"
+        days = self.days_since_last_closed_loss()
+        if days is not None and days >= float(pause_resume_days):
+            return "quality_only"
+        return "paused"
+
+    @staticmethod
+    def ticket_is_quality(ticket: dict[str, Any]) -> bool:
+        """Perfect/elite hist certainty — used for post-pause quality_only resumes."""
+        cert = str(ticket.get("certainty_tier") or "").lower()
+        if cert in {"perfect", "elite"}:
+            return True
+        win = ticket.get("hist_win_pct")
+        if win is None:
+            win = ticket.get("win_pct")
+        n = ticket.get("hist_samples")
+        if n is None:
+            n = ticket.get("win_samples")
+        try:
+            return float(win or 0) >= 85.0 and int(n or 0) >= 5
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def ticket_is_sniper(ticket: dict[str, Any]) -> bool:
+        sym = str(ticket.get("symbol") or "").upper()
+        return bool(
+            sym in INDEX_SNIPERS
+            or str(ticket.get("action") or "") in {"RADAR_HOT", "SNIPER"}
+            or ticket.get("from_radar")
+            or ticket.get("sniper")
+        )
+
+    def enter(
+        self,
+        ticket: dict[str, Any],
+        *,
+        max_open: int = 1,
+        loss_cooldown_days: int = 5,
+        max_cash_frac: float = 0.25,
+        max_contracts: int = 2,
+        prefer_calls: bool = True,
+        min_ensemble: float = 55.0,
+        mega_min_ensemble: float | None = None,
+        min_ask: float = 0.0,
+        max_ask: float | None = None,
+        prefer_core_megas: bool = False,
+        max_consecutive_losses: int = 3,
+        require_quality: bool = False,
+        block_snipers: bool = False,
+    ) -> ChallengeTrade | None:
+        if ticket.get("action") not in {"ENTRY", "BUY_NOW", "BUY_RIP", "RADAR_HOT", "SNIPER"}:
+            return None
+        symbol = str(ticket.get("symbol") or "").upper()
+        # SPX index options aren't Yahoo-chain friendly — snipe SPY as the proxy
+        if symbol == "SPX":
+            symbol = "SPY"
+            ticket = dict(ticket)
+            ticket["symbol"] = "SPY"
+            ticket.setdefault("thesis", "SPX→SPY sniper proxy")
+        right = str(ticket.get("right") or "C").upper()
+        if right not in {"C", "P"}:
+            # Infer from OCC when radar leaves right blank
+            occ = str(ticket.get("contract") or "")
+            if len(occ) >= 15 and occ[-9] in {"C", "P"}:
+                right = occ[-9]
+            else:
+                right = "C"
+        ask = float(ticket.get("ask") or 0)
+        contract = str(ticket.get("contract") or "")
+        if not symbol or ask <= 0 or not contract or contract.endswith("_SYN"):
+            return None
+        if float(min_ask or 0) > 0 and ask < float(min_ask):
+            return None
+        if max_ask is not None and float(max_ask) > 0 and ask > float(max_ask):
+            return None
+        if self.open_by_symbol_right(symbol, right):
+            return None
+        if len(self.open_trades()) >= max_open:
+            return None
+        # Hard pause is enforced by sync_from_tickets; enter() still respects
+        # consecutive-loss freeze unless quality_only resume flags are set.
+        if (
+            self.consecutive_losses() >= int(max_consecutive_losses)
+            and not require_quality
+            and not block_snipers
+        ):
+            return None
+        # Do not chase the same loser immediately (e.g. SLV put loop)
+        if symbol.upper() in self.recent_loss_symbols(cooldown_days=loss_cooldown_days):
+            return None
+        if symbol.upper() in self.lifetime_loss_symbols(min_losses=2):
+            return None
+        is_sniper = self.ticket_is_sniper({**ticket, "symbol": symbol})
+        if block_snipers and is_sniper:
+            return None
+        if require_quality and not self.ticket_is_quality(ticket):
+            return None
+        is_mega = symbol in CORE_MEGAS or is_sniper
+        if prefer_core_megas and not is_mega and str(ticket.get("action") or "") != "BUY_RIP":
+            # Non-mega ENTRY still allowed, but RIP/mega/sniper path is preferred upstream
+            pass
+        if prefer_calls and right == "P":
+            # Puts only when ticket explicitly dump-confirmed
+            if not ticket.get("dump_confirm"):
+                return None
+        ens = ticket.get("ensemble_score")
+        ens_floor = float(min_ensemble)
+        if is_sniper:
+            # Radar/index snipers are tape+liquidity gated, not hist/ensemble gated
+            ens_floor = 0.0
+        elif is_mega or str(ticket.get("action") or "") == "BUY_RIP" or ticket.get("from_rip"):
+            soft = mega_min_ensemble if mega_min_ensemble is not None else min(ens_floor, 55.0)
+            ens_floor = float(soft)
+        if ens is not None and float(ens) < float(ens_floor):
+            return None
+        # Require a live-looking print (volume or explicit live mark source)
+        vol = ticket.get("volume")
+        if vol is not None and int(vol) <= 0:
+            return None
+        mark_src = str(ticket.get("mark_source") or "")
+        if mark_src in {"zone", "ledger"} and not ticket.get("bid"):
+            return None
+
+        style = ticket.get("hold_style") or ticket.get("pace_style") or ticket.get("horizon")
+        if is_sniper:
+            style = "sprint"
+        hp = hold_period_for(style, ticket.get("dte"))
+        # Ticket board may already pin sprint hold days — prefer those
+        if ticket.get("hold_min_days") is not None:
+            hp = {
+                **hp,
+                "min_days": int(ticket["hold_min_days"]),
+                "max_days": int(ticket.get("hold_max_days") or hp["max_days"]),
+                "ideal_days": int(ticket.get("hold_ideal_days") or hp["ideal_days"]),
+                "label": ticket.get("hold_period_label") or hp["label"],
+            }
+        if is_sniper:
+            hp = {
+                **hp,
+                "style": "sprint",
+                "min_days": 0,
+                "max_days": 1,
+                "ideal_days": 0,
+                "label": f"sniper same-day (bank +{SNIPER_BANK_PCT:.0f}% / {SNIPER_FLATTEN_HOURS:.0f}h flat)",
+            }
+        contracts = int(ticket.get("contracts_for_bankroll") or 1)
+        contracts = max(1, min(int(max_contracts), contracts))
+        # Cap risk: never deploy more than max_cash_frac of cash on one flip.
+        # Hard skip when even 1 contract exceeds the frac (do not force oversized tickets).
+        frac = float(ticket.get("max_cash_frac") or max_cash_frac or 0.25)
+        frac = min(1.0, max(0.05, frac))
+        max_cost = float(self.book.cash) * frac
+        unit = ask * 100.0
+        if unit > max_cost + 1e-9:
+            return None
+        cost = unit * contracts
+        if cost > max_cost:
+            contracts = max(0, int(max_cost // unit))
+            contracts = min(int(max_contracts), contracts)
+            if contracts < 1:
+                return None
+            cost = unit * contracts
+        if cost > self.book.cash:
+            contracts = max(0, int(self.book.cash // unit))
+            contracts = min(int(max_contracts), contracts)
+            cost = unit * contracts
+            if contracts < 1 or cost <= 0 or cost > self.book.cash:
+                return None
+
+        mult = float(
+            ticket.get("target_premium_mult")
+            or (SNIPER_TARGET_MULT if is_sniper else 1.75)
+        )
+        # Snipers bank ~+20% same day; other sprint tickets still aim ~40–100%
+        if is_sniper:
+            mult = max(1.15, min(1.60, mult))
+        else:
+            mult = max(1.4, min(2.0, mult))
+        target_pct = round((mult - 1.0) * 100.0, 1)
+        target_ask = ticket.get("target_ask")
+        if target_ask is None:
+            target_ask = round(ask * mult, 2)
+        # Snipers cut faster; sprint otherwise
+        if is_sniper:
+            stop_pct = float(ticket.get("stop_loss_pct") or SNIPER_STOP_PCT)
+        else:
+            stop_pct = float(ticket.get("stop_loss_pct") or (35.0 if hp.get("style") == "sprint" else 45.0))
+        side = "CALL" if right == "C" else "PUT"
+        lane = "SNIPER" if is_sniper else "CHALLENGE"
+        enter_plan = ticket.get("enter_plan") or (
+            f"ENTER {lane} {side} now @ ≤${ask:.2f} · {ticket.get('expiry') or '?'} · "
+            f"K{ticket.get('strike')} · hold {hp['label']}"
+        )
+        exit_plan = ticket.get("exit_plan") or (
+            f"EXIT when premium ≥${float(target_ask):.2f} (+{target_pct:.0f}%)"
+            + (f" or bank +{SNIPER_BANK_PCT:.0f}% same day" if is_sniper else "")
+            + f", or stop −{stop_pct:.0f}%"
+            + (
+                f", or flatten ~{SNIPER_FLATTEN_HOURS:.0f}h / EOD"
+                if is_sniper
+                else f", or max hold {hp['max_days']}d"
+            )
+        )
+        cash_before = round(self.book.cash, 2)
+        trade = ChallengeTrade(
+            id=f"CH-{symbol}{right}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
+            symbol=symbol,
+            right=right,
+            contract=contract,
+            expiry=ticket.get("expiry"),
+            strike=ticket.get("strike"),
+            horizon="sprint" if is_sniper else str(ticket.get("horizon") or hp.get("style") or "sprint"),
+            dte_at_entry=ticket.get("dte"),
+            entered_at=_now(),
+            entry_ask=ask,
+            entry_spot=finite_float(ticket.get("spot") or ticket.get("live_last")),
+            entry_reason=ticket.get("thesis")
+            or ticket.get("detail")
+            or ("INDEX SNIPER ENTRY" if is_sniper else "CHALLENGE ENTRY"),
+            hold_min_days=int(hp["min_days"]),
+            hold_max_days=int(hp["max_days"]),
+            hold_ideal_days=int(hp["ideal_days"]),
+            target_premium_mult=mult,
+            stop_loss_pct=stop_pct,
+            contracts=contracts,
+            cost=cost,
+            mark=ask,
+            last_action="ENTRY",
+            last_action_detail=f"Entered {lane} {side} @ ${ask:.2f} · target +{target_pct:.0f}%",
+            hist_win_pct=ticket.get("hist_win_pct"),
+            hist_samples=ticket.get("hist_samples"),
+            hit_1pct=ticket.get("hit_1pct"),
+            hit_2pct=ticket.get("hit_2pct"),
+            target_profit_pct=target_pct,
+            target_ask=float(target_ask) if target_ask is not None else None,
+            enter_plan=str(enter_plan),
+            exit_plan=str(exit_plan),
+            hold_approx_label=str(
+                ticket.get("hold_approx_label")
+                or (hp["label"] if is_sniper else f"≈{hp['ideal_days']}d ({hp['min_days']}–{hp['max_days']}d)")
+            ),
+            certainty_tier=ticket.get("certainty_tier") or ("sniper" if is_sniper else None),
+            cash_before=cash_before,
+        )
+        # Soft wall EXIT on underlying (copied from board walls)
+        soft = ticket.get("soft_exit")
+        if soft is not None:
+            try:
+                trade.soft_exit = float(soft)  # type: ignore[attr-defined]
+            except (TypeError, ValueError):
+                pass
+        self.book.cash -= cost
+        cash_after = round(self.book.cash, 2)
+        equity_after = round(cash_after + ask * 100 * contracts, 2)
+        trade.cash_after = cash_after
+        trade.equity_after = equity_after
+        trade.balance_note = (
+            f"Balance after ENTRY: cash ${cash_after:,.2f} · sleeve equity ${equity_after:,.2f} "
+            f"(was ${cash_before:,.2f})"
+        )
+        trade.last_action_detail = (
+            f"Entered {lane} {side} @ ${ask:.2f} · target +{target_pct:.0f}% · "
+            f"cash ${cash_before:,.2f}→${cash_after:,.2f}"
+        )
+        self.book.trades.append(trade)
+        self.book.balance_log.append(
+            {
+                "at": trade.entered_at,
+                "action": "ENTRY",
+                "symbol": symbol,
+                "right": right,
+                "trade_id": trade.id,
+                "cash_before": cash_before,
+                "cash_after": cash_after,
+                "equity_after": equity_after,
+                "debit_usd": cost,
+                "pnl_usd": None,
+            }
+        )
+        self.save()
+        return trade
+
+    def _days_held(self, trade: ChallengeTrade) -> float:
+        try:
+            entered = datetime.fromisoformat(trade.entered_at.replace("Z", "+00:00"))
+            return (datetime.now(timezone.utc) - entered).total_seconds() / 86400.0
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    def evaluate_open(
+        self,
+        trade: ChallengeTrade,
+        *,
+        mark: float | None,
+        quote: dict[str, Any] | None = None,
+        sprint_desk: bool = True,
+    ) -> dict[str, Any]:
+        """Return ENTRY/HOLD/EXIT recommendation for an open challenge trade."""
+        days = self._days_held(trade)
+        trade.hold_days = round(days, 2)
+        bid = float(mark) if mark and mark > 0 else float(trade.mark or trade.entry_ask)
+        trade.mark = bid
+        unreal = ((bid - trade.entry_ask) / trade.entry_ask * 100.0) if trade.entry_ask else None
+        trade.unrealized_pct = round(unreal, 2) if unreal is not None else None
+
+        target_pct = (trade.target_premium_mult - 1.0) * 100.0
+        mom5 = quote.get("mom_5m_pct") if quote else None
+        live = None
+        if quote:
+            live = quote.get("session_change_pct")
+            if live is None:
+                live = quote.get("change_pct")
+
+        reasons: list[str] = []
+        action = "HOLD"
+        is_sniper = (
+            str(trade.symbol or "").upper() in INDEX_SNIPERS
+            or str(trade.certainty_tier or "").lower() == "sniper"
+            or "SNIPER" in str(trade.entry_reason or "").upper()
+        )
+
+        # Retire long-dated / multi-week opens so the sleeve can flip 1–3d tickets
+        dte_entry = int(trade.dte_at_entry) if trade.dte_at_entry is not None else None
+        if sprint_desk and (
+            int(trade.hold_max_days or 0) > SPRINT_RETIRE_MAX_HOLD_DAYS
+            or (dte_entry is not None and dte_entry > SPRINT_RETIRE_MAX_DTE)
+        ):
+            action = "EXIT"
+            reasons.append(
+                "sprint desk — retire long-dated hold for 1–3d / 50–100% flips"
+            )
+
+        if unreal is not None and unreal >= target_pct:
+            action = "EXIT"
+            reasons.append(f"hit challenge target +{unreal:.0f}% (≥{target_pct:.0f}%)")
+        # Index sniper: bank +20% same day (ideal flip path $1k→$100k)
+        elif (
+            is_sniper
+            and unreal is not None
+            and unreal >= SNIPER_BANK_PCT
+            and days >= 0.01
+        ):
+            action = "EXIT"
+            reasons.append(
+                f"bank sniper +{unreal:.0f}% (≥{SNIPER_BANK_PCT:.0f}%) same day — next index flip"
+            )
+        # Other sprint: bank +40% to free capital for next flip
+        elif (
+            unreal is not None
+            and unreal >= 40.0
+            and days >= max(0.05, float(trade.hold_min_days or 0) * 0.25)
+        ):
+            action = "EXIT"
+            reasons.append(f"bank sprint +{unreal:.0f}% (≥40%) — free capital for next flip")
+        if unreal is not None and unreal <= -trade.stop_loss_pct:
+            action = "EXIT"
+            reasons.append(f"stop −{abs(unreal):.0f}%")
+        # Sniper early cut — don't wait for full stop if already −12% after ~1h
+        elif (
+            is_sniper
+            and unreal is not None
+            and unreal <= -SNIPER_EARLY_CUT_PCT
+            and days >= 0.04
+        ):
+            action = "EXIT"
+            reasons.append(f"sniper early cut −{abs(unreal):.0f}%")
+        # Early sprint cut — don't wait for full −35/−45 if already −25% after min hold
+        elif (
+            unreal is not None
+            and unreal <= -25.0
+            and days >= max(0.15, float(trade.hold_min_days or 0) * 0.5)
+            and str(trade.horizon or "").lower() in {"sprint", "weekly", "fast", "1-3d"}
+        ):
+            action = "EXIT"
+            reasons.append(f"early sprint cut −{abs(unreal):.0f}%")
+        # Same-day sniper: force flat after ~4h (0–1 DTE wings)
+        flatten_days = float(SNIPER_FLATTEN_HOURS) / 24.0
+        if (
+            is_sniper
+            and action == "HOLD"
+            and days >= flatten_days
+            and (dte_entry is None or int(dte_entry) <= 1)
+        ):
+            action = "EXIT"
+            reasons.append(f"same-day sniper flatten (~{SNIPER_FLATTEN_HOURS:.0f}h)")
+        if days >= trade.hold_max_days:
+            action = "EXIT"
+            reasons.append(f"max hold {trade.hold_max_days}d reached ({days:.1f}d)")
+            # If we only have a stale entry reprint as mark, salvage a small residual
+            if (
+                trade.entry_ask
+                and mark is not None
+                and abs(float(bid) - float(trade.entry_ask)) < 1e-9
+            ):
+                salvage = max(0.01, float(trade.entry_ask) * 0.05)
+                trade.mark = salvage
+                bid = salvage
+                unreal = ((bid - trade.entry_ask) / trade.entry_ask * 100.0) if trade.entry_ask else None
+                trade.unrealized_pct = round(unreal, 2) if unreal is not None else None
+                reasons.append(f"no live mark — salvage exit @ ${salvage:.2f}")
+        # Thesis fail: call vs dump / put vs rip
+        if trade.right == "C" and mom5 is not None and mom5 <= -0.35 and days >= trade.hold_min_days:
+            action = "EXIT"
+            reasons.append(f"call tape fail 5m {mom5:+.2f}% after min hold")
+        if trade.right == "P" and mom5 is not None and mom5 >= 0.35 and days >= trade.hold_min_days:
+            action = "EXIT"
+            reasons.append(f"put tape fail 5m {mom5:+.2f}% after min hold")
+        if (
+            action == "HOLD"
+            and days >= trade.hold_ideal_days
+            and unreal is not None
+            and unreal >= target_pct * 0.7
+        ):
+            action = "EXIT"
+            reasons.append(f"ideal hold + {unreal:.0f}% (≥70% of target) — bank & roll")
+
+        # Soft wall on underlying when attached to the trade
+        soft = getattr(trade, "soft_exit", None)
+        if soft is None and isinstance(quote, dict):
+            soft = quote.get("soft_exit")
+        if soft is not None and quote:
+            spot = quote.get("last")
+            if spot is not None:
+                soft_f = float(soft)
+                spot_f = float(spot)
+                if trade.right == "C" and spot_f >= soft_f:
+                    action = "EXIT"
+                    reasons.append(f"spot {spot_f:.2f} ≥ soft EXIT ${soft_f:.2f} (call wall)")
+                elif trade.right == "P" and spot_f <= soft_f:
+                    action = "EXIT"
+                    reasons.append(f"spot {spot_f:.2f} ≤ soft EXIT ${soft_f:.2f} (put wall)")
+
+        if action == "HOLD":
+            reasons.append(
+                f"holding {days:.1f}d / max {trade.hold_max_days}d · "
+                f"unreal {unreal:+.1f}%" if unreal is not None else f"holding {days:.1f}d"
+            )
+
+        trade.last_action = action
+        trade.last_action_detail = "; ".join(reasons)
+        return {
+            "action": action,
+            "trade_id": trade.id,
+            "symbol": trade.symbol,
+            "right": trade.right,
+            "hold_days": round(days, 2),
+            "hold_max_days": trade.hold_max_days,
+            "hold_min_days": trade.hold_min_days,
+            "unrealized_pct": trade.unrealized_pct,
+            "mark": bid,
+            "detail": trade.last_action_detail,
+        }
+
+    def exit_trade(self, trade_id: str, *, exit_bid: float, reason: str) -> ChallengeTrade | None:
+        for t in self.book.trades:
+            if t.id != trade_id or t.status != "open":
+                continue
+            bid = max(0.0, float(exit_bid))
+            proceeds = bid * 100 * t.contracts
+            cash_before = round(self.book.cash, 2)
+            t.exit_bid = bid
+            t.proceeds = proceeds
+            t.pnl_usd = round(proceeds - t.cost, 2)
+            t.profit_pct = (
+                round(((bid - t.entry_ask) / t.entry_ask) * 100, 2) if t.entry_ask else None
+            )
+            t.exited_at = _now()
+            t.exit_reason = reason
+            t.status = "closed"
+            t.hold_days = round(self._days_held(t), 2)
+            t.last_action = "EXIT"
+            t.cash_before = cash_before
+            self.book.cash += proceeds
+            cash_after = round(self.book.cash, 2)
+            t.cash_after = cash_after
+            t.equity_after = cash_after
+            t.balance_note = (
+                f"Balance after EXIT: cash/equity ${cash_after:,.2f} "
+                f"(was cash ${cash_before:,.2f} + open mark) · P&L ${t.pnl_usd:,.2f}"
+                + (f" ({t.profit_pct:+.1f}%)" if t.profit_pct is not None else "")
+            )
+            t.last_action_detail = (
+                f"{reason} · cash ${cash_before:,.2f}→${cash_after:,.2f} · P&L ${t.pnl_usd:,.2f}"
+                + (f" ({t.profit_pct:+.1f}%)" if t.profit_pct is not None else "")
+            )
+            self.book.flips_closed += 1
+            if (t.pnl_usd or 0) > 0:
+                self.book.wins += 1
+            else:
+                self.book.losses += 1
+            self.book.balance_log.append(
+                {
+                    "at": t.exited_at,
+                    "action": "EXIT",
+                    "symbol": t.symbol,
+                    "right": t.right,
+                    "trade_id": t.id,
+                    "cash_before": cash_before,
+                    "cash_after": cash_after,
+                    "equity_after": cash_after,
+                    "debit_usd": None,
+                    "pnl_usd": t.pnl_usd,
+                    "profit_pct": t.profit_pct,
+                    "proceeds": proceeds,
+                }
+            )
+            self.save()
+            return t
+        return None
+
+    def refresh_open_marks(
+        self,
+        *,
+        aliases: dict[str, str] | None = None,
+    ) -> dict[str, float]:
+        """Pull live bid/last for each open challenge contract.
+
+        Returns map of trade_id and contract -> mark. Updates trade.mark in place.
+        Priority: live bid → last → ask. Never invents a flat entry reprint.
+        """
+        aliases = aliases or {}
+        marks: dict[str, float] = {}
+        try:
+            from odte_scanner.options.live_chain import fetch_live_option_quote
+        except Exception:  # noqa: BLE001
+            return marks
+
+        for t in self.open_trades():
+            if not t.expiry or t.strike is None:
+                continue
+            opt_right = "put" if str(t.right or "C").upper() == "P" else "call"
+            try:
+                q = fetch_live_option_quote(
+                    t.symbol,
+                    str(t.expiry),
+                    float(t.strike),
+                    yahoo_symbol=aliases.get(t.symbol),
+                    right=opt_right,
+                    contract=str(t.contract or "") or None,
+                )
+            except Exception:  # noqa: BLE001
+                q = None
+            if not q:
+                continue
+            px = None
+            if q.bid and float(q.bid) > 0:
+                px = float(q.bid)
+            elif q.last and float(q.last) > 0:
+                px = float(q.last)
+            elif q.ask and float(q.ask) > 0:
+                px = float(q.ask)
+            if px is None or px <= 0:
+                continue
+            marks[t.id] = px
+            if t.contract:
+                marks[t.contract] = px
+            t.mark = px
+            if t.entry_ask and float(t.entry_ask) > 0:
+                t.unrealized_pct = round((px - float(t.entry_ask)) / float(t.entry_ask) * 100.0, 2)
+        if marks:
+            self.save()
+        return marks
+
+    def sync_from_tickets(
+        self,
+        tickets: list[dict[str, Any]],
+        *,
+        quotes: dict[str, dict[str, Any]] | None = None,
+        auto_enter: bool = True,
+        auto_exit: bool = True,
+        max_open: int = 1,
+        sprint_desk: bool = True,
+        live_marks: dict[str, float] | None = None,
+        loss_cooldown_days: int = 5,
+        max_cash_frac: float = 0.25,
+        max_contracts: int = 2,
+        prefer_calls: bool = True,
+        prefer_core_megas: bool = True,
+        min_ensemble: float = 55.0,
+        mega_min_ensemble: float | None = None,
+        min_ask: float = 0.0,
+        max_ask: float | None = None,
+        max_consecutive_losses: int = 3,
+        pause_resume_days: float = 2.0,
+    ) -> dict[str, Any]:
+        quotes = quotes or {}
+        live_marks = live_marks or {}
+        entered: list[str] = []
+        exited: list[str] = []
+        holds: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+
+        # Evaluate opens first
+        for t in list(self.open_trades()):
+            # Prefer live option mark, then ticket bid/last
+            mark = None
+            live_ok = False
+            if t.id in live_marks and float(live_marks[t.id]) > 0:
+                mark = float(live_marks[t.id])
+                live_ok = True
+            elif t.contract and t.contract in live_marks and float(live_marks[t.contract]) > 0:
+                mark = float(live_marks[t.contract])
+                live_ok = True
+            for tk in tickets:
+                if tk.get("symbol") == t.symbol and str(tk.get("right") or "C").upper() == t.right:
+                    if mark is None:
+                        if tk.get("bid") and float(tk["bid"]) > 0:
+                            mark = float(tk["bid"])
+                            if t.entry_ask and abs(mark - float(t.entry_ask)) >= 1e-6:
+                                live_ok = True
+                        elif tk.get("option_last") and float(tk["option_last"]) > 0:
+                            mark = float(tk["option_last"])
+                            live_ok = True
+                        elif tk.get("ask") and float(tk["ask"]) > 0:
+                            cand = float(tk["ask"])
+                            if t.entry_ask is None or abs(cand - float(t.entry_ask)) >= 1e-6:
+                                mark = cand
+                    # Backfill precision fields if older ledger row
+                    if t.hit_1pct is None and tk.get("hit_1pct") is not None:
+                        t.hit_1pct = tk.get("hit_1pct")
+                        t.hit_2pct = tk.get("hit_2pct")
+                        t.hist_win_pct = tk.get("hist_win_pct")
+                        t.hist_samples = tk.get("hist_samples")
+                    # Never overwrite a stored ENTRY plan with HOLD/WAIT ticket text
+                    if (not t.enter_plan) and tk.get("action") == "ENTRY" and tk.get("enter_plan"):
+                        t.enter_plan = str(tk.get("enter_plan"))
+                    if (not t.exit_plan) and tk.get("exit_plan"):
+                        t.exit_plan = str(tk.get("exit_plan"))
+                    elif t.exit_plan.startswith("Already") or not t.exit_plan:
+                        if tk.get("exit_plan"):
+                            t.exit_plan = str(tk.get("exit_plan"))
+                    if t.target_ask is None and tk.get("target_ask") is not None:
+                        t.target_ask = float(tk["target_ask"])
+                    if t.target_profit_pct is None and t.target_premium_mult:
+                        t.target_profit_pct = round((t.target_premium_mult - 1.0) * 100.0, 1)
+                    if not t.hold_approx_label and tk.get("hold_approx_label"):
+                        t.hold_approx_label = str(tk.get("hold_approx_label"))
+                    break
+            if mark is None:
+                mark = t.mark
+            ev = self.evaluate_open(
+                t, mark=mark, quote=quotes.get(t.symbol), sprint_desk=sprint_desk
+            )
+            # Tag whether mark came from a live refresh
+            ev["live_mark"] = live_ok
+            holds.append(ev)
+            if auto_exit and ev["action"] == "EXIT":
+                exit_bid = float(ev["mark"])
+                reason = str(ev["detail"] or "EXIT")
+                # Never silently book $0 P&L at entry ask without saying so
+                if (
+                    t.entry_ask is not None
+                    and abs(exit_bid - float(t.entry_ask)) < 1e-9
+                    and not live_ok
+                ):
+                    reason = f"{reason} · exit priced at entry (no live bid/mark)"
+                out = self.exit_trade(t.id, exit_bid=exit_bid, reason=reason)
+                if out:
+                    exited.append(out.id)
+
+        # Auto-enter top ENTRY ticket if flat (skip recent losers / illiquid / too-rich)
+        enter_mode = "ok"
+        pause_reason: str | None = None
+        if auto_enter and len(self.open_trades()) < max_open:
+            enter_mode = self.auto_enter_mode(
+                max_consecutive_losses=max_consecutive_losses,
+                pause_resume_days=pause_resume_days,
+            )
+            if enter_mode == "paused":
+                days = self.days_since_last_closed_loss()
+                left = (
+                    max(0.0, float(pause_resume_days) - float(days))
+                    if days is not None
+                    else float(pause_resume_days)
+                )
+                pause_reason = (
+                    f"{max_consecutive_losses}+ consecutive losses — auto-enter paused "
+                    f"(~{left:.1f}d until quality-only resume)"
+                )
+                self.save()
+                return {
+                    "entered": entered,
+                    "exited": exited,
+                    "holds": holds,
+                    "open_evals": holds,
+                    "skipped": skipped[:12],
+                    "cash": round(self.book.cash, 2),
+                    "equity": self.book.equity,
+                    "paused": True,
+                    "enter_mode": "paused",
+                    "pause_reason": pause_reason,
+                    "pause_resume_days": float(pause_resume_days),
+                    "days_since_last_loss": days,
+                    "book": self.book.to_dict(),
+                }
+
+            quality_only = enter_mode == "quality_only"
+            if quality_only:
+                pause_reason = (
+                    f"{max_consecutive_losses}+ consecutive losses cooled — "
+                    "quality-only resume (perfect/elite hist, snipers blocked)"
+                )
+
+            blocked = self.recent_loss_symbols(cooldown_days=loss_cooldown_days) | self.lifetime_loss_symbols(
+                min_losses=2
+            )
+            frac = min(1.0, max(0.05, float(max_cash_frac or 0.25)))
+            max_cost = float(self.book.cash) * frac
+            ordered = list(tickets)
+
+            ordered = sorted(
+                ordered,
+                key=lambda tk: (
+                    # After a death spiral: prefer quality hist, bury snipers
+                    (0 if self.ticket_is_quality(tk) else 1) if quality_only else 0,
+                    (1 if self.ticket_is_sniper(tk) else 0) if quality_only else (0 if self.ticket_is_sniper(tk) else 1),
+                    # Among snipers: cheapest liquid wing first (SPY $0.34 before QQQ $0.71)
+                    float(tk.get("ask") or 99.0) if self.ticket_is_sniper(tk) else 0.0,
+                    0 if str(tk.get("right") or "C").upper() == "C" else 1 if prefer_calls else 0,
+                    0
+                    if (
+                        str(tk.get("symbol") or "").upper() in CORE_MEGAS
+                        or str(tk.get("action") or "") == "BUY_RIP"
+                        or tk.get("from_rip")
+                    )
+                    else (0 if not prefer_core_megas else 1),
+                    0
+                    if str(tk.get("action") or "") in {"ENTRY", "BUY_RIP", "BUY_NOW", "RADAR_HOT", "SNIPER"}
+                    else 1,
+                    -float(tk.get("volume") or tk.get("ensemble_score") or tk.get("strength") or 0),
+                ),
+            )
+            for tk in ordered:
+                act = str(tk.get("action") or "")
+                if act not in {"ENTRY", "BUY_NOW", "BUY_RIP", "RADAR_HOT", "SNIPER"}:
+                    continue
+                # Normalize rip / radar into ENTRY for the paper sleeve
+                if act in {"BUY_RIP", "RADAR_HOT", "SNIPER"}:
+                    tk = dict(tk)
+                    if act == "BUY_RIP":
+                        tk["from_rip"] = True
+                    if act in {"RADAR_HOT", "SNIPER"}:
+                        tk["from_radar"] = True
+                        tk["sniper"] = True
+                    tk["action"] = "ENTRY"
+                    tk.setdefault("hold_style", "sprint")
+                    tk.setdefault("horizon", "sprint")
+                    tk.setdefault("hold_min_days", 0)
+                    tk.setdefault("hold_max_days", 1)
+                    tk.setdefault("hold_ideal_days", 0 if act in {"RADAR_HOT", "SNIPER"} else 1)
+                    tk.setdefault(
+                        "target_premium_mult",
+                        1.4 if act in {"RADAR_HOT", "SNIPER"} else 1.5,
+                    )
+                    if not tk.get("right"):
+                        occ = str(tk.get("contract") or "")
+                        tk["right"] = occ[-9] if len(occ) >= 15 and occ[-9] in {"C", "P"} else "C"
+                if quality_only and self.ticket_is_sniper(tk):
+                    skipped.append({"symbol": tk.get("symbol"), "reason": "quality_only_blocks_sniper"})
+                    continue
+                if quality_only and not self.ticket_is_quality(tk):
+                    skipped.append({"symbol": tk.get("symbol"), "reason": "quality_only_needs_perfect_elite"})
+                    continue
+                if not tk.get("contract") or tk.get("ask") in (None, 0):
+                    continue
+                ask = float(tk.get("ask") or 0)
+                if float(min_ask or 0) > 0 and ask < float(min_ask):
+                    skipped.append({"symbol": tk.get("symbol"), "reason": "ask_below_min"})
+                    continue
+                if max_ask is not None and float(max_ask) > 0 and ask > float(max_ask):
+                    skipped.append({"symbol": tk.get("symbol"), "reason": "ask_above_max"})
+                    continue
+                if ask * 100.0 > max_cost + 1e-9:
+                    skipped.append({"symbol": tk.get("symbol"), "reason": "over_cash_frac"})
+                    continue
+                if str(tk.get("symbol") or "").upper() in blocked:
+                    skipped.append({"symbol": tk.get("symbol"), "reason": "loss_cooldown"})
+                    continue
+                tr = self.enter(
+                    tk,
+                    max_open=max_open,
+                    loss_cooldown_days=loss_cooldown_days,
+                    max_cash_frac=max_cash_frac,
+                    max_contracts=max_contracts,
+                    prefer_calls=prefer_calls,
+                    prefer_core_megas=prefer_core_megas,
+                    min_ensemble=min_ensemble,
+                    mega_min_ensemble=mega_min_ensemble,
+                    min_ask=min_ask,
+                    max_ask=max_ask,
+                    max_consecutive_losses=max_consecutive_losses,
+                    require_quality=quality_only,
+                    block_snipers=quality_only,
+                )
+                if tr:
+                    entered.append(tr.id)
+                    break
+
+        self.save()
+        return {
+            "entered": entered,
+            "exited": exited,
+            "open_evals": holds,
+            "holds": holds,
+            "skipped": skipped[:12],
+            "book": self.book.to_dict(),
+            "cash": round(self.book.cash, 2),
+            "equity": self.book.equity,
+            "paused": enter_mode == "paused",
+            "enter_mode": enter_mode,
+            "pause_reason": pause_reason,
+            "pause_resume_days": float(pause_resume_days),
+            "days_since_last_loss": self.days_since_last_closed_loss(),
+        }

@@ -83,6 +83,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+# Cap native BLAS/OpenMP thread pools BEFORE any candidate imports numpy/pandas/
+# scipy/sklearn. Each mined candidate runs in its own forked, memory-limited child;
+# OpenBLAS otherwise tries to spin up one big thread-pool arena PER child, and under
+# the sandbox's rlimit that fails with "OpenBLAS error: Memory allocation still failed
+# after 10 retries", killing the child ("child exited ... sent no result") -- a pure
+# harness artifact that wrongly counts a runnable candidate as COULD_NOT_EXECUTE.
+# Single-threaded BLAS removes the arena allocation; numpy reads these at import, and
+# setdefault respects anything the user set explicitly. (os is imported above.)
+for _blas_var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                  "NUMEXPR_NUM_THREADS", "OPENBLAS_MAIN_FREE", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_blas_var, "1")
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from tainted import new_marker  # noqa: E402
@@ -413,10 +425,40 @@ def _parse_params(source: str) -> list[dict]:
     if func_node is None:
         raise ValueError("no function definition found in candidate source")
     out = []
-    for a in func_node.args.args:
+    # Defaults align to the LAST len(defaults) positional args (Python's rule).
+    pos = func_node.args.args
+    defaults = func_node.args.defaults
+    n_no_default = len(pos) - len(defaults)
+    for i, a in enumerate(pos):
         ann_text = ast.unparse(a.annotation) if a.annotation is not None else None
-        out.append({"name": a.arg, "annotation": ann_text})
+        has_default = i >= n_no_default
+        default_src = ast.unparse(defaults[i - n_no_default]) if has_default else None
+        out.append({"name": a.arg, "annotation": ann_text,
+                    "has_default": has_default, "default_src": default_src})
     return out, func_node.name
+
+
+def _safe_default(default_src: str | None):
+    """Evaluate a parameter's OWN declared default from source, for a
+    non-target optional parameter. Real code calling this function would
+    simply omit the argument and let this default apply; fabricating a
+    placeholder STRING instead is what broke `requests.get(url,
+    params='<placeholder>')` -> "'str' object has no attribute 'items'"
+    (the hit was recorded, so Tier-1 said TRIGGERED, but the real request
+    raised before any I/O, so the SSRF oracle was never hit -> a false
+    NOT_CONFIRMED). A safe literal default (None, True/False, a number, a
+    string, (), [], {}) is reproduced exactly via ast.literal_eval; anything
+    non-literal (a call, a name, a sentinel object) falls back to None --
+    None is by far the most common optional default and is almost always the
+    value that keeps the real code path intact, which a random string never
+    is."""
+    if not default_src:
+        return None
+    try:
+        import ast as _ast
+        return _ast.literal_eval(default_src)
+    except (ValueError, SyntaxError):
+        return None
 
 
 # Untyped or bool-typed "flag" parameters (create_dirs, overwrite, force,
@@ -471,11 +513,31 @@ _OBJECT_LIKE_TRUSTED_NAMES = {
 }
 
 
-def _build_arg(name: str, annotation: str | None, marker: str | None):
+_URL_NAME_HINTS = ("url", "uri", "endpoint", "webhook", "callback", "href", "link")
+
+
+def _looks_url(name: str) -> bool:
+    n = (name or "").lower()
+    return any(h in n for h in _URL_NAME_HINTS)
+
+
+def _build_arg(name: str, annotation: str | None, marker: str | None, live: bool = False):
     """Build one call argument. `marker` is not None exactly for the ONE
     parameter being tested as the attacker-controlled injection point on
     this run; every other parameter gets a generic, inert stand-in."""
     if marker is not None:
+        # CENSUS (Tier-1) ONLY: a URL-shaped injection point handed a BARE token
+        # makes the candidate die with "unknown url type: '<marker>'" before the
+        # SSRF sink is ever reached -- a construction miss, not a safe result. Wrap
+        # the marker into a syntactically valid URL that still carries the marker
+        # substring, so urlopen/requests parse it and taint propagation to the sink
+        # is observed. Gated to `not live`: in Tier-2 the marker is already the live
+        # oracle URL (it contains "://"), so this never perturbs exploitation. The
+        # marker substring is preserved -> is_tainted() still fires -> a DEFENDED
+        # SSRF that validates/blocks the host still raises before the sink and is
+        # correctly NOT triggered (soundness unaffected; verified by the battery).
+        if (not live) and _looks_url(name) and "://" not in str(marker):
+            return f"http://{marker}.oracle.invalid/{marker}"
         return marker
     if name in _CONTEXT_PARAM_NAMES:
         # invoke/fabric Context handle -> honest run()/sudo() routed to the
@@ -484,6 +546,18 @@ def _build_arg(name: str, annotation: str | None, marker: str | None):
         return _ContextStub()
     if name in ("self", "cls") or name in _OBJECT_LIKE_TRUSTED_NAMES:
         return _FakeInstance()
+    # A non-target OPTIONAL parameter (annotation admits None / Optional): its
+    # own declared default semantics are "may be absent", so None is the
+    # faithful inert value. A fabricated placeholder string here is actively
+    # harmful -- e.g. Database.execute(sql, parameters) then takes its
+    # `parameters is not None` branch and runs `conn.execute(sql, 'autoharness_
+    # placeholder')`, corrupting the exact SQL under test so the injection
+    # never executes cleanly (FOUND BY TESTING: sqlite-utils execute/count_where
+    # CWE-89 cases sat unconfirmed for precisely this reason). The target param
+    # is already handled above (marker is not None), so this only ever changes
+    # an auxiliary argument, never the injection point.
+    if annotation and ("None" in annotation or "Optional" in annotation):
+        return None
     if _looks_boolean(name, annotation):
         return False
     if not _looks_string_shaped(annotation):
@@ -733,6 +807,73 @@ def _build_import_ns(module_source: str | None, file_rel_path: str | None = None
     return ns
 
 
+def _build_module_ns(module_source: str | None, file_rel_path: str | None = None,
+                     scratch_dir: str | None = None) -> dict:
+    """Build the namespace a fallback candidate should execute in, with the
+    candidate's OWN module globals present: imports, module-level constants,
+    and the SIBLING functions/classes it calls.
+
+    FOUND BY THE CORPUS CENSUS: the dominant COULD_NOT_EXECUTE cause (94/264,
+    36%) was `NameError: name '<x>' is not defined` -- a candidate exec'd in
+    ISOLATION (because the real module could not be imported wholesale: a
+    relative import or missing dep aborted importlib) references a name its
+    module defines at top level. Running the module's top-level body here,
+    statement by statement with per-statement try/except, defines as many of
+    those names as resolve -- one unresolvable line (a relative import reaching
+    an uninstalled sibling) costs only that line's names, not the namespace.
+
+    This runs inside the sandbox + patched_sinks, so any module-level side
+    effect is contained; the tainted marker never appears in module-level code
+    and rec.tracing_active is off here, so nothing module-level is mistaken for
+    a candidate sink hit. __name__ is set to a non-__main__ value (from
+    _build_import_ns), which also stops a module's `if __name__ == '__main__':`
+    block from firing -- removing the CLI-main SystemExit failures too."""
+    ns = _build_exec_namespace()
+    # package context (__package__/__name__) + independently-resolved imports
+    ns.update(_build_import_ns(module_source, file_rel_path))
+    ns["__file__"] = (os.path.join(scratch_dir, "candidate.py") if scratch_dir
+                      else "<auto_harness_candidate>")
+    if not module_source:
+        return ns
+    try:
+        tree = ast.parse(module_source)
+    except SyntaxError:
+        return ns
+    for node in tree.body:
+        try:
+            exec(compile(ast.Module(body=[node], type_ignores=[]), "<module_ns>", "exec"), ns)  # noqa: S102
+        except Exception:
+            continue  # best-effort: skip a statement whose deps don't resolve
+    return ns
+
+
+def vendor_sys_path_roots(repo_src) -> list[str]:
+    """Absolute sys.path roots for a mined repo's vendored source. Reads
+    _repo_src/.pathdirs (written by mine_prompts' vendoring) so nested and
+    non-standard layouts (backend/app/..., flat script folders, src/) all
+    import -- not just top-level packages. Falls back to the _repo_src dir
+    itself for corpora mined before .pathdirs existed."""
+    from pathlib import Path as _P
+    repo_src = _P(repo_src)
+    if not repo_src.is_dir():
+        return []
+    roots: list[str] = []
+    pd = repo_src / ".pathdirs"
+    if pd.is_file():
+        for line in pd.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            d = repo_src if line == "." else repo_src / line
+            if d.is_dir():
+                r = str(d.resolve())
+                if r not in roots:
+                    roots.append(r)
+    if not roots:
+        roots = [str(repo_src.resolve())]
+    return roots
+
+
 def _cheap_construct(cls, scratch_dir: str, ns: dict, depth: int = 0):
     """Best-effort: build a real instance of `cls`. Try the no-arg
     constructor first; if that fails, inspect __init__ and recursively build
@@ -954,7 +1095,11 @@ def _child_main(source: str, func_name: str, param_name: str | None, marker: str
             # non-trivial parent __init__ would have set up -- a candidate
             # whose correctness actually depends on that will still
             # honestly fail later, just for a more specific reason.
-            namespace: dict[str, Any] = _build_exec_namespace()
+            # Enrich with the candidate's own module globals (imports, module
+            # constants, sibling defs) so a method referencing them resolves
+            # instead of NameError -- the dominant fallback failure. See
+            # _build_module_ns. The method's __globals__ becomes this namespace.
+            namespace: dict[str, Any] = _build_module_ns(module_source, file_rel_path, scratch_dir)
             shell_name = "_MinedShell"
             # Subclass the honest connection-fallback mixin so a DB-wrapper
             # method reaching for self.conn / self.execute gets a REAL
@@ -969,7 +1114,9 @@ def _child_main(source: str, func_name: str, param_name: str | None, marker: str
             func = getattr(shell_cls, func_name, None) if shell_cls else None
             self_instance = shell_cls.__new__(shell_cls) if shell_cls else None
         else:
-            namespace: dict[str, Any] = _build_exec_namespace()
+            # Enrich with module globals (see _build_module_ns) so a top-level
+            # function referencing a module import/constant/sibling resolves.
+            namespace: dict[str, Any] = _build_module_ns(module_source, file_rel_path, scratch_dir)
             exec(compile(normalized, f"<candidate:{func_name}>", "exec"), namespace)
             func = namespace.get(func_name)
             self_instance = None
@@ -1107,7 +1254,18 @@ def _child_main(source: str, func_name: str, param_name: str | None, marker: str
                     args.append(self_instance)
                     continue
                 if p["name"] == param_name:
-                    args.append(_build_arg(p["name"], p["annotation"], marker))
+                    args.append(_build_arg(p["name"], p["annotation"], marker, live=live))
+                    continue
+                # A NON-target parameter that declares its OWN default: a real
+                # caller would omit it and let that default apply. Reproduce the
+                # real default instead of fabricating a placeholder string --
+                # the placeholder is what made requests.get(url, params='<ph>')
+                # crash on params.items() AFTER the sink hit was recorded,
+                # turning a real SSRF into TRIGGERED-but-oracle-never-hit. This
+                # only affects defaulted params; required object params below
+                # (e.g. `c: Context`) still get a real constructed instance.
+                if p.get("has_default"):
+                    args.append(_safe_default(p.get("default_src")))
                     continue
                 # STEP C: for a NON-target parameter whose annotation names a
                 # real class (e.g. `c: Context`, `runner: Runner`), build a
@@ -1147,8 +1305,10 @@ def _child_main(source: str, func_name: str, param_name: str | None, marker: str
                     try:
                         with _ctxlib.redirect_stdout(_buf):
                             _func_entered = True
+                            rec.tracing_active = True  # scope non-SQL sink trace to the candidate's own call
                             _retval = func(*args)
                     finally:
+                        rec.tracing_active = False
                         _os.dup2(_saved_err_fd, 2)
                         _os.close(_saved_err_fd)
                         _os.close(_devnull_fd)
@@ -1251,6 +1411,11 @@ def _child_main(source: str, func_name: str, param_name: str | None, marker: str
                 t.get("marker_in_sql") and t.get("exec_ok") is False for t in _trace)
             _marker_ran_ok = any(
                 t.get("marker_in_sql") and t.get("exec_ok") is True for t in _trace)
+            # Non-SQL sink chain (path traversal / command injection), so a
+            # CWE-22 / CWE-78 NOT_CONFIRMED gets a real root cause instead of
+            # the SQL-only "no SQL executed" label.
+            _ptrace = list(getattr(rec, "path_trace", []) or [])
+            _ctrace = list(getattr(rec, "cmd_trace", []) or [])
             _diag = {
                 "function_entered": _func_entered,
                 "n_sql_executed": len(_trace),
@@ -1260,6 +1425,20 @@ def _child_main(source: str, func_name: str, param_name: str | None, marker: str
                 "marker_syntax_error": _marker_syntax_error,
                 "marker_ran_ok": _marker_ran_ok,
                 "sql_sample": [t.get("sql") for t in _trace[:6]],
+                "n_path_sinks": len(_ptrace),
+                "marker_in_path_sink": any(t.get("tainted") for t in _ptrace),
+                "path_escaped": any(t.get("tainted") and t.get("escaped") for t in _ptrace),
+                "n_cmd_sinks": len(_ctrace),
+                "marker_in_cmd_sink": any(t.get("tainted") for t in _ctrace),
+                "cmd_shell_reached": any(t.get("tainted") and t.get("shell") for t in _ctrace),
+                "sink_sample": [t.get("arg") for t in (_ptrace + _ctrace)[:6]],
+                # Per-hit detail for tainted filesystem sinks: the resolved path,
+                # whether the real open/write succeeded, and whether it escaped.
+                # _PathTraversal.verify uses this to prove a read-traversal that
+                # opens our planted file without echoing its contents.
+                "path_sink_hits": [{"real": t.get("real"), "opened_ok": t.get("opened_ok"),
+                                    "escaped": t.get("escaped")}
+                                   for t in _ptrace if t.get("tainted")][:6],
             }
 
         if triggered and hits:

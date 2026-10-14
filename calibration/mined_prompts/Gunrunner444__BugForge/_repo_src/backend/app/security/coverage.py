@@ -1,0 +1,172 @@
+"""Honest detection coverage labels.
+
+Phase 26 marks a cell ``tested`` only when a dedicated security fixture
+asserts that behavior. A parser test is not a security-coverage test.
+
+``tested`` means this phase or an existing fixture asserts the behavior.
+``existing-suite`` means an older test covers part of the family, not that
+the language has Python-equivalent semantic analysis.
+``limited`` means the vocabulary or profile exists and is not claimed as
+full semantic support.
+``unsupported`` means this phase does not claim a detector for that cell.
+"""
+
+from __future__ import annotations
+
+COVERAGE: dict[str, dict[str, str]] = {
+    "python": {
+        "sql": "tested",
+        "command": "tested",
+        "path": "tested",
+        "ssrf": "tested",
+        "xss": "tested",
+        "deserialization": "tested",
+        "dynamic_exec": "tested",
+        "redirect": "tested",
+        "secrets_controls": "tested",
+    },
+    "javascript": {
+        "sql": "tested",
+        "command": "tested",
+        "path": "tested",
+        "ssrf": "tested",
+        "xss": "tested",
+        "deserialization": "tested",
+        "dynamic_exec": "tested",
+        "redirect": "tested",
+        "secrets_controls": "tested",
+    },
+    "typescript": {
+        "sql": "tested",
+        "command": "tested",
+        "path": "tested",
+        "ssrf": "tested",
+        "xss": "tested",
+        "deserialization": "tested",
+        "dynamic_exec": "tested",
+        "redirect": "tested",
+        "secrets_controls": "tested",
+    },
+    "go": {
+        "sql": "tested",
+        "command": "tested",
+        "path": "tested",
+        "ssrf": "tested",
+        "xss": "tested",
+        "deserialization": "tested",
+        "dynamic_exec": "unsupported",
+        "redirect": "tested",
+        "secrets_controls": "tested",
+    },
+    "java": {
+        "sql": "tested",
+        "command": "tested",
+        "path": "tested",
+        "ssrf": "tested",
+        "xss": "limited",
+        "deserialization": "tested",
+        "dynamic_exec": "tested",
+        "redirect": "tested",
+        "secrets_controls": "tested",
+    },
+    "ruby": {
+        "sql": "tested",
+        "command": "tested",
+        "path": "tested",
+        "ssrf": "tested",
+        "xss": "tested",
+        "deserialization": "tested",
+        "dynamic_exec": "tested",
+        "redirect": "tested",
+        "secrets_controls": "tested",
+    },
+    "php": {
+        "sql": "tested",
+        "command": "tested",
+        "path": "tested",
+        "ssrf": "tested",
+        "xss": "tested",
+        "deserialization": "tested",
+        "dynamic_exec": "tested",
+        "redirect": "tested",
+        "secrets_controls": "tested",
+    },
+    "kotlin": {
+        "sql": "tested",
+        "command": "tested",
+        "path": "tested",
+        "ssrf": "tested",
+        "xss": "tested",
+        "deserialization": "limited",
+        "dynamic_exec": "unsupported",
+        "redirect": "tested",
+        "secrets_controls": "tested",
+    },
+    "c_cpp": {
+        "sql": "limited",
+        "command": "existing-suite",
+        "path": "existing-suite",
+        "ssrf": "unsupported",
+        "xss": "unsupported",
+        "deserialization": "unsupported",
+        "dynamic_exec": "unsupported",
+        "redirect": "unsupported",
+        "secrets_controls": "limited",
+    },
+    "rust": {
+        "sql": "tested",
+        "command": "tested",
+        "path": "tested",
+        "ssrf": "tested",
+        "xss": "tested",
+        "deserialization": "tested",
+        "dynamic_exec": "unsupported",
+        "redirect": "tested",
+        "secrets_controls": "tested",
+    },
+    "swift": {
+        "sql": "limited",
+        "command": "limited",
+        "path": "limited",
+        "ssrf": "limited",
+        "xss": "unsupported",
+        "deserialization": "limited",
+        "dynamic_exec": "limited",
+        "redirect": "unsupported",
+        "secrets_controls": "limited",
+    },
+    "csharp": {
+        "sql": "tested",
+        "command": "tested",
+        "path": "tested",
+        "ssrf": "tested",
+        "xss": "tested",
+        "deserialization": "limited",
+        "dynamic_exec": "unsupported",
+        "redirect": "tested",
+        "secrets_controls": "tested",
+    },
+    "shell": {
+        "sql": "unsupported",
+        "command": "limited",
+        "path": "limited",
+        "ssrf": "unsupported",
+        "xss": "unsupported",
+        "deserialization": "unsupported",
+        "dynamic_exec": "limited",
+        "redirect": "unsupported",
+        "secrets_controls": "limited",
+    },
+}
+
+FAMILIES = (
+    "sql",
+    "command",
+    "path",
+    "ssrf",
+    "xss",
+    "deserialization",
+    "dynamic_exec",
+    "redirect",
+    "secrets_controls",
+)

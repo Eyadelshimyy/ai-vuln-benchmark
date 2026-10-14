@@ -1,0 +1,33 @@
+{
+  "repo": "Gunrunner444__BugForge",
+  "file": "backend/app/security_testing/screenshots.py",
+  "function": "save",
+  "line": 29,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `save` function (parameters: data).",
+  "prompt_source": "    def save(self, data: bytes, *, stem: str) -> Path:\n        \"\"\"Implement the `save` function (parameters: data).\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    def save(self, data: bytes, *, stem: str) -> Path:\n        if not data:\n            raise ValueError(\"Screenshot is empty\")\n        if len(data) > self.max_bytes:\n            raise ValueError(f\"Screenshot exceeds size limit ({self.max_bytes} bytes)\")\n        if any(part in stem for part in (\"..\", \"/\", \"\\\\\")):\n            raise ValueError(\"Invalid screenshot name\")\n        name = _safe_stem(stem)\n        if not name:\n            raise ValueError(\"Invalid screenshot name\")\n        path = (self.root / f\"{name}.png\").resolve()\n        if not _is_within(self.root, path):\n            raise ValueError(\"Screenshot path escapes the evidence directory\")\n        path.write_bytes(data)\n        self.cleanup()\n        return path",
+  "module_source": "\"\"\"Controlled project evidence directory for screenshots.\"\"\"\n\nfrom __future__ import annotations\n\nfrom pathlib import Path\n\n_MAX_STEM = 80\n\n\nclass ScreenshotStore:\n    def __init__(\n        self,\n        root: Path,\n        *,\n        max_bytes: int = 2_000_000,\n        max_files: int = 50,\n    ) -> None:\n        self.root = root.resolve()\n        self.root.mkdir(parents=True, exist_ok=True)\n        self.max_bytes = max_bytes\n        self.max_files = max_files\n\n    @classmethod\n    def for_project(cls, project_id: str, *, base: Path | None = None) -> ScreenshotStore:\n        safe = _safe_stem(project_id) or \"project\"\n        root = (base or Path.cwd() / \"var\" / \"bugforge\" / \"evidence\") / safe / \"screenshots\"\n        return cls(root)\n\n    def save(self, data: bytes, *, stem: str) -> Path:\n        if not data:\n            raise ValueError(\"Screenshot is empty\")\n        if len(data) > self.max_bytes:\n            raise ValueError(f\"Screenshot exceeds size limit ({self.max_bytes} bytes)\")\n        if any(part in stem for part in (\"..\", \"/\", \"\\\\\")):\n            raise ValueError(\"Invalid screenshot name\")\n        name = _safe_stem(stem)\n        if not name:\n            raise ValueError(\"Invalid screenshot name\")\n        path = (self.root / f\"{name}.png\").resolve()\n        if not _is_within(self.root, path):\n            raise ValueError(\"Screenshot path escapes the evidence directory\")\n        path.write_bytes(data)\n        self.cleanup()\n        return path\n\n    def cleanup(self) -> None:\n        files = sorted(\n            (item for item in self.root.glob(\"*.png\") if item.is_file()),\n            key=lambda item: item.stat().st_mtime,\n        )\n        while len(files) > self.max_files:\n            stale = files.pop(0)\n            stale.unlink(missing_ok=True)\n\n\ndef _safe_stem(value: str) -> str:\n    cleaned = []\n    for char in value.strip():\n        if char.isalnum() or char in {\"-\", \"_\"}:\n            cleaned.append(char)\n        elif char in {\".\", \" \", \":\"}:\n            cleaned.append(\"_\")\n    return \"\".join(cleaned)[:_MAX_STEM]\n\n\ndef _is_within(root: Path, candidate: Path) -> bool:\n    try:\n        candidate.relative_to(root)\n        return True\n    except ValueError:\n        return False\n",
+  "construction_recipe": {
+    "call_args_source": "(tmp_path / 'shots')",
+    "uses_tmp_path": true,
+    "source_file": "backend/tests/test_phase3/test_hardening.py",
+    "source_line": 458
+  },
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 16
+    },
+    "ai_commit": "fb8deaa56566",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      29,
+      44
+    ]
+  }
+}

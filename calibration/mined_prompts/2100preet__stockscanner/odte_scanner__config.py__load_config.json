@@ -1,0 +1,28 @@
+{
+  "repo": "2100preet__stockscanner",
+  "file": "odte_scanner/config.py",
+  "function": "load_config",
+  "line": 13,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `load_config` function (parameters: path).",
+  "prompt_source": "def load_config(path: str | Path | None = None) -> dict[str, Any]:\n    \"\"\"Implement the `load_config` function (parameters: path).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def load_config(path: str | Path | None = None) -> dict[str, Any]:\n    cfg_path = Path(path) if path else DEFAULT_CONFIG\n    with cfg_path.open() as f:\n        data = yaml.safe_load(f) or {}\n    return data",
+  "module_source": "from __future__ import annotations\n\nfrom pathlib import Path\nfrom typing import Any\n\nimport yaml\n\n\nROOT = Path(__file__).resolve().parents[1]\nDEFAULT_CONFIG = ROOT / \"config.yaml\"\n\n\ndef load_config(path: str | Path | None = None) -> dict[str, Any]:\n    cfg_path = Path(path) if path else DEFAULT_CONFIG\n    with cfg_path.open() as f:\n        data = yaml.safe_load(f) or {}\n    return data\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 5
+    },
+    "ai_commit": "3be9059efc4f",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      13,
+      17
+    ]
+  }
+}

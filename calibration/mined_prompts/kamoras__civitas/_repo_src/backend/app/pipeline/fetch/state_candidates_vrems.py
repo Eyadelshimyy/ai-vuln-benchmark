@@ -1,0 +1,298 @@
+"""The certified November ballot from a state's candidate-tracking system
+(VREMS "Candidate Tracking", as South Carolina runs it).
+
+South Carolina sat on `google_civic` all cycle. Its primary results ARE
+reachable (a Clarity host, enr-scvotes.org), but reading nominees from
+them would have published the wrong Senate nominee: one candidate won
+the June 9 Republican primary outright, then a separate US Senate
+Special Republican Primary (August 11) and its runoff nominated someone
+else. Any primary-results reader that stops at June names the wrong
+person; one that tries to follow specials has to know every special
+exists. The candidate-tracking list for the 11/3/2026 Statewide General
+Election answers the question directly: the special's nominee, alongside
+the Constitution, Libertarian and Workers candidates no primary ever lists.
+
+Flow (read from the site's own SelectElection.js / CandidateSearch.js):
+  GET  {base}/Candidate/GetElections?electionType=General&year={year}
+       -> [{electionId, electionName, electionDate}]
+  GET  {base}/Candidate/CandidateSearch?electionId={id}
+       -> anti-forgery token + the office dropdown
+  POST {base}/Candidate/CandidateSearch/  (multipart, one per office)
+       -> an HTML table: Office | ... | Name on Ballot | ... | Party | ... | Candidate Status
+
+The election is picked by the statutory general-election DATE and the
+federal offices by what parse_office recognises in the dropdown, so
+neither an election id nor an office id is pinned here.
+
+With `statewide_offices` set, the state's own offices are read as well,
+and then ONE search for every office replaces the per-office ones. The
+dropdown cannot be used to pick them: South Carolina's lists its House
+as a bare "State House of Representatives", and only each result row's
+own label ("State House of Representatives, District 1") carries the
+district the legislative gate needs. So every row goes through the same
+three gates by its own label. That puts ~900 county, school-board and
+special-district rows in front of them (1,175 Active rows on the real
+2026 list), and two things keep them out: the gates themselves, and, for
+a statewide office, the row's own "Associated Counties" cell — a
+statewide contest is associated with no county, and the one local row
+whose label reads like a statewide body ("Public Service District,
+Fripp Island Public Service Commission") names Beaufort there.
+"""
+
+import logging
+import re
+
+import httpx
+from lxml import html as lxml_html
+
+from app.pipeline.fetch.fec import general_election_day
+from app.pipeline.fetch.http_utils import (
+    BROWSER_HEADERS,
+    fetch_json_with_retry,
+    fetch_with_retry,
+)
+from app.pipeline.fetch.state_candidates_common import (
+    ballot_list_party,
+    clean_display_name,
+    normalize_party,
+    parse_office,
+    parse_state_leg_office,
+    parse_statewide_office,
+    surname,
+)
+from app.pipeline.rate_limiter import RateLimiter
+
+logger = logging.getLogger(__name__)
+
+_rate_limiter = RateLimiter(rps=1.0)
+
+# Everyone the general election lists who is still on it. "Withdrew",
+# "Died", "Disqualified" and friends are separate statuses, so asking
+# for Active is what drops them — the one filter this list needs.
+_ACTIVE = "Active"
+
+
+def _general_election_id(elections: list, year: int) -> str | None:
+    wanted = general_election_day(year).isoformat()
+    ids = [
+        str(e.get("electionId"))
+        for e in elections
+        if isinstance(e, dict)
+        and str(e.get("electionDate") or "").startswith(wanted)
+        and "general" in str(e.get("electionName") or "").lower()
+    ]
+    # Two "general" elections on the federal day (a statewide general and,
+    # say, a municipal one) would be a guess — refuse rather than pick.
+    return ids[0] if len(ids) == 1 else None
+
+
+def _search_form(page: str) -> tuple[dict, list[str], str | None] | None:
+    """Hidden fields to echo back, the federal office ids offered, and
+    the id of the dropdown's own "All" choice (None if it has none)."""
+    tree = lxml_html.fromstring(page)
+    forms = tree.xpath('//form[@id="searchForm"]')
+    if not forms:
+        return None
+    form = forms[0]
+    hidden = {
+        i.get("name"): i.get("value") or ""
+        for i in form.xpath('.//input[@type="hidden"][@name]')
+    }
+    offices = [
+        o.get("value")
+        for o in form.xpath('.//select[@id="SelectedOffice"]/option')
+        if o.get("value") and parse_office(o.text_content() or "")
+    ]
+    every = next(
+        (
+            o.get("value")
+            for o in form.xpath('.//select[@id="SelectedOffice"]/option')
+            if o.get("value") and (o.text_content() or "").strip().lower() == "all"
+        ),
+        None,
+    )
+    return hidden, offices, every
+
+
+# A running mate's cell carries the mate's own filing status after the
+# name: "Mike Reichenbach (Active)".
+_MATE_STATUS_RE = re.compile(r"^(?P<name>.*?)\s*\((?P<status>[^()]*)\)\s*$")
+
+
+def _active_mate(cell: str) -> str:
+    """The running mate's name when they are still on the ticket: the cell
+    names no status, or says "Active". A withdrawn (or any other status)
+    mate is not on the ballot beside the governor, so is not joined --
+    clean_display_name would strip "(Withdrawn)" as an annotation and
+    keep the name."""
+    cell = " ".join(cell.split())
+    m = _MATE_STATUS_RE.match(cell)
+    if m:
+        if m.group("status").strip().lower() != "active":
+            return ""
+        cell = m.group("name")
+    return clean_display_name(cell)
+
+
+def _state_office_record(row: dict) -> dict | None:
+    """A statewide-executive or state-legislative record for one Active
+    result row, or None. Only called for a state that opted in."""
+    label = row.get("Office") or ""
+    statewide = parse_statewide_office(label)
+    seat = None
+    if statewide is not None:
+        # A statewide contest is associated with no county. A row that
+        # names one is a local body whose label happens to read like a
+        # statewide one, whatever the gate made of it.
+        if (row.get("Associated Counties") or "").strip():
+            return None
+        office, district = statewide
+    else:
+        legislative = parse_state_leg_office(label)
+        if legislative is None:
+            return None
+        office, district, seat = legislative
+    # The Party column of a certified November list: a party the shared
+    # vocabulary cannot name (South Carolina's Workers Party, which has no
+    # FEC code either) is kept under OTHER_PARTY with its printed label,
+    # never dropped and never guessed into a code.
+    party = ballot_list_party(row.get("Party") or "")
+    name = clean_display_name(row.get("Name on Ballot") or "")
+    if not party or not name:
+        return None
+    # A joint ticket's second name is its own column ("Governor and
+    # Lieutenant Governor": Alan Wilson, "Mike Reichenbach (Active)"); the
+    # ballot prints the pair, so the page does too -- "Alan Wilson and
+    # Mike Reichenbach", the way Maryland's list reads.
+    mate = _active_mate(row.get("Running Mate") or "")
+    if mate:
+        name = f"{name} and {mate}"
+    record = {"office": office, "district": district, "party": party[0], "last_name": name}
+    if party[1]:
+        record["party_label"] = party[1]
+    if seat is not None:
+        record["seat"] = seat
+    return record
+
+
+def _rows(page: str) -> list[dict]:
+    """The result table as header -> cell dicts, keyed by the site's own
+    column names so a reordered column cannot shift a party into a name."""
+    tree = lxml_html.fromstring(page) if page.strip() else None
+    if tree is None:
+        return []
+    tables = tree.xpath('//table[@id="gridCandidateSearch"]') or tree.xpath("//table")
+    if not tables:
+        return []
+    headers = [(th.text_content() or "").strip() for th in tables[0].xpath(".//thead//th")]
+    out = []
+    for tr in tables[0].xpath(".//tbody/tr"):
+        cells = [(td.text_content() or "").strip() for td in tr.xpath("./td")]
+        if len(cells) == len(headers):
+            out.append(dict(zip(headers, cells)))
+    return out
+
+
+async def fetch_confirmed_candidates(
+    client: httpx.AsyncClient, year: int, state: str, source: dict,
+) -> list[dict] | None:
+    base = (source.get("base_url") or "").rstrip("/")
+    if not base:
+        logger.warning("%s vrems source has no base_url", state)
+        return None
+
+    elections = await fetch_json_with_retry(
+        client, _rate_limiter,
+        f"{base}/Candidate/GetElections?electionType=General&year={year}",
+        f"{state} candidate-tracking elections",
+    )
+    if not isinstance(elections, list):
+        return None
+    election_id = _general_election_id(elections, year)
+    if not election_id:
+        logger.info("%s candidate tracking lists no single %d general election yet", state, year)
+        return None
+
+    resp = await fetch_with_retry(
+        client, _rate_limiter, "GET", f"{base}/Candidate/CandidateSearch?electionId={election_id}",
+        log_label=f"{state} candidate search page", headers=BROWSER_HEADERS,
+    )
+    if resp is None:
+        return None
+    form = _search_form(resp.text)
+    if not form or not form[1]:
+        logger.warning("%s candidate search page has no federal office to ask for", state)
+        return None
+    hidden, office_ids, every = form
+    want_state = bool(source.get("statewide_offices"))
+    if want_state:
+        if not every:
+            # Asking office by office would miss the legislature (see the
+            # module docstring), and a partial list under the opt-in reads
+            # as a confirmed absence. Say nothing instead.
+            logger.warning("%s candidate search offers no 'All' office to ask for", state)
+            return None
+        office_ids = [every]
+
+    records: list[dict] = []
+    federal_count = 0
+    left_out = 0
+    for office_id in office_ids:
+        fields = {
+            **hidden,
+            "ElectionId": election_id,
+            "SelectedOffice": office_id,
+            "SelectedCandidateStatus": _ACTIVE,
+            "CandidateFirstName": "",
+            "CandidateLastName": "",
+        }
+        resp = await fetch_with_retry(
+            client, _rate_limiter, "POST", f"{base}/Candidate/CandidateSearch/",
+            log_label=f"{state} candidates for office {office_id}", headers=BROWSER_HEADERS,
+            files={k: (None, v) for k, v in fields.items()},
+        )
+        if resp is None:
+            # A missing office would read as "nobody is running" for it.
+            return None
+        for row in _rows(resp.text):
+            if row.get("Candidate Status") != _ACTIVE:
+                continue
+            parsed = parse_office(row.get("Office") or "")
+            if not parsed:
+                if want_state:
+                    state_record = _state_office_record(row)
+                    if state_record is not None:
+                        records.append(state_record)
+                    elif (
+                        parse_statewide_office(row.get("Office") or "")
+                        or parse_state_leg_office(row.get("Office") or "")
+                    ):
+                        left_out += 1
+                continue
+            display = clean_display_name(row.get("Name on Ballot") or "")
+            last = surname(display)
+            if not last:
+                continue
+            federal_count += 1
+            records.append({
+                "office": parsed[0],
+                "district": parsed[1],
+                "party": normalize_party(row.get("Party") or "", ballot_list=True),
+                "last_name": last,
+                "display_name": display,
+                "party_label": (row.get("Party") or "").strip(),
+            })
+
+    if not federal_count:
+        logger.warning("%s candidate tracking returned no federal candidate for election %s", state, election_id)
+        return None
+    if left_out:
+        logger.info(
+            "%s candidate tracking: %d state-office rows left out (a county-associated "
+            "statewide label, or a row with no name or no party printed)", state, left_out,
+        )
+    logger.info(
+        "%s candidate tracking: %d federal candidates, %d state-office (election %s)",
+        state, federal_count, len(records) - federal_count, election_id,
+    )
+    return records

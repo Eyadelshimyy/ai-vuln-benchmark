@@ -1,0 +1,1123 @@
+"""The three certified-November-ballot adapters added 2026-09-26 (LA
+voterportal, SC vrems, MO certified_pdf), and the two matcher fixes the
+live verification of them exposed. Fixtures are trimmed copies of what
+each state actually served that day."""
+
+from types import SimpleNamespace
+
+import httpx
+import pytest
+
+from app.pipeline.fetch.state_candidates import _match_candidate
+from app.pipeline.fetch.state_candidates_certified_pdf import parse_certification
+from app.pipeline.fetch.state_candidates_voterportal import (
+    fetch_confirmed_candidates as fetch_voterportal,
+)
+from app.pipeline.fetch.state_candidates_vrems import (
+    _general_election_id,
+    fetch_confirmed_candidates as fetch_vrems,
+)
+
+LA_URL = "https://portal.test/Data"
+
+LA_DATES = {"Dates": {"Date": [
+    {"PKElectionID": "344", "ElectionDate": "11/03/2026", "ResultsOfficial": "0"},
+    {"PKElectionID": "343", "ElectionDate": "06/27/2026", "ResultsOfficial": "1"},
+]}}
+
+LA_RACES = {"Races": {"Race": [
+    {"ID": "1", "SpecificTitle": "U. S. Senator",
+     "Choice": [{"ID": "a", "Desc": '"Jamie" Davis (DEM)'}, {"ID": "b", "Desc": "Julia Letlow (REP)"}]},
+    {"ID": "2", "SpecificTitle": "U. S. Representative -- 2nd Congressional District",
+     "Choice": [{"ID": "c", "Desc": "Troy A. Carter, Sr. (DEM)"},
+                {"ID": "d", "Desc": 'Walter "Rocky" Beach (NOPTY)'},
+                {"ID": "e", "Desc": "Lisa Ballay (LBT)"}]},
+    # A one-candidate race comes back as a bare object, not a list.
+    {"ID": "3", "SpecificTitle": "U. S. Representative -- 9th Congressional District",
+     "Choice": {"ID": "f", "Desc": "Solo Person (REP)"}},
+    {"ID": "4", "SpecificTitle": "Mayor -- City of DeRidder",
+     "Choice": [{"ID": "g", "Desc": "Not Federal (DEM)"}]},
+]}}
+
+
+def _client(handler):
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+@pytest.mark.asyncio
+async def test_voterportal_reads_the_staged_general_ballot():
+    def handler(request):
+        blob = request.url.params["blob"]
+        if blob == "ElectionDates.htm":
+            return httpx.Response(200, json=LA_DATES)
+        assert blob == "20261103/RacesCandidates_Multiparish.htm"
+        return httpx.Response(200, json=LA_RACES)
+
+    async with _client(handler) as client:
+        records = await fetch_voterportal(client, 2026, "LA", {"data_url": LA_URL})
+
+    by_name = {r["display_name"]: r for r in records}
+    assert set(by_name) == {'"Jamie" Davis', "Julia Letlow", "Troy A. Carter, Sr.",
+                            'Walter "Rocky" Beach', "Lisa Ballay", "Solo Person"}
+    assert by_name['"Jamie" Davis'] == {
+        "office": "S", "district": None, "party": "D", "last_name": "Davis",
+        "display_name": '"Jamie" Davis', "party_label": "DEM",
+    }
+    assert by_name["Troy A. Carter, Sr."]["last_name"] == "Carter"
+    # No-party is an ordinary independent on a certified ballot.
+    assert by_name['Walter "Rocky" Beach']["party"] == "I"
+    assert by_name["Solo Person"]["district"] == 9
+
+
+@pytest.mark.asyncio
+async def test_voterportal_says_cannot_tell_before_the_general_is_staged():
+    dates = {"Dates": {"Date": [{"ElectionDate": "06/27/2026"}]}}
+
+    async with _client(lambda r: httpx.Response(200, json=dates)) as client:
+        assert await fetch_voterportal(client, 2026, "LA", {"data_url": LA_URL}) is None
+
+
+SC_BASE = "https://vrems.test"
+
+SC_ELECTIONS = [
+    {"electionId": "22596", "electionName": "Statewide General Election",
+     "electionDate": "2026-11-03T00:00:00"},
+    {"electionId": "22760", "electionName": "US Senate Special Republican Primary",
+     "electionDate": "2026-08-11T00:00:00"},
+]
+
+SC_SEARCH_PAGE = """<html><body><form id="searchForm">
+<input type="hidden" id="ElectionId" name="ElectionId" value="22596" />
+<input type="hidden" id="ExportFileName" name="ExportFileName" value="x" />
+<select id="SelectedOffice" name="SelectedOffice">
+<option value="-1">All</option><option value="463">Governor and Lieutenant Governor</option>
+<option value="376">U.S. Senate</option><option value="378">U.S. House of Representatives</option>
+<option value="380">State House of Representatives</option></select>
+</form></body></html>"""
+
+_HEAD = ("<table id=\"gridCandidateSearch\"><thead><tr><th>Office</th><th>Associated Counties</th>"
+         "<th>Name on Ballot</th><th>Running Mate</th><th>Party</th><th>Location of Filing</th>"
+         "<th>Candidate Status</th></tr></thead><tbody>")
+
+
+def _sc_row(office, name, party, status="Active"):
+    return (f"<tr><td>{office}</td><td></td><td><a href='#'>{name}</a></td><td></td>"
+            f"<td>{party}</td><td>State</td><td>{status}</td></tr>")
+
+
+SC_TABLES = {
+    "376": _HEAD + _sc_row("U.S. Senate", "Delia Whitfield", "Republican")
+    + _sc_row("U.S. Senate", "Mark Hackett", "Constitution") + "</tbody></table>",
+    "378": _HEAD + _sc_row("U.S. House of Representatives, District 2", "Joe Wilson", "Republican")
+    + _sc_row("U.S. House of Representatives, District 2", "Pat Petition", "Petition")
+    + _sc_row("U.S. House of Representatives, District 2", "Gone Away", "Democratic", "Withdrew(2)")
+    + "</tbody></table>",
+}
+
+
+@pytest.mark.asyncio
+async def test_vrems_reads_every_federal_office_on_the_general_ballot():
+    asked = []
+
+    def handler(request):
+        if request.url.path == "/Candidate/GetElections":
+            return httpx.Response(200, json=SC_ELECTIONS)
+        if request.method == "GET":
+            return httpx.Response(200, text=SC_SEARCH_PAGE)
+        body = request.content.decode()
+        office = next(o for o in SC_TABLES if f'name="SelectedOffice"\r\n\r\n{o}\r\n' in body)
+        asked.append(office)
+        assert "Active" in body
+        return httpx.Response(200, text=SC_TABLES[office])
+
+    async with _client(handler) as client:
+        records = await fetch_vrems(client, 2026, "SC", {"base_url": SC_BASE})
+
+    # Only the offices parse_office recognises as federal were asked for.
+    assert asked == ["376", "378"]
+    got = {(r["office"], r["district"], r["display_name"], r["party"]) for r in records}
+    assert got == {
+        ("S", None, "Delia Whitfield", "R"),
+        ("S", None, "Mark Hackett", "C"),
+        ("H", 2, "Joe Wilson", "R"),
+        ("H", 2, "Pat Petition", "I"),
+    }
+
+
+def test_vrems_refuses_to_guess_between_two_generals():
+    two = SC_ELECTIONS + [{"electionId": "9", "electionName": "Municipal General Election",
+                           "electionDate": "2026-11-03T00:00:00"}]
+    assert _general_election_id(SC_ELECTIONS, 2026) == "22596"
+    assert _general_election_id(two, 2026) is None
+
+
+MO_LINES = """Certificate of Candidates for
+REPUBLICAN PARTY EMBLEM
+REPUBLICAN CANDIDATES
+For State Auditor
+Scott Fitzpatrick
+For U.S. Representative
+District 1, Paul Berry III
+District 5, Rick Brattin
+For State Senator
+District 2, Nick Schroer
+7
+DEMOCRATIC CANDIDATES
+For U.S. Senator
+Jane Example
+For U.S. Representative
+District 5, Emanuel Cleaver, II
+LIBERTARIAN CANDIDATES
+For U.S. Representative
+District 5, Randall (Randy) Langkraehr
+INDEPENDENT CANDIDATES
+For U.S. Representative
+District 2, Indy Pendent
+JUDICIAL CANDIDATES
+For U.S. Representative
+District 3, Should Not Appear
+""".splitlines()
+
+
+def test_certified_pdf_reads_each_line_under_its_party_and_office():
+    got = {(r["office"], r["district"], r["party"], r["display_name"]) for r in parse_certification(MO_LINES)}
+    assert got == {
+        ("H", 1, "R", "Paul Berry III"),
+        ("H", 5, "R", "Rick Brattin"),
+        ("S", None, "D", "Jane Example"),
+        ("H", 5, "D", "Emanuel Cleaver, II"),
+        ("H", 5, "L", "Randall (Randy) Langkraehr"),  # the nickname the ballot prints
+        ("H", 2, "I", "Indy Pendent"),
+    }
+
+
+def _cand(name, party, cid, raised=0):
+    return SimpleNamespace(name=name, party=party, id=cid,
+                           has_raised_funds=raised > 0, contributions=raised)
+
+
+def test_match_strips_a_suffix_filed_on_the_fec_surname():
+    # FEC files "CLEAVER II, EMANUEL"; the ballot prints "Emanuel Cleaver, II".
+    cleaver = _cand("CLEAVER II, EMANUEL", "DEM", "H4MO05234")
+    assert _match_candidate([cleaver, _cand("BRATTIN, RICHARD", "REP", "x")], "Cleaver", "D") is cleaver
+
+
+def test_match_confirms_one_person_filed_under_two_fec_ids():
+    # MO-1 2026: one Paul Berry, two FEC candidate ids. Two different people
+    # (SMITH, JANE / SMITH, BOB) are still refused: test_state_candidates.py
+    # TestMatchCandidate.test_returns_none_when_same_surname_and_party_both_ambiguous.
+    stale = _cand("BERRY, PAUL", "REP", "H2MO01111")
+    live = _cand("BERRY, PAUL", "REP", "H6MO01222", raised=150_000)
+    assert _match_candidate([stale, live, _cand("BELL, WESLEY", "DEM", "b")], "Berry", "R") is live
+
+
+# --- The sync: ballot-only rows, and a certified ballot being authoritative ---
+
+from unittest.mock import AsyncMock  # noqa: E402
+
+from app.models import Candidate, Race  # noqa: E402
+from app.pipeline.fetch import state_candidates as sc  # noqa: E402
+
+
+def _race(db, race_id, state, office="S", district=None):
+    db.add(Race(id=race_id, cycle_year=2026, office=office, state=state, district=district, is_special=False))
+
+
+def _db_cand(db, cid, race_id, name, party, **kw):
+    db.add(Candidate(id=cid, race_id=race_id, name=name, party=party, **kw))
+
+
+def _one_state(monkeypatch, state):
+    """Sync only `state`, with no FEC calendar fetch."""
+    async def no_calendar(client, cycle):
+        return {}, False
+    monkeypatch.setattr(sc.election_dates, "fetch_fec_calendar", no_calendar)
+    monkeypatch.setattr(sc, "configured_states", lambda: {state})
+
+
+@pytest.fixture()
+def only(monkeypatch):
+    def scope(state, records):
+        _one_state(monkeypatch, state)
+        strategy = sc.source_for_state(state)["strategy"]
+        monkeypatch.setitem(sc.STRATEGIES, strategy, AsyncMock(return_value=records))
+    return scope
+
+
+def _rec(office, district, party, last, display):
+    return {"office": office, "district": district, "party": party,
+            "last_name": last, "display_name": display}
+
+
+@pytest.mark.asyncio
+async def test_a_certified_ballot_unconfirms_a_nominee_who_withdrew(db_session, only):
+    # Maine 2026: Colfax won the primary, withdrew, Penrose replaced him.
+    # The sticky flag used to keep Colfax on the page beside Penrose.
+    _race(db_session, "2026-SEN-LA", "LA")
+    _db_cand(db_session, "S6ME00001", "2026-SEN-LA", "COLFAX, WHITFIELD", "DEM", confirmed_general=True)
+    _db_cand(db_session, "S6ME00002", "2026-SEN-LA", "PENROSE, TROY", "DEM")
+    _db_cand(db_session, "S6ME00003", "2026-SEN-LA", "PRYOR, SUSAN M.", "REP", confirmed_general=True)
+    db_session.commit()
+    only("LA", [_rec("S", None, "D", "Penrose", "Reid D. Penrose"),
+                _rec("S", None, "R", "Pryor", "Susan M. Pryor")])
+
+    results = await sc.sync_confirmed_candidates(db_session, None, 2026)
+
+    flags = {c.id: c.confirmed_general for c in db_session.query(Candidate)}
+    assert flags == {"S6ME00001": False, "S6ME00002": True, "S6ME00003": True}
+    assert results["LA"]["unconfirmed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_ballot_candidate_with_no_fec_filing_is_shown(db_session, only):
+    _race(db_session, "2026-HOUSE-LA-2", "LA", office="H", district=2)
+    _db_cand(db_session, "H6LA02001", "2026-HOUSE-LA-2", "CARTER, TROY A. SR.", "DEM")
+    db_session.commit()
+    only("LA", [_rec("H", 2, "D", "Carter", "Troy A. Carter, Sr."),
+                _rec("H", 2, "I", "Beach", 'Walter "Rocky" Beach')])
+
+    results = await sc.sync_confirmed_candidates(db_session, None, 2026)
+
+    beach = db_session.query(Candidate).filter(Candidate.id.startswith("ballot:")).one()
+    assert beach.name == 'BEACH, WALTER "ROCKY"'
+    # The page shows the name as the state prints it, not the FEC-style
+    # form built for matching (60 such rows had none on 2026-10-08).
+    assert beach.ballot_name == 'Walter "Rocky" Beach'
+    assert beach.party == "IND"
+    assert beach.confirmed_general is True
+    assert beach.fec_filed is False
+    assert results["LA"]["ballotOnly"] == 1
+    assert results["LA"]["unmatched"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_ballot_only_row_gives_way_once_the_candidate_files(db_session, only):
+    _race(db_session, "2026-HOUSE-LA-2", "LA", office="H", district=2)
+    db_session.commit()
+    only("LA", [_rec("H", 2, "I", "Beach", 'Walter "Rocky" Beach')])
+    await sc.sync_confirmed_candidates(db_session, None, 2026)
+    assert db_session.query(Candidate).filter(Candidate.id.startswith("ballot:")).count() == 1
+
+    # He files with the FEC; the next run matches the real record, and the
+    # placeholder must not survive beside it (or win the match).
+    _db_cand(db_session, "H6LA02099", "2026-HOUSE-LA-2", "BEACH, WALTER", "IND")
+    db_session.commit()
+    await sc.sync_confirmed_candidates(db_session, None, 2026)
+
+    rows = {c.id: c.confirmed_general for c in db_session.query(Candidate)}
+    assert rows == {"H6LA02099": True}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_fetch_leaves_ballot_only_rows_alone(db_session, only):
+    _race(db_session, "2026-HOUSE-LA-2", "LA", office="H", district=2)
+    db_session.commit()
+    only("LA", [_rec("H", 2, "I", "Beach", 'Walter "Rocky" Beach')])
+    await sc.sync_confirmed_candidates(db_session, None, 2026)
+
+    only("LA", None)  # the source is down: that says nothing about the ballot
+    await sc.sync_confirmed_candidates(db_session, None, 2026)
+    assert db_session.query(Candidate).filter(Candidate.id.startswith("ballot:")).count() == 1
+
+
+@pytest.mark.asyncio
+async def test_a_non_candidate_row_never_becomes_a_person(db_session, only):
+    _race(db_session, "2026-HOUSE-LA-2", "LA", office="H", district=2)
+    db_session.commit()
+    only("LA", [_rec("H", 2, None, "Scattering", "Write-In Scattering"),
+                _rec("H", 2, "R", "Smith", "Smith")])  # a surname alone is not a ballot entry
+
+    results = await sc.sync_confirmed_candidates(db_session, None, 2026)
+
+    assert db_session.query(Candidate).count() == 0
+    assert results["LA"]["unmatched"] == 2
+
+
+@pytest.mark.asyncio
+async def test_a_person_named_blank_is_a_person_but_a_write_in_is_not_on_the_ballot(db_session, only):
+    """The aggregate-row filter matches whole labels: a candidate surnamed
+    Blank is shown, while a name the source marks as a write-in is still
+    not a person printed on the November ballot."""
+    _race(db_session, "2026-HOUSE-LA-2", "LA", office="H", district=2)
+    db_session.commit()
+    only("LA", [_rec("H", 2, "D", "Blank", "Mary Blank"),
+                _rec("H", 2, None, "Redkey", "Redkey, David (Write-In)"),
+                _rec("H", 2, None, "Blank", "Blank Votes"),
+                _rec("H", 2, None, "Voted", "Times Blank Voted"),
+                _rec("H", 2, None, "Delegates", "Uncommitted Delegates"),
+                _rec("H", 2, None, "Votes", "Over/Under Votes")])
+
+    await sc.sync_confirmed_candidates(db_session, None, 2026)
+
+    assert [c.name for c in db_session.query(Candidate)] == ["BLANK, MARY"]
+
+
+@pytest.mark.asyncio
+async def test_primary_results_never_unconfirm_anyone(db_session, only):
+    # Pennsylvania reads primary results: a later fetch that doesn't list a
+    # nominee is not evidence they left the ballot.
+    _race(db_session, "2026-SEN-PA", "PA")
+    _db_cand(db_session, "S6PA00001", "2026-SEN-PA", "NOMINEE, JANE", "DEM", confirmed_general=True)
+    db_session.commit()
+    only("PA", [_rec("S", None, "R", "Other", "Some Other")])
+
+    await sc.sync_confirmed_candidates(db_session, None, 2026)
+
+    assert db_session.query(Candidate).filter(Candidate.id == "S6PA00001").one().confirmed_general is True
+
+
+def test_match_folds_accents_and_reads_married_names():
+    sanchez = _cand("SANCHEZ, LINDA", "DEM", "a")
+    assert _match_candidate([sanchez, _cand("LEE, AL", "REP", "b")], "Sánchez", "D") is sanchez
+    hinson = _cand("ARENHOLZ, ASHLEY HINSON", "REP", "c")
+    assert _match_candidate([hinson, _cand("TUREK, JOSHUA", "DEM", "d")], "Hinson", "R") is hinson
+
+
+def test_match_uses_the_given_name_between_two_same_party_namesakes():
+    eric, mayra = _cand("FLORES, ERIC", "REP", "e"), _cand("FLORES, MAYRA NOHEMI", "REP", "m")
+    assert _match_candidate([eric, mayra], "FLORES", "R", "Mayra Flores") is mayra
+    assert _match_candidate([eric, mayra], "FLORES", "R") is None
+
+
+def test_match_tolerates_one_transposed_letter_only_with_the_given_name():
+    fec = _cand("DAUGHTERY, BRANDON", "LIB", "x")
+    assert _match_candidate([fec], "Daugherty", "L", "Brandon Coulter Daugherty") is fec
+    assert _match_candidate([fec], "Daugherty", "L") is None
+    assert _match_candidate([fec], "Daugherty", "L", "Kevin Daugherty") is None
+
+
+# --- Wisconsin: the certified canvass, and a state's own fallback source ---
+
+from app.pipeline.fetch.state_candidates_canvass_summary_pdf import parse_canvass  # noqa: E402
+
+WI_LINES = """WEC Canvass Reporting System
+Office GOVERNOR Total Votes: 1,283,728
+Party: Republican Total Votes: 491,013
+Winner 468,019 95.32% Tom Tiffany Republican
+Office REPRESENTATIVE IN CONGRESS DISTRICT 1 Total Votes: 122,554
+Party: Republican Total Votes: 51,119
+Winner 50,915 99.6% Bryan Steil Republican
+204 .4%
+SCATTERING
+Party: Democratic 71,403
+Total Votes:
+15,455 21.64% Peter Burgelis Democrat
+Winner 31,494 44.11% Mitchell Berman Democrat
+Party: REPRESENTATIVE IN CONGRESS DISTRICT 1 - Constitution Total Votes: 13
+Winner 13 100% SCATTERING
+Office REPRESENTATIVE IN CONGRESS DISTRICT 2 Total Votes: 165,383
+Party: Republican Total Votes: 1,179
+Winner 1,179 100% SCATTERING
+Party: Democratic Total Votes: 164,183
+Winner 144,365 87.93% Mark Pocan Democrat
+Report Generated - 8/27/2026 11:44:51 AM Page 5 of 79
+Office REPRESENTATIVE IN CONGRESS DISTRICT 2 Total Votes: 165,383
+Party: Democratic Total Votes: 164,183
+208 .13% SCATTERING
+Office REPRESENTATIVE IN CONGRESS DISTRICT 6 Total Votes: 150,000
+Party: Wisconsin Green Total Votes: 62
+Winner 62 100% Matthew Arndt Wisconsin
+Green
+Party: Libertarian Total Votes: 9
+Winner 9 100% Democrat
+""".splitlines()
+
+
+def test_canvass_reads_the_states_own_winner_marks():
+    got = {(r["district"], r["party"], r["display_name"]) for r in parse_canvass(WI_LINES)}
+    assert got == {
+        (1, "R", "Bryan Steil"),
+        (1, "D", "Mitchell Berman"),   # the marked winner, not the first name listed
+        (2, "D", "Mark Pocan"),        # once, though a page break repeats the office
+        (6, "G", "Matthew Arndt"),     # party wrapped onto the next line
+    }
+    # Governor is not federal; SCATTERING is not a person; a Winner line
+    # whose name was lost ("Winner 9 100% Democrat") names nobody.
+
+
+@pytest.mark.asyncio
+async def test_a_states_fallback_runs_when_its_source_returns_nothing(db_session, monkeypatch):
+    _one_state(monkeypatch, "WI")
+    monkeypatch.setitem(sc.STRATEGIES, "canvass_summary_pdf", AsyncMock(return_value=None))
+    fallback = AsyncMock(return_value=[_rec("H", 2, "D", "Pocan", "Mark Pocan")])
+    monkeypatch.setitem(sc.STRATEGIES, "google_civic", fallback)
+    _race(db_session, "2026-HOUSE-WI-2", "WI", office="H", district=2)
+    _db_cand(db_session, "H8WI02156", "2026-HOUSE-WI-2", "POCAN, MARK", "DEM")
+    db_session.commit()
+
+    results = await sc.sync_confirmed_candidates(db_session, None, 2026)
+
+    assert fallback.await_count == 1
+    assert results["WI"]["confirmed"] == 1
+
+
+# --- Which source answered decides "confirmed" vs "nominees" ---
+
+from app.api import elections as elections_api  # noqa: E402
+
+
+def test_a_complete_ballot_readmits_no_unopposed_filer(db_session):
+    _race(db_session, "2026-SEN-CO", "CO")
+    _db_cand(db_session, "S6CO1", "2026-SEN-CO", "HICKENLOOPER, JOHN", "DEM", confirmed_general=True)
+    _db_cand(db_session, "S6CO2", "2026-SEN-CO", "SOLO, REP FILER", "REP", incumbent_challenge="C")
+    db_session.commit()
+    race = db_session.query(Race).filter(Race.id == "2026-SEN-CO").one()
+
+    assert {c.id for c in elections_api._confirmed_or_all(race.candidates, "CO", False)} == {"S6CO1", "S6CO2"}
+    # A party missing from a certified ballot has nobody on it.
+    assert {c.id for c in elections_api._confirmed_or_all(race.candidates, "CO", True)} == {"S6CO1"}
+
+
+@pytest.mark.asyncio
+async def test_a_fallback_answer_is_labelled_nominees_not_confirmed(db_session, monkeypatch):
+    _one_state(monkeypatch, "CO")
+    monkeypatch.setitem(sc.STRATEGIES, "certified_table", AsyncMock(return_value=None))
+    monkeypatch.setitem(sc.STRATEGIES, "clarity", AsyncMock(return_value=[_rec("S", None, "D", "Hickenlooper", "John Hickenlooper")]))
+    _race(db_session, "2026-SEN-CO", "CO")
+    _db_cand(db_session, "S6CO1", "2026-SEN-CO", "HICKENLOOPER, JOHN", "DEM")
+    db_session.commit()
+
+    await sc.sync_confirmed_candidates(db_session, None, 2026)
+
+    # CO's entry claims a complete ballot, but tonight its fallback (primary
+    # results) answered, so the page must say "nominees".
+    assert elections_api._race_complete(elections_api._ballot_marker(db_session, "CO", 2026), "CO", "2026-SEN-CO") is False
+
+
+# --- certified_table options Tennessee needed ---
+
+from app.pipeline.fetch.state_candidates_certified_table import (  # noqa: E402
+    fetch_confirmed_candidates as fetch_certified_table,
+    parse_certified_rows,
+)
+from app.pipeline.fetch.state_candidates_common import discover_certification_link, parse_office  # noqa: E402
+from app.pipeline.rate_limiter import RateLimiter  # noqa: E402
+
+
+def test_united_states_house_is_a_federal_label():
+    assert parse_office("United States House of Representatives District 1") == ("H", 1)
+    # A bare "House of Representatives" is still a state chamber's name.
+    assert parse_office("House of Representatives District 4") is None
+
+
+def test_certified_rows_by_office_label_and_deduplicated():
+    rows = [
+        {"Office": "United States Senate", "Candidate": "Bill Hagerty", "Party Name": "Republican"},
+        {"Office": "United States Senate", "Candidate": "Tharon Chandler", "Party Name": "Independent"},
+        {"Office": "United States House of Representatives District 1", "Candidate": "Diana Harshbarger", "Party Name": "Republican"},
+        {"Office": "United States House of Representatives District 1", "Candidate": "Diana Harshbarger", "Party Name": "Republican"},
+        {"Office": "Governor", "Candidate": "Not Federal", "Party Name": "Democratic"},
+    ]
+    fmt = {"office_column": "Office", "office_parse": True, "party_column": "Party Name", "name_columns": ["Candidate"]}
+    got = {(r["office"], r["district"], r["display_name"], r["party"]) for r in parse_certified_rows(rows, fmt)}
+    assert got == {("S", None, "Bill Hagerty", "R"), ("S", None, "Tharon Chandler", "I"), ("H", 1, "Diana Harshbarger", "R")}
+
+
+@pytest.mark.asyncio
+async def test_every_listed_file_is_required():
+    # A Senate list without its House list is half a ballot, and half a
+    # ballot would unconfirm real nominees.
+    page = '<a href="/s/USSenate_Nov2026.xlsx">x</a>'  # the House file is missing
+
+    def handler(request):
+        return httpx.Response(200, text=page)
+
+    source = {"discovery": {"page_url": "https://sos.test/{year}-lists",
+                            "link_regexes": ['href="([^"]*USSenate_Nov{year}\\.xlsx)"',
+                                             'href="([^"]*USHouse_Nov{year}\\.xlsx)"']},
+              "format": {"office_column": "Office", "office_parse": True,
+                         "party_column": "Party", "name_columns": ["Candidate"]}}
+    async with _client(handler) as client:
+        assert await fetch_certified_table(client, 2026, "TN", source) is None
+
+
+@pytest.mark.asyncio
+async def test_a_certified_general_list_decides_federal_races_over_primary_results(db_session, monkeypatch):
+    # Maine 2026 in miniature: the primary results still name Colfax, the
+    # certified list names Penrose. The list runs first and alone decides;
+    # Colfax is never confirmed, not even for a moment within the run.
+    _one_state(monkeypatch, "ME")
+    monkeypatch.setitem(sc.STRATEGIES, "me_results", AsyncMock(return_value=[_rec("S", None, "D", "Colfax", "Gordon Colfax")]))
+    monkeypatch.setitem(sc.STRATEGIES, "certified_table", AsyncMock(return_value=[_rec("S", None, "D", "Penrose", "Reid D. Penrose")]))
+    _race(db_session, "2026-SEN-ME", "ME")
+    _db_cand(db_session, "S6ME1", "2026-SEN-ME", "COLFAX, WHITFIELD", "DEM")
+    _db_cand(db_session, "S6ME2", "2026-SEN-ME", "PENROSE, TROY", "DEM")
+    db_session.commit()
+
+    await sc.sync_confirmed_candidates(db_session, None, 2026)
+
+    flags = {c.id: c.confirmed_general for c in db_session.query(Candidate)}
+    assert flags == {"S6ME1": False, "S6ME2": True}
+    # The page shows the name as the state printed it.
+    assert db_session.get(Candidate, "S6ME2").ballot_name == "Reid D. Penrose"
+    assert elections_api._race_complete(elections_api._ballot_marker(db_session, "ME", 2026), "ME", "2026-SEN-ME") is True
+
+
+# --- Florida's candidate list ---
+
+from app.pipeline.fetch.state_candidates_dos_canlist import parse_canlist  # noqa: E402
+
+FL_PAGE = """<html><body>
+<b>United States Senator</b>
+<table class="results"><tr><th>Candidate</th><th>Status</th><th>Primary</th><th>General</th></tr>
+<tr><td><a>Moody</a>, <a>Ashley</a> (REP) *Incumbent</td><td>Qualified</td><td>Won</td><td></td></tr>
+<tr><td>Gleason, Chris (REP)</td><td>Defeated</td><td>Eliminated</td><td></td></tr>
+<tr><td>Gillespie, Neil J. (NPA)</td><td>Qualified</td><td></td><td></td></tr>
+<tr><td>Toulme, Alix Christopher (WRI)</td><td>Qualified</td><td></td><td></td></tr>
+</table>
+<b>United States Representative</b>
+<table class="results"><tr><th>District</th><th>Candidate</th><th>Status</th><th>Primary</th><th>General</th></tr>
+<tr><td>1</td><td>Patronis, Jimmy (REP) *Incumbent</td><td>Qualified</td><td>Won</td><td></td></tr>
+<tr><td></td><td>Valimont, Gay (DEM)</td><td>Qualified</td><td>Unopposed</td><td></td></tr>
+<tr><td></td><td>Barnes, Henry L. "Rick" (DEM)</td><td>Withdrew</td><td></td><td></td></tr>
+<tr><td>10</td><td>Frost, Maxwell Alejandro (DEM) *Incumbent</td><td>Unopposed</td><td>Unopposed</td><td>Unopposed</td></tr>
+</table></body></html>"""
+
+
+def test_florida_list_keeps_the_ballot_and_carries_the_district_forward():
+    got = {(r["office"], r["district"], r["display_name"], r["party"]) for r in parse_canlist(FL_PAGE)}
+    assert got == {
+        ("S", None, "Ashley Moody", "R"),
+        ("S", None, "Neil J. Gillespie", "I"),       # no-party is an ordinary entry
+        ("H", 1, "Jimmy Patronis", "R"),
+        ("H", 1, "Gay Valimont", "D"),               # district carried from the row above
+        ("H", 10, "Maxwell Alejandro Frost", "D"),   # unopposed: the seat's only candidate
+    }
+    # Defeated, withdrawn and declared write-ins are not on the ballot.
+
+
+from app.pipeline.fetch.state_candidates_certified_table import _rows as _rows_of_certified_table  # noqa: E402
+from app.pipeline.fetch.state_candidates_certified_table import pdf_table_rows  # noqa: E402
+
+
+def _words(*cells, top):
+    """One printed row: (x0, text) per word, each word 20pt wide."""
+    return [{"x0": x, "x1": x + 20, "top": top, "bottom": top + 8, "text": t} for x, t in cells]
+
+
+def test_pdf_table_reads_cells_under_their_headings_and_carries_the_office():
+    # Iowa's layout in miniature: headings centred over left-aligned data,
+    # the office printed once per group, a governor's group after the
+    # federal ones and a footer at the foot of the page. Hinson's short
+    # address reaches no heading; Turek's full one shows where the Address
+    # column starts, so Hinson's still lands there and not in her name.
+    header = _words((50, "Office"), (160, "Party"), (226, "Ballot"), (247, "Name"), (386, "Address"), top=80)
+    page = header + [
+        *_words((8, "United"), (29, "States"), (50, "Senator"), (156, "Republican"), (201, "Ashley"),
+                (222, "Hinson"), (302, "PO"), (323, "Box"), top=90),
+        *_words((156, "Democratic"), (201, "Josh"), (222, "Turek"), (302, "PO"), (323, "Box"),
+                (344, "1005,"), (365, "Council"), (386, "Bluffs"), top=110),
+        *_words((8, "Governor"), (156, "Republican"), (201, "Zach"), (222, "Lahn"), top=130),
+        *_words((156, "Democratic"), (201, "Rob"), (222, "Sand"), top=150),
+        *_words((8, "Ballot"), (29, "vacancies"), (50, "may"), (71, "be"), (92, "filled"), top=170),
+    ]
+    fmt = {"office_column": "Office", "office_parse": True, "office_fill_down": True,
+           "party_column": "Party", "name_columns": ["Ballot Name"]}
+    rows = pdf_table_rows([page], ["Office", "Party", "Ballot Name"])
+    assert rows[0]["Ballot Name"] == "Ashley Hinson" and rows[0]["Address"] == "PO Box"
+    got = [(r["office"], r["display_name"], r["party"]) for r in parse_certified_rows(rows, fmt)]
+    # Rob Sand, under Governor, never inherits the Senate office above it.
+    assert got == [("S", "Ashley Hinson", "R"), ("S", "Josh Turek", "D")]
+
+
+def test_certified_rows_read_the_district_column_after_the_office_and_keep_only_active():
+    # Maryland: the office and the district are separate columns, and a
+    # withdrawn or failed petitioner stays in the file with a status.
+    rows = [
+        {"Office Name": "Representative in Congress", "Contest": "Congressional District 5",
+         "Last": "Hall", "First": "Mildred Marie", "Party": "Other Candidates", "Status": "Active"},
+        {"Office Name": "Representative in Congress", "Contest": "Congressional District 5",
+         "Last": "Jordan", "First": "Brian S.", "Party": "Unaffiliated",
+         "Status": "Failed to Submit Required Number of Signatures - 08/11/2026"},
+        {"Office Name": "State Senator", "Contest": "Legislative District 1",
+         "Last": "McKay", "First": "Mike", "Party": "Republican", "Status": "Active"},
+        {"Office Name": "U.S. Senator", "Contest": "State Of Maryland",
+         "Last": "Osborn", "First": "Dan", "Party": "By Petition", "Status": "Active"},
+    ]
+    fmt = {"office_column": "Office Name", "office_parse": True, "district_column": "Contest",
+           "party_column": "Party", "surname_column": "Last", "name_columns": ["First", "Last"],
+           "status_column": "Status", "status_values": ["Active"]}
+    got = {(r["office"], r["district"], r["display_name"], r["party"]) for r in parse_certified_rows(rows, fmt)}
+    assert got == {("H", 5, "Mildred Marie Hall", None), ("S", None, "Dan Osborn", "I")}
+
+
+def test_match_reads_a_two_word_ballot_surname_filed_as_one_word():
+    delaney = _cand("DELANEY, APRIL MCCLAIN", "DEM", "H4MD06")
+    assert _match_candidate([delaney, _cand("FICKER, ROBIN", "REP", "H0MD06")], "McClain Delaney", "D",
+                            "April McClain Delaney") is delaney
+
+
+_NM_PAGE = """<html><body><h1>{year} General Election Contest/Candidate List</h1>
+<table><tr><td><table><tr><td>search form</td></tr></table></td></tr></table>
+<table>
+<tr><th>Contest</th><th>Contest</th><th>District</th><th>First Name</th><th>Last Name</th>
+    <th>Party</th><th>Status</th></tr>
+<tr><td>United States Senator</td><td>United States Senator</td><td></td><td>BEN</td><td>LUJAN</td>
+    <td>DEM</td><td>Qualified</td></tr>
+<tr><td>United States Senator</td><td>United States Senator</td><td></td><td>MIRA</td><td>OCONNELL</td>
+    <td>DTS</td><td>Disqualified</td></tr>
+<tr><td>United States RepresentativeDISTRICT 3</td><td>United States Representative</td><td>DISTRICT 3</td>
+    <td>MARTIN</td><td>ZAMORA</td><td>REP</td><td>Qualified</td></tr>
+</table></body></html>"""
+
+_NM_SOURCE = {
+    "discovery": {"url": "https://portal.test/CandidateList.aspx?cty=99",
+                  "year_regex": "{year} General Election Contest/Candidate List"},
+    "format": {"office_column": "Contest", "office_parse": True, "district_column": "District",
+               "party_column": "Party", "surname_column": "Last Name",
+               "name_columns": ["First Name", "Last Name"],
+               "status_column": "Status", "status_values": ["Qualified"]},
+}
+
+
+@pytest.mark.asyncio
+async def test_html_list_is_read_only_when_it_names_this_years_election():
+    # New Mexico's portal has one address that always shows the CURRENT
+    # election; last cycle's list must never confirm anyone this cycle.
+    def handler(request):
+        return httpx.Response(200, text=_NM_PAGE.replace("{year}", "2026"))
+
+    async with _client(handler) as client:
+        got = await fetch_certified_table(client, 2026, "NM", _NM_SOURCE)
+        assert {(r["office"], r["district"], r["display_name"], r["party"]) for r in got} == {
+            ("S", None, "BEN LUJAN", "D"), ("H", 3, "MARTIN ZAMORA", "R"),
+        }
+        assert await fetch_certified_table(client, 2028, "NM", _NM_SOURCE) == []  # not published for that year yet: "not yet", not a failure
+
+
+def test_a_row_with_a_withdrawal_date_is_off_the_ballot():
+    # Wyoming's roster keeps a withdrawn candidate with a Date Withdrawn;
+    # only rows with that column empty are on the ballot. Its party codes
+    # are its own: LBR is Libertarian, CT Constitution.
+    rows = [
+        {"Office Sought": "UNITED STATES REPRESENTATIVE", "Party Affiliation": "LBR",
+         "Candidate Last Name": "CARVER", "Ballot Name": "Shawn Carver", "Date Withdrawn": ""},
+        {"Office Sought": "UNITED STATES REPRESENTATIVE", "Party Affiliation": "CT",
+         "Candidate Last Name": "HAGGIT", "Ballot Name": "Jeffrey Haggit", "Date Withdrawn": ""},
+        {"Office Sought": "UNITED STATES REPRESENTATIVE", "Party Affiliation": "REP",
+         "Candidate Last Name": "DOE", "Ballot Name": "Jane Doe", "Date Withdrawn": "08/01/2026"},
+    ]
+    fmt = {"office_column": "Office Sought", "office_parse": True, "party_column": "Party Affiliation",
+           "surname_column": "Candidate Last Name", "name_columns": ["Ballot Name"],
+           "status_column": "Date Withdrawn", "status_values": [""]}
+    got = {(r["district"], r["display_name"], r["party"]) for r in parse_certified_rows(rows, fmt)}
+    assert got == {(None, "Shawn Carver", "L"), (None, "Jeffrey Haggit", "C")}
+
+
+@pytest.mark.asyncio
+async def test_a_list_behind_the_pages_own_export_button():
+    # Hawaii: a paged grid whose Export to CSV button returns every row. The
+    # page's form is posted back with that button, and only after the page
+    # names this year's election.
+    page = ('<html><h1>{year} Candidate Report</h1><form><input type="hidden" name="__VIEWSTATE" value="vs">'
+            '<input type="submit" name="export" value=""></form></html>')
+    listing = ('"Contests","Party","BallotName","Status"\r\n'
+               '"U.S. REPRESENTATIVE, DIST I","NONPARTISAN","BERNING, Nathan M.","In General"\r\n'
+               '"U.S. REPRESENTATIVE, DIST II","DEMOCRATIC","LEGER DOE, Teresa","In General"\r\n'
+               '"U.S. REPRESENTATIVE, DIST I","DEMOCRATIC","RIVERA, Jennifer","In Primary"\r\n')
+    posted = []
+
+    def handler(request):
+        if request.url.host == "elections.test":
+            return httpx.Response(200, text='<a href="https://portal.test/Report.aspx?elid=94">x</a>')
+        if request.method == "POST":
+            posted.append(request.content.decode())
+            return httpx.Response(200, text=listing, headers={"content-type": "text/csv"})
+        return httpx.Response(200, text=page.replace("{year}", "2026"))
+
+    source = {
+        "discovery": {"page_url": "https://elections.test/reports",
+                      "link_regex": 'href="(https://portal\\.test/Report\\.aspx\\?elid=\\d+)"',
+                      "year_regex": "{year} Candidate Report", "form_button": "export"},
+        "format": {"office_column": "Contests", "office_parse": True, "party_column": "Party",
+                   "name_columns": ["BallotName"], "name_last_first": True,
+                   "status_column": "Status", "status_values": ["In General"]},
+    }
+    async with _client(handler) as client:
+        got = await fetch_certified_table(client, 2026, "HI", source)
+        assert await fetch_certified_table(client, 2028, "HI", source) == []  # not published for that year yet: "not yet", not a failure
+    assert "__VIEWSTATE=vs" in posted[0] and "export=" in posted[0]
+    assert {(r["district"], r["display_name"], r["last_name"], r["party"]) for r in got} == {
+        (1, "Nathan M. BERNING", "BERNING", "I"), (2, "Teresa LEGER DOE", "LEGER DOE", "D"),
+    }
+
+
+import io  # noqa: E402
+import zipfile  # noqa: E402
+
+from app.pipeline.fetch.state_candidates_tabular import _xlsx_rows  # noqa: E402
+
+
+def test_xlsx_with_inline_strings_and_no_shared_string_table():
+    # Delaware's candidate list writes every cell as an inline string and
+    # ships no xl/sharedStrings.xml; the shared reader used to refuse it.
+    def c(ref, text):
+        return f'<c r="{ref}" t="inlineStr"><is><t>{text}</t></is></c>'
+    sheet = ('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'
+             f'<row r="1">{c("A1", "Office")}{c("B1", "BallotName")}</row>'
+             f'<row r="2">{c("A2", "U.S. Senator")}{c("B2", "Chris Coons")}</row>'
+             '</sheetData></worksheet>')
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("xl/worksheets/sheet1.xml", sheet)
+    assert _xlsx_rows(buf.getvalue()) == [{"Office": "U.S. Senator", "BallotName": "Chris Coons"}]
+
+
+@pytest.mark.asyncio
+async def test_every_linked_office_page_is_read_and_write_ins_are_not():
+    # Kentucky: one page per office, linked from an index. A year with no
+    # Senate race has no Senate page, so every page found is read rather
+    # than requiring a fixed set; each must name this year's general.
+    index = ('<a href="Default.aspx?id=3">US Senator (4)</a> <a href="Default.aspx?id=4">US Representative (21)</a>'
+             '<a href="Default.aspx?id=11">State Senator (30)</a>')
+    header = ("<title>Election: {year} General Election</title><table><tr><th>Name / Running Mate</th>"
+              "<th>Office</th><th>District/Division</th><th>Party</th></tr>")
+    pages = {
+        "3": header + "<tr><td>Andy Barr</td><td>US Senator</td><td></td><td>Republican Party</td></tr></table>",
+        "4": header + ("<tr><td>Gerardo Serrano</td><td>US Representative</td><td>5th</td><td>Independent</td></tr>"
+                       "<tr><td>Billy Ray Wilson</td><td>US Representative</td><td>5th</td><td>Write-In</td></tr>"
+                       "</table>"),
+    }
+
+    def handler(request):
+        page_id = request.url.params.get("id")
+        if page_id is None:
+            return httpx.Response(200, text=index)
+        return httpx.Response(200, text=pages[page_id].replace("{year}", "2026"))
+
+    source = {
+        "discovery": {"page_url": "https://sos.test/CandidateFilings/",
+                      "link_regex": 'href="(Default\\.aspx\\?id=\\d+)"[^>]*>US (?:Senator|Representative)\\b',
+                      "every_link": True, "year_regex": "Election: {year} General Election"},
+        "format": {"office_column": "Office", "office_parse": True, "district_column": "District/Division",
+                   "party_column": "Party", "name_columns": ["Name / Running Mate"],
+                   "exclude": {"Party": "Write-In"}},
+    }
+    async with _client(handler) as client:
+        got = await fetch_certified_table(client, 2026, "KY", source)
+        assert await fetch_certified_table(client, 2028, "KY", source) == []  # not published for that year yet: "not yet", not a failure
+    assert {(r["office"], r["district"], r["display_name"], r["party"]) for r in got} == {
+        ("S", None, "Andy Barr", "R"), ("H", 5, "Gerardo Serrano", "I"),
+    }
+
+
+def test_tables_under_office_headings_with_the_party_in_the_name():
+    # Alaska: one table per office under an <h4>, the registration printed
+    # in the name cell, write-ins listed but not printed on the ballot.
+    page = ("<h4>UNITED STATES SENATOR</h4><table><tr><th>Candidate Name on Ballot</th><th>Contact</th></tr>"
+            "<tr><td>Heikes, Gerald L. (Registered Republican) (Certified)</td><td>x</td></tr>"
+            "<tr><td>Sullivan, Daniel J. Jr. (Registered Republican) (Certified)</td><td>x</td></tr>"
+            "<tr><td>Sullivan, Dan S. (Registered Republican) (Certified) Incumbent</td><td>x</td></tr>"
+            "<tr><td>Certified Write-In Hill, Sidney (Undeclared) (Certified)</td><td>x</td></tr></table>"
+            "<h4>UNITED STATES REPRESENTATIVE</h4><table><tr><th>Candidate Name on Ballot</th><th>Contact</th></tr>"
+            "<tr><td>Hill, Bill (Nonpartisan) (Certified)</td><td>x</td></tr></table>"
+            "<h4>SENATE DISTRICT A</h4><table><tr><th>Candidate Name on Ballot</th><th>Contact</th></tr>"
+            "<tr><td>Stedman, Bert K. (Registered Republican) (Certified)</td><td>x</td></tr></table>")
+    fmt = {"html_headings": True, "office_column": "heading_4", "office_parse": True,
+           "party_column": "Candidate Name on Ballot", "party_regex": "\\((?:Registered\\s+)?([^)]+)\\)",
+           "name_columns": ["Candidate Name on Ballot"], "name_last_first": True,
+           "exclude_regex": {"Candidate Name on Ballot": "^Certified Write-In"}}
+    rows = _rows_of_certified_table(page.encode(), "https://ak.test/candidates", fmt)
+    got = [(r["office"], r["display_name"], r["last_name"], r["party"], r["party_label"])
+           for r in parse_certified_rows(rows, fmt)]
+    assert got == [
+        ("S", "Gerald L. Heikes", "Heikes", "R", "Republican"),
+        ("S", "Daniel J. Sullivan Jr.", "Sullivan", "R", "Republican"),
+        ("S", "Dan S. Sullivan", "Sullivan", "R", "Republican"),
+        ("H", "Bill Hill", "Hill", "I", "Nonpartisan"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_two_digit_year_in_a_link():
+    # Alaska names its elections "26genr"; last cycle's link may still be up.
+    page = '<a href="https://ak.test/c/?election=24genr">2024</a> <a href="https://ak.test/c/?election=26genr">2026</a>'
+    async with _client(lambda request: httpx.Response(200, text=page)) as client:
+        url = await discover_certification_link(
+            client, RateLimiter(rps=1000), "https://ak.test/c/", 'href="(https://ak\\.test/c/\\?election={yy}genr)"',
+            2026, "AK",
+        )
+    assert url == "https://ak.test/c/?election=26genr"
+
+
+@pytest.mark.asyncio
+async def test_a_partial_certified_list_decides_only_the_races_it_covers(db_session, monkeypatch):
+    # A national source knows only the districts it has a verified address
+    # for. It decides those races; primary results still fill the rest, and
+    # the page may call only the covered races "confirmed".
+    _one_state(monkeypatch, "ME")
+    monkeypatch.setitem(sc.STRATEGIES, "me_results", AsyncMock(return_value=[
+        _rec("S", None, "D", "Colfax", "Gordon Colfax"),
+        _rec("H", 2, "R", "LePage", "Paul LePage"),
+    ]))
+    monkeypatch.setitem(sc.STRATEGIES, "certified_table", AsyncMock(return_value=[
+        _rec("S", None, "D", "Penrose", "Reid D. Penrose"),
+        _rec("S", None, "I", "Indie", "Jordan Indie"),  # on the list, never filed with the FEC
+    ]))
+    _race(db_session, "2026-SEN-ME", "ME")
+    _race(db_session, "2026-HOUSE-ME-2", "ME", office="H", district=2)
+    _db_cand(db_session, "S6ME1", "2026-SEN-ME", "COLFAX, WHITFIELD", "DEM")
+    _db_cand(db_session, "S6ME2", "2026-SEN-ME", "PENROSE, TROY", "DEM")
+    _db_cand(db_session, "H6ME2", "2026-HOUSE-ME-2", "LEPAGE, PAUL", "REP")
+    db_session.commit()
+
+    await sc.sync_confirmed_candidates(db_session, None, 2026)
+
+    flags = {c.id: c.confirmed_general for c in db_session.query(Candidate)}
+    assert flags["S6ME1"] is False and flags["S6ME2"] is True
+    assert flags["H6ME2"] is True  # the uncovered race still gets its nominee
+    # The list's ballot-only candidate survives the second (primary-results) pass.
+    assert any(cid.startswith("ballot:2026-SEN-ME:") for cid in flags)
+    marker = elections_api._ballot_marker(db_session, "ME", 2026)
+    assert marker["complete"] is False and marker["races"] == ["2026-SEN-ME"]
+    assert elections_api._race_complete(marker, "ME", "2026-SEN-ME") is True
+    assert elections_api._race_complete(marker, "ME", "2026-HOUSE-ME-2") is False
+
+
+def test_the_states_printed_name_is_kept_but_never_a_last_first_one(db_session):
+    _race(db_session, "2026-HOUSE-MD-2", "MD", office="H", district=2)
+    _db_cand(db_session, "H4MD02", "2026-HOUSE-MD-2", "OLSZEWSKI, JOHN ANTHONY JR.", "DEM")
+    _db_cand(db_session, "H4MD99", "2026-HOUSE-MD-2", "WALLACE, DAVID DRAIN II", "REP")
+    db_session.commit()
+    olszewski, wallace = (db_session.get(Candidate, cid) for cid in ("H4MD02", "H4MD99"))
+
+    sc._note_ballot_name(db_session, olszewski, {"display_name": 'John "Johnny O" Olszewski, Jr.'})
+    sc._note_ballot_name(db_session, wallace, {"display_name": "WALLACE, DAVE"})
+
+    # A comma before a suffix is part of the name; before a given name it
+    # marks a "Last, First" printing, which is left to the FEC name.
+    assert olszewski.ballot_name == 'John "Johnny O" Olszewski, Jr.'
+    assert wallace.ballot_name is None
+
+    # "Last, First, Jr." is still a last-first printing, suffix or not; so is
+    # "Lee, Jr.", a surname and its suffix.
+    for printed in ("OLSZEWSKI, JOHN, JR.", "Wallace, Jr."):
+        sc._note_ballot_name(db_session, wallace, {"display_name": printed})
+        assert wallace.ballot_name is None
+
+
+from app.pipeline.fetch.state_candidates_grouped_list_pdf import (  # noqa: E402
+    fetch_confirmed_candidates as fetch_grouped_list,
+    parse_grouped_list,
+)
+
+
+def _w(x, text, top):
+    return {"x0": x, "x1": x + 8 * len(text), "top": top, "bottom": top + 8, "text": text}
+
+
+def _line(top, *cells):
+    return [_w(x, t, top) for x, t in cells]
+
+
+def test_grouped_list_reads_candidates_under_office_headings():
+    # Illinois's list in miniature: a page header with text left of the
+    # name column (not a candidate), an independent struck from the ballot
+    # on the line below, and a district that runs onto the next page.
+    fmt = {"name_x": 150, "date_x": 440, "removed_regex": r"\b(REMOVED|WITHDRAWN)\b"}
+    page1 = [
+        *_line(10, (32, "9/26/2026"), (74, "5:21PM"), (248, "WEBSITE"), (293, "CANDIDATE"), (350, "LIST")),
+        *_line(40, (252, "4TH"), (272, "CONGRESS")),
+        *_line(55, (18, "DEMOCRATIC"), (155, "Patty"), (185, "Garcia"), (448, "11/3/2025")),
+        *_line(70, (18, "INDEPENDENT"), (155, "Mayra"), (185, "Macias"), (448, "5/26/2026")),
+        *_line(80, (155, "8445"), (185, "S"), (195, "Kostner"), (300, "REMOVED"), (360, "7/21/2026")),
+    ]
+    page2 = [
+        *_line(10, (32, "9/26/2026"), (74, "5:21PM"), (248, "WEBSITE"), (293, "CANDIDATE"), (350, "LIST")),
+        *_line(55, (18, "INDEPENDENT"), (155, "Chris"), (185, "Getty"), (448, "5/18/2026")),
+    ]
+    got = [(r["district"], r["display_name"], r["party"]) for r in parse_grouped_list([page1, page2], fmt)]
+    assert got == [(4, "Patty Garcia", "D"), (4, "Chris Getty", "I")]
+
+
+def _tiny_pdf(items) -> bytes:
+    """A one-page PDF with each (x, y, text) printed where it says — enough
+    for pdfplumber, so a PDF source's whole fetch path runs in a test."""
+    stream = "".join(f"BT /F1 10 Tf {x} {y} Td ({t}) Tj ET\n" for x, y, t in items).encode()
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R"
+        b" /Resources << /Font << /F1 5 0 R >> >> >>",
+        b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"endstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    out = io.BytesIO()
+    out.write(b"%PDF-1.4\n")
+    offsets = []
+    for i, obj in enumerate(objs, 1):
+        offsets.append(out.tell())
+        out.write(b"%d 0 obj\n" % i + obj + b"\nendobj\n")
+    xref = out.tell()
+    out.write(b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1))
+    for offset in offsets:
+        out.write(b"%010d 00000 n \n" % offset)
+    out.write(b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, xref))
+    return out.getvalue()
+
+
+_IL_SOURCE = {
+    "discovery": {
+        "page_url": "https://board.test/",
+        "id_regex": 'ElectionID=([^"&]+)"[^>]*>\\s*Next Election',
+        "year_regex": "General Election - 11/\\s*\\d{1,2}/{year}",
+        "url_templates": ["https://board.test/list.pdf?ElectionID={id}&g=house"],
+    },
+    "format": {"name_x": 150, "date_x": 440, "removed_regex": r"\b(REMOVED|WITHDRAWN)\b"},
+}
+
+
+@pytest.mark.asyncio
+async def test_grouped_list_fetch_finds_the_election_and_checks_its_year():
+    home = '<a href="Info.aspx?ElectionID=abc%3d">\n  Next Election</a>'
+    pdf = _tiny_pdf([
+        (230, 760, "General Election - 11/ 3/2026"), (252, 740, "4TH CONGRESS"),
+        (18, 720, "DEMOCRATIC"), (155, 720, "Patty Garcia"), (448, 720, "11/3/2025"),
+    ])
+    fetched = []
+
+    def handler(request):
+        if request.url.path == "/list.pdf":
+            fetched.append(str(request.url))
+            return httpx.Response(200, content=pdf)
+        return httpx.Response(200, text=home)
+
+    async with _client(handler) as client:
+        got = await fetch_grouped_list(client, 2026, "IL", _IL_SOURCE)
+        # Last cycle's (or a primary's) list never confirms anyone this cycle.
+        assert await fetch_grouped_list(client, 2028, "IL", _IL_SOURCE) is None
+    assert fetched[0].endswith("ElectionID=abc%3d&g=house")
+    assert [(r["office"], r["district"], r["display_name"]) for r in got] == [("H", 4, "Patty Garcia")]
+
+
+@pytest.mark.asyncio
+async def test_grouped_list_fetch_refuses_what_it_cannot_trust():
+    async def run(handler, source=_IL_SOURCE):
+        async with _client(handler) as client:
+            return await fetch_grouped_list(client, 2026, "IL", source)
+
+    # No election id on the home page, or two of them.
+    assert await run(lambda r: httpx.Response(200, text="no link")) is None
+    # A page instead of the PDF (an error page answering 200).
+    assert await run(lambda r: httpx.Response(
+        200, text='<a href="x?ElectionID=a">Next Election</a>' if r.url.path == "/" else "<html>error</html>",
+    )) is None
+    # Configuration missing a key is reported, not guessed.
+    assert await run(lambda r: httpx.Response(200), {"discovery": {}, "format": {}}) is None
+@pytest.mark.asyncio
+async def test_a_list_rendered_per_contest_chosen_from_a_dropdown():
+    # North Dakota: candidates render only once a contest is chosen and
+    # searched; the contest's value is a per-election id, so it is chosen
+    # by its visible text, and an office not on this year's ballot (no
+    # Senate race) is skipped rather than failing the list.
+    page = ('<html><h1>{year} General Election Contest/Candidate List</h1><form>'
+            '<input type="hidden" name="__VIEWSTATE" value="vs">'
+            '<select name="contest"><option value="0">All</option>'
+            '<option value="22055">Representative in Congress</option></select>'
+            '<input type="submit" name="search" value="Search"></form></html>')
+    table = ("<table><tr><th>Contest</th><th>First Name</th><th>Last Name</th><th>Party</th></tr>"
+             "<tr><td>Representative in Congress</td><td>Helene</td><td>Neville</td><td>independent nomination</td></tr>"
+             "</table>")
+    posted = []
+
+    def handler(request):
+        if request.url.host == "sos.test":
+            return httpx.Response(200, text='<a href="https://vip.test/candidatelist.aspx?eid=348">list</a>')
+        if request.method == "POST":
+            posted.append(request.content.decode())
+            return httpx.Response(200, text=table)
+        return httpx.Response(200, text=page.replace("{year}", "2026"))
+
+    def source(options):
+        return {
+            "discovery": {"page_url": "https://sos.test/elections",
+                          "link_regex": 'href="(https://vip\\.test/candidatelist\\.aspx\\?eid=\\d+)"',
+                          "year_regex": "{year} General Election Contest/Candidate List",
+                          "form_button": "search", "form_select": {"contest": options}},
+            "format": {"office_column": "Contest", "office_parse": True, "party_column": "Party",
+                       "surname_column": "Last Name", "name_columns": ["First Name", "Last Name"]},
+        }
+
+    async with _client(handler) as client:
+        got = await fetch_certified_table(client, 2026, "ND", source(["Representative in Congress", "United States Senator"]))
+        assert await fetch_certified_table(client, 2026, "ND", source(["United States Senator"])) is None
+    assert posted == ["__VIEWSTATE=vs&contest=22055&search=Search"]
+    assert [(r["office"], r["display_name"], r["party"]) for r in got] == [("H", "Helene Neville", "I")]
+
+
+async def test_a_failed_main_source_claims_nothing_about_state_offices(db_session, monkeypatch):
+    # Illinois in miniature: its results export fails, while its certified
+    # list answers with federal rows only. (Its general_list now carries
+    # the state offices itself, so this is the list reading none.) Syncing
+    # the empty statewide list would write a marker, and the page would
+    # call "we could not read it" a confirmed absence of a governor's race.
+    _one_state(monkeypatch, "IL")
+    monkeypatch.setitem(sc.STRATEGIES, "tabular", AsyncMock(return_value=None))
+    monkeypatch.setitem(sc.STRATEGIES, "grouped_list_pdf", AsyncMock(return_value=[_rec("S", None, "D", "Stratton", "Juliana Stratton")]))
+    _race(db_session, "2026-SEN-IL", "IL")
+    _db_cand(db_session, "S6IL1", "2026-SEN-IL", "STRATTON, JULIANA", "DEM")
+    db_session.commit()
+
+    await sc.sync_confirmed_candidates(db_session, None, 2026)
+
+    assert db_session.get(Candidate, "S6IL1").confirmed_general is True
+    _, coverage = elections_api._statewide_section(db_session, "IL", 2026)
+    assert coverage["status"] == elections_api.StatewideCoverageStatus.NOT_YET_COVERED
+
+
+async def test_an_empty_answer_claims_nothing_about_state_offices(db_session, monkeypatch):
+    # Massachusetts in miniature: its adapter returns [] while the primary
+    # is inside its settle_days window, having read nothing. Syncing that
+    # would write "checked, no Governor's race" and delete stored nominees.
+    _one_state(monkeypatch, "MA")
+    monkeypatch.setitem(sc.STRATEGIES, "ma_pd43", AsyncMock(return_value=[]))
+    _race(db_session, "2026-SEN-MA", "MA")
+    db_session.commit()
+
+    await sc.sync_confirmed_candidates(db_session, None, 2026)
+
+    _, coverage = elections_api._statewide_section(db_session, "MA", 2026)
+    assert coverage["status"] == elections_api.StatewideCoverageStatus.NOT_YET_COVERED
+
+
+# ── a list not published yet is "not yet", never a confirmed absence ──
+
+@pytest.mark.asyncio
+async def test_an_empty_answer_from_a_complete_ballot_source_changes_nothing(db_session, only, monkeypatch):
+    """Michigan's and Oklahoma's lists answer [] until they are the ballot
+    (another year's page, primary filers still listed). That must neither
+    unconfirm anyone nor prune a ballot-only row nor record the state's
+    ballot as the complete certified one -- and it is not a failed fetch."""
+    from app.api.elections import _ballot_marker
+    _race(db_session, "2026-SEN-MI", "MI")
+    _db_cand(db_session, "S6MI00001", "2026-SEN-MI", "ROGERS, MIKE", "REP", confirmed_general=True)
+    _db_cand(db_session, "ballot:2026-SEN-MI:tim-long", "2026-SEN-MI", "LONG, TIM", "U.S. TAXPAYERS PARTY",
+             confirmed_general=True)
+    db_session.commit()
+    only("MI", [])
+    monkeypatch.setitem(sc.STRATEGIES, "google_civic", AsyncMock(return_value=None))
+
+    results = await sc.sync_confirmed_candidates(db_session, None, 2026)
+
+    assert results["MI"]["status"] == "ok"
+    assert {c.id: c.confirmed_general for c in db_session.query(Candidate)} == {
+        "S6MI00001": True, "ballot:2026-SEN-MI:tim-long": True,
+    }
+    assert _ballot_marker(db_session, "MI", 2026)["complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_an_empty_general_list_is_handled_like_one_that_did_not_answer(db_session, only, monkeypatch):
+    """Colorado's certified list before it is posted: its [] must not take
+    the federal races from the primary results (it covers none)."""
+    from app.api.elections import _ballot_marker
+    _race(db_session, "2026-SEN-CO", "CO")
+    _db_cand(db_session, "S6CO00001", "2026-SEN-CO", "HICKENLOOPER, JOHN", "DEM")
+    db_session.commit()
+    only("CO", [_rec("S", None, "D", "Hickenlooper", "John Hickenlooper")])
+    monkeypatch.setitem(sc.STRATEGIES, "certified_table", AsyncMock(return_value=[]))
+
+    await sc.sync_confirmed_candidates(db_session, None, 2026)
+
+    assert db_session.query(Candidate).one().confirmed_general is True
+    assert _ballot_marker(db_session, "CO", 2026)["sourceName"] == sc.source_for_state("CO")["source_name"]

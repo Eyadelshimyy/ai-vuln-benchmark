@@ -1,0 +1,1575 @@
+"""
+Endpoints de clientes: CONECTADOS A LA TABLA REAL `clientes` (public.clientes).
+- Conexión: engine/sesión desde app.core.database (DATABASE_URL en .env).
+- Modelo: app.models.cliente.Cliente con __tablename__ = "clientes".
+- Todos los datos son REALES: listado, stats, get, create, update, delete y cambio de estado
+  usan Depends(get_db) y consultas contra la tabla clientes. No hay stubs ni datos demo.
+"""
+import logging
+import re
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
+from typing import Optional, Any
+
+from fastapi import APIRouter, Query, Depends, HTTPException, Body
+
+from app.core.deps import get_current_user, forbid_operator_clientes_gestion
+from app.core.rol_normalization import canonical_rol
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
+from sqlalchemy import select, func, or_, delete, text
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import ProgrammingError, OperationalError, IntegrityError
+
+from app.core.database import get_db, BUSINESS_TIMEZONE
+from app.models.cliente import Cliente
+from app.models.cliente_email_historial import ClienteEmailHistorial
+from app.models.estado_cliente import EstadoCliente
+from app.models.prestamo import Prestamo
+from app.schemas.auth import UserResponse
+from app.schemas.cliente import ClienteResponse, ClienteCreate, ClienteUpdate
+from app.services.cliente_email_historial_service import (
+    archivar_cambios_emails_cliente,
+    listar_emails_historial_cliente,
+    map_correos_historial_por_cliente_ids,
+)
+from app.utils.cliente_emails import secundario_distinto_del_principal
+from app.utils.cedula_busqueda import cedula_busqueda_canonica
+
+logger = logging.getLogger(__name__)
+router = APIRouter(dependencies=[Depends(get_current_user)])
+
+
+def _operator_clientes_search_allowed(search: Optional[str]) -> bool:
+    """Operador: solo búsqueda acotada (p. ej. formulario de préstamos), no listado CRM."""
+    return len((search or "").strip()) >= 2
+
+
+def _row_to_cliente_response(
+    row: Any,
+    *,
+    correos_historial: Optional[list[str]] = None,
+) -> ClienteResponse:
+    """Convierte una fila ORM a ClienteResponse tolerando NULLs y tipos de BD."""
+    date_keys = {"fecha_nacimiento", "fecha_registro", "fecha_actualizacion"}
+    d: dict[str, Any] = {}
+    for key in (
+        "id",
+        "cedula",
+        "nombres",
+        "telefono",
+        "email",
+        "email_secundario",
+        "direccion",
+        "fecha_nacimiento",
+        "ocupacion",
+        "estado",
+        "fecha_registro",
+        "fecha_actualizacion",
+        "usuario_registro",
+        "notas",
+    ):
+        try:
+            v = getattr(row, key, None)
+            if v is None:
+                if key == "id":
+                    v = 0
+                elif key in date_keys:
+                    pass
+                elif key == "email_secundario":
+                    v = None
+                else:
+                    v = ""
+            d[key] = v
+        except Exception:
+            d[key] = None if key in date_keys or key == "email_secundario" else ("" if key != "id" else 0)
+    d["correos_historial"] = list(correos_historial or [])
+    return ClienteResponse.model_validate(d)
+
+
+def _enrich_clientes_con_historial(
+    db: Session, clientes_list: list[ClienteResponse]
+) -> list[ClienteResponse]:
+    """Adjunta correos_historial (pasados) a cada ClienteResponse del listado."""
+    if not clientes_list:
+        return clientes_list
+    vigentes = {
+        int(c.id): [c.email or "", c.email_secundario or ""]
+        for c in clientes_list
+        if c.id
+    }
+    hist_map = map_correos_historial_por_cliente_ids(
+        db, list(vigentes.keys()), vigentes_por_id=vigentes
+    )
+    out: list[ClienteResponse] = []
+    for c in clientes_list:
+        data = c.model_dump()
+        data["correos_historial"] = hist_map.get(int(c.id), [])
+        out.append(ClienteResponse.model_validate(data))
+    return out
+
+
+def _cliente_response_con_historial(db: Session, row: Any) -> ClienteResponse:
+    vigentes = [
+        str(getattr(row, "email", "") or ""),
+        str(getattr(row, "email_secundario", "") or ""),
+    ]
+    hist = listar_emails_historial_cliente(
+        db, int(row.id), excluir_vigentes=vigentes
+    )
+    return _row_to_cliente_response(row, correos_historial=hist)
+
+
+def _cliente_id_conflicto_email(db: Session, email_norm: str, exclude_id: Optional[int] = None):
+    """Otro cliente (distinto exclude_id) usa este email en email o email_secundario."""
+    if not (email_norm or "").strip():
+        return None
+    en = (email_norm or "").strip()
+    q = select(Cliente.id).where(
+        or_(Cliente.email == en, Cliente.email_secundario == en)
+    )
+    if exclude_id is not None:
+        q = q.where(Cliente.id != exclude_id)
+    return db.execute(q).first()
+
+
+# Estados de cliente desde BD (tabla estados_cliente) - usado en formularios
+ESTADOS_CLIENTE_FALLBACK = [
+    {"valor": "ACTIVO", "etiqueta": "Activo", "orden": 1},
+    {"valor": "INACTIVO", "etiqueta": "Inactivo", "orden": 2},
+    {"valor": "FINALIZADO", "etiqueta": "Finalizado", "orden": 3},
+    {"valor": "LEGACY", "etiqueta": "Legacy", "orden": 4},
+]
+
+
+@router.get("/estados", summary="Lista de estados de cliente para dropdowns")
+def get_estados_cliente(db: Session = Depends(get_db)):
+    """
+    Obtiene lista de estados de cliente desde la tabla estados_cliente.
+    Si la tabla no existe, retorna lista por defecto.
+    """
+    try:
+        rows = db.execute(
+            select(EstadoCliente.valor, EstadoCliente.etiqueta, EstadoCliente.orden)
+            .order_by(EstadoCliente.orden)
+        ).all()
+        if rows:
+            return {"estados": [{"valor": r[0], "etiqueta": r[1], "orden": r[2]} for r in rows]}
+    except Exception:
+        pass
+    return {"estados": ESTADOS_CLIENTE_FALLBACK}
+
+
+@router.get("", summary="Listado paginado", response_model=dict)
+def get_clientes(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=100),
+    search: Optional[str] = Query(None),
+    estado: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    current: UserResponse = Depends(get_current_user),
+):
+    """
+    Listado paginado de clientes desde la BD.
+    Filtros: search (cedula, nombres, email, telefono), estado (ACTIVO, INACTIVO, MORA, FINALIZADO).
+    """
+    # Columnas que existen en la tabla clientes (sin total_financiamiento ni dias_mora).
+    _cols = (
+        Cliente.id,
+        Cliente.cedula,
+        Cliente.nombres,
+        Cliente.telefono,
+        Cliente.email,
+        Cliente.email_secundario,
+        Cliente.direccion,
+        Cliente.fecha_nacimiento,
+        Cliente.ocupacion,
+        Cliente.estado,
+        Cliente.fecha_registro,
+        Cliente.fecha_actualizacion,
+        Cliente.usuario_registro,
+        Cliente.notas,
+    )
+    try:
+        q = select(*_cols)
+        count_q = select(func.count()).select_from(Cliente)
+
+        if search and search.strip():
+            raw_stripped = search.strip()
+            t = f"%{raw_stripped}%"
+            ced_canon = cedula_busqueda_canonica(raw_stripped)
+            cedula_preds = [Cliente.cedula.ilike(t)]
+            if ced_canon:
+                # BD puede guardar V-30.081.920; el front envía V30081920 → comparar cédula normalizada
+                ced_col_norm = func.regexp_replace(
+                    func.upper(func.coalesce(Cliente.cedula, "")),
+                    "[^VEGJ0-9]",
+                    "",
+                    "g",
+                )
+                cedula_preds.append(ced_col_norm == ced_canon)
+            # Correos actuales o pasados (historial) → encuentra al cliente por cualquiera
+            hist_match = (
+                select(ClienteEmailHistorial.id)
+                .where(ClienteEmailHistorial.cliente_id == Cliente.id)
+                .where(
+                    or_(
+                        ClienteEmailHistorial.email.ilike(t),
+                        ClienteEmailHistorial.email_norm.ilike(t),
+                    )
+                )
+                .exists()
+            )
+            filtro = or_(
+                or_(*cedula_preds),
+                Cliente.nombres.ilike(t),
+                Cliente.email.ilike(t),
+                Cliente.email_secundario.ilike(t),
+                Cliente.telefono.ilike(t),
+                hist_match,
+            )
+            q = q.select_from(Cliente).where(filtro)
+            count_q = count_q.where(filtro)
+        else:
+            q = q.select_from(Cliente)
+        if estado and estado.strip():
+            est = estado.strip().upper()
+            q = q.where(Cliente.estado == est)
+            count_q = count_q.where(Cliente.estado == est)
+
+        total = db.scalar(count_q) or 0
+        # Ordenar por fecha de registro (más recientes primero); si falta, por id desc
+        q = q.order_by(Cliente.fecha_registro.desc().nullslast(), Cliente.id.desc()).offset((page - 1) * per_page).limit(per_page)
+        result = db.execute(q)
+        rows = result.all()
+
+        total_pages = (total + per_page - 1) // per_page if total else 0
+
+        clientes_list = []
+        for r in rows:
+            try:
+                clientes_list.append(_row_to_cliente_response(r))
+            except (ValidationError, TypeError, AttributeError) as ve:
+                logger.warning("Fila cliente id=%s omitida por validación: %s", getattr(r, "id", "?"), ve)
+                continue
+        if rows and not clientes_list:
+            logger.error("Ninguna fila pudo serializarse; revisar esquema de tabla clientes.")
+            raise HTTPException(
+                status_code=500,
+                detail="Error al cargar el listado de clientes: datos no compatibles con el esquema.",
+            )
+        try:
+            clientes_list = _enrich_clientes_con_historial(db, clientes_list)
+        except Exception as hist_err:
+            logger.warning("No se pudo adjuntar correos_historial al listado: %s", hist_err)
+        return {
+            "clientes": clientes_list,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages,
+        }
+    except (ProgrammingError, OperationalError) as e:
+        logger.exception("Error de BD en listado de clientes: %s", e)
+        hint = (
+            " Revisa que la tabla clientes tenga las columnas: id, cedula, nombres, telefono, email, "
+            "email_secundario, direccion, fecha_nacimiento, ocupacion, estado, fecha_registro, "
+            "fecha_actualizacion, usuario_registro, notas."
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error al cargar el listado de clientes: {e!s}.{hint}",
+        ) from e
+    except ValidationError as ve:
+        logger.exception("Error de validación en listado de clientes: %s", ve)
+        raise HTTPException(status_code=500, detail=f"Error al cargar el listado de clientes: {ve!s}") from ve
+    except Exception as e:
+        logger.exception("Error en listado de clientes: %s", e)
+        err_msg = str(e)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error al cargar el listado de clientes: {err_msg}",
+        ) from e
+
+
+@router.get("/stats")
+def get_clientes_stats(
+    db: Session = Depends(get_db),
+    _: UserResponse = Depends(forbid_operator_clientes_gestion),
+):
+    """
+    Estadísticas de clientes: total, activos, inactivos, finalizados, nuevos_este_mes.
+    finalizados = clientes distintos con estado FINALIZADO o con al menos un préstamo en LIQUIDADO.
+    nuevos_este_mes = clientes con fecha_registro en el mes calendario actual (zona America/Caracas),
+    misma noción de alta que el DEFAULT al insertar en clientes.fecha_registro.
+    """
+    total = db.scalar(select(func.count()).select_from(Cliente)) or 0
+    activos = db.scalar(select(func.count()).select_from(Cliente).where(Cliente.estado == "ACTIVO")) or 0
+    inactivos = db.scalar(select(func.count()).select_from(Cliente).where(Cliente.estado == "INACTIVO")) or 0
+    finalizados = (
+        db.scalar(
+            select(func.count(func.distinct(Cliente.id)))
+            .select_from(Cliente)
+            .outerjoin(Prestamo, Prestamo.cliente_id == Cliente.id)
+            .where(
+                or_(
+                    Cliente.estado == "FINALIZADO",
+                    Prestamo.estado == "LIQUIDADO",
+                )
+            )
+        )
+        or 0
+    )
+    # Nuevos clientes: fecha_registro (no nulo) en el mes calendario actual en zona negocio.
+    mes_actual_expr = f"date_trunc('month', (CURRENT_TIMESTAMP AT TIME ZONE '{BUSINESS_TIMEZONE}'))"
+    nuevos_este_mes = 0
+    ultima_alta_este_mes_iso: Optional[str] = None
+    mes_calendario: Optional[str] = None
+    try:
+        mes_calendario = db.execute(
+            text(
+                f"SELECT to_char((CURRENT_TIMESTAMP AT TIME ZONE '{BUSINESS_TIMEZONE}'), 'YYYY-MM')"
+            )
+        ).scalar()
+        stmt = text(f"""
+            SELECT count(*)::int FROM clientes
+            WHERE fecha_registro IS NOT NULL
+              AND date_trunc('month', fecha_registro) = {mes_actual_expr}
+        """)
+        nuevos_este_mes = int(db.execute(stmt).scalar() or 0)
+
+        # Si el KPI está en 0 pero hubo altas Drive este mes, alinear fecha_registro
+        # (DEFAULT antiguo u omisión al insertar) y recalcular.
+        if nuevos_este_mes == 0:
+            try:
+                drive_mes = int(
+                    db.execute(
+                        text(
+                            f"""
+                            SELECT count(*)::int
+                            FROM auditoria_cliente_alta_desde_drive
+                            WHERE estado = 'APROBADO_INSERTADO'
+                              AND date_trunc(
+                                    'month',
+                                    creado_en AT TIME ZONE '{BUSINESS_TIMEZONE}'
+                                  ) = {mes_actual_expr}
+                            """
+                        )
+                    ).scalar()
+                    or 0
+                )
+            except Exception:
+                drive_mes = 0
+            if drive_mes > 0:
+                _sincronizar_fecha_registro_altas_drive_mes_actual(db)
+                nuevos_este_mes = int(db.execute(stmt).scalar() or 0)
+
+        ultima_alta = db.execute(
+            text(f"""
+            SELECT max(fecha_registro) FROM clientes
+            WHERE fecha_registro IS NOT NULL
+              AND date_trunc('month', fecha_registro) = {mes_actual_expr}
+        """)
+        ).scalar()
+        if isinstance(ultima_alta, datetime):
+            if ultima_alta.tzinfo is None:
+                ultima_alta = ultima_alta.replace(tzinfo=ZoneInfo(BUSINESS_TIMEZONE))
+            ultima_alta_este_mes_iso = ultima_alta.isoformat()
+    except Exception as e:
+        logger.warning("Error calculando nuevos_este_mes por fecha_registro: %s", e)
+        nuevos_este_mes = 0
+
+    # Última actualización real en tabla clientes: max(fecha_actualizacion, fecha_registro).
+    # Nota: estos timestamps suelen ser "naive". Como la conexión fija BUSINESS_TIMEZONE,
+    # adjuntamos esa zona para devolver ISO explícito al frontend.
+    ultima_actualizacion_iso: Optional[str] = None
+    try:
+        ultima_dt = db.scalar(
+            select(func.max(func.coalesce(Cliente.fecha_actualizacion, Cliente.fecha_registro)))
+            .select_from(Cliente)
+        )
+        if isinstance(ultima_dt, datetime):
+            if ultima_dt.tzinfo is None:
+                ultima_dt = ultima_dt.replace(tzinfo=ZoneInfo(BUSINESS_TIMEZONE))
+            ultima_actualizacion_iso = ultima_dt.isoformat()
+    except Exception as e:
+        logger.warning("Error calculando ultima_actualizacion de clientes: %s", e)
+    result = {
+        "total": int(total),
+        "activos": int(activos),
+        "inactivos": int(inactivos),
+        "finalizados": int(finalizados),
+        "nuevos_este_mes": nuevos_este_mes,
+        "mes_calendario": mes_calendario,
+        "ultima_alta_este_mes": ultima_alta_este_mes_iso,
+        "ultima_actualizacion": ultima_actualizacion_iso,
+    }
+    logger.debug("GET /clientes/stats -> %s", result)
+    return result
+
+
+@router.get("/stats/diagnostico", summary="Diagnóstico KPIs (nuevos_este_mes)")
+def get_clientes_stats_diagnostico(
+    db: Session = Depends(get_db),
+    _: UserResponse = Depends(forbid_operator_clientes_gestion),
+):
+    """
+    Devuelve datos para auditar por qué nuevos_este_mes puede estar en 0:
+    mes_actual_bd, total_con_fecha_registro, nuevos_este_mes, ejemplo_fecha_registro,
+    default de columna, altas Drive del mes y desfase fecha_registro vs auditoría.
+    """
+    try:
+        mes_bd = db.execute(
+            text(
+                f"SELECT date_trunc('month', (CURRENT_TIMESTAMP AT TIME ZONE '{BUSINESS_TIMEZONE}'))"
+            )
+        ).scalar()
+        mes_calendario = db.execute(
+            text(
+                f"SELECT to_char((CURRENT_TIMESTAMP AT TIME ZONE '{BUSINESS_TIMEZONE}'), 'YYYY-MM')"
+            )
+        ).scalar()
+        total_con_fecha = db.scalar(
+            text("SELECT count(*)::int FROM clientes WHERE fecha_registro IS NOT NULL")
+        ) or 0
+        nuevos = db.scalar(
+            text(f"""
+            SELECT count(*)::int FROM clientes
+            WHERE fecha_registro IS NOT NULL
+              AND date_trunc('month', fecha_registro)
+                  = date_trunc('month', (CURRENT_TIMESTAMP AT TIME ZONE '{BUSINESS_TIMEZONE}'))
+        """)
+        ) or 0
+        ejemplo = db.execute(text("""
+            SELECT id, fecha_registro::text
+            FROM clientes
+            WHERE fecha_registro IS NOT NULL
+            ORDER BY fecha_registro DESC
+            LIMIT 1
+        """)).first()
+        col_default = db.execute(
+            text(
+                """
+                SELECT column_default
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'clientes'
+                  AND column_name = 'fecha_registro'
+                """
+            )
+        ).scalar()
+        por_mes = db.execute(
+            text(
+                """
+                SELECT to_char(date_trunc('month', fecha_registro), 'YYYY-MM') AS mes,
+                       count(*)::int AS n
+                FROM clientes
+                WHERE fecha_registro IS NOT NULL
+                GROUP BY 1
+                ORDER BY 1 DESC
+                LIMIT 8
+                """
+            )
+        ).all()
+        drive_mes = 0
+        desfase_drive = 0
+        try:
+            drive_mes = int(
+                db.execute(
+                    text(
+                        f"""
+                        SELECT count(*)::int
+                        FROM auditoria_cliente_alta_desde_drive
+                        WHERE estado = 'APROBADO_INSERTADO'
+                          AND date_trunc(
+                                'month',
+                                creado_en AT TIME ZONE '{BUSINESS_TIMEZONE}'
+                              )
+                              = date_trunc(
+                                'month',
+                                (CURRENT_TIMESTAMP AT TIME ZONE '{BUSINESS_TIMEZONE}')
+                              )
+                        """
+                    )
+                ).scalar()
+                or 0
+            )
+            desfase_drive = int(
+                db.execute(
+                    text(
+                        f"""
+                        SELECT count(*)::int
+                        FROM auditoria_cliente_alta_desde_drive a
+                        JOIN clientes c
+                          ON regexp_replace(upper(trim(c.cedula)), '[^A-Z0-9]', '', 'g')
+                           = regexp_replace(upper(trim(a.cedula)), '[^A-Z0-9]', '', 'g')
+                        WHERE a.estado = 'APROBADO_INSERTADO'
+                          AND date_trunc(
+                                'month',
+                                a.creado_en AT TIME ZONE '{BUSINESS_TIMEZONE}'
+                              )
+                              = date_trunc(
+                                'month',
+                                (CURRENT_TIMESTAMP AT TIME ZONE '{BUSINESS_TIMEZONE}')
+                              )
+                          AND date_trunc('month', c.fecha_registro)
+                              IS DISTINCT FROM date_trunc(
+                                'month',
+                                a.creado_en AT TIME ZONE '{BUSINESS_TIMEZONE}'
+                              )
+                        """
+                    )
+                ).scalar()
+                or 0
+            )
+        except Exception as e_drive:
+            logger.warning("diagnostico Drive omitido: %s", e_drive)
+
+        sentinel = int(
+            db.execute(
+                text(
+                    "SELECT count(*)::int FROM clientes WHERE fecha_registro::date = DATE '2025-10-31'"
+                )
+            ).scalar()
+            or 0
+        )
+        return {
+            "mes_actual_bd": str(mes_bd) if mes_bd else None,
+            "mes_calendario": mes_calendario,
+            "total_con_fecha_registro": int(total_con_fecha),
+            "nuevos_este_mes": int(nuevos),
+            "ejemplo_ultimo_registro": (
+                {"id": ejemplo[0], "fecha_registro": ejemplo[1]} if ejemplo else None
+            ),
+            "fecha_registro_column_default": col_default,
+            "altas_por_mes_fecha_registro": [
+                {"mes": r[0], "n": int(r[1])} for r in por_mes
+            ],
+            "drive_aprobados_insertados_este_mes": drive_mes,
+            "drive_este_mes_con_fecha_registro_desfasada": desfase_drive,
+            "clientes_con_fecha_sentinel_2025_10_31": sentinel,
+        }
+    except Exception as e:
+        logger.exception("Error en stats/diagnostico: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+class EstadoPayload(BaseModel):
+    estado: str
+
+
+class CheckCedulasRequest(BaseModel):
+    """Lista de cédulas a comprobar (p. ej. desde carga masiva)."""
+    cedulas: list[str] = []
+
+
+class CheckCedulasResponse(BaseModel):
+    """Cédulas que ya existen en la tabla clientes."""
+    existing_cedulas: list[str] = []
+
+
+def _normalizar_cedula_carga_masiva(s: str) -> str:
+    """Alineado con frontend `normalizeCedulaInput`: mayúsculas, sin espacios/guiones/puntos/dos puntos, dígitos ancho completo → ASCII."""
+    if not s:
+        return ""
+    t = str(s).strip().upper()
+    t = re.sub(r"[\u200B-\u200D\uFEFF\u00AD]", "", t)
+    out: list[str] = []
+    for ch in t:
+        o = ord(ch)
+        if 0xFF10 <= o <= 0xFF19:
+            out.append(chr(o - 0xFF10 + ord("0")))
+        else:
+            out.append(ch)
+    t = "".join(out)
+    t = re.sub(r"[\s\-_.:]", "", t)
+    return t
+
+
+def _expr_cedula_normalizada_sql(column):
+    """
+    Normalización superficial de la columna cédula en SQL (PostgreSQL), alineada con
+    `_normalizar_cedula_carga_masiva` / POST check-cedulas.
+    """
+    return func.regexp_replace(
+        func.regexp_replace(func.upper(func.trim(column)), r"[[:space:]]", "", "g"),
+        r"[-_.:]",
+        "",
+        "g",
+    )
+
+
+def _cedula_clave_comparacion_clientes(s: str) -> str:
+    """
+    Clave para comparar con `_expr_cedula_normalizada_sql(Cliente.cedula)`.
+    Si solo hay 6-11 dígitos, antepone V (misma regla que validate_cedula).
+    """
+    t = _normalizar_cedula_carga_masiva(s or "")
+    if re.fullmatch(r"\d{6,11}", t):
+        t = "V" + t
+    return t
+
+
+class CheckEmailsRequest(BaseModel):
+    """Lista de emails a comprobar (p. ej. desde carga masiva)."""
+    emails: list[str] = []
+
+
+class CheckEmailsResponse(BaseModel):
+    """Emails que ya existen en la tabla clientes (normalizados a minúsculas)."""
+    existing_emails: list[str] = []
+
+
+@router.get("/casos-a-revisar", response_model=dict)
+def get_casos_a_revisar(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    _: UserResponse = Depends(forbid_operator_clientes_gestion),
+):
+    """
+    Clientes que no cumplen validadores: tienen valores placeholder
+    (cedula=Z999999999, nombres=Revisar Nombres, telefono=+589999999999, email=revisar@email.com).
+    """
+    _cols = (
+        Cliente.id,
+        Cliente.cedula,
+        Cliente.nombres,
+        Cliente.telefono,
+        Cliente.email,
+        Cliente.email_secundario,
+        Cliente.direccion,
+        Cliente.fecha_nacimiento,
+        Cliente.ocupacion,
+        Cliente.estado,
+        Cliente.fecha_registro,
+        Cliente.fecha_actualizacion,
+        Cliente.usuario_registro,
+        Cliente.notas,
+    )
+    filtro = or_(
+        Cliente.cedula == "Z999999999",
+        Cliente.nombres == "Revisar Nombres",
+        Cliente.telefono == "+589999999999",
+        Cliente.email == "revisar@email.com",
+    )
+    count_q = select(func.count()).select_from(Cliente).where(filtro)
+    total = db.scalar(count_q) or 0
+    q = (
+        select(*_cols)
+        .select_from(Cliente)
+        .where(filtro)
+        .order_by(Cliente.id.desc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+    )
+    rows = db.execute(q).all()
+    clientes_list = []
+    for r in rows:
+        try:
+            clientes_list.append(_row_to_cliente_response(r))
+        except (ValidationError, TypeError, AttributeError) as ve:
+            logger.warning("Fila cliente id=%s omitida: %s", getattr(r, "id", "?"), ve)
+    try:
+        clientes_list = _enrich_clientes_con_historial(db, clientes_list)
+    except Exception as hist_err:
+        logger.warning("casos-a-revisar: historial correos omitido: %s", hist_err)
+    total_pages = (total + per_page - 1) // per_page if total else 0
+    return {
+        "clientes": clientes_list,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": total_pages,
+    }
+
+
+class ActualizarLoteItem(BaseModel):
+    """Item para actualización en lote (mismos nombres de campo que ClienteUpdate; correo_2 = email_secundario)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: int
+    cedula: Optional[str] = None
+    nombres: Optional[str] = None
+    telefono: Optional[str] = None
+    email: Optional[str] = Field(None, validation_alias=AliasChoices("email", "correo_1"))
+    email_secundario: Optional[str] = Field(
+        None,
+        validation_alias=AliasChoices("email_secundario", "correo_2"),
+    )
+    direccion: Optional[str] = None
+    ocupacion: Optional[str] = None
+    notas: Optional[str] = None
+
+
+class ActualizarLoteResponse(BaseModel):
+    """Respuesta de actualización en lote."""
+    actualizados: int = 0
+    errores: list[dict] = []
+    total_procesados: int = 0
+
+
+@router.post("/actualizar-lote", response_model=ActualizarLoteResponse)
+def actualizar_clientes_lote(
+    items: list[ActualizarLoteItem],
+    db: Session = Depends(get_db),
+    _: UserResponse = Depends(forbid_operator_clientes_gestion),
+):
+    """
+    Actualizar múltiples clientes. Cada item debe tener id y los campos a actualizar.
+    Usa las mismas validaciones que update_cliente (duplicados â†’ 409).
+    """
+    actualizados = 0
+    errores: list[dict] = []
+    for item in items:
+        data = item.model_dump(exclude_unset=True)
+        if "id" not in data:
+            errores.append({"id": item.id, "error": "Falta id"})
+            continue
+        cid = data.pop("id")
+        if not data:
+            continue
+        try:
+            payload = ClienteUpdate(**{k: v for k, v in data.items() if v is not None})
+            _perform_update_cliente(cid, payload, db)
+            actualizados += 1
+        except HTTPException as e:
+            detail = e.detail
+            if isinstance(detail, (list, dict)):
+                detail = str(detail)
+            errores.append({"id": cid, "error": str(detail)})
+        except (ValidationError, TypeError) as e:
+            errores.append({"id": cid, "error": str(e)})
+    return ActualizarLoteResponse(
+        actualizados=actualizados,
+        errores=errores,
+        total_procesados=len(items),
+    )
+
+
+@router.post("/check-cedulas", response_model=CheckCedulasResponse)
+def check_cedulas(
+    payload: CheckCedulasRequest,
+    db: Session = Depends(get_db),
+    _: UserResponse = Depends(forbid_operator_clientes_gestion),
+):
+    """
+    Comprobar qué cédulas ya están registradas en tabla clientes (carga masiva).
+    Comparación por cédula normalizada (sin guiones/puntos/espacios), coherente con el Excel de clientes.
+    Devuelve las formas canónicas enviadas que ya existen en BD.
+    """
+    if not payload.cedulas:
+        return CheckCedulasResponse(existing_cedulas=[])
+    incoming_set: set[str] = set()
+    incoming_order: list[str] = []
+    for c in payload.cedulas:
+        n = _cedula_clave_comparacion_clientes(c or "")
+        if n and n not in incoming_set:
+            incoming_set.add(n)
+            incoming_order.append(n)
+    if not incoming_order:
+        return CheckCedulasResponse(existing_cedulas=[])
+
+    ced_norm_sql = _expr_cedula_normalizada_sql(Cliente.cedula)
+    rows = db.execute(select(Cliente.cedula).where(ced_norm_sql.in_(incoming_order))).scalars().all()
+    found: list[str] = []
+    seen_found: set[str] = set()
+    for raw in rows or []:
+        n = _cedula_clave_comparacion_clientes(raw or "")
+        if n in incoming_set and n not in seen_found:
+            seen_found.add(n)
+            found.append(n)
+    return CheckCedulasResponse(existing_cedulas=found)
+
+
+@router.post("/check-emails", response_model=CheckEmailsResponse)
+def check_emails(
+    payload: CheckEmailsRequest,
+    db: Session = Depends(get_db),
+    _: UserResponse = Depends(forbid_operator_clientes_gestion),
+):
+    """
+    Comprobar qué emails ya están registrados en la tabla clientes (carga masiva).
+    Recibe una lista de emails y devuelve los que ya existen en la BD (comparación sin distinguir mayúsculas).
+    """
+    if not payload.emails:
+        return CheckEmailsResponse(existing_emails=[])
+    emails_norm = list({(e or "").strip().lower() for e in payload.emails if (e or "").strip()})
+    if not emails_norm:
+        return CheckEmailsResponse(existing_emails=[])
+    r1 = db.execute(
+        select(func.lower(Cliente.email)).where(func.lower(Cliente.email).in_(emails_norm))
+    ).scalars().all()
+    r2 = db.execute(
+        select(func.lower(Cliente.email_secundario)).where(
+            Cliente.email_secundario.isnot(None),
+            func.lower(Cliente.email_secundario).in_(emails_norm),
+        )
+    ).scalars().all()
+    existing = sorted({str(x) for x in (list(r1) + list(r2)) if x})
+    return CheckEmailsResponse(existing_emails=existing)
+
+
+@router.patch("/{cliente_id}/estado", response_model=ClienteResponse)
+def cambiar_estado_cliente(
+    cliente_id: int,
+    payload: EstadoPayload,
+    db: Session = Depends(get_db),
+    _: UserResponse = Depends(forbid_operator_clientes_gestion),
+):
+    """Cambiar estado del cliente (PATCH /clientes/{id}/estado)."""
+    row = db.get(Cliente, cliente_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+    estado = payload.estado
+    if estado not in ("ACTIVO", "INACTIVO", "MORA", "FINALIZADO", "LEGACY"):
+        raise HTTPException(status_code=400, detail="estado debe ser ACTIVO, INACTIVO, MORA, FINALIZADO o LEGACY")
+    row.estado = estado
+    db.commit()
+    db.refresh(row)
+    return ClienteResponse.model_validate(row)
+
+
+@router.get("/{cliente_id}", response_model=ClienteResponse)
+def get_cliente(cliente_id: int, db: Session = Depends(get_db)):
+    """Obtener un cliente por ID (incluye correos_historial / correos_conocidos)."""
+    row = db.get(Cliente, cliente_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+    try:
+        return _cliente_response_con_historial(db, row)
+    except Exception as hist_err:
+        logger.warning("get_cliente: historial correos omitido: %s", hist_err)
+        return ClienteResponse.model_validate(row)
+
+
+def _normalize_for_duplicate(s: str) -> str:
+    """Normaliza string para comparación de duplicados (strip, case)."""
+    return (s or "").strip()
+
+
+def _digits_telefono(s: str) -> str:
+    """Solo dígitos del teléfono para comparar duplicados."""
+    return re.sub(r"\D", "", (s or "").strip())
+
+
+def _ahora_caracas_naive() -> datetime:
+    """Marca de alta/actualización en zona de negocio (naive, para columnas DateTime sin tz)."""
+    return datetime.now(ZoneInfo(BUSINESS_TIMEZONE)).replace(tzinfo=None)
+
+
+def _sincronizar_fecha_registro_altas_drive_mes_actual(db: Session) -> int:
+    """
+    Si hubo altas Drive este mes pero clientes.fecha_registro quedó fuera del mes
+    (p. ej. DEFAULT antiguo 2025-10-31), alinea fecha_registro con auditoria.creado_en.
+    Idempotente. Devuelve filas actualizadas.
+    """
+    try:
+        res = db.execute(
+            text(
+                f"""
+                WITH drive_mes AS (
+                  SELECT DISTINCT ON (
+                    regexp_replace(upper(trim(cedula)), '[^A-Z0-9]', '', 'g')
+                  )
+                    regexp_replace(upper(trim(cedula)), '[^A-Z0-9]', '', 'g') AS ced_norm,
+                    (creado_en AT TIME ZONE '{BUSINESS_TIMEZONE}') AS alta_local
+                  FROM auditoria_cliente_alta_desde_drive
+                  WHERE estado = 'APROBADO_INSERTADO'
+                    AND date_trunc(
+                          'month',
+                          creado_en AT TIME ZONE '{BUSINESS_TIMEZONE}'
+                        )
+                        = date_trunc(
+                          'month',
+                          (CURRENT_TIMESTAMP AT TIME ZONE '{BUSINESS_TIMEZONE}')
+                        )
+                  ORDER BY
+                    regexp_replace(upper(trim(cedula)), '[^A-Z0-9]', '', 'g'),
+                    creado_en DESC
+                )
+                UPDATE clientes c
+                SET fecha_registro = d.alta_local
+                FROM drive_mes d
+                WHERE regexp_replace(upper(trim(c.cedula)), '[^A-Z0-9]', '', 'g')
+                      = d.ced_norm
+                  AND (
+                    c.fecha_registro::date = DATE '2025-10-31'
+                    OR date_trunc('month', c.fecha_registro)
+                       IS DISTINCT FROM date_trunc('month', d.alta_local)
+                  )
+                """
+            )
+        )
+        n = int(res.rowcount or 0)
+        if n > 0:
+            db.commit()
+            logger.info(
+                "sincronizadas %s fecha_registro desde auditoria Drive (mes actual)",
+                n,
+            )
+        return n
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.warning(
+            "No se pudo sincronizar fecha_registro desde Drive (omitido): %s", e
+        )
+        return 0
+
+
+def create_cliente_from_payload(db: Session, payload: ClienteCreate, *, commit: bool = True) -> Cliente:
+    """
+    Inserta un cliente aplicando las mismas reglas que POST /clientes (duplicados, teléfono, correos).
+    Si commit=True (defecto), hace commit al final. Si commit=False, solo flush (p. ej. lote atómico).
+    Lanza HTTPException (409/400) si corresponde.
+    """
+    cedula_norm = _cedula_clave_comparacion_clientes(_normalize_for_duplicate(payload.cedula) or "") or "Z999999999"
+    nombres_norm = _normalize_for_duplicate(payload.nombres)
+    email_norm = _normalize_for_duplicate(payload.email)
+    telefono_dig = _digits_telefono(payload.telefono)
+
+    # Prohibir duplicado por cédula (misma cédula en cualquier formato en tabla clientes)
+    ced_norm_sql = _expr_cedula_normalizada_sql(Cliente.cedula)
+    existing_cedula = db.execute(select(Cliente.id).where(ced_norm_sql == cedula_norm)).first()
+    if existing_cedula:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Ya existe un cliente con la misma cédula. Cliente existente ID: {existing_cedula[0]}",
+        )
+
+    # Prohibir duplicado por nombre completo
+    if nombres_norm:
+        existing_nombres = db.execute(
+            select(Cliente.id).where(Cliente.nombres == nombres_norm)
+        ).first()
+        if existing_nombres:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Ya existe un cliente con el mismo nombre completo. Cliente existente ID: {existing_nombres[0]}",
+            )
+
+    # Prohibir duplicado por correo 1 o correo 2 (cualquier columna; misma regla de normalización)
+    if email_norm:
+        ex = _cliente_id_conflicto_email(db, email_norm, None)
+        if ex:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Ya existe un cliente con el mismo correo 1. Cliente existente ID: {ex[0]}",
+            )
+    sec_raw = _normalize_for_duplicate(getattr(payload, "email_secundario", None) or "")
+    _, sec_norm = secundario_distinto_del_principal(email_norm or payload.email, sec_raw or None)
+    if sec_norm:
+        ex2 = _cliente_id_conflicto_email(db, sec_norm, None)
+        if ex2:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Ya existe un cliente con el mismo correo 2. Cliente existente ID: {ex2[0]}",
+            )
+
+    # Si teléfono duplicado (2 números exactamente iguales) â†’ reemplazar por +589999999999
+    telefono_final = payload.telefono
+    tel_10 = telefono_dig[-10:] if len(telefono_dig) >= 10 else telefono_dig
+    if len(telefono_dig) >= 8 and tel_10 != "4111111111":
+        rows_telefono = db.execute(
+            select(Cliente.id, Cliente.telefono).where(Cliente.telefono.isnot(None))
+        ).all()
+        for r in rows_telefono:
+            if r.telefono and _digits_telefono(r.telefono) == telefono_dig:
+                telefono_final = "+589999999999"
+                break
+
+    ahora = _ahora_caracas_naive()
+    row = Cliente(
+        cedula=cedula_norm,
+        nombres=payload.nombres,
+        telefono=telefono_final,
+        email=payload.email,
+        email_secundario=sec_norm,
+        direccion=payload.direccion,
+        fecha_nacimiento=payload.fecha_nacimiento,
+        ocupacion=payload.ocupacion,
+        estado=payload.estado,
+        fecha_registro=ahora,
+        fecha_actualizacion=ahora,
+        usuario_registro=payload.usuario_registro,
+        notas=payload.notas,
+    )
+    db.add(row)
+    if commit:
+        db.commit()
+        db.refresh(row)
+    else:
+        db.flush()
+        db.refresh(row)
+    return row
+
+
+@router.post("", response_model=ClienteResponse, status_code=201)
+def create_cliente(
+    payload: ClienteCreate,
+    db: Session = Depends(get_db),
+    _: UserResponse = Depends(forbid_operator_clientes_gestion),
+):
+    """
+    Crear cliente en la BD.
+    No permitido duplicados: misma cédula, mismo nombre, mismo correo 1/correo 2 o mismo teléfono -> 409.
+    Aplica a Nuevo Cliente y Carga masiva. JSON: email/email_secundario o correo_1/correo_2.
+    """
+    row = create_cliente_from_payload(db, payload)
+    try:
+        return _cliente_response_con_historial(db, row)
+    except Exception:
+        return ClienteResponse.model_validate(row)
+
+
+def _perform_update_cliente(cliente_id: int, payload: ClienteUpdate, db: Session) -> ClienteResponse:
+    """
+    Lógica interna de actualización de cliente (reutilizable desde rutas y otros métodos).
+    No se permite dejar cédula+nombres o email duplicados con otro cliente (distinto id) â†’ 409.
+    Retorna ClienteResponse tras guardar en BD.
+    """
+    row = db.get(Cliente, cliente_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+    data = payload.model_dump(exclude_unset=True)
+    # No permitir sobrescribir id ni fecha_registro en actualizaciones
+    data.pop("id", None)
+    data.pop("fecha_registro", None)
+    # Actualizar siempre fecha_actualizacion al guardar (BD sin tz; asumimos UTC)
+    data["fecha_actualizacion"] = datetime.now(ZoneInfo("UTC")).replace(tzinfo=None)
+
+    # Validar duplicados: no permitir cédula, nombre, email ni teléfono igual a otro cliente
+    if "cedula" in data:
+        cedula_norm = (
+            _cedula_clave_comparacion_clientes(
+                _normalize_for_duplicate(data.get("cedula") or getattr(row, "cedula") or "") or ""
+            )
+            or "Z999999999"
+        )
+        data["cedula"] = cedula_norm
+        if cedula_norm:
+            ced_norm_sql = _expr_cedula_normalizada_sql(Cliente.cedula)
+            existing = db.execute(
+                select(Cliente.id).where(ced_norm_sql == cedula_norm, Cliente.id != cliente_id)
+            ).first()
+            if existing:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Ya existe otro cliente con la misma cédula. Cliente existente ID: {existing[0]}",
+                )
+    if "nombres" in data:
+        nombres_norm = _normalize_for_duplicate(data.get("nombres") or getattr(row, "nombres") or "")
+        if nombres_norm:
+            existing = db.execute(
+                select(Cliente.id).where(Cliente.nombres == nombres_norm, Cliente.id != cliente_id)
+            ).first()
+            if existing:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Ya existe otro cliente con el mismo nombre completo. Cliente existente ID: {existing[0]}",
+                )
+    if "email" in data or "email_secundario" in data:
+        prim_actual = str(getattr(row, "email", "") or "")
+        sec_actual = str(getattr(row, "email_secundario", "") or "").strip() or None
+        prim_nuevo = _normalize_for_duplicate(data.get("email", prim_actual) if "email" in data else prim_actual)
+        if "email_secundario" in data:
+            sec_nuevo_raw = data.get("email_secundario")
+            if sec_nuevo_raw is None:
+                sec_nuevo = None
+            else:
+                sec_nuevo = _normalize_for_duplicate(sec_nuevo_raw) or None
+        else:
+            sec_nuevo = sec_actual
+        _, sec_coherente = secundario_distinto_del_principal(prim_nuevo or prim_actual, sec_nuevo)
+        if "email_secundario" in data:
+            data["email_secundario"] = sec_coherente
+        if prim_nuevo:
+            ex = _cliente_id_conflicto_email(db, prim_nuevo, cliente_id)
+            if ex:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Ya existe otro cliente con el mismo correo 1. Cliente existente ID: {ex[0]}",
+                )
+        if sec_coherente:
+            exs = _cliente_id_conflicto_email(db, sec_coherente, cliente_id)
+            if exs:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Ya existe otro cliente con el mismo correo 2. Cliente existente ID: {exs[0]}",
+                )
+        if prim_nuevo and sec_coherente and prim_nuevo.strip().lower() == sec_coherente.strip().lower():
+            raise HTTPException(status_code=400, detail="El correo 2 no puede repetir el correo 1")
+        # Archivar correo(s) anterior(es) antes de sobrescribir (n cambios → n correos en historial)
+        try:
+            archivar_cambios_emails_cliente(
+                db,
+                row,
+                email_nuevo=prim_nuevo if "email" in data else None,
+                email_secundario_nuevo=sec_coherente if "email_secundario" in data else None,
+                email_en_payload="email" in data,
+                email_secundario_en_payload="email_secundario" in data,
+                usuario_cambio=str(data.get("usuario_registro") or getattr(row, "usuario_registro", "") or "")
+                or None,
+            )
+        except Exception as hist_err:
+            logger.warning(
+                "No se pudo archivar correo anterior cliente_id=%s: %s",
+                cliente_id,
+                hist_err,
+            )
+    if "telefono" in data:
+        telefono_dig = _digits_telefono(data.get("telefono") or getattr(row, "telefono") or "")
+        tel_10 = telefono_dig[-10:] if len(telefono_dig) >= 10 else telefono_dig
+        if len(telefono_dig) >= 8 and tel_10 != "4111111111":
+            rows_telefono = db.execute(
+                select(Cliente.id, Cliente.telefono).where(
+                    Cliente.telefono.isnot(None),
+                    Cliente.id != cliente_id,
+                )
+            ).all()
+            for r in rows_telefono:
+                if r.telefono and _digits_telefono(r.telefono) == telefono_dig:
+                    data["telefono"] = "+589999999999"
+                    break
+
+    for k, v in data.items():
+        setattr(row, k, v)
+    db.commit()
+    db.refresh(row)
+    try:
+        return _cliente_response_con_historial(db, row)
+    except Exception:
+        return ClienteResponse.model_validate(row)
+
+
+@router.put("/{cliente_id}", response_model=ClienteResponse)
+def update_cliente(
+    cliente_id: int,
+    payload: ClienteUpdate,
+    db: Session = Depends(get_db),
+    _: UserResponse = Depends(forbid_operator_clientes_gestion),
+):
+    """
+    Actualizar cliente (endpoint HTTP).
+    No se permite dejar cédula+nombres o email duplicados con otro cliente (distinto id) â†’ 409.
+    """
+    return _perform_update_cliente(cliente_id, payload, db)
+
+
+@router.delete("/{cliente_id}", status_code=204)
+def delete_cliente(
+    cliente_id: int,
+    db: Session = Depends(get_db),
+    _: UserResponse = Depends(forbid_operator_clientes_gestion),
+):
+    """Eliminar cliente. No se puede si tiene préstamos asociados."""
+    row = db.get(Cliente, cliente_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+
+    # Verificar si tiene préstamos (FK bloquea el delete)
+    count_prestamos = db.scalar(
+        select(func.count()).select_from(Prestamo).where(Prestamo.cliente_id == cliente_id)
+    ) or 0
+    if count_prestamos > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"No se puede eliminar: el cliente tiene {count_prestamos} préstamo(s) asociado(s). "
+            "Elimine o reasigne los préstamos antes de eliminar al cliente.",
+        )
+
+    try:
+        db.delete(row)
+        db.commit()
+        return None
+    except IntegrityError as e:
+        db.rollback()
+        logger.warning("IntegrityError al eliminar cliente %s: %s", cliente_id, e)
+        raise HTTPException(
+            status_code=409,
+            detail="No se puede eliminar: el cliente tiene registros asociados (préstamos, cuotas, tickets, etc.).",
+        ) from e
+
+
+# ============================================================================
+# CARGA MASIVA DE CLIENTES DESDE EXCEL
+# ============================================================================
+
+from datetime import date, datetime
+from fastapi import UploadFile, File
+import io
+from decimal import Decimal
+
+try:
+    import openpyxl
+except ImportError:
+    openpyxl = None
+
+from app.models.cliente_con_error import ClienteConError
+
+
+def _normalize_cedula_excel(cedula_str: str) -> str:
+    """Normaliza cédula desde Excel: uppercase, sin espacios."""
+    if not cedula_str:
+        return ""
+    return str(cedula_str).strip().upper()
+
+
+def _validate_email(email: str) -> bool:
+    """Valida formato básico de email."""
+    if not email:
+        return False
+    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    return bool(re.match(pattern, email))
+
+
+def _parse_fecha(fecha_val: any) -> date:
+    """Intenta parsear fecha en múltiples formatos."""
+    if isinstance(fecha_val, date):
+        return fecha_val
+    if isinstance(fecha_val, datetime):
+        return fecha_val.date()
+    if not fecha_val:
+        return None
+    
+    s = str(fecha_val).strip()
+    for fmt in ("%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+@router.post("/upload-excel", response_model=dict)
+async def upload_clientes_excel(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: UserResponse = Depends(forbid_operator_clientes_gestion),
+):
+    """
+    Carga masiva de clientes desde Excel.
+    Formato esperado: Cédula | Nombres | Dirección | Fecha Nacimiento | Ocupación | Correo 1 | Teléfono
+    Columna opcional 8: Correo 2 (email_secundario), misma regla de unicidad que en API (no repetir en BD ni
+    entre correo 1 y 2 del mismo cliente).
+
+    Validaciones:
+    - Cédula: V|E|J|Z + 6-11 dígitos, única en BD
+    - Email: formato válido, único en BD (correo 1 y 2 cuentan como direcciones ocupadas)
+    - Teléfono: requerido
+    - Nombres: requerido
+
+    Respuesta: {registros_creados, registros_con_error, clientes_con_errores}
+    """
+    if not file.filename or not file.filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="Debe subir un archivo Excel (.xlsx o .xls)")
+    
+    if not openpyxl:
+        raise HTTPException(status_code=500, detail="Excel library not available")
+    
+    try:
+        content = await file.read()
+        wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        ws = wb.active
+        
+        if not ws:
+            return {
+                "registros_creados": 0,
+                "registros_con_error": 0,
+                "clientes_con_errores": []
+            }
+        
+        registros_creados = 0
+        registros_con_error = 0
+        clientes_con_errores = []
+        
+        # Cargar emails y cédulas existentes para validación rápida
+        cedulas_existentes = set(
+            db.execute(select(Cliente.cedula)).scalars().all()
+        )
+        emails_existentes: set[str] = set()
+        for em in db.execute(select(Cliente.email)).scalars().all():
+            if em is not None and str(em).strip():
+                emails_existentes.add(str(em).strip())
+        for em in (
+            db.execute(select(Cliente.email_secundario).where(Cliente.email_secundario.isnot(None)))
+            .scalars()
+            .all()
+        ):
+            if em is not None and str(em).strip():
+                emails_existentes.add(str(em).strip())
+        cedulas_en_lote = set()
+        emails_en_lote = set()
+        
+        usuario_email = current_user.email if hasattr(current_user, 'email') else "sistema@rapicredit.com"
+        
+        # Procesar filas (saltar header)
+        for idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+            if not row or all(cell is None for cell in row):
+                continue
+            
+            try:
+                cedula_raw = row[0] if len(row) > 0 else None
+                nombres_raw = row[1] if len(row) > 1 else None
+                direccion_raw = row[2] if len(row) > 2 else None
+                fecha_nac_raw = row[3] if len(row) > 3 else None
+                ocupacion_raw = row[4] if len(row) > 4 else None
+                email_raw = row[5] if len(row) > 5 else None
+                telefono_raw = row[6] if len(row) > 6 else None
+                email_secundario_raw = row[7] if len(row) > 7 else None
+
+                errores = []
+                
+                # Validar cédula
+                cedula = _normalize_cedula_excel(str(cedula_raw or ""))
+                if not cedula:
+                    errores.append("Cédula es requerida")
+                elif not re.match(r"^[VEJZ]\d{6,11}$", cedula):
+                    errores.append("Cédula debe ser V|E|J|Z + 6-11 dígitos")
+                elif cedula in cedulas_existentes or cedula in cedulas_en_lote:
+                    errores.append("Cédula duplicada (existe en BD o en este lote)")
+                else:
+                    cedulas_en_lote.add(cedula)
+                
+                # Validar nombres
+                nombres = str(nombres_raw or "").strip()
+                if not nombres:
+                    errores.append("Nombres es requerido")
+                
+                # Validar dirección
+                direccion = str(direccion_raw or "").strip()
+                if not direccion:
+                    errores.append("Dirección es requerida")
+                
+                # Validar fecha nacimiento
+                fecha_nac = _parse_fecha(fecha_nac_raw)
+                if not fecha_nac:
+                    errores.append("Fecha de nacimiento inválida")
+                
+                # Validar ocupación
+                ocupacion = str(ocupacion_raw or "").strip()
+                if not ocupacion:
+                    errores.append("Ocupación es requerida")
+                
+                # Validar correo 1 (prioridad) y correo 2 opcional (columna 8)
+                email = str(email_raw or "").strip()
+                email_valid = False
+                if not email:
+                    errores.append("Email es requerido")
+                elif not _validate_email(email):
+                    errores.append("Email no tiene formato válido")
+                elif email in emails_existentes or email in emails_en_lote:
+                    errores.append("Email duplicado (existe en BD o en este lote)")
+                else:
+                    emails_en_lote.add(email)
+                    email_valid = True
+
+                email_secundario_in = str(email_secundario_raw or "").strip()
+                _, sec_norm = secundario_distinto_del_principal(
+                    email if email_valid else None,
+                    email_secundario_in or None,
+                )
+                if email_secundario_in and not email_valid:
+                    errores.append("Correo 2 requiere un correo 1 válido en la misma fila")
+                elif email_valid:
+                    if email_secundario_in and not sec_norm:
+                        errores.append("Correo 2 vacío o igual al correo 1")
+                    elif sec_norm:
+                        if not _validate_email(sec_norm):
+                            errores.append("Correo 2 no tiene formato válido")
+                        elif sec_norm in emails_existentes or sec_norm in emails_en_lote:
+                            errores.append("Correo 2 duplicado (existe en BD o en este lote)")
+                        else:
+                            emails_en_lote.add(sec_norm)
+
+                # Validar teléfono
+                telefono = str(telefono_raw or "").strip()
+                if not telefono:
+                    errores.append("Teléfono es requerido")
+                
+                # Si hay errores, agregar a lista de revisión
+                if errores:
+                    cliente_error = ClienteConError(
+                        cedula=cedula or None,
+                        nombres=nombres,
+                        telefono=telefono or None,
+                        email=email or None,
+                        direccion=direccion,
+                        fecha_nacimiento=str(fecha_nac_raw) if fecha_nac_raw else None,
+                        ocupacion=ocupacion or None,
+                        estado="PENDIENTE",
+                        errores_descripcion="; ".join(errores),
+                        fila_origen=idx,
+                        usuario_registro=usuario_email
+                    )
+                    db.add(cliente_error)
+                    registros_con_error += 1
+                    continue
+                
+                # Crear cliente
+                cliente = Cliente(
+                    cedula=cedula,
+                    nombres=nombres,
+                    telefono=telefono,
+                    email=email,
+                    email_secundario=sec_norm,
+                    direccion=direccion,
+                    fecha_nacimiento=fecha_nac,
+                    ocupacion=ocupacion,
+                    estado="ACTIVO",
+                    usuario_registro=usuario_email,
+                    notas="Cargado desde Excel",
+                )
+                db.add(cliente)
+                registros_creados += 1
+
+            except Exception as e:
+                logger.error(f"Error procesando fila {idx}: {e}")
+                cliente_error = ClienteConError(
+                    cedula=str(row[0]) if len(row) > 0 else None,
+                    nombres=str(row[1]) if len(row) > 1 else None,
+                    telefono=str(row[6]) if len(row) > 6 else None,
+                    email=str(row[5]) if len(row) > 5 else None,
+                    errores_descripcion=f"Error general: {str(e)[:200]}",
+                    fila_origen=idx,
+                    usuario_registro=usuario_email
+                )
+                db.add(cliente_error)
+                registros_con_error += 1
+        
+        db.commit()
+        
+        return {
+            "registros_creados": registros_creados,
+            "registros_con_error": registros_con_error,
+            "mensaje": f"Se crearon {registros_creados} cliente(s) y {registros_con_error} con error(es)"
+        }
+        
+    except Exception as e:
+        db.rollback()
+        logger.exception("Error cargando Excel de clientes: %s", e)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error procesando archivo: {str(e)[:200]}"
+        )
+
+
+@router.get("/revisar/lista", response_model=dict)
+def get_clientes_con_errores(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    _: UserResponse = Depends(forbid_operator_clientes_gestion),
+):
+    """
+    Listado de clientes con errores de validación (pendientes de revisión).
+    Paginado para facilitar corrección manual.
+    """
+    total = db.scalar(select(func.count()).select_from(ClienteConError)) or 0
+    rows = db.execute(
+        select(ClienteConError)
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+    ).scalars().all()
+    
+    return {
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "items": [
+            {
+                "id": r.id,
+                "cedula": r.cedula,
+                "nombres": r.nombres,
+                "email": r.email,
+                "telefono": r.telefono,
+                "errores": r.errores_descripcion,
+                "fila_origen": r.fila_origen,
+                "estado": r.estado,
+                "fecha_registro": r.fecha_registro.isoformat() if r.fecha_registro else None,
+            }
+            for r in rows
+        ]
+    }
+
+
+class RevisarClienteAgregarBody(BaseModel):
+    """Datos de una fila para enviar a revisión manual (clientes_con_errores)."""
+    cedula: Optional[str] = None
+    nombres: Optional[str] = None
+    direccion: Optional[str] = None
+    fecha_nacimiento: Optional[str] = None
+    ocupacion: Optional[str] = None
+    email: Optional[str] = None
+    telefono: Optional[str] = None
+    errores_descripcion: Optional[str] = None
+    fila_origen: Optional[int] = None
+
+
+@router.post("/revisar/agregar", response_model=dict)
+def agregar_cliente_a_revisar(
+    body: RevisarClienteAgregarBody,
+    db: Session = Depends(get_db),
+    current_user: UserResponse = Depends(forbid_operator_clientes_gestion),
+):
+    """
+    Envía una fila a la tabla clientes_con_errores (revisar clientes).
+    Usado desde la carga masiva cuando el usuario pulsa "Enviar a Revisar Clientes".
+    """
+    usuario_email = current_user.email if hasattr(current_user, "email") else "sistema@rapicredit.com"
+    row = ClienteConError(
+        cedula=body.cedula,
+        nombres=body.nombres,
+        direccion=body.direccion,
+        fecha_nacimiento=body.fecha_nacimiento,
+        ocupacion=body.ocupacion,
+        email=body.email,
+        telefono=body.telefono,
+        estado="PENDIENTE",
+        errores_descripcion=body.errores_descripcion or "Enviado a revisión desde carga masiva",
+        fila_origen=body.fila_origen,
+        usuario_registro=usuario_email,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {"id": row.id, "mensaje": "Cliente enviado a Revisar Clientes"}
+
+
+@router.delete("/revisar/{error_id}", status_code=204)
+def resolver_cliente_error(
+    error_id: int,
+    db: Session = Depends(get_db),
+    _: UserResponse = Depends(forbid_operator_clientes_gestion),
+):
+    """Marcar cliente con error como resuelto (eliminar de la lista)."""
+    row = db.get(ClienteConError, error_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Registro no encontrado")
+    
+    db.delete(row)
+    db.commit()
+    return None
+
+@router.post("/revisar/eliminar-por-descarga")
+def eliminar_clientes_por_descarga(
+    ids: list[int] = Body(...),
+    db: Session = Depends(get_db),
+    _: UserResponse = Depends(forbid_operator_clientes_gestion),
+):
+    """Elimina registros de clientes_con_errores tras su descarga en Excel."""
+    if not ids:
+        return {"deleted": 0}
+    
+    result = db.execute(
+        delete(ClienteConError).where(ClienteConError.id.in_(ids))
+    )
+    db.commit()
+    return {"deleted": result.rowcount}
+
+
+
+

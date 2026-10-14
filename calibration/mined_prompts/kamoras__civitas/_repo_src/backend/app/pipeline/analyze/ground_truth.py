@@ -1,0 +1,721 @@
+"""Derived consistency gate for scoring algorithms.
+
+Runs at the end of each pipeline run and flags results that have come
+unmoored from the raw public records they are computed from. A failure
+means either a data-fetch regression (e.g., PAC totals silently dropping
+to zero) or an algorithm change with unintended effects, and should be
+investigated before trusting the run. Failures are logged as warnings
+(non-fatal — data still publishes, but the run is flagged).
+
+Every expectation here is DERIVED from the current population's own raw
+data at check time — no politician is named and no score range is
+hand-typed (AGENTS.md principle 1 / 3a). A prior version of this module
+kept a hand-maintained GROUND_TRUTH table of named reference senators
+with per-senator score ranges, plus a
+second drifting copy in scripts/rescore.py; that table went stale with
+membership churn, encoded developer priors about specific people, and
+violated the no-hardcoded-values principle. See git history for the
+table and the 2026-06/2026-07 audit notes that motivated each range.
+
+Three families of checks, all population-level:
+
+1. Raw-input integrity — existence checks on the inputs scoring depends
+   on (any receipts at all, any nonzero PAC totals among funded members,
+   any party-labeled votes). Catches the fetch regressions the old named
+   checks caught — a feed silently zeroing out — directly at the source,
+   for whoever is currently in office.
+
+2. Direction-of-effect — Spearman rank correlation between each score
+   and an upstream raw metric it must track: Funding Independence must
+   fall as the PAC share of receipts rises and rise with small-donor
+   share; Constituent Alignment must track its vote component recomputed
+   from the stored party-labeled votes (constituent_metrics — since v6.15
+   that component is not monotonic in break rate, and since v6.16 it peaks
+   at the seat's expectation, so raw break rate alone doesn't rank it). "The most PAC-free members must score high on FI" is exactly
+   what the old named rows asserted, computed fresh each run for
+   whoever currently holds that profile.
+
+3. Extremes — Mann-Whitney U on the top/bottom decile by each raw
+   metric: the decile the metric says should score highest must score
+   stochastically higher than the rest, and the lowest-expected decile
+   lower. The lower-tail test is the derived form of an old audit trap
+   capping one named leader's score, without naming anyone.
+
+check_score_distribution guards the failure mode per-member checks
+can't see — the whole population collapsing toward one value (Promise
+Persistence did exactly this before being removed as a scored dimension,
+see docs/methodology/member-score/v6.0.md). The old fixed stdev floors
+(8.0/6.5/5.5 — themselves hand-calibrated from live audits) are replaced
+by two derived tests: a point-mass check (a strict majority sharing one
+value is a collapse by definition) and a self-history check (today's
+stdev an extreme low outlier vs. this algorithm version's own snapshot
+history, by modified z-score).
+
+The named constants below are statistical conventions and sample-size
+guards (significance level, decile definition, Iglewicz–Hoaglin outlier
+cutoff), not calibrated domain values — nothing in them encodes who is
+in office or what any member should score.
+"""
+
+import logging
+import math
+import statistics
+import warnings
+from collections import Counter, defaultdict
+
+from scipy import stats as scipy_stats
+
+from app.pipeline.analyze.party_line_record import load_record
+from app.pipeline.transform.normalize_votes import stored_vote
+from app.pipeline.analyze.score_calculator import (
+    ALGORITHM_VERSION,
+    CONSTITUENT_FULL_CONFIDENCE_VOTES,
+    SATURATION_QUANTILE,
+    beyond_saturation,
+    party_break_rate,
+    seat_break_residual,
+    seat_relative_vote_score,
+)
+
+logger = logging.getLogger(__name__)
+
+# ── Statistical conventions and sample-size guards ──────────────────────────
+# One-sided significance level for rank tests (Fisher's conventional 0.05).
+ALPHA = 0.05
+# Minimum population for any check — too few rows to judge (same n≥10 guard
+# the previous version of this module used).
+MIN_POPULATION = 10
+# Minimum party-labeled votes before a member's break rate is a usable
+# denominator (same n≥10 sample-size convention).
+MIN_LABELED_VOTES = 10
+# Extremes tests need enough members for a meaningful decile split
+# (rule-of-thumb minimum for the rank-sum test's normal approximation).
+MIN_EXTREMES_POPULATION = 30
+# "Extreme group" = a decile (ordinal definition, not a tuned value).
+EXTREME_FRACTION = 0.10
+# Modified z-score outlier cutoff (Iglewicz & Hoaglin 1993, "How to Detect
+# and Handle Outliers", recommend 3.5) and its MAD normalization constant.
+MODIFIED_Z_CUTOFF = 3.5
+MAD_Z_SCALE = 0.6745
+# Minimum distinct snapshot dates before the self-history stdev check runs.
+MIN_HISTORY_DATES = 5
+#
+# v6.11 (2026-07-23, same day as this module's rewrite): coalition breadth
+# moved to Legislative Effectiveness and position congruence added to this
+# dimension (docs/methodology/member-score/). No GROUND_TRUTH entries to
+# re-verify here anymore — the derived checks above re-measure the current
+# population automatically every run, which is the entire point of this
+# rewrite; a scoring-formula change no longer requires hand-updating
+# reference ranges the way the old hardcoded table did.
+
+_DIM_LABEL = {
+    "score_constituent_alignment": "IV",
+    "score_funding_independence": "FI",
+    "score_funding_diversity": "FD",
+    "score_legislative_effectiveness": "LE",
+}
+
+# (metric key, score attr, expected rank direction, what the metric measures)
+# direction +1: score must RISE with the metric; -1: score must FALL.
+_CONSISTENCY_CHECKS: list[tuple[str, str, int, str]] = [
+    ("pac_ratio", "score_funding_independence", -1,
+     "PAC share of receipts (FEC)"),
+    # No check against raw PAC dollars. One was added when v6.22 judged the
+    # share against campaigns of the same size, which made the score track
+    # the dollars. v6.26 compares the share with what the seat predicts
+    # instead, so a large campaign taking a small share scores high however
+    # many dollars that is (PAC dollars barely vary with campaign size,
+    # r = 0.17), and the dollars check failed both chambers on the first
+    # v6.26 runs (Spearman -0.02 Senate, +0.03 House, 2026-10-04) while the
+    # share check passed.
+    ("small_donor_pct", "score_funding_independence", +1,
+     "small-donor share of receipts (FEC unitemized)"),
+    # Constituent Alignment's vote component recomputed from the stored
+    # votes (constituent_metrics): one check over the whole chamber, the
+    # heaviest breakers included, rather than a falling-side check the
+    # Senate's handful of members past saturation could never populate.
+    ("seat_relative_vote", "score_constituent_alignment", +1,
+     "seat-relative vote score recomputed from the stored party-labeled votes"),
+]
+
+
+def _tie_extended_extreme(
+    ordered: list[tuple], k: int, from_start: bool,
+) -> tuple[list, list]:
+    """Split `ordered` (sorted ascending by raw metric) into (extreme
+    group, rest), extending the nominal k-sized cut so a metric value
+    tied across the boundary lands entirely on one side.
+
+    2026-08-26 audit: the Senate Independence check was failing
+    (p=0.237, needs <0.05) for a real reason — party_break_rate has a
+    hard floor at 0.0 shared by 16+ of 100 senators (many simply never
+    break with party on labeled votes; this isn't rare noise for this
+    metric the way it would be for a continuous financial ratio). A
+    plain `ordered[:k]`/`ordered[-k:]` slice at k=10 split that 16-way
+    tie arbitrarily — whichever 10 of the 16 the DB query happened to
+    return first landed "in" the least-independent decile, the other 6
+    landed in "the rest", contaminating the comparison group with
+    members equally low on the raw metric and diluting the test's
+    ability to find a real separation.
+
+    The rank check now runs on the recomputed vote score (seat_relative_
+    vote), where ties sit at the 0 floor from both tails (full loyalty in
+    an opposed seat, heavy breaking past saturation); the same extension
+    applies.
+    """
+    n = len(ordered)
+    if from_start:
+        idx = k
+        boundary = ordered[idx - 1][0]
+        while idx < n and ordered[idx][0] == boundary:
+            idx += 1
+        return ordered[:idx], ordered[idx:]
+    idx = n - k
+    boundary = ordered[idx][0]
+    while idx > 0 and ordered[idx - 1][0] == boundary:
+        idx -= 1
+    return ordered[idx:], ordered[:idx]
+
+
+def constituent_metrics(
+    break_rate: float | None,
+    labeled_votes: int,
+    state: str,
+    party: str,
+    effective_party: str | None = None,
+    district: int | None = None,
+    reference: dict | None = None,
+) -> dict:
+    """The Constituent Alignment inputs a member record carries:
+    seat_relative_vote (the vote component recomputed from the raw votes by
+    the scorer's own seat_relative_vote_score; None below MIN_LABELED_VOTES
+    or without a measured expectation) and beyond_saturation (|residual|
+    past the party's scale on either side; None below
+    CONSTITUENT_FULL_CONFIDENCE_VOTES — the reference's saturation point is
+    measured only on full-confidence records). ``break_rate`` and
+    ``labeled_votes`` are party_break_rate's. Shared by the pipeline gate
+    and scripts/rescore.py so both judge members one way.
+
+    The rank check against it asks whether stored scores still follow the
+    stored votes — a plumbing and data check. The shape itself (the peak,
+    the decline, the shrinkage) is pinned by test_constituent_alignment.py,
+    not here: a gate metric written to differ from the formula would flag
+    every legitimate design change as a failure."""
+    out = {"seat_relative_vote": None, "beyond_saturation": None}
+    if break_rate is None or labeled_votes < MIN_LABELED_VOTES:
+        return out
+    dev = seat_break_residual(
+        break_rate, labeled_votes, state, party, effective_party=effective_party,
+        district=district, reference=reference,
+    )
+    if dev is not None:
+        residual, scale, typical = dev
+        out["seat_relative_vote"] = seat_relative_vote_score(residual, scale, labeled_votes, typical)
+        if labeled_votes >= CONSTITUENT_FULL_CONFIDENCE_VOTES:
+            out["beyond_saturation"] = beyond_saturation(residual, scale)
+    return out
+
+
+# Twice the reference's out-of-pattern tail (1 - SATURATION_QUANTILE),
+# rounded so the float arithmetic lands on the documented value: 0.2, not
+# 0.19999999999999996, which would fail a share of exactly 20%.
+_BEYOND_SATURATION_TOLERANCE = round(2 * (1 - SATURATION_QUANTILE), 9)
+
+
+def _beyond_saturation_share(members: list[dict]) -> tuple[float, int] | None:
+    """Share of full-confidence members whose |residual| from their seat's
+    expectation exceeds their party's scale, on either side. The reference
+    defines each party's scale as the SATURATION_QUANTILE of its |residual|
+    over the full-confidence members it was measured on, so ~1 -
+    SATURATION_QUANTILE of them are beyond it; the probe allows twice
+    that, because the gate reads current members' stored votes — members
+    whose scoring failed this run keep last run's — rather than the exact
+    run population."""
+    flags = [m["metrics"].get("beyond_saturation") for m in members]
+    readable = [f for f in flags if f is not None]
+    # Same minimum as every rank check: early in a congress only a few
+    # members have enough labeled votes, and 2 of 8 is noise, not a
+    # disagreement between the reference and the votes. None: not run.
+    if len(readable) < MIN_POPULATION:
+        return None
+    return sum(readable) / len(readable), len(readable)
+
+
+def evaluate_derived_checks(
+    members: list[dict], entity_label: str = "senators", reference_measured: bool = False,
+) -> dict:
+    """Run the integrity + consistency checks over plain member records.
+
+    Pure-data entry point shared by ``check_ground_truth`` (ORM) and
+    ``scripts/rescore.py`` (shadow-scored payloads), so the shadow harness
+    exercises the same gate instead of keeping a second copy.
+
+    Each member record:
+        {"name": str,
+         "scores": {score_attr: float | None},
+         "metrics": {"pac_ratio": float | None,
+                     "small_donor_pct": float | None,
+                     "seat_relative_vote": float | None,
+                     "beyond_saturation": bool | None},
+         "raw": {"total_raised": float, "total_from_pacs": float,
+                 "labeled_votes": int}}
+
+    ``reference_measured``: whether the Constituent Alignment reference
+    the records were judged against was measured from this population this
+    run. The past-saturation share probe runs only then.
+
+    Returns {"checked": int, "failures": [{senator, dimension, score,
+    expected, rationale}, ...]} — same failure shape the pipelines persist.
+    """
+    failures: list[dict] = []
+    checked = 0
+    n_all = len(members)
+
+    if n_all < MIN_POPULATION:
+        logger.info(
+            "Derived checks: only %d %s — below n=%d minimum, skipping",
+            n_all, entity_label, MIN_POPULATION,
+        )
+        return {"checked": 0, "failures": []}
+
+    # ── 1. Raw-input integrity (existence checks — no thresholds) ──────────
+    funded = [m for m in members if (m["raw"].get("total_raised") or 0) > 0]
+    integrity_probes = [
+        (
+            not funded,
+            "FI", "total_raised > 0 for someone",
+            "every current {label} has zero total receipts — the funding "
+            "fetch produced no data",
+        ),
+        (
+            bool(funded) and all(
+                (m["raw"].get("total_from_pacs") or 0) == 0 for m in funded
+            ),
+            "FI", "total_from_pacs > 0 for someone",
+            "PAC totals are zero for every funded {label} — the exact "
+            "silent-fetch regression this gate exists to catch",
+        ),
+        (
+            bool(funded) and all(
+                (m["metrics"].get("small_donor_pct") or 0) == 0 for m in funded
+            ),
+            "FI", "small_donor_pct > 0 for someone",
+            "small-donor share is zero for every funded {label} — "
+            "unitemized-contribution data missing from the fetch",
+        ),
+        (
+            sum(m["raw"].get("labeled_votes") or 0 for m in members) == 0,
+            "IV", "party-labeled votes exist",
+            "no {label} has any party-labeled vote — vote fetch or "
+            "party-labeling is producing nothing",
+        ),
+    ]
+    # Only meaningful, and only counted as a check, when the reference was
+    # measured from this population (a fallback reference from another run
+    # makes no promise about these members' spread) and enough members are
+    # readable.
+    probe = _beyond_saturation_share(members) if reference_measured else None
+    if probe is not None:
+        share, n_readable = probe
+        checked += 1
+        if share > _BEYOND_SATURATION_TOLERANCE:
+            rationale = (
+                f"{share:.0%} of full-confidence {entity_label} sit beyond Constituent "
+                "Alignment's scale (either side); the reference defines each "
+                f"party's as the {SATURATION_QUANTILE:.0%} quantile of its |residual| (about "
+                f"{1 - SATURATION_QUANTILE:.0%} beyond it) and the gate allows up to "
+                f"{_BEYOND_SATURATION_TOLERANCE:.0%} — "
+                "the constituent reference and the votes disagree"
+            )
+            failures.append({
+                "senator": f"{round(share * n_readable)} of {n_readable} full-confidence {entity_label}",
+                "dimension": "IV",
+                "score": round(share, 3),
+                "expected": [f"share beyond saturation <= {_BEYOND_SATURATION_TOLERANCE:.0%}", None],
+                "rationale": rationale,
+            })
+            logger.warning("DERIVED CHECK FAIL [IV]: %s", rationale)
+    for failed, dim_label, expectation, rationale in integrity_probes:
+        checked += 1
+        if failed:
+            failures.append({
+                "senator": f"ALL ({n_all} {entity_label})",
+                "dimension": dim_label,
+                "score": 0,
+                "expected": [expectation, None],
+                "rationale": rationale.format(label=entity_label[:-1]),
+            })
+            logger.warning(
+                "DERIVED CHECK FAIL [%s]: %s", dim_label,
+                rationale.format(label=entity_label[:-1]),
+            )
+
+    # ── 2 & 3. Rank consistency between scores and raw metrics ─────────────
+    for metric, dim, direction, describes in _CONSISTENCY_CHECKS:
+        label = _DIM_LABEL.get(dim, dim)
+        pairs = [
+            (m["metrics"].get(metric), m["scores"].get(dim), m["name"])
+            for m in members
+        ]
+        pairs = [(x, y, nm) for x, y, nm in pairs if x is not None and y is not None]
+        n = len(pairs)
+        if n < MIN_POPULATION:
+            logger.info(
+                "Derived checks: %s vs %s has only %d usable pairs — skipping",
+                label, metric, n,
+            )
+            continue
+
+        xs = [p[0] for p in pairs]
+        ys = [p[1] for p in pairs]
+
+        checked += 1
+        with warnings.catch_warnings():
+            # A constant input (e.g. every PAC ratio identical) is handled
+            # explicitly below via the NaN result — no need for the warning.
+            warnings.simplefilter("ignore", scipy_stats.ConstantInputWarning)
+            res = scipy_stats.spearmanr(xs, ys)
+        rho = float(res.statistic)
+        if math.isnan(rho):
+            failures.append({
+                "senator": f"ALL ({n} {entity_label})",
+                "dimension": label,
+                "score": 0,
+                "expected": [f"rank variation in {metric} and {label}", None],
+                "rationale": (
+                    f"{label} vs {describes}: no rank variation (constant "
+                    "input) — scores or raw data have degenerated"
+                ),
+            })
+            logger.warning(
+                "DERIVED CHECK FAIL [%s]: constant input for %s correlation",
+                label, metric,
+            )
+            continue
+
+        # One-sided p in the expected direction.
+        p_one = res.pvalue / 2 if rho * direction > 0 else 1 - res.pvalue / 2
+        if rho * direction <= 0 or p_one > ALPHA:
+            failures.append({
+                "senator": f"ALL ({n} {entity_label})",
+                "dimension": label,
+                "score": round(rho, 3),
+                "expected": [
+                    f"spearman rho {'>' if direction > 0 else '<'} 0",
+                    f"one-sided p < {ALPHA}",
+                ],
+                "rationale": (
+                    f"{label} no longer tracks {describes}: "
+                    f"rho={rho:.2f}, one-sided p={p_one:.3g}"
+                ),
+            })
+            logger.warning(
+                "DERIVED CHECK FAIL [%s]: rho=%.2f (expected sign %+d), "
+                "one-sided p=%.3g vs %s — score decoupled from %s",
+                label, rho, direction, p_one, describes, metric,
+            )
+
+        if n < MIN_EXTREMES_POPULATION:
+            continue
+
+        # Extreme deciles by the raw metric, both tails, named by what the
+        # metric says they should score: "highest-expected" is the decile
+        # that should score highest. (Not "most independent": for
+        # Constituent Alignment's peaked vote score the low tail holds the
+        # most loyal and the heaviest over-breakers alike.)
+        k = max(int(n * EXTREME_FRACTION), MIN_POPULATION // 2)
+        ordered = sorted(pairs, key=lambda p: p[0])
+        most, most_rest = _tie_extended_extreme(ordered, k, from_start=direction <= 0)
+        least, least_rest = _tie_extended_extreme(ordered, k, from_start=direction > 0)
+        for group, rest, alternative, side in (
+            (most, most_rest, "greater", "highest-expected"),
+            (least, least_rest, "less", "lowest-expected"),
+        ):
+            group_scores = [y for _, y, _ in group]
+            rest_scores = [y for _, y, _ in rest]
+            if not rest_scores:
+                # A tie spanning the whole population (every member at one
+                # value of the metric) leaves nothing to compare against;
+                # the point-mass check is what speaks to that.
+                logger.info(
+                    "Derived checks: %s decile by %s is the whole population (tie) — skipping",
+                    side, metric,
+                )
+                continue
+            checked += 1
+            mw = scipy_stats.mannwhitneyu(
+                group_scores, rest_scores, alternative=alternative,
+            )
+            if math.isnan(mw.pvalue) or mw.pvalue > ALPHA:
+                names = ", ".join(nm for _, _, nm in group)
+                failures.append({
+                    "senator": f"{side} decile by {metric} ({len(group)} of {n} {entity_label})",
+                    "dimension": label,
+                    "score": round(float(statistics.median(group_scores)), 1),
+                    "expected": [
+                        f"stochastically {alternative} than the rest",
+                        f"one-sided p < {ALPHA}",
+                    ],
+                    "rationale": (
+                        f"the {side} decile by {describes} does not score "
+                        f"{'above' if alternative == 'greater' else 'below'} "
+                        f"the rest of the chamber on {label} "
+                        f"(Mann-Whitney p={float(mw.pvalue):.3g}; members: {names})"
+                    ),
+                })
+                logger.warning(
+                    "DERIVED CHECK FAIL [%s]: %s decile by %s not %s rest "
+                    "(p=%.3g)",
+                    label, side, metric, alternative, float(mw.pvalue),
+                )
+
+    return {"checked": checked, "failures": failures}
+
+
+def _vote_query_for(model):
+    """Return (vote_model, member-id column) for a chamber's member model."""
+    from app.models import KeyVote, RepKeyVote
+
+    if model.__name__ == "Senator":
+        return KeyVote, KeyVote.senator_id
+    return RepKeyVote, RepKeyVote.representative_id
+
+
+def _member_records(db, model, constituent_reference: dict | None = None) -> list[dict]:
+    """Build the plain member records ``evaluate_derived_checks`` consumes
+    from the chamber's current members and their labeled votes.
+    ``constituent_reference`` is the reference this run scored with; the
+    persisted one when not given."""
+    vote_model, fk_col = _vote_query_for(model)
+    # Each member's party-labeled votes, as the dicts party_break_rate reads
+    # (stored_vote), so the gate judges members on
+    # the score's own statistic: its dedupe, its minimum count.
+    current = db.query(model).filter(model.is_current.is_(True)).all()
+    votes: dict[str, list[dict]] = defaultdict(list)
+    for row_id, member_id, bill_id, with_party in (
+        db.query(vote_model.id, fk_col, vote_model.bill_id, vote_model.voted_with_party)
+        .filter(vote_model.voted_with_party.isnot(None))
+        .filter(fk_col.in_([m.id for m in current]))
+        .all()
+    ):
+        votes[member_id].append(stored_vote(row_id, bill_id, with_party))
+    records = []
+    for m in current:
+        raised = m.total_raised or 0
+        # The same denominator Funding Independence scores on (contributions,
+        # falling back to receipts for rows scored before it existed) — a
+        # direction-of-effect check against a different ratio than the one
+        # scored would weaken for reasons unrelated to the scores.
+        base = getattr(m, "total_contributions", None) or raised
+        rate, labeled = party_break_rate(
+            {"keyVotes": votes[m.id], "partyLineRecord": load_record(m.party_line_record)},
+        )
+        constituent = constituent_metrics(
+            rate, labeled, m.state or "", m.party or "I",
+            effective_party=getattr(m, "caucus_party", None),
+            district=getattr(m, "district", None),
+            reference=constituent_reference,
+        )
+        records.append({
+            "id": m.id,
+            "name": m.name,
+            "scores": {dim: getattr(m, dim, None) for dim in _DIM_LABEL},
+            "metrics": {
+                "pac_ratio": (m.total_from_pacs or 0) / base if base > 0 else None,
+                "small_donor_pct": m.small_donor_percentage if base > 0 else None,
+                **constituent,
+            },
+            "raw": {
+                "total_raised": raised,
+                "total_from_pacs": m.total_from_pacs or 0,
+                "labeled_votes": labeled,
+            },
+        })
+    return records
+
+
+def check_ground_truth(
+    db, model=None, constituent_reference: dict | None = None, reference_measured: bool = False,
+) -> dict:
+    """Check the chamber's scores for consistency with its own raw data.
+
+    Args:
+        db: SQLAlchemy session.
+        model: Senator (default) or Representative — the derived checks
+            are chamber-agnostic, unlike the named reference table they
+            replaced (which is why the House previously had no gate).
+        constituent_reference: the Constituent Alignment reference this
+            run scored with (live_constituent_reference_measured). Defaults to the
+            persisted one, which differs only if persisting it failed.
+        reference_measured: whether that reference was measured from this
+            run's members (live_constituent_reference_measured); gates the
+            past-saturation share probe.
+
+    Returns:
+        {"checked": int, "failures": [ {senator, dimension, score,
+         expected, rationale}, ... ]}
+    """
+    if model is None:
+        from app.models import Senator
+        model = Senator
+    entity_label = "senators" if model.__name__ == "Senator" else "representatives"
+
+    report = evaluate_derived_checks(
+        _member_records(db, model, constituent_reference), entity_label,
+        reference_measured=reference_measured,
+    )
+
+    if not report["failures"]:
+        logger.info(
+            "Derived consistency gate: %d/%d checks passed (%s)",
+            report["checked"], report["checked"], entity_label,
+        )
+    else:
+        logger.warning(
+            "Derived consistency gate: %d/%d checks FAILED (%s) — "
+            "investigate before trusting this run's scores",
+            len(report["failures"]), report["checked"], entity_label,
+        )
+    return report
+
+
+# ScoreSnapshot stores dimensions positionally — same mapping as
+# score_calibration.DIMENSIONS (score_2 is retired Promise Persistence).
+_SNAPSHOT_COLUMN = {
+    "score_funding_independence": "score_1",
+    "score_constituent_alignment": "score_3",
+    "score_funding_diversity": "score_4",
+    "score_legislative_effectiveness": "score_5",
+}
+
+
+def check_score_distribution(db, model=None) -> list[dict]:
+    """Flag any scored dimension whose population has collapsed to a point.
+
+    ``model`` defaults to Senator; pass Representative to run the same
+    check for the House (both share the same score_* column names).
+
+    Two derived tests per dimension, replacing the hand-calibrated stdev
+    floors a previous version kept (8.0/6.5/5.5 — see git history for the
+    audits that produced them):
+
+    - Point-mass: a strict majority of the population sharing one
+      (integer-rounded) value is a collapse by definition, with no
+      threshold to tune. Promise Persistence's historical collapse (76%
+      of senators at the neutral prior) trips this immediately.
+    - Self-history: today's stdev is compared against this algorithm
+      version's own per-date snapshot stdevs within the current Congress;
+      a modified z-score below -3.5 (Iglewicz & Hoaglin) flags a sudden
+      collapse. Cross-version shifts are deliberate algorithm changes and
+      a new Congress resets the current-term window (AGENTS.md principle
+      6) — early in one, members have few votes and bills, and scores sit
+      near their shrinkage prior by design — so both are boundaries the
+      trend chart annotates rather than collapses alarmed here; gradual
+      drift is score_calibration.py's job.
+
+    Returns failures in the same shape as check_ground_truth's, so
+    callers can merge the two lists.
+    """
+    from app.models import ScoreSnapshot
+    from app.pipeline.fetch.congress import congress_first_year, congress_of_date
+    from app.time_utils import utcnow
+
+    if model is None:
+        from app.models import Senator
+        model = Senator
+
+    failures: list[dict] = []
+    rows = db.query(model).all()
+    is_senate = model.__name__ == "Senator"
+    entity_type = "senator" if is_senate else "representative"
+    entity_label = "senators" if is_senate else "representatives"
+    today = utcnow().strftime("%Y-%m-%d")
+
+    # Per-date historical values for this chamber under the CURRENT
+    # algorithm version, excluding today's just-written snapshot.
+    snapshot_cols = [getattr(ScoreSnapshot, col) for col in _SNAPSHOT_COLUMN.values()]
+    congress_now = congress_of_date(today)
+    history_rows = (
+        db.query(ScoreSnapshot.date, *snapshot_cols)
+        .filter(
+            ScoreSnapshot.entity_type == entity_type,
+            ScoreSnapshot.algorithm_version == ALGORITHM_VERSION,
+            # This Congress convened January 3 of its first year.
+            ScoreSnapshot.date >= f"{congress_first_year(congress_now)}-01-03",
+            ScoreSnapshot.date < today,
+        )
+        .all()
+    )
+    # Same Congress by calendar date, the boundary the trend chart and the
+    # leaderboard arrows use. A CURRENT_CONGRESS setting left behind the
+    # calendar is ops_alerts.check_current_congress_staleness's to flag.
+    by_date: dict[str, list[tuple]] = defaultdict(list)
+    for row in history_rows:
+        by_date[row[0]].append(row[1:])
+
+    for idx, (dim, _col) in enumerate(_SNAPSHOT_COLUMN.items()):
+        label = _DIM_LABEL.get(dim, dim)
+        values = [v for v in (getattr(s, dim, None) for s in rows) if v is not None]
+        if len(values) < MIN_POPULATION:
+            continue
+        stdev = statistics.pstdev(values)
+
+        mode_count = max(Counter(round(v) for v in values).values())
+        if mode_count * 2 > len(values):
+            failures.append({
+                "senator": f"ALL ({len(values)} {entity_label})",
+                "dimension": label,
+                "score": round(mode_count / len(values), 2),
+                "expected": ["no single value held by a majority", None],
+                "rationale": (
+                    f"{mode_count} of {len(values)} {entity_label} share one "
+                    f"value — scores have collapsed toward a point mass"
+                ),
+            })
+            logger.warning(
+                "DERIVED CHECK FAIL: %s point-mass collapse — %d/%d share "
+                "one value (stdev=%.2f)",
+                label, mode_count, len(values), stdev,
+            )
+            continue
+
+        history_stdevs = [
+            statistics.pstdev(vals)
+            for vals in (
+                [t[idx] for t in tuples if t[idx] is not None]
+                for tuples in by_date.values()
+            )
+            if len(vals) >= MIN_POPULATION
+        ]
+        if len(history_stdevs) < MIN_HISTORY_DATES:
+            continue
+        med = statistics.median(history_stdevs)
+        mad = statistics.median(abs(h - med) for h in history_stdevs)
+        if mad == 0:
+            # Perfectly flat history gives the modified z-score no scale;
+            # the point-mass check above still guards catastrophic collapse.
+            continue
+        z = MAD_Z_SCALE * (stdev - med) / mad
+        if z < -MODIFIED_Z_CUTOFF:
+            derived_floor = med - MODIFIED_Z_CUTOFF * mad / MAD_Z_SCALE
+            failures.append({
+                "senator": f"ALL ({len(values)} {entity_label})",
+                "dimension": label,
+                "score": round(stdev, 2),
+                "expected": [round(derived_floor, 2), None],
+                "rationale": (
+                    f"population stdev {stdev:.2f} is an extreme low outlier "
+                    f"vs this algorithm version's own history (median "
+                    f"{med:.2f} over {len(history_stdevs)} snapshot dates, "
+                    f"modified z={z:.1f}) — scores are losing discriminative "
+                    "power"
+                ),
+            })
+            logger.warning(
+                "DERIVED CHECK FAIL: %s population stdev=%.2f vs history "
+                "median %.2f (modified z=%.1f, n=%d dates) — dimension may "
+                "have collapsed",
+                label, stdev, med, z, len(history_stdevs),
+            )
+
+    return failures

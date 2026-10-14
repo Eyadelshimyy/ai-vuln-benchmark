@@ -1,0 +1,2124 @@
+"""Admin API — protected management endpoints for dashboard, pipeline control, and metrics."""
+
+import asyncio
+import json
+import logging
+import os
+import secrets
+import threading
+import time
+from collections.abc import Callable
+from datetime import UTC as _UTC
+from datetime import datetime, timedelta
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from app import background, database, net_stats, ops_alerts, pipeline_chain
+from app.api.elections import ballot_state_codes
+from app.api.pipeline import _is_pipeline_running
+from app.api.pipeline_runner import run_pipeline_in_thread
+from app.api.visits import CONFIRMED_VISITS_SINCE, DEVICE_CLASSES, LOAD_TIMING_BUCKETS_MS, LOAD_TIMING_METRICS
+from app.config import settings
+from app.database import get_db, get_visits_db, off_loop
+from app.http_client import make_async_client
+from app.models import (
+    ActionIssue,
+    AnalysisCache,
+    ApiCache,
+    ApiRejectionCount,
+    ApiRequestCount,
+    CampaignPromise,
+    Donor,
+    ElectionPipelineRun,
+    ExploreDocument,
+    HousePipelineRun,
+    IndustryDonation,
+    Justice,
+    JusticeVote,
+    KeyVote,
+    LearnedClassification,
+    LobbyingMatch,
+    MonitorUpdate,
+    NationalMonitor,
+    PageLoadTiming,
+    PageView,
+    PipelinePhaseTiming,
+    PipelineRateLimitStat,
+    PipelineRun,
+    PipelineStatus,
+    President,
+    RepCampaignPromise,
+    RepDonor,
+    RepIndustryDonation,
+    RepKeyVote,
+    RepLobbyingMatch,
+    Representative,
+    RepSponsoredBill,
+    ScoreSnapshot,
+    Senator,
+    SiteVisit,
+    SponsoredBill,
+    StockTradesPipelineRun,
+    SupplementaryPipelineRun,
+    TimelineEntry,
+)
+from app.pipeline import (
+    election_pipeline,
+    house_pipeline,
+    lease,
+    lexical_index,
+    run_tracker,
+    senate_pipeline,
+    stock_pipeline,
+    supplementary_pipeline,
+    vector_store,
+)
+from app.pipeline.analyze import document_authority
+from app.pipeline.analyze import story_actor
+from app.pipeline.analyze.action_center import get_action_refresh_state
+from app.pipeline.analyze.bill_learning import get_health_metrics
+from app.pipeline.analyze.ollama_client import get_llm_stats
+from app.pipeline.analyze.score_calibration import generate_calibration_report
+from app.pipeline.fetch import ballot_measure_pdf_sources, district_pvi
+from app.pipeline_chain import chain_running
+from app.scheduler import get_next_run_time, triggered_chain
+from app.services import bill_service
+from app.time_utils import utcnow
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/admin")
+
+
+def _get_admin_token() -> str:
+    return settings.ADMIN_TOKEN or settings.PIPELINE_TRIGGER_TOKEN
+
+
+def require_admin(authorization: str | None = Header(default=None)) -> None:
+    token = _get_admin_token()
+    if not token:
+        raise HTTPException(status_code=503, detail="Admin token not configured")
+    expected = f"Bearer {token}"
+    if not authorization or not secrets.compare_digest(authorization, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _live_elapsed(run) -> float | None:
+    """Elapsed seconds for a pipeline run row, computed live if still running.
+
+    A "running" row's stored elapsed_seconds is stale (only written on
+    completion), so while it's in flight we compute it against now instead.
+    """
+    if run.status == PipelineStatus.RUNNING and run.started_at:
+        return round((utcnow() - run.started_at).total_seconds(), 1)
+    return run.elapsed_seconds
+
+
+def _parse_progress_steps(run) -> list | None:
+    """Decode a run's progress_detail JSON column, or None if absent/invalid."""
+    if not getattr(run, "progress_detail", None):
+        return None
+    try:
+        return json.loads(run.progress_detail)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _history_entry(run, pipeline_type: str, extra: dict) -> dict:
+    """Shared fields for a pipeline_history row; `extra` adds the type-specific ones."""
+    return {
+        "id": run.id,
+        "pipelineType": pipeline_type,
+        "startedAt": run.started_at.isoformat() if run.started_at else None,
+        "completedAt": run.completed_at.isoformat() if run.completed_at else None,
+        "status": run.status,
+        "elapsedSeconds": run.elapsed_seconds,
+        "errorMessage": run.error_message,
+        **extra,
+    }
+
+
+def _clear_stuck_runs(db: Session, model, is_running: Callable[[], bool], pipeline_label: str) -> dict:
+    """Mark any stuck (status=running) run of `model` as failed.
+
+    Shared by the pipelines' "clear stuck run" admin endpoints —
+    use when the in-memory flag says idle but the DB record still shows
+    running (e.g. after a container restart mid-run).
+
+    The rows are read before the flag, and only those rows are cleared,
+    each still RUNNING: a run raises its flag before its row commits
+    (run_tracker.acquire_tracked_run), so a row read here whose run is
+    going in this process finds the flag up, and a run starting after the
+    read keeps its row.
+    """
+    stuck = [
+        (run.id, run.started_at)
+        for run in db.query(model).filter(model.status == PipelineStatus.RUNNING).all()
+    ]
+    if is_running():
+        raise HTTPException(
+            status_code=409, detail=f"{pipeline_label} pipeline is actively running: stop it first"
+        )
+    if not stuck:
+        return {"cleared": 0, "message": "No stuck runs found"}
+
+    now = utcnow()
+    cleared = 0
+    for run_id, started_at in stuck:
+        cleared += db.query(model).filter(model.id == run_id, model.status == PipelineStatus.RUNNING).update({
+            "status": PipelineStatus.FAILED,
+            "error_message": "Cleared by admin (container restart)",
+            "completed_at": now,
+            "elapsed_seconds": round((now - started_at).total_seconds(), 1) if started_at else None,
+        }, synchronize_session=False)
+    db.commit()
+    return {"cleared": cleared, "message": f"Marked {cleared} run(s) as failed"}
+
+
+@router.post("/auth")
+async def admin_auth(authorization: str | None = Header(default=None)):
+    """Validate an admin token. Returns 200 on success, 401 on failure."""
+    require_admin(authorization)
+    return {"status": "authenticated"}
+
+
+def _parse_proc_stat_cpu(text: str) -> tuple[int, int] | None:
+    """(busy, total) cumulative CPU ticks from /proc/stat's aggregate line.
+
+    Fields: user nice system idle iowait irq softirq steal [guest guest_nice].
+    Idle time is idle + iowait (a CPU waiting on disk is not busy). guest and
+    guest_nice are already counted inside user/nice, so they are left out of
+    the total. The caller turns two readings into a utilisation percentage —
+    ticks since boot say nothing about "now" on their own.
+    """
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts or parts[0] != "cpu":
+            continue
+        try:
+            values = [int(v) for v in parts[1:9]]
+        except ValueError:
+            return None
+        if len(values) < 4:
+            return None
+        values += [0] * (8 - len(values))
+        total = sum(values)
+        idle = values[3] + values[4]
+        return total - idle, total
+    return None
+
+
+def _read_system_stats() -> dict:
+    """Read host-level system stats from /proc and /sys (works in Docker)."""
+    stats: dict = {}
+
+    # Cumulative CPU ticks (/proc/stat is host-wide inside a container).
+    # Utilisation is the change between two polls; the load average below is
+    # a different quantity — runnable tasks, smoothed over a minute — and
+    # reads as ~0% on a mostly idle multi-core host even when work is running.
+    try:
+        with open("/proc/stat") as f:
+            ticks = _parse_proc_stat_cpu(f.read())
+        stats["cpuBusyTicks"], stats["cpuTotalTicks"] = ticks if ticks else (None, None)
+    except OSError:
+        stats["cpuBusyTicks"] = None
+        stats["cpuTotalTicks"] = None
+
+    try:
+        with open("/proc/loadavg") as f:
+            parts = f.read().split()
+        stats["loadAvg"] = [float(parts[0]), float(parts[1]), float(parts[2])]
+    except Exception:
+        stats["loadAvg"] = None
+
+    try:
+        stats["cpuCount"] = os.cpu_count() or 1
+    except Exception:
+        stats["cpuCount"] = 1
+
+    try:
+        with open("/proc/meminfo") as f:
+            meminfo = {}
+            for line in f:
+                k, _, v = line.partition(":")
+                meminfo[k.strip()] = int(v.strip().split()[0]) * 1024
+        stats["memTotalBytes"] = meminfo.get("MemTotal", 0)
+        stats["memAvailableBytes"] = meminfo.get("MemAvailable", 0)
+        stats["memUsedBytes"] = stats["memTotalBytes"] - stats["memAvailableBytes"]
+        stats["memUsedPct"] = round(
+            stats["memUsedBytes"] / stats["memTotalBytes"] * 100, 1
+        ) if stats["memTotalBytes"] else 0
+    except Exception:
+        stats["memTotalBytes"] = 0
+        stats["memAvailableBytes"] = 0
+        stats["memUsedBytes"] = 0
+        stats["memUsedPct"] = 0
+
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            stats["cpuTempC"] = round(int(f.read().strip()) / 1000, 1)
+    except Exception:
+        stats["cpuTempC"] = None
+
+    try:
+        st = os.statvfs("/data")
+        stats["diskTotalBytes"] = st.f_frsize * st.f_blocks
+        stats["diskUsedBytes"] = st.f_frsize * (st.f_blocks - st.f_bfree)
+        stats["diskFreeBytes"] = st.f_frsize * st.f_bavail
+        stats["diskUsedPct"] = round(
+            stats["diskUsedBytes"] / stats["diskTotalBytes"] * 100, 1
+        ) if stats["diskTotalBytes"] else 0
+    except Exception:
+        stats["diskTotalBytes"] = 0
+        stats["diskUsedBytes"] = 0
+        stats["diskFreeBytes"] = 0
+        stats["diskUsedPct"] = 0
+
+    try:
+        with open("/proc/uptime") as f:
+            stats["uptimeSeconds"] = int(float(f.read().split()[0]))
+    except Exception:
+        stats["uptimeSeconds"] = None
+
+    try:
+        # This container's counters (the pipeline's, under Swarm), and the
+        # rate the API containers recorded (net_stats: a container sees only
+        # its own interfaces). The dashboard adds the two rates.
+
+        stats["netRxBytes"], stats["netTxBytes"] = net_stats.own_totals() or (None, None)
+        rates = net_stats.api_rates()
+        stats["apiNetRxRate"] = rates["rxRate"] if rates else None
+        stats["apiNetTxRate"] = rates["txRate"] if rates else None
+    except Exception:
+        # Unknown, never zero: the dashboard would read the next good
+        # counters as a lifetime of bytes in one interval.
+        stats["netRxBytes"] = stats["netTxBytes"] = None
+        stats["apiNetRxRate"] = stats["apiNetTxRate"] = None
+
+    return stats
+
+
+def _collect_vector_db_stats(db: Session) -> dict:
+    """Collect comprehensive vector DB and learning store metrics."""
+    stats: dict = {}
+    try:
+        vec_stats = vector_store.collection_stats()
+        stats["status"] = "ok"
+        stats.update(vec_stats)
+        stats["embeddingModel"] = vector_store.EMBEDDING_MODEL_NAME
+        stats["embeddingModelVersion"] = vector_store.get_model_version()
+        stats["embeddingDimensions"] = vector_store.EMBEDDING_DIMENSIONS
+
+    except Exception:
+        logger.exception("Vector DB stats collection failed")
+        stats = {"status": "unavailable", "error": "collection failed; see server logs"}
+
+    # Learning store metrics (always attempt even if chroma is down)
+    try:
+        total_learned = db.query(func.count(LearnedClassification.entity_name)).scalar() or 0
+        by_source = dict(
+            db.query(LearnedClassification.source, func.count(LearnedClassification.entity_name))
+            .group_by(LearnedClassification.source).all()
+        )
+        by_type = dict(
+            db.query(LearnedClassification.entity_type, func.count(LearnedClassification.entity_name))
+            .group_by(LearnedClassification.entity_type).all()
+        )
+        avg_confidence = db.query(func.avg(LearnedClassification.confidence)).scalar()
+        confidence_buckets_raw = (
+            db.query(
+                func.round(LearnedClassification.confidence, 1).label("bucket"),
+                func.count(LearnedClassification.entity_name),
+            )
+            .group_by("bucket")
+            .order_by("bucket")
+            .all()
+        )
+        confidence_dist = {str(round(float(b), 1)): c for b, c in confidence_buckets_raw}
+
+        newest = db.query(func.max(LearnedClassification.learned_at)).scalar()
+        oldest = db.query(func.min(LearnedClassification.learned_at)).scalar()
+
+        stats["learningStore"] = {
+            "totalEntries": total_learned,
+            "bySource": by_source,
+            "byType": by_type,
+            "avgConfidence": round(float(avg_confidence), 3) if avg_confidence else None,
+            "confidenceDistribution": confidence_dist,
+            "newestEntry": newest.isoformat() if newest else None,
+            "oldestEntry": oldest.isoformat() if oldest else None,
+        }
+    except Exception:
+        logger.exception("Learning store metrics collection failed")
+        stats["learningStore"] = {"error": "collection failed; see server logs"}
+
+    return stats
+
+
+@router.get("/system/stats", dependencies=[Depends(require_admin)])
+async def admin_system_stats():
+    """Lightweight endpoint for live system metrics polling."""
+    return _read_system_stats()
+
+
+def _window_dates(days: int) -> list[str]:
+    """The last `days` UTC calendar dates, oldest first, ending today."""
+
+    today = datetime.now(_UTC).date()
+    return [(today - timedelta(days=offset)).isoformat() for offset in range(days - 1, -1, -1)]
+
+
+@router.get("/visitor-stats", dependencies=[Depends(require_admin)])
+def admin_visitor_stats(
+    days: int = Query(30, ge=1, le=366), db: Session = Depends(get_visits_db),
+) -> list[dict]:
+    """Daily visitors, first-paint loads and page views for the last N
+    calendar days, oldest first.
+
+    ``confirmedVisitors`` counts SiteVisit rows (one per visitor per day, keyed
+    by a salted daily-rotating hash — see models.py), never raw IPs, and only
+    from CONFIRMED_VISITS_SINCE, when a visit began to count only once the
+    browser that opened the page had run it; it is null before then, where
+    the rows counted mostly automation. ``firstPaintLoads`` counts cold page
+    loads whose browser reported a first contentful paint (PageLoadTiming's
+    ``fcp`` cells, every device): a browser that drew the page while it was
+    in view, the closest thing to a person reading it that is counted
+    without identifying anyone. ``uniqueVisitors`` is the SiteVisit count
+    for every day, as stored. Page views sum PageView's raw hit counter.
+    Every day in the window is present, zero-filled:
+    the dashboard draws this as a line, and a day with no rows skipped rather
+    than reported as 0 would draw a straight segment across an outage instead
+    of the dip that shows it.
+    """
+    dates = _window_dates(days)
+    visitors = dict(
+        db.query(SiteVisit.date, func.count(SiteVisit.visitor_hash))
+        .filter(SiteVisit.date >= dates[0])
+        .group_by(SiteVisit.date)
+        .all()
+    )
+    views = dict(
+        db.query(PageView.date, func.sum(PageView.count))
+        .filter(PageView.date >= dates[0])
+        .group_by(PageView.date)
+        .all()
+    )
+    painted = dict(
+        db.query(PageLoadTiming.date, func.sum(PageLoadTiming.count))
+        .filter(PageLoadTiming.date >= dates[0], PageLoadTiming.metric == "fcp")
+        .group_by(PageLoadTiming.date)
+        .all()
+    )
+    return [
+        {
+            "date": d,
+            "confirmedVisitors": int(visitors.get(d, 0)) if d >= CONFIRMED_VISITS_SINCE else None,
+            "firstPaintLoads": int(painted.get(d) or 0),
+            "uniqueVisitors": int(visitors.get(d, 0)),
+            "pageViews": int(views.get(d) or 0),
+        }
+        for d in dates
+    ]
+
+
+def _histogram_percentile(buckets: list[tuple[int, int]], q: float) -> float | None:
+    """The q-quantile (0-1) of a PageLoadTiming histogram, interpolated linearly
+    inside the bucket it falls in. `buckets` is [(upper_bound_ms, count)].
+
+    The lower edge of each bucket is the previous bound in the fixed ladder
+    (LOAD_TIMING_BUCKETS_MS), not the previous *populated* bucket — a sparse
+    day must not stretch one bucket across the empty ones below it.
+    """
+
+    total = sum(n for _, n in buckets)
+    if total == 0:
+        return None
+    counts = dict(buckets)
+    target = q * total
+    seen = 0
+    lower = 0
+    for bound in LOAD_TIMING_BUCKETS_MS:
+        n = counts.get(bound, 0)
+        if n and seen + n >= target:
+            return round(lower + (bound - lower) * (target - seen) / n, 1)
+        seen += n
+        lower = bound
+    return float(LOAD_TIMING_BUCKETS_MS[-1])
+
+
+@router.get("/load-times", dependencies=[Depends(require_admin)])
+def admin_load_times(
+    days: int = Query(30, ge=1, le=366), db: Session = Depends(get_visits_db),
+) -> dict:
+    """Page-load percentiles per day, and per route over the whole window.
+
+    ``days`` has one entry per calendar day (zero-filled like visitor-stats),
+    each carrying p50/p75/p95 and the sample count for every metric —
+    ``ttfb`` (server response, the part this host controls), ``fcp`` (first
+    contentful paint) and ``load`` (the load event). A day with no samples
+    has null percentiles, not 0: nothing was measured, which is different
+    from a page that loaded instantly. ``byPath`` ranks routes by p95 of the
+    load event over the window, slowest first. ``devices`` splits each day's
+    first-paint loads by the class the browser reported (desktop, tablet,
+    mobile, or ``unrecorded`` for a load counted before the split or from a
+    page that predates it), and ``deviceTotals`` sums the window.
+    """
+
+    dates = _window_dates(days)
+    rows = (
+        db.query(PageLoadTiming.date, PageLoadTiming.path, PageLoadTiming.metric,
+                 PageLoadTiming.bucket_ms, PageLoadTiming.device, PageLoadTiming.count)
+        .filter(PageLoadTiming.date >= dates[0])
+        .all()
+    )
+
+    device_keys = (*DEVICE_CLASSES, "unrecorded")
+    per_day: dict[tuple[str, str], dict[int, int]] = {}
+    per_path: dict[tuple[str, str], dict[int, int]] = {}
+    devices = {d: dict.fromkeys(device_keys, 0) for d in dates}
+    for date, path, metric, bucket, device, count in rows:
+        if metric == "fcp" and date in devices:
+            devices[date][device if device in DEVICE_CLASSES else "unrecorded"] += count
+        day_hist = per_day.setdefault((date, metric), {})
+        day_hist[bucket] = day_hist.get(bucket, 0) + count
+        path_hist = per_path.setdefault((path, metric), {})
+        path_hist[bucket] = path_hist.get(bucket, 0) + count
+
+    def _summary(hist: dict[int, int] | None) -> dict:
+        items = sorted((hist or {}).items())
+        return {
+            "samples": sum(n for _, n in items),
+            "p50": _histogram_percentile(items, 0.50),
+            "p75": _histogram_percentile(items, 0.75),
+            "p95": _histogram_percentile(items, 0.95),
+        }
+
+    by_path = [
+        {"path": path, **_summary(hist)}
+        for (path, metric), hist in per_path.items()
+        if metric == "load"
+    ]
+    by_path.sort(key=lambda e: e["p95"] or 0, reverse=True)
+
+    return {
+        "metrics": list(LOAD_TIMING_METRICS),
+        "days": [
+            {"date": d, **{m: _summary(per_day.get((d, m))) for m in LOAD_TIMING_METRICS},
+             "devices": devices[d]}
+            for d in dates
+        ],
+        "deviceTotals": {k: sum(day[k] for day in devices.values()) for k in device_keys},
+        "byPath": by_path,
+    }
+
+
+@router.get("/api-usage", dependencies=[Depends(require_admin)])
+def admin_api_usage(
+    days: int = Query(30, ge=1, le=366), db: Session = Depends(get_visits_db),
+) -> dict:
+    """Public API and MCP use for the last N calendar days (ApiRequestCount).
+
+    ``days`` is zero-filled like visitor-stats, one entry per day: requests
+    over plain HTTP and as MCP tool calls; of all of them, how many were
+    refused for the rate limit (429), ``rejected`` as the caller's mistake
+    (any other 4xx: an invalid parameter, an id that doesn't exist) and
+    ``serverErrors`` (5xx, the API's own failures); and ``mcpConnections``
+    — tool listings, which a client makes when it connects. ``totals`` sums
+    the window; ``byEndpoint`` totals it per endpoint, busiest first;
+    ``rejections`` says which parameter broke which rule on the invalid
+    (422) requests (ApiRejectionCount), most frequent first.
+    Counts only: nothing here identifies a caller, and none of it is in the
+    visitor figures (a program calling the API is not a visitor).
+    """
+    dates = _window_dates(days)
+    rows = (
+        db.query(ApiRequestCount.date, ApiRequestCount.endpoint, ApiRequestCount.channel,
+                 ApiRequestCount.status, ApiRequestCount.count)
+        .filter(ApiRequestCount.date >= dates[0])
+        .all()
+    )
+    outcomes = ("rateLimited", "rejected", "serverErrors")
+
+    def outcome(status: int) -> str | None:
+        if status == 429:
+            return "rateLimited"
+        if 400 <= status < 500:
+            return "rejected"
+        return "serverErrors" if status >= 500 else None
+
+    per_day = {d: {"date": d, "http": 0, "mcp": 0, **{k: 0 for k in outcomes}, "mcpConnections": 0}
+               for d in dates}
+    per_endpoint: dict[str, dict] = {}
+    for date, endpoint, channel, status, count in rows:
+        day = per_day.get(date)
+        if day is None:
+            continue
+        if endpoint == "tools/list":
+            day["mcpConnections"] += count
+            continue
+        day[channel] += count
+        totals = per_endpoint.setdefault(
+            endpoint, {"endpoint": endpoint, "http": 0, "mcp": 0, **{k: 0 for k in outcomes}},
+        )
+        totals[channel] += count
+        if kind := outcome(status):
+            day[kind] += count
+            totals[kind] += count
+    rejections: dict[tuple, int] = {}
+    for endpoint, parameter, reason, count in (
+        db.query(ApiRejectionCount.endpoint, ApiRejectionCount.parameter, ApiRejectionCount.reason,
+                 ApiRejectionCount.count)
+        .filter(ApiRejectionCount.date >= dates[0])
+        .all()
+    ):
+        rejections[(endpoint, parameter, reason)] = rejections.get((endpoint, parameter, reason), 0) + count
+    keys = ("http", "mcp", *outcomes, "mcpConnections")
+    return {
+        "days": list(per_day.values()),
+        "totals": {k: sum(day[k] for day in per_day.values()) for k in keys},
+        "byEndpoint": sorted(per_endpoint.values(), key=lambda e: e["http"] + e["mcp"], reverse=True),
+        "rejections": [
+            {"endpoint": e, "parameter": p, "reason": r, "count": n}
+            for (e, p, r), n in sorted(rejections.items(), key=lambda kv: -kv[1])
+        ],
+    }
+
+
+@router.get("/visitor-breakdown", dependencies=[Depends(require_admin)])
+def admin_visitor_breakdown(date: str | None = None, db: Session = Depends(get_visits_db)) -> dict:
+    """Browser/OS/device-type counts for one day (default today, UTC).
+
+    Aggregate counts only — never joined back to individual visitor_hash
+    rows in the response, so this can't be used to profile a single visit.
+    """
+
+    day = date or datetime.now(_UTC).date().isoformat()
+
+    def _counts(column):
+        # Rows written before this column existed default to '' (the
+        # ALTER TABLE ADD COLUMN default), not the "Other" the app itself
+        # writes for an unrecognized UA — normalize both to the same
+        # group so they don't show up as two separate "Other" rows.
+        normalized = func.coalesce(func.nullif(column, ""), "Other")
+        rows = (
+            db.query(normalized, func.count(SiteVisit.visitor_hash))
+            .filter(SiteVisit.date == day)
+            .group_by(normalized)
+            .order_by(func.count(SiteVisit.visitor_hash).desc())
+            .all()
+        )
+        return [{"name": name, "count": n} for name, n in rows]
+
+    return {
+        "date": day,
+        "browsers": _counts(SiteVisit.browser),
+        "os": _counts(SiteVisit.os),
+        "devices": _counts(SiteVisit.device_type),
+    }
+
+
+@router.get("/top-pages", dependencies=[Depends(require_admin)])
+def admin_top_pages(days: int = 7, limit: int = 10, db: Session = Depends(get_visits_db)) -> list[dict]:
+    """Most-visited page templates over the last N days, by raw view count.
+
+    Counts PageView rows (every page view, not deduped by visitor — see
+    models.py for why that's a separate table from SiteVisit) grouped by
+    normalized route template (e.g. "/politicians/[id]").
+    """
+
+    cutoff = (datetime.now(_UTC).date() - timedelta(days=days - 1)).isoformat()
+    rows = (
+        db.query(PageView.path, func.sum(PageView.count).label("total"))
+        .filter(PageView.date >= cutoff)
+        .group_by(PageView.path)
+        .order_by(func.sum(PageView.count).desc())
+        .limit(limit)
+        .all()
+    )
+    return [{"path": p, "views": int(n)} for p, n in rows]
+
+
+_VACANCY_REASONS = {"deceased", "resigned", "expelled"}
+
+
+@router.post("/politicians/{politician_id}/vacancy", dependencies=[Depends(require_admin)])
+async def admin_set_vacancy(
+    politician_id: str,
+    is_current: bool = Query(...),
+    reason: str | None = Query(default=None),
+    left_office_date: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Mark a senator/representative's seat vacant, or restore it.
+
+    An override on top of the automatic nightly roster reconciliation in
+    pipeline/member_lifecycle.py — use it to record a departure before the
+    roster catches up, or to correct one it got wrong. Note that the next
+    reconciliation re-derives both fields from the roster, so restoring
+    someone the roster still lists as gone will not stick. Historical
+    scores/data are never touched here, only the vacancy fields.
+
+    Marking someone vacant also starts their removal clock: once
+    left_office_date is more than RETIREMENT_GRACE_DAYS old, the nightly
+    purge deletes them and their child rows for good.
+    """
+    if reason is not None and reason not in _VACANCY_REASONS:
+        raise HTTPException(status_code=400, detail=f"reason must be one of {sorted(_VACANCY_REASONS)}")
+
+    # Validated, not merely stored: member_lifecycle's purge compares this
+    # field as a string against a YYYY-MM-DD cutoff, so a plausible-looking
+    # typo ("2026", "07/01/2026") sorts below every real cutoff and would
+    # delete the member on the next nightly run. The purge re-stamps
+    # anything malformed rather than acting on it, but the value should
+    # never get that far.
+    if left_office_date is not None:
+        try:
+            datetime.strptime(left_office_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="left_office_date must be YYYY-MM-DD",
+            ) from None
+
+    entity = db.query(Senator).filter(Senator.id == politician_id).first()
+    if entity is None:
+        entity = db.query(Representative).filter(Representative.id == politician_id).first()
+    if entity is None:
+        raise HTTPException(status_code=404, detail="Senator or representative not found")
+
+    entity.is_current = is_current
+    entity.vacancy_reason = reason if not is_current else None
+    entity.left_office_date = left_office_date if not is_current else None
+    db.commit()
+
+    return {
+        "id": entity.id,
+        "name": entity.name,
+        "isCurrent": entity.is_current,
+        "vacancyReason": entity.vacancy_reason,
+        "leftOfficeDate": entity.left_office_date,
+    }
+
+
+@router.post(
+    "/ballot-measures/{state}/{election_date}/accept-absence", dependencies=[Depends(require_admin)],
+)
+def admin_accept_measure_absence(
+    state: str,
+    election_date: str,
+    note: str = Query(..., min_length=10, max_length=1000),
+    force: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Accept that `state`'s measures for `election_date` are gone, for a
+    source that can only report its document missing.
+
+    Some sources say "measure gone" (Florida's Status "Removed", Oklahoma's
+    register re-dating a State Question) and the pipeline marks those
+    removed itself. Others can only stop publishing: Michigan's November
+    document disappears when its only proposal is struck. Then the nightly
+    sync sees measures on file and a document missing, and alerts every
+    night — correctly, since it can't tell a struck measure from a broken
+    source. This is the operator's answer once they've checked the state's
+    own announcement: the source's rows for the election are marked
+    removed (rendered as removed through the grace window), coverage reads
+    confirmed none with `note` recorded verbatim, and the nightly sync
+    leaves that standing while the reader keeps finding nothing. A real
+    answer from the reader later replaces it. Every row for the election
+    is marked removed, whatever its source: no row may render as current
+    under an operator's "none". Only a state with a registered direct
+    source can be accepted (400 otherwise): every other state reads "not
+    yet covered", which the nightly sync would restore anyway.
+
+    Refused (409) while the latest read of this state's source COVERED the
+    election — a freshly read list — unless `force=true`. Every action is
+    logged and kept in measure_coverage.operator_actions. The public page
+    shows this answer as the operator's determination, never as the
+    state's own statement.
+
+    `note` is required: say what was checked (e.g. "SOS release 2026-10-02:
+    Proposal 2026-2 removed by court order").
+    """
+
+    state = state.upper()
+    if state not in ballot_state_codes():
+        raise HTTPException(status_code=404, detail="Unknown state")
+    try:
+        datetime.strptime(election_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="election_date must be YYYY-MM-DD") from None
+    source = ballot_measure_pdf_sources.source_for_state(state)
+    if source is None:
+        raise HTTPException(status_code=400, detail=f"{state} has no registered direct source")
+    source_name = source["source_name"]
+    try:
+        marked = election_pipeline.accept_state_absence(db, state, election_date, source_name, note.strip(), force=force)
+    except election_pipeline.AbsenceRefused as refused:
+        raise HTTPException(status_code=409, detail=str(refused)) from None
+    return {
+        "state": state, "electionDate": election_date, "sourceName": source_name,
+        "markedRemoved": marked, "force": force,
+    }
+
+
+@router.get("/dashboard", dependencies=[Depends(require_admin)])
+async def admin_dashboard(request: Request, db: Session = Depends(get_db)):
+    """Comprehensive admin dashboard with system health, data stats, and pipeline info."""
+
+    # --- System health ---
+    db_status = "ok"
+    try:
+        db.execute(func.count(Senator.id))
+    except Exception:
+        db_status = "unavailable"
+
+    ollama_status = "unavailable"
+    ollama_model = settings.OLLAMA_MODEL
+    try:
+        async with make_async_client(timeout=5.0) as client:
+            if settings.LLM_BACKEND == "llama-server":
+                resp = await client.get(f"{settings.LLAMA_SERVER_URL}/health")
+            else:
+                resp = await client.get(f"{settings.OLLAMA_BASE_URL}/api/tags")
+            if resp.status_code == 200:
+                ollama_status = "ok"
+    except Exception:
+        pass
+
+    # --- Data counts ---
+    data_counts = {
+        "senators": db.query(func.count(Senator.id)).scalar() or 0,
+        "senatorDonors": db.query(func.count(Donor.id)).scalar() or 0,
+        "senatorIndustryDonations": db.query(func.count(IndustryDonation.id)).scalar() or 0,
+        "senatorVotes": db.query(func.count(KeyVote.id)).scalar() or 0,
+        "senatorLobbyingMatches": db.query(func.count(LobbyingMatch.id)).scalar() or 0,
+        "senatorPromises": db.query(func.count(CampaignPromise.id)).scalar() or 0,
+        "senatorBills": db.query(func.count(SponsoredBill.id)).scalar() or 0,
+        "representatives": db.query(func.count(Representative.id)).scalar() or 0,
+        "repDonors": db.query(func.count(RepDonor.id)).scalar() or 0,
+        "repIndustryDonations": db.query(func.count(RepIndustryDonation.id)).scalar() or 0,
+        "repVotes": db.query(func.count(RepKeyVote.id)).scalar() or 0,
+        "repLobbyingMatches": db.query(func.count(RepLobbyingMatch.id)).scalar() or 0,
+        "repPromises": db.query(func.count(RepCampaignPromise.id)).scalar() or 0,
+        "repBills": db.query(func.count(RepSponsoredBill.id)).scalar() or 0,
+        "presidents": db.query(func.count(President.id)).scalar() or 0,
+        "justices": db.query(func.count(Justice.id)).scalar() or 0,
+        "justiceVotes": db.query(func.count(JusticeVote.id)).scalar() or 0,
+        "exploreDocuments": db.query(func.count(ExploreDocument.id)).scalar() or 0,
+        "actionIssues": db.query(func.count(ActionIssue.id)).scalar() or 0,
+        "nationalMonitors": db.query(func.count(NationalMonitor.id)).scalar() or 0,
+        "monitorUpdates": db.query(func.count(MonitorUpdate.id)).scalar() or 0,
+        "timelineEntries": db.query(func.count(TimelineEntry.id)).scalar() or 0,
+        "scoreSnapshots": db.query(func.count(ScoreSnapshot.id)).scalar() or 0,
+        "learnedClassifications": db.query(func.count(LearnedClassification.entity_name)).scalar() or 0,
+        "pipelineRuns": db.query(func.count(PipelineRun.id)).scalar() or 0,
+        "apiCacheEntries": db.query(func.count(ApiCache.cache_key)).scalar() or 0,
+        "analysisCacheEntries": db.query(func.count(AnalysisCache.input_hash)).scalar() or 0,
+    }
+
+    # --- Database file size ---
+    db_path = settings.DATABASE_URL.replace("sqlite:///", "").replace("sqlite:////", "/")
+    try:
+        db_size_bytes = os.path.getsize(db_path)
+    except Exception:
+        db_size_bytes = 0
+
+    # --- Pipeline info ---
+    last_run = (
+        db.query(PipelineRun)
+        .order_by(PipelineRun.started_at.desc())
+        .first()
+    )
+    total_runs = db.query(func.count(PipelineRun.id)).scalar() or 0
+    successful_runs = (
+        db.query(func.count(PipelineRun.id))
+        .filter(PipelineRun.status == PipelineStatus.COMPLETED)
+        .scalar() or 0
+    )
+    failed_runs = (
+        db.query(func.count(PipelineRun.id))
+        .filter(PipelineRun.status == PipelineStatus.FAILED)
+        .scalar() or 0
+    )
+
+    is_running = _is_pipeline_running(db)
+
+    try:
+        next_scheduled = get_next_run_time()
+    except Exception:
+        next_scheduled = None
+
+    pipeline_info = {
+        "isRunning": is_running,
+        "nextScheduled": next_scheduled,
+        "cronSchedule": settings.PIPELINE_CRON_SCHEDULE,
+        "totalRuns": total_runs,
+        "successfulRuns": successful_runs,
+        "failedRuns": failed_runs,
+    }
+
+    if last_run:
+        dash_progress_steps = None
+        if last_run.progress_detail:
+            try:
+                dash_progress_steps = json.loads(last_run.progress_detail)
+            except (ValueError, TypeError):
+                pass
+        pipeline_info["lastRun"] = {
+            "id": last_run.id,
+            "startedAt": last_run.started_at.isoformat() if last_run.started_at else None,
+            "completedAt": last_run.completed_at.isoformat() if last_run.completed_at else None,
+            "status": last_run.status,
+            "currentPhase": last_run.current_phase,
+            "senatorsProcessed": last_run.senators_processed,
+            "senatorsTotal": last_run.senators_total or 0,
+            "senatorsFailed": last_run.senators_failed,
+            "billsClassified": last_run.bills_classified,
+            "llmCalls": last_run.llm_calls,
+            "cacheHits": last_run.cache_hits,
+            "cacheMisses": last_run.cache_misses,
+            "elapsedSeconds": last_run.elapsed_seconds,
+            "errorMessage": last_run.error_message,
+            "progressSteps": dash_progress_steps,
+            # Reference-senator score checks from the end of the run —
+            # non-empty means scores shifted outside externally-verifiable
+            # ranges and the run needs investigation before being trusted.
+            "groundTruthFailures": json.loads(last_run.ground_truth_failures)
+            if getattr(last_run, "ground_truth_failures", None)
+            else [],
+        }
+
+    # --- Vector DB stats ---
+    # Off the loop: full scans of the vector tables, in the pipeline process
+    # whose loop also streams Explore summaries.
+    vector_db_stats = await off_loop(db, _collect_vector_db_stats)
+
+    # --- LLM stats ---
+    try:
+        llm_stats = get_llm_stats()
+    except Exception:
+        llm_stats = {}
+
+    first_run = (
+        db.query(PipelineRun.started_at)
+        .order_by(PipelineRun.started_at.asc())
+        .limit(1)
+        .scalar()
+    )
+
+    uptime_info: dict = {
+        # This process's start. /api/admin/ is served by the pipeline
+        # process (nginx/civitas.conf), so it is that one's — which is what
+        # the pipeline timeline needs (a restart ends a running pipeline).
+        "processStartedAt": getattr(request.app.state, "process_started_at", None),
+        "firstPipelineRun": first_run.isoformat() if first_run else None,
+        "totalRestarts": total_runs,
+    }
+
+    return {
+        "system": {
+            "database": db_status,
+            "ollama": ollama_status,
+            "ollamaModel": ollama_model,
+            "ollamaUrl": settings.OLLAMA_BASE_URL,
+            "dbSizeBytes": db_size_bytes,
+            "vectorDb": vector_db_stats,
+        },
+        "host": _read_system_stats(),
+        "uptime": uptime_info,
+        "data": data_counts,
+        "pipeline": pipeline_info,
+        "llm": llm_stats,
+        "opsAlerts": ops_alerts.recent_alerts(),
+    }
+
+
+@router.get("/pipeline/status", dependencies=[Depends(require_admin)])
+async def admin_pipeline_status(db: Session = Depends(get_db)):
+    """Live pipeline status for polling during a run."""
+    db.expire_all()
+
+    # Whether each pipeline is going is read on both sides of its row, and
+    # counts as running if either read says so. A run makes itself known
+    # (its flag — acquire_tracked_run — or its Senate lease's tag) in the
+    # same step as committing its RUNNING row, and lets go only after
+    # committing its final status; each query here sees the latest commit.
+    # So a run finishing during this poll is caught by the read before, one
+    # starting by the read after, and a RUNNING row is never paired with a
+    # stopped run — which the dashboard would show as stuck, and, once the
+    # run ends, as ending without an outcome.
+    def running_flags() -> tuple[bool, bool, bool, bool]:
+        return (
+            house_pipeline.is_house_pipeline_running(), stock_pipeline.is_stock_pipeline_running(),
+            supplementary_pipeline.is_supplementary_pipeline_running(), election_pipeline.is_election_pipeline_running(),
+        )
+
+    flags_before = running_flags()
+    _row, senate_running_before, senate_clearable_before = run_tracker.senate_run_state(db)
+
+    last_run = (
+        db.query(PipelineRun)
+        .order_by(PipelineRun.started_at.desc())
+        .first()
+    )
+    last_house_run = (
+        db.query(HousePipelineRun)
+        .order_by(HousePipelineRun.started_at.desc())
+        .first()
+    )
+    last_stock_run = (
+        db.query(StockTradesPipelineRun)
+        .order_by(StockTradesPipelineRun.started_at.desc())
+        .first()
+    )
+    last_supplementary_run = (
+        db.query(SupplementaryPipelineRun)
+        .order_by(SupplementaryPipelineRun.started_at.desc())
+        .first()
+    )
+    last_election_run = (
+        db.query(ElectionPipelineRun)
+        .order_by(ElectionPipelineRun.started_at.desc())
+        .first()
+    )
+
+    _row, senate_running_after, senate_clearable_after = run_tracker.senate_run_state(db)
+    house_running, stock_running, supplementary_running, election_running = (
+        before or after for before, after in zip(flags_before, running_flags())
+    )
+    is_running = senate_running_before or senate_running_after
+    # Clearable only if both reads found a row no live lease speaks for.
+    senate_clearable = senate_clearable_before and senate_clearable_after
+
+    result: dict = {
+        "isRunning": is_running,
+        # A RUNNING Senate row no live lease speaks for
+        # (run_tracker.senate_run_state): the dashboard shows it as stuck and
+        # offers clear-stuck-senate, which accepts exactly then.
+        "senateRowClearable": senate_clearable,
+        "houseIsRunning": house_running,
+        "stockTradesIsRunning": stock_running,
+        "supplementaryIsRunning": supplementary_running,
+        "electionIsRunning": election_running,
+        # An admin data reset in any process; check-and-deploy.sh waits it
+        # out like a pipeline run, since killing it mid-wipe leaves the
+        # indexes describing rows that are gone.
+        "dataResetIsRunning": _data_reset_running(db),
+        # A rebuild of the Explore vector index (at start, in an Explore
+        # run, or an admin re-embed): twenty-odd minutes that a restart
+        # would throw away, with semantic search off until the next one.
+        "exploreIndexIsRebuilding": vector_store.is_rebuilding(),
+        # An Explore run in any process (its lease): a triggered or startup
+        # run has no run row, and its top-up can take twenty-odd minutes a
+        # restart would throw away mid-batch.
+        "exploreIsRunning": _explore_running(db),
+        # A chain of pipelines (nightly or triggered) between its links:
+        # a restart then would drop the links it has yet to run.
+        "pipelineChainIsRunning": chain_running(),
+    }
+
+    if last_supplementary_run:
+        result["supplementaryLastRun"] = {
+            "id": last_supplementary_run.id,
+            "startedAt": last_supplementary_run.started_at.isoformat() if last_supplementary_run.started_at else None,
+            "completedAt": last_supplementary_run.completed_at.isoformat() if last_supplementary_run.completed_at else None,
+            "status": last_supplementary_run.status,
+            "currentPhase": last_supplementary_run.current_phase,
+            "exploreDocsIngested": last_supplementary_run.explore_docs_ingested,
+            "justicesScored": last_supplementary_run.justices_scored,
+            "justicesSkipped": last_supplementary_run.justices_skipped,
+            "committeeLeadershipRefreshed": last_supplementary_run.committee_leadership_refreshed,
+            "committeeLeadershipSkipped": last_supplementary_run.committee_leadership_skipped,
+            "districtPviRefreshed": last_supplementary_run.district_pvi_refreshed,
+            "districtPviSkipped": last_supplementary_run.district_pvi_skipped,
+            "presidentsUpdated": last_supplementary_run.presidents_updated,
+            "elapsedSeconds": _live_elapsed(last_supplementary_run),
+            "errorMessage": last_supplementary_run.error_message,
+            "progressSteps": _parse_progress_steps(last_supplementary_run),
+        }
+
+    if last_election_run:
+        result["electionLastRun"] = {
+            "id": last_election_run.id,
+            "startedAt": last_election_run.started_at.isoformat() if last_election_run.started_at else None,
+            "completedAt": last_election_run.completed_at.isoformat() if last_election_run.completed_at else None,
+            "status": last_election_run.status,
+            "currentPhase": last_election_run.current_phase,
+            "candidatesSynced": last_election_run.candidates_synced,
+            "financialsRefreshed": last_election_run.financials_refreshed,
+            "coverageItemsIngested": last_election_run.coverage_items_ingested,
+            "elapsedSeconds": _live_elapsed(last_election_run),
+            "errorMessage": last_election_run.error_message,
+            "progressSteps": _parse_progress_steps(last_election_run),
+        }
+
+    if last_stock_run:
+        result["stockTradesLastRun"] = {
+            "id": last_stock_run.id,
+            "startedAt": last_stock_run.started_at.isoformat() if last_stock_run.started_at else None,
+            "completedAt": last_stock_run.completed_at.isoformat() if last_stock_run.completed_at else None,
+            "status": last_stock_run.status,
+            "houseTradesIngested": last_stock_run.house_trades_ingested,
+            "senateTradesIngested": last_stock_run.senate_trades_ingested,
+            "presidentTradesIngested": last_stock_run.president_trades_ingested,
+            "elapsedSeconds": _live_elapsed(last_stock_run),
+            "errorMessage": last_stock_run.error_message,
+            "progressSteps": _parse_progress_steps(last_stock_run),
+        }
+
+    if last_house_run:
+        result["houseLastRun"] = {
+            "id": last_house_run.id,
+            "startedAt": last_house_run.started_at.isoformat() if last_house_run.started_at else None,
+            "completedAt": last_house_run.completed_at.isoformat() if last_house_run.completed_at else None,
+            "status": last_house_run.status,
+            "repsProcessed": last_house_run.reps_processed,
+            "repsTotal": last_house_run.reps_total,
+            "repsFailed": last_house_run.reps_failed,
+            "elapsedSeconds": _live_elapsed(last_house_run),
+            "errorMessage": last_house_run.error_message,
+            "groundTruthFailures": json.loads(last_house_run.ground_truth_failures)
+            if getattr(last_house_run, "ground_truth_failures", None)
+            else [],
+            "progressSteps": _parse_progress_steps(last_house_run),
+        }
+
+    if last_run:
+        result["lastRun"] = {
+            "id": last_run.id,
+            "startedAt": last_run.started_at.isoformat() if last_run.started_at else None,
+            "completedAt": last_run.completed_at.isoformat() if last_run.completed_at else None,
+            "status": last_run.status,
+            "currentPhase": last_run.current_phase,
+            "senatorsProcessed": last_run.senators_processed,
+            "senatorsTotal": last_run.senators_total or 0,
+            "senatorsFailed": last_run.senators_failed,
+            "billsClassified": last_run.bills_classified,
+            "llmCalls": last_run.llm_calls,
+            "cacheHits": last_run.cache_hits,
+            "cacheMisses": last_run.cache_misses,
+            "elapsedSeconds": _live_elapsed(last_run),
+            "errorMessage": last_run.error_message,
+            "progressSteps": _parse_progress_steps(last_run),
+        }
+
+    ac = get_action_refresh_state()
+    result["actionRefresh"] = {
+        "isRunning": ac["is_running"],
+        "stage": ac["stage"],
+        "stageDetail": ac["stage_detail"],
+        "startedAt": ac["started_at"].isoformat() if ac["started_at"] else None,
+        "lastCompletedAt": ac["last_completed_at"].isoformat() if ac["last_completed_at"] else None,
+        "lastIssuesCreated": ac["last_issues_created"],
+        "lastIssuesRetired": ac["last_issues_retired"],
+        "lastStoriesGenerated": ac["last_stories_generated"],
+        "lastBskyPosted": ac["last_bsky_posted"],
+        "lastElapsed": ac["last_elapsed"],
+    }
+
+    return result
+
+
+@router.get("/pipeline/history", dependencies=[Depends(require_admin)])
+async def admin_pipeline_history(
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """Return recent pipeline run history (Senate + supplementary + House + stock trades + election interleaved by date)."""
+    senate_runs = (
+        db.query(PipelineRun)
+        .order_by(PipelineRun.started_at.desc())
+        .limit(limit)
+        .all()
+    )
+    house_runs = (
+        db.query(HousePipelineRun)
+        .order_by(HousePipelineRun.started_at.desc())
+        .limit(limit)
+        .all()
+    )
+    stock_runs = (
+        db.query(StockTradesPipelineRun)
+        .order_by(StockTradesPipelineRun.started_at.desc())
+        .limit(limit)
+        .all()
+    )
+    supplementary_runs = (
+        db.query(SupplementaryPipelineRun)
+        .order_by(SupplementaryPipelineRun.started_at.desc())
+        .limit(limit)
+        .all()
+    )
+    election_runs = (
+        db.query(ElectionPipelineRun)
+        .order_by(ElectionPipelineRun.started_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    senate_entries = [
+        _history_entry(r, "senate", {
+            "currentPhase": r.current_phase,
+            "senatorsProcessed": r.senators_processed,
+            "senatorsTotal": r.senators_total or 0,
+            "senatorsFailed": r.senators_failed,
+            "billsClassified": r.bills_classified,
+            "llmCalls": r.llm_calls,
+            "cacheHits": r.cache_hits,
+            "cacheMisses": r.cache_misses,
+            "progressSteps": _parse_progress_steps(r),
+        })
+        for r in senate_runs
+    ]
+    house_entries = [
+        _history_entry(r, "house", {
+            "repsProcessed": r.reps_processed,
+            "repsTotal": r.reps_total,
+            "repsFailed": r.reps_failed,
+            "progressSteps": _parse_progress_steps(r),
+        })
+        for r in house_runs
+    ]
+    stock_entries = [
+        _history_entry(r, "stock_trades", {
+            "houseTradesIngested": r.house_trades_ingested,
+            "senateTradesIngested": r.senate_trades_ingested,
+            "presidentTradesIngested": r.president_trades_ingested,
+            "progressSteps": _parse_progress_steps(r),
+        })
+        for r in stock_runs
+    ]
+    supplementary_entries = [
+        _history_entry(r, "supplementary", {
+            "currentPhase": r.current_phase,
+            "exploreDocsIngested": r.explore_docs_ingested,
+            "justicesScored": r.justices_scored,
+            "justicesSkipped": r.justices_skipped,
+            "committeeLeadershipRefreshed": r.committee_leadership_refreshed,
+            "committeeLeadershipSkipped": r.committee_leadership_skipped,
+            "districtPviRefreshed": r.district_pvi_refreshed,
+            "districtPviSkipped": r.district_pvi_skipped,
+            "presidentsUpdated": r.presidents_updated,
+            "progressSteps": _parse_progress_steps(r),
+        })
+        for r in supplementary_runs
+    ]
+    election_entries = [
+        _history_entry(r, "election", {
+            "currentPhase": r.current_phase,
+            "candidatesSynced": r.candidates_synced,
+            "financialsRefreshed": r.financials_refreshed,
+            "coverageItemsIngested": r.coverage_items_ingested,
+            "progressSteps": _parse_progress_steps(r),
+        })
+        for r in election_runs
+    ]
+
+    # Each pipeline type's own query above is already capped at `limit` —
+    # don't re-truncate the interleaved union down to that same `limit`.
+    # Senate/House run far more often than Stock Trades/Supplementary (daily
+    # vs. every few days), so a shared cap on the combined list silently
+    # starves the infrequent ones out of the visible history entirely once
+    # enough Senate/House runs accumulate (found 2026-07-23: Stock Trades'
+    # only entry in the last 20 combined rows was one run-length away from
+    # falling off, inflated further by the deploy-race bug's repeated
+    # stale/failed Senate retries — see check-and-deploy.sh). Returning the
+    # full union (bounded at 4x `limit` by the per-type queries) guarantees
+    # every pipeline type keeps its own most recent `limit` runs visible.
+    return sorted(
+        senate_entries + house_entries + stock_entries + supplementary_entries + election_entries,
+        key=lambda x: x["startedAt"] or "",
+        reverse=True,
+    )
+
+
+@router.get("/pipeline/trend", dependencies=[Depends(require_admin)])
+async def admin_pipeline_trend(
+    days: int = Query(30, ge=1, le=366),
+    db: Session = Depends(get_db),
+):
+    """Every run of every pipeline started in the last `days` UTC calendar days
+    (today included), oldest first.
+
+    The slim sibling of /pipeline/history for charting: one row per run with
+    only type, start, status and duration, bounded by a date window rather
+    than a per-type count. History's count cap is right for a table and wrong
+    for a chart — 20 daily Senate runs and 20 weekly Stock Trades runs cover
+    different spans, so a shared x-axis would show one pipeline's failures
+    stopping three weeks before another's.
+    """
+
+    # From 00:00 UTC of the first calendar day, not "now minus N x 24h": the
+    # dashboard buckets these by UTC date, and a rolling cutoff would count
+    # runs from the afternoon of day -N in its totals that no day of the
+    # chart shows.
+    cutoff = datetime.strptime(_window_dates(days)[0], "%Y-%m-%d")
+    runs = []
+    for model, pipeline_type in (
+        (PipelineRun, "senate"),
+        (HousePipelineRun, "house"),
+        (SupplementaryPipelineRun, "supplementary"),
+        (StockTradesPipelineRun, "stock_trades"),
+        (ElectionPipelineRun, "election"),
+    ):
+        for r in (
+            db.query(model.id, model.started_at, model.status, model.elapsed_seconds)
+            .filter(model.started_at >= cutoff)
+            .all()
+        ):
+            runs.append({
+                "id": r.id,
+                "pipelineType": pipeline_type,
+                "startedAt": r.started_at.isoformat() if r.started_at else None,
+                "status": r.status,
+                "elapsedSeconds": r.elapsed_seconds,
+            })
+    runs.sort(key=lambda x: x["startedAt"] or "")
+    return {"days": days, "runs": runs}
+
+
+# Run-model __tablename__ -> the pipelineType label already used by
+# /pipeline/history, so both endpoints name the same pipeline the same way.
+PHASE_TIMING_KINDS = {
+    "pipeline_runs": "senate",
+    "house_pipeline_runs": "house",
+    "supplementary_pipeline_runs": "supplementary",
+    "stock_trades_pipeline_runs": "stock_trades",
+    "election_pipeline_runs": "election",
+}
+
+
+@router.get("/pipeline/timings", dependencies=[Depends(require_admin)])
+async def admin_pipeline_timings(
+    kind: str = Query(default="pipeline_runs"),
+    runs: int = Query(default=10, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """Per-phase durations for the last `runs` runs of one pipeline.
+
+    Answers the question a run's total elapsed_seconds cannot: when a
+    pipeline's wall-clock grows, which phase absorbed it. The `phases`
+    rollup groups by the coarse fetch/transform/analyze/finalize tag in
+    each pipeline's STEPS definition — the split that distinguishes time
+    blocked on rate-limited external APIs from local compute, and so the
+    split that determines whether faster hardware could help at all.
+    """
+    if kind not in PHASE_TIMING_KINDS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown pipeline kind '{kind}'. Valid: {sorted(PHASE_TIMING_KINDS)}",
+        )
+
+    recent_run_ids = [
+        r[0]
+        for r in db.query(PipelinePhaseTiming.run_id)
+        .filter(PipelinePhaseTiming.run_kind == kind)
+        .distinct()
+        .order_by(PipelinePhaseTiming.run_id.desc())
+        .limit(runs)
+        .all()
+    ]
+    if not recent_run_ids:
+        return {"kind": kind, "pipelineType": PHASE_TIMING_KINDS[kind], "runs": [], "phaseTrend": {}}
+
+    rows = (
+        db.query(PipelinePhaseTiming)
+        .filter(
+            PipelinePhaseTiming.run_kind == kind,
+            PipelinePhaseTiming.run_id.in_(recent_run_ids),
+        )
+        .order_by(PipelinePhaseTiming.run_id.desc(), PipelinePhaseTiming.id.asc())
+        .all()
+    )
+
+    by_run: dict[int, list] = {}
+    for row in rows:
+        by_run.setdefault(row.run_id, []).append(row)
+
+    rl_rows = (
+        db.query(PipelineRateLimitStat)
+        .filter(
+            PipelineRateLimitStat.run_kind == kind,
+            PipelineRateLimitStat.run_id.in_(recent_run_ids),
+        )
+        .all()
+    )
+    # (run_id, step_key) -> {source: (requests, blocked_seconds)}
+    rl_by_step: dict[tuple[int, str], dict] = {}
+    for row in rl_rows:
+        rl_by_step.setdefault((row.run_id, row.step_key), {})[row.source] = (
+            row.requests, row.blocked_seconds,
+        )
+
+    run_entries = []
+    phase_trend: dict[str, list] = {}
+    for run_id in recent_run_ids:
+        steps = by_run.get(run_id, [])
+        # A step still in flight, or one whose start timestamp was lost to a
+        # mid-run restart, has no duration — counting it as 0 would understate
+        # the total, so it is reported separately rather than silently folded in.
+        timed = [s for s in steps if s.duration_seconds is not None]
+        total = round(sum(s.duration_seconds for s in timed), 1)
+
+        phase_totals: dict[str, dict] = {}
+        for step in timed:
+            bucket = phase_totals.setdefault(step.phase or "", {"seconds": 0.0, "steps": 0})
+            bucket["seconds"] += step.duration_seconds
+            bucket["steps"] += 1
+
+        phases = [
+            {
+                "phase": phase,
+                "seconds": round(data["seconds"], 1),
+                "pct": round(100.0 * data["seconds"] / total, 1) if total else 0.0,
+                "steps": data["steps"],
+            }
+            for phase, data in sorted(
+                phase_totals.items(), key=lambda kv: kv[1]["seconds"], reverse=True
+            )
+        ]
+        for entry in phases:
+            phase_trend.setdefault(entry["phase"], []).append(
+                {"runId": run_id, "seconds": entry["seconds"]}
+            )
+
+        # Per-source rollup for the whole run, and the single number this
+        # endpoint exists to produce: what share of the run was spent
+        # inside a rate limiter rather than doing work. A run that is
+        # mostly blocked is throughput-bound on someone else's API and
+        # cannot be shortened by faster local hardware.
+        source_totals: dict[str, dict] = {}
+        for (r_id, _step_key), sources in rl_by_step.items():
+            if r_id != run_id:
+                continue
+            for source, (requests, blocked) in sources.items():
+                bucket = source_totals.setdefault(source, {"requests": 0, "blockedSeconds": 0.0})
+                bucket["requests"] += requests
+                bucket["blockedSeconds"] += blocked
+        total_blocked = round(sum(b["blockedSeconds"] for b in source_totals.values()), 1)
+
+        starts = [s.started_at for s in steps if s.started_at]
+        ends = [s.completed_at for s in steps if s.completed_at]
+        run_entries.append({
+            "runId": run_id,
+            "startedAt": min(starts).isoformat() if starts else None,
+            "completedAt": max(ends).isoformat() if ends else None,
+            "totalSeconds": total,
+            "untimedSteps": len(steps) - len(timed),
+            "blockedSeconds": total_blocked,
+            "blockedPct": round(100.0 * total_blocked / total, 1) if total else 0.0,
+            "rateLimitSources": [
+                {
+                    "source": source,
+                    "requests": data["requests"],
+                    "blockedSeconds": round(data["blockedSeconds"], 1),
+                }
+                for source, data in sorted(
+                    source_totals.items(),
+                    key=lambda kv: kv[1]["blockedSeconds"], reverse=True,
+                )
+            ],
+            "phases": phases,
+            "steps": [
+                {
+                    "stepKey": s.step_key,
+                    "label": s.label,
+                    "phase": s.phase,
+                    "status": s.status,
+                    "seconds": s.duration_seconds,
+                    "blockedSeconds": round(
+                        sum(b for _, b in rl_by_step.get((run_id, s.step_key), {}).values()), 1,
+                    ),
+                }
+                for s in sorted(
+                    steps,
+                    key=lambda s: (s.duration_seconds is None, -(s.duration_seconds or 0)),
+                )
+            ],
+        })
+
+    return {
+        "kind": kind,
+        "pipelineType": PHASE_TIMING_KINDS[kind],
+        "runs": run_entries,
+        "phaseTrend": phase_trend,
+    }
+
+
+def refuse_while_chain_runs() -> None:
+    """409 while a pipeline chain (nightly or triggered) is running: what a
+    trigger starts would run beside the chain's current link, and the chain
+    runs that pipeline itself."""
+
+    if chain_running():
+        raise HTTPException(status_code=409, detail="A pipeline chain is already running")
+
+
+def start_pipeline_trigger(db: Session, senator: str | None, fetch_only: bool, *, error_label: str) -> None:
+    """Start what a pipeline trigger asks for, or 409. A single senator or a
+    fetch-only run is the Senate pipeline alone; otherwise the nightly
+    chain's five pipelines, each whatever the one before it did
+    (scheduler.triggered_chain) — so a trigger recovers any of them, not only
+    the first. Refused while the Senate pipeline or a chain is running. A
+    full trigger claims the chain slot here, before answering, so two of
+    them can't both find it free."""
+
+    if _is_pipeline_running(db):
+        raise HTTPException(status_code=409, detail="Pipeline is already running")
+    if senator is not None or fetch_only:
+        refuse_while_chain_runs()
+
+        async def senate_only() -> None:
+            await senate_pipeline.run_senate_pipeline(senator_filter=senator, fetch_only=fetch_only)
+
+        run_pipeline_in_thread(senate_only, name="pipeline-run", error_label=error_label)
+        return
+    chain_id = pipeline_chain.claim()
+    if chain_id is None:
+        raise HTTPException(status_code=409, detail="A pipeline chain is already running")
+    try:
+        run_pipeline_in_thread(triggered_chain(chain_id), name="pipeline-run", error_label=error_label)
+    except BaseException:
+        # Never started (a data reset holds writes): the slot isn't its.
+        pipeline_chain.release(chain_id)
+        raise
+
+
+@router.post("/pipeline/trigger", dependencies=[Depends(require_admin)])
+def admin_trigger_pipeline(
+    senator: str | None = Query(default=None),
+    fetch_only: bool = Query(default=False),
+    db: Session = Depends(get_db),
+):
+    """Trigger a pipeline run from the admin panel. A plain def: its
+    run-in-progress check is a blocking database read, so FastAPI runs it
+    on the threadpool rather than the event loop."""
+    start_pipeline_trigger(db, senator, fetch_only, error_label="Admin-triggered pipeline run failed")
+    return {
+        "message": "Pipeline triggered",
+        "senatorFilter": senator,
+        "fetchOnly": fetch_only,
+    }
+
+
+@router.post("/pipeline/reembed-explore", dependencies=[Depends(require_admin)], status_code=202)
+async def admin_reembed_explore(db: Session = Depends(get_db)):
+    """Rebuild every search structure over the explore corpus.
+
+    Use this after changing the embedding model, or any time search results
+    look inconsistent with the documents actually in the table, to rebuild
+    without running the full ingest pipeline. All three structures are
+    derived from `explore_documents`, so all three are rebuilt together —
+    rebuilding only the embeddings is how the vector index and the keyword
+    index end up disagreeing about what exists.
+
+    Started in the background and answered at once: re-embedding the corpus
+    takes over twenty minutes on the Pi, far past any request's timeout, and
+    work tied to a request that is dropped partway would leave its lease
+    let go under writes still running. Its progress is in the logs, and the
+    admin data dashboard shows the index rebuilding.
+    """
+
+    # One at a time: a second, while the first is queued or running, would
+    # only be refused its lease in the background after a 202. A rebuild of
+    # another kind running is no reason to refuse: the job waits its turn.
+    # (Released by the job, or here on the way out: a Lock may be released
+    # from another thread.)
+    if not _reembed_slot.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Explore re-embed not started: one is already under way")
+
+    def why_not(session: Session) -> str | None:
+        # Checked here so a refusal is answered, not only logged by the job
+        # (which checks again, taking the lease, should one start between).
+        if lease.held(session, lease.DATA_RESET):
+            return lease.refusal_text(lease.REFUSED_BY_RESET)
+        who = lease.holder(session, lease.EXPLORE)
+        return lease.refusal_text(lease.REFUSED_HELD, lease.EXPLORE, who) if who is not None else None
+
+    try:
+        refused = await off_loop(db, why_not)
+    except BaseException:
+        _reembed_slot.release()
+        raise
+    if refused is not None:
+        _reembed_slot.release()
+        raise HTTPException(status_code=409, detail=f"Explore re-embed not started: {refused}")
+
+    asked = time.monotonic()
+
+    def _reembed() -> None:
+        # A lease, so a reset or an explore ingest in another process sees
+        # it too; background.start_writer registers it for this process's data reset.
+        # Underway as a rebuild once it holds the lease (not while it asks:
+        # refused, it rebuilds nothing, and a start mustn't have left an
+        # incomplete index to it), keyword and authority passes included:
+        # check-and-deploy waits it out. The lease is taken before waiting
+        # out a start's rebuild, not after: that rebuild's own refit asks
+        # for it the moment the rebuild ends, and would win it from an
+        # accepted re-embed that then does nothing.
+        with lease.job(lease.EXPLORE, who="Explore re-embed") as held:
+            if not held:
+                return  # logged as a skip by lease.job
+            with vector_store.rebuild_underway():
+                _reembed_held()
+
+    def _reembed_held() -> None:
+        try:
+            # Waiting out a top-up, or a rebuild begun since it was asked
+            # for — which did this work already (None), so it isn't redone.
+            count = vector_store.rebuild_explore_index(database.SessionLocal, wait=True, unless_rebuilt_since=asked)
+        except Exception as error:
+            if isinstance(error, vector_store.RebuildFailed):  # the index is gone
+                logger.exception("Explore re-embed failed — search's vector index is not ready until a "
+                                 "rebuild completes (the next Explore run or start retries it)")
+                vector_store.alert_rebuild_failed("admin re-embed", error)
+            else:  # before the swap: the index is as it was
+                logger.exception("Explore re-embed not done — the index is unchanged")
+            return
+        ops_alerts.resolve_ops_alert("explore-index-rebuild")  # whole again
+        try:
+            # Not _write_model_version: that records the classification
+            # model's vectors as current, which this doesn't touch.
+            db = database.SessionLocal()
+            try:
+                indexed = lexical_index.rebuild_index(db)
+                authority = document_authority.update_document_authority(db)
+            finally:
+                db.close()
+            # Last, as in an Explore run: it measures the finished indexes.
+            vector_store.recalibrate_ranking(database.SessionLocal)
+            logger.info("Explore re-embed complete: %s embedded, %d keyword-indexed, authority %s",
+                        "none newly" if count is None else count, indexed, authority)
+        except Exception:
+            logger.exception("Explore re-embed: the vector index is rebuilt, but a later pass failed "
+                             "(the next Explore run redoes them)")
+
+    def _job() -> None:
+        try:
+            _reembed()
+        finally:
+            _reembed_slot.release()
+
+    try:
+        background.start_writer(_job, name="explore-reembed")
+    except BaseException:
+        _reembed_slot.release()
+        raise
+    return {"started": True}
+
+
+# Held while an admin re-embed is queued or running (the pipeline process is
+# one process).
+_reembed_slot = threading.Lock()
+
+
+@router.post("/pipeline/trigger-house", dependencies=[Depends(require_admin)])
+def admin_trigger_house_pipeline(db: Session = Depends(get_db)):
+    """Trigger a House representative pipeline run.
+
+    409 while a pipeline chain is running (refuse_while_chain_runs: it
+    would run beside the chain's current link, and the chain runs House
+    itself), or when a House run is already going (or holds the
+    district-lines lease every House run takes), like /pipeline/trigger's
+    Senate check, naming what holds it. A District PVI refresh or the
+    startup rescore holding that lease (district_pvi.waits_for — so is a
+    lease a killed holder left, while the startup release re-checks it) is
+    not a refusal: the run waits for it (run_house_on_sitting_lines), and
+    the answer says so. Neither check is the lock — the run's own lease and
+    run lock are (fetch/district_pvi.run_house_on_sitting_lines,
+    run_house_pipeline), and a trigger that slips past both checks is
+    refused by them — but they turn the common double click into an answer
+    instead of a silent skip. A plain def, since both checks are blocking
+    database reads: FastAPI runs it on the threadpool, off the event loop.
+    """
+
+    refuse_while_chain_runs()
+    if run_tracker.run_in_progress(db, HousePipelineRun):
+        raise HTTPException(status_code=409, detail="House pipeline is already running")
+    holder = lease.holder(db, lease.DISTRICT_LINES)
+    if holder is not None and not district_pvi.waits_for(holder):
+        raise HTTPException(
+            status_code=409, detail=f"{lease.refusal_text(lease.REFUSED_HELD, who=holder)}; it holds the district lines",
+        )
+
+    async def _run():
+        # Through the modules, as #791 does: a test patching
+        # house_pipeline.run_house_pipeline must reach the call.
+        return await district_pvi.run_house_on_sitting_lines(house_pipeline.run_house_pipeline)
+
+    run_pipeline_in_thread(
+        _run, name="house-pipeline-run", error_label="House pipeline run failed",
+    )
+    if district_pvi.waits_for(holder):
+        return {"message": f"House pipeline triggered: it starts when the {holder} holding the district lines finishes"}
+    return {"message": "House pipeline triggered"}
+
+
+@router.post("/pipeline/clear-stuck-senate", dependencies=[Depends(require_admin)])
+async def admin_clear_stuck_senate(db: Session = Depends(get_db)):
+    """Mark any stuck (status=running) Senate pipeline run as failed.
+
+    For a row no live lease speaks for (run_tracker.senate_run_state):
+    past the age rule, proven dead, or named by no lease — one from a
+    release without leases, or one left RUNNING after its lease was let go.
+    Refused for a row its run's lease names while held: that may be a live
+    run whose heartbeat stalled; if it died, the hourly tidy or the next
+    Senate run marks it stale within about two hours of its last beat.
+    Only the row checked is cleared (a run starting meanwhile keeps its own).
+    """
+
+    row_id, _running, clearable = run_tracker.senate_run_state(db)
+    if row_id is None:
+        return {"cleared": 0, "message": "No stuck runs found"}
+    if not clearable:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The Senate run's lease still speaks for this row; it may be a live run whose heartbeat "
+                "is stalled. If it has died, it is marked stale within about two hours of its last beat."
+            ),
+        )
+    now = utcnow()
+    cleared = db.query(PipelineRun).filter(
+        PipelineRun.id == row_id, PipelineRun.status == PipelineStatus.RUNNING,
+    ).update({
+        "status": PipelineStatus.FAILED, "error_message": "Cleared by admin (container restart)",
+        "completed_at": now,
+    }, synchronize_session=False)
+    db.commit()
+    return {"cleared": cleared, "message": f"Marked {cleared} run(s) as failed"}
+
+
+@router.post("/pipeline/clear-stuck-house", dependencies=[Depends(require_admin)])
+async def admin_clear_stuck_house(db: Session = Depends(get_db)):
+    """Mark any stuck (status=running) house pipeline run as failed.
+
+    Use when the in-memory flag says idle but the DB record still shows running
+    (e.g. after a container restart mid-run).
+    """
+
+    return _clear_stuck_runs(db, HousePipelineRun, house_pipeline.is_house_pipeline_running, "House")
+
+
+@router.post("/pipeline/clear-stuck-stock-trades", dependencies=[Depends(require_admin)])
+async def admin_clear_stuck_stock_trades(db: Session = Depends(get_db)):
+    """Mark any stuck (status=running) stock-trades pipeline run as failed.
+
+    Use when the in-memory flag says idle but the DB record still shows
+    running (e.g. after a container restart mid-run).
+    """
+
+    return _clear_stuck_runs(db, StockTradesPipelineRun, stock_pipeline.is_stock_pipeline_running, "Stock trades")
+
+
+@router.post("/pipeline/trigger-supplementary", dependencies=[Depends(require_admin)])
+async def admin_trigger_supplementary_pipeline():
+    """Trigger a supplementary (explore docs/SCOTUS/presidents) pipeline run.
+
+    Refused while a pipeline chain is running, like the house trigger above;
+    otherwise the pipeline's own run lock refuses a duplicate.
+    """
+
+    refuse_while_chain_runs()
+    run_pipeline_in_thread(
+        supplementary_pipeline.run_supplementary_pipeline,
+        name="supplementary-pipeline-run",
+        error_label="Supplementary pipeline run failed",
+    )
+    return {"message": "Supplementary pipeline triggered"}
+
+
+@router.post("/pipeline/clear-stuck-supplementary", dependencies=[Depends(require_admin)])
+async def admin_clear_stuck_supplementary(db: Session = Depends(get_db)):
+    """Mark any stuck (status=running) supplementary pipeline run as failed.
+
+    Use when the in-memory flag says idle but the DB record still shows
+    running (e.g. after a container restart mid-run).
+    """
+
+    return _clear_stuck_runs(db, SupplementaryPipelineRun, supplementary_pipeline.is_supplementary_pipeline_running, "Supplementary")
+
+
+@router.post("/pipeline/trigger-election", dependencies=[Depends(require_admin)])
+async def admin_trigger_election_pipeline():
+    """Trigger a midterm-elections pipeline run (candidate roster,
+    financials, coverage ingestion, Bluesky posting).
+
+    Refused while a pipeline chain is running, like the house trigger above;
+    otherwise the pipeline's own run lock refuses a duplicate.
+    """
+
+    refuse_while_chain_runs()
+    run_pipeline_in_thread(
+        election_pipeline.run_election_pipeline,
+        name="election-pipeline-run",
+        error_label="Election pipeline run failed",
+    )
+    return {"message": "Election pipeline triggered"}
+
+
+@router.post("/pipeline/clear-stuck-election", dependencies=[Depends(require_admin)])
+async def admin_clear_stuck_election(db: Session = Depends(get_db)):
+    """Mark any stuck (status=running) election pipeline run as failed.
+
+    Use when the in-memory flag says idle but the DB record still shows
+    running (e.g. after a container restart mid-run).
+    """
+
+    return _clear_stuck_runs(db, ElectionPipelineRun, election_pipeline.is_election_pipeline_running, "Election")
+
+
+def _explore_running(db: Session) -> bool:
+    """Whether an Explore run (or anything else holding its lease) is live.
+    Unreadable counts as running: a deploy waits a poll rather than kill
+    one mid-top-up, which is silent. A read that fails every time is not —
+    each deferred poll logs why — and FORCE_DEPLOY=1 overrides it."""
+
+    try:
+        return lease.holder(db, lease.EXPLORE) is not None
+    except Exception:
+        logger.warning("Explore lease unreadable — reported as running", exc_info=True)
+        return True
+
+
+def _data_reset_running(db: Session) -> bool:
+    return lease.held(db, lease.DATA_RESET)
+
+
+def _reset_holding_every_writer() -> dict:
+    """database.reset_all_data, with every writer held off from before it starts to
+    after it ends. One synchronous function, run in a worker thread: the
+    request awaiting it can be cancelled (a client that disconnects), the
+    thread can't, so the holds are released only when the wipe is done.
+
+    - In this process, app.background.exclusive(): granted only while no
+      writer thread or task is registered, and while held none starts.
+    - In any process — a rollout's other task included — the reset's lease
+      (lease.DATA_RESET), which a pipeline's run lock and every other lease
+      (lease.TIERS: each job without a run lock holds one) check. The reset commits it first and then checks
+      theirs, so between a pipeline or refresh and the reset one always sees
+      the other.
+
+    Raises background.WritersBusy, naming them, if anything is writing already.
+    """
+
+    with background.exclusive("Another data reset"):
+        db = database.SessionLocal()
+        try:
+            with lease.holding(db, lease.DATA_RESET) as token:
+                if token is None:
+                    raise background.WritersBusy(["Another data reset"])
+                busy = [f"{label} run" for label, model in run_tracker.run_tables().items() if run_tracker.run_in_progress(db, model)]
+                busy += [
+                    who for who in (lease.holder(db, tier) for tier in lease.TIERS if tier != lease.DATA_RESET)
+                    if who is not None and who not in busy
+                ]
+                if busy:
+                    raise background.WritersBusy(busy)
+                return database.reset_all_data()
+        finally:
+            db.close()
+
+
+@router.post("/data/reset", dependencies=[Depends(require_admin)])
+async def admin_reset_data():
+    """Wipe what the pipelines derive from their sources, for a clean start.
+
+    Clears senators, votes, donors, the learning store, caches and the
+    vector store — every table except database.RESET_KEEPS, the history no
+    run can rebuild (the Action Center's, run history). The next pipeline
+    runs rebuild the rest from scratch with the latest code. While an
+    election's results are on show the held election's ballot and count
+    are kept too (database.RESET_KEEPS_WHILE_RESULTS; named in the
+    response's details as kept_for_election_results), with the coverage
+    markers its pages read (HELD_BALLOT_MARKER_TIERS): nothing can rebuild
+    them until the window closes.
+
+    Every writer is held off for the whole wipe (_reset_holding_every_writer);
+    anything already writing refuses the reset (409, naming it).
+    """
+
+    try:
+        summary = await asyncio.to_thread(_reset_holding_every_writer)
+    except background.WritersBusy as busy:
+        raise HTTPException(status_code=409, detail=f"Cannot reset while running: {busy}") from None
+    # Every API process holds a bills collection built from what was just
+    # wiped: tell them (bill_service records the change for other processes).
+    # A database write in the pipeline process: off the event loop.
+
+    await asyncio.to_thread(bill_service.warm_bill_collection_cache)
+    total_rows = sum(v for k, v in summary.items() if isinstance(v, int))
+    return {
+        "status": "reset_complete",
+        "rowsDeleted": total_rows,
+        "details": summary,
+    }
+
+
+# Counters that represent a story being dropped rather than published.
+# Grouped so the endpoint below can answer the question these counters
+# exist for — "did the pipeline see nothing, or see something and drop
+# it?" — without the caller having to know which of the ten-odd gates in
+# the action pipeline is which.
+_SUPPRESSION_COUNTERS = (
+    "issues_skipped_grounding",
+    "issues_skipped_role_check",
+    "issues_skipped_too_few_facts",
+    "issues_skipped_duplicate_title",
+    "issues_skipped_no_action_surface",
+    "bsky_reposts_suppressed_no_new_information",
+    "bsky_posts_suppressed_near_duplicate",
+    "bsky_posts_skipped_too_long",
+    # No longer emitted (the post stopped being model-written, 2026-09);
+    # kept so runs from before that still total in the window.
+    "bsky_post_grounding_rejections",
+)
+
+_INTAKE_COUNTERS = ("articles_fetched", "articles_policy_relevant", "clusters_considered", "clusters_attempted")
+
+_OUTPUT_COUNTERS = ("issues_new_topic", "issues_matched_existing", "bsky_reposts_allowed")
+
+_GROUPED_COUNTERS = frozenset(_INTAKE_COUNTERS + _OUTPUT_COUNTERS + _SUPPRESSION_COUNTERS)
+
+
+def _coerce_counts(raw) -> dict[str, int] | None:
+    """A run's counter payload as {name: int}, or None if unusable.
+
+    Non-integer values are dropped rather than coerced: these are counts,
+    and a payload where one isn't a number is corrupt in a way worth
+    ignoring rather than guessing at. bool is excluded explicitly because
+    it is an int subclass and would otherwise sum as 0/1.
+    """
+    if not isinstance(raw, dict):
+        return None
+    return {
+        str(k): v for k, v in raw.items()
+        if isinstance(v, int) and not isinstance(v, bool)
+    }
+
+
+_ACTOR_CLASS_NAMES = {
+    "us_gov": "U.S. government (no official named)",
+    "us_election": "U.S. elections",
+    "us_foreign": "U.S. foreign policy",
+    "us_policy_issue": "U.S. policy issue",
+    "us_courts": "U.S. courts",
+    "foreign_politics": "Foreign politics",
+    "foreign_conflict": "Foreign conflict",
+    "business": "Business",
+    "crime": "Crime",
+    "human_interest": "Human interest",
+    "science_health": "Science and health",
+    "sports_ent": "Sports and entertainment",
+    "disaster": "Disaster",
+    "other": "Other",
+}
+
+
+def _actor_names(labels: set[str], db: Session) -> dict[str, str]:
+    """A readable name for each principal-actor label (story_actor)."""
+    names: dict[str, str] = {}
+    by_branch: dict[str, list[str]] = {}
+    for label in labels:
+        if label == story_actor.PRESIDENT:
+            president = db.query(President.name).filter(President.is_current.is_(True)).scalar()
+            names[label] = f"President {president}" if president else "The president"
+        elif label.startswith("class:"):
+            names[label] = _ACTOR_CLASS_NAMES.get(label[6:], label[6:])
+        else:
+            branch, _, ident = label.partition(":")
+            by_branch.setdefault(branch, []).append(ident)
+    for branch, model in (("senate", Senator), ("house", Representative), ("scotus", Justice)):
+        ids = by_branch.get(branch)
+        if ids:
+            for ident, name in db.query(model.id, model.name).filter(model.id.in_(ids)).all():
+                names[f"{branch}:{ident}"] = name
+    for label in labels:
+        names.setdefault(label, label)
+    return names
+
+
+@router.get("/actor-concentration", dependencies=[Depends(require_admin)])
+def admin_actor_concentration(
+    weeks: Annotated[int, Query(ge=1, le=52)] = 12, db: Session = Depends(get_db),
+) -> dict:
+    """Principal-actor concentration of the Action Center's news issues, per
+    ISO week (Monday first), oldest first, the current week last.
+
+    Each issue counts once, in the week of its ``date`` (the last day a
+    refresh published it), by its ``principal_actor`` (story_actor: the
+    official named first in its headline, else the kind of story). ``hhi``
+    is the Herfindahl index of those actors, the sum of squared shares: 1.0
+    when one actor leads every issue, lower as the lead spreads; null for a
+    week with no labelled issue. ``top`` is the most frequent actor and its
+    count, ``president`` the issues the sitting president leads, and
+    ``noGovernment`` the issues whose class is one in which no government
+    acts (business, crime, a disaster...). Primary-source drafts (roll calls,
+    rules) are left out: their subject is the record, not a story choice.
+    """
+    today = datetime.now(_UTC).date()
+    monday = today - timedelta(days=today.weekday())
+    starts = [monday - timedelta(weeks=n) for n in range(weeks - 1, -1, -1)]
+    rows = (
+        db.query(ActionIssue.date, ActionIssue.principal_actor)
+        .filter(
+            ActionIssue.source_type.is_(None),
+            ActionIssue.principal_actor.is_not(None),
+            ActionIssue.date >= starts[0].isoformat(),
+        )
+        .all()
+    )
+    by_week: dict[str, list[str]] = {s.isoformat(): [] for s in starts}
+    for day, actor in rows:
+        try:
+            d = datetime.strptime(day, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        key = (d - timedelta(days=d.weekday())).isoformat()
+        if key in by_week:
+            by_week[key].append(actor)
+    names = _actor_names({a for actors in by_week.values() for a in actors}, db)
+    out = []
+    for start, actors in by_week.items():
+        counts: dict[str, int] = {}
+        for a in actors:
+            counts[a] = counts.get(a, 0) + 1
+        top = max(counts, key=counts.get) if counts else None
+        hhi = story_actor.herfindahl(actors)
+        out.append({
+            "weekStart": start,
+            "issues": len(actors),
+            "hhi": round(hhi, 3) if hhi is not None else None,
+            "top": {"label": top, "name": names[top], "issues": counts[top]} if top else None,
+            "president": counts.get(story_actor.PRESIDENT, 0),
+            "noGovernment": sum(n for a, n in counts.items() if not story_actor.has_government_actor(a)),
+        })
+    return {"weeks": out}
+
+
+@router.get("/action-metrics", dependencies=[Depends(require_admin)])
+async def admin_action_metrics(
+    limit: int = Query(48, ge=1, le=500),
+    # Annotated, so a direct call (tests, other modules) gets a real None
+    # rather than the Query() marker as its default.
+    since_hours: Annotated[int | None, Query(ge=1, le=24 * 60)] = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Per-run Action Center validator counters, newest run first.
+
+    The action pipeline records these on every refresh but nothing read
+    them back, so the question they answer — is the platform quiet
+    because the news is quiet, or because a validator is dropping
+    everything? — could only be settled by opening a shell on the box and
+    querying api_cache by hand. Every gate in the pipeline fails closed,
+    which is the right default for a platform that publishes under its own
+    name, but it means silence is the failure mode for roughly ten
+    independent checks and none of them is louder than the others.
+
+    ``runs`` is the raw per-run counter set. ``totals`` sums the window,
+    split into intake (what arrived), output (what published), and
+    suppressed (what was dropped, by which gate) — a window with healthy
+    intake and near-zero output is a suppression problem; one where
+    intake itself is near zero is a quiet news cycle or a broken feed.
+    Anything the pipeline records that isn't in those three groups lands
+    in ``other`` rather than being dropped: a counter this endpoint has
+    never heard of is exactly the one worth seeing, and silently omitting
+    it would reproduce the blind spot the endpoint exists to remove.
+
+    Runs are hourly, so gaps in ``runs`` are themselves a signal: a
+    refresh that crashed or was still holding the lock leaves no row.
+    ``since_hours`` bounds the window by time instead of by row count, so
+    ``totals`` describe exactly the hours a caller charts — with ``limit``
+    alone, a window with gaps reaches further back to fill its quota.
+    """
+    query = db.query(ApiCache).filter(ApiCache.tier == "action-metrics")
+    if since_hours is not None:
+        query = query.filter(ApiCache.cached_at >= utcnow() - timedelta(hours=since_hours))
+    rows = query.order_by(ApiCache.cached_at.desc()).limit(limit).all()
+
+    runs = []
+    for row in rows:
+        try:
+            payload = json.loads(row.data_json)
+        except (ValueError, TypeError):
+            continue  # a malformed row shouldn't blank the whole report
+        # Shape is checked, not assumed: a diagnostic endpoint that 500s
+        # on one bad row fails precisely when it's being reached for.
+        counts = _coerce_counts(payload.get("counts")) if isinstance(payload, dict) else None
+        if counts is None:
+            continue
+        runs.append({
+            "run": row.cache_key,
+            "recordedAt": row.cached_at.isoformat() if row.cached_at else None,
+            "counts": counts,
+            # Per-run rollups the dashboard charts run over run, so it needs
+            # no copy of which counter belongs to which group. Intake stays
+            # as its raw counters (fetched -> relevant -> clusters is a
+            # funnel; summing its stages would count one article three
+            # times), and so does output's Bluesky counter, which counts
+            # posts, not issues.
+            "issuesPublished": counts.get("issues_new_topic", 0)
+            + counts.get("issues_matched_existing", 0),
+            "suppressed": sum(counts.get(k, 0) for k in _SUPPRESSION_COUNTERS),
+        })
+
+    def _sum(keys) -> dict:
+        return {
+            k: sum(r["counts"].get(k, 0) for r in runs)
+            for k in keys
+            if any(r["counts"].get(k) for r in runs)
+        }
+
+    suppressed = _sum(_SUPPRESSION_COUNTERS)
+    ungrouped = sorted({
+        k for r in runs for k in r["counts"] if k not in _GROUPED_COUNTERS
+    })
+    return {
+        "runs": runs,
+        "totals": {
+            "intake": _sum(_INTAKE_COUNTERS),
+            "output": _sum(_OUTPUT_COUNTERS),
+            "suppressed": suppressed,
+            "suppressedTotal": sum(suppressed.values()),
+            "other": _sum(ungrouped),
+        },
+        "runsReturned": len(runs),
+    }
+
+
+@router.get("/classification/health", dependencies=[Depends(require_admin)])
+async def admin_classification_health(db: Session = Depends(get_db)):
+    """Classification system health metrics for monitoring adaptive learning."""
+    return get_health_metrics(db)
+
+
+@router.get("/score-calibration", dependencies=[Depends(require_admin)])
+async def get_score_calibration(entity_type: str = "senator"):
+    """Score distribution monitoring across consecutive pipeline runs.
+
+    Compares distributions between the two most recent snapshot dates.
+    Drift events are logged automatically during each pipeline run; this
+    endpoint surfaces the latest comparison for observability.
+
+    Query params:
+      entity_type: ``senator`` (default) or ``representative``
+    """
+
+    if entity_type not in ("senator", "representative"):
+        raise HTTPException(
+            status_code=400,
+            detail="entity_type must be 'senator' or 'representative'",
+        )
+
+    report = generate_calibration_report(entity_type)
+    if report is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Fewer than 2 snapshot dates exist for entity_type={entity_type!r}",
+        )
+    return report
+
+

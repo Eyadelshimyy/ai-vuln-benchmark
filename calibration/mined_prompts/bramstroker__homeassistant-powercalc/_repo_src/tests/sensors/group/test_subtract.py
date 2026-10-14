@@ -1,0 +1,144 @@
+from homeassistant.const import CONF_ENTITY_ID, CONF_NAME, STATE_UNAVAILABLE
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.typing import ConfigType
+import pytest
+
+from custom_components.powercalc import (
+    CONF_ENERGY_SENSOR_FRIENDLY_NAMING,
+    CONF_ENERGY_SENSOR_NAMING,
+    CONF_POWER_SENSOR_FRIENDLY_NAMING,
+    CONF_POWER_SENSOR_NAMING,
+)
+from custom_components.powercalc.const import (
+    CONF_CREATE_GROUP,
+    CONF_CREATE_UTILITY_METERS,
+    CONF_GROUP_TYPE,
+    CONF_SUBTRACT_ENTITIES,
+    GroupType,
+)
+from custom_components.powercalc.errors import SensorConfigurationError
+from custom_components.powercalc.sensors.group.subtract import validate_config
+from tests.common import (
+    assert_entity_state,
+    run_powercalc_setup,
+    set_states,
+)
+
+
+async def test_subtract_sensor(hass: HomeAssistant) -> None:
+    await set_states(hass, [("sensor.a_power", 100), ("sensor.b_power", 20), ("sensor.c_power", 25)])
+    await run_powercalc_setup(
+        hass,
+        {
+            CONF_CREATE_GROUP: "Test",
+            CONF_GROUP_TYPE: GroupType.SUBTRACT,
+            CONF_CREATE_UTILITY_METERS: True,
+            CONF_ENTITY_ID: "sensor.a_power",
+            CONF_SUBTRACT_ENTITIES: [
+                "sensor.b_power",
+                "sensor.c_power",
+            ],
+        },
+    )
+
+    assert_entity_state(hass, "sensor.test_power", "55.00")
+
+    await set_states(hass, [("sensor.b_power", 22.45)])
+    assert_entity_state(hass, "sensor.test_power", "52.55")
+
+    assert hass.states.get("sensor.test_energy_daily")
+
+
+async def test_base_sensor_state_none(hass: HomeAssistant) -> None:
+    await set_states(hass, [("sensor.b_power", 20)])
+    await run_powercalc_setup(
+        hass,
+        {
+            CONF_CREATE_GROUP: "Test",
+            CONF_GROUP_TYPE: GroupType.SUBTRACT,
+            CONF_ENTITY_ID: "sensor.a_power",
+            CONF_SUBTRACT_ENTITIES: [
+                "sensor.b_power",
+            ],
+        },
+    )
+
+    assert_entity_state(hass, "sensor.test_power", STATE_UNAVAILABLE)
+
+
+@pytest.mark.parametrize(
+    "config,valid",
+    [
+        (
+            {
+                CONF_NAME: "Test",
+                CONF_SUBTRACT_ENTITIES: [
+                    "sensor.b_power",
+                    "sensor.c_power",
+                ],
+            },
+            False,
+        ),
+        (
+            {
+                CONF_NAME: "Test",
+                CONF_ENTITY_ID: "sensor.a_power",
+            },
+            False,
+        ),
+        (
+            {
+                CONF_ENTITY_ID: "sensor.a_power",
+                CONF_SUBTRACT_ENTITIES: [
+                    "sensor.b_power",
+                    "sensor.c_power",
+                    "sensor.d_power",
+                ],
+            },
+            False,
+        ),
+        (
+            {
+                CONF_NAME: "Test",
+                CONF_ENTITY_ID: "sensor.a_power",
+                CONF_SUBTRACT_ENTITIES: [
+                    "sensor.b_power",
+                    "sensor.c_power",
+                    "sensor.d_power",
+                ],
+            },
+            True,
+        ),
+    ],
+)
+def test_validate(config: ConfigType, valid: bool) -> None:
+    if not valid:
+        with pytest.raises(SensorConfigurationError):
+            validate_config(config)
+    else:
+        validate_config(config)
+
+
+async def test_friendly_naming(hass: HomeAssistant) -> None:
+    await run_powercalc_setup(
+        hass,
+        {
+            CONF_CREATE_GROUP: "test",
+            CONF_GROUP_TYPE: GroupType.SUBTRACT,
+            CONF_ENTITY_ID: "sensor.a_power",
+            CONF_SUBTRACT_ENTITIES: [
+                "sensor.b_power",
+                "sensor.c_power",
+            ],
+        },
+        {
+            CONF_ENERGY_SENSOR_NAMING: "{} powercalc energy",
+            CONF_ENERGY_SENSOR_FRIENDLY_NAMING: "{} Powercalc Energy",
+            CONF_POWER_SENSOR_NAMING: "{} powercalc power",
+            CONF_POWER_SENSOR_FRIENDLY_NAMING: "{} Powercalc Power",
+        },
+    )
+
+    assert_entity_state(hass, "sensor.test_powercalc_power", attributes={"friendly_name": "test Powercalc Power"})
+
+    assert_entity_state(hass, "sensor.test_powercalc_energy", attributes={"friendly_name": "test Powercalc Energy"})

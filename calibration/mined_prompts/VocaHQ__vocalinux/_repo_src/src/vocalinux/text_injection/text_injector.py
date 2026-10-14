@@ -1,0 +1,3232 @@
+"""
+Text injection module for Vocalinux.
+
+This module is responsible for injecting recognized text into the active
+application, supporting both X11 and Wayland environments.
+"""
+
+import logging
+import math
+import os
+import shutil
+import socket
+import subprocess
+import threading
+import time
+from enum import Enum
+from typing import List, Optional, Tuple
+
+from ..utils.host_process import host_env
+from ..utils.paths import config_dir
+from .focused_window import is_focused_window_terminal, read_wm_class
+from .ibus_engine import (
+    IBusTextInjector,
+    is_ibus_active_input_method,
+    is_ibus_available,
+    is_ibus_daemon_running,
+)
+from .remote_desktop_portal import (
+    KEYSYM_BACKSPACE,
+    RemoteDesktopPortal,
+    RemoteDesktopPortalError,
+)
+
+_PORTAL_SUBMIT_TIMEOUT_S = 195.0  # portal's _START_TIMEOUT_S + _REQUEST_TIMEOUT_S
+
+logger = logging.getLogger(__name__)
+
+_GLOBAL_YDOTOOL_UNIT = "/etc/systemd/user/default.target.wants/ydotool.service"
+
+
+def _ydotool_install_guidance() -> str:
+    """Return package- and source-specific ydotool service instructions."""
+    return (
+        "Ubuntu package setup for ydotool:\n"
+        "  sudo apt install ydotool\n"
+        "  sudo usermod -aG input $USER  # then log out and back in\n"
+        "  systemctl --user enable --now ydotool.service\n"
+        "  Do NOT use 'systemctl --global enable ydotool.service'; it also starts "
+        "ydotool in display-manager greeter sessions.\n"
+        "If ydotool was built from source and installed a system unit, use instead:\n"
+        "  sudo systemctl enable --now ydotoold.service"
+    )
+
+
+def _warn_if_ydotool_globally_enabled() -> None:
+    """Warn when ydotool's user unit is enabled for every account, including greeters."""
+    if os.path.lexists(_GLOBAL_YDOTOOL_UNIT):
+        logger.warning(
+            "ydotool.service is enabled globally at %s. This can start an input-injection "
+            "daemon in display-manager greeter sessions. Disable it with "
+            "'sudo systemctl --global disable ydotool.service', then enable it only for "
+            "this user with 'systemctl --user enable --now ydotool.service'.",
+            _GLOBAL_YDOTOOL_UNIT,
+        )
+
+
+def _is_kde_plasma_session() -> bool:
+    """Return True when the current desktop session appears to be KDE Plasma."""
+    if os.environ.get("KDE_FULL_SESSION", "").lower() == "true":
+        return True
+
+    desktop_values = [
+        os.environ.get("XDG_CURRENT_DESKTOP", ""),
+        os.environ.get("DESKTOP_SESSION", ""),
+        os.environ.get("GDMSESSION", ""),
+    ]
+    desktop = " ".join(value for value in desktop_values if value).lower()
+    return "kde" in desktop or "plasma" in desktop
+
+
+def _kde_wayland_ibus_hint() -> str:
+    """Return the KDE Plasma Wayland IBus setup hint."""
+    return (
+        "Open System Settings -> Keyboard -> Virtual Keyboard, select "
+        "'IBus Wayland', then restart Vocalinux or log out and back in."
+    )
+
+
+class DesktopEnvironment(Enum):
+    """Enum representing the desktop environment."""
+
+    X11 = "x11"
+    X11_IBUS = "x11-ibus"  # X11 with IBus engine (preferred for non-US layouts)
+    WAYLAND = "wayland"
+    WAYLAND_XDOTOOL = "wayland-xdotool"  # Wayland with XWayland fallback
+    WAYLAND_IBUS = "wayland-ibus"  # Wayland with IBus engine (preferred)
+    UNKNOWN = "unknown"
+
+
+class _InjectionAborted(Exception):
+    """Raised inside injection helpers when shutdown cuts an injection short."""
+
+
+class _PartiallyTyped(subprocess.CalledProcessError):
+    """A chunked type call delivered a prefix of the text before failing.
+
+    ``typed`` counts the characters already on screen so a fallback can
+    continue from the remainder instead of typing them a second time.
+    """
+
+    def __init__(self, typed: int, cause: subprocess.CalledProcessError) -> None:
+        super().__init__(cause.returncode, cause.cmd, output=cause.output, stderr=cause.stderr)
+        self.typed = typed
+
+
+class TextInjector:
+    """
+    Class for injecting text into the active application.
+
+    This class handles the injection of text into the currently focused
+    application window, supporting both X11 and Wayland environments.
+    """
+
+    # Class-level fallback so objects built without __init__ (test helpers
+    # using __new__) still answer the abort checks; __init__ rebinds a fresh
+    # per-instance event, so the shared default is never the one that is set.
+    _abort_injections: threading.Event = threading.Event()
+
+    # Characters confirmed delivered by the most recent inject_text call:
+    # the full length on success, the confirmed prefix after a partial
+    # failure, -1 when delivery is unknowable, 0 when nothing was typed.
+    last_typed_count: int = 0
+
+    def __init__(self, wayland_mode: bool = False):
+        """
+        Initialize the text injector.
+
+        Args:
+            wayland_mode: Force Wayland compatibility mode
+        """
+        self._ibus_injector: Optional[IBusTextInjector] = None
+        self._portal: Optional[RemoteDesktopPortal] = None
+        self._backend_pin: Tuple[str, Optional[str]] = ("auto", None)
+        self.environment = self._detect_environment()
+        self._session_environment = self.environment
+        self._ibus_ready = False
+        self._ibus_init_failed = False
+        self._ibus_init_thread: Optional[threading.Thread] = None
+        self._state_lock = threading.Lock()
+        self._abort_injections = threading.Event()
+        self.last_typed_count = 0
+        self._clipboard_tool_health = {}
+        self._clipboard_timeout = 0.35
+        # Overlapping ydotool pastes: bump generation to cancel stale restores;
+        # target keeps the original pre-injection clipboard across the window.
+        self._clipboard_restore_generation = 0
+        self._clipboard_restore_target: Optional[str] = None
+
+        # Force Wayland mode if requested
+        if wayland_mode and self.environment == DesktopEnvironment.X11:
+            logger.info("Forcing Wayland compatibility mode")
+            self.environment = DesktopEnvironment.WAYLAND
+            self._session_environment = self.environment
+
+        logger.info(f"Using text injection for {self.environment.value} environment")
+
+        # Check for required tools
+        self._check_dependencies()
+
+        # Test if wtype actually works in this environment
+        if (
+            self.environment == DesktopEnvironment.WAYLAND
+            and hasattr(self, "wayland_tool")
+            and self.wayland_tool == "wtype"
+        ):
+            try:
+                result = self._probe_wtype_support()
+                error_output = result.stderr.lower()
+                if "compositor does not support" in error_output or result.returncode != 0:
+                    logger.warning(
+                        "Wayland compositor does not support virtual "
+                        f"keyboard protocol: {error_output}"
+                    )
+                    if _is_kde_plasma_session():
+                        logger.warning(
+                            "KDE Plasma Wayland detected. wtype is not a reliable "
+                            f"text injection path on this compositor. {_kde_wayland_ibus_hint()}"
+                        )
+                    # xdotool only types into XWayland windows. Prefer ydotool
+                    # (uinput) so native Wayland apps still receive text.
+                    if shutil.which("ydotool") and self._ensure_ydotoold():
+                        self.wayland_tool = "ydotool"
+                        logger.info(
+                            "wtype unsupported on this compositor; "
+                            "using ydotool (uinput) for native Wayland apps"
+                        )
+                    elif shutil.which("xdotool"):
+                        logger.info("Automatically switching to XWayland fallback with xdotool")
+                        self.environment = DesktopEnvironment.WAYLAND_XDOTOOL
+                        self._warn_if_snap_xwayland_only()
+                    else:
+                        logger.error("No fallback text injection method available")
+            except Exception as e:
+                logger.warning(f"Error testing wtype: {e}, will try to use it anyway")
+
+        # Verify XWayland fallback works - perform a test injection
+        if self.environment == DesktopEnvironment.WAYLAND_XDOTOOL:
+            logger.info("Testing XWayland text injection fallback")
+            try:
+                # Wait a moment to ensure any error messages are displayed before test
+                time.sleep(0.5)
+                # Try xdotool in more verbose mode for better diagnostics
+                self._test_xdotool_fallback()
+            except Exception as e:
+                logger.error(f"XWayland fallback test failed: {e}")
+
+        # Last, so it sees the final selection: _check_dependencies() returns early
+        # on two paths, and the wtype probe above can still demote a pin that was
+        # honoured up to that point.
+        self._warn_if_pin_not_honoured(*self._backend_pin)
+
+    def stop(self) -> None:
+        """
+        Clean up resources and restore previous state.
+
+        Call this when shutting down Vocalinux.
+        """
+        with self._state_lock:
+            if self._ibus_injector:
+                logger.info("Stopping IBus text injector")
+                self._ibus_injector.stop()
+                self._ibus_injector = None
+            portal = getattr(self, "_portal", None)
+            if portal is not None:
+                logger.info("Closing RemoteDesktop portal session")
+                portal.close()
+                self._portal = None
+            self._ibus_ready = False
+
+    def _probe_wtype_support(self) -> subprocess.CompletedProcess:
+        """Probe wtype support without typing visible text."""
+        return subprocess.run(
+            ["wtype", ""], stderr=subprocess.PIPE, text=True, check=False, timeout=2, env=host_env()
+        )
+
+    def _detect_environment(self) -> DesktopEnvironment:
+        """
+        Detect the current desktop environment (X11 or Wayland).
+
+        Returns:
+            The detected desktop environment
+        """
+        session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
+        wayland_display = os.environ.get("WAYLAND_DISPLAY")
+        x11_display = os.environ.get("DISPLAY")
+
+        if session_type == "wayland":
+            # Flatpak often has no Wayland socket (injection uses uinput/x11). Prefer
+            # ydotool: xdotool only types into XWayland windows, not native clients.
+            if os.environ.get("FLATPAK_ID") and not wayland_display and x11_display:
+                if shutil.which("ydotool"):
+                    logger.info(
+                        "Flatpak on Wayland host: using ydotool (uinput) for text injection"
+                    )
+                    return DesktopEnvironment.WAYLAND
+                logger.info(
+                    "Flatpak on Wayland host: no ydotool; falling back to xdotool/XWayland "
+                    "(X11 apps only)"
+                )
+                return DesktopEnvironment.WAYLAND_XDOTOOL
+            return DesktopEnvironment.WAYLAND
+        # A live Wayland socket beats a stale XDG_SESSION_TYPE=x11. Plasma
+        # Wayland GTK apps often keep session_type=x11, then we pick IBus/XIM
+        # and native Kate/Obsidian get nothing (issue #752).
+        if wayland_display:
+            return DesktopEnvironment.WAYLAND
+        if session_type == "x11" or x11_display:
+            return DesktopEnvironment.X11
+        logger.warning("Could not detect desktop environment, defaulting to X11")
+        return DesktopEnvironment.X11
+
+    # Wayland compositors that do NOT bridge IBus commits to native Wayland
+    # clients. On these, an IBus engine's commit_text() reaches only XWayland and
+    # GTK/Qt apps that load the IBus IM module, while native apps (e.g.
+    # cosmic-term) receive nothing -- the injection appears to succeed but the
+    # text is silently dropped. These are the smithay/wlroots-based compositors
+    # that implement input handling without IBus text-input integration.
+    _IBUS_UNBRIDGED_COMPOSITORS = (
+        "cosmic",
+        "sway",
+        "hyprland",
+        "wayfire",
+        "river",
+        "niri",
+        "labwc",
+        "weston",
+    )
+
+    # Backends a user may pin explicitly, via VOCALINUX_FORCE_BACKEND or the
+    # text_injection.backend setting. Named once so the two readers and the two
+    # "expected ..." messages cannot drift apart as values are added.
+    _SELECTABLE_BACKENDS = ("ibus", "portal", "wtype", "ydotool", "xdotool")
+
+    # The chosen Wayland injection tool; None until _check_dependencies picks
+    # one (readers go through getattr because __new__ tests skip __init__).
+    wayland_tool: Optional[str]
+
+    @staticmethod
+    def _accepted_backends_help() -> str:
+        """The accepted pin values, for user-facing "expected ..." messages."""
+        return "/".join(TextInjector._SELECTABLE_BACKENDS) + "/auto"
+
+    def _kde_virtual_keyboard_enabled(self) -> bool:
+        """Return True when KWin VirtualKeyboard / input method is enabled.
+
+        On KDE Plasma Wayland, IBus only reaches native apps when this is on
+        (issue #574). KWin 6 reports the setting through the ``available``
+        property; ``enabled`` existed on Plasma 5 and is kept as a fallback
+        (issue #911). Disabled or unqueryable → treat IBus as unbridged.
+        """
+        for prop in ("available", "enabled"):
+            try:
+                result = subprocess.run(
+                    [
+                        "gdbus",
+                        "call",
+                        "--session",
+                        "--dest",
+                        "org.kde.KWin",
+                        "--object-path",
+                        "/VirtualKeyboard",
+                        "--method",
+                        "org.freedesktop.DBus.Properties.Get",
+                        "org.kde.kwin.VirtualKeyboard",
+                        prop,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    env=host_env(),
+                )
+            except (subprocess.SubprocessError, FileNotFoundError) as e:
+                logger.info(
+                    "Could not query KWin VirtualKeyboard (%s); treating IBus as unbridged.",
+                    e,
+                )
+                return False
+
+            out = (result.stdout or "").strip().lower() if result.returncode == 0 else ""
+            # gdbus prints the variant as (<true>,) on KWin 6 and doubly
+            # wrapped as (<<true>>,) on Plasma 5; the bare "<true>" substring
+            # matches both forms.
+            if "<true>" in out:
+                return True
+            if "<false>" in out:
+                logger.info(
+                    "KWin Virtual Keyboard is disabled; IBus commits will not reach "
+                    "native apps. Falling back to ydotool/wtype. Enable: System "
+                    "Settings → Keyboard → Virtual Keyboard → IBus Wayland."
+                )
+                return False
+            # The property does not exist on this KWin (Plasma 6 dropped
+            # 'enabled'; Plasma 5 lacks 'available') or its answer was not a
+            # readable boolean -- try the other name before giving up.
+            logger.debug(
+                "KWin VirtualKeyboard property '%s' inconclusive (rc=%s out=%r).",
+                prop,
+                result.returncode,
+                result.stdout,
+            )
+
+        logger.info("KWin VirtualKeyboard not confirmed; treating IBus as unbridged.")
+        return False
+
+    @staticmethod
+    def _ibus_wayland_bridge_running() -> bool:
+        """Whether IBus' zwp_input_method_v2 bridge (``ibus-wayland``) is running.
+
+        The ``_IBUS_UNBRIDGED_COMPOSITORS`` denylist assumes nothing sits between
+        the compositor and ibus-daemon. Since IBus 1.5.32 the ``ibus-wayland``
+        helper implements ``zwp_input_method_v2``, so on a compositor that
+        exposes ``zwp_input_method_manager_v2`` (the wlroots/smithay ones on the
+        denylist all do) it relays commits to native Wayland clients speaking
+        text-input-v3. When it is running, those compositors are bridged.
+
+        Mirrors ``is_ibus_daemon_running()`` in ibus_engine.py.
+        """
+        try:
+            result = subprocess.run(
+                ["pgrep", "-x", "ibus-wayland"], capture_output=True, timeout=2, env=host_env()
+            )
+            return result.returncode == 0
+        except (subprocess.SubprocessError, FileNotFoundError):
+            return False
+
+    def _wayland_compositor_bridges_ibus(self) -> bool:
+        """Whether native Wayland clients receive IBus commits on this compositor.
+
+        GNOME (mutter), KDE (kwin) and most full desktops bridge IBus to native
+        Wayland clients, so an engine's commit_text() reaches the focused app. A
+        handful of compositors (see ``_IBUS_UNBRIDGED_COMPOSITORS``) do not, so on
+        those we must use a virtual-keyboard tool (wtype/ydotool) instead. We use
+        a denylist rather than an allowlist so that unrecognised desktops keep the
+        previous IBus-preferred behaviour.
+
+        A denylisted compositor is still bridged when ``ibus-wayland`` is running,
+        since that supplies exactly the input-method-v2 relay those compositors
+        lack (issue #607). The check is a live probe rather than configuration,
+        so this degrades back to the denylist on its own if the bridge dies or
+        was never started.
+
+        On KDE Plasma Wayland, bridging also requires KWin VirtualKeyboard to be
+        enabled (issue #574); otherwise commit_text succeeds at the IBus layer
+        but never reaches apps.
+        """
+        if self.environment != DesktopEnvironment.WAYLAND:
+            # X11 / XWayland: IBus reaches apps through XIM regardless of DE.
+            return True
+        desktop = " ".join(
+            os.environ.get(var, "")
+            for var in ("XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP", "DESKTOP_SESSION")
+        ).lower()
+        if any(name in desktop for name in self._IBUS_UNBRIDGED_COMPOSITORS):
+            if self._ibus_wayland_bridge_running():
+                logger.info(
+                    "Compositor '%s' is on the unbridged list, but the ibus-wayland "
+                    "input-method-v2 bridge is running; IBus can reach native "
+                    "Wayland clients.",
+                    os.environ.get("XDG_CURRENT_DESKTOP", "unknown"),
+                )
+                return True
+            return False
+        if _is_kde_plasma_session():
+            return self._kde_virtual_keyboard_enabled()
+        return True
+
+    def _ydotool_socket_paths(self) -> list:
+        """Return candidate Unix socket paths used by ydotoold."""
+        paths = []
+        env_socket = os.environ.get("YDOTOOL_SOCKET")
+        if env_socket:
+            paths.append(env_socket)
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+        if runtime_dir:
+            paths.append(os.path.join(runtime_dir, ".ydotool_socket"))
+        paths.append("/tmp/.ydotool_socket")
+        return paths
+
+    def _is_ydotoold_running(self) -> bool:
+        """Return True if ydotoold is accepting connections.
+
+        A leftover socket file is not enough: after a crash or a Flatpak session
+        exit the path can remain while nothing listens, and ydotool then fails
+        with exit status 2. Probe with a real connect(); remove only sockets
+        that nothing accepts.
+
+        ydotool 1.x uses a Unix **datagram** socket (not stream). Probing with
+        SOCK_STREAM fails with EPROTOTYPE and must not be treated as stale.
+        """
+        for path in self._ydotool_socket_paths():
+            if not os.path.exists(path):
+                continue
+            # Try dgram first (ydotool 1.x), then stream (other clients).
+            connected = False
+            wrong_type = False
+            for sock_type in (socket.SOCK_DGRAM, socket.SOCK_STREAM):
+                sock = None
+                try:
+                    sock = socket.socket(socket.AF_UNIX, sock_type)
+                    sock.settimeout(0.5)
+                    sock.connect(path)
+                    connected = True
+                    break
+                except OSError as e:
+                    # Linux: EPROTOTYPE (91) / some kernels EISCONN variants when
+                    # socket type mismatches the listening end.
+                    if getattr(e, "errno", None) in (
+                        getattr(socket, "EPROTOTYPE", 91),
+                        91,
+                    ):
+                        wrong_type = True
+                        continue
+                finally:
+                    if sock is not None:
+                        try:
+                            sock.close()
+                        except OSError:
+                            pass
+            if connected:
+                return True
+            if wrong_type:
+                # Socket exists with a type we failed to match; do not unlink —
+                # a live ydotoold may still be serving clients that use dgram.
+                # Fall through to next path.
+                continue
+            try:
+                os.unlink(path)
+                logger.info("Removed stale ydotool socket: %s", path)
+            except OSError:
+                pass
+        return False
+
+    def _ensure_ydotoold(self) -> bool:
+        """Start ydotoold if needed so ydotool can inject via uinput.
+
+        ydotool 1.x talks to a daemon that owns /dev/uinput. Inside Flatpak we
+        start the daemon on demand when the app is granted device access.
+        Host ydotool 0.1.x often works without a daemon; starting one is still
+        safe when ydotoold is installed. The CLI still needs a writable
+        /dev/uinput (Snap: ``snap connect vocalinux:uinput``).
+        """
+        if self._is_ydotoold_running():
+            return True
+        ydotoold = shutil.which("ydotoold")
+        if not ydotoold:
+            # Distro ydotool 0.1.x may not ship a daemon; treat as ready
+            # only when /dev/uinput is actually writable.
+            if shutil.which("ydotool") is None:
+                return False
+            if not self._uinput_usable():
+                logger.warning(self._uinput_permission_hint())
+                return False
+            return True
+        if not self._uinput_usable():
+            logger.warning(
+                "ydotoold needs /dev/uinput (Flatpak: grant --device=all). "
+                "Text injection into native Wayland apps will fail."
+            )
+            return False
+        try:
+            subprocess.Popen(
+                [ydotoold],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                env=host_env(),
+            )
+        except OSError as e:
+            logger.warning(f"Could not start ydotoold: {e}")
+            return False
+        for _ in range(40):
+            time.sleep(0.05)
+            if self._is_ydotoold_running():
+                logger.info("Started ydotoold for uinput text injection")
+                return True
+        logger.warning("ydotoold did not become ready in time")
+        return False
+
+    @staticmethod
+    def _forced_backend_setting() -> Optional[str]:
+        """``VOCALINUX_FORCE_BACKEND`` as three distinct states.
+
+        ``None`` when the variable is not set, ``"auto"`` when it is explicitly
+        set to auto, otherwise the backend name. The distinction matters:
+        ``auto`` is how a user asks for autodetection *this run* despite a saved
+        ``text_injection.backend`` pin, which is the one-run A/B test this
+        variable exists for. Collapsing it into "nothing was set" would let the
+        saved pin win and make the variable useless for that.
+
+        Accepts ``ibus``, ``portal``, ``wtype``, ``ydotool``, ``xdotool`` or
+        ``auto``.
+        """
+        raw = os.environ.get("VOCALINUX_FORCE_BACKEND")
+        if raw is None:
+            return None
+        value = raw.strip().lower()
+        if not value:
+            return None
+        if value == "auto":
+            return "auto"
+        if value in TextInjector._SELECTABLE_BACKENDS:
+            return value
+        logger.warning(
+            "Ignoring unknown VOCALINUX_FORCE_BACKEND=%r (expected %s)",
+            value,
+            TextInjector._accepted_backends_help(),
+        )
+        # Deliberately unset rather than "auto": a typo in a shell variable should
+        # not discard a valid saved pin, only fail to override it.
+        return None
+
+    @staticmethod
+    def _uinput_usable() -> bool:
+        """Return True when this process can open ``/dev/uinput`` for write."""
+        try:
+            fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            return False
+        os.close(fd)
+        return True
+
+    @staticmethod
+    def _uinput_permission_hint() -> str:
+        """How to grant ydotool access to ``/dev/uinput`` in this install."""
+        if os.environ.get("SNAP"):
+            return (
+                "ydotool cannot open /dev/uinput. For the Snap, run: "
+                "sudo snap connect vocalinux:uinput"
+            )
+        return (
+            "ydotool cannot open /dev/uinput. "
+            "Add your user to the input group and log out, or start ydotoold. "
+            f"{_ydotool_install_guidance()}"
+        )
+
+    @staticmethod
+    def _warn_if_snap_xwayland_only() -> None:
+        """Log that Snap XWayland fallback will miss native Wayland apps."""
+        if not os.environ.get("SNAP"):
+            return
+        logger.warning(
+            "Snap XWayland fallback only types into X11/XWayland apps. "
+            "Native Wayland apps need: sudo snap connect vocalinux:uinput"
+        )
+
+    @staticmethod
+    def _forced_backend() -> str:
+        """Backend pinned via ``VOCALINUX_FORCE_BACKEND``, or ``"auto"``.
+
+        Autodetection has to infer whether IBus commits actually reach the
+        focused app, and it cannot verify that: ``commit_text()`` reports
+        success even when the text is dropped. This gives users an escape hatch
+        when the inference is wrong, and makes the two paths A/B-testable
+        without editing code.
+
+        Accepts ``ibus``, ``portal``, ``wtype``, ``ydotool``, ``xdotool`` or
+        ``auto``. Anything else is ignored with a warning, so a typo cannot
+        silently pin a backend.
+
+        This covers the environment variable only. ``_backend_preference()``
+        combines it with the persistent ``text_injection.backend`` setting, and
+        needs unset and an explicit ``auto`` told apart -- see
+        ``_forced_backend_setting()``.
+        """
+        return TextInjector._forced_backend_setting() or "auto"
+
+    def _resolve_wayland_key_tool(self) -> Optional[str]:
+        """Pick (or reuse) the Wayland virtual-keyboard tool for key events.
+
+        Mirrors the preference ``_check_dependencies`` already applies: prefer
+        ydotool via uinput once its daemon is (or can be made) ready, and only
+        fall back to wtype. Callers that resolve a tool after startup -- IBus
+        shortcut routing, BackSpace key events -- use this instead of picking
+        their own order.
+
+        Returns:
+            The tool name, or None if neither is installed.
+        """
+        if getattr(self, "wayland_tool", None):
+            return self.wayland_tool
+
+        ydotool_available = shutil.which("ydotool") is not None
+        wtype_available = shutil.which("wtype") is not None
+
+        # _ensure_ydotoold can block for ~2s, so it stays outside the lock.
+        if ydotool_available and self._ensure_ydotoold():
+            tool = "ydotool"
+        elif ydotool_available and not wtype_available:
+            tool = "ydotool"
+        elif wtype_available:
+            tool = "wtype"
+        else:
+            return None
+
+        with self._state_lock:
+            self.wayland_tool = tool
+        logger.info(f"Using {tool} for Wayland key events")
+        return tool
+
+    @staticmethod
+    def _configured_backend() -> str:
+        """Backend pinned via ``text_injection.backend`` in config.json, or ``"auto"``.
+
+        The environment variable is fine for a one-off experiment, but a user
+        whose compositor is autodetected wrongly needs the choice to survive a
+        restart without wrapping the launcher in a shell script (issue #476).
+
+        Read from disk rather than through ConfigManager to keep this package
+        independent of the UI layer, matching ``_should_copy_to_clipboard()``.
+
+        A file that cannot be used is reported at warning level, not debug. This
+        setting is hand-edited, so a stray comma is a likely way to reach it, and
+        the symptom of staying quiet is the silent IBus miss the pin was set to
+        avoid -- indistinguishable from the pin simply not working.
+
+        The two shape checks below are what keep the lookup total, so the
+        handler only has to cover reading and parsing. Locating the file is
+        deliberately outside the handler: ``config_dir()`` resolving a path is
+        not a failure this should paper over, and computing it inside the
+        ``try`` only meant the handler could not name the file it failed on.
+        """
+        import json
+
+        config_path = os.path.join(config_dir(), "config.json")
+        if not os.path.exists(config_path):
+            return "auto"
+
+        try:
+            with open(config_path, "r") as f:
+                config = json.load(f)
+        except (OSError, ValueError) as e:
+            # Corrupt or unreadable must not block startup, but must not pass
+            # unmentioned either: the user edited this file expecting an effect.
+            logger.warning(
+                "Ignoring text_injection.backend: could not read %s (%s). "
+                "Continuing with backend autodetection.",
+                config_path,
+                e,
+            )
+            return "auto"
+
+        if not isinstance(config, dict):
+            logger.warning(
+                "Ignoring text_injection.backend: %s is not a JSON object. "
+                "Continuing with backend autodetection.",
+                config_path,
+            )
+            return "auto"
+
+        section = config.get("text_injection")
+        if section is None:
+            return "auto"
+        if not isinstance(section, dict):
+            logger.warning(
+                "Ignoring text_injection.backend: the text_injection section of %s "
+                "is not a JSON object. Continuing with backend autodetection.",
+                config_path,
+            )
+            return "auto"
+
+        value = str(section.get("backend", "") or "").strip().lower()
+        if not value or value == "auto":
+            return "auto"
+        if value in TextInjector._SELECTABLE_BACKENDS:
+            return value
+        logger.warning(
+            "Ignoring unknown text_injection.backend=%r (expected %s)",
+            value,
+            TextInjector._accepted_backends_help(),
+        )
+        return "auto"
+
+    @staticmethod
+    def _resolve_backend_pin() -> Tuple[str, Optional[str]]:
+        """The pinned backend and where it came from, resolved once.
+
+        Returns ``(backend, source)``. ``source`` names the setting that won, or
+        is ``None`` when nothing pinned anything. Both come from a single pass so
+        callers that report the source cannot disagree with the value actually
+        used -- and so the environment is parsed once per construction, which
+        also means a malformed value is reported once rather than per caller.
+
+        ``VOCALINUX_FORCE_BACKEND`` wins so a backend can still be A/B-tested
+        for one run without editing (or permanently changing) the user's config.
+        That includes an explicit ``auto``, which asks for autodetection this run
+        and so must short-circuit here rather than fall through to the saved pin.
+        """
+        env = TextInjector._forced_backend_setting()
+        if env is not None:
+            return env, "VOCALINUX_FORCE_BACKEND"
+        configured = TextInjector._configured_backend()
+        if configured != "auto":
+            return configured, "text_injection.backend"
+        return "auto", None
+
+    @staticmethod
+    def _backend_preference() -> str:
+        """The backend to pin, from the environment or config.json."""
+        return TextInjector._resolve_backend_pin()[0]
+
+    @staticmethod
+    def _resolved_backend_from_state(
+        ibus_injector: Optional[IBusTextInjector],
+        environment: DesktopEnvironment,
+        wayland_tool: Optional[str],
+    ) -> Optional[str]:
+        """Resolve a backend from one consistent snapshot of injector state."""
+        if ibus_injector is not None and environment in (
+            DesktopEnvironment.X11_IBUS,
+            DesktopEnvironment.WAYLAND_IBUS,
+        ):
+            return "ibus"
+        if environment in (
+            DesktopEnvironment.X11,
+            DesktopEnvironment.WAYLAND_XDOTOOL,
+        ):
+            return "xdotool"
+        return wayland_tool
+
+    def _resolved_backend(self) -> Optional[str]:
+        """The backend actually in effect, read back from final state.
+
+        Deliberately reads ``environment`` before ``wayland_tool``: the wtype
+        probe in ``__init__`` demotes a failed wtype to ``WAYLAND_XDOTOOL``
+        without clearing ``wayland_tool``, and ``inject_text()`` follows
+        ``environment``. Reading the tool first would report wtype while
+        injection actually goes through XWayland.
+        """
+        with self._state_lock:
+            ibus_injector = self._ibus_injector
+            environment = self.environment
+            wayland_tool = getattr(self, "wayland_tool", None)
+        return self._resolved_backend_from_state(ibus_injector, environment, wayland_tool)
+
+    def _warn_if_pin_not_honoured(self, pinned: str, source: Optional[str]) -> None:
+        """Say so when the backend in use is not the one that was pinned.
+
+        One comparison rather than a check per cause: a missing binary, a value
+        that does not apply to this session type, IBus being unavailable and the
+        wtype probe demoting to XWayland all end the same way -- something other
+        than the pinned backend is doing the typing -- and a new cause is covered
+        without adding a branch here.
+
+        This is a startup diagnostic, not a live invariant. It runs once, at the
+        end of construction. ``_try_recover_from_fallback()`` can later switch
+        the tool when ydotoold appears mid-session, so a pin that becomes
+        honoured (or stops being honoured) after startup is not reported again.
+        """
+        if not source or pinned == "auto":
+            return
+        with self._state_lock:
+            ibus_injector = self._ibus_injector
+            environment = self.environment
+            ibus_ready = self._ibus_ready
+            ibus_init_failed = self._ibus_init_failed
+            wayland_tool = getattr(self, "wayland_tool", None)
+        resolved = self._resolved_backend_from_state(ibus_injector, environment, wayland_tool)
+
+        if (
+            pinned == "ibus"
+            and ibus_injector is not None
+            and not ibus_ready
+            and not ibus_init_failed
+            and resolved != "ibus"
+        ):
+            logger.info(
+                "%s=%s: IBus initialization is pending; backend selection is not final.",
+                source,
+                pinned,
+            )
+            return
+        # Unreachable today (every path either sets a backend or raises before
+        # construction finishes), but guarded so a future path cannot render
+        # "using None instead" at a user.
+        if resolved is None or resolved == pinned:
+            return
+
+        if pinned == "ibus":
+            reason = " (IBus support is not available)" if not is_ibus_available() else ""
+        elif pinned == "portal":
+            # The portal is not a binary; probe it rather than PATH.
+            reason = "" if self._portal_probe() else " (RemoteDesktop portal is not available)"
+        elif pinned in self._SELECTABLE_BACKENDS:
+            reason = f" ({pinned} is not installed)" if not shutil.which(pinned) else ""
+        else:
+            reason = ""
+        logger.warning(
+            "%s=%s was not applied%s; using %s instead.", source, pinned, reason, resolved
+        )
+
+    def _check_dependencies(self):
+        """Check for the required tools for text injection."""
+        ibus_requested = False
+        forced, pin_source = self._resolve_backend_pin()
+        self._backend_pin = (forced, pin_source)
+        if pin_source and forced != "auto":
+            # States the request, not the result. Nothing has been checked for
+            # availability yet, and an unavailable pin falls through to
+            # autodetection further down -- so a word like "overriding" here
+            # would describe an outcome this line cannot know, and would read as
+            # contradicting the "was not applied" warning when it does not hold.
+            logger.info("%s=%s: backend pin requested", pin_source, forced)
+
+        # Prefer IBus on both X11 and Wayland - it sends Unicode directly,
+        # bypassing keyboard layout issues entirely
+        if is_ibus_available() and forced in ("auto", "ibus"):
+            ibus_active = is_ibus_active_input_method()
+            gtk_im = os.environ.get("GTK_IM_MODULE", "").lower()
+            qt_im = os.environ.get("QT_IM_MODULE", "").lower()
+            xmodifiers = os.environ.get("XMODIFIERS", "").lower()
+            explicit_non_ibus_im = (
+                (gtk_im and "ibus" not in gtk_im)
+                or (qt_im and "ibus" not in qt_im)
+                or (
+                    xmodifiers not in ("", "@im=none")
+                    and "@im=" in xmodifiers
+                    and "@im=ibus" not in xmodifiers
+                )
+            )
+            # Bridging Wayland DEs (GNOME): inject_text() switches to the
+            # real vocalinux engine for each commit, so a bare xkb:* baseline is
+            # fine (#501, #504). KDE joins that set only when KWin's Virtual
+            # Keyboard is confirmed on: a confirmed VK bridge is what makes the
+            # commits reach apps, and it is also what keeps the #752
+            # leftover-daemon trap (scoped activate reports success while
+            # Kate/Qt get nothing) excluded when the VK check fails (#911).
+            # Unbridged compositors still bail below.
+            wayland_scoped_ibus = (
+                self.environment == DesktopEnvironment.WAYLAND
+                and not explicit_non_ibus_im
+                and (not _is_kde_plasma_session() or self._kde_virtual_keyboard_enabled())
+            )
+
+            # Check if IBus is the active input method (not just installed)
+            # This is important because IBus may be installed but not being used,
+            # e.g., when the user has configured ydotool or Fcitx instead.
+            # VOCALINUX_FORCE_BACKEND=ibus bypasses the reachability guards below
+            # and goes straight to setup.
+            force_ibus = forced == "ibus"
+            if not force_ibus and not ibus_active and not wayland_scoped_ibus:
+                logger.info(
+                    "IBus is installed but not the active input method. "
+                    "Falling back to alternative text injection method."
+                )
+            # Check if ibus-daemon is running before attempting setup
+            elif not force_ibus and not is_ibus_daemon_running():
+                logger.info(
+                    "IBus daemon not running. This is normal on some desktop environments "
+                    "(e.g., KDE Plasma). Using alternative text injection method. "
+                    "For IBus setup, see: https://github.com/VocaHQ/vocalinux/wiki/IBus-Setup"
+                )
+            # Some Wayland compositors (COSMIC, Sway, Hyprland, ...) do not deliver
+            # IBus commits to native Wayland apps, so IBus would silently drop the
+            # text even though commit_text() reports success.
+            elif not force_ibus and not self._wayland_compositor_bridges_ibus():
+                logger.info(
+                    "Compositor '%s' does not bridge IBus to native Wayland apps; "
+                    "using virtual-keyboard injection (wtype/ydotool) instead.",
+                    os.environ.get("XDG_CURRENT_DESKTOP", "unknown"),
+                )
+            else:
+                # force_ibus short-circuits all three guards above, so a pinned
+                # run arrives here without any of them having been evaluated.
+                # This warns for the compositor guard only: that is the case
+                # with a documented silent failure (#478, #485), where IBus
+                # reports the commit as delivered and the text never arrives.
+                # The other two guards are out of scope for this warning.
+                if force_ibus and not self._wayland_compositor_bridges_ibus():
+                    logger.warning(
+                        "Compositor '%s' does not bridge IBus to native Wayland apps, but an "
+                        "explicit ibus pin overrides that check. Dictation may silently do "
+                        "nothing in native Wayland windows; remove the pin to fall back to "
+                        "wtype/ydotool.",
+                        os.environ.get("XDG_CURRENT_DESKTOP", "unknown"),
+                    )
+                try:
+                    if wayland_scoped_ibus and not ibus_active:
+                        logger.info(
+                            "Wayland with ibus-daemon running; using scoped IBus injection "
+                            "despite bare/inactive baseline engine"
+                        )
+                    self._ibus_injector = IBusTextInjector(auto_activate=False)
+                    ibus_requested = True
+                except Exception as e:
+                    logger.warning(f"IBus initialization failed: {e}, trying alternatives")
+        if self.environment == DesktopEnvironment.X11:
+            # Check for xdotool
+            if not shutil.which("xdotool"):
+                if ibus_requested:
+                    self._start_ibus_initialization()
+                    return
+                logger.error("xdotool not found. Please install it with: sudo apt install xdotool")
+                raise RuntimeError("Missing required dependency: xdotool")
+        else:
+            # Fallback: Check for wtype or ydotool for Wayland
+            wtype_available = shutil.which("wtype") is not None
+            ydotool_available = shutil.which("ydotool") is not None
+            xdotool_available = shutil.which("xdotool") is not None
+            # A pinned wtype/ydotool that is installed is honoured without
+            # autodetection, so probing the portal -- a session-bus round
+            # trip on a private worker -- is skipped for those users.
+            pinned_tool_present = (forced == "wtype" and wtype_available) or (
+                forced == "ydotool" and ydotool_available
+            )
+            portal_available = not pinned_tool_present and self._portal_probe()
+
+            if ydotool_available:
+                _warn_if_ydotool_globally_enabled()
+
+            # Prefer ydotool when the daemon is (or can be) ready. Flatpak ships
+            # ydotool for native Wayland typing; wtype needs a Wayland socket.
+            # The RemoteDesktop portal sits ahead of both in autodetection: it
+            # is the only injection path Wayland sanctions, works inside the
+            # Flatpak sandbox without /dev/uinput, and reaches native clients
+            # on compositors with no input-method-v2 bridge. KDE is the
+            # exception: KWin's portal scrambles letter case (#911), so on
+            # Plasma a present ydotool goes first -- the ordering from before
+            # the portal backend existed.
+            kde_ydotool_first = ydotool_available and _is_kde_plasma_session()
+            if forced == "portal" and portal_available:
+                self._select_portal_backend(
+                    "%s=portal: using RemoteDesktop portal for Wayland injection",
+                    pin_source,
+                )
+            elif forced == "wtype" and wtype_available:
+                self.wayland_tool = "wtype"
+                logger.info("%s=wtype: using wtype for Wayland injection", pin_source)
+            elif forced == "ydotool" and ydotool_available:
+                self._ensure_ydotoold()
+                self.wayland_tool = "ydotool"
+                logger.info("%s=ydotool: using ydotool for Wayland injection", pin_source)
+            elif portal_available and not kde_ydotool_first:
+                self._select_portal_backend(
+                    "Using the RemoteDesktop portal for Wayland text injection"
+                )
+            elif ydotool_available and self._ensure_ydotoold():
+                self.wayland_tool = "ydotool"
+                logger.info("Using ydotool for Wayland text injection")
+            elif portal_available:
+                # Reached only on KDE after ydotool proved unusable; on other
+                # desktops the earlier portal branch already fired. A daemonless
+                # ydotool must not outrank a working portal: it may fail at
+                # injection time (no /dev/uinput), while the portal delivers.
+                self._select_portal_backend(
+                    "Using the RemoteDesktop portal for Wayland text injection"
+                )
+            elif ydotool_available and not wtype_available:
+                self.wayland_tool = "ydotool"
+                logger.warning(
+                    "ydotoold not ready; using ydotool without daemon "
+                    "(may fail or have latency/permission issues)"
+                )
+            elif wtype_available:
+                self.wayland_tool = "wtype"
+                logger.info(f"Using {self.wayland_tool} for Wayland text injection")
+            elif xdotool_available:
+                # Fallback to xdotool with XWayland
+                self.environment = DesktopEnvironment.WAYLAND_XDOTOOL
+                logger.info(
+                    "No native Wayland tools found. Using xdotool with XWayland as fallback"
+                )
+            else:
+                if ibus_requested:
+                    self._start_ibus_initialization()
+                    return
+                logger.error(
+                    "No text injection tools found. Please install one of:\n"
+                    "- IBus (recommended, usually pre-installed)\n"
+                    "- wtype: sudo apt install wtype (GNOME/Sway)\n"
+                    "- ydotool: sudo apt install ydotool (works on all Wayland compositors)\n"
+                    "- xdotool: sudo apt install xdotool (X11/XWayland only)\n"
+                    "\n"
+                    "For KDE Plasma Wayland users: wtype is not supported. "
+                    f"{_kde_wayland_ibus_hint()}\n"
+                    f"Or install ydotool/wl-copy for fallback:\n{_ydotool_install_guidance()}\n"
+                    "Or for clipboard fallback: sudo apt install wl-copy"
+                )
+                raise RuntimeError("Missing required dependencies for text injection")
+
+        if ibus_requested:
+            self._start_ibus_initialization()
+
+    def _portal_probe(self) -> bool:
+        """Check whether the RemoteDesktop portal can inject keyboard events.
+
+        The client is created lazily and cached on first success so
+        ``wayland_tool == "portal"`` reuses the same connection/worker. The
+        probe itself only asks the portal for its interface version; the
+        session handshake (and its one-time permission prompt) is deferred
+        to the first actual injection.
+        """
+        # getattr: __new__-constructed injectors (tests) lack __init__ attrs.
+        portal = getattr(self, "_portal", None)
+        if portal is None:
+            if not RemoteDesktopPortal.supported():
+                return False
+            try:
+                portal = RemoteDesktopPortal()
+            except Exception as e:
+                logger.debug(f"Could not create the RemoteDesktop portal client: {e}")
+                return False
+        try:
+            if portal.probe():
+                self._portal = portal
+                return True
+        except Exception as e:
+            logger.debug(f"RemoteDesktop portal probe failed: {e}")
+        return False
+
+    def _select_portal_backend(self, log_message: str, *args: object) -> None:
+        """Select the RemoteDesktop portal as the Wayland injection tool."""
+        self.wayland_tool = "portal"
+        if self.environment == DesktopEnvironment.WAYLAND_XDOTOOL:
+            # The portal reaches native Wayland clients, not just XWayland, so
+            # a Flatpak session that demoted to XWayland upgrades back.
+            self.environment = DesktopEnvironment.WAYLAND
+        logger.info(log_message, *args)
+
+    def _try_inject_with_portal(self, text: str) -> Tuple[bool, Optional[str]]:
+        """Send text through the RemoteDesktop portal.
+
+        Returns ``(True, "")`` on success. On failure the second element is
+        the part of ``text`` the portal had not typed yet -- the whole string
+        when it never got started, the tail when it failed mid-string -- so
+        the fallback backend does not duplicate delivered characters. It is
+        ``None`` when the job timed out without reporting its count: whatever
+        reached the compositor is then unknowable and nothing may be replayed.
+        """
+        portal = getattr(self, "_portal", None)
+        if portal is None:
+            return False, text
+        try:
+            return bool(portal.inject_text(text)), ""
+        except RemoteDesktopPortalError as e:
+            logger.warning(f"RemoteDesktop portal injection failed: {e}")
+            if e.delivered is None:
+                return False, None
+            return False, text[e.delivered :]
+        except Exception as e:
+            logger.warning(f"RemoteDesktop portal injection failed: {e}")
+            return False, text
+
+    def _try_portal_keypress(self, keysym: int, count: int = 1) -> Tuple[bool, Optional[int]]:
+        """Tap one keysym ``count`` times through the portal.
+
+        Returns ``(True, 0)`` on success; on failure the taps still owed, so
+        the fallback does not re-send presses the portal already delivered.
+        ``None`` means a timed-out job never reported its count, so no part
+        of the request may be replayed.
+        """
+        portal = getattr(self, "_portal", None)
+        if portal is None:
+            return False, count
+        try:
+            portal.tap_keysym(keysym, count)
+            return True, 0
+        except RemoteDesktopPortalError as e:
+            logger.warning(f"RemoteDesktop portal key event failed: {e}")
+            if e.delivered is None:
+                return False, None
+            return False, max(0, count - e.delivered)
+        except Exception as e:
+            logger.warning(f"RemoteDesktop portal key event failed: {e}")
+            return False, count
+
+    def _try_portal_shortcut(
+        self, steps: List[Tuple[List[str], str]]
+    ) -> Tuple[bool, Optional[List[Tuple[List[str], str]]]]:
+        """Send parsed shortcut steps through the portal.
+
+        Returns ``(True, [])`` on success; on failure the steps still to
+        send, so the fallback does not re-run steps that already fired.
+        ``None`` means a timed-out job never reported its count, so no step
+        may be replayed.
+        """
+        portal = getattr(self, "_portal", None)
+        if portal is None:
+            return False, steps
+        try:
+            portal.send_shortcut(steps)
+            return True, []
+        except RemoteDesktopPortalError as e:
+            logger.warning(f"RemoteDesktop portal shortcut failed: {e}")
+            if e.delivered is None:
+                return False, None
+            return False, list(steps[e.delivered :])
+        except Exception as e:
+            logger.warning(f"RemoteDesktop portal shortcut failed: {e}")
+            return False, list(steps)
+
+    def _demote_portal_backend(self) -> bool:
+        """Drop the portal for this run and pick the next Wayland tool.
+
+        Mirrors the startup preference: ydotool with a ready daemon, then
+        ydotool alone when wtype is absent, then wtype, then the XWayland
+        fallback. Returns False when nothing else exists, leaving the
+        clipboard fallback to report the failure.
+        """
+        portal = getattr(self, "_portal", None)
+        if portal is not None:
+            try:
+                portal.close()
+            except Exception as e:
+                logger.debug(f"Could not close RemoteDesktop portal client: {e}")
+            self._portal = None
+        with self._state_lock:
+            self.wayland_tool = None
+
+        ydotool_available = shutil.which("ydotool") is not None
+        wtype_available = shutil.which("wtype") is not None
+        xdotool_available = shutil.which("xdotool") is not None
+
+        tool = None
+        if ydotool_available and self._ensure_ydotoold():
+            tool = "ydotool"
+        elif ydotool_available and not wtype_available:
+            tool = "ydotool"
+        elif wtype_available:
+            tool = "wtype"
+        elif xdotool_available:
+            with self._state_lock:
+                self.environment = DesktopEnvironment.WAYLAND_XDOTOOL
+            logger.warning("RemoteDesktop portal failed; using xdotool/XWayland fallback")
+            return True
+        else:
+            return False
+
+        with self._state_lock:
+            self.wayland_tool = tool
+        logger.warning(f"RemoteDesktop portal failed; falling back to {tool}")
+        return True
+
+    def _start_ibus_initialization(self) -> None:
+        if self._ibus_injector is None or self._ibus_init_thread is not None:
+            return
+
+        if self.environment == DesktopEnvironment.WAYLAND and not hasattr(self, "wayland_tool"):
+            if shutil.which("wtype"):
+                self.wayland_tool = "wtype"
+            elif shutil.which("ydotool"):
+                self.wayland_tool = "ydotool"
+
+        self._ibus_init_failed = False
+        self._ibus_init_thread = threading.Thread(
+            target=self._initialize_ibus_in_background,
+            daemon=True,
+        )
+        self._ibus_init_thread.start()
+        logger.info("Starting IBus warmup in background")
+
+    def _initialize_ibus_in_background(self) -> None:
+        if self._ibus_injector is None:
+            return
+
+        try:
+            # Keep the Vocalinux IBus process warm without selecting it as the
+            # user's active keyboard engine. Activation is scoped to each text
+            # commit so normal typing keeps layout-specific compose/dead keys.
+            self._ibus_injector.prepare_engine()
+            with self._state_lock:
+                self._ibus_ready = True
+                self._ibus_init_failed = False
+                if self._session_environment == DesktopEnvironment.X11:
+                    self.environment = DesktopEnvironment.X11_IBUS
+                else:
+                    self.environment = DesktopEnvironment.WAYLAND_IBUS
+            logger.info(
+                f"Using IBus for {self.environment.value} text injection (best compatibility)"
+            )
+        except Exception as e:
+            with self._state_lock:
+                self._ibus_ready = False
+                self._ibus_init_failed = True
+            logger.warning(f"IBus initialization failed: {e}, continuing with fallback")
+
+    def _get_clipboard_tools(self) -> list:
+        tools = []
+        # Prefer wl-copy on Wayland (including Flatpak with --socket=wayland).
+        host_is_wayland = (
+            self._session_environment == DesktopEnvironment.WAYLAND
+            or os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+            or bool(os.environ.get("WAYLAND_DISPLAY"))
+        )
+        if host_is_wayland and shutil.which("wl-copy"):
+            tools.append("wl-copy")
+        if shutil.which("xclip"):
+            tools.append("xclip")
+        if shutil.which("xsel"):
+            tools.append("xsel")
+        if not host_is_wayland and shutil.which("wl-copy"):
+            tools.append("wl-copy")
+        return tools
+
+    def _x11_clipboard_tools(self) -> list:
+        """xclip/xsel only: the X11 CLIPBOARD an xdotool paste actually reads."""
+        return [name for name in ("xclip", "xsel") if shutil.which(name)]
+
+    def _run_clipboard_command(self, tool: str, text: str) -> bool:
+        # NB: wl-copy/xclip/xsel fork a background process that keeps owning the
+        # selection in order to serve it. That child inherits our pipes, so
+        # capturing stderr via subprocess.PIPE makes run() block until the child
+        # exits (i.e. until the clipboard is next overwritten) and then time out
+        # — even though the copy itself succeeded. Redirect to DEVNULL so run()
+        # only waits for the short-lived foreground process.
+        if tool == "wl-copy":
+            subprocess.run(
+                ["wl-copy", text],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=self._clipboard_timeout,
+                env=host_env(),
+            )
+            return True
+
+        if tool == "xclip":
+            subprocess.run(
+                ["xclip", "-selection", "clipboard"],
+                input=text,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=self._clipboard_timeout,
+                env=host_env(),
+            )
+            return True
+
+        if tool == "xsel":
+            subprocess.run(
+                ["xsel", "--clipboard", "--input"],
+                input=text,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=self._clipboard_timeout,
+                env=host_env(),
+            )
+            return True
+
+        return False
+
+    def _switch_to_non_ibus_backend(self) -> bool:
+        """Switch from IBus mode to a non-IBus backend for runtime fallback."""
+        if self.environment == DesktopEnvironment.X11_IBUS:
+            if shutil.which("xdotool"):
+                with self._state_lock:
+                    self.environment = DesktopEnvironment.X11
+                logger.warning("IBus injection failed, switching to X11 xdotool fallback")
+                return True
+
+            logger.error("IBus fallback failed: xdotool is not available on X11")
+            return False
+
+        if self.environment == DesktopEnvironment.WAYLAND_IBUS:
+            ydotool_available = shutil.which("ydotool") is not None
+            wtype_available = shutil.which("wtype") is not None
+            xdotool_available = shutil.which("xdotool") is not None
+
+            if ydotool_available:
+                try:
+                    subprocess.run(
+                        ["ydotool", "type", ""],
+                        check=True,
+                        stderr=subprocess.PIPE,
+                        timeout=2,
+                        env=host_env(),
+                    )
+                    with self._state_lock:
+                        self.wayland_tool = "ydotool"
+                        self.environment = DesktopEnvironment.WAYLAND
+                    logger.warning("IBus injection failed, switching to Wayland ydotool fallback")
+                    return True
+                except (
+                    subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired,
+                    FileNotFoundError,
+                ):
+                    logger.debug("ydotool fallback unavailable (daemon not running)")
+
+            if wtype_available:
+                with self._state_lock:
+                    self.wayland_tool = "wtype"
+                    self.environment = DesktopEnvironment.WAYLAND
+                logger.warning("IBus injection failed, switching to Wayland wtype fallback")
+                return True
+
+            if xdotool_available:
+                with self._state_lock:
+                    self.environment = DesktopEnvironment.WAYLAND_XDOTOOL
+                logger.warning("IBus injection failed, switching to XWayland xdotool fallback")
+                return True
+
+            logger.error(
+                "IBus fallback failed: no Wayland text injection tools available "
+                "(ydotool, wtype, xdotool)"
+            )
+            return False
+
+        return True
+
+    def _test_xdotool_fallback(self):
+        """Test if xdotool is working correctly with XWayland."""
+        try:
+            # Get the DISPLAY environment variable for XWayland
+            xwayland_display = os.environ.get("DISPLAY", ":0")
+            logger.debug(f"Using DISPLAY={xwayland_display} for XWayland")
+
+            # Try using xdotool with explicit DISPLAY setting
+            test_env = os.environ.copy()
+            test_env["DISPLAY"] = xwayland_display
+
+            # Check if we can get active window (less intrusive test)
+            window_id = subprocess.run(
+                ["xdotool", "getwindowfocus"],
+                env=host_env(test_env),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            if window_id.returncode != 0 or "failed" in window_id.stderr.lower():
+                logger.warning(f"XWayland detection test failed: {window_id.stderr}")
+                # Try to force XWayland environment more explicitly
+                test_env["GDK_BACKEND"] = "x11"
+            else:
+                logger.debug("XWayland test successful")
+        except Exception as e:
+            logger.error(f"Failed to test XWayland fallback: {e}")
+
+    def _try_recover_from_fallback(self):
+        """
+        Try to recover from xdotool fallback mode by re-checking for better tools.
+
+        This allows switching to ydotool if the daemon was started after initial detection,
+        or to wtype if the compositor now supports virtual keyboard.
+
+        Returns:
+            True if a better tool was found and environment was updated, False otherwise
+        """
+        if self.environment != DesktopEnvironment.WAYLAND_XDOTOOL:
+            return False
+
+        logger.info("Checking for better Wayland text injection tools...")
+
+        # Check for ydotool with daemon running
+        if shutil.which("ydotool"):
+            try:
+                subprocess.run(
+                    ["ydotool", "type", ""],
+                    check=True,
+                    stderr=subprocess.PIPE,
+                    timeout=2,
+                    env=host_env(),
+                )
+                self.wayland_tool = "ydotool"
+                self.environment = DesktopEnvironment.WAYLAND
+                logger.info("Recovered to ydotool - ydotoold daemon is now running")
+                return True
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+                logger.debug("ydotool available but daemon not running")
+
+        # Check for wtype with compositor support
+        if shutil.which("wtype"):
+            try:
+                result = self._probe_wtype_support()
+                error_output = result.stderr.lower()
+                if "compositor does not support" not in error_output and result.returncode == 0:
+                    self.wayland_tool = "wtype"
+                    self.environment = DesktopEnvironment.WAYLAND
+                    logger.info("Recovered to wtype - compositor now supports virtual keyboard")
+                    return True
+            except Exception as e:
+                logger.debug(f"Error testing wtype: {e}")
+
+        logger.debug("No better tools available, continuing with xdotool fallback")
+        return False
+
+    def _copy_to_clipboard(self, text: str, tools: Optional[list] = None) -> bool:
+        """
+        Copy text to clipboard.
+
+        This is useful for:
+        - Fallback when injection fails on unsupported compositors (like KDE Plasma)
+        - Always-on clipboard copy so users can paste recognized text elsewhere
+
+        Args:
+            text: The text to copy to clipboard
+            tools: Clipboard binaries to try. Defaults to ``_get_clipboard_tools``
+                (session clipboard). XWayland paste passes xclip/xsel so the
+                text lands on the X11 CLIPBOARD that xdotool Ctrl+V reads.
+
+        Returns:
+            True if clipboard copy was successful, False otherwise
+        """
+        logger.info("Copying text to clipboard")
+
+        for tool in tools if tools is not None else self._get_clipboard_tools():
+            if self._clipboard_tool_health.get(tool) is False:
+                continue
+
+            try:
+                if self._run_clipboard_command(tool, text):
+                    self._clipboard_tool_health[tool] = True
+                    logger.info(f"Text copied to clipboard using {tool}")
+                    return True
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                FileNotFoundError,
+            ) as e:
+                self._clipboard_tool_health[tool] = False
+                logger.warning(f"{tool} failed: {e}")
+
+        logger.warning(
+            "Clipboard copy failed. Install wl-copy (Wayland) or xclip/xsel "
+            "to enable clipboard functionality."
+        )
+        return False
+
+    def _clear_clipboard(self, tools: Optional[list] = None) -> bool:
+        """
+        Clear the clipboard using the first available tool.
+
+        Each backend has its own clear command:
+        - wl-copy: ``--clear`` flag removes the selection entirely
+        - xsel:    ``--clear`` flag
+        - xclip:   pipe empty input (creates an empty text offer)
+
+        Args:
+            tools: Clipboard binaries to try. Defaults to ``_get_clipboard_tools``.
+                Pass the same list the matching copy used (xclip/xsel for an
+                XWayland paste) so restore hits the same selection.
+
+        Returns True if the clipboard was cleared successfully.
+        """
+        for tool in tools if tools is not None else self._get_clipboard_tools():
+            if self._clipboard_tool_health.get(tool) is False:
+                continue
+            try:
+                if tool == "wl-copy":
+                    subprocess.run(
+                        ["wl-copy", "--clear"],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=self._clipboard_timeout,
+                        env=host_env(),
+                    )
+                    return True
+                if tool == "xsel":
+                    subprocess.run(
+                        ["xsel", "--clipboard", "--clear"],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=self._clipboard_timeout,
+                        env=host_env(),
+                    )
+                    return True
+                if tool == "xclip":
+                    subprocess.run(
+                        ["xclip", "-selection", "clipboard"],
+                        input="",
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                        timeout=self._clipboard_timeout,
+                        env=host_env(),
+                    )
+                    return True
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                FileNotFoundError,
+            ):
+                continue
+        return False
+
+    def _should_copy_to_clipboard(self) -> bool:
+        """Check if copy-to-clipboard setting is enabled."""
+        try:
+            import json
+
+            config_path = os.path.join(config_dir(), "config.json")
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                return config.get("text_injection", {}).get("copy_to_clipboard", False)
+        except Exception as e:
+            logger.debug(f"Could not read copy_to_clipboard setting: {e}")
+        return False
+
+    def _show_clipboard_fallback_notification(self):
+        """Show a desktop notification when text is copied to clipboard as fallback."""
+        try:
+            subprocess.Popen(
+                [
+                    "notify-send",
+                    "-i",
+                    "edit-paste",
+                    "-a",
+                    "Vocalinux",
+                    "Text copied to clipboard",
+                    "Text injection failed — paste with Ctrl+V " "(Ctrl+Shift+V in a terminal)",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=host_env(),
+            )
+        except Exception as e:
+            logger.debug(f"Could not show clipboard notification: {e}")
+
+    def abort_injections(self) -> None:
+        """Ask in-flight injections to stop at their next safe boundary.
+
+        Called on application quit so a worker holding the injection lock
+        finishes promptly: chunk loops and the Wayland typing call poll the
+        flag and raise ``_InjectionAborted`` instead of running to
+        completion, while every subprocess that is already in flight still
+        returns on its own timeout.
+        """
+        self._abort_injections.set()
+
+    def inject_text(self, text: str) -> bool:
+        """
+        Inject text into the currently focused application.
+
+        Args:
+            text: The text to inject
+
+        Returns:
+            True if injection was successful, False otherwise
+        """
+        self.last_typed_count = 0
+
+        if not text or not text.strip():
+            logger.debug("Empty text provided, skipping injection")
+            return True
+
+        if self._abort_injections.is_set():
+            return False
+
+        logger.info(f"Starting text injection: '{text}' (length: {len(text)})")
+        logger.debug(f"Environment: {self.environment}")
+
+        # Get information about the current window/application
+        self._log_current_window_info()
+
+        # Note: No shell escaping needed - subprocess is called with list arguments,
+        # which passes text directly without shell interpretation
+        logger.debug(f"Text to inject: '{text}'")
+
+        # Re-check for available tools in Wayland fallback mode
+        # This allows switching to ydotool if the daemon was started after initial detection
+        if self.environment == DesktopEnvironment.WAYLAND_XDOTOOL:
+            self._try_recover_from_fallback()
+
+        try:
+            with self._state_lock:
+                current_env = self.environment
+                ibus_injector = self._ibus_injector
+
+            if (
+                current_env == DesktopEnvironment.WAYLAND_IBUS
+                or current_env == DesktopEnvironment.X11_IBUS
+            ):
+                if ibus_injector is not None:
+                    result = ibus_injector.inject_text(text)
+                    if result:
+                        logger.info("Text injection completed successfully")
+                        if self._should_copy_to_clipboard():
+                            threading.Thread(
+                                target=self._copy_to_clipboard,
+                                args=(text,),
+                                daemon=True,
+                            ).start()
+                        return True
+
+                    logger.warning(
+                        "IBus runtime injection failed. Falling back to non-IBus backend."
+                    )
+                    if not self._switch_to_non_ibus_backend():
+                        raise RuntimeError(
+                            "IBus injection failed and no non-IBus fallback is available"
+                        )
+                else:
+                    logger.error("IBus injector not initialized, trying non-IBus fallback")
+                    if not self._switch_to_non_ibus_backend():
+                        raise RuntimeError(
+                            "IBus injector not initialized and no non-IBus fallback is available"
+                        )
+
+            with self._state_lock:
+                current_env = self.environment
+
+            if (
+                current_env == DesktopEnvironment.X11
+                or current_env == DesktopEnvironment.WAYLAND_XDOTOOL
+            ):
+                self._inject_with_xdotool(text)
+            else:
+                try:
+                    self._inject_with_wayland_tool(text)
+                except subprocess.CalledProcessError as e:
+                    # A chunked type call may have delivered a prefix; the
+                    # fallback continues from the untyped remainder so text
+                    # already on screen is never sent a second time.
+                    typed = e.typed if isinstance(e, _PartiallyTyped) else 0
+                    remaining = text[typed:]
+                    stderr_msg = e.stderr.strip() if e.stderr else "No stderr output"
+                    unsupported_wayland = (
+                        "compositor does not support" in str(e).lower()
+                        or "compositor does not support" in stderr_msg.lower()
+                    )
+                    logger.warning(
+                        f"Wayland tool failed: {e}. stderr: {stderr_msg}. Falling back to xdotool"
+                    )
+                    if (
+                        unsupported_wayland
+                        and current_env == DesktopEnvironment.WAYLAND
+                        and _is_kde_plasma_session()
+                    ):
+                        logger.warning(
+                            "KDE Plasma Wayland rejected virtual keyboard injection. "
+                            f"{_kde_wayland_ibus_hint()}"
+                        )
+                    if unsupported_wayland and shutil.which("xdotool"):
+                        logger.info(
+                            "Switching to XWayland fallback - will re-check for better tools"
+                        )
+                        with self._state_lock:
+                            self.environment = DesktopEnvironment.WAYLAND_XDOTOOL
+                        try:
+                            self._inject_with_xdotool(remaining)
+                        except _PartiallyTyped as nested:
+                            # Keep the count relative to the original text.
+                            raise _PartiallyTyped(typed + nested.typed, nested) from nested
+                    else:
+                        raise
+            logger.info("Text injection completed successfully")
+
+            if self._should_copy_to_clipboard():
+                threading.Thread(
+                    target=self._copy_to_clipboard,
+                    args=(text,),
+                    daemon=True,
+                ).start()
+
+            self.last_typed_count = len(text)
+            return True
+        except _InjectionAborted:
+            self.last_typed_count = -1
+            logger.info("Injection aborted by shutdown")
+            return False
+        except _PartiallyTyped as e:
+            # A prefix is already on screen; the clipboard fallback must hold
+            # only the untyped remainder or a manual paste duplicates it.
+            # Reporting success would mark the whole transcription injected,
+            # so "delete that" could erase text before the typed prefix.
+            logger.error(f"Text injection failed after a prefix was typed: {e}")
+            self.last_typed_count = e.typed
+            remaining = text[e.typed :]
+            try:
+                if self._copy_to_clipboard(remaining):
+                    logger.info(
+                        "Remaining text copied to clipboard as fallback - user can paste manually"
+                    )
+                    self._show_clipboard_fallback_notification()
+            except (OSError, subprocess.SubprocessError, RuntimeError) as clipboard_error:
+                logger.debug(f"Clipboard fallback also failed: {clipboard_error}")
+
+            try:
+                from ..ui.audio_feedback import play_error_sound
+
+                play_error_sound()
+            except ImportError:
+                logger.warning("Could not import audio feedback module")
+            return False
+        except subprocess.TimeoutExpired as e:
+            # A type call that ran past its bound may have delivered only part
+            # of the text; putting the full text on the clipboard would let a
+            # manual paste duplicate the fragment already typed.  How much
+            # arrived is unknowable, so the caller must not trust any count.
+            self.last_typed_count = -1
+            logger.error(f"Text injection timed out, text may be partially typed: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to inject text: {e}", exc_info=True)
+
+            try:
+                if self._copy_to_clipboard(text):
+                    logger.info("Text copied to clipboard as fallback - user can paste manually")
+                    self._show_clipboard_fallback_notification()
+                    return True
+            except (OSError, subprocess.SubprocessError, RuntimeError) as clipboard_error:
+                logger.debug(f"Clipboard fallback also failed: {clipboard_error}")
+
+            try:
+                from ..ui.audio_feedback import play_error_sound
+
+                play_error_sound()
+            except ImportError:
+                logger.warning("Could not import audio feedback module")
+            return False
+
+    def _inject_with_xdotool(self, text: str):
+        """
+        Inject text using xdotool for X11 environments.
+
+        On WAYLAND_XDOTOOL, try an X11 clipboard paste first. ``xdotool type``
+        follows the active layout and garbles non-Latin text (#657).
+
+        Args:
+            text: The text to inject
+        """
+        env = os.environ.copy()
+
+        if self.environment == DesktopEnvironment.WAYLAND_XDOTOOL:
+            env["GDK_BACKEND"] = "x11"
+            env["QT_QPA_PLATFORM"] = "xcb"
+            if not env.get("DISPLAY"):
+                env["DISPLAY"] = ":0"
+            # xclip reads process env, not the type-path subprocess env.
+            os.environ.setdefault("DISPLAY", env["DISPLAY"])
+            logger.debug(f"Using XWayland with DISPLAY={env['DISPLAY']}")
+            self._wait_for_modifiers_released()
+            if self._inject_via_clipboard_paste(text, env=env):
+                return
+            logger.warning(
+                "Clipboard paste failed, falling back to xdotool type "
+                "(character-by-character; text may be scrambled on non-US layouts)"
+            )
+
+            # Add a small delay to ensure text is injected properly
+            time.sleep(0.3)  # Increased delay for better reliability
+
+            # Try to ensure the window has focus using more robust approach
+            try:
+                # Get current active window
+                active_window = subprocess.run(
+                    ["xdotool", "getactivewindow"],
+                    env=host_env(env),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                    timeout=2,
+                )
+
+                if active_window.returncode == 0 and active_window.stdout.strip():
+                    window_id = active_window.stdout.strip()
+                    # Focus explicitly on that window
+                    subprocess.run(
+                        ["xdotool", "windowactivate", "--sync", window_id],
+                        env=host_env(env),
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                        timeout=5,
+                    )
+                    # Wait a moment for the focus to take effect
+                    time.sleep(0.2)
+            except Exception as e:
+                logger.debug(f"Window focus command failed: {e}")
+
+        # Inject text using xdotool
+        try:
+            max_retries = 2
+            logger.debug(f"Starting xdotool injection with {max_retries} max retries")
+
+            # Retries resume at the first untyped chunk: restarting from the
+            # top would duplicate the chunks a failed attempt already sent.
+            typed = 0
+            for retry in range(max_retries + 1):
+                try:
+                    # Inject in smaller chunks to avoid issues with very long text
+                    chunk_size = 20  # Reduced chunk size for better reliability
+                    total_chunks = (len(text) + chunk_size - 1) // chunk_size
+                    logger.debug(
+                        f"Splitting text into {total_chunks} chunks of max {chunk_size} chars"
+                    )
+
+                    for i in range(typed, len(text), chunk_size):
+                        if self._abort_injections.is_set():
+                            raise _InjectionAborted
+                        chunk = text[i : i + chunk_size]
+                        chunk_num = (i // chunk_size) + 1
+
+                        # First try with clearmodifiers. ``--`` ends option
+                        # parsing: a chunk that starts with '-' (a word
+                        # hyphenated across the chunk boundary) is typed
+                        # literally instead of read as a flag and rejected
+                        # (#921).
+                        cmd = ["xdotool", "type", "--clearmodifiers", "--", chunk]
+                        logger.debug(f"Injecting chunk {chunk_num}/{total_chunks}: '{chunk}'")
+
+                        subprocess.run(
+                            cmd,
+                            env=host_env(env),
+                            check=True,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            timeout=5,
+                        )
+                        typed = min(i + chunk_size, len(text))
+
+                        # Add a larger delay between chunks
+                        if i + chunk_size < len(text):
+                            time.sleep(0.1)
+
+                    logger.info(
+                        f"Text injected using xdotool: '{text[:20]}...' ({len(text)} chars)"
+                    )
+                    break  # Successfully injected
+                except subprocess.CalledProcessError as chunk_error:
+                    if retry < max_retries:
+                        logger.warning(
+                            f"Retrying text injection (attempt {retry + 1}/{max_retries}): "
+                            f"{chunk_error.stderr}"
+                        )
+                        time.sleep(0.5)  # Wait before retry
+                    else:
+                        logger.error(f"Final attempt failed: {chunk_error.stderr}")
+                        # typed counts only completed chunks, so the
+                        # clipboard fallback gets the untyped remainder.
+                        raise _PartiallyTyped(typed, chunk_error) from chunk_error
+                except subprocess.TimeoutExpired:
+                    if retry < max_retries:
+                        logger.warning(
+                            f"Text injection timeout, retrying (attempt {retry + 1}/{max_retries})"
+                        )
+                        time.sleep(0.5)
+                    else:
+                        logger.error("Text injection timed out on final attempt")
+                        raise
+
+            # Release modifiers without sending Escape, which applications may
+            # interpret as a request to cancel or leave the focused input.
+            try:
+                subprocess.run(
+                    [
+                        "xdotool",
+                        "keyup",
+                        "--clearmodifiers",
+                        "Control_L",
+                        "Control_R",
+                        "Shift_L",
+                        "Shift_R",
+                        "Alt_L",
+                        "Alt_R",
+                        "Super_L",
+                        "Super_R",
+                    ],
+                    env=host_env(env),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=2,
+                )
+            except Exception:
+                pass  # Ignore any errors from this command
+        except subprocess.CalledProcessError as e:
+            logger.error(f"xdotool error: {e.stderr}")
+            raise
+
+    def _has_non_ascii(self, text: str) -> bool:
+        """Check if text contains any non-ASCII characters."""
+        try:
+            text.encode("ascii")
+            return False
+        except UnicodeEncodeError:
+            return True
+
+    def _read_clipboard(self) -> Optional[str]:
+        """
+        Read clipboard text only.
+
+        Requests text MIME types so image/file data is not treated as text.
+        Returns the text, "" if a tool reports a verifiably empty clipboard,
+        or None if unreadable as text (non-text data, no tool, or error).
+
+        On WAYLAND_XDOTOOL this reads the X11 CLIPBOARD (xclip/xsel), matching
+        the selection the xdotool paste wrote. wl-paste is a different clipboard.
+        """
+        prefer_x11 = self.environment == DesktopEnvironment.WAYLAND_XDOTOOL
+        host_is_wayland = (
+            self._session_environment == DesktopEnvironment.WAYLAND
+            or os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+            or bool(os.environ.get("WAYLAND_DISPLAY"))
+        )
+
+        # Bare `xclip -o` / `wl-paste` can return raw image bytes with rc=0.
+        candidates: list[list[str]] = []
+        if not prefer_x11 and host_is_wayland and shutil.which("wl-paste"):
+            candidates.append(["wl-paste", "--no-newline", "--type", "text"])
+        if shutil.which("xclip"):
+            candidates.append(["xclip", "-selection", "clipboard", "-o", "-t", "UTF8_STRING"])
+        if shutil.which("xsel"):
+            candidates.append(["xsel", "--clipboard", "--output"])
+        if not prefer_x11 and not host_is_wayland and shutil.which("wl-paste"):
+            candidates.append(["wl-paste", "--no-newline", "--type", "text"])
+
+        saw_empty = False
+        for cmd in candidates:
+            try:
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=1.0,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=host_env(),
+                )
+                if result.returncode == 0:
+                    return result.stdout
+                # Only wl-paste's empty signal — xclip "target not available"
+                # also means image/file. Keep scanning other backends.
+                if "nothing is copied" in (result.stderr or "").lower():
+                    saw_empty = True
+            except (subprocess.TimeoutExpired, OSError, UnicodeDecodeError):
+                continue
+
+        return "" if saw_empty else None
+
+    def _paste_shortcut_preference(self) -> str:
+        """Return the configured clipboard-paste shortcut id."""
+        from ..ui.config_manager import DEFAULT_PASTE_SHORTCUT, normalize_paste_shortcut
+
+        try:
+            import json
+
+            config_path = os.path.join(config_dir(), "config.json")
+            if os.path.exists(config_path):
+                with open(config_path, "r") as handle:
+                    config = json.load(handle)
+                return normalize_paste_shortcut(
+                    config.get("text_injection", {}).get("paste_shortcut")
+                )
+        except Exception as exc:
+            logger.debug(f"Could not read paste_shortcut setting: {exc}")
+        return DEFAULT_PASTE_SHORTCUT
+
+    def _should_use_terminal_paste(self) -> bool:
+        """Return True when clipboard injection should send Ctrl+Shift+V.
+
+        Detection is best-effort. A probe error must not abort injection — the
+        caller falls back to Ctrl+V.
+        """
+        try:
+            preference = self._paste_shortcut_preference()
+            if preference == "ctrl+shift+v":
+                return True
+            if preference == "ctrl+v":
+                return False
+            return bool(is_focused_window_terminal())
+        except Exception as exc:
+            logger.debug(f"Terminal paste detection failed: {exc}")
+            return False
+
+    def _inject_via_clipboard_paste(self, text: str, env: Optional[dict] = None) -> bool:
+        """
+        Inject text by copying to clipboard and simulating a paste chord.
+
+        Ordinary text fields receive Ctrl+V. Terminal emulators typically bind
+        paste to Ctrl+Shift+V, so auto-detect (or the Settings override) picks
+        that chord instead. Workaround for ydotool's US-ASCII-only key events
+        (see issue #362). The chord itself is sent with wtype keysyms when
+        that tool is usable, otherwise with a layout-resolved ydotool keycode
+        for Latin 'v' (issue #787). On WAYLAND_XDOTOOL the copy uses xclip/xsel
+        and the chord is xdotool's, because the focused XWayland window pastes
+        the X11 CLIPBOARD (#657). Saves the previous clipboard and restores it
+        after a short delay. Overlapping pastes share one restore target
+        (pre-first-injection content) and a generation counter so stale restore
+        threads exit.
+
+        Args:
+            text: The text to inject.
+            env: Subprocess environment for the paste chord. XWayland passes the
+                DISPLAY=:0 env the type path already builds.
+
+        Returns:
+            True if successful, False otherwise
+        """
+        logger.debug(
+            "Using clipboard-paste injection for non-ASCII text "
+            "(saving clipboard to restore after paste)"
+        )
+
+        prefer_x11 = self.environment == DesktopEnvironment.WAYLAND_XDOTOOL
+        tools = self._x11_clipboard_tools() if prefer_x11 else None
+
+        # Inherit a pending restore target so a second paste in the delay window
+        # still restores the original clipboard, not intermediate dictated text.
+        with self._state_lock:
+            pending_target = self._clipboard_restore_target
+        previous_clipboard = (
+            pending_target if pending_target is not None else self._read_clipboard()
+        )
+
+        if not self._copy_to_clipboard(text, tools=tools):
+            logger.warning("Could not copy text to clipboard for paste injection")
+            return False
+
+        # Clipboard is overwritten — take ownership. Publish the original
+        # clipboard now (first writer wins) so an overlapping paste inherits
+        # it even if this paste later fails.
+        with self._state_lock:
+            self._clipboard_restore_generation += 1
+            generation = self._clipboard_restore_generation
+            if (
+                previous_clipboard is not None
+                and not self._should_copy_to_clipboard()
+                and self._clipboard_restore_target is None
+            ):
+                self._clipboard_restore_target = previous_clipboard
+
+        # Simulate paste. XWayland uses xdotool against the X11 CLIPBOARD;
+        # native Wayland prefers wtype keysyms, then layout-resolved ydotool.
+        # ydotool syntax differs by version:
+        # - 0.1.x (distro packages): named sequences, e.g. ctrl+v
+        # - 1.x (Flatpak build): keycode:value (29=LEFTCTRL, 42=LEFTSHIFT,
+        #   and the evdev code that produces Latin 'v' on the active layout —
+        #   KEY_V=47 only on QWERTY). Passing 1.x codes to 0.1.x does not
+        #   paste; it types garbage (e.g. "2442").
+        paste_cmd: list = []
+        try:
+            use_terminal_paste = self._should_use_terminal_paste()
+            paste_cmd = self._clipboard_paste_command(terminal=use_terminal_paste)
+            logger.debug(
+                "Simulating %s paste with: %s",
+                "terminal" if use_terminal_paste else "standard",
+                paste_cmd,
+            )
+            if self._abort_injections.is_set():
+                raise _InjectionAborted
+            subprocess.run(
+                paste_cmd,
+                check=True,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=3,
+                env=host_env(env),
+            )
+            logger.info(f"Text injected via clipboard paste: '{text[:20]}...' ({len(text)} chars)")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            logger.warning(f"Paste simulation failed: {e}")
+            # timeout=3 SIGKILLs the ydotool client. ydotoold keeps any keys it
+            # already applied, so a virtual Ctrl can stay held until logout (#658).
+            if paste_cmd:
+                self._ydotool_release_paste_keys(paste_cmd)
+            with self._state_lock:
+                stale = generation != self._clipboard_restore_generation
+                if not stale:
+                    self._clipboard_restore_target = None
+            if (
+                not stale
+                and previous_clipboard is not None
+                and not self._should_copy_to_clipboard()
+            ):
+                if previous_clipboard == "":
+                    self._clear_clipboard(tools=tools)
+                else:
+                    self._copy_to_clipboard(previous_clipboard, tools=tools)
+            return False
+
+        # Delayed restore so Ctrl+V can land first. Skip when the user wants
+        # dictated text left on the clipboard (copy_to_clipboard setting).
+        if previous_clipboard is not None and not self._should_copy_to_clipboard():
+
+            def _restore() -> None:
+                time.sleep(0.3)
+                with self._state_lock:
+                    if generation != self._clipboard_restore_generation:
+                        return
+                    target = self._clipboard_restore_target
+                    self._clipboard_restore_target = None
+                if target is None:
+                    return
+                # User copied something else during the delay — leave it alone.
+                if self._read_clipboard() != text:
+                    logger.debug("Clipboard changed during restore delay; skipping restore")
+                    return
+                if target == "":
+                    success = self._clear_clipboard(tools=tools)
+                else:
+                    success = self._copy_to_clipboard(target, tools=tools)
+                if success:
+                    logger.debug("Clipboard restored to previous content")
+                else:
+                    logger.debug("Could not restore previous clipboard content")
+
+            threading.Thread(target=_restore, daemon=True).start()
+        else:
+            with self._state_lock:
+                if generation == self._clipboard_restore_generation:
+                    self._clipboard_restore_target = None
+
+        return True
+
+    # ydotool 1.x (Flatpak pins v1.0.4): KEY_LEFTCTRL=29, KEY_LEFTSHIFT=42.
+    # KEY_V=47 is the QWERTY physical key; non-QWERTY layouts (e.g. de(neo))
+    # produce Latin 'v' on a different keycode and must not use 47 blindly.
+    _YDOTOOL_KEY_LEFTCTRL = 29
+    _YDOTOOL_KEY_LEFTSHIFT = 42
+    _YDOTOOL_KEY_V_QWERTY = 47
+    # ydotool 0.1.x (common distro packages): named key sequences. ``v`` here
+    # is physical KEY_V, so non-QWERTY paste uses the linux name of the key
+    # that actually produces 'v' (see _ydotool_ctrl_v_command).
+    _YDOTOOL_LEGACY_CTRL_V = ["ydotool", "key", "ctrl+v"]
+    _YDOTOOL_LEGACY_CTRL_SHIFT_V = ["ydotool", "key", "ctrl+shift+v"]
+    # Kernel KEY_* letter names are QWERTY positions (KEY_W=17), not characters.
+    _EVDEV_LETTER_KEY_NAMES = {
+        16: "q",
+        17: "w",
+        18: "e",
+        19: "r",
+        20: "t",
+        21: "y",
+        22: "u",
+        23: "i",
+        24: "o",
+        25: "p",
+        30: "a",
+        31: "s",
+        32: "d",
+        33: "f",
+        34: "g",
+        35: "h",
+        36: "j",
+        37: "k",
+        38: "l",
+        44: "z",
+        45: "x",
+        46: "c",
+        47: "v",
+        48: "b",
+        49: "n",
+        50: "m",
+    }
+
+    def _ydotool_uses_legacy_named_keys(self) -> bool:
+        """Return True when the installed ydotool expects named key sequences."""
+        cached = getattr(self, "_ydotool_legacy_named_keys", None)
+        if cached is not None:
+            return bool(cached)
+
+        ydotool_path = shutil.which("ydotool")
+        if not isinstance(ydotool_path, str):
+            ydotool_path = ""
+        if os.environ.get("FLATPAK_ID") or ydotool_path.startswith("/app/"):
+            self._ydotool_legacy_named_keys = False
+            return False
+
+        help_text = ""
+        try:
+            result = subprocess.run(
+                ["ydotool", "key", "--help"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                env=host_env(),
+            )
+            help_text = f"{result.stdout or ''}{result.stderr or ''}"
+        except (OSError, subprocess.SubprocessError) as e:
+            logger.debug(f"Could not probe ydotool key --help: {e}")
+
+        # 0.1.x help: "separated by plus (+)" / examples like alt+r, CTRL+alt+f3
+        if "plus (+)" in help_text or "separated by plus" in help_text.lower():
+            uses_legacy = True
+        elif ":1" in help_text or "keycode" in help_text.lower():
+            uses_legacy = False
+        else:
+            # Unknown help text: prefer named sequence (safe on 0.1.x; fails
+            # loudly on 1.x rather than typing digit garbage).
+            logger.debug("Unrecognized ydotool key --help; defaulting to legacy named keys")
+            uses_legacy = True
+
+        self._ydotool_legacy_named_keys = uses_legacy
+        return uses_legacy
+
+    def _evdev_keycode_for_paste_v(self) -> int:
+        """Return the evdev keycode that produces Latin 'v' on the active layout.
+
+        Falls back to QWERTY KEY_V (47) when the layout map is missing or has
+        no 'v' entry. LEFTCTRL/LEFTSHIFT are not remapped.
+        """
+        try:
+            from ..ui.keyboard_backends.layout_key_map import get_active_char_to_evdev_map
+
+            char_map = get_active_char_to_evdev_map()
+        except Exception as exc:
+            logger.debug("Could not load layout map for paste 'v': %s", exc)
+            return self._YDOTOOL_KEY_V_QWERTY
+        if char_map and "v" in char_map:
+            try:
+                return int(char_map["v"])
+            except (TypeError, ValueError):
+                logger.debug("Ignoring non-integer layout map entry for 'v': %r", char_map["v"])
+        return self._YDOTOOL_KEY_V_QWERTY
+
+    def _linux_key_name_for_evdev_code(self, code: int) -> Optional[str]:
+        """Return the ydotool 0.1.x key name for an evdev keycode.
+
+        Named ``ctrl+v`` is physical KEY_V. On Neo, Latin 'v' is KEY_W (17), so
+        the legacy dialect must emit ``ctrl+w``. Names come from evdev.ecodes
+        when available; kernel KEY_* letter positions are the fallback.
+        """
+        try:
+            from evdev import ecodes
+
+            name = None
+            keys = getattr(ecodes, "keys", None)
+            if isinstance(keys, dict):
+                name = keys.get(code)
+            if name is None:
+                key_map = getattr(ecodes, "KEY", None)
+                if isinstance(key_map, dict):
+                    name = key_map.get(code)
+            if name is None:
+                bytype = getattr(ecodes, "bytype", None)
+                ev_key = getattr(ecodes, "EV_KEY", None)
+                if isinstance(bytype, dict) and ev_key is not None:
+                    name = bytype.get(ev_key, {}).get(code)
+            if isinstance(name, (list, tuple)):
+                name = next(
+                    (item for item in name if isinstance(item, str) and item.startswith("KEY_")),
+                    None,
+                )
+            if isinstance(name, str) and name.startswith("KEY_") and len(name) > 4:
+                return name[4:].lower()
+        except Exception as exc:
+            logger.debug("evdev.ecodes lookup failed for keycode %s: %s", code, exc)
+        return self._EVDEV_LETTER_KEY_NAMES.get(code)
+
+    def _ydotool_v1_paste_command(self, v_code: int, *, terminal: bool) -> list:
+        """ydotool 1.x press/release sequence for Ctrl(+Shift)+the key that types 'v'."""
+        ctrl = self._YDOTOOL_KEY_LEFTCTRL
+        shift = self._YDOTOOL_KEY_LEFTSHIFT
+        if terminal:
+            return [
+                "ydotool",
+                "key",
+                f"{ctrl}:1",
+                f"{shift}:1",
+                f"{v_code}:1",
+                f"{v_code}:0",
+                f"{shift}:0",
+                f"{ctrl}:0",
+            ]
+        return ["ydotool", "key", f"{ctrl}:1", f"{v_code}:1", f"{v_code}:0", f"{ctrl}:0"]
+
+    def _wtype_usable_for_paste(self) -> bool:
+        """Return True when wtype can send a layout-independent paste keysym.
+
+        Paste may use wtype even when the typing backend is ydotool. KDE Plasma
+        already treats wtype as an unreliable virtual-keyboard path, so skip it
+        there unless this session already selected wtype (startup probe passed).
+        """
+        cached = getattr(self, "_wtype_paste_usable", None)
+        if cached is not None:
+            return bool(cached)
+
+        if getattr(self, "wayland_tool", None) == "wtype":
+            self._wtype_paste_usable = True
+            return True
+        if not shutil.which("wtype"):
+            self._wtype_paste_usable = False
+            return False
+        if _is_kde_plasma_session():
+            logger.debug("Skipping wtype paste chord on KDE Plasma (wtype is unreliable there)")
+            self._wtype_paste_usable = False
+            return False
+        try:
+            result = self._probe_wtype_support()
+            error_output = (result.stderr or "").lower()
+            usable = result.returncode == 0 and "compositor does not support" not in error_output
+        except Exception as exc:
+            logger.debug("wtype paste probe failed: %s", exc)
+            usable = False
+        self._wtype_paste_usable = usable
+        return usable
+
+    def _wtype_paste_command(self, *, terminal: bool = False) -> list:
+        """wtype argv that types Latin 'v' as a keysym, with Ctrl (and Shift)."""
+        if terminal:
+            return ["wtype", "-M", "ctrl", "-M", "shift", "v"]
+        return ["wtype", "-M", "ctrl", "v"]
+
+    def _clipboard_paste_command(self, *, terminal: bool = False) -> list:
+        """Return argv for the clipboard paste chord.
+
+        On WAYLAND_XDOTOOL, xdotool against the X11 CLIPBOARD (what an XWayland
+        window pastes from). Otherwise prefers wtype keysyms, then ydotool
+        with a layout-resolved keycode for 'v'.
+        """
+        if self.environment == DesktopEnvironment.WAYLAND_XDOTOOL:
+            chord = "ctrl+shift+v" if terminal else "ctrl+v"
+            return ["xdotool", "key", "--clearmodifiers", chord]
+        if self._wtype_usable_for_paste():
+            return self._wtype_paste_command(terminal=terminal)
+        return self._ydotool_ctrl_v_command(terminal=terminal)
+
+    def _ydotool_ctrl_v_command(self, *, terminal: bool = False) -> list:
+        """Return argv to simulate paste for the installed ydotool.
+
+        ydotool 0.1.x expects ``key ctrl+v`` or ``key ctrl+shift+v`` (physical
+        KEY_V). ydotool 1.x expects evdev press/release keycodes (29=LEFTCTRL,
+        42=LEFTSHIFT, plus the key that produces Latin 'v' on the active
+        layout — 47 only on QWERTY).
+
+        Flatpak always ships pinned ydotool 1.0.4 under /app, so we use the
+        keycode form there without probing. Host installs probe ``key --help``.
+        """
+        cache_attr = "_ydotool_terminal_paste_cmd" if terminal else "_ydotool_ctrl_v_cmd"
+        cached = getattr(self, cache_attr, None)
+        if cached is not None:
+            return list(cached)
+
+        v_code = self._evdev_keycode_for_paste_v()
+        if self._ydotool_uses_legacy_named_keys():
+            if v_code == self._YDOTOOL_KEY_V_QWERTY:
+                cmd = (
+                    list(self._YDOTOOL_LEGACY_CTRL_SHIFT_V)
+                    if terminal
+                    else list(self._YDOTOOL_LEGACY_CTRL_V)
+                )
+            else:
+                key_name = self._linux_key_name_for_evdev_code(v_code)
+                if key_name:
+                    token = f"ctrl+shift+{key_name}" if terminal else f"ctrl+{key_name}"
+                    cmd = ["ydotool", "key", token]
+                    logger.info(
+                        "ydotool 0.1.x paste uses %s (layout 'v' is evdev %s, not KEY_V=47)",
+                        token,
+                        v_code,
+                    )
+                else:
+                    # Named ctrl+v would hit the wrong physical key. Prefer the
+                    # 1.x keycode form; some builds accept it, and 0.1.x garbage
+                    # is still better documented than silently opening Print.
+                    cmd = self._ydotool_v1_paste_command(v_code, terminal=terminal)
+                    logger.warning(
+                        "ydotool 0.1.x has no name for layout 'v' keycode %s; "
+                        "sending 1.x-style keycodes %s",
+                        v_code,
+                        cmd,
+                    )
+        else:
+            cmd = self._ydotool_v1_paste_command(v_code, terminal=terminal)
+            if v_code != self._YDOTOOL_KEY_V_QWERTY:
+                logger.info(
+                    "ydotool paste uses evdev %s for Latin 'v' (not QWERTY KEY_V=47)",
+                    v_code,
+                )
+
+        setattr(self, cache_attr, cmd)
+        return list(cmd)
+
+    def _ydotool_paste_release_command(self, paste_cmd: list) -> list:
+        """Return argv that lifts keys held by a ydotool paste chord.
+
+        wtype chords are ignored: they do not go through ydotoold, so a killed
+        client cannot leave a virtual modifier down.
+        """
+        if not paste_cmd or paste_cmd[0] != "ydotool":
+            return []
+
+        pressed: list = []
+        for token in paste_cmd:
+            if isinstance(token, str) and token.endswith(":1"):
+                code = token[:-2]
+                if code:
+                    pressed.append(code)
+        if pressed:
+            # Reverse press order so the letter lifts before Shift/Ctrl.
+            return ["ydotool", "key"] + [f"{code}:0" for code in reversed(pressed)]
+
+        token = ""
+        for part in reversed(paste_cmd):
+            if isinstance(part, str) and part not in ("ydotool", "key"):
+                token = part.lower()
+                break
+        has_ctrl = "ctrl" in token
+        has_shift = "shift" in token
+        if has_ctrl and has_shift:
+            # 0.1.x has no keycode:value form. A named tap is down+up; if the
+            # modifier is already down, the up half should clear it.
+            return ["ydotool", "key", "ctrl+shift"]
+        if has_shift:
+            return ["ydotool", "key", "shift"]
+        if has_ctrl:
+            return ["ydotool", "key", "ctrl"]
+        return []
+
+    def _ydotool_release_paste_keys(self, paste_cmd: list) -> None:
+        """Best-effort Ctrl/Shift/letter up after a failed ydotool paste (#658).
+
+        Releasing an already-up key is a no-op. If ydotoold is still wedged the
+        follow-up may also time out; we swallow that so paste failure stays False.
+        """
+        release = self._ydotool_paste_release_command(paste_cmd)
+        if not release:
+            return
+        try:
+            subprocess.run(
+                release,
+                check=False,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=1,
+                env=host_env(),
+            )
+        except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
+            logger.debug("ydotool paste-key release did not complete")
+
+    # evdev keycodes for modifier keys. If any of these is still physically held
+    # when a Wayland injection fires, the injected keystrokes are modified: a
+    # held Alt turns the Ctrl+V paste into Ctrl+Alt+V (nothing pastes), and a
+    # held modifier turns typed letters into shortcuts. Because toggle/PTT
+    # shortcuts are themselves modifiers (e.g. Alt+R) and transcription can
+    # finish in tens of milliseconds, the user is often still holding the key
+    # when injection starts, causing intermittent "nothing pasted" failures.
+    _MODIFIER_KEYCODES = frozenset({29, 97, 56, 100, 42, 54, 125, 126})
+
+    def _held_modifier_keycodes(self) -> set:
+        """Return modifier keycodes currently held on any physical keyboard."""
+        try:
+            import evdev
+            from evdev import ecodes
+        except ImportError:
+            return set()
+
+        held: set = set()
+        try:
+            for path in evdev.list_devices():
+                try:
+                    device = evdev.InputDevice(path)
+                except (OSError, PermissionError):
+                    continue
+                try:
+                    if ecodes.EV_KEY not in device.capabilities():
+                        continue
+                    held |= set(device.active_keys()) & self._MODIFIER_KEYCODES
+                except OSError:
+                    continue
+                finally:
+                    device.close()
+        except Exception as e:
+            logger.debug(f"Could not read modifier key state: {e}")
+        return held
+
+    _DEFAULT_INJECT_MODIFIER_WAIT = 1.0
+
+    def _injection_modifier_wait_seconds(self) -> float:
+        """Return the sanitized max seconds to wait for modifiers to release.
+
+        Reads VOCALINUX_INJECT_MODIFIER_WAIT and falls back to the default for
+        anything unusable: a non-numeric value, or a non-finite one. In
+        particular ``inf`` parses fine and is positive, so without this guard it
+        would make the wait deadline infinite and block injection forever while a
+        modifier stays held.
+        """
+        raw = os.environ.get("VOCALINUX_INJECT_MODIFIER_WAIT")
+        if raw is None:
+            return self._DEFAULT_INJECT_MODIFIER_WAIT
+        try:
+            value = float(raw)
+        except ValueError:
+            return self._DEFAULT_INJECT_MODIFIER_WAIT
+        if not math.isfinite(value):
+            logger.warning(
+                "VOCALINUX_INJECT_MODIFIER_WAIT=%r is not a finite number; " "using default %.1fs",
+                raw,
+                self._DEFAULT_INJECT_MODIFIER_WAIT,
+            )
+            return self._DEFAULT_INJECT_MODIFIER_WAIT
+        return value
+
+    def _wait_for_modifiers_released(self) -> None:
+        """Wait briefly for shortcut modifier keys to be released before injecting.
+
+        Returns immediately if no modifier is held (the common case), so this
+        adds no latency unless the user is still holding their toggle/PTT
+        shortcut. Bounded by VOCALINUX_INJECT_MODIFIER_WAIT seconds (default 1.0;
+        set to 0 to disable). Best-effort: if evdev/permissions are unavailable
+        it simply proceeds.
+        """
+        max_wait = self._injection_modifier_wait_seconds()
+        if max_wait <= 0:
+            return
+
+        deadline = time.monotonic() + max_wait
+        waited = False
+        while time.monotonic() < deadline:
+            if not self._held_modifier_keycodes():
+                if waited:
+                    logger.debug("Modifier keys released; proceeding with injection")
+                return
+            waited = True
+            time.sleep(0.015)
+        logger.debug(
+            f"Modifier keys still held after {max_wait:.2f}s; injecting anyway "
+            "(paste/typing may be affected)"
+        )
+
+    def _inject_with_wayland_tool(self, text: str):
+        """
+        Inject text using a Wayland-compatible tool (wtype or ydotool).
+
+        For ydotool: if the text contains non-ASCII characters (accented
+        letters like á, é, ú, CJK characters, etc.), uses clipboard-based
+        injection instead, because ydotool simulates evdev key events which
+        only cover US ASCII keycodes. See issue #362.
+
+        Args:
+            text: The text to inject
+
+        Raises:
+            subprocess.CalledProcessError: If the tool fails, with stderr captured
+        """
+        # Wait for the shortcut modifier(s) to be released first, so a held Alt
+        # doesn't turn the Ctrl+V paste into Ctrl+Alt+V (nothing pastes) or
+        # modify typed keys. The portal's keysyms are equally affected by a
+        # still-held physical modifier, so the wait stays ahead of every tool.
+        self._wait_for_modifiers_released()
+
+        # Characters the portal confirmed before a demote: partial-type counts
+        # raised later are relative to the shortened text and must be rebased
+        # by this prefix or the caller replays delivered input.
+        typed_prefix = 0
+
+        if self.wayland_tool == "portal":
+            portal_ok, remaining_text = self._try_inject_with_portal(text)
+            if portal_ok:
+                return
+            if not self._demote_portal_backend():
+                raise RuntimeError(
+                    "RemoteDesktop portal injection failed and no Wayland fallback is available"
+                )
+            if remaining_text is None:
+                # The timed-out job never reported its delivered count, so
+                # retyping any part could duplicate what already arrived.
+                # Surface as a timeout: the caller drops the injection rather
+                # than offering a clipboard copy of the full text.
+                raise subprocess.TimeoutExpired(cmd="portal", timeout=_PORTAL_SUBMIT_TIMEOUT_S)
+            if not remaining_text:
+                return
+            typed_prefix = len(text) - len(remaining_text)
+            if self.environment == DesktopEnvironment.WAYLAND_XDOTOOL:
+                try:
+                    self._inject_with_xdotool(remaining_text)
+                except _PartiallyTyped as nested:
+                    # Keep the count relative to the original text.
+                    raise _PartiallyTyped(typed_prefix + nested.typed, nested) from nested
+                return
+            text = remaining_text
+
+        # Prefer clipboard + paste chord for ydotool: one chord instead of
+        # per-character evdev keycodes (those follow physical US key positions
+        # and scramble text on other layouts). The paste chord is not
+        # automatically layout-safe: wtype keysyms are, ydotool keycodes are
+        # only after resolving Latin 'v' for the active layout (#787).
+        # Flatpak ships wl-copy (--socket=wayland) so native Wayland apps get
+        # bulk paste; character-by-character type is only a fallback.
+        if self.wayland_tool == "ydotool":
+            if not self._ensure_ydotoold():
+                logger.warning("ydotoold not ready before injection")
+            logger.info(
+                "Using clipboard paste for ydotool "
+                "(single paste chord instead of per-character typing)"
+            )
+            if self._inject_via_clipboard_paste(text):
+                return
+            logger.warning(
+                "Clipboard paste failed, falling back to ydotool type "
+                "(character-by-character; text may be scrambled on non-US layouts)"
+            )
+
+        # Type in chunks so shutdown can abort between subprocess calls — one
+        # whole-string call could not be interrupted for its full
+        # length-scaled duration.  Each chunk's budget is a generous multiple
+        # of its expected duration: a legitimately slow type must never be cut
+        # mid-text — only a stall far beyond it is.
+        chunk_size = 200
+        for i in range(0, len(text), chunk_size):
+            if self._abort_injections.is_set():
+                raise _InjectionAborted
+            chunk = text[i : i + chunk_size]
+            if self.wayland_tool == "wtype":
+                # ``--`` puts wtype in raw-text mode so a leading '-' is not
+                # parsed as an option.
+                cmd = ["wtype", "--", chunk]
+                # wtype types at compositor pace; the budget scales with the
+                # chunk length so only a wedged process can ever hit it.
+                type_timeout = max(5, len(chunk) * 0.05)
+            else:  # ydotool
+                # Keep key-delay > 0 to avoid Shift-leak ("Can you" -> "CAN YOu").
+                # Low delay so fallback typing finishes quickly for long phrases.
+                key_delay = os.environ.get("VOCALINUX_YDOTOOL_KEY_DELAY", "2")
+                # ``--`` ends ydotool's option parsing for the same reason.
+                cmd = ["ydotool", "type", "--key-delay", key_delay, "--", chunk]
+                type_timeout = max(5, len(chunk) * self._key_delay_seconds(key_delay) * 4)
+            try:
+                subprocess.run(
+                    cmd,
+                    check=True,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=type_timeout,
+                    env=host_env(),
+                )
+            except subprocess.TimeoutExpired:
+                logger.error(f"{self.wayland_tool} type timed out; text may be partially typed")
+                raise
+            except subprocess.CalledProcessError as e:
+                if i > 0:
+                    # Earlier chunks are already on screen; let the caller
+                    # continue from the untyped remainder.
+                    raise _PartiallyTyped(typed_prefix + i, e) from e
+                # Re-raise with stderr preserved for better diagnostics
+                raise subprocess.CalledProcessError(
+                    e.returncode, e.cmd, output=e.output, stderr=e.stderr
+                ) from e
+
+        logger.info(
+            f"Text injected using {self.wayland_tool}: '{text[:20]}...' ({len(text)} chars)"
+        )
+
+    def _inject_keyboard_shortcut(self, shortcut: str) -> bool:
+        """
+        Inject a keyboard shortcut.
+
+        Args:
+            shortcut: The keyboard shortcut to inject (e.g., "ctrl+z", "ctrl+a")
+
+        Returns:
+            True if injection was successful, False otherwise
+        """
+        logger.debug(f"Injecting keyboard shortcut: {shortcut}")
+
+        if self._abort_injections.is_set():
+            return False
+
+        try:
+            if (
+                self.environment == DesktopEnvironment.X11
+                or self.environment == DesktopEnvironment.WAYLAND_XDOTOOL
+                # IBus commits text; it cannot synthesise key combinations. Send
+                # the shortcut through XIM's underlying X server instead.
+                or self.environment == DesktopEnvironment.X11_IBUS
+            ):
+                return self._inject_shortcut_with_xdotool(shortcut)
+            if self.environment == DesktopEnvironment.WAYLAND_IBUS:
+                # Same on Wayland: fall through to a virtual-keyboard tool. Without
+                # this, self.wayland_tool may be unset -> AttributeError -> the
+                # except below swallows it and every shortcut silently returns False.
+                if self._resolve_wayland_key_tool() is None:
+                    logger.error("No virtual-keyboard tool available for shortcuts")
+                    return False
+            return self._inject_shortcut_with_wayland_tool(shortcut)
+        except Exception as e:
+            logger.error(f"Failed to inject keyboard shortcut '{shortcut}': {e}")
+            return False
+
+    def _inject_shortcut_with_xdotool(self, shortcut: str) -> bool:
+        """
+        Inject a keyboard shortcut using xdotool.
+
+        Args:
+            shortcut: The keyboard shortcut to inject
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Create environment with explicit X11 settings for Wayland compatibility
+        env = os.environ.copy()
+
+        if self.environment == DesktopEnvironment.WAYLAND_XDOTOOL:
+            env["GDK_BACKEND"] = "x11"
+            env["QT_QPA_PLATFORM"] = "xcb"
+            if "DISPLAY" not in env or not env["DISPLAY"]:
+                env["DISPLAY"] = ":0"
+
+        try:
+            cmd = ["xdotool", "key", "--clearmodifiers", shortcut]
+            subprocess.run(
+                cmd,
+                env=host_env(env),
+                check=True,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+            logger.debug(f"Keyboard shortcut '{shortcut}' injected successfully")
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"xdotool shortcut error: {e.stderr}")
+            return False
+        except subprocess.TimeoutExpired:
+            logger.error(f"xdotool shortcut timed out: '{shortcut}'")
+            return False
+
+    def _inject_shortcut_with_wayland_tool(self, shortcut: str) -> bool:
+        """
+        Inject a keyboard shortcut using a Wayland-compatible tool.
+
+        Args:
+            shortcut: The keyboard shortcut to inject
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            steps = self._parse_shortcut(shortcut)
+        except ValueError as e:
+            logger.error(f"Cannot parse shortcut '{shortcut}': {e}")
+            return False
+
+        # A held toggle/PTT modifier rewrites the chord we are about to send, so
+        # wait it out first -- same reason and placement as _inject_with_wayland_tool.
+        self._wait_for_modifiers_released()
+
+        # Characters the portal confirmed before a demote: partial-type counts
+        # raised later are relative to the shortened text and must be rebased
+        # by this prefix or the caller replays delivered input.
+        typed_prefix = 0
+
+        if self.wayland_tool == "portal":
+            portal_ok, remaining_steps = self._try_portal_shortcut(steps)
+            if portal_ok:
+                return True
+            if not self._demote_portal_backend():
+                return False
+            if remaining_steps is None:
+                # Untracked delivery: replaying the shortcut could trigger
+                # actions the timed-out job already sent.
+                return False
+            if not remaining_steps:
+                return True
+            steps = remaining_steps
+            if self.environment == DesktopEnvironment.WAYLAND_XDOTOOL:
+                return self._inject_shortcut_with_xdotool(self._steps_to_shortcut(steps))
+            # Fall through to the demoted wtype/ydotool.
+
+        if self.wayland_tool == "wtype":
+            # wtype does support combinations: -M presses a modifier, -k types a
+            # key, -m releases it. Modifiers must be released explicitly -- wtype
+            # only auto-releases them when the process exits.
+            cmd = ["wtype"]
+            for modifiers, key in steps:
+                for mod in modifiers:
+                    cmd += ["-M", self._WTYPE_MODIFIERS[mod]]
+                cmd += ["-k", key]
+                for mod in reversed(modifiers):
+                    cmd += ["-m", self._WTYPE_MODIFIERS[mod]]
+        elif self.wayland_tool == "ydotool":
+            if not self._ensure_ydotoold():
+                logger.warning("ydotoold not ready before shortcut injection")
+
+            if self._ydotool_uses_legacy_named_keys():
+                # 0.1.x: one named chord token per step, all in a single call --
+                # it accepts any number of key sequences as positional args.
+                tokens = []
+                for modifiers, key in steps:
+                    token = self._ydotool_legacy_token(modifiers, key)
+                    if token is None:
+                        logger.error(
+                            f"No ydotool 0.1.x key name for '{key}' in shortcut '{shortcut}'"
+                        )
+                        return False
+                    tokens.append(token)
+                cmd = ["ydotool", "key"] + tokens
+            else:
+                # 1.x takes RAW KEYCODES only ("29:1 44:1 44:0 29:0"), never
+                # "ctrl+z" -- it documents non-interpretable values as "only cause
+                # a delay", so the old string form was a silent no-op.
+                seq = []
+                for modifiers, key in steps:
+                    codes = []
+                    for name in modifiers + [key]:
+                        code = self._KEYCODES.get(name.lower())
+                        if code is None:
+                            logger.error(f"No keycode for '{name}' in shortcut '{shortcut}'")
+                            return False
+                        codes.append(code)
+                    seq += [f"{c}:1" for c in codes] + [f"{c}:0" for c in reversed(codes)]
+                cmd = ["ydotool", "key"] + seq
+        else:
+            logger.warning(f"Keyboard shortcuts not supported with {self.wayland_tool}")
+            return False
+
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=max(3, len(steps) * 0.5),
+                env=host_env(),
+            )
+            logger.debug(f"Keyboard shortcut '{shortcut}' injected successfully")
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"{self.wayland_tool} shortcut error: {e.stderr}")
+            return False
+        except subprocess.TimeoutExpired:
+            logger.error(f"{self.wayland_tool} shortcut injection timed out for '{shortcut}'")
+            return False
+
+    # Modifier aliases -> wtype's names ("shift", "capslock", "ctrl", "logo",
+    # "win", "alt", "altgr" per wtype(1)).
+    _WTYPE_MODIFIERS = {
+        "ctrl": "ctrl",
+        "control": "ctrl",
+        "shift": "shift",
+        "alt": "alt",
+        "altgr": "altgr",
+        "super": "logo",
+        "meta": "logo",
+        "win": "logo",
+        "logo": "logo",
+    }
+
+    # Raw evdev keycodes from linux/input-event-codes.h, for ydotool. Covers the
+    # modifiers plus every key referenced by ActionHandler._SHORTCUT_ACTIONS.
+    _KEYCODES = {
+        "ctrl": 29,
+        "control": 29,
+        "shift": 42,
+        "alt": 56,
+        "altgr": 100,
+        "super": 125,
+        "meta": 125,
+        "win": 125,
+        "logo": 125,
+        "a": 30,
+        "c": 46,
+        "v": 47,
+        "x": 45,
+        "y": 21,
+        "z": 44,
+        "home": 102,
+        "end": 107,
+        "left": 105,
+        "right": 106,
+        "up": 103,
+        "down": 108,
+        "backspace": 14,
+        "delete": 111,
+        "return": 28,
+        "enter": 28,
+        "tab": 15,
+        "escape": 1,
+        "space": 57,
+    }
+
+    # ydotool 0.1.x resolves names through libevdevPlus' Table_ModifierKeys and
+    # Table_FunctionKeys (uppercased). A name it does not know silently falls back
+    # to that name's FIRST CHARACTER and still exits 0 -- "altgr" types "a" -- so
+    # only names confirmed present in those tables may ever be emitted.
+    # Deliberately absent: altgr, escape (0.1.x spells it ESC), space, return.
+    _YDOTOOL_LEGACY_NAMES = {
+        "ctrl": "ctrl",
+        "control": "ctrl",
+        "shift": "shift",
+        "alt": "alt",
+        "super": "super",
+        "meta": "meta",
+        "win": "super",
+        "logo": "super",
+        "a": "a",
+        "c": "c",
+        "v": "v",
+        "x": "x",
+        "y": "y",
+        "z": "z",
+        "home": "home",
+        "end": "end",
+        "left": "left",
+        "right": "right",
+        "up": "up",
+        "down": "down",
+        "backspace": "backspace",
+        "delete": "delete",
+        "enter": "enter",
+        "tab": "tab",
+    }
+
+    @classmethod
+    def _ydotool_legacy_token(cls, modifiers, key: str):
+        """Build one ydotool 0.1.x ``mod+mod+key`` chord token.
+
+        Returns:
+            The token, or None if any name has no 0.1.x spelling.
+        """
+        names = []
+        for name in list(modifiers) + [key]:
+            mapped = cls._YDOTOOL_LEGACY_NAMES.get(name.lower())
+            if mapped is None:
+                return None
+            names.append(mapped)
+        return "+".join(names)
+
+    @classmethod
+    def _parse_shortcut(cls, shortcut: str):
+        """Parse a shortcut string into a list of ``(modifiers, key)`` steps.
+
+        Tokens are classified by name rather than position, because the mappings
+        in ``ActionHandler._SHORTCUT_ACTIONS`` are not all "modifiers first" --
+        ``select_line`` is ``"Home+shift+End"``, which means *press Home, then
+        Shift+End*, i.e. two sequential steps rather than one chord. Each
+        non-modifier token closes a step, consuming the modifiers seen since the
+        previous one.
+
+        Returns:
+            e.g. "ctrl+shift+Right" -> [(["ctrl", "shift"], "Right")]
+                 "Home+shift+End"   -> [([], "Home"), (["shift"], "End")]
+
+        Raises:
+            ValueError: if the shortcut has no key, or ends with a dangling modifier.
+        """
+        steps = []
+        pending = []
+        for token in shortcut.split("+"):
+            token = token.strip()
+            if not token:
+                continue
+            if token.lower() in cls._WTYPE_MODIFIERS:
+                pending.append(token.lower())
+            else:
+                steps.append((pending, token))
+                pending = []
+        if pending:
+            raise ValueError(f"trailing modifier(s) with no key: {'+'.join(pending)}")
+        if not steps:
+            raise ValueError("no key found")
+        return steps
+
+    @staticmethod
+    def _steps_to_shortcut(steps: List[Tuple[List[str], str]]) -> str:
+        """Render parsed ``_parse_shortcut`` steps back as a ``+``-joined string.
+
+        Used to hand only the unsent tail of a partially delivered shortcut
+        to the xdotool fallback, which takes a shortcut string, not steps.
+        """
+        return "+".join("+".join(modifiers + [key]) for modifiers, key in steps)
+
+    def press_backspace(self, count: int) -> bool:
+        """Send ``count`` real BackSpace key events.
+
+        Deleting text cannot be done by injecting U+0008 characters: ydotool has
+        no keymap entry for it (so it types nothing) and IBus ``commit_text()``
+        commits it as a literal control character. Only actual key events delete.
+
+        Args:
+            count: Number of backspaces to send.
+
+        Returns:
+            True if the presses were delivered, False otherwise.
+        """
+        if count <= 0:
+            return True
+
+        if self._abort_injections.is_set():
+            return False
+
+        logger.debug(f"Sending {count} backspace key event(s)")
+
+        if (
+            self.environment == DesktopEnvironment.X11
+            or self.environment == DesktopEnvironment.WAYLAND_XDOTOOL
+            or self.environment == DesktopEnvironment.X11_IBUS
+        ):
+            env = os.environ.copy()
+            if self.environment == DesktopEnvironment.WAYLAND_XDOTOOL:
+                env["GDK_BACKEND"] = "x11"
+                env["QT_QPA_PLATFORM"] = "xcb"
+                if not env.get("DISPLAY"):
+                    env["DISPLAY"] = ":0"
+            try:
+                # --clearmodifiers already neutralises a held modifier here, so
+                # this path needs no _wait_for_modifiers_released().
+                subprocess.run(
+                    ["xdotool", "key", "--clearmodifiers", "--repeat", str(count), "BackSpace"],
+                    env=host_env(env),
+                    check=True,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=max(3, count * 0.05),
+                )
+                return True
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                FileNotFoundError,
+            ) as e:
+                logger.error(f"xdotool backspace error: {e}")
+                return False
+
+        # Wayland (including WAYLAND_IBUS -- IBus cannot send key events).
+        # A held PTT modifier would turn every BackSpace into Ctrl+BackSpace
+        # (delete-word), so wait it out before resolving and sending.
+        self._wait_for_modifiers_released()
+        tool = self._resolve_wayland_key_tool()
+        if not tool:
+            logger.error("No virtual-keyboard tool available to send backspaces")
+            return False
+
+        if tool == "portal":
+            portal_ok, remaining = self._try_portal_keypress(KEYSYM_BACKSPACE, count)
+            if portal_ok:
+                return True
+            if not self._demote_portal_backend():
+                return False
+            if remaining is None:
+                # Untracked delivery: replaying presses could delete text the
+                # timed-out job already removed.
+                return False
+            if remaining <= 0:
+                return True
+            return self.press_backspace(remaining)
+
+        if tool == "ydotool" and not self._ensure_ydotoold():
+            # Checked on every call, not just when the tool is first resolved:
+            # wayland_tool is cached from startup, so a daemon that died since
+            # would otherwise never be restarted for this path alone. Both other
+            # ydotool call sites warn and continue the same way.
+            logger.warning("ydotoold not ready before backspace injection")
+
+        if tool == "wtype":
+            cmd = ["wtype"] + ["-k", "BackSpace"] * count
+            timeout = max(3, count * 0.01)
+        elif self._ydotool_uses_legacy_named_keys():
+            # 0.1.x: N named tokens in one call. Its per-call delay budget is
+            # spread across all events, so this stays flat regardless of count
+            # -- unlike --repeat, which re-runs the sequence at ~100ms each.
+            cmd = ["ydotool", "key"] + [self._ydotool_legacy_token([], "backspace")] * count
+            timeout = 5
+        else:
+            # 1.x sleeps --key-delay after EVERY token (12ms by default), so a
+            # 400-character deletion would otherwise take ~9.6s. Match the delay
+            # `ydotool type` already uses, and scale the budget with the count.
+            code = self._KEYCODES["backspace"]
+            delay = os.environ.get("VOCALINUX_YDOTOOL_KEY_DELAY", "2")
+            cmd = ["ydotool", "key", "--key-delay", delay] + [f"{code}:1", f"{code}:0"] * count
+            timeout = max(3, count * 2 * self._key_delay_seconds(delay) * 3)
+
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+                env=host_env(),
+            )
+            return True
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            FileNotFoundError,
+        ) as e:
+            logger.error(f"{tool} backspace error: {e}")
+            return False
+
+    @staticmethod
+    def _key_delay_seconds(raw: str) -> float:
+        """Parse a ydotool key-delay in ms, falling back to its 12ms default."""
+        try:
+            return max(0.0, int(raw)) / 1000
+        except (TypeError, ValueError):
+            return 0.012
+
+    def _log_current_window_info(self):
+        """Log information about the current window/application for debugging."""
+        try:
+            if (
+                self.environment == DesktopEnvironment.X11
+                or self.environment == DesktopEnvironment.WAYLAND_XDOTOOL
+            ):
+                self._log_x11_window_info()
+            else:
+                logger.debug("Window info logging not available for pure Wayland")
+        except Exception as e:
+            logger.debug(f"Could not get window info: {e}")
+
+    def _log_x11_window_info(self):
+        """Log X11 window information."""
+        env = os.environ.copy()
+
+        if self.environment == DesktopEnvironment.WAYLAND_XDOTOOL:
+            env["GDK_BACKEND"] = "x11"
+            env["QT_QPA_PLATFORM"] = "xcb"
+            if "DISPLAY" not in env or not env["DISPLAY"]:
+                env["DISPLAY"] = ":0"
+
+        try:
+            # Get active window ID
+            result = subprocess.run(
+                ["xdotool", "getactivewindow"],
+                env=host_env(env),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+                timeout=2,
+            )
+            window_id = result.stdout.strip()
+            logger.debug(f"Active window ID: {window_id}")
+
+            # Get window name
+            result = subprocess.run(
+                ["xdotool", "getwindowname", window_id],
+                env=host_env(env),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+                timeout=2,
+            )
+            window_name = result.stdout.strip()
+            logger.info(f"Target window: '{window_name}' (ID: {window_id})")
+
+            # Prefer xprop; xdotool classname is last-resort when xprop is missing
+            # (see focused_window.read_wm_class).
+            window_class = read_wm_class(window_id, env, xdotool_fallback=True)
+            logger.debug(f"Window class: {window_class}")
+
+            # Get window PID
+            result = subprocess.run(
+                ["xdotool", "getwindowpid", window_id],
+                env=host_env(env),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+                timeout=2,
+            )
+            window_pid = result.stdout.strip()
+            logger.debug(f"Window PID: {window_pid}")
+
+            # Try to get process name
+            try:
+                with open(f"/proc/{window_pid}/comm", "r") as f:
+                    process_name = f.read().strip()
+                logger.info(f"Target process: {process_name} (PID: {window_pid})")
+            except Exception:
+                pass
+
+        except subprocess.TimeoutExpired:
+            logger.warning("Timeout getting window information")
+        except subprocess.CalledProcessError as e:
+            logger.debug(f"xdotool command failed: {e.stderr}")
+        except Exception as e:
+            logger.debug(f"Error getting window info: {e}")

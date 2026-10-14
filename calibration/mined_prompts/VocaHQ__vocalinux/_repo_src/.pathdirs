@@ -1,0 +1,8 @@
+.
+src
+src/vocalinux/audio
+src/vocalinux/speech_recognition
+src/vocalinux/text_injection
+src/vocalinux/ui
+src/vocalinux/ui/keyboard_backends
+src/vocalinux/utils

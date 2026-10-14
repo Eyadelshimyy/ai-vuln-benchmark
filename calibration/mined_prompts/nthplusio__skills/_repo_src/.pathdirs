@@ -1,0 +1,12 @@
+.
+skills/scoussens-skills/harness-discovery/evals
+skills/scoussens-skills/harness-discovery/scripts
+skills/scoussens-skills/optimize-ci/scripts
+skills/scoussens-skills/orchestration-run/evals
+skills/scoussens-skills/orchestration-run/scripts
+skills/scoussens-skills/orchestration-setup/scripts
+skills/scoussens-skills/pr-review-round/scripts
+skills/scoussens-skills/visualize-spec/evals
+skills/scoussens-skills/visualize-spec/evals/fixtures/order-hooks/src
+skills/scoussens-skills/visualize-spec/evals/fixtures/order-hooks/src/order_hooks
+skills/scoussens-skills/work-proposal/scripts

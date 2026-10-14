@@ -1,0 +1,335 @@
+import logging
+
+from homeassistant.components import sensor
+from homeassistant.components.sensor import SensorDeviceClass
+from homeassistant.config_entries import SOURCE_INTEGRATION_DISCOVERY, ConfigEntry
+from homeassistant.const import CONF_ENTITY_ID, CONF_PLATFORM, STATE_OFF, STATE_ON, STATE_UNAVAILABLE
+from homeassistant.core import HomeAssistant, State
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.setup import async_setup_component
+import pytest
+from pytest_homeassistant_custom_component.common import (
+    setup_test_component_platform,
+)
+
+from custom_components.powercalc.common import create_source_entity
+from custom_components.powercalc.config_flow import Step
+from custom_components.powercalc.const import (
+    CONF_CURRENT_ENTITY,
+    CONF_POWER_FACTOR,
+    CONF_VOLTAGE,
+    CONF_WLED,
+    DOMAIN,
+)
+from custom_components.powercalc.errors import StrategyConfigurationError
+from custom_components.powercalc.strategy.wled import WledStrategy
+import custom_components.test.sensor as test_sensor_platform
+from tests.common import (
+    assert_entity_state,
+    mock_device,
+    mock_device_with_entities,
+    mock_entities_in_registry,
+    run_powercalc_setup,
+    set_states,
+)
+
+
+async def test_can_calculate_power(
+    hass: HomeAssistant,
+) -> None:
+    mock_device_with_entities(hass, "light.test")
+    await set_states(hass, [("light.test", STATE_ON)])
+    light_source_entity = create_source_entity("light.test", hass)
+
+    estimated_current_entity = test_sensor_platform.MockSensor(
+        name="test_estimated_current",
+        native_value="50.0",
+        unique_id="abc",
+    )
+
+    setup_test_component_platform(hass, sensor.DOMAIN, [estimated_current_entity])
+
+    assert await async_setup_component(
+        hass,
+        sensor.DOMAIN,
+        {sensor.DOMAIN: {CONF_PLATFORM: "test"}},
+    )
+
+    strategy = WledStrategy(
+        config={CONF_VOLTAGE: 5, CONF_POWER_FACTOR: 0.9},
+        light_entity=light_source_entity,
+        hass=hass,
+        standby_power=0.1,
+    )
+    await strategy.validate_config()
+    assert strategy.can_calculate_standby()
+
+    state = State("sensor.test_estimated_current", "50.0")
+    assert float(await strategy.calculate(state)) == pytest.approx(0.225, 0.01)
+
+    state = State("light.test", STATE_OFF)
+    assert await strategy.calculate(state) == 0.1
+
+    state = State("light.test", STATE_ON)
+    assert float(await strategy.calculate(state)) == pytest.approx(0.225, 0.01)
+
+
+async def test_calculate_returns_none_before_current_entity_is_resolved(hass: HomeAssistant) -> None:
+    await set_states(hass, [("light.test", STATE_ON)])
+    strategy = WledStrategy(
+        config={CONF_VOLTAGE: 5},
+        light_entity=create_source_entity("light.test", hass),
+        hass=hass,
+    )
+
+    assert await strategy.calculate(State("light.test", STATE_ON)) is None
+
+
+async def test_calculate_returns_none_when_dependent_state_is_missing(
+    hass: HomeAssistant,
+) -> None:
+    mock_entities_in_registry(
+        hass,
+        {
+            "light.test": {},
+            "sensor.test_estimated_current": {},
+        },
+    )
+    light_source_entity = create_source_entity("light.test", hass)
+
+    strategy = WledStrategy(
+        config={CONF_VOLTAGE: 5, CONF_POWER_FACTOR: 0.9},
+        light_entity=light_source_entity,
+        hass=hass,
+        standby_power=0.1,
+    )
+    await strategy.validate_config()
+
+    assert await strategy.calculate(State("sensor.test_estimated_current", "50.0")) is None
+
+    await set_states(hass, [("light.test", STATE_ON)])
+    assert await strategy.calculate(State("light.test", STATE_ON)) is None
+
+
+async def test_find_estimated_current_entity_by_device_class(
+    hass: HomeAssistant,
+) -> None:
+    """
+    By default we will search for estimated_current entity by naming convention _estimated_current
+    When none is found we check for entities on the same WLED device with device_class current
+    """
+    mock_device(hass, "wled-device-id", "WLED", "WLED")
+
+    mock_entities_in_registry(
+        hass,
+        {
+            "light.test": {"device_id": "wled-device-id"},
+            "sensor.test_current": {
+                "device_id": "wled-device-id",
+                "unit_of_measurement": "mA",
+                "original_device_class": SensorDeviceClass.CURRENT,
+            },
+        },
+    )
+
+    strategy = WledStrategy(
+        config={CONF_VOLTAGE: 5, CONF_POWER_FACTOR: 0.9},
+        light_entity=create_source_entity("light.test", hass),
+        hass=hass,
+        standby_power=0.1,
+    )
+    estimated_current_entity = await strategy.find_estimated_current_entity()
+    assert estimated_current_entity == "sensor.test_current"
+
+
+async def test_exception_is_raised_when_no_estimated_current_entity_found(
+    hass: HomeAssistant,
+) -> None:
+    mock_entities_in_registry(
+        hass,
+        {
+            "light.test": {"device_id": "wled-device-id"},
+        },
+    )
+
+    strategy = WledStrategy(
+        config={CONF_VOLTAGE: 5, CONF_POWER_FACTOR: 0.9},
+        light_entity=create_source_entity("light.test", hass),
+        hass=hass,
+        standby_power=0.1,
+    )
+    with pytest.raises(StrategyConfigurationError):
+        await strategy.find_estimated_current_entity()
+
+
+async def test_configured_current_entity_takes_precedence(
+    hass: HomeAssistant,
+) -> None:
+    """
+    When the user provides a current entity themselves, that one must be used.
+    This is needed when the WLED integration does not create an estimated current sensor,
+    for example when the brightness limiter is configured per output. See #4545
+    """
+    mock_device(hass, "wled-device-id", "WLED", "WLED")
+
+    mock_entities_in_registry(
+        hass,
+        {
+            "light.test": {"device_id": "wled-device-id"},
+            "sensor.test_current": {
+                "device_id": "wled-device-id",
+                "unit_of_measurement": "mA",
+                "original_device_class": SensorDeviceClass.CURRENT,
+            },
+        },
+    )
+
+    strategy = WledStrategy(
+        config={CONF_VOLTAGE: 5, CONF_POWER_FACTOR: 0.9, CONF_CURRENT_ENTITY: "sensor.wled_rest_current"},
+        light_entity=create_source_entity("light.test", hass),
+        hass=hass,
+    )
+    await strategy.validate_config()
+
+    assert strategy.get_entities_to_track() == ["sensor.wled_rest_current"]
+
+    await set_states(hass, [("light.test", STATE_ON), ("sensor.wled_rest_current", "500")])
+    assert float(await strategy.calculate(State("light.test", STATE_ON))) == pytest.approx(2.25, 0.01)
+
+
+async def test_configured_current_entity_not_in_registry(hass: HomeAssistant) -> None:
+    """
+    A current entity provided by the user does not need to be in the entity registry.
+    YAML defined sensors, for example a REST sensor, have no unique id and are not registered.
+    """
+    mock_entities_in_registry(hass, {"light.test": {}})
+
+    await run_powercalc_setup(
+        hass,
+        {
+            CONF_ENTITY_ID: "light.test",
+            CONF_WLED: {
+                CONF_VOLTAGE: 5,
+                CONF_POWER_FACTOR: 1,
+                CONF_CURRENT_ENTITY: "sensor.wled_rest_current",
+            },
+        },
+    )
+
+    await set_states(hass, [("light.test", STATE_ON), ("sensor.wled_rest_current", "500")])
+    assert_entity_state(hass, "sensor.test_power", "2.50")
+
+
+async def test_wled_autodiscovery_flow(hass: HomeAssistant, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.ERROR)
+    mock_device(hass, "wled-device", "WLED", "FOSS")
+    mock_entities_in_registry(
+        hass,
+        {
+            "light.test": {"device_id": "wled-device"},
+            "light.test_master": {"unique_id": "1234-master", "original_name": "Master", "device_id": "wled-device"},
+            "light.test_segment1": {
+                "unique_id": "1234-segment",
+                "original_name": "WLED Segment1",
+                "device_id": "wled-device",
+            },
+            "light.test_segment_1_2": {"unique_id": "1234-segment", "device_id": "wled-device"},
+            "sensor.test_current": {
+                "device_id": "wled-device",
+                "unit_of_measurement": "mA",
+                "original_device_class": SensorDeviceClass.CURRENT,
+            },
+        },
+    )
+
+    await run_powercalc_setup(hass)
+
+    flows = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+    assert len(flows) == 1
+
+    flow = flows[0]
+    context = flow["context"]
+    assert context["source"] == SOURCE_INTEGRATION_DISCOVERY
+    assert flow["step_id"] == Step.WLED
+
+    result = await hass.config_entries.flow.async_configure(
+        flow["flow_id"],
+        {CONF_VOLTAGE: 5},
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    entry: ConfigEntry = result["result"]
+    assert entry.unique_id == "pc_wled-device"
+
+    assert len(caplog.records) == 0
+
+
+async def test_yaml_configuration(hass: HomeAssistant) -> None:
+    """
+    Full functional test for YAML configuration setup.
+    Also check standby power can be calculated by the WLED strategy
+    """
+    mock_device(hass, "wled-device", "WLED", "FOSS")
+    mock_entities_in_registry(
+        hass,
+        {
+            "light.test": {"device_id": "wled-device"},
+            "sensor.test_current": {
+                "device_id": "wled-device",
+                "unit_of_measurement": "mA",
+                "original_device_class": SensorDeviceClass.CURRENT,
+            },
+        },
+    )
+
+    await run_powercalc_setup(
+        hass,
+        {
+            CONF_ENTITY_ID: "light.test",
+            CONF_WLED: {
+                CONF_VOLTAGE: 5,
+                CONF_POWER_FACTOR: 1,
+            },
+        },
+    )
+
+    await set_states(hass, [("light.test", STATE_ON), ("sensor.test_current", 500)])
+    assert_entity_state(hass, "sensor.test_power", "2.50")
+
+    await set_states(hass, [("light.test", STATE_OFF), ("sensor.test_current", 50)])
+    assert_entity_state(hass, "sensor.test_power", "0.25")
+
+
+async def test_estimated_current_sensor_unavailable(hass: HomeAssistant, caplog: pytest.LogCaptureFixture) -> None:
+    """Test that a warning is logged when estimated current sensor is unavailable."""
+
+    caplog.set_level(logging.WARNING)
+
+    mock_device(hass, "wled-device-id", "WLED", "WLED")
+
+    mock_entities_in_registry(
+        hass,
+        {
+            "light.test": {"device_id": "wled-device-id"},
+            "sensor.test_current": {
+                "device_id": "wled-device-id",
+                "unit_of_measurement": "mA",
+                "original_device_class": SensorDeviceClass.CURRENT,
+            },
+        },
+    )
+
+    await run_powercalc_setup(
+        hass,
+        {
+            CONF_ENTITY_ID: "light.test",
+            CONF_WLED: {
+                CONF_VOLTAGE: 5,
+                CONF_POWER_FACTOR: 1,
+            },
+        },
+    )
+
+    await set_states(hass, [("sensor.test_current", STATE_UNAVAILABLE), ("light.test", STATE_ON)])
+    assert "light.test: Estimated current entity sensor.test_current is not available" in caplog.text
+
+    assert_entity_state(hass, "sensor.test_power", STATE_UNAVAILABLE)

@@ -1,0 +1,323 @@
+from collections.abc import Callable
+from dataclasses import dataclass
+from enum import StrEnum
+import math
+import time
+from typing import Any, TypeGuard
+
+import requests
+from requests.auth import AuthBase, HTTPBasicAuth, HTTPDigestAuth
+
+from measure.powermeter.const import (
+    SHELLY_GEN1_STATUS_ENDPOINT,
+    SHELLY_INFO_ENDPOINT,
+    SHELLY_RPC_DEVICE_STATUS_ENDPOINT,
+    SHELLY_RPC_PM1_STATUS_ENDPOINT,
+    SHELLY_RPC_SWITCH_STATUS_ENDPOINT,
+)
+from measure.powermeter.powermeter import PowerMeasurementResult
+
+
+class ShellyProbeFailure(StrEnum):
+    UNREACHABLE = "unreachable"
+    AUTH_REQUIRED = "auth_required"
+    AUTH_FAILED = "auth_failed"
+    HTTP_ERROR = "http_error"
+    INVALID_RESPONSE = "invalid_response"
+    NO_POWER_COMPONENT = "no_power_component"
+    MULTIPLE_POWER_COMPONENTS = "multiple_power_components"
+    INVALID_CHANNEL = "invalid_channel"
+
+
+class ShellyPowerComponentType(StrEnum):
+    GEN1_METER = "meter"
+    SWITCH = "switch"
+    PM1 = "pm1"
+
+
+@dataclass(frozen=True)
+class ShellyDeviceInfo:
+    generation: int
+    device_id: str | None
+    name: str | None
+    model: str | None
+    auth_required: bool
+
+
+@dataclass(frozen=True)
+class ShellyPowerComponent:
+    type: ShellyPowerComponentType
+    id: int
+    supports_voltage: bool
+
+    @property
+    def status_endpoint(self) -> str:
+        if self.type is ShellyPowerComponentType.GEN1_METER:
+            return SHELLY_GEN1_STATUS_ENDPOINT
+        endpoint = (
+            SHELLY_RPC_SWITCH_STATUS_ENDPOINT
+            if self.type is ShellyPowerComponentType.SWITCH
+            else SHELLY_RPC_PM1_STATUS_ENDPOINT
+        )
+        return endpoint.format(component_id=self.id)
+
+
+@dataclass(frozen=True)
+class ShellyDevice:
+    info: ShellyDeviceInfo
+    power_components: list[ShellyPowerComponent]
+
+    def select_power_component(self, channel: int | None) -> ShellyPowerComponent:
+        components = self.power_components
+        if channel is not None:
+            components = [component for component in components if component.id == channel]
+            if not components:
+                raise ShellyProbeError(
+                    ShellyProbeFailure.INVALID_CHANNEL,
+                    f"Shelly outlet {channel + 1} does not have a supported power measurement component",
+                )
+        if len(components) > 1:
+            raise ShellyProbeError(
+                ShellyProbeFailure.MULTIPLE_POWER_COMPONENTS,
+                "Multiple power measurement components were found; select the outlet to measure",
+            )
+        return components[0]
+
+
+class ShellyProbeError(Exception):
+    def __init__(
+        self,
+        failure: ShellyProbeFailure,
+        message: str,
+        *,
+        device_info: ShellyDeviceInfo | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.failure = failure
+        self.device_info = device_info
+
+    @property
+    def auth_required(self) -> bool:
+        return self.failure is ShellyProbeFailure.AUTH_REQUIRED
+
+
+_INVALID_GENERATION_MESSAGE = "The Shelly generation was invalid"
+_RATE_LIMIT_RETRY_DELAY_SECONDS = 2
+
+
+class ShellyClient:
+    """Probe and read Shelly Gen1 and Gen2+ power components."""
+
+    def __init__(
+        self,
+        ip_address: str,
+        timeout: int,
+        *,
+        username: str = "admin",
+        password: str | None = None,
+        http_get: Callable[..., requests.Response] | None = None,
+    ) -> None:
+        self._base_url = f"http://{ip_address}"
+        self._timeout = timeout
+        self._username = username
+        self._password = password
+        self._authentication: AuthBase | None = None
+        self._http_get = http_get or requests.get
+
+    def probe(self) -> ShellyDevice:
+        info = self._get_device_info()
+        if info.auth_required:
+            if not self._password:
+                raise ShellyProbeError(
+                    ShellyProbeFailure.AUTH_REQUIRED,
+                    "Authentication is enabled; enter the Shelly password",
+                    device_info=info,
+                )
+            self._authentication = (
+                HTTPBasicAuth(self._username, self._password)
+                if info.generation == 1
+                else HTTPDigestAuth("admin", self._password)
+            )
+
+        try:
+            components = self._probe_gen1() if info.generation == 1 else self._probe_rpc()
+        except ShellyProbeError as error:
+            raise ShellyProbeError(error.failure, str(error), device_info=info) from error
+        return ShellyDevice(info=info, power_components=components)
+
+    def read(self, component: ShellyPowerComponent, *, include_voltage: bool) -> PowerMeasurementResult:
+        data = self._request_json(component.status_endpoint, "power measurement")
+        if component.type is ShellyPowerComponentType.GEN1_METER:
+            return self._parse_gen1_reading(data, component.id)
+        return self._parse_rpc_reading(data, include_voltage=include_voltage)
+
+    def _get_device_info(self) -> ShellyDeviceInfo:
+        data = self._request_json(SHELLY_INFO_ENDPOINT, "information")
+        if not isinstance(data, dict):
+            raise self._invalid_response("The Shelly information response was invalid")
+
+        generation_value = data.get("gen", 1)
+        if isinstance(generation_value, bool):
+            raise self._invalid_response(_INVALID_GENERATION_MESSAGE)
+        try:
+            generation = int(generation_value)
+        except (TypeError, ValueError) as error:
+            raise self._invalid_response(_INVALID_GENERATION_MESSAGE) from error
+        if generation < 1:
+            raise self._invalid_response(_INVALID_GENERATION_MESSAGE)
+
+        return ShellyDeviceInfo(
+            generation=generation,
+            device_id=_optional_string(data.get("id") or data.get("mac")),
+            name=_optional_string(data.get("name")),
+            model=_optional_string(data.get("model") or data.get("type")),
+            auth_required=data.get("auth_en") is True or data.get("auth") is True,
+        )
+
+    def _probe_gen1(self) -> list[ShellyPowerComponent]:
+        data = self._request_json(SHELLY_GEN1_STATUS_ENDPOINT, "power status")
+        self._gen1_meter(data)
+        assert isinstance(data, dict)
+        components = []
+        for channel, meter in enumerate(data["meters"]):
+            if isinstance(meter, dict) and _is_number(meter.get("power")):
+                components.append(
+                    ShellyPowerComponent(type=ShellyPowerComponentType.GEN1_METER, id=channel, supports_voltage=False),
+                )
+        return components
+
+    def _probe_rpc(self) -> list[ShellyPowerComponent]:
+        data = self._request_json(SHELLY_RPC_DEVICE_STATUS_ENDPOINT, "RPC status")
+        if not isinstance(data, dict):
+            raise self._invalid_response("The Shelly RPC status response was invalid")
+
+        components: list[ShellyPowerComponent] = []
+        for key, value in data.items():
+            component = _power_component(key, value)
+            if component is not None:
+                components.append(component)
+
+        if not components:
+            raise ShellyProbeError(
+                ShellyProbeFailure.NO_POWER_COMPONENT,
+                "No supported power measurement component was found",
+            )
+        return sorted(components, key=lambda component: component.id)
+
+    def _request_json(self, endpoint: str, description: str) -> object:
+        response = self._get(endpoint)
+        if response.status_code == 429:
+            time.sleep(_RATE_LIMIT_RETRY_DELAY_SECONDS)
+            response = self._get(endpoint)
+
+        if response.status_code in {401, 403}:
+            authenticated = self._authentication is not None
+            message = (
+                "The Shelly username or password is incorrect"
+                if authenticated
+                else "Authentication is enabled; enter the Shelly password"
+            )
+            raise ShellyProbeError(
+                ShellyProbeFailure.AUTH_FAILED if authenticated else ShellyProbeFailure.AUTH_REQUIRED,
+                message,
+            )
+        if response.status_code != 200:
+            raise ShellyProbeError(
+                ShellyProbeFailure.HTTP_ERROR,
+                f"The Shelly {description} endpoint returned HTTP {response.status_code}",
+            )
+        try:
+            return response.json()
+        except ValueError as error:
+            raise self._invalid_response(f"The Shelly {description} response was invalid") from error
+
+    def _get(self, endpoint: str) -> requests.Response:
+        try:
+            return self._http_get(
+                f"{self._base_url}{endpoint}",
+                timeout=self._timeout,
+                allow_redirects=False,
+                auth=self._authentication,
+            )
+        except requests.RequestException as error:
+            raise ShellyProbeError(
+                ShellyProbeFailure.UNREACHABLE,
+                "The Shelly device could not be reached",
+            ) from error
+
+    def _parse_gen1_reading(self, data: object, channel: int) -> PowerMeasurementResult:
+        meter = self._gen1_meter(data, channel)
+        timestamp = meter.get("timestamp")
+        if not _is_number(timestamp):
+            raise self._invalid_response("The Shelly Gen1 power status response did not contain a valid timestamp")
+        return PowerMeasurementResult(power=float(meter["power"]), updated=float(timestamp))
+
+    def _parse_rpc_reading(self, data: object, *, include_voltage: bool) -> PowerMeasurementResult:
+        if not isinstance(data, dict) or not _is_number(data.get("apower")):
+            raise self._invalid_response("The Shelly RPC power status response did not contain a valid power value")
+        voltage = data.get("voltage")
+        voltage_value: float | None = None
+        if include_voltage:
+            if not _is_number(voltage):
+                raise self._invalid_response(
+                    "The Shelly RPC power status response did not contain a valid voltage value",
+                )
+            voltage_value = float(voltage)
+        return PowerMeasurementResult(
+            power=float(data["apower"]),
+            voltage=voltage_value,
+            updated=time.time(),
+        )
+
+    def _gen1_meter(self, data: object, channel: int = 0) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            raise self._invalid_response("The Shelly Gen1 power status response was invalid")
+        meters = data.get("meters")
+        valid_meter = (
+            isinstance(meters, list)
+            and 0 <= channel < len(meters)
+            and isinstance(meters[channel], dict)
+            and _is_number(meters[channel].get("power"))
+        )
+        if not valid_meter:
+            raise self._invalid_response("The Shelly Gen1 power status response did not contain a valid power value")
+        assert isinstance(meters, list)
+        meter = meters[channel]
+        assert isinstance(meter, dict)
+        return meter
+
+    @staticmethod
+    def _invalid_response(message: str) -> ShellyProbeError:
+        return ShellyProbeError(ShellyProbeFailure.INVALID_RESPONSE, message)
+
+
+def _power_component(key: object, value: object) -> ShellyPowerComponent | None:
+    if not isinstance(key, str) or not isinstance(value, dict) or not _is_number(value.get("apower")):
+        return None
+    type_value, separator, component_id_value = key.partition(":")
+    if not separator or not component_id_value.isdecimal():
+        return None
+    try:
+        component_type = ShellyPowerComponentType(type_value)
+    except ValueError:
+        return None
+    if component_type is ShellyPowerComponentType.GEN1_METER:
+        return None
+    return ShellyPowerComponent(
+        type=component_type,
+        id=int(component_id_value),
+        supports_voltage=_is_number(value.get("voltage")),
+    )
+
+
+def _is_number(value: object) -> TypeGuard[int | float]:
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # pragma: no cover - integers beyond float range are not realistic meter readings
+        return False
+
+
+def _optional_string(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None

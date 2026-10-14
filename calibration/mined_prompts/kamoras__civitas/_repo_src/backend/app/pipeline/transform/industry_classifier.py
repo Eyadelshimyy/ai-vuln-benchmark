@@ -1,0 +1,564 @@
+"""Hybrid industry classifier using a tiered strategy.
+
+Classification tiers (in priority order):
+1. Learning store lookup (instant, highest confidence)
+2. Sentence-transformer embedding cosine similarity against industry
+   descriptions (fast, no LLM, generalizes to unseen entities)
+3. Returns "OTHER" — the kNN reclassifier handles unknowns in batch
+   and feeds results back into the learning store.
+
+Academic rationale
+------------------
+Industry classification of campaign donors is a text classification
+task where the "document" is an entity name (e.g. "Lockheed Martin
+Employees PAC") and the classes are industry sectors. Cosine similarity
+in dense embedding space (Reimers & Gurevych 2019, Sentence-BERT) is
+the standard approach for short-text classification where labeled
+training data per class is limited (Minaee et al. 2021, "Deep Learning-
+Based Text Classification: A Comprehensive Review," ACM Computing
+Surveys 54:3).
+
+The industry descriptions serve as class prototypes in a zero-shot
+classification setup (Yin, Hay & Roth 2019, "Benchmarking Zero-shot
+Text Classification," EMNLP). Each description is a natural-language
+definition of the industry enriched with exemplar company names,
+providing both semantic coverage and entity-level anchoring.
+
+The tiered strategy follows the computational parsimony principle from
+Jurafsky & Martin (2023, "Speech and Language Processing," 3rd ed.):
+use the simplest sufficient model at each stage, reserving expensive
+methods for the residual.
+
+References
+----------
+- Reimers, N. & Gurevych, I. (2019). Sentence-BERT. EMNLP 2019.
+- Minaee, S. et al. (2021). ACM Computing Surveys, 54(3), 1-40.
+- Yin, W., Hay, J. & Roth, D. (2019). Benchmarking Zero-shot Text
+  Classification. EMNLP 2019, 3914-3923.
+- Jurafsky, D. & Martin, J. H. (2023). Speech and Language
+  Processing. 3rd ed. Stanford University.
+"""
+
+import logging
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
+
+import numpy as np
+from sqlalchemy.orm import Session
+
+from app.models import LearnedClassification
+from app.time_utils import utcnow
+
+logger = logging.getLogger(__name__)
+
+INDUSTRY_DESCRIPTIONS: dict[str, str] = {
+    "PHARMA": (
+        "pharmaceutical drugs biotech medicine vaccines clinical trials drug manufacturing. "
+        "Pfizer Merck AbbVie Eli Lilly Johnson & Johnson Novartis Sanofi AstraZeneca Amgen "
+        "Gilead Moderna Regeneron biopharmaceutical prescription drugs"
+    ),
+    "INSURANCE": (
+        "insurance underwriting coverage premiums actuarial health insurance property casualty. "
+        "Anthem Cigna Humana UnitedHealth Aetna Blue Cross Blue Shield BCBS MetLife Aflac Progressive "
+        "Allstate State Farm Geico mutual life benefit plan underwriter indemnity "
+        "Hartford Nationwide Liberty Mutual Travelers USAA"
+    ),
+    "OIL_GAS": (
+        "oil gas petroleum drilling fracking pipeline fossil fuel refinery crude natural gas. "
+        "Exxon Chevron ConocoPhillips BP Shell Halliburton Koch Marathon Valero exploration "
+        "upstream downstream"
+    ),
+    "DEFENSE": (
+        "defense military weapons aerospace missiles contractors armed forces. "
+        "Lockheed Raytheon Boeing Northrop Grumman General Dynamics BAE L3Harris Leidos "
+        "naval army air force Pentagon"
+    ),
+    # Measured and not changed (2026-10-09): adding "credit union league
+    # association of credit unions" here moved a credit-union trade group off
+    # LABOR_UNIONS (5 of the FEC file's 25 credit-union PACs read as unions,
+    # 1 after) and lifted the record-labelled committees from 250 to 253
+    # right, but it relabelled 434 of the learning store's 25,403 names, and
+    # of 60 of those judged by hand 19 improved and 19 got worse. Any edit
+    # to a prototype moves every name near it; this one is a wash.
+    "FINANCE": (
+        "banking investment securities hedge private equity venture capital. "
+        "Wall Street asset management brokerage wealth management credit lending mortgage. "
+        "Credit union savings bank federal credit union mutual savings. "
+        "Goldman Sachs Morgan Stanley JPMorgan Citigroup Bank of America Wells Fargo BlackRock "
+        "Fidelity Vanguard Raymond James BB&T Truist PNC Capital One TD Bank "
+        "financial services fiduciary trading derivatives bonds equities"
+    ),
+    # No organization's name in REAL_ESTATE or GUNS (v6.30): a name like
+    # "National Association of Realtors" or "National Rifle Association"
+    # matched every "National ... Association" by its generic words. Measured
+    # on the 1,861 PAC donor names stored 2026-10-08: GUNS fell from 97 names
+    # to 6 and 91 of the 160 changed labels left GUNS, nearly all for a
+    # better or no label; the Realtors' PAC stays REAL_ESTATE. The cost: the
+    # NRA's political fund and two gun-safety PACs now read POLITICAL or
+    # LOBBYISTS (one side each). Adding any of those names back brought 81
+    # to 119 names into GUNS, mostly wrong (scripts/evaluate_industry_classifier.py
+    # and docs/methodology/member-score/v6.30.md).
+    "REAL_ESTATE": (
+        "real estate property housing mortgage realty realtors homebuilder REIT commercial property development"
+    ),
+    "TECH": (
+        "technology software internet cloud computing artificial intelligence data silicon valley. "
+        "Google Alphabet Meta Facebook Apple Microsoft Amazon Oracle Salesforce Intel Nvidia "
+        "digital platform cybersecurity"
+    ),
+    "TELECOM": (
+        "telecommunications wireless broadband cable internet service provider cellular network satellite. "
+        "AT&T Verizon T-Mobile Comcast Charter Sprint CenturyLink Windstream"
+    ),
+    "AGRIBUSINESS": (
+        "agriculture farming crop livestock dairy grain agribusiness ranching fertilizer seed. "
+        "Monsanto Cargill Archer Daniels Deere John Deere Bayer sugar cotton"
+    ),
+    "ENERGY": (
+        "energy utility electric power renewable solar wind nuclear coal generation transmission. "
+        "Electric cooperative power company electric co-op. "
+        "Duke Energy Dominion Exelon NextEra Southern Company"
+    ),
+    "CONSTRUCTION": "construction building contractor engineering infrastructure cement architecture development",
+    "TRANSPORT": (
+        "transportation airline aviation railroad shipping trucking logistics freight maritime. "
+        "FedEx UPS Delta United Airlines American Airlines Southwest"
+    ),
+    "LAWYERS": (
+        "law firm attorney legal litigation counsel solicitor legal services LLP PLLC. "
+        "Skadden Jones Day Kirkland Latham Sidley Covington Greenberg law office attorneys at law. "
+        "Brownstein Hyatt Simpson Thacher DLA Piper Baker McKenzie Hogan Lovells "
+        "White & Case Gibson Dunn Sullivan Cromwell Cleary Gottlieb Blank Rome Howrey"
+    ),
+    "LOBBYISTS": (
+        "lobbying government relations public affairs advocacy influence. "
+        "Akin Gump Squire Patton Boggs BGR Group Invariant LLC Holland Knight lobbying firm"
+    ),
+    "GAMBLING": "casino gambling gaming sports betting lottery wagering Las Vegas Sands MGM Wynn Caesars",
+    # Both sides of firearms-issue advocacy stay in the description (2026-07):
+    # "gun safety gun violence prevention" beside "second amendment", so
+    # neither side's donor base is structurally unable to match the GUNS
+    # policy area. Organization names are out (see REAL_ESTATE above).
+    "GUNS": (
+        "firearm gun rifle ammunition weapons manufacturer second amendment "
+        "gun safety gun violence prevention shooting sports"
+    ),
+    "TOBACCO": "tobacco cigarette vaping e-cigarette nicotine smoking Altria Philip Morris Reynolds JUUL",
+    "CRYPTO": (
+        "cryptocurrency bitcoin blockchain digital currency decentralized finance "
+        "web3 token coin. Bitcoin BTC Ethereum ETH Solana SOL Dogecoin DOGE "
+        "Cardano ADA XRP Ripple Litecoin LTC Polygon MATIC Avalanche AVAX "
+        "Chainlink LINK Polkadot Tron Stellar Uniswap USDC Tether USDT "
+        "stablecoin World Liberty Financial WLFI Coinbase Binance Kraken"
+    ),
+    "PRIVATE_PRISON": "prison corrections incarceration detention correctional facility CoreCivic GEO Group",
+    "LABOR_UNIONS": (
+        "union labor workers organized labor collective bargaining. "
+        "AFL-CIO SEIU Teamsters AFSCME United Auto Workers UAW carpenters electricians plumbers "
+        "steelworkers machinists firefighters laborers IBEW teachers union brotherhood"
+    ),
+    "EDUCATION": "university college school education academic teaching research higher education",
+    "MEDIA": "media broadcast television news publishing journalism entertainment studio film",
+    "RETAIL": "retail store merchandise consumer goods shopping wholesale distribution",
+    "MANUFACTURING": "manufacturing factory production industrial assembly plant fabrication",
+    "HEALTHCARE": (
+        "hospital health clinic medical healthcare nursing patient care physician. "
+        "Medical center health system medical association dental nurses optometric chiropractic podiatry. "
+        "Surgical orthopedic anesthesiology radiology dermatology ophthalmology pediatric obstetrics. "
+        "AMA HCA Kaiser Permanente Mayo Clinic"
+    ),
+    "POLITICAL": (
+        "political party campaign committee victory fund leadership fund election. "
+        "National committee DSCC NRSC Democratic Republican senatorial congressional. "
+        "Emily's List Club for Growth campaign services digital strategy voter contact. "
+        "action fund victory committee joint fundraising state victory friends of "
+        "for senate for congress reelect senate majority PAC super PAC "
+        "political action committee grassroots advocacy votes voters ballot"
+    ),
+}
+
+
+_PAC_NAMING_PROTOTYPE = (
+    "political action committee PAC employees PAC good government fund "
+    "political fund voluntary contributions committee"
+)
+
+_embeddings_cache: dict[str, np.ndarray] = {}
+_pac_naming_emb: np.ndarray | None = None
+
+# ── Classification thresholds ────────────────────────────────────────────────
+#
+# snowflake-arctic-embed-xs is asymmetric: entity names are encoded with
+# prompt_name="query"; industry descriptions are encoded as documents.
+# All cosine scores are in the asymmetric query→document space (~0.74 baseline).
+#
+# SPREAD_THRESHOLD = 0.070
+#   Minimum margin by which the top industry score must exceed the mean of all
+#   industry scores for a classification to be accepted. Entities whose names
+#   appear in an industry description show large spread (>0.10); generic or
+#   unknown entities show near-uniform scores across industries (spread <0.06).
+#   0.070 sits in the observed gap between these two populations.
+#   Calibrated empirically on a sample of ~1,200 FEC donor names across 12
+#   pipeline runs; raising to 0.09 cuts ~8% of valid labels, lowering to 0.05
+#   admits ~11% false positives from generic LLC/Corp names.
+#
+# POLITICAL_MARGIN = 0.06
+#   When the top-scoring industry is POLITICAL, allow the runner-up to win if
+#   the runner-up also clears SPREAD_THRESHOLD and POLITICAL loses by less than
+#   this margin. Many PAC names contain the word "political" or "committee"
+#   which biases toward POLITICAL even when the donor's actual industry is clear
+#   from the name (e.g., "TEAMSTERS POLITICAL FUND" → LABOR_UNIONS).
+#   0.06 was chosen so genuine political entities (where POLITICAL wins by >0.08)
+#   are kept, while incidental PAC naming (where margin is <0.04) is corrected.
+#   If the embedding model is replaced, re-derive both thresholds together.
+SPREAD_THRESHOLD = 0.070
+POLITICAL_MARGIN = 0.06
+
+# How strongly an entity's name must resemble "[X] PAC" naming (cosine
+# against the PAC-naming prototype) before decontextualization even
+# considers overriding a POLITICAL top score. Below this, POLITICAL wins
+# outright without paying for a full sort of the industry scores — used
+# by both the single-entity and batch classifiers (2026-08 cleanup:
+# previously duplicated as a bare 0.35 literal in two places, and briefly
+# checked only inside the sort instead of before it during consolidation).
+PAC_CONTEXT_THRESHOLD = 0.35
+
+
+def clear_industry_embedding_cache() -> None:
+    """Clear cached industry embeddings (call between pipeline runs)."""
+    _embeddings_cache.clear()
+
+
+def _get_industry_embeddings() -> dict[str, np.ndarray]:
+    """Pre-compute and cache industry description embeddings."""
+    if _embeddings_cache:
+        return _embeddings_cache
+
+    from app.pipeline.vector_store import get_embedding_model
+    model = get_embedding_model()
+    for industry, description in INDUSTRY_DESCRIPTIONS.items():
+        embedding = model.encode([description], show_progress_bar=False)[0]
+        _embeddings_cache[industry] = embedding / np.linalg.norm(embedding)
+
+    logger.info("Computed embeddings for %d industry descriptions", len(_embeddings_cache))
+    return _embeddings_cache
+
+
+def _get_pac_naming_embedding() -> np.ndarray:
+    """Cache and return the PAC naming context prototype embedding (document-side)."""
+    global _pac_naming_emb
+    if _pac_naming_emb is not None:
+        return _pac_naming_emb
+    from app.pipeline.vector_store import get_embedding_model
+    model = get_embedding_model()
+    # Encoded as a document (no query prompt), same as industry descriptions.
+    emb = model.encode([_PAC_NAMING_PROTOTYPE], show_progress_bar=False)[0]
+    _pac_naming_emb = emb / np.linalg.norm(emb)
+    return _pac_naming_emb
+
+
+def _decontextualize_political(
+    scored: list[tuple[str, float]],
+    mean_score: float,
+    pac_context_score: float,
+) -> tuple[str, float]:
+    """If POLITICAL wins, check whether the entity is an industry-PAC.
+
+    Many entities are named "[Industry] PAC" — the word PAC pulls them
+    toward POLITICAL in embedding space. If the entity has high cosine
+    similarity to the PAC naming context prototype AND a non-POLITICAL
+    runner-up has sufficient spread (score - mean > SPREAD_THRESHOLD)
+    and is within margin, prefer the runner-up.
+
+    Shared by the single-entity and batch classifiers (2026-08 cleanup:
+    the batch path used to re-implement this decision independently over
+    numpy arrays — same SPREAD_THRESHOLD/POLITICAL_MARGIN logic, two
+    places to keep in sync). Callers precompute pac_context_score (a dot
+    product against the PAC naming prototype) since both already have a
+    query embedding in hand — the batch path computes it once, vectorized,
+    for the whole batch rather than per row.
+    """
+    if not scored or scored[0][0] != "POLITICAL":
+        return scored[0] if scored else ("OTHER", 0.0)
+
+    political_score = scored[0][1]
+
+    if pac_context_score < PAC_CONTEXT_THRESHOLD:
+        return scored[0]
+
+    for industry, score in scored[1:]:
+        if score - mean_score >= SPREAD_THRESHOLD and political_score - score < POLITICAL_MARGIN:
+            logger.debug(
+                "PAC decontextualization: POLITICAL(%.3f) -> %s(%.3f), pac_ctx=%.3f",
+                political_score, industry, score, pac_context_score,
+            )
+            return industry, score
+
+    return scored[0]
+
+
+def classify_industry(org_name: str | None) -> str:
+    """Classify a single org name using embedding cosine similarity.
+
+    Returns:
+        Industry code string, or "OTHER" if below similarity threshold.
+    """
+    result, _ = classify_industry_with_provenance(org_name)
+    return result
+
+
+def classify_industry_with_provenance(org_name: str | None) -> tuple[str, dict]:
+    """Classify and return provenance metadata (top scores, matched anchor).
+
+    Uses embedding cosine similarity against industry description prototypes.
+    When POLITICAL wins, applies mathematical decontextualization to detect
+    "[Industry] PAC" naming patterns and prefer the true industry.
+
+    Returns:
+        (industry_code, metadata_dict) where metadata_dict contains
+        top_match, top_score, runner_up, runner_up_score.
+    """
+    if not org_name or len(org_name.strip()) < 2:
+        return "OTHER", {}
+
+    # Tier 0: hospitality keyword check — hotels/motels/lodges score anomalously
+    # high on MEDIA in the arctic-xs embedding space because "Inn", "Hampton",
+    # etc. overlap with entertainment vocabulary. Hotels are a form of
+    # commercial real estate (Smith Travel Research classification, used by
+    # Deloitte & Touche and CBRE for real estate sector analysis).
+    import re as _re
+    _HOTEL_SUFFIX = _re.compile(
+        r'\b(Inn|Hotel|Suites|Lodge|Resort|Motel|Lodging|Hospitality)\b',
+        _re.IGNORECASE,
+    )
+    _HOTEL_BRANDS = frozenset({
+        "HAMPTON", "HILTON", "MARRIOTT", "HYATT", "SHERATON", "WESTIN",
+        "HOLIDAY INN", "BEST WESTERN", "RADISSON", "WYNDHAM", "INTERCONTINENTAL",
+        "EMBASSY", "COMFORT INN", "LA QUINTA", "EXTENDED STAY", "COURTYARD",
+        "RESIDENCE INN", "FAIRFIELD", "DOUBLETREE", "ALOFT", "FOUR SEASONS",
+        "RITZ-CARLTON", "RITZ CARLTON", "W HOTELS",
+    })
+    _name_upper = org_name.upper()
+    if _HOTEL_SUFFIX.search(org_name) or any(b in _name_upper for b in _HOTEL_BRANDS):
+        return "REAL_ESTATE", {"top_match": "REAL_ESTATE", "top_score": 1.0, "tier": "hospitality_keyword"}
+
+    from app.pipeline.vector_store import get_embedding_model
+
+    raw_embs_cache = _get_industry_embeddings()
+    model = get_embedding_model()
+
+    # Entity name is a query; industry descriptions are documents.
+    # snowflake-arctic-embed-xs must use prompt_name="query" for queries.
+    query_emb = _primed_query_embs.get(org_name)
+    if query_emb is None:
+        query_emb = model.encode([org_name], prompt_name="query", show_progress_bar=False)[0]
+        norm = np.linalg.norm(query_emb)
+        if norm > 0:
+            query_emb = query_emb / norm
+
+    scored: list[tuple[str, float]] = []
+    for industry, ind_emb in raw_embs_cache.items():
+        score = float(np.dot(query_emb, ind_emb))
+        scored.append((industry, score))
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    mean_score = sum(s for _, s in scored) / len(scored) if scored else 0.0
+    pac_context_score = 0.0
+    if scored and scored[0][0] == "POLITICAL":
+        pac_context_score = float(np.dot(query_emb, _get_pac_naming_embedding()))
+    best_industry, best_score = _decontextualize_political(scored, mean_score, pac_context_score)
+    if best_score - mean_score < SPREAD_THRESHOLD:
+        best_industry = "OTHER"
+
+    meta: dict = {"top_match": scored[0][0], "top_score": round(scored[0][1], 4)} if scored else {}
+    if len(scored) > 1:
+        meta["runner_up"] = scored[1][0]
+        meta["runner_up_score"] = round(scored[1][1], 4)
+
+    return best_industry, meta
+
+
+def classify_industries_batch_scored(org_names: list[str]) -> dict[str, tuple[str, float]]:
+    """Batch-classify org names, returning (industry, confidence) pairs.
+
+    Core embedding classifier — all names are encoded in batch against
+    industry description embeddings.  Only entries above
+    SIMILARITY_THRESHOLD are included in the result; absent names should
+    be treated as OTHER.
+
+    Returns:
+        Dict mapping original name -> (industry_code, cosine_score).
+    """
+    if not org_names:
+        return {}
+
+    results: dict[str, tuple[str, float]] = {}
+
+    needs_embedding: list[tuple[int, str]] = []
+    for i, name in enumerate(org_names):
+        if not name or len(name.strip()) < 2:
+            continue
+        needs_embedding.append((i, name))
+
+    if not needs_embedding:
+        return results
+
+    from app.pipeline.vector_store import encode_normalized, get_embedding_model
+
+    raw_embs_cache = _get_industry_embeddings()
+    ind_keys = list(raw_embs_cache.keys())
+    ind_matrix = np.stack([raw_embs_cache[k] for k in ind_keys])
+    pac_emb = _get_pac_naming_embedding()
+
+    model = get_embedding_model()
+    raw_names = [name for _, name in needs_embedding]
+
+    # Entity names are queries; encode with the retrieval query prompt.
+    raw_embs = encode_normalized(model, raw_names, prompt_name="query")
+
+    scores = raw_embs @ ind_matrix.T
+    mean_scores = scores.mean(axis=1)  # (n_queries,) — baseline per query
+    pac_ctx_scores = raw_embs @ pac_emb
+
+    for j, (_, name) in enumerate(needs_embedding):
+        row_scores = scores[j]
+        mean_s = float(mean_scores[j])
+        best_idx = int(np.argmax(row_scores))
+        best_score = float(row_scores[best_idx])
+        best_industry = ind_keys[best_idx]
+
+        # Full sort (and the decontextualization decision itself, shared
+        # with the single-entity path above) only when the cheap argmax
+        # picked POLITICAL *and* PAC-naming context is high enough for
+        # _decontextualize_political to do anything but immediately
+        # return scored[0] anyway — same gate the pre-consolidation code
+        # checked before sorting (2026-08 cleanup review: had drifted to
+        # checking this only inside the sorted call, paying for a sort
+        # every time regardless of whether it could change the outcome).
+        if best_industry == "POLITICAL" and pac_ctx_scores[j] >= PAC_CONTEXT_THRESHOLD:
+            scored_row = sorted(zip(ind_keys, row_scores.tolist()), key=lambda x: x[1], reverse=True)
+            best_industry, best_score = _decontextualize_political(
+                scored_row, mean_s, float(pac_ctx_scores[j]),
+            )
+
+        if best_score - mean_s >= SPREAD_THRESHOLD:
+            results[name] = (best_industry, best_score)
+
+    logger.info(
+        "Batch classified %d org names (%d matched via embedding)",
+        len(org_names),
+        sum(1 for _ in results),
+    )
+    return results
+
+
+# Query embeddings encoded ahead in one batch (primed_industry_lookups),
+# read by classify_industry_with_provenance and cleared when the block ends.
+_primed_query_embs: dict[str, np.ndarray] = {}
+
+
+@contextmanager
+def primed_industry_lookups(org_names: Iterable[str], db_session: Session | None = None) -> Iterator[None]:
+    """Encode, in one batch, every name in `org_names` that
+    classify_with_learning would send to the embedding model: not already
+    in the learning store, not the hospitality tier. One member's
+    contribution detail names a few hundred employers and committees, and
+    one encode call each cost ~0.13 s on the Pi (2026-10)."""
+    from app.pipeline.vector_store import encode_normalized, get_embedding_model
+
+    names = [n for n in dict.fromkeys(org_names) if n and len(n.strip()) >= 2]
+    if db_session is not None and names:
+        learned = {
+            row[0] for row in db_session.query(LearnedClassification.entity_name).filter(
+                LearnedClassification.entity_type == "industry",
+                LearnedClassification.entity_name.in_({n.upper().strip() for n in names}),
+            )
+        }
+        names = [n for n in names if n.upper().strip() not in learned]
+    if names:
+        _primed_query_embs.update(zip(names, encode_normalized(get_embedding_model(), names, prompt_name="query")))
+    try:
+        yield
+    finally:
+        _primed_query_embs.clear()
+
+
+def classify_with_learning(
+    org_name: str,
+    db_session: Session | None = None,
+) -> tuple[str, str]:
+    """Classify using the full tiered strategy.
+
+    Returns:
+        (industry_code, source) where source is "learned", "embedding", or "unknown"
+    """
+    if not org_name or len(org_name.strip()) < 2:
+        return "OTHER", "unknown"
+
+    normalized = org_name.upper().strip()
+
+    if db_session is not None:
+        learned = (
+            db_session.query(LearnedClassification)
+            .filter(
+                LearnedClassification.entity_name == normalized,
+                LearnedClassification.entity_type == "industry",
+            )
+            .first()
+        )
+        if learned:
+            return learned.value, "learned"
+
+    industry, meta = classify_industry_with_provenance(org_name)
+    if industry != "OTHER":
+        if db_session is not None:
+            _store_classification(
+                db_session, normalized, "industry", industry, 0.9, "embedding",
+                match_metadata=meta,
+            )
+        return industry, "embedding"
+
+    return "OTHER", "unknown"
+
+
+def _store_classification(
+    db_session: Session,
+    entity_name: str,
+    entity_type: str,
+    value: str,
+    confidence: float,
+    source: str,
+    match_metadata: dict | None = None,
+) -> None:
+    """Upsert a classification into the learning store with provenance."""
+    import json
+    from app.pipeline.vector_store import get_model_version
+
+    meta_json = json.dumps(match_metadata) if match_metadata else None
+
+    existing = (
+        db_session.query(LearnedClassification)
+        .filter(
+            LearnedClassification.entity_name == entity_name,
+            LearnedClassification.entity_type == entity_type,
+        )
+        .first()
+    )
+    if existing:
+        existing.value = value
+        existing.confidence = confidence
+        existing.source = source
+        existing.model_version = get_model_version() if source in ("embedding", "nn") else None
+        existing.match_metadata = meta_json
+        existing.learned_at = utcnow()
+    else:
+        db_session.add(LearnedClassification(
+            entity_name=entity_name,
+            entity_type=entity_type,
+            value=value,
+            confidence=confidence,
+            source=source,
+            model_version=get_model_version() if source in ("embedding", "nn") else None,
+            match_metadata=meta_json,
+        ))
+    db_session.commit()

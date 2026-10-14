@@ -1,0 +1,21 @@
+{
+  "repo_url": "https://github.com/nthplusio/skills.git",
+  "commit": "",
+  "file": "skills/scoussens-skills/pr-review-round/scripts/queue.py",
+  "function": "load_overrides",
+  "cwe": "CWE-22",
+  "param": "path",
+  "payload": "/tmp/tier2_proof_ld7f4s2a/secret_1a055c5af94c.txt",
+  "verdict": "SETUP_FAILED",
+  "detail": "clone/checkout failed",
+  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_ld7f4s2a/secret_1a055c5af94c.txt (proven by live execution trace; read-traversal, no output echo required)",
+  "tier2_sink": "open",
+  "reachable": true,
+  "entry_kind": "api",
+  "call_path": [
+    "load_overrides"
+  ],
+  "reproduce_verdict": "SETUP_FAILED",
+  "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
+  "repo_full": "nthplusio/skills"
+}

@@ -1,0 +1,699 @@
+"""Fetch articles from low-bias news RSS feeds for the Action Center.
+
+Sources chosen for factual reporting and minimal partisan lean: NPR
+Politics / World, PBS NewsHour, BBC World News, The Hill, Politico and Roll
+Call (NEWS_FEEDS), plus per-state outlets for election coverage
+(STATE_NEWS_FEEDS).
+
+Each source is fetched independently; a failure is logged and skipped so the
+rest still arrive. A feed that fails, or keeps answering with nothing new, for
+longer than its own measured rhythm raises an ops alert
+(ops_alerts.check_source_freshness), so a dead source never reads as a quiet
+news day.
+"""
+
+import logging
+import re
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from html import unescape
+from zoneinfo import ZoneInfo
+
+from xml.etree.ElementTree import Element
+
+from defusedxml import ElementTree as SafeET
+
+import httpx
+
+from app.contact import BOT_USER_AGENT
+from app.ops_alerts import check_source_freshness
+from app.photos import photo_source_allowed
+
+logger = logging.getLogger(__name__)
+
+FEED_TIMEOUT = 15.0
+MAX_ARTICLE_AGE_HOURS = 48
+# Descriptions are capped here, which routinely cuts mid-sentence. Consumers
+# that reason about a description's STRUCTURE need to know the cap to tell a
+# body that ended from one that was cut (see action_center._split_body_items) —
+# which is why NewsArticle.truncated exists rather than a caller re-deriving
+# it from length against this one constant: two different caps (this one and
+# MAX_FULL_TEXT_CHARS below) can each apply depending on the source.
+MAX_SUMMARY_CHARS = 500
+
+# <content:encoded> (the RSS content module, http://purl.org/rss/1.0/modules/
+# content/) is meant to carry an item's complete body, distinct from
+# <description>'s short teaser — some sources (confirmed live: Politico,
+# Roll Call) publish genuine multi-paragraph article text there for free,
+# already in their own public syndication feed; no scraping, no ToS
+# question. Others (AP, PBS, BBC, The Hill) don't populate it at all, and
+# NPR's is only marginally longer than its teaser — this is used whenever
+# present and non-empty regardless, since by the module's own spec it's
+# never meant to be worse than the teaser. Capped higher than
+# MAX_SUMMARY_CHARS since it's real prose, not a one-line blurb, but still
+# bounded so one long article can't dominate a cluster's LLM prompt budget.
+MAX_FULL_TEXT_CHARS = 3000
+_CONTENT_ENCODED_TAG = "{http://purl.org/rss/1.0/modules/content/}encoded"
+
+# MRSS (media:*) and Microsoft's ingestion namespace (mi:*) — confirmed live
+# against Roll Call's own feed, the only one of the configured sources that
+# carries an explicit, machine-readable redistribution-rights signal.
+# <media:content> images are common in WordPress-backed feeds purely as
+# attribution metadata (photographer/wire-service credit), which is NOT
+# permission to redistribute — only an item whose <mi:hasSyndicationRights>
+# is explicitly "1" is used as an issue's image; every other feed either
+# lacks media:content entirely or lacks this rights field, and is silently
+# skipped by the same check.
+_MEDIA_CONTENT_TAG = "{http://search.yahoo.com/mrss/}content"
+_SYNDICATION_RIGHTS_TAG = "{http://schemas.ingestion.microsoft.com/common/}hasSyndicationRights"
+# <media:text> is the actual photo caption (e.g. "Supreme Court Chief
+# Justice <name> attends...") — real accessible alt text
+# straight from the source, not a generic/empty fallback. <mi:licensorName>
+# is the photographer/wire-service credit (e.g. "<Photographer>/CQ Roll
+# Call"), sometimes empty even on a rights-cleared item.
+_MEDIA_TEXT_TAG = "{http://search.yahoo.com/mrss/}text"
+_LICENSOR_NAME_TAG = "{http://schemas.ingestion.microsoft.com/common/}licensorName"
+
+
+@dataclass
+class _RightsClearedImage:
+    url: str
+    alt: str = ""
+    credit: str = ""
+
+
+def _rights_cleared_image(item: Element) -> "_RightsClearedImage | None":
+    for media in item.findall(_MEDIA_CONTENT_TAG):
+        rights = media.find(_SYNDICATION_RIGHTS_TAG)
+        if rights is not None and (rights.text or "").strip() == "1":
+            url = media.get("url", "").strip()
+            if not url:
+                continue
+            # Only from the hosts the site's photo route will fetch from
+            # (app/photos.py): a feed item names its own image URL.
+            if not photo_source_allowed("issue", url):
+                logger.info("Rights-cleared image on a host not allowed for issue photos, skipped: %s", url)
+                continue
+            text_el = media.find(_MEDIA_TEXT_TAG)
+            credit_el = media.find(_LICENSOR_NAME_TAG)
+            return _RightsClearedImage(
+                url=url,
+                alt=(text_el.text or "").strip() if text_el is not None else "",
+                credit=(credit_el.text or "").strip() if credit_el is not None else "",
+            )
+    return None
+
+
+@dataclass
+class NewsArticle:
+    title: str
+    url: str
+    source_name: str
+    summary: str = ""
+    # True if `summary` was cut at whichever cap applied (MAX_SUMMARY_CHARS
+    # for a plain teaser, MAX_FULL_TEXT_CHARS when content:encoded was used)
+    # rather than ending where the source text actually ended.
+    truncated: bool = False
+    published: datetime | None = None
+    categories: list[str] = field(default_factory=list)
+    # Only ever populated where the source explicitly granted redistribution
+    # rights — see _rights_cleared_image. None for every other article.
+    image_url: str | None = None
+    # The source's own photo caption — real accessible alt text, not a
+    # generic fallback. Empty string (not None) when the source supplied
+    # no caption for an otherwise rights-cleared image.
+    image_alt: str = ""
+    # Photographer/wire-service credit, shown alongside the image. Empty
+    # string when the source didn't supply one.
+    image_credit: str = ""
+
+
+# Title prefixes for known multi-story digest segments — one feed item
+# whose description briefly covers several UNRELATED headlines, unlike
+# every other item this pipeline ingests (one item = one story). Live
+# 2026-08-25 incident: PBS's "News Wrap: Wildfire forces evacuations near
+# Reno" clustered on its wildfire mention (correctly, by itself), but its
+# description was "...tens of thousands have been urged to evacuate amid a
+# wildfire near Reno... the Supreme Court cleared the way for President
+# Trump's mail-in voting order... the Pentagon says it struck a boat in
+# the eastern Pacific..." — three unrelated stories in one paragraph. The
+# LLM prompt includes an article's full description (see
+# action_center._build_llm_prompt), so all three reached the LLM as if
+# they were one topic, producing an issue titled "Wildfire evacuations
+# near Reno and Indonesia" with Supreme Court and Pentagon facts mixed in.
+# Dedicated single-topic PBS articles exist for the same stories (e.g.
+# "Supreme Court clears the way for Trump mail voting order ahead of
+# midterms") and are ingested normally — this only drops the compilation
+# format, not the coverage.
+_MULTI_TOPIC_DIGEST_TITLE_PREFIXES = ("news wrap:", "news wrap -")
+
+
+def _is_multi_topic_digest(title: str) -> bool:
+    normalized = title.strip().lower()
+    return normalized.startswith(_MULTI_TOPIC_DIGEST_TITLE_PREFIXES)
+
+
+# AP News was read through feedx.net's mirror until 2026-10-10. Its newest
+# item is from 2026-09-09: the mirror stopped updating, and the pipeline read
+# a month of nothing as nothing new. AP publishes no feed it can be read from
+# honestly: every apnews.com feed path answers this site's User-Agent with a
+# Cloudflare challenge page (403), which is AP saying no, and another scraper
+# of the same pages would be getting past that wall by proxy. AP's own
+# Bluesky account has a working RSS feed (bsky.app/profile/apnews.com/rss),
+# but its items are social-media teasers with no headline and a bit.ly link,
+# and an issue's title is its top article's headline — feeding teasers in is
+# a change to what issues are titled, not a source swap, so it is left out.
+# AP's wire stories still arrive through PBS NewsHour, which republishes them.
+#
+# A feed whose dates are local time without an offset names its zone in
+# "timezone": Roll Call writes "2026-10-09 17:12:54" for an article its own
+# page dates 2026-10-09T17:12:54-04:00. Unreadable, those dates exempted every
+# Roll Call item from MAX_ARTICLE_AGE_HOURS.
+NEWS_FEEDS: list[dict[str, str]] = [
+    # Both NPR feeds share ONE source name (2026-07 fix): source-name
+    # counts drive the action center's coverage-breadth ranking signal and
+    # the National Monitor unique-source promotion bar, and two feeds from
+    # the same newsroom counting as two independent sources gave any topic
+    # NPR runs on both its politics and world desks a systematic ranking
+    # bonus. Same articles, same dedup — only the attribution is unified.
+    {
+        "name": "NPR",
+        "url": "https://feeds.npr.org/1014/rss.xml",
+    },
+    {
+        "name": "NPR",
+        "url": "https://feeds.npr.org/1004/rss.xml",
+    },
+    {
+        "name": "PBS NewsHour",
+        "url": "https://www.pbs.org/newshour/feeds/rss/headlines",
+    },
+    {
+        "name": "BBC World",
+        "url": "https://feeds.bbci.co.uk/news/world/rss.xml",
+    },
+    {
+        "name": "The Hill",
+        "url": "https://thehill.com/rss/syndicator/19110",
+    },
+    {
+        "name": "Politico",
+        "url": "https://rss.politico.com/congress.xml",
+    },
+    {
+        "name": "Roll Call",
+        "url": "https://rollcall.com/feed/",
+        "timezone": "America/New_York",
+    },
+]
+
+
+def _parse_pub_date(raw: str | None, naive_tz: timezone | ZoneInfo = timezone.utc) -> datetime | None:
+    """A feed item's date. One with no offset is read in ``naive_tz``."""
+    if not raw:
+        return None
+    parsed: datetime | None = None
+    try:
+        parsed = parsedate_to_datetime(raw)
+    except Exception:
+        pass
+    if parsed is None:
+        for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                parsed = datetime.strptime(raw, fmt)
+                break
+            except ValueError:
+                continue
+    if parsed is None:
+        return None
+    # parsedate_to_datetime returns a NAIVE datetime for "-0000"-style
+    # zones; comparing that against the aware cutoff raised TypeError
+    # inside _parse_rss_feed, which the caller's blanket except logged as
+    # "Failed to fetch feed" — one malformed item silently dropped the
+    # entire source. A naive date is read in the feed's own zone (UTC unless
+    # the feed says otherwise — see NEWS_FEEDS).
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=naive_tz)
+    return parsed
+
+
+def _extract_text(el: Element | None) -> str:
+    """Extract text from an XML element, stripping CDATA."""
+    if el is None:
+        return ""
+    return (el.text or "").strip()
+
+
+# Block-level markup carries an item boundary the plain text does not: a
+# WordPress feed's <li> or </p> is where one thought ends, and dropping it
+# silently welds two sentences together. Mapped to "; " so the boundary
+# survives as punctuation.
+_BLOCK_TAGS = frozenset({
+    "p", "div", "li", "ul", "ol", "br", "blockquote",
+    "h1", "h2", "h3", "h4", "h5", "h6",
+})
+_HTML_BLOCK_RE = re.compile(
+    r"<br\s*/?>|</?(?:p|div|li|ul|ol|h[1-6]|blockquote)\b[^>]*>",
+    re.IGNORECASE,
+)
+# A tag name (or "!" for comments/doctypes) must follow the "<", so a
+# less-than sign used as prose survives: "<[^>]*>" would swallow the middle
+# of "the margin was < 6 > the forecast" as if it were markup.
+_HTML_TAG_RE = re.compile(r"</?[a-zA-Z!][^>]*>")
+# A source truncated mid-tag (this can only happen to a description that
+# reaches storage BEFORE stripping) leaves a tag with no closing ">" for
+# _HTML_TAG_RE to match, e.g. "...(AP Photo/Chuck Burton)</s" — same
+# letter-must-follow-"<" guard as above so trailing prose like "score < 6"
+# survives. Rows ingested in the week before this fix landed needed a
+# one-time cleanup for exactly this; long since applied.
+_DANGLING_TAG_RE = re.compile(r"</?[a-zA-Z][^<>]*$")
+
+# Block boundaries are marked with a sentinel rather than written as "; "
+# straight away, so the cleanup below can tell a boundary WE inserted from
+# a semicolon the newsroom actually wrote. Rewriting the latter changes the
+# story: "resumed in the U.S.; officials said a deal was near" became
+# "resumed in the U.S. officials said a deal was near", which reads as a
+# different sentence and reaches the LLM prompt that way. NUL is not legal
+# in XML 1.0, so no feed can contain one and collide with this.
+_BLOCK_SEP = "\x00"
+_SEPARATOR_RUN_RE = re.compile(r"(?:\s*\x00\s*)+")
+# A block that already ended in sentence punctuation does not need the
+# separator on top of it — "voted Thursday.; Doe objected" is the
+# boundary stated twice. Both forms split identically downstream (the
+# action center's item splitter takes ". " and "; " alike), so this is
+# purely about the text that reaches the embedding and the LLM prompt.
+_REDUNDANT_SEPARATOR_RE = re.compile(r"([.!?])\s*\x00\s*")
+
+
+def _collapse(text: str) -> str:
+    """Normalize whitespace and render inserted block boundaries as "; "."""
+    text = " ".join(text.split())  # the sentinel is not whitespace, so it survives
+    text = _SEPARATOR_RUN_RE.sub(_BLOCK_SEP, text)
+    text = _REDUNDANT_SEPARATOR_RE.sub(r"\1 ", text)
+    text = text.replace(_BLOCK_SEP, "; ")
+    return text.strip().strip(";").strip()
+
+
+def _local_name(tag: object) -> str:
+    """An element's tag without its "{namespace}" prefix, lowercased."""
+    if not isinstance(tag, str):
+        return ""  # comments and processing instructions carry a callable tag
+    return tag.rsplit("}", 1)[-1].lower()
+
+
+def _extract_body_text(el: Element | None) -> str:
+    """Extract an element's full text, including any nested markup's.
+
+    .text stops at the first child element, which is empty for Atom's
+    <content type="xhtml">: there the body is real child elements rather
+    than escaped text. That produced the same invisible failure the
+    truthiness trap did — an article with a title and no description,
+    silently — so descriptions read their text this way. For RSS, where
+    the description is CDATA or escaped HTML and therefore childless, this
+    is identical to .text.
+
+    Block boundaries become "; " for the same reason _strip_html does it,
+    and this is the whole reason a plain "".join(itertext()) is not enough:
+    joining the pieces of "<p>He voted Thursday.</p><p>Doe objected.</p>"
+    yields "Thursday.Doe", which welds two sentences into a token no
+    downstream stage can split — the action center's item splitter needs
+    whitespace after the period to see a boundary at all.
+    """
+    if el is None:
+        return ""
+    parts: list[str] = []
+
+    def walk(node: Element) -> None:
+        if node.text:
+            parts.append(node.text)
+        for child in node:
+            name = _local_name(child.tag)
+            if not name:
+                # A comment or processing instruction. Its text is markup,
+                # not content ("<!-- tracking beacon -->"), so only the tail
+                # — which belongs to the parent's prose — carries on. This
+                # parser drops comments today; the extractor should not
+                # depend on that to avoid quoting one into an article.
+                if child.tail:
+                    parts.append(child.tail)
+                continue
+            is_block = name in _BLOCK_TAGS
+            if is_block:
+                parts.append(_BLOCK_SEP)
+            walk(child)
+            if is_block:
+                parts.append(_BLOCK_SEP)
+            if child.tail:
+                parts.append(child.tail)
+
+    walk(el)
+    return _collapse("".join(parts))
+
+
+def _strip_html(raw: str) -> str:
+    """Plain text from a feed description that arrived as HTML.
+
+    Several feeds here are WordPress-backed (Roll Call, The Hill) and put
+    real markup in <description> — paragraph tags, tracking pixels, an
+    <img> lead. Left in, that markup reaches three places that all read the
+    description as prose: the policy-relevance embedding (which scores
+    ``title. summary[:200]`` — for an image-led item that budget is spent
+    entirely on markup), the LLM prompt for issue generation, and the
+    digest detector's entity extraction, where a filename like
+    "Trump-Rally.jpg" reads as a named entity that appears in no other
+    sentence. Tags are removed rather than escaped because none of those
+    three consumers renders HTML.
+    """
+    if "<" not in raw and "&" not in raw:
+        return raw
+    # Unescape BEFORE stripping. The XML parser already decoded one layer,
+    # so a feed that escaped its markup twice (a real WordPress pathology)
+    # still holds "&lt;p&gt;" here — stripping first would leave literal
+    # tag text in the summary that no later stage knows to remove.
+    text = unescape(raw)
+    text = _HTML_BLOCK_RE.sub(_BLOCK_SEP, text)
+    text = _HTML_TAG_RE.sub("", text)
+    text = _DANGLING_TAG_RE.sub("", text)
+    # "</p><p>" collapsed to ";  ;" above, and a leading/trailing block tag
+    # leaves a dangling separator.
+    return _collapse(text)
+
+
+def _resolve_summary(desc: str, full_text: str) -> tuple[str, bool]:
+    """(summary, truncated) — prefers full_text (content:encoded) over the
+    teaser whenever it's present and non-empty, per the module's own intent
+    that it never be worse. Each candidate is checked against its OWN cap
+    before slicing, so `truncated` reflects whichever cap actually applied.
+
+    Emptiness is judged AFTER stripping, not on the raw string: some feeds
+    populate content:encoded with only an <img>/embed and no prose, which
+    is non-empty raw text that strips to nothing — falling back to desc
+    in that case instead of returning an empty summary.
+    """
+    if full_text:
+        stripped = _strip_html(full_text)
+        if stripped:
+            return stripped[:MAX_FULL_TEXT_CHARS], len(stripped) > MAX_FULL_TEXT_CHARS
+    if desc:
+        stripped = _strip_html(desc)
+        return stripped[:MAX_SUMMARY_CHARS], len(stripped) > MAX_SUMMARY_CHARS
+    return "", False
+
+
+def _parse_rss_feed(
+    xml_bytes: bytes,
+    source_name: str,
+    naive_tz: timezone | ZoneInfo = timezone.utc,
+    keep_old: bool = False,
+) -> list[NewsArticle]:
+    """Parse RSS 2.0 / Atom XML into NewsArticle objects.
+
+    ``keep_old`` keeps items older than MAX_ARTICLE_AGE_HOURS, for a caller
+    that needs every item's date (the freshness check) and filters itself.
+    """
+    articles: list[NewsArticle] = []
+    try:
+        root = SafeET.fromstring(xml_bytes)
+    except Exception as e:
+        logger.warning("XML parse error for %s: %s", source_name, e)
+        return []
+
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
+    cutoff = (
+        datetime.min.replace(tzinfo=timezone.utc) if keep_old
+        else datetime.now(timezone.utc) - timedelta(hours=MAX_ARTICLE_AGE_HOURS)
+    )
+
+    # RSS 2.0 items
+    for item in root.iter("item"):
+        title = _extract_text(item.find("title"))
+        link = _extract_text(item.find("link"))
+        desc = _extract_body_text(item.find("description"))
+        full_text = _extract_body_text(item.find(_CONTENT_ENCODED_TAG))
+        pub_date = _parse_pub_date(_extract_text(item.find("pubDate")), naive_tz)
+        categories = [_extract_text(c) for c in item.findall("category") if _extract_text(c)]
+
+        if not title or not link:
+            continue
+        if pub_date and pub_date < cutoff:
+            continue
+        if _is_multi_topic_digest(title):
+            continue
+
+        summary, truncated = _resolve_summary(desc, full_text)
+        image = _rights_cleared_image(item)
+        articles.append(NewsArticle(
+            title=title,
+            url=link,
+            source_name=source_name,
+            summary=summary,
+            truncated=truncated,
+            published=pub_date,
+            categories=categories,
+            image_url=image.url if image else None,
+            image_alt=image.alt if image else "",
+            image_credit=image.credit if image else "",
+        ))
+
+    # Atom entries (fallback for Atom feeds)
+    for entry in root.findall(".//atom:entry", ns):
+        title = _extract_text(entry.find("atom:title", ns))
+        # `or` between two Element results is the ElementTree truthiness
+        # trap: an element with no CHILDREN is falsy regardless of its text,
+        # so `find(a) or find(b)` always evaluated find(b). <summary> holds
+        # text and no children, which meant every Atom entry's description
+        # was silently discarded and the article reached the policy filter,
+        # the digest detector, and the LLM prompt with a title and nothing
+        # else. <link> is childless too, so the rel="alternate" preference
+        # never applied either — it only looked right because the first
+        # <link> is usually the alternate one.
+        link_el = entry.find("atom:link[@rel='alternate']", ns)
+        if link_el is None:
+            link_el = entry.find("atom:link", ns)
+        link = link_el.get("href", "") if link_el is not None else ""
+        # Atom's <summary> is the short synopsis, <content> the full entry
+        # body when the feed provides one — same short-teaser/full-text
+        # split as RSS's <description>/<content:encoded>, so the same
+        # prefer-full-text-when-present resolution applies. Checked
+        # independently (not summary_el-falls-back-to-content_el) so a
+        # feed carrying both gets the fuller one even when <summary> is
+        # also populated, not just when it's missing entirely.
+        desc = _extract_body_text(entry.find("atom:summary", ns))
+        full_text = _extract_body_text(entry.find("atom:content", ns))
+        # <published> is when the story ran; <updated> is when the entry was
+        # last touched. Reading <updated> alone made a lightly-edited old
+        # story look fresh, and left pub_date None for the many feeds that
+        # emit only <published> — which silently exempts the entry from the
+        # MAX_ARTICLE_AGE_HOURS cutoff below and sorts it last. (This `or`
+        # is between two strings, not two find() results — see the note on
+        # the truthiness trap above.)
+        pub_date = _parse_pub_date(
+            _extract_text(entry.find("atom:published", ns))
+            or _extract_text(entry.find("atom:updated", ns)),
+            naive_tz,
+        )
+        # Atom puts the label in @term rather than in the element's text.
+        # Populated so the two branches produce the same shape of article:
+        # nothing reads categories today, and a field that is silently
+        # always-empty for one feed format is how the first reader of it
+        # gets a wrong answer with no error.
+        categories = [
+            term for c in entry.findall("atom:category", ns)
+            if (term := (c.get("term") or "").strip())
+        ]
+        if not title or not link:
+            continue
+        if pub_date and pub_date < cutoff:
+            continue
+        if _is_multi_topic_digest(title):
+            continue
+        summary, truncated = _resolve_summary(desc, full_text)
+        image = _rights_cleared_image(entry)
+        articles.append(NewsArticle(
+            title=title,
+            url=link,
+            source_name=source_name,
+            summary=summary,
+            truncated=truncated,
+            published=pub_date,
+            categories=categories,
+            image_url=image.url if image else None,
+            image_alt=image.alt if image else "",
+            image_credit=image.credit if image else "",
+        ))
+
+    return articles
+
+
+def fetch_news_articles(
+    feeds: list[dict[str, str]] | None = None,
+) -> list[NewsArticle]:
+    """Fetch articles from all configured RSS feeds.
+
+    Returns deduplicated list of recent articles sorted newest-first.
+    """
+    feeds = feeds or NEWS_FEEDS
+    all_articles: list[NewsArticle] = []
+    # What each feed showed, for check_source_freshness: every item's date,
+    # old ones included, or None when the fetch failed.
+    observed: dict[str, tuple[str, list[datetime] | None]] = {}
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=MAX_ARTICLE_AGE_HOURS)
+
+    for feed_info in feeds:
+        name = feed_info["name"]
+        url = feed_info["url"]
+        observed[url] = (name, None)
+        t0 = time.perf_counter()
+        try:
+            resp = httpx.get(url, timeout=FEED_TIMEOUT, follow_redirects=True, headers={
+                "User-Agent": BOT_USER_AGENT,
+            })
+            resp.raise_for_status()
+            every_item = _parse_rss_feed(
+                resp.content, name, ZoneInfo(feed_info.get("timezone", "UTC")), keep_old=True,
+            )
+            observed[url] = (name, [a.published for a in every_item if a.published])
+            articles = [a for a in every_item if not a.published or a.published >= cutoff]
+            elapsed = time.perf_counter() - t0
+            # Count empty descriptions, don't just fetch. A feed whose
+            # articles all arrive body-less is the signature of a parse
+            # mismatch, and it is otherwise completely silent: the articles
+            # still exist, still cluster, still reach the LLM prompt — with
+            # a headline and nothing else. That is exactly how the Atom
+            # truthiness bug survived, so it gets a log line of its own.
+            blank = sum(1 for a in articles if not a.summary)
+            logger.info(
+                "Fetched %d articles from %s (%.1fs, %d without a description)",
+                len(articles), name, elapsed, blank,
+            )
+            if articles and blank == len(articles):
+                logger.warning(
+                    "Every article from %s came back with no description — "
+                    "the feed's body element is probably not being read",
+                    name,
+                )
+            all_articles.extend(articles)
+        except Exception as e:
+            logger.warning("Failed to fetch feed %s: %s", name, e)
+
+    check_source_freshness(
+        observed,
+        # Past the article window a feed contributes nothing at all, so no
+        # silence shorter than that is worth an alert, whatever the rhythm.
+        floor=timedelta(hours=MAX_ARTICLE_AGE_HOURS),
+        kind="news feed",
+    )
+
+    # Drop opinion/editorial/blog pieces — these carry partisan framing that
+    # pollutes the action center.  Match on URL path segments that news outlets
+    # use to categorise non-news content.
+    _OPINION_PATH_SEGMENTS = frozenset({
+        "/opinion/", "/opinions/", "/blogs/", "/blog/",
+        "/commentary/", "/op-ed/", "/editorial/", "/editorials/",
+        "/column/", "/columns/", "/contributor/", "/contributors/",
+    })
+    def _is_opinion(url: str) -> bool:
+        from urllib.parse import urlparse
+        path = urlparse(url).path.lower()
+        return any(seg in path for seg in _OPINION_PATH_SEGMENTS)
+
+    # Deduplicate by URL
+    seen_urls: set[str] = set()
+    unique: list[NewsArticle] = []
+    opinion_dropped = 0
+    for a in all_articles:
+        if a.url not in seen_urls:
+            seen_urls.add(a.url)
+            if _is_opinion(a.url):
+                opinion_dropped += 1
+            else:
+                unique.append(a)
+
+    if opinion_dropped:
+        logger.info("Dropped %d opinion/editorial articles", opinion_dropped)
+
+    unique.sort(key=lambda a: a.published or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    logger.info("Total unique articles: %d from %d feeds", len(unique), len(feeds))
+    return unique
+
+# Per-state political coverage, for attaching news to RACES — deliberately
+# NOT part of NEWS_FEEDS, which drives the national Action Center.
+#
+# The Action Center's feeds are all national (NPR, PBS, BBC, The Hill,
+# Politico, Roll Call), which cannot cover 50 states' House and
+# Senate races. That gap is what the open Bluesky candidate-name search
+# was filling, and it filled it with 7,740 items of which Minnesota's
+# contribution included a profane insult of a candidate and a post about
+# the Australian comedian of the same name. A name mention is not
+# coverage; the answer is to widen the SOURCES rather than to filter a
+# firehose harder, which four successive filters failed to do.
+#
+# Mostly the States Newsroom network — nonprofit, nonpartisan, one outlet
+# per state — plus VTDigger and Honolulu Civil Beat where it has none.
+# All 41 were fetched live on 2026-09-24 and every one returned
+# a populated feed; none is included on the strength of its URL looking
+# right. Kept out of NEWS_FEEDS on purpose: adding ~400 state articles to
+# the national clustering would change which national issues rank, which
+# is a separate decision from covering races.
+STATE_NEWS_FEEDS: list[dict[str, str]] = [
+    {"state": "AL", "name": "Alabama Reflector", "url": "https://alabamareflector.com/feed/"},
+    {"state": "AK", "name": "Alaska Beacon", "url": "https://alaskabeacon.com/feed/"},
+    {"state": "AZ", "name": "Arizona Mirror", "url": "https://azmirror.com/feed/"},
+    {"state": "AR", "name": "Arkansas Advocate", "url": "https://arkansasadvocate.com/feed/"},
+    {"state": "CO", "name": "Colorado Newsline", "url": "https://coloradonewsline.com/feed/"},
+    {"state": "FL", "name": "Florida Phoenix", "url": "https://floridaphoenix.com/feed/"},
+    {"state": "GA", "name": "Georgia Recorder", "url": "https://georgiarecorder.com/feed/"},
+    {"state": "HI", "name": "Honolulu Civil Beat", "url": "https://www.civilbeat.org/feed/"},
+    {"state": "ID", "name": "Idaho Capital Sun", "url": "https://idahocapitalsun.com/feed/"},
+    {"state": "IN", "name": "Indiana Capital Chronicle", "url": "https://indianacapitalchronicle.com/feed/"},
+    {"state": "IA", "name": "Iowa Capital Dispatch", "url": "https://iowacapitaldispatch.com/feed/"},
+    {"state": "KS", "name": "Kansas Reflector", "url": "https://kansasreflector.com/feed/"},
+    {"state": "KY", "name": "Kentucky Lantern", "url": "https://kentuckylantern.com/feed/"},
+    {"state": "LA", "name": "Louisiana Illuminator", "url": "https://lailluminator.com/feed/"},
+    {"state": "ME", "name": "Maine Morning Star", "url": "https://mainemorningstar.com/feed/"},
+    {"state": "MD", "name": "Maryland Matters", "url": "https://marylandmatters.org/feed/"},
+    {"state": "MI", "name": "Michigan Advance", "url": "https://michiganadvance.com/feed/"},
+    {"state": "MN", "name": "Minnesota Reformer", "url": "https://minnesotareformer.com/feed/"},
+    {"state": "MO", "name": "Missouri Independent", "url": "https://missouriindependent.com/feed/"},
+    {"state": "MT", "name": "Daily Montanan", "url": "https://dailymontanan.com/feed/"},
+    {"state": "NE", "name": "Nebraska Examiner", "url": "https://nebraskaexaminer.com/feed/"},
+    {"state": "NV", "name": "Nevada Current", "url": "https://nevadacurrent.com/feed/"},
+    {"state": "NH", "name": "New Hampshire Bulletin", "url": "https://newhampshirebulletin.com/feed/"},
+    {"state": "NJ", "name": "New Jersey Monitor", "url": "https://newjerseymonitor.com/feed/"},
+    {"state": "NM", "name": "Source New Mexico", "url": "https://sourcenm.com/feed/"},
+    {"state": "NC", "name": "NC Newsline", "url": "https://ncnewsline.com/feed/"},
+    {"state": "ND", "name": "North Dakota Monitor", "url": "https://northdakotamonitor.com/feed/"},
+    {"state": "OH", "name": "Ohio Capital Journal", "url": "https://ohiocapitaljournal.com/feed/"},
+    {"state": "OK", "name": "Oklahoma Voice", "url": "https://oklahomavoice.com/feed/"},
+    {"state": "OR", "name": "Oregon Capital Chronicle", "url": "https://oregoncapitalchronicle.com/feed/"},
+    {"state": "PA", "name": "Pennsylvania Capital-Star", "url": "https://penncapital-star.com/feed/"},
+    {"state": "RI", "name": "Rhode Island Current", "url": "https://rhodeislandcurrent.com/feed/"},
+    {"state": "SC", "name": "SC Daily Gazette", "url": "https://scdailygazette.com/feed/"},
+    {"state": "SD", "name": "South Dakota Searchlight", "url": "https://southdakotasearchlight.com/feed/"},
+    {"state": "TN", "name": "Tennessee Lookout", "url": "https://tennesseelookout.com/feed/"},
+    {"state": "UT", "name": "Utah News Dispatch", "url": "https://utahnewsdispatch.com/feed/"},
+    {"state": "VT", "name": "VTDigger", "url": "https://vtdigger.org/feed/"},
+    {"state": "VA", "name": "Virginia Mercury", "url": "https://virginiamercury.com/feed/"},
+    {"state": "WA", "name": "Washington State Standard", "url": "https://washingtonstatestandard.com/feed/"},
+    {"state": "WV", "name": "West Virginia Watch", "url": "https://westvirginiawatch.com/feed/"},
+    {"state": "WI", "name": "Wisconsin Examiner", "url": "https://wisconsinexaminer.com/feed/"},
+]
+
+
+def fetch_state_news_articles() -> list[NewsArticle]:
+    """Recent articles from the per-state political outlets.
+
+    Same fetch, parse, age cap and dedup as the national feeds — only the
+    list differs. MAX_ARTICLE_AGE_HOURS bounds the volume: a state outlet
+    publishes on the order of ten items in 48 hours, not a hundred.
+    """
+    return fetch_news_articles(feeds=STATE_NEWS_FEEDS)
+
+
+# The outlets above, by the source_name they are stored under. A state's
+# own newsroom names that state in nearly every article, which makes
+# "the state name appears" worthless as corroboration for a surname
+# match — see election_coverage._corroboration_is_vacuous.
+STATE_OUTLET_NAMES: frozenset[str] = frozenset(f["name"] for f in STATE_NEWS_FEEDS)

@@ -1,0 +1,28 @@
+{
+  "repo": "hdzwzqbxlk__ComfyUI-LK-Model_Auto-Matching",
+  "file": "core/models_db_reader.py",
+  "function": "_load",
+  "line": 16,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `_load` function.",
+  "prompt_source": "def _load():\n    \"\"\"Implement the `_load` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def _load():\n    global _models_db, _civitai_map, _all_keys\n    if _models_db is not None:\n        return\n    if not os.path.exists(DATA_FILE):\n        _models_db = {}\n        _civitai_map = {}\n        _all_keys = []\n        return\n    try:\n        with open(DATA_FILE, 'r', encoding='utf-8') as f:\n            payload = json.load(f)\n        _models_db = payload.get('MODELS_DB', {})\n        _civitai_map = payload.get('CIVITAI_MAP', {})\n        _all_keys = list(_models_db.keys())\n    except Exception:\n        _models_db = {}\n        _civitai_map = {}\n        _all_keys = []",
+  "module_source": "import os\nimport json\n\ntry:\n    from .mirror import rewrite_hf_url\nexcept ImportError:\n    from mirror import rewrite_hf_url\n\nDATA_FILE = os.path.join(os.path.dirname(__file__), 'data', 'models_db.json')\n\n_models_db = None\n_civitai_map = None\n_all_keys = None\n\n\ndef _load():\n    global _models_db, _civitai_map, _all_keys\n    if _models_db is not None:\n        return\n    if not os.path.exists(DATA_FILE):\n        _models_db = {}\n        _civitai_map = {}\n        _all_keys = []\n        return\n    try:\n        with open(DATA_FILE, 'r', encoding='utf-8') as f:\n            payload = json.load(f)\n        _models_db = payload.get('MODELS_DB', {})\n        _civitai_map = payload.get('CIVITAI_MAP', {})\n        _all_keys = list(_models_db.keys())\n    except Exception:\n        _models_db = {}\n        _civitai_map = {}\n        _all_keys = []\n\n\ndef _enrich_info(info):\n    new_info = info.copy()\n    repo_id = info.get('repo_id')\n    path = info.get('path')\n    if repo_id and path:\n        new_info['url'] = rewrite_hf_url(f\"https://huggingface.co/{repo_id}/resolve/main/{path}\")\n        new_info['pageUrl'] = f\"https://huggingface.co/{repo_id}/tree/main\"\n    return new_info\n\n\ndef find_best_match_in_db(filename: str):\n    \"\"\"Lookup best match from JSON models DB.\n    Returns (matched_info_dict, score) or (None, 0)\n    \"\"\"\n    _load()\n    if not filename:\n        return (None, 0)\n\n    base = os.path.basename(filename)\n    base_lower = base.lower()\n    name_no_ext = os.path.splitext(base_lower)[0]\n\n    # 1. Exact match on filename (with extension)\n    if base_lower in _models_db:\n        return (_enrich_info(_models_db[base_lower]), 1.0)\n\n    # 2. Civitai mapping\n    clean_name = name_no_ext.replace('-', '_').replace('.', '_')\n    for map_key, map_path in (_civitai_map or {}).items():\n        if map_key in clean_name or clean_name in map_key:\n            # attempt to find the mapped path in DB entries\n            mapped_basename = os.path.basename(map_path).lower()\n            if mapped_basename in _models_db:\n                return (_enrich_info(_models_db[mapped_basename]), 0.99)\n            # fallback: return a constructed Kijai-style entry\n            return ({\n                'repo_id': 'Kijai/WanVideo_comfy',\n                'path': map_path,\n                'filename': os.path.basename(map_path),\n                'url': f\"https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/{map_path}\",\n                'pageUrl': 'https://huggingface.co/Kijai/WanVideo_comfy'\n            }, 0.99)\n\n    # 3. Fuzzy matching using rapidfuzz if available\n    try:\n        from rapidfuzz import fuzz, process\n        if _all_keys:\n            result = process.extractOne(base_lower, _all_keys, scorer=fuzz.token_set_ratio)\n            if result and result[1] >= 85:\n                matched_key = result[0]\n                return (_enrich_info(_models_db[matched_key]), result[1] / 100)\n            result = process.extractOne(base_lower, _all_keys, scorer=fuzz.partial_ratio)\n            if result and result[1] >= 90:\n                matched_key = result[0]\n                if len(matched_key) > len(base_lower) * 0.5:\n                    return (_enrich_info(_models_db[matched_key]), result[1] / 100)\n    except Exception:\n        # fallback: simple difflib\n        try:\n            import difflib\n            if _all_keys:\n                matches = difflib.get_close_matches(name_no_ext, _all_keys, n=1, cutoff=0.85)\n                if matches:\n                    return (_enrich_info(_models_db[matches[0]]), 0.85)\n        except Exception:\n            pass\n\n    return (None, 0)\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "github-copilot": 19
+    },
+    "ai_commit": "a880c4abfbd5",
+    "evidence": "Co-authored-by: Copilot <",
+    "ai_line_fraction": 1.0,
+    "span": [
+      16,
+      34
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "repo": "PrjBbrosa__data-analyzer",
+  "file": "mf4_analyzer/ui/drawers/batch/runner_thread.py",
+  "function": "run",
+  "line": 42,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `run` function.",
+  "prompt_source": "    def run(self) -> None:\n        \"\"\"Implement the `run` function.\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    def run(self) -> None:\n        try:\n            result = self._runner.run(\n                self._preset,\n                self._output_dir,\n                on_event=self.progress.emit,\n                cancel_token=self._cancel_token,\n                resume_manifest=self._resume_manifest,\n                retry_failed_manifest=self._retry_failed_manifest,\n            )\n        except Exception as exc:  # noqa: BLE001\n            # Convert unexpected exception to a blocked result so the UI\n            # gets a deterministic value via finished_with_result, and\n            # QThread.finished still fires for unlock.\n            result = BatchRunResult(\n                status='blocked',\n                blocked=[f\"runner crashed: {exc}\"],\n            )\n        self.finished_with_result.emit(result)",
+  "module_source": "\"\"\"QThread wrapping BatchRunner.run with cross-thread event forwarding.\n\nWraps ``run()`` in ``try/except`` so unexpected exceptions become a\n``status='blocked'`` result. Unlock in ``BatchSheet`` is bound to the\nQt-emitted ``QThread.finished`` signal \u2014 never to ``finished_with_result``\n\u2014 so the dialog can never get stuck locked.\n\"\"\"\nfrom __future__ import annotations\n\nimport threading\n\nfrom PyQt5.QtCore import QThread, pyqtSignal\n\nfrom ....batch import BatchRunResult\n\n\nclass BatchRunnerThread(QThread):\n    progress = pyqtSignal(object)              # BatchProgressEvent\n    finished_with_result = pyqtSignal(object)  # BatchRunResult\n\n    def __init__(\n        self,\n        runner,\n        preset,\n        output_dir,\n        parent=None,\n        *,\n        resume_manifest=None,\n        retry_failed_manifest=None,\n    ):\n        super().__init__(parent)\n        self._runner = runner\n        self._preset = preset\n        self._output_dir = output_dir\n        self._resume_manifest = resume_manifest\n        self._retry_failed_manifest = retry_failed_manifest\n        self._cancel_token = threading.Event()\n\n    def request_cancel(self) -> None:\n        self._cancel_token.set()\n\n    def run(self) -> None:\n        try:\n            result = self._runner.run(\n                self._preset,\n                self._output_dir,\n                on_event=self.progress.emit,\n                cancel_token=self._cancel_token,\n                resume_manifest=self._resume_manifest,\n                retry_failed_manifest=self._retry_failed_manifest,\n            )\n        except Exception as exc:  # noqa: BLE001\n            # Convert unexpected exception to a blocked result so the UI\n            # gets a deterministic value via finished_with_result, and\n            # QThread.finished still fires for unlock.\n            result = BatchRunResult(\n                status='blocked',\n                blocked=[f\"runner crashed: {exc}\"],\n            )\n        self.finished_with_result.emit(result)\n\n\nclass BatchPreviewThread(QThread):\n    \"\"\"Render one representative group without sharing BatchSheet run state.\"\"\"\n\n    finished_with_result = pyqtSignal(object)  # BatchPreviewResult\n\n    def __init__(self, runner, preset, group_id, temp_dir, parent=None):\n        super().__init__(parent)\n        self._runner = runner\n        self._preset = preset\n        self._group_id = str(group_id)\n        self._temp_dir = temp_dir\n        self._cancel_token = threading.Event()\n\n    def request_cancel(self) -> None:\n        self._cancel_token.set()\n\n    def run(self) -> None:\n        try:\n            result = self._runner.preview_group(\n                self._preset,\n                self._group_id,\n                self._temp_dir,\n                cancel_token=self._cancel_token,\n            )\n        except Exception as exc:  # noqa: BLE001\n            from ....batch import BatchPreviewResult\n            result = BatchPreviewResult(\n                image_path=None,\n                group_id=self._group_id,\n                display_name='',\n                loaded_source_count=0,\n                message=f'preview crashed: {exc}',\n            )\n        self.finished_with_result.emit(result)\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 17
+    },
+    "ai_commit": "d9490cc49b5b",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 0.895,
+    "span": [
+      42,
+      60
+    ]
+  }
+}

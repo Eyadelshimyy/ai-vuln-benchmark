@@ -1,0 +1,223 @@
+"""
+Holder de configuración para informe de pagos (Google Sheets, OCR, email).
+Usado por: OCR, digitalización en Sheet, envío de email 6:00/13:00/16:30.
+La config se guarda en tabla configuracion (clave informe_pagos_config).
+
+Persistencia: la configuración se mantiene hasta que el usuario cambie algún valor (Guardar
+o Conectar con Google). No hay expiración por tiempo ni borrado automático: el refresh_token
+y el resto de campos permanecen en BD hasta que se actualicen o se borre explícitamente la fila.
+"""
+import json
+import logging
+import re
+import time
+from typing import Any, List
+
+logger = logging.getLogger(__name__)
+
+CLAVE_INFORME_PAGOS_CONFIG = "informe_pagos_config"
+_current: dict[str, Any] = {}
+# /status de Auditoría Email llamaba sync en cada poll (~1 s + log). 60 s basta.
+_SYNC_TTL_SECONDS = 60.0
+_last_sync_time = 0.0
+
+
+def invalidate_informe_pagos_config_cache() -> None:
+    global _last_sync_time
+    _last_sync_time = 0.0
+
+# Horarios envío (America/Caracas): 6:00, 13:00, 16:30
+HORARIOS_ENVIO_DEFAULT = [{"hour": 6, "minute": 0}, {"hour": 13, "minute": 0}, {"hour": 16, "minute": 30}]
+
+
+def sync_from_db(*, force: bool = False) -> None:
+    """Carga informe_pagos_config desde la tabla configuracion."""
+    global _last_sync_time
+    now = time.time()
+    if not force and _current and (now - _last_sync_time) < _SYNC_TTL_SECONDS:
+        return
+    try:
+        from app.core.database import SessionLocal
+        from app.models.configuracion import Configuracion
+        db = SessionLocal()
+        try:
+            row = db.get(Configuracion, CLAVE_INFORME_PAGOS_CONFIG)
+            if not row or not row.valor:
+                logger.info("[INFORME_PAGOS] sync_from_db: no hay fila o valor en BD (clave=%s); config vacía.", CLAVE_INFORME_PAGOS_CONFIG)
+                _current.clear()
+                _last_sync_time = time.time()
+                return
+            data = json.loads(row.valor)
+            if not isinstance(data, dict):
+                logger.warning("[INFORME_PAGOS] sync_from_db: valor en BD no es dict; config no actualizada.")
+                return
+            _current.clear()
+            _current.update(data)
+            has_json = bool((data.get("google_credentials_json") or "").strip())
+            has_oauth = bool((data.get("google_oauth_refresh_token") or "").strip())
+            logger.info(
+                "[INFORME_PAGOS] sync_from_db OK: config cargada desde BD (cuenta_servicio=%s oauth=%s).",
+                has_json, has_oauth,
+            )
+            _last_sync_time = time.time()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning("[INFORME_PAGOS] sync_from_db FALLO: no se pudo cargar informe_pagos_config: %s", e, exc_info=True)
+
+
+def get_informe_pagos_config() -> dict[str, Any]:
+    """Devuelve la config actual (Google Drive, Sheets, OCR, destinatarios, horarios)."""
+    if not _current:
+        sync_from_db()
+    return dict(_current)
+
+
+def get_google_credentials_json() -> str:
+    """Contenido JSON de la cuenta de servicio (Drive + Sheets + Vision)."""
+    cfg = get_informe_pagos_config()
+    return (cfg.get("google_credentials_json") or "").strip()
+
+
+def get_google_oauth_client_id() -> str:
+    """Client ID del cliente OAuth (Drive/Sheets cuando no hay cuenta de servicio)."""
+    cfg = get_informe_pagos_config()
+    return (cfg.get("google_oauth_client_id") or "").strip()
+
+
+def get_google_oauth_client_secret() -> str:
+    """Client secret del cliente OAuth."""
+    cfg = get_informe_pagos_config()
+    return (cfg.get("google_oauth_client_secret") or "").strip()
+
+
+def get_google_oauth_refresh_token() -> str:
+    """Refresh token OAuth (obtenido tras autorizar una vez con Google)."""
+    cfg = get_informe_pagos_config()
+    return (cfg.get("google_oauth_refresh_token") or "").strip()
+
+
+def use_google_oauth() -> bool:
+    """True si debemos usar OAuth (refresh_token) en lugar de cuenta de servicio para Drive/Sheets."""
+    return bool(get_google_oauth_refresh_token())
+
+
+def get_google_sheets_id() -> str:
+    """ID de la hoja de cálculo (desde la URL)."""
+    cfg = get_informe_pagos_config()
+    return (cfg.get("google_sheets_id") or "").strip()
+
+
+def get_sheet_tab_principal() -> str:
+    """
+    Nombre de la pestaña donde escribir (ej. "Hoja 1").
+    Si está vacío, se usan pestañas por periodo: 6am, 1pm, 4h30.
+    Útil para que los datos aparezcan en la pestaña por defecto en lugar de en 6am/1pm/4h30.
+    """
+    cfg = get_informe_pagos_config()
+    return (cfg.get("sheet_tab_principal") or "").strip()
+
+
+def _parse_keywords_from_config(raw: Any, default_list: List[str]) -> List[str]:
+    """Parsea palabras clave desde config (string separado por coma/salto de línea o lista)."""
+    if raw is None or raw == "":
+        return default_list
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    s = str(raw).strip()
+    if not s:
+        return default_list
+    return [k for part in re.split(r"[\n,]+", s) if (k := part.strip())]
+
+
+def get_ocr_keywords_nombre_banco() -> List[str]:
+    """
+    Palabras clave para ubicar 'Institución financiera' (nombre del banco) en el texto OCR.
+    Si la línea contiene alguna, se toma como nombre del banco/institución.
+    """
+    cfg = get_informe_pagos_config()
+    raw = cfg.get("ocr_keywords_nombre_banco")
+    return _parse_keywords_from_config(raw, _default_keywords_nombre_banco())
+
+
+def _default_keywords_nombre_banco() -> List[str]:
+    return [
+        "banco", "bank", "bancaria", "c.a.", "ca ", "s.a.", "sa ",
+        "institución financiera", "institucion financiera", "entidad financiera",
+    ]
+
+
+def get_ocr_keywords_numero_deposito() -> List[str]:
+    """
+    Palabras clave para ubicar 'Número de depósito' / referencia en el texto OCR.
+    Si la línea contiene alguna, se busca un número largo (10+ dígitos) como valor.
+    """
+    cfg = get_informe_pagos_config()
+    raw = cfg.get("ocr_keywords_numero_deposito")
+    return _parse_keywords_from_config(raw, _default_keywords_numero_deposito())
+
+
+def _default_keywords_numero_deposito() -> List[str]:
+    return [
+        "ref", "referencia", "depósito", "deposito", "nº", "no.", "nro", "número", "numero",
+        "comprobante", "recibo", "documento", "ruc",
+    ]
+
+
+def get_ocr_keywords_numero_documento() -> List[str]:
+    """
+    Palabras clave para ubicar 'Documento' (número de comprobante/recibo) en el texto OCR.
+    Ej: "numero de documento", "n°", "comprobante de venta". Si la línea contiene alguna, se extrae el valor.
+    """
+    cfg = get_informe_pagos_config()
+    raw = cfg.get("ocr_keywords_numero_documento")
+    return _parse_keywords_from_config(raw, _default_keywords_numero_documento())
+
+
+def _default_keywords_numero_documento() -> List[str]:
+    """Palabras clave por defecto para ubicar número de documento en OCR."""
+    return [
+        "n°",  # Comprobantes: "N° 052-055-000112796"
+        "nº",
+        "comprobante de venta",
+        "numero de documento",
+        "numero de recibo",
+        "número de documento",
+        "número de recibo",
+        "numero documento",
+        "numero recibo",
+        "nº documento",
+        "nº recibo",
+        "nº doc",
+        "no. documento",
+        "no. recibo",
+        "documento n°",
+        "recibo n°",
+        "documento no",
+        "recibo no",
+        "ci",
+        "ruc",
+    ]
+
+
+def get_destinatarios_informe_emails() -> List[str]:
+    """Emails que reciben el informe (6:00, 13:00, 16:30)."""
+    cfg = get_informe_pagos_config()
+    raw = cfg.get("destinatarios_informe_emails") or ""
+    return [e.strip() for e in str(raw).split(",") if e.strip() and "@" in e.strip()]
+
+
+def get_horarios_envio() -> List[dict]:
+    """Lista de {hour, minute} para envío (default 6:00, 13:00, 16:30)."""
+    cfg = get_informe_pagos_config()
+    h = cfg.get("horarios_envio")
+    if isinstance(h, list) and len(h) >= 1:
+        return h
+    return HORARIOS_ENVIO_DEFAULT
+
+
+def update_from_api(data: dict[str, Any]) -> None:
+    """Actualiza el holder desde la API de configuración."""
+    for k, v in data.items():
+        if v is not None:
+            _current[k] = v

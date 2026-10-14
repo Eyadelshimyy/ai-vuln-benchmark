@@ -1,0 +1,28 @@
+{
+  "repo": "bramstroker__homeassistant-powercalc",
+  "file": "utils/library/build_info_table.py",
+  "function": "write_md_table",
+  "line": 26,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Write the listing data to a Markdown table using pytablewriter.",
+  "prompt_source": "def write_md_table(data: list[Mapping[str, str]], output_file: str) -> None:\n    \"\"\"Write the listing data to a Markdown table using pytablewriter.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def write_md_table(data: list[Mapping[str, str]], output_file: str) -> None:\n    \"\"\"Write the listing data to a Markdown table using pytablewriter.\"\"\"\n    writer = pytablewriter.MarkdownTableWriter()\n    writer.table_name = \"Device Power Data\"\n    fields = list(data[0].keys())\n    writer.headers = fields\n    writer.value_matrix = [[row.get(field, \"\") for field in fields] for row in data]\n\n    with open(output_file, \"w\") as f:\n        writer.stream = f\n        writer.write_table()",
+  "module_source": "from collections.abc import Callable, Mapping\nfrom typing import Any\n\nimport pytablewriter\n\nfrom utils.library.common import find_model_json_files\n\n\ndef build_list(filter_callback: Callable[[dict[str, Any]], bool] | None, fields: list[str]) -> list[Mapping[str, str]]:\n    \"\"\"Count occurrences of each measure_device in all model.json files.\"\"\"\n    listing: list[Mapping[str, str]] = []\n    for model_data in find_model_json_files():\n        json_data = model_data[\"data\"]\n        if filter_callback and not filter_callback(json_data):\n            continue\n        entry_data = {\n            \"manufacturer\": model_data[\"manufacturer\"],\n            \"model\": model_data[\"model\"],\n            \"sub_profile\": model_data[\"sub_profile\"],\n        }\n        entry_data.update({field: json_data.get(field) for field in fields})\n        listing.append(entry_data)\n    return listing\n\n\ndef write_md_table(data: list[Mapping[str, str]], output_file: str) -> None:\n    \"\"\"Write the listing data to a Markdown table using pytablewriter.\"\"\"\n    writer = pytablewriter.MarkdownTableWriter()\n    writer.table_name = \"Device Power Data\"\n    fields = list(data[0].keys())\n    writer.headers = fields\n    writer.value_matrix = [[row.get(field, \"\") for field in fields] for row in data]\n\n    with open(output_file, \"w\") as f:\n        writer.stream = f\n        writer.write_table()\n\n\ndef main() -> None:\n    fields = [\"standby_power\", \"standby_power_on\", \"fixed_config\", \"only_self_usage\"]\n    listing = build_list(\n        lambda j: j.get(\"device_type\") == \"smart_switch\",\n        fields,\n    )\n\n    # Write the result to a Markdown file\n    output_file = \"device_power_data.md\"\n    write_md_table(listing, output_file)\n\n\nif __name__ == \"__main__\":\n    main()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 1
+    },
+    "ai_commit": "4c75326775de",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 0.091,
+    "span": [
+      26,
+      36
+    ]
+  }
+}

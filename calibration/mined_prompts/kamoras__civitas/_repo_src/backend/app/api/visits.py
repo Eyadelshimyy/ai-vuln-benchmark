@@ -1,0 +1,750 @@
+"""Privacy-respecting unique-visitor tracking.
+
+No raw IP or User-Agent is ever stored. `POST /api/track-visit` is called by
+the frontend's proxy (frontend/src/proxy.ts), which relays requests the site
+needs in order to work at all — the page itself, and the requests Next's
+router makes once the page runs in a browser — and a page counts only when
+both arrive from one client (_confirmed_paths). A client that never runs
+the page is never counted, and the visit and the page it started on are
+counted without the browser sending anything a blocker could refuse. Later
+pages in the same tab are sent by the browser (frontend NavigationBeacon):
+a click on a link Next has prefetched reaches no server at all.
+What is recorded is only an HMAC of the IP under a random salt that exists
+for the current UTC day and is then deleted — see SiteVisit in models.py for
+why that makes past hashes unrecoverable and why this table can't grow
+per-request.
+"""
+
+import asyncio
+import hashlib
+import hmac
+import logging
+import re
+import secrets
+import time
+from dataclasses import dataclass
+from typing import Literal
+
+from fastapi import APIRouter, Query, Request
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
+from sqlalchemy.orm import Session
+
+from app import ops_alerts
+from app.api import throttle
+from app.api.rate_limit import SELF_DECLARED_CRAWLER
+from app.database import VisitsSessionLocal
+from app.issue_ids import from_public_id
+from app.models import ApiRejectionCount, ApiRequestCount, IssueView, PageLoadTiming, PageView, SiteVisit, VisitSalt
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+# 2026-07 incident: this endpoint fires on every real page view — by far
+# the highest-frequency write in the app — and used to write directly to
+# the DB inline. Two compounding problems, both real:
+#
+# 1. SiteVisit/PageView shared the main SQLite file (and connection pool)
+#    with the nightly pipeline, which can hold SQLite's single writer
+#    lock for extended stretches while processing a batch between
+#    commits. A blocked write here held a pool connection for the full
+#    30s default busy-timeout; under real concurrent traffic during a
+#    pipeline run, that exhausted the pool fast, piling up blocked
+#    requests until the container hit its memory limit and got OOM-killed.
+# 2. Separately (caught in review before this shipped): the route was
+#    `async def` but did its DB write synchronously inline — a blocking
+#    SQLite call inside `async def` runs directly on the event loop, so
+#    it doesn't just hold up ITS OWN request, it freezes every other
+#    concurrent request the whole process is serving, for however long
+#    the write takes. Moving the write off the request path entirely
+#    (below) fixes this at the root rather than just shortening how long
+#    each block lasts.
+#
+# Fix: track_visit no longer touches the database at all. It computes
+# the (already-fast, non-blocking) hash/normalization work and enqueues
+# a plain event; a single background consumer (run_visit_consumer,
+# started from app.main's lifespan) drains the queue and writes in small
+# batches via asyncio.to_thread, off the event loop entirely. This also
+# means SiteVisit/PageView only ever have ONE writer (the consumer), so
+# there's no concurrent-writer contention left to guard against even
+# without the separate database file below — that split (see
+# database.py's _derive_visits_database_url) is kept anyway as
+# defense-in-depth: it means even a pathological consumer stall can't
+# contend with the nightly pipeline's own writes to the main database.
+#
+# Bounded, not unbounded: under sustained overload the queue fills and
+# new events are dropped (logged, never blocking the producer) rather
+# than growing memory without limit — the same "best-effort, not
+# guaranteed" contract this table already had.
+_VISIT_QUEUE_MAXSIZE = 1000
+_VISIT_BATCH_MAX = 50
+_visit_queue: "asyncio.Queue[_VisitEvent | _TimingEvent | _ApiEvent]" = asyncio.Queue(maxsize=_VISIT_QUEUE_MAXSIZE)
+
+# Upper bounds (ms) of the page-load histogram buckets PageLoadTiming counts
+# into. Roughly geometric, so the relative precision of an interpolated
+# percentile is about the same at 150ms as at 8s. A duration past the last
+# bound is dropped rather than clamped: a minute-long "load" is a tab that was
+# backgrounded or a laptop that slept mid-load, not a page that took a minute,
+# and clamping it into the top bucket would drag p95 toward a number no reader
+# actually waited for.
+LOAD_TIMING_BUCKETS_MS: tuple[int, ...] = (
+    50, 100, 150, 200, 300, 400, 500, 750, 1000, 1500, 2000,
+    2500, 3000, 4000, 5000, 7500, 10000, 15000, 20000, 30000,
+)
+LOAD_TIMING_METRICS: tuple[str, ...] = ("ttfb", "fcp", "load")
+# The device classes a load-timing report may carry, computed in the browser
+# (frontend LoadTimingBeacon's deviceClass) — see PageLoadTiming.
+DeviceClass = Literal["desktop", "tablet", "mobile"]
+DEVICE_CLASSES: tuple[str, ...] = ("desktop", "tablet", "mobile")
+
+
+@dataclass(frozen=True)
+class _VisitEvent:
+    date: str
+    visitor_hash: str
+    browser: str
+    os: str
+    device_type: str
+    normalized_path: str
+    # Set only when the raw path was /issue/{a well-formed public_id} — see
+    # _extract_issue_public_id. None for every other page, including a
+    # malformed /issue/ path, which still counts toward normalized_path.
+    issue_public_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _TimingEvent:
+    """One page load's Navigation Timing, already bucketed — see PageLoadTiming."""
+    date: str
+    normalized_path: str
+    # metric -> bucket upper bound (ms); only metrics the browser reported.
+    buckets: tuple[tuple[str, int], ...]
+    # A DEVICE_CLASSES member, or "" when the report carried none.
+    device: str = ""
+
+
+@dataclass(frozen=True)
+class _ApiEvent:
+    """One public API request — see ApiRequestCount."""
+    date: str
+    endpoint: str
+    channel: str
+    status: int
+    # For a 422: (parameter, validation error type), see ApiRejectionCount.
+    rejection: tuple[str, str] | None = None
+
+
+def record_api_request(
+    endpoint: str, channel: str, status: int, rejection: tuple[str, str] | None = None,
+) -> None:
+    """Count one public API or MCP request (ApiRequestCount). Takes nothing
+    about the caller. Queued for the same consumer as visits, so it never
+    writes on the request path; must be called on the event loop (the
+    queue is an asyncio one)."""
+    try:
+        _visit_queue.put_nowait(_ApiEvent(
+            date=_today(), endpoint=endpoint, channel=channel, status=status, rejection=rejection,
+        ))
+    except asyncio.QueueFull:
+        logger.warning("Visit queue full (%d) — dropping API request count", _VISIT_QUEUE_MAXSIZE)
+
+
+def _bucket_for(ms: float) -> int | None:
+    """The LOAD_TIMING_BUCKETS_MS bound `ms` falls under, or None when it is
+    out of range (negative, NaN, or past the last bucket — see the ladder)."""
+    if not ms >= 0:  # also rejects NaN
+        return None
+    for bound in LOAD_TIMING_BUCKETS_MS:
+        if ms <= bound:
+            return bound
+    return None
+
+
+def _write_visit_batch(batch: list["_VisitEvent | _TimingEvent | _ApiEvent"], db: Session) -> None:
+    """Write a batch of queued visit events in one transaction.
+
+    Called by run_visit_consumer (via asyncio.to_thread, with a fresh
+    VisitsSessionLocal()) and directly by tests (with the shared
+    db_session fixture) — kept as a plain, session-injected function
+    rather than owning its own session, the same pattern every other
+    DB-touching function in this codebase follows.
+    """
+    try:
+        for event in batch:
+            if isinstance(event, _TimingEvent):
+                for metric, bucket in event.buckets:
+                    db.execute(
+                        sqlite_insert(PageLoadTiming).values(
+                            date=event.date, path=event.normalized_path,
+                            metric=metric, bucket_ms=bucket, device=event.device, count=1,
+                        ).on_conflict_do_update(
+                            index_elements=["date", "path", "metric", "bucket_ms", "device"],
+                            set_={"count": PageLoadTiming.count + 1},
+                        )
+                    )
+                continue
+            if isinstance(event, _ApiEvent):
+                db.execute(
+                    sqlite_insert(ApiRequestCount).values(
+                        date=event.date, endpoint=event.endpoint,
+                        channel=event.channel, status=event.status, count=1,
+                    ).on_conflict_do_update(
+                        index_elements=["date", "endpoint", "channel", "status"],
+                        set_={"count": ApiRequestCount.count + 1},
+                    )
+                )
+                if event.rejection:
+                    db.execute(
+                        sqlite_insert(ApiRejectionCount).values(
+                            date=event.date, endpoint=event.endpoint, channel=event.channel,
+                            parameter=event.rejection[0][:64], reason=event.rejection[1][:64], count=1,
+                        ).on_conflict_do_update(
+                            index_elements=["date", "endpoint", "channel", "parameter", "reason"],
+                            set_={"count": ApiRejectionCount.count + 1},
+                        )
+                    )
+                continue
+
+            stmt = sqlite_insert(SiteVisit).values(
+                date=event.date,
+                visitor_hash=event.visitor_hash,
+                browser=event.browser,
+                os=event.os,
+                device_type=event.device_type,
+            ).on_conflict_do_nothing(index_elements=["date", "visitor_hash"])
+            db.execute(stmt)
+
+            page_stmt = sqlite_insert(PageView).values(
+                date=event.date, path=event.normalized_path, count=1,
+            ).on_conflict_do_update(
+                index_elements=["date", "path"],
+                set_={"count": PageView.count + 1},
+            )
+            db.execute(page_stmt)
+
+            if event.issue_public_id:
+                issue_stmt = sqlite_insert(IssueView).values(
+                    date=event.date, issue_public_id=event.issue_public_id, count=1,
+                ).on_conflict_do_update(
+                    index_elements=["date", "issue_public_id"],
+                    set_={"count": IssueView.count + 1},
+                )
+                db.execute(issue_stmt)
+        db.commit()
+    except (OperationalError, SATimeoutError):
+        # Best-effort (see module docstring) — drop this batch rather
+        # than retry indefinitely; the consumer loop moves on to the
+        # next batch regardless.
+        logger.warning("Visit batch write failed (%d events dropped)", len(batch))
+        db.rollback()
+
+
+def _write_visit_batch_with_own_session(batch: list["_VisitEvent | _TimingEvent | _ApiEvent"]) -> None:
+    """Entry point for asyncio.to_thread — owns the session lifecycle
+    since, unlike _write_visit_batch, there's no request-scoped session
+    to inject here."""
+    db = VisitsSessionLocal()
+    try:
+        _write_visit_batch(batch, db)
+    finally:
+        db.close()
+
+
+async def run_visit_consumer() -> None:
+    """Background consumer, started once from app.main's lifespan and
+    cancelled on shutdown. Drains the queue and writes in batches (up to
+    _VISIT_BATCH_MAX per commit) entirely off the event loop, via
+    asyncio.to_thread — the whole point of this consumer disappears if
+    its own write blocks the loop the same way the old inline write did.
+    """
+    last_check = -_STALE_SALT_CHECK_S
+    while True:
+        now = time.monotonic()
+        if now - last_check >= _STALE_SALT_CHECK_S:
+            last_check = now
+            # Off the loop: it deletes an ended day's salt row too.
+            await asyncio.to_thread(_forget_stale_salts)
+        try:
+            event = await asyncio.wait_for(_visit_queue.get(), timeout=_STALE_SALT_CHECK_S)
+        except TimeoutError:
+            continue
+        batch = [event]
+        while len(batch) < _VISIT_BATCH_MAX:
+            try:
+                batch.append(_visit_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        await asyncio.to_thread(_write_visit_batch_with_own_session, batch)
+
+
+# Structural User-Agent parsing (RFC-shaped, not a classification decision —
+# UA tokens like "Chrome/" or "Firefox/" are a fixed, documented format, not
+# ambiguous real-world data). Order matters: Edge and Opera UAs also contain
+# "Chrome/" and "Safari/" boilerplate, so the more specific token must be
+# checked first.
+# Headless Chrome, as Playwright and Puppeteer drive it by default (the
+# cloud agents that test this site among them), says so in its own User-Agent
+# token, the way the parsers below read "Chrome/" or "Firefox/". It runs the
+# site's scripts like a person's browser, so it would pass the page-then-
+# router check (_confirmed_paths); only this token tells it apart. An agent
+# driving a real browser window can't be told apart, and is browsing.
+_AUTOMATED_BROWSER = "HeadlessChrome"
+# Crawlers that render pages in a real browser engine (Bingbot, Applebot,
+# Baiduspider-render, OAI-SearchBot, GoogleOther…) run the page too, and name
+# themselves by the crawler convention (rate_limit.SELF_DECLARED_CRAWLER). Of the 17
+# addresses that sent the browser beacon in 16 hours on 2026-10-10, 14 were
+# these.
+
+
+def _parse_browser(ua: str) -> str:
+    if re.search(r"Edg/", ua):
+        return "Edge"
+    if re.search(r"OPR/|Opera", ua):
+        return "Opera"
+    if re.search(r"Firefox/", ua):
+        return "Firefox"
+    if re.search(r"Chrome/", ua):
+        return "Chrome"
+    if re.search(r"Safari/", ua):
+        return "Safari"
+    return "Other"
+
+
+def _parse_os(ua: str) -> str:
+    if re.search(r"Windows", ua):
+        return "Windows"
+    if re.search(r"Android", ua):
+        return "Android"
+    if re.search(r"iPhone|iPad|iPod|iOS", ua):
+        return "iOS"
+    if re.search(r"Macintosh|Mac OS X", ua):
+        return "macOS"
+    if re.search(r"Linux", ua):
+        return "Linux"
+    return "Other"
+
+
+def _parse_device(ua: str) -> str:
+    if re.search(r"iPad|Tablet", ua):
+        return "tablet"
+    if re.search(r"Mobile|iPhone|Android", ua):
+        return "mobile"
+    return "desktop"
+
+
+# (date, salt) for the current UTC day, per process. The salt itself lives
+# in the visits database (VisitSalt) so every backend process shares it.
+_salt_cache: tuple[str, bytes] | None = None
+
+
+def _load_or_create_salt(date: str) -> bytes | None:
+    """The shared salt for `date`, creating it if this is the first visit
+    of the day. Every other day's salt is deleted in the same transaction —
+    once a day's salt is gone, that day's hashes can't be recomputed from
+    an IP by anyone.
+
+    None when another worker has already made a later day's salt: this one
+    read the clock just before midnight, and making `date`'s again would
+    bring back a salt that was deleted."""
+    from sqlalchemy import exists, literal, select
+
+    db = VisitsSessionLocal()
+    try:
+        db.execute(
+            sqlite_insert(VisitSalt)
+            .from_select(
+                ["date", "salt"],
+                select(literal(date), literal(secrets.token_hex(32))).where(
+                    ~exists().where(VisitSalt.date > date),
+                ),
+            )
+            .on_conflict_do_nothing(index_elements=["date"])
+        )
+        # Earlier days only: with several API workers, one that read the
+        # clock just before midnight must not delete the new day's salt
+        # another already made and cached — the two would then hash the
+        # same visitor differently all day.
+        db.query(VisitSalt).filter(VisitSalt.date < date).delete()
+        db.commit()
+        salt = db.query(VisitSalt.salt).filter(VisitSalt.date == date).scalar()
+        return bytes.fromhex(salt) if salt is not None else None
+    finally:
+        db.close()
+
+
+def _today() -> str:
+    """The current UTC day, as the salts are dated — the throttle store's
+    own clock, since a visit salt can come from there (_shared_salt)."""
+    return throttle.utc_today()
+
+
+async def _daily_salt(date: str) -> bytes:
+    global _salt_cache
+    if _salt_cache is not None and _salt_cache[0] == date:
+        return _salt_cache[1]
+    try:
+        salt = await asyncio.to_thread(_load_or_create_salt, date)
+    except Exception:
+        # Degrade to a fallback salt; nothing reversible is ever stored. The
+        # shared salt is retried on the next call (this isn't cached as it).
+        # One fallback for the whole container for the day where possible —
+        # derived from a RAM salt every worker shares (throttle.derived_salt,
+        # deleted when the day ends) — so a visitor during the outage counts
+        # once, not once per worker (a fresh salt per call made every visit a
+        # new unique). Visitors
+        # who span the outage and the recovery still count twice: no salt
+        # matching the shared one exists while it can't be read.
+        logger.warning("Visit salt unavailable — using a fallback salt", exc_info=True)
+        # Reads the RAM store on first use in a day: off the event loop.
+        return await asyncio.to_thread(_fallback_salt_for, date)
+    if salt is None:
+        # The day ended a moment ago and its salt is gone: this visit, from
+        # its last instant, is hashed with a salt nobody keeps — it may count
+        # as one more unique for that day, never as a recoverable address.
+        return secrets.token_bytes(32)
+    # Cached only while its day lasts: a salt loaded just before midnight
+    # and returned after it, once the sweep has cleared the cache, must not
+    # put the ended day's salt back in memory.
+    if date == _today():
+        _salt_cache = (date, salt)
+    return salt
+
+
+# The UTC day this process last made sure the database holds no earlier
+# day's salt (_forget_stale_salts).
+_salt_swept_day: str | None = None
+
+
+# (date, salt, whether it is the container-shared one)
+_fallback_salt: tuple[str, bytes, bool] | None = None
+
+
+# How often an idle worker checks for a salt left over from a previous day.
+_STALE_SALT_CHECK_S = 60.0
+
+
+def _forget_stale_salts() -> None:
+    """Drop any salt for a day that has ended — from this process's memory,
+    and the shared row from the visits database — without waiting for a new
+    day's first visit: until then, anyone holding it could recompute
+    yesterday's visitor hashes (AGENTS.md §8)."""
+    global _salt_cache, _fallback_salt
+    today = _today()
+    if _salt_cache is not None and _salt_cache[0] != today:
+        _salt_cache = None
+    if _fallback_salt is not None and _fallback_salt[0] != today:
+        _fallback_salt = None
+    # And from the database, once per new day: otherwise an ended day's row
+    # stays until the next day's first visit, hours later on a quiet night.
+    # By making today's salt — the one step that deletes earlier days
+    # (_load_or_create_salt) — never by deleting alone: a worker that read
+    # the clock just before midnight refuses to recreate an ended day's salt
+    # only because a later day's row exists.
+    global _salt_swept_day
+    if _salt_swept_day != today:
+        try:
+            _load_or_create_salt(today)
+            _salt_swept_day = today
+        except Exception:
+            logger.warning("Couldn't drop an ended day's visit salt — retried next tick", exc_info=True)
+    # The RAM store's salts, including the one the fallback derives from,
+    # are dropped by the store's own maintenance (throttle.run_maintenance).
+
+
+def _fallback_salt_for(date: str) -> bytes:
+    """The container's shared fallback (throttle.derived_salt: a RAM salt
+    deleted when the day ends) — or, while that store is down too, this process's own, kept
+    only until the shared one can be made: a private salt kept all day
+    would count this worker's visitors apart from every other worker's."""
+    global _fallback_salt
+    if date != _today():
+        # A visit from a day that has ended: hashed with a salt nobody keeps,
+        # as _daily_salt does once the day's salt is gone — never with a
+        # salt that outlives its day.
+        return secrets.token_bytes(32)
+    if _fallback_salt is None or _fallback_salt[0] != date or not _fallback_salt[2]:
+        shared = throttle.derived_salt(f"visits:{date}", date)
+        if shared is not None:
+            _fallback_salt = (date, shared, True)
+        elif _fallback_salt is None or _fallback_salt[0] != date:
+            _fallback_salt = (date, secrets.token_bytes(32), False)
+    return _fallback_salt[1]
+
+
+def _visitor_hash(ip: str, salt: bytes) -> str:
+    # Keyed on IP only (2026-07): the User-Agent used to be in this key,
+    # which meant one client rotating the User-Agent header produced
+    # unlimited distinct hashes — a new SiteVisit row per request, i.e. a
+    # disk-fill vector on an unauthenticated endpoint. Dropping it bounds
+    # daily rows to distinct source IPs (the natural unique-visitor unit).
+    # The day is carried by the salt, which rotates daily.
+    #
+    # The salt replaces a key derived from ADMIN_TOKEN (falling back to the
+    # literal "civitas" when no token was set). That key never changed, and
+    # the IPv4 space is small enough to enumerate, so anyone holding the key
+    # could turn every stored hash back into an IP.
+    return hmac.new(salt, ip.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+_KNOWN_STATIC_PATHS = {
+    "/", "/about", "/accessibility", "/action", "/bills", "/changelog",
+    "/compare", "/developers", "/environmental", "/explore", "/feedback", "/feeds", "/leaderboard",
+    "/politicians", "/elections", "/congress", "/congress/bills",
+    # /scorecard has no page anymore (renamed) but old Bluesky posts still
+    # link to it — kept here so that 404 traffic stays visibly labeled
+    # "/scorecard" instead of draining into the unlabeled "/other" bucket.
+    "/scorecard",
+    # The About chapters (frontend/src/lib/aboutPages.ts). Listed rather
+    # than prefix-collapsed: which chapter people read is the useful part.
+    "/about/scores", "/about/presidents-and-justices", "/about/elections",
+    "/about/news", "/about/data", "/about/limitations", "/about/references",
+}
+# Longest first: "/congress/bills/S.1" is a bill page, "/congress/2026-09-24"
+# a day report.
+_DYNAMIC_PREFIXES = ("/congress/bills/", "/politicians/", "/issue/", "/explore/", "/elections/", "/congress/")
+
+
+def _normalize_path(raw: str) -> str:
+    """Collapse a request path to a stable route template for aggregation.
+
+    /politicians/chuck-grassley -> /politicians/[id], not its own row per
+    politician — otherwise "most visited pages" would fragment across
+    every individual id instead of showing which routes get read. Anything
+    outside the known route set (bad input, a since-removed route) buckets
+    to "/other" rather than growing the table with arbitrary strings from
+    an unauthenticated, public endpoint.
+    """
+    path = (raw or "/").split("?")[0].rstrip("/") or "/"
+    if path in _KNOWN_STATIC_PATHS:
+        return path
+    for prefix in _DYNAMIC_PREFIXES:
+        if path.startswith(prefix) and len(path) > len(prefix):
+            return f"{prefix}[id]"
+    return "/other"
+
+
+def _extract_issue_public_id(raw: str) -> str | None:
+    """The issue public_id out of a raw /issue/{id} path, or None.
+
+    Deliberately not folded into _normalize_path: that function's whole
+    job is collapsing per-id routes away (see its docstring) — this is
+    the one place that per-id detail is kept, for IssueView, and only
+    ever for a well-formed id (from_public_id's own validation), so a
+    malformed or made-up path segment can't grow that table with junk.
+    """
+    path = (raw or "/").split("?")[0].rstrip("/") or "/"
+    if not path.startswith("/issue/"):
+        return None
+    candidate = path[len("/issue/"):]
+    return candidate if from_public_id(candidate) is not None else None
+
+
+def _track_ip(request: Request) -> str:
+    # nginx sets X-Real-IP for every request it proxies (nginx/civitas.conf)
+    # — the same header its rate limits are keyed by — and the frontend's
+    # proxy relays the one nginx set for the page request it reports.
+    # backend:8000 isn't reachable outside the Docker network, so nothing
+    # else can supply it.
+    forwarded = request.headers.get("X-Real-IP")
+    if forwarded:
+        return forwarded
+    peer = request.client.host if request.client else None
+    return peer or "unknown"
+
+
+# The first whole UTC day counted by confirmation (#893, deployed the evening
+# of 2026-10-10 UTC): a page counts only once the browser that opened it has
+# run it. Earlier SiteVisit rows counted any client that asked for a page the
+# way a browser does, and automation was nearly all of them (on 2026-10-09 a
+# single crawler was ~7,000 of 7,357 visitors). The admin dashboard reports
+# no confirmed visitors before this day rather than a number that means
+# something else.
+CONFIRMED_VISITS_SINCE = "2026-10-11"
+
+# page        the proxy saw a browser ask for a page (Sec-Fetch-Dest:
+#             document; frontend/src/lib/visitSignal.ts)
+# router      the proxy saw a same-origin fetch from a page running in a
+#             browser: Next's router prefetching the links in view
+# navigation  the browser itself: a page opened inside the app
+#             (NavigationBeacon), which reaches no server otherwise
+VisitSignal = Literal["page", "router", "navigation"]
+
+# How long an opened page waits for its browser's first router request.
+# Next prefetches the links in view within a second or two of the page
+# hydrating; minutes cover a slow connection or a tab opened in the
+# background.
+_PENDING_S = 10 * 60
+# How long a client that has run a page has its navigations counted: the
+# whole day. Its key changes at midnight anyway (throttle.client_key), so
+# this is "has run a page today", which the visit itself already records.
+_RAN_PAGE_S = 24 * 3600
+_PENDING, _RAN_PAGE = "visit-pending", "visit-ran-page"
+_CONFIRMED = "visit-confirmed"
+
+# check_visits_confirmed: alert when pages are being held and none has been
+# confirmed for a whole day. A day, not a few hours: real readers who run
+# the page are few here (one ordinary browser in the first hour after
+# #893 shipped, against ~50 crawler page holds an hour), so a quiet night
+# with no reader is normal and must not page anyone. The hold floor keeps a
+# day with almost no traffic quiet too.
+_UNCONFIRMED_HOURS = 24
+_UNCONFIRMED_MIN_HOLDS = 200
+UNCONFIRMED_CONDITION = "visits-unconfirmed"
+
+
+def _held_path(path: str) -> str:
+    """The page as it is held while it waits: the route template, or the
+    issue's own path — exactly what PageView and IssueView keep, so a
+    request path never sits in the store as it was sent."""
+    issue = _extract_issue_public_id(path)
+    return f"/issue/{issue}" if issue else _normalize_path(path)
+
+
+def _confirmed_paths(ip: str, kind: VisitSignal, path: str) -> list[str]:
+    """The page views `kind` from `ip` completes, in the throttle store
+    (RAM, keyed by throttle.client_key — never the IP).
+
+    A page request is held, not counted: its headers prove nothing (in
+    October 2026 a crawler sending Sec-Fetch-Dest: document and randomised
+    Chrome User-Agents from thousands of residential addresses was ~7,000 of
+    a day's 7,357 counted visitors, and it never ran a page). The page's
+    first router request from the same client — sent only by the page's
+    own script running in a browser — counts every page it holds. A
+    navigation counts its own page too, once the client has run a page
+    today; one that hasn't is no reader clicking a link.
+
+    The page and router requests are how the site works (the router's
+    prefetches are its links), so a reader blocking tracking requests still
+    has the visit and its first page counted, with nothing extra sent. Only
+    the navigation beacon is a request of its own, and a blocker that
+    refuses it is respected.
+    """
+    key = throttle.client_key(ip, "visit")
+    if kind == "page":
+        throttle.hold(_PENDING, key, _held_path(path), ttl=_PENDING_S)
+        throttle.tally(_PENDING)
+        return []
+    paths = throttle.take(_PENDING, key)
+    if paths:
+        throttle.tally(_CONFIRMED, len(paths))
+    if kind == "navigation" and (paths or throttle.held(_RAN_PAGE, key)):
+        paths.append(_held_path(path))
+    if paths:
+        throttle.hold(_RAN_PAGE, key, "", ttl=_RAN_PAGE_S)
+    return paths
+
+
+# Whether this process may have an unconfirmed-visits alert open: True until
+# its first healthy check, which resolves one another process (or this one,
+# before a restart) raised.
+_may_be_alerting = True
+
+
+def check_visits_confirmed() -> None:
+    """Alert when the visit counter holds pages but confirms none over a
+    whole day of watching: the router requests that confirm them have
+    stopped arriving, which reads on the dashboard as no visitors rather
+    than as a fault. Every API worker runs it (main._watch_pipeline_service);
+    the alert's dedupe makes it page once."""
+    global _may_be_alerting
+    holds, began = throttle.tallied(_PENDING, hours=_UNCONFIRMED_HOURS)
+    confirmed, _ = throttle.tallied(_CONFIRMED, hours=_UNCONFIRMED_HOURS)
+    if confirmed:
+        if _may_be_alerting and ops_alerts.resolve_ops_alert(UNCONFIRMED_CONDITION) >= 0:
+            _may_be_alerting = False
+        return
+    watched = began is not None and time.time() - began >= (_UNCONFIRMED_HOURS - 1) * 3600
+    if watched and holds >= _UNCONFIRMED_MIN_HOLDS:
+        _may_be_alerting = True
+        ops_alerts.send_ops_alert(
+            "Visits: pages held, none confirmed",
+            f"{holds} page requests were held for confirmation in the last "
+            f"{_UNCONFIRMED_HOURS} hours and none was confirmed: no router request "
+            "(Sec-Fetch-Dest: empty, same-origin) reached the visit counter from the "
+            "frontend proxy. Visitor counts read zero until it is fixed "
+            "(frontend/src/proxy.ts, lib/visitSignal.ts, app/api/visits.py).",
+            dedupe_key=f"{UNCONFIRMED_CONDITION}-{_today()}",
+            condition=UNCONFIRMED_CONDITION,
+        )
+
+
+@router.post("/track-visit", status_code=204)
+async def track_visit(request: Request, kind: VisitSignal = Query(...), path: str = Query("/")) -> None:
+    """Enqueues the page views this request completes and returns
+    immediately — see the module docstring for why this never touches the
+    database directly.
+
+    Must stay `async def`, not `def`: asyncio.Queue is explicitly not
+    thread-safe, and `_visit_queue.put_nowait` below has to run on the
+    same event loop thread run_visit_consumer's `await _visit_queue.get()`
+    is running on. A plain `def` here would get dispatched to Starlette's
+    thread pool instead, calling put_nowait from the wrong thread. The
+    throttle store's calls run on its own threads (throttle.run).
+    """
+    ip = _track_ip(request)
+    user_agent = request.headers.get("User-Agent", "")
+    if _AUTOMATED_BROWSER in user_agent or SELF_DECLARED_CRAWLER.search(user_agent):
+        return
+    paths = await throttle.run(_confirmed_paths, ip, kind, path)
+    if not paths:
+        return
+    date = _today()
+    visitor_hash = _visitor_hash(ip, await _daily_salt(date))
+    for page in paths:
+        event = _VisitEvent(
+            date=date,
+            visitor_hash=visitor_hash,
+            browser=_parse_browser(user_agent),
+            os=_parse_os(user_agent),
+            device_type=_parse_device(user_agent),
+            normalized_path=_normalize_path(page),
+            issue_public_id=_extract_issue_public_id(page),
+        )
+        try:
+            _visit_queue.put_nowait(event)
+        except asyncio.QueueFull:
+            logger.warning("Visit queue full (%d) — dropping visit event", _VISIT_QUEUE_MAXSIZE)
+
+
+@router.post("/track-timing", status_code=204)
+async def track_timing(
+    path: str = Query("/"),
+    ttfb: float | None = Query(None),
+    fcp: float | None = Query(None),
+    load: float | None = Query(None),
+    device: DeviceClass | None = Query(None),
+) -> None:
+    """Records one hard page load's Navigation Timing (milliseconds), sent by
+    the browser's LoadTimingBeacon after the load event.
+
+    Unlike track-visit this is called by the browser itself, through nginx's
+    rate-limited /api/ location, and it reads nothing about the caller — no
+    IP, no User-Agent. The one thing it learns beyond the timings is `device`,
+    one of three words the browser chose from its own media features (see
+    PageLoadTiming); anything else is refused by validation, so the counter
+    has exactly those values. The route is normalized exactly as track-visit's is and
+    each duration is reduced to its histogram bucket before it is queued (see
+    PageLoadTiming), so an arbitrary client can at most add counts to a
+    bounded set of (route, metric, bucket) cells — never grow the table with
+    strings of its own. Same queue and consumer as track-visit, for the same
+    reason: this must never write to the database on the request path.
+    Must stay `async def` — see track_visit.
+    """
+    buckets = tuple(
+        (metric, bucket)
+        for metric, value in (("ttfb", ttfb), ("fcp", fcp), ("load", load))
+        if value is not None and (bucket := _bucket_for(value)) is not None
+    )
+    if not buckets:
+        return
+    event = _TimingEvent(
+        date=_today(),
+        normalized_path=_normalize_path(path),
+        buckets=buckets,
+        device=device or "",
+    )
+    try:
+        _visit_queue.put_nowait(event)
+    except asyncio.QueueFull:
+        logger.warning("Visit queue full (%d) — dropping timing event", _VISIT_QUEUE_MAXSIZE)

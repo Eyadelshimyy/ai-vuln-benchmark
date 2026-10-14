@@ -1,0 +1,2063 @@
+"""
+Gmail: listar correos con adjunto o parte con nombre de imagen/PDF (has:attachment OR filename:png|jpg|...).
+Pipeline Pagos: extrae candidatos imagen/PDF o Word (.docx con foto embebida) (adjunto, cuerpo, .eml); **Gemini solo si el remitente está en tabla clientes**
+(email o email_secundario). Cada imagen es un candidato; cada **página** de un PDF también (PDF multipágina se parte en varios candidatos, **una fila** por página digitalizada).
+La etiqueta final del hilo la decide el pipeline (p. ej. TEXTO / ERROR EMAIL / MANUAL según reglas).
+Plantilla A/B/C/D/E/F la decide Gemini por binario (imagen o PDF de una página).
+"""
+import base64
+import hashlib
+import logging
+import re
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from app.services.pagos_gmail.helpers import (
+    extract_sender_email,
+    ext_for_mime,
+    is_allowed_attachment,
+    is_raster_image_mime,
+    is_vision_attachment_candidate,
+    is_word_docx_attachment,
+    normalizar_candidato_descargado,
+)
+
+logger = logging.getLogger(__name__)
+
+# Una sola respuesta de users.labels.list por instancia de servicio hasta invalidar (p. ej. tras crear etiqueta).
+_gmail_labels_list_by_service_id: Dict[int, List[dict]] = {}
+
+
+def invalidate_gmail_labels_list_cache(service: Any) -> None:
+    """Quita la cache de etiquetas para este cliente Gmail (tras crear/borrar etiqueta)."""
+    _gmail_labels_list_by_service_id.pop(id(service), None)
+
+
+def _fetch_gmail_labels_list_raw(service: Any) -> Optional[List[dict]]:
+    """
+    Lista completa de etiquetas Gmail (sistema + usuario). Cacheada por id(service) si la API responde OK.
+    Si falla la API, devuelve None (no cachea; el caller puede reintentar o degradar).
+    """
+    key = id(service)
+    if key in _gmail_labels_list_by_service_id:
+        return _gmail_labels_list_by_service_id[key]
+    try:
+        resp = service.users().labels().list(userId="me").execute()
+        labels = list(resp.get("labels", []))
+        _gmail_labels_list_by_service_id[key] = labels
+        return labels
+    except Exception as e:
+        logger.warning("_fetch_gmail_labels_list_raw: %s", e)
+        return None
+
+
+# Gmail admite hasta 100 sub-peticiones por batch HTTP; el límite que suele romper el flujo es la
+# **concurrencia efectiva por usuario** ("Too many concurrent requests for user"). El tamaño de lote
+# real lo fija settings.PAGOS_GMAIL_METADATA_BATCH_CHUNK (por defecto 8).
+_GMAIL_BATCH_METADATA_MAX_CHUNK = 50
+
+
+def _gmail_metadata_batch_chunk_size() -> int:
+    """Tamaño de lote para metadata; acotado para no superar el máximo del batch API."""
+    try:
+        from app.core.config import settings
+
+        n = int(getattr(settings, "PAGOS_GMAIL_METADATA_BATCH_CHUNK", 8) or 8)
+    except Exception:
+        n = 8
+    return max(1, min(n, _GMAIL_BATCH_METADATA_MAX_CHUNK))
+
+
+def _gmail_metadata_inter_chunk_sleep_sec() -> float:
+    try:
+        from app.core.config import settings
+
+        return float(getattr(settings, "PAGOS_GMAIL_METADATA_INTER_CHUNK_SLEEP_SEC", 0.12) or 0.0)
+    except Exception:
+        return 0.12
+
+
+def batch_get_messages_metadata(
+    service: Any,
+    message_ids: List[str],
+    metadata_headers: Optional[List[str]] = None,
+) -> Dict[str, dict]:
+    """
+    Obtiene ``messages.get`` en formato metadata por lotes (BatchHttpRequest).
+    Reintenta con GET individual si una entrada del batch falla o falta respuesta.
+    Ante 429 (concurrencia / rate limit) en el GET individual aplica backoff breve.
+    """
+    from googleapiclient.errors import HttpError
+    from googleapiclient.http import BatchHttpRequest
+
+    headers = metadata_headers or ["From", "Date", "Subject"]
+    out: Dict[str, dict] = {}
+    if not message_ids:
+        return out
+
+    def _single_get(mid: str) -> None:
+        max_attempts = 6
+        for attempt in range(max_attempts):
+            try:
+                meta = service.users().messages().get(
+                    userId="me",
+                    id=mid,
+                    format="metadata",
+                    metadataHeaders=headers,
+                ).execute()
+                out[mid] = meta
+                return
+            except HttpError as ex:
+                if ex.resp.status == 429 and attempt < max_attempts - 1:
+                    wait = _parse_gmail_retry_after_seconds(ex)
+                    if wait is None or wait <= 0 or wait > _GMAIL_429_MAX_WAIT_SECONDS:
+                        wait = min(8.0, 0.35 * (2**attempt))
+                    time.sleep(min(float(wait), 12.0))
+                    continue
+                logger.warning("batch_get_messages_metadata get individual msg=%s: %s", mid, ex)
+                return
+            except Exception as ex:
+                logger.warning("batch_get_messages_metadata get individual msg=%s: %s", mid, ex)
+                return
+
+    def _batch_callback(mid: str):
+        def _cb(request_id: str, response: Optional[dict], exception: Optional[BaseException]) -> None:
+            rid = request_id or mid
+            if exception is not None:
+                logger.warning(
+                    "batch_get_messages_metadata batch msg=%s: %s", rid, exception
+                )
+                _single_get(mid)
+            elif response is not None:
+                out[mid] = response
+            else:
+                _single_get(mid)
+
+        return _cb
+
+    chunk_sz = _gmail_metadata_batch_chunk_size()
+    sleep_between = _gmail_metadata_inter_chunk_sleep_sec()
+    for i in range(0, len(message_ids), chunk_sz):
+        chunk = message_ids[i : i + chunk_sz]
+        batch = service.new_batch_http_request()
+        for mid in chunk:
+            req = service.users().messages().get(
+                userId="me",
+                id=mid,
+                format="metadata",
+                metadataHeaders=headers,
+            )
+            batch.add(req, callback=_batch_callback(mid), request_id=mid)
+        try:
+            batch.execute()
+        except Exception as ex:
+            logger.warning("batch_get_messages_metadata execute chunk: %s", ex)
+        for mid in chunk:
+            if mid not in out:
+                _single_get(mid)
+        if sleep_between > 0.0 and (i + chunk_sz) < len(message_ids):
+            time.sleep(sleep_between)
+    return out
+
+
+def batch_get_messages_full(
+    service: Any,
+    message_ids: List[str],
+) -> Dict[str, dict]:
+    """
+    Como ``batch_get_messages_metadata`` pero en ``format=full``: devuelve payload completo
+    (parts con mimeType/filename, snippet, labelIds, internalDate). No descarga binarios de
+    adjuntos: para eso ``users.messages.attachments.get`` es una llamada aparte.
+
+    Útil para previsualización en UI (decidir qué mensajes escanear) sin gastar Gemini ni
+    descargar binarios. Costo en cuota Gmail por mensaje = 5 units (igual que metadata).
+    """
+    from googleapiclient.errors import HttpError
+
+    out: Dict[str, dict] = {}
+    if not message_ids:
+        return out
+
+    def _single_get(mid: str) -> None:
+        max_attempts = 6
+        for attempt in range(max_attempts):
+            try:
+                meta = service.users().messages().get(
+                    userId="me",
+                    id=mid,
+                    format="full",
+                ).execute()
+                out[mid] = meta
+                return
+            except HttpError as ex:
+                if ex.resp.status == 429 and attempt < max_attempts - 1:
+                    wait = _parse_gmail_retry_after_seconds(ex)
+                    if wait is None or wait <= 0 or wait > _GMAIL_429_MAX_WAIT_SECONDS:
+                        wait = min(8.0, 0.35 * (2**attempt))
+                    time.sleep(min(float(wait), 12.0))
+                    continue
+                logger.warning("batch_get_messages_full get individual msg=%s: %s", mid, ex)
+                return
+            except Exception as ex:
+                logger.warning("batch_get_messages_full get individual msg=%s: %s", mid, ex)
+                return
+
+    def _batch_callback(mid: str):
+        def _cb(request_id: str, response: Optional[dict], exception: Optional[BaseException]) -> None:
+            rid = request_id or mid
+            if exception is not None:
+                logger.warning("batch_get_messages_full batch msg=%s: %s", rid, exception)
+                _single_get(mid)
+            elif response is not None:
+                out[mid] = response
+            else:
+                _single_get(mid)
+
+        return _cb
+
+    chunk_sz = _gmail_metadata_batch_chunk_size()
+    sleep_between = _gmail_metadata_inter_chunk_sleep_sec()
+    for i in range(0, len(message_ids), chunk_sz):
+        chunk = message_ids[i : i + chunk_sz]
+        batch = service.new_batch_http_request()
+        for mid in chunk:
+            req = service.users().messages().get(userId="me", id=mid, format="full")
+            batch.add(req, callback=_batch_callback(mid), request_id=mid)
+        try:
+            batch.execute()
+        except Exception as ex:
+            logger.warning("batch_get_messages_full execute chunk: %s", ex)
+        for mid in chunk:
+            if mid not in out:
+                _single_get(mid)
+        if sleep_between > 0.0 and (i + chunk_sz) < len(message_ids):
+            time.sleep(sleep_between)
+    return out
+
+
+def _payload_iter_parts(payload: Optional[dict]):
+    """Itera todas las partes (recursivamente) de un payload Gmail format=full."""
+    if not payload:
+        return
+    yield payload
+    for sub in payload.get("parts", []) or []:
+        yield from _payload_iter_parts(sub)
+
+
+def payload_has_media_candidate(payload: Optional[dict]) -> bool:
+    """
+    True si el payload (format=full) tiene al menos una parte candidata:
+    - mimeType en MIME_IMAGE_OR_PDF, o
+    - filename con extensión permitida (is_allowed_attachment).
+    - message/rfc822 / .eml, usado por el lote IT Master.
+
+    No descarga el binario; solo lee parts.mimeType/filename. Usado para preview UI.
+    """
+    for part in _payload_iter_parts(payload):
+        fname = part.get("filename") or ""
+        mt = (part.get("mimeType") or "").lower()
+        if is_vision_attachment_candidate(mt, fname) or is_raster_image_mime(mt):
+            return True
+        if mt == "message/rfc822":
+            return True
+        if fname.strip().lower().endswith((".eml", ".msg")):
+            return True
+    return False
+
+
+class PagosGmailGmailListError(RuntimeError):
+    """
+    Fallo al listar o enriquecer metadatos desde la API de Gmail.
+    No debe confundirse con inbox vacio (lista vacia legitima).
+    """
+
+
+# Etiquetas de usuario (A = MERCANTIL, B = BNC, C = BINANCE, D = BNV / BDV, E = Bancamiga, F = TESORO, G = RECIBO). Se crean si no existen.
+PAGOS_GMAIL_LABEL_IMAGEN_1 = "MERCANTIL"
+PAGOS_GMAIL_LABEL_IMAGEN_2 = "BNC"
+PAGOS_GMAIL_LABEL_IMAGEN_3 = "BINANCE"
+PAGOS_GMAIL_LABEL_IMAGEN_4 = "BNV"
+PAGOS_GMAIL_LABEL_BANCAMIGA = "BANCAMIGA"
+PAGOS_GMAIL_LABEL_TESORO = "TESORO"
+PAGOS_GMAIL_LABEL_RECIBO = "RECIBO"
+# Remitente (De) sin fila en clientes.email (o fallo BD): misma leyenda que columna Cedula del Excel.
+PAGOS_GMAIL_LABEL_ERROR_EMAIL = "ERROR EMAIL"
+# Ninguna plantilla A/B/C/D/E/F reconocida (o no se aplico otra etiqueta de clasificacion).
+PAGOS_GMAIL_LABEL_MANUAL = "MANUAL"
+# Sin captura/PDF de comprobante: cuerpo u adjuntos no extraen imagen/PDF de pago (no hay columnas desde pixeles).
+PAGOS_GMAIL_LABEL_TEXTO = "TEXTO"
+# Marca de "ya procesado por el pipeline" para el correo maestro de lote (IT Master).
+# Se agrega tras procesar el correo, independientemente de si el resultado fue OK o ERROR EMAIL,
+# para que el operador identifique visualmente en Gmail qué correos ya pasaron por el sistema.
+PAGOS_GMAIL_LABEL_CONCILIACION = "CONCILIACION"
+
+# === Modo "Lote IT Master" ===
+# Correo maestro: From: <PAGOS_GMAIL_LOTE_REMITENTE_IT_MASTER>, asunto = solo cedula numerica (6-9 digitos),
+# adjuntos .eml (uno por cada comprobante real). Cada .eml se procesa como un correo independiente, pero la
+# cedula del cliente se TOMA del asunto del maestro (no de la inferida del remitente del .eml).
+PAGOS_GMAIL_LOTE_REMITENTE_IT_MASTER = "itmaster@rapicreditca.com"
+# Asunto del maestro: solo digitos (6-9). Se le antepone "V" en el pipeline para resolver el cliente.
+_PAGOS_GMAIL_LOTE_CEDULA_SUBJECT_RE = re.compile(r"^\s*(\d{6,9})\s*$")
+
+
+def pagos_gmail_label_exclusions_query() -> str:
+    """
+    Fragmento opcional para parametro q de Gmail: excluye por etiquetas de clasificacion del pipeline.
+    El listado del escaneo (list_messages_by_filter / count) ya no lo usa: se incluyen estrella, etiquetas, leidos y no leidos.
+    """
+    return (
+        f'-label:"{PAGOS_GMAIL_LABEL_IMAGEN_1}" '
+        f'-label:"{PAGOS_GMAIL_LABEL_IMAGEN_2}" '
+        f'-label:"{PAGOS_GMAIL_LABEL_IMAGEN_3}" '
+        f'-label:"{PAGOS_GMAIL_LABEL_IMAGEN_4}" '
+        f'-label:"{PAGOS_GMAIL_LABEL_BANCAMIGA}" '
+        f'-label:"{PAGOS_GMAIL_LABEL_TESORO}" '
+        f'-label:"{PAGOS_GMAIL_LABEL_RECIBO}" '
+        f'-label:"{PAGOS_GMAIL_LABEL_ERROR_EMAIL}" '
+        f'-label:"{PAGOS_GMAIL_LABEL_MANUAL}" '
+        f'-label:"{PAGOS_GMAIL_LABEL_TEXTO}"'
+    )
+
+
+def pagos_gmail_list_q_media_parts() -> str:
+    """
+    Criterio Gmail: adjunto declarado, .eml de lote IT Master, o parte con nombre de imagen/PDF
+    (capturas en cuerpo / inline).
+    Evita perder Binance y similares que no disparan has:attachment en algunos clientes.
+    """
+    return (
+        "(has:attachment OR filename:png OR filename:jpg OR filename:jpeg OR "
+        "filename:pdf OR filename:webp OR filename:heic OR filename:heif OR "
+        "filename:gif OR filename:tif OR filename:tiff OR filename:bmp OR "
+        "filename:docx OR filename:doc OR "
+        "filename:eml OR filename:msg OR filename:image OR filename:img OR "
+        "filename:photo OR filename:captura)"
+    )
+
+
+def pagos_gmail_inbox_media_query() -> str:
+    """
+    Consulta base Gmail (q) para el pipeline: inbox + adjunto o imagen/PDF en cuerpo.
+    Incluye leidos y no leidos, con y sin estrella, con cualquier etiqueta (no se excluye por -label: ni -is:starred).
+    """
+    return f"in:inbox {pagos_gmail_list_q_media_parts()}"
+
+
+def pagos_gmail_inbox_media_unlabeled_query() -> str:
+    """
+    Igual que el listado de inbox+media, pero solo correos **sin etiqueta de usuario**.
+
+    Gmail siempre tiene etiquetas de sistema (INBOX, UNREAD, STARRED, IMPORTANT).
+    ``has:nouserlabels`` deja fuera MERCANTIL/BNC/ERROR EMAIL/MANUAL/TEXTO y cualquier
+    otra etiqueta aplicada por el pipeline o por una persona. Equivale a lo que
+    «Procesar manualmente» termina procesando (el pipeline omite lo ya etiquetado).
+    """
+    return f"{pagos_gmail_inbox_media_query()} has:nouserlabels"
+
+
+def pagos_gmail_error_email_rescan_query() -> str:
+    """
+    Re-escaneo especial: correos en inbox con imagen/PDF y etiqueta **ERROR EMAIL**.
+    El pipeline deduplica por hash de adjunto en la misma corrida para evitar filas duplicadas.
+    """
+    return (
+        f'in:inbox label:"{PAGOS_GMAIL_LABEL_ERROR_EMAIL}" '
+        f"{pagos_gmail_list_q_media_parts()}"
+    )
+
+
+def pagos_gmail_manual_error_email_redigitaliza_query() -> str:
+    """
+    Segunda pasada al final de una corrida: inbox + media con **MANUAL** y **ERROR EMAIL**.
+    El pipeline filtra de nuevo para correos con ambas etiquetas (puede haber otras etiquetas de usuario en el hilo;
+    la omisión por etiquetas del lote principal sigue las reglas de ``pipeline.py``).
+    """
+    return (
+        f'in:inbox label:{PAGOS_GMAIL_LABEL_MANUAL} '
+        f'label:"{PAGOS_GMAIL_LABEL_ERROR_EMAIL}" '
+        f"{pagos_gmail_list_q_media_parts()}"
+    )
+
+
+def pagos_gmail_pending_identification_query() -> str:
+    """
+    Correos inbox+media **sin etiqueta de usuario** (has:nouserlabels).
+    Usado por el cron cada 30 min y por scan_filter=pending_identification.
+    """
+    return pagos_gmail_inbox_media_unlabeled_query()
+
+
+# Scan filter para re-escaneo manual por remitente concreto (módulo Actualizaciones > Gmail).
+# A diferencia de **all**, este filtro acota la lista Gmail a un único `from:` y el pipeline
+# saltea la omisión por etiquetas de usuario para mensajes cuyo remitente coincida exactamente
+# (ver ``pipeline.py``: re-procesa y, antes de Gemini, retira del set permitido).
+PAGOS_GMAIL_SCAN_FILTER_MANUAL_REDIG_REMITENTE = "manual_redigitaliza_por_remitente"
+
+
+def _sanitize_from_email_for_gmail_query(from_email: Optional[str]) -> Optional[str]:
+    """
+    Normaliza el correo para usar como ``from:`` en la búsqueda Gmail.
+    Devuelve None si no es un email plausible (sin ``@`` o caracteres peligrosos para ``q``).
+    """
+    if not from_email:
+        return None
+    s = str(from_email).strip().lower()
+    if not s or "@" not in s:
+        return None
+    # Gmail acepta `from:foo@bar.com`; evitamos comillas y espacios que rompan q.
+    if any(c in s for c in (" ", '"', "'", "\n", "\r", "\t")):
+        return None
+    # Restringido a chars válidos de email + algunos signos comunes (+, %, ., _, -).
+    if not re.fullmatch(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", s):
+        return None
+    return s
+
+
+#: Criterios para el modo 'manual_redigitaliza_por_remitente':
+#: - 'remitente' (default): ``from:<correo>`` (compatible con el comportamiento anterior).
+#: - 'destinatario': ``to:<correo>`` (correos donde el correo dado es destinatario).
+#: - 'participante': ``(from:<correo> OR to:<correo>)`` (cualquier participante en INBOX).
+PAGOS_GMAIL_REDIG_CRITERIO_REMITENTE = "remitente"
+PAGOS_GMAIL_REDIG_CRITERIO_DESTINATARIO = "destinatario"
+PAGOS_GMAIL_REDIG_CRITERIO_PARTICIPANTE = "participante"
+PAGOS_GMAIL_REDIG_CRITERIOS_VALIDOS = (
+    PAGOS_GMAIL_REDIG_CRITERIO_REMITENTE,
+    PAGOS_GMAIL_REDIG_CRITERIO_DESTINATARIO,
+    PAGOS_GMAIL_REDIG_CRITERIO_PARTICIPANTE,
+)
+
+
+def _build_participante_predicate(sender: str, criterio: str) -> str:
+    """
+    Construye el predicado Gmail según el criterio del re-escaneo selectivo.
+    ``sender`` debe estar previamente saneado por ``_sanitize_from_email_for_gmail_query``.
+    """
+    c = (criterio or "").strip().lower() or PAGOS_GMAIL_REDIG_CRITERIO_REMITENTE
+    if c == PAGOS_GMAIL_REDIG_CRITERIO_DESTINATARIO:
+        return f"to:{sender}"
+    if c == PAGOS_GMAIL_REDIG_CRITERIO_PARTICIPANTE:
+        return f"(from:{sender} OR to:{sender})"
+    return f"from:{sender}"
+
+
+def pagos_gmail_manual_redigitaliza_por_remitente_query(
+    from_email: str,
+    criterio: str = PAGOS_GMAIL_REDIG_CRITERIO_REMITENTE,
+) -> str:
+    """
+    Re-escaneo manual: inbox + media + predicado según ``criterio``.
+    Si el correo no es válido, devuelve la query base (el pipeline interpreta el caso 'sin from_email').
+    """
+    sender = _sanitize_from_email_for_gmail_query(from_email)
+    base = pagos_gmail_inbox_media_query()
+    if not sender:
+        return base
+    # En el módulo IT Master, el correo configurado es la cuenta Gmail conectada
+    # (buzón receptor). Por eso se rastrea en INBOX como destinatario (`to:`),
+    # no como remitente (`from:`); los `from:` reales pueden ser clientes/terceros.
+    if sender == PAGOS_GMAIL_LOTE_REMITENTE_IT_MASTER:
+        return f"{base} to:{sender}"
+    return f"{base} {_build_participante_predicate(sender, criterio)}"
+
+
+def pagos_gmail_list_query_for_scan_filter(
+    filter_type: str,
+    from_email: Optional[str] = None,
+    criterio: str = PAGOS_GMAIL_REDIG_CRITERIO_REMITENTE,
+) -> str:
+    """
+    Parámetro **q** de Gmail para listar/count según scan_filter del pipeline.
+    - **all**: inbox + criterio imagen/PDF (incluye ya etiquetados; el pipeline los omite al procesar).
+    - **pending_identification**: inbox + media **sin etiqueta de usuario** (has:nouserlabels).
+    - **unread** / **read**: mismo criterio que **all** + is:unread / is:read.
+    - **error_email_rescan**: inbox + media + label ERROR EMAIL.
+    - **manual_redigitaliza_por_remitente**: inbox + media + predicado según ``criterio``.
+      Cuando ``from_email`` es válido, también se aplica a **all/unread/read** para acotar el listado.
+    """
+    ft = (filter_type or "").strip().lower()
+    if ft == "error_email_rescan":
+        return pagos_gmail_error_email_rescan_query()
+    if ft == "manual_error_email_redigitaliza":
+        return pagos_gmail_manual_error_email_redigitaliza_query()
+    if ft == PAGOS_GMAIL_SCAN_FILTER_MANUAL_REDIG_REMITENTE:
+        # from_email obligatorio para tener sentido; el endpoint valida y rechaza si falta.
+        return pagos_gmail_manual_redigitaliza_por_remitente_query(
+            from_email or "", criterio=criterio
+        )
+    if ft == "pending_identification":
+        base = pagos_gmail_pending_identification_query()
+    else:
+        base = pagos_gmail_inbox_media_query()
+        if ft == "unread":
+            base = f"{base} is:unread"
+        elif ft == "read":
+            base = f"{base} is:read"
+    sender = _sanitize_from_email_for_gmail_query(from_email)
+    if sender:
+        return f"{base} {_build_participante_predicate(sender, criterio)}"
+    return base
+
+
+def build_gmail_service(credentials: Any):
+    """
+    Cliente Gmail con timeout de socket. Sin él, una conexión que se queda a
+    medias deja el hilo bloqueado para siempre: el escaneo Auditoría Email
+    conserva su candado, nunca late, y ni el heal de huérfano ni Reanudar
+    pueden recuperarlo hasta reiniciar el proceso.
+    """
+    from googleapiclient.discovery import build
+
+    from app.core.config import settings
+
+    timeout_sec = int(getattr(settings, "GMAIL_HTTP_TIMEOUT_SECONDS", 120) or 120)
+    try:
+        import httplib2
+        from google_auth_httplib2 import AuthorizedHttp
+
+        http = AuthorizedHttp(credentials, http=httplib2.Http(timeout=timeout_sec))
+        return build("gmail", "v1", http=http, cache_discovery=False)
+    except ImportError:
+        logger.warning(
+            "[PAGOS_GMAIL] cliente Gmail sin timeout de socket (%ss): "
+            "faltan httplib2/google_auth_httplib2",
+            timeout_sec,
+        )
+        return build("gmail", "v1", credentials=credentials, cache_discovery=False)
+
+
+def _message_has_extractable_content(payload: dict) -> bool:
+    """
+    True si el mensaje tiene adjuntos permitidos, imágenes/PDF en el cuerpo,
+    o un mensaje reenviado (message/rfc822) que puede contener comprobantes dentro.
+    """
+    parts = payload.get("parts", [])
+    if not parts:
+        mime = (payload.get("mimeType") or "").lower()
+        fname = payload.get("filename") or ""
+        if is_vision_attachment_candidate(mime, fname) or is_raster_image_mime(mime):
+            if payload.get("body", {}).get("data") or payload.get("body", {}).get("attachmentId"):
+                return True
+        if fname and is_allowed_attachment(fname):
+            return True
+        return False
+    for part in parts:
+        filename = (part.get("filename") or "").strip()
+        if filename and is_allowed_attachment(filename):
+            return True
+        if filename.lower().endswith((".eml", ".msg")):
+            return True
+        mime = (part.get("mimeType") or "").strip().lower()
+        if is_vision_attachment_candidate(mime, filename) or is_raster_image_mime(mime):
+            return True
+        # Correo reenviado (Fwd:): el comprobante está dentro del mensaje adjunto
+        if mime == "message/rfc822":
+            return True
+        nested = part.get("parts") or []
+        if nested and _message_has_extractable_content({"parts": nested}):
+            return True
+    return False
+
+
+def _is_image_pdf_part_candidate(mime: str, filename: str) -> bool:
+    """
+    Permite candidatos por MIME o por extension de archivo.
+    Algunos proveedores adjuntan PDF con MIME generico `application/octet-stream`.
+    Incluye .docx (foto del recibo en word/media/).
+    """
+    return is_vision_attachment_candidate(mime, filename)
+
+
+# Máximo de segundos que esperamos en un reintento ante 429 (evita bloquear el worker ~15 min).
+_GMAIL_429_MAX_WAIT_SECONDS = 120
+
+
+def _parse_gmail_retry_after_seconds(exc: Exception) -> Optional[int]:
+    """
+    Parsea 'Retry after 2026-03-10T17:41:45.544Z' del mensaje de error 429 de Gmail.
+    Devuelve segundos hasta ese instante, o None si no se puede parsear.
+    """
+    msg = str(exc) if exc else ""
+    # Gmail: "User-rate limit exceeded.  Retry after 2026-03-10T17:41:45.544Z"
+    m = re.search(r"Retry\s+after\s+([\dTZ.:+-]+)", msg, re.IGNORECASE)
+    if not m:
+        return None
+    raw = m.group(1).strip()
+    try:
+        # ISO 8601 con Z -> reemplazar por +00:00 para fromisoformat
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        retry_at = datetime.fromisoformat(raw)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        delta = (retry_at - now).total_seconds()
+        return max(0, int(delta))
+    except (ValueError, TypeError):
+        return None
+
+
+def list_messages_by_filter(
+    service: Any,
+    filter_type: str = "all",
+    from_email: Optional[str] = None,
+    criterio: str = PAGOS_GMAIL_REDIG_CRITERIO_REMITENTE,
+) -> List[dict]:
+    """
+    Lista mensajes segun el filtro; correos con adjunto o parte imagen/PDF nombrada (inline/cuerpo).
+    filter_type: "unread" | "read" | "all" | "pending_identification" | "error_email_rescan"
+    | "manual_error_email_redigitaliza" | "manual_redigitaliza_por_remitente".
+    Por defecto (**all**): inbox + imagen/PDF, leidos y no leidos, con cualquier etiqueta
+    (incluye **ERROR EMAIL**; no se excluye por -label:; el pipeline omite los ya etiquetados).
+    **pending_identification**: mismo criterio de media, pero solo correos **sin etiqueta de usuario** (``has:nouserlabels``).
+    **unread** / **read**: mismo criterio que **all** + ``is:unread`` / ``is:read`` en la consulta Gmail.
+    **error_email_rescan**: inbox con etiqueta ERROR EMAIL + media; el pipeline puede procesar si **solo** esa etiqueta de usuario (ver omision por etiquetas en ``pipeline.py``).
+    **manual_redigitaliza_por_remitente**: inbox + media + ``from:<from_email>``; el pipeline no omite por etiquetas de usuario cuando el remitente del mensaje coincide con ``from_email`` (ver pipeline).
+    ``from_email`` (opcional, solo modo manual por remitente o como acotación adicional): añade ``from:<correo>`` al criterio **q** Gmail.
+    Pagina con **maxResults** 500 hasta que no haya **nextPageToken** (todos los mensajes que cumplen **q**).
+    Metadata de mensajes: **batch** ``messages.get`` (tamaño de lote configurable, por defecto 8) para reducir 429 por concurrencia.
+    Cada elemento incluye **internal_date_ms** (epoch ms de Gmail) y **label_ids** (incluye UNREAD si aplica);
+    el pipeline ordena y procesa del primero al ultimo de la bandeja (mas reciente primero) y marca **leido** si entraba no leido.
+    """
+    from googleapiclient.errors import HttpError
+
+    def _fetch() -> List[dict]:
+        all_msg_refs: List[dict] = []
+        page_token: Optional[str] = None
+        params_base: dict = {
+            "userId": "me",
+            "maxResults": 500,
+            "includeSpamTrash": False,
+        }
+        params_base["q"] = pagos_gmail_list_query_for_scan_filter(
+            filter_type, from_email, criterio=criterio
+        )
+        logger.info(
+            "[PAGOS_GMAIL] list_messages_by_filter Gmail q=%r (filter=%s, from_email=%s, criterio=%s)",
+            params_base["q"],
+            filter_type,
+            (from_email or "").strip().lower() or "(sin remitente)",
+            criterio,
+        )
+
+        while True:
+            params = dict(params_base)
+            if page_token:
+                params["pageToken"] = page_token
+            result = service.users().messages().list(**params).execute()
+            batch = result.get("messages", [])
+            all_msg_refs.extend(batch)
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                break
+        logger.info(
+            "[PAGOS_GMAIL] list_messages_by_filter Gmail listo: %d mensajes (filter=%s, from_email=%s, criterio=%s)",
+            len(all_msg_refs),
+            filter_type,
+            (from_email or "").strip().lower() or "(sin remitente)",
+            criterio,
+        )
+        ids_ordered = [m["id"] for m in all_msg_refs]
+        meta_by_id = batch_get_messages_metadata(
+            service, ids_ordered, metadata_headers=["From", "Date", "Subject"]
+        )
+        out = []
+        for msg in all_msg_refs:
+            mid = msg["id"]
+            meta = meta_by_id.get(mid)
+            if not meta:
+                logger.warning(
+                    "[PAGOS_GMAIL] list_messages_by_filter: sin metadata para msg id=%s (omitido)",
+                    mid,
+                )
+                continue
+            payload = meta.get("payload", {})
+            headers = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
+            raw_internal = meta.get("internalDate")
+            try:
+                internal_date_ms = int(raw_internal) if raw_internal is not None else 0
+            except (TypeError, ValueError):
+                internal_date_ms = 0
+            # labelIds: ids de sistema (INBOX, UNREAD) y de usuario; el pipeline puede leer ERROR EMAIL entre ellas.
+            label_ids = list(meta.get("labelIds") or [])
+            _tid_raw = (msg.get("threadId") or meta.get("threadId") or "").strip()
+            thread_id = _tid_raw[:100] if _tid_raw else None
+            out.append(
+                {
+                    "id": mid,
+                    "thread_id": thread_id,
+                    "payload": payload,
+                    "headers": headers,
+                    "internal_date_ms": internal_date_ms,
+                    "label_ids": label_ids,
+                }
+            )
+        return out
+
+    try:
+        return _fetch()
+    except HttpError as e:
+        if e.resp.status != 429:
+            logger.exception("Gmail list_messages_by_filter(%s): %s", filter_type, e)
+            raise PagosGmailGmailListError(
+                f"No se pudo listar Gmail (HTTP {e.resp.status}, filtro={filter_type})."
+            ) from e
+        wait_sec = _parse_gmail_retry_after_seconds(e)
+        logger.warning("[PAGOS_GMAIL] Gmail 429 (filtro=%s), esperando %ds, 1 reintento.", filter_type, wait_sec or 0)
+        if wait_sec is not None and 0 < wait_sec <= _GMAIL_429_MAX_WAIT_SECONDS:
+            time.sleep(wait_sec)
+            try:
+                return _fetch()
+            except HttpError as e2:
+                if e2.resp.status == 429:
+                    logger.warning(
+                        "[PAGOS_GMAIL] Gmail 429 persistente tras reintento (filtro=%s)",
+                        filter_type,
+                    )
+                    raise PagosGmailGmailListError(
+                        f"Gmail sigue en rate limit (429) tras reintento (filtro={filter_type})."
+                    ) from e2
+                logger.exception("Gmail list_messages_by_filter (reintento): %s", e2)
+                raise PagosGmailGmailListError(
+                    f"Gmail HTTP {e2.resp.status} en reintento al listar (filtro={filter_type})."
+                ) from e2
+        raise PagosGmailGmailListError(
+            f"Gmail 429 (filtro={filter_type}): retry_after={wait_sec!s}s no aplicable "
+            f"(max {_GMAIL_429_MAX_WAIT_SECONDS}s) o no parseable."
+        ) from e
+    except PagosGmailGmailListError:
+        raise
+    except Exception as e:
+        logger.exception("Gmail list_messages_by_filter(%s): %s", filter_type, e)
+        raise PagosGmailGmailListError(
+            f"Error inesperado listando Gmail (filtro={filter_type}): {e!s}"
+        ) from e
+
+
+
+def count_messages_by_filter(
+    service: Any,
+    filter_type: str = "all",
+    from_email: Optional[str] = None,
+    criterio: str = PAGOS_GMAIL_REDIG_CRITERIO_REMITENTE,
+) -> int:
+    """
+    Cuenta mensajes segun el filtro sin obtener metadata (solo list paginado).
+    Mismo criterio **q** que list_messages_by_filter (ver pagos_gmail_list_query_for_scan_filter).
+    ``from_email`` opcional para acotar a un correo participante.
+    ``criterio`` controla si se busca como remitente / destinatario / participante (default: remitente).
+    """
+    from googleapiclient.errors import HttpError
+
+    def _count() -> int:
+        total = 0
+        page_token: Optional[str] = None
+        params_base: dict = {
+            "userId": "me",
+            "maxResults": 500,
+            "includeSpamTrash": False,
+        }
+        params_base["q"] = pagos_gmail_list_query_for_scan_filter(
+            filter_type, from_email, criterio=criterio
+        )
+        logger.info(
+            "[PAGOS_GMAIL] count_messages_by_filter Gmail q=%r (filter=%s, from_email=%s, criterio=%s)",
+            params_base["q"],
+            filter_type,
+            (from_email or "").strip().lower() or "(sin remitente)",
+            criterio,
+        )
+        while True:
+            params = dict(params_base)
+            if page_token:
+                params["pageToken"] = page_token
+            result = service.users().messages().list(**params).execute()
+            batch = result.get("messages", [])
+            total += len(batch)
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                break
+        return total
+
+    try:
+        return _count()
+    except HttpError as e:
+        if e.resp.status != 429:
+            logger.warning("Gmail count_messages_by_filter(%s): %s", filter_type, e)
+            raise PagosGmailGmailListError(
+                f"No se pudo contar en Gmail (HTTP {e.resp.status}, filtro={filter_type})."
+            ) from e
+        wait_sec = _parse_gmail_retry_after_seconds(e)
+        logger.warning("[PAGOS_GMAIL] Gmail 429 (count, filtro=%s), esperando %ds", filter_type, wait_sec or 0)
+        if wait_sec is not None and 0 < wait_sec <= _GMAIL_429_MAX_WAIT_SECONDS:
+            time.sleep(wait_sec)
+            try:
+                return _count()
+            except HttpError as e2:
+                logger.warning("Gmail count 429/HTTP tras reintento (%s): %s", filter_type, e2)
+                raise PagosGmailGmailListError(
+                    f"No se pudo contar en Gmail tras 429 (HTTP {e2.resp.status}, filtro={filter_type})."
+                ) from e2
+        raise PagosGmailGmailListError(
+            f"Gmail 429 al contar (filtro={filter_type}): retry_after={wait_sec!s}s no aplicable "
+            f"(max {_GMAIL_429_MAX_WAIT_SECONDS}s) o no parseable."
+        ) from e
+    except PagosGmailGmailListError:
+        raise
+    except Exception as e:
+        logger.warning("Gmail count_messages_by_filter(%s): %s", filter_type, e)
+        raise PagosGmailGmailListError(
+            f"Error inesperado contando Gmail (filtro={filter_type}): {e!s}"
+        ) from e
+
+
+def list_unread_with_attachments(service: Any) -> List[dict]:
+    """
+    Lista correos en inbox con criterio imagen/PDF (leidos y no leidos; mismo listado que "all").
+    Nombre historico; equivale a list_messages_by_filter(service, "all").
+    """
+    return list_messages_by_filter(service, "all")
+
+
+def get_message_date(headers: dict) -> datetime:
+    """Fecha de recepción del correo (para carpeta/hoja por día)."""
+    from email.utils import parsedate_to_datetime
+    date_str = headers.get("date") or headers.get("Date") or ""
+    try:
+        dt = parsedate_to_datetime(date_str)
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+    except Exception:
+        return datetime.utcnow()
+
+
+def get_message_full_payload(service: Any, message_id: str) -> dict:
+    """Obtiene el payload completo del mensaje (incluye body.data para partes inline y HTML)."""
+    try:
+        msg = service.users().messages().get(userId="me", id=message_id, format="full").execute()
+        return msg.get("payload", {})
+    except Exception as e:
+        logger.warning("Error obteniendo mensaje completo %s: %s", message_id, e)
+        return {}
+
+
+def _html_to_plain(html: str) -> str:
+    """Convierte HTML a texto plano para uso en extracción (cuerpo del correo)."""
+    if not html:
+        return ""
+    text = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
+    text = re.sub(r"</p>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"&nbsp;", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"&amp;", "&", text, flags=re.IGNORECASE)
+    text = re.sub(r"&lt;", "<", text, flags=re.IGNORECASE)
+    text = re.sub(r"&gt;", ">", text, flags=re.IGNORECASE)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def get_message_body_text(payload: dict) -> str:
+    """
+    Extrae el cuerpo del correo en texto plano desde el payload de Gmail API.
+    Prefiere text/plain; si no hay, usa text/html convirtiendo a texto.
+    Útil para que Gemini extraiga datos del cuerpo cuando no hay adjuntos o como contexto.
+    """
+    plain = ""
+    html = ""
+
+    def _collect(part: dict) -> None:
+        nonlocal plain, html
+        mime = (part.get("mimeType") or "").strip().lower()
+        body = part.get("body") or {}
+        data_b64 = body.get("data")
+        if not data_b64:
+            for sub in (part.get("parts") or []):
+                _collect(sub)
+            return
+        try:
+            raw = base64.urlsafe_b64decode(data_b64 + "==")
+            text = raw.decode("utf-8", errors="replace")
+            if mime == "text/plain":
+                plain = text
+            elif mime == "text/html" and not plain:
+                html = text
+        except Exception:
+            pass
+        for sub in (part.get("parts") or []):
+            _collect(sub)
+
+    _collect(payload)
+    if plain:
+        return plain.strip()[:15000]  # límite razonable para contexto Gemini
+    if html:
+        return _html_to_plain(html).strip()[:15000]
+    return ""
+
+
+def get_message_all_text_parts(payload: dict, max_chars: int = 30000) -> str:
+    """
+    Concatena text/plain, text/html (a plano) y partes message/delivery-status / rfc822
+    para parsear DSN de rebote (notificaciones@ suele estar en el mensaje original anidado).
+    """
+    chunks: list[str] = []
+
+    def _collect(part: dict) -> None:
+        mime = (part.get("mimeType") or "").strip().lower()
+        body = part.get("body") or {}
+        data_b64 = body.get("data")
+        if data_b64:
+            try:
+                raw = base64.urlsafe_b64decode(data_b64 + "==")
+                text = raw.decode("utf-8", errors="replace")
+                if mime == "text/html":
+                    text = _html_to_plain(text)
+                if text.strip():
+                    chunks.append(text.strip())
+            except Exception:
+                pass
+        for sub in part.get("parts") or []:
+            _collect(sub)
+
+    _collect(payload or {})
+    joined = "\n\n".join(chunks)
+    return joined[:max_chars]
+
+
+def get_message_raw_bytes(service: Any, message_id: str) -> Optional[bytes]:
+    """
+    Obtiene el correo completo en formato raw (RFC 2822) para guardarlo como .eml en Drive.
+    Returns bytes del mensaje .eml o None si falla.
+    """
+    try:
+        msg = service.users().messages().get(userId="me", id=message_id, format="raw").execute()
+        raw_b64 = msg.get("raw")
+        if not raw_b64:
+            return None
+        # Gmail devuelve base64url; añadir padding si hace falta
+        pad = 4 - len(raw_b64) % 4
+        if pad != 4:
+            raw_b64 += "=" * pad
+        return base64.urlsafe_b64decode(raw_b64)
+    except Exception as e:
+        logger.warning("Error obteniendo mensaje raw %s: %s", message_id, e)
+        return None
+
+
+def get_attachments_for_message(service: Any, message_id: str, payload: dict) -> List[Tuple[str, bytes, str]]:
+    """(filename, content_bytes, mime_type) para cada adjunto permitido."""
+    parts = payload.get("parts", [])
+    out = []
+    for part in parts:
+        filename = (part.get("filename") or "").strip()
+        if not filename or not is_allowed_attachment(filename):
+            continue
+        att_id = part.get("body", {}).get("attachmentId")
+        if not att_id:
+            continue
+        try:
+            att = service.users().messages().attachments().get(userId="me", messageId=message_id, id=att_id).execute()
+            data = att.get("data")
+            if data:
+                raw = base64.urlsafe_b64decode(data)
+                mime = part.get("mimeType") or "application/octet-stream"
+                out.append((filename, raw, mime))
+        except Exception as e:
+            logger.warning("Error descargando adjunto %s: %s", filename, e)
+    return out
+
+
+def get_attachment_image_pdf_files_for_message(
+    service: Any, message_id: str, payload: dict
+) -> List[Tuple[str, bytes, str]]:
+    """
+    Partes imagen/PDF con attachmentId (adjunto archivo tipico o parte descargable).
+    Si Gmail no envia filename o la extension no coincide, se usa nombre sintetico para no perder el binario.
+    El pipeline Pagos combina esto con cuerpo incrustado en get_pagos_gmail_image_pdf_files_for_pipeline.
+    """
+    out: List[Tuple[str, bytes, str]] = []
+
+    def _effective_filename(part: dict, mime: str, att_id: str) -> str:
+        fn = (part.get("filename") or "").strip()
+        if fn and is_allowed_attachment(fn):
+            return fn
+        safe = (att_id or "x").replace("/", "_")[:20]
+        return f"gmail_att_{safe}.{ext_for_mime(mime)}"
+
+    def walk(parts: List[dict]) -> None:
+        for part in parts:
+            nested = part.get("parts") or []
+            if nested:
+                walk(nested)
+                continue
+            mime = (part.get("mimeType") or "application/octet-stream").strip().lower()
+            if not _is_image_pdf_part_candidate(mime, part.get("filename") or ""):
+                continue
+            att_id = part.get("body", {}).get("attachmentId")
+            if not att_id:
+                continue
+            use_fn = _effective_filename(part, mime, att_id)
+            try:
+                att = service.users().messages().attachments().get(
+                    userId="me", messageId=message_id, id=att_id
+                ).execute()
+                data = att.get("data")
+                if data:
+                    raw = base64.urlsafe_b64decode(data)
+                    norm = normalizar_candidato_descargado(use_fn, raw, mime)
+                    if norm:
+                        out.append(norm)
+            except Exception as e:
+                logger.warning("Error descargando adjunto %s: %s", use_fn, e)
+
+    parts = payload.get("parts") or []
+    if parts:
+        walk(parts)
+    else:
+        mime = (payload.get("mimeType") or "").strip().lower()
+        body = payload.get("body") or {}
+        att_id = body.get("attachmentId")
+        if att_id and _is_image_pdf_part_candidate(mime, payload.get("filename") or ""):
+            use_fn = _effective_filename(payload, mime, att_id)
+            try:
+                att = service.users().messages().attachments().get(
+                    userId="me", messageId=message_id, id=att_id
+                ).execute()
+                data = att.get("data")
+                if data:
+                    raw = base64.urlsafe_b64decode(data)
+                    norm = normalizar_candidato_descargado(use_fn, raw, mime)
+                    if norm:
+                        out.append(norm)
+            except Exception as e:
+                logger.warning("Error descargando adjunto raiz %s: %s", use_fn, e)
+    return out
+
+
+def _header_value_from_part_headers(part: dict, header_name: str) -> str:
+    want = header_name.strip().lower()
+    for h in part.get("headers") or []:
+        if (h.get("name") or "").strip().lower() == want:
+            return (h.get("value") or "").strip()
+    return ""
+
+
+def _content_disposition_type(cd_value: str) -> str:
+    """Primer token de Content-Disposition: inline, attachment, form-data, o vacio."""
+    if not (cd_value or "").strip():
+        return ""
+    return (cd_value.split(";", 1)[0].strip().lower())
+
+
+def _download_gmail_leaf_part_bytes(service: Any, message_id: str, part: dict) -> Optional[bytes]:
+    body = part.get("body") or {}
+    data_b64 = body.get("data")
+    if data_b64:
+        try:
+            return base64.urlsafe_b64decode(data_b64)
+        except Exception as e:
+            logger.debug("Decode part data: %s", e)
+            return None
+    att_id = body.get("attachmentId")
+    if not att_id:
+        return None
+    try:
+        att = service.users().messages().attachments().get(
+            userId="me", messageId=message_id, id=att_id
+        ).execute()
+        if att.get("data"):
+            return base64.urlsafe_b64decode(att["data"])
+    except Exception as e:
+        logger.warning("Error descargando attachmentId %s: %s", att_id, e)
+    return None
+
+
+def _is_body_embedded_image_pdf_leaf(part: dict, parent_mime: str) -> bool:
+    """
+    True: inline, multipart/related (cid), o hijo de multipart/mixed sin disposition attachment
+    (imagen en el cuerpo del correo junto al texto). False si es explicitamente attachment
+    (lo cubre get_attachment_image_pdf_files_for_message; dedupe evita doble escaneo).
+    """
+    dt = _content_disposition_type(_header_value_from_part_headers(part, "Content-Disposition"))
+    if dt == "attachment":
+        return False
+    if dt == "inline":
+        return True
+    p = (parent_mime or "").strip().lower()
+    if p == "multipart/related":
+        return True
+    if p == "multipart/mixed":
+        return True
+    return False
+
+
+def _dedupe_image_pdf_by_content(items: List[Tuple[str, bytes, str]]) -> List[Tuple[str, bytes, str]]:
+    seen: set[str] = set()
+    out: List[Tuple[str, bytes, str]] = []
+    for fn, content, mime in items:
+        fp = hashlib.sha256(content).hexdigest()
+        if fp in seen:
+            continue
+        seen.add(fp)
+        out.append((fn, content, mime))
+    return out
+
+
+def _expand_word_docx_pipeline_candidates(
+    items: List[Tuple[str, bytes, str, str]],
+) -> List[Tuple[str, bytes, str, str]]:
+    """
+    Convierte adjuntos .docx en imagen embebida (word/media/) lista para Gemini.
+    Si la extracción falla, se omite el candidato (Gemini no lee .docx directamente).
+    """
+    import os
+
+    from app.services.cobros.comprobante_docx import (
+        es_mime_word,
+        extraer_imagen_comprobante_desde_docx,
+    )
+
+    out: List[Tuple[str, bytes, str, str]] = []
+    for fname, raw, mime, origen in items:
+        if not es_mime_word(mime, fname):
+            out.append((fname, raw, mime, origen))
+            continue
+        try:
+            img_bytes, img_fn, img_mime = extraer_imagen_comprobante_desde_docx(raw)
+            stem = os.path.splitext(fname)[0] or "comprobante"
+            out_name = f"{stem}_{img_fn}"
+            out.append((out_name, img_bytes, img_mime, f"{origen}_docx"))
+            logger.info(
+                "[PAGOS_GMAIL] Word '%s': imagen extraida (%s, %d bytes) -> candidato Gemini",
+                fname,
+                img_mime,
+                len(img_bytes),
+            )
+        except ValueError as exc:
+            logger.warning(
+                "[PAGOS_GMAIL] Word '%s': no se pudo extraer imagen (%s); se omite candidato",
+                fname,
+                exc,
+            )
+    return out
+
+
+def _dedupe_pipeline_candidates(
+    items: List[Tuple[str, bytes, str, str]],
+) -> List[Tuple[str, bytes, str, str]]:
+    """Deduplica por hash del binario; conserva la primera etiqueta de origen encontrada."""
+    seen: set[str] = set()
+    out: List[Tuple[str, bytes, str, str]] = []
+    for fn, content, mime, origen in items:
+        fp = hashlib.sha256(content).hexdigest()
+        if fp in seen:
+            continue
+        seen.add(fp)
+        out.append((fn, content, mime, origen))
+    return out
+
+
+def get_body_embedded_image_pdf_files_for_message(
+    service: Any, message_id: str, payload: dict
+) -> List[Tuple[str, bytes, str]]:
+    """
+    Imagenes/PDF mostradas en el cuerpo del correo (no como attachment declarado):
+    - Content-Disposition: inline, multipart/related (cid), multipart/mixed sin attachment,
+    - data:image/...;base64,... en HTML,
+    - mensaje de una sola parte image/* o PDF sin Content-Disposition: attachment.
+    """
+    out: List[Tuple[str, bytes, str]] = []
+    parts = payload.get("parts") or []
+
+    def _append_leaf(part: dict, mime: str) -> None:
+        if not _is_image_pdf_part_candidate(mime, part.get("filename") or ""):
+            return
+        raw = _download_gmail_leaf_part_bytes(service, message_id, part)
+        if not raw:
+            return
+        norm = normalizar_candidato_descargado(part.get("filename") or "", raw, mime)
+        if norm:
+            out.append(norm)
+
+    if not parts:
+        root_mime = (payload.get("mimeType") or "").strip().lower()
+        if _is_image_pdf_part_candidate(root_mime, payload.get("filename") or ""):
+            if _content_disposition_type(_header_value_from_part_headers(payload, "Content-Disposition")) != "attachment":
+                _append_leaf(payload, root_mime)
+    else:
+
+        def walk(plist: List[dict], parent_mime: str) -> None:
+            for part in plist:
+                mime = (part.get("mimeType") or "").strip().lower()
+                nested = part.get("parts") or []
+                if nested:
+                    walk(nested, mime)
+                    continue
+                if not _is_image_pdf_part_candidate(mime, part.get("filename") or ""):
+                    continue
+                if not _is_body_embedded_image_pdf_leaf(part, parent_mime):
+                    continue
+                _append_leaf(part, mime)
+
+        walk(parts, (payload.get("mimeType") or "").strip().lower())
+
+    try:
+        out.extend(_get_images_from_html_body(service, message_id, payload))
+    except Exception as e:
+        logger.warning("[PAGOS_GMAIL] get_body_embedded: HTML body images: %s", e)
+
+    return _dedupe_image_pdf_by_content(out)
+
+
+def _get_inline_images_from_parts(
+    service: Any, message_id: str, parts: List[dict], prefix: str = ""
+) -> List[Tuple[str, bytes, str]]:
+    """Recorre parts y devuelve (filename, content, mime) para partes imagen/PDF con body.data o attachmentId."""
+    out = []
+    for i, part in enumerate(parts):
+        mime = (part.get("mimeType") or "").strip().lower()
+        nested = part.get("parts") or []
+        if nested:
+            out.extend(_get_inline_images_from_parts(service, message_id, nested, prefix=f"{prefix}{i}_"))
+            continue
+        if not _is_image_pdf_part_candidate(mime, part.get("filename") or ""):
+            continue
+        body = part.get("body") or {}
+        att_id = body.get("attachmentId")
+        data_b64 = body.get("data")
+        raw = None
+        if data_b64:
+            try:
+                raw = base64.urlsafe_b64decode(data_b64)
+            except Exception as e:
+                logger.debug("Decode inline part %s: %s", prefix, e)
+        elif att_id:
+            try:
+                att = service.users().messages().attachments().get(
+                    userId="me", messageId=message_id, id=att_id
+                ).execute()
+                if att.get("data"):
+                    raw = base64.urlsafe_b64decode(att["data"])
+            except Exception as e:
+                logger.warning("Error descargando parte inline %s: %s", att_id, e)
+        if raw:
+            filename = (part.get("filename") or "").strip()
+            if not filename:
+                filename = f"inline_{prefix}{i}.{ext_for_mime(mime)}"
+            norm = normalizar_candidato_descargado(filename, raw, mime)
+            if norm:
+                out.append(norm)
+    return out
+
+
+def _get_images_from_html_body(service: Any, message_id: str, payload: dict) -> List[Tuple[str, bytes, str]]:
+    """Extrae imágenes embebidas en HTML como data:image/...;base64,..."""
+    out = []
+    parts = payload.get("parts", [])
+    html_parts = []
+    for part in parts:
+        mime = (part.get("mimeType") or "").strip().lower()
+        if mime == "text/html":
+            body = part.get("body") or {}
+            if body.get("data"):
+                try:
+                    html_parts.append(base64.urlsafe_b64decode(body["data"]).decode("utf-8", errors="replace"))
+                except Exception as e:
+                    logger.debug("Decode HTML part: %s", e)
+            elif body.get("attachmentId"):
+                try:
+                    att = service.users().messages().attachments().get(
+                        userId="me", messageId=message_id, id=body["attachmentId"]
+                    ).execute()
+                    if att.get("data"):
+                        html_parts.append(base64.urlsafe_b64decode(att["data"]).decode("utf-8", errors="replace"))
+                except Exception as e:
+                    logger.debug("Fetch HTML attachment: %s", e)
+    # También cuerpo sin parts
+    if not html_parts and payload.get("mimeType", "").strip().lower() == "text/html":
+        body = payload.get("body") or {}
+        if body.get("data"):
+            try:
+                html_parts.append(base64.urlsafe_b64decode(body["data"]).decode("utf-8", errors="replace"))
+            except Exception:
+                pass
+    # Regex: data:image/(jpeg|png|...);base64,([A-Za-z0-9+/=]+)
+    data_url_re = re.compile(r"data:image/([a-zA-Z0-9+.-]+);base64,([A-Za-z0-9+/=]+)")
+    for idx, html in enumerate(html_parts):
+        for m in data_url_re.finditer(html):
+            try:
+                subtype = m.group(1).lower().replace("+", "-")
+                b64 = m.group(2)
+                raw = base64.b64decode(b64)
+                mime = f"image/{subtype}" if "/" in subtype else f"image/{subtype}"
+                if mime == "image/jpg":
+                    mime = "image/jpeg"
+                if not is_raster_image_mime(mime):
+                    continue
+                norm = normalizar_candidato_descargado(
+                    f"body_image_{idx}_{len(out)}.{ext_for_mime(mime)}", raw, mime
+                )
+                if norm:
+                    out.append(norm)
+            except Exception as e:
+                logger.debug("Decode data URL image: %s", e)
+    return out
+
+
+def _get_images_from_rfc822_parts(
+    service: Any, message_id: str, parts: List[dict], prefix: str = ""
+) -> List[Tuple[str, bytes, str]]:
+    """
+    Extrae imagenes/PDFs de partes message/rfc822 (correos reenviados, Fwd:).
+    Recorre el arbol de parts en profundidad; parsea cada .eml con email.message.
+    """
+    import email as email_lib
+
+    out: List[Tuple[str, bytes, str]] = []
+    for i, part in enumerate(parts):
+        mime = (part.get("mimeType") or "").strip().lower()
+        nested = part.get("parts") or []
+        if nested:
+            out.extend(
+                _get_images_from_rfc822_parts(
+                    service, message_id, nested, prefix=f"{prefix}{i}_"
+                )
+            )
+        if mime != "message/rfc822":
+            continue
+        body = part.get("body") or {}
+        att_id = body.get("attachmentId")
+        data_b64 = body.get("data")
+        raw: bytes | None = None
+        if data_b64:
+            try:
+                raw = base64.urlsafe_b64decode(data_b64)
+            except Exception as e:
+                logger.debug("Decode rfc822 inline %s: %s", prefix, e)
+        elif att_id:
+            try:
+                att = service.users().messages().attachments().get(
+                    userId="me", messageId=message_id, id=att_id
+                ).execute()
+                if att.get("data"):
+                    raw = base64.urlsafe_b64decode(att["data"])
+            except Exception as e:
+                logger.warning("Error descargando rfc822 %s: %s", att_id, e)
+        if not raw:
+            continue
+        try:
+            embedded_msg = email_lib.message_from_bytes(raw)
+            for j, subpart in enumerate(embedded_msg.walk()):
+                ct = (subpart.get_content_type() or "").lower()
+                fn_sub = subpart.get_filename() or ""
+                if not is_vision_attachment_candidate(ct, fn_sub) and not is_raster_image_mime(ct):
+                    continue
+                payload_bytes = subpart.get_payload(decode=True)
+                if not payload_bytes:
+                    continue
+                fname = subpart.get_filename() or f"fwd_{prefix}{i}_{j}.{ext_for_mime(ct)}"
+                norm = normalizar_candidato_descargado(fname, payload_bytes, ct)
+                if not norm:
+                    continue
+                fname, payload_bytes, ct = norm
+                out.append((fname, payload_bytes, ct))
+                logger.debug(
+                    "[PAGOS_GMAIL] rfc822: extraido '%s' (%s, %d bytes)",
+                    fname,
+                    ct,
+                    len(payload_bytes),
+                )
+        except Exception as e:
+            logger.warning("Error parseando rfc822 %s: %s", prefix, e)
+    return out
+
+
+def get_pagos_gmail_image_pdf_files_for_pipeline(
+    service: Any, message_id: str, payload: dict
+) -> List[Tuple[str, bytes, str, str]]:
+    """
+    Candidatos a escanear con Gemini (misma imagen adjunta o en cuerpo se deduplica por hash SHA-256):
+    1) Incrustado en cuerpo: inline, multipart/related (cid), data: en HTML, hijos image/PDF en multipart/mixed
+       que no sean Content-Disposition: attachment.
+    2) Archivo adjunto: cualquier parte image/PDF con attachmentId (con o sin filename en Gmail).
+    3) Reenvios: binarios image/PDF dentro de message/rfc822 (.eml anidado).
+    4) Recorrido MIME completo: todas las partes image/PDF con body.data o attachmentId (cubre p. ej. hijos de
+       multipart/alternative que 1) no marcaria solo como \"cuerpo\"). Duplicados respecto a 1–3 se eliminan al deduplicar.
+
+    Cada tupla incluye `origen_binario`: **embebida** (cuerpo/inline/HTML/related) o **adjunta** (attachment típico;
+    acepta PDF, JPG, PNG, etc.) o **reenvio_eml** (parte rfc822) o **mime_recorrido** (resto del árbol MIME).
+    El pipeline puede partir PDFs multi-página en una petición por página.
+    """
+    embedded = get_body_embedded_image_pdf_files_for_message(service, message_id, payload)
+    attached = get_attachment_image_pdf_files_for_message(service, message_id, payload)
+    rfc822_parts: List[Tuple[str, bytes, str]] = []
+    try:
+        rfc822_parts = _get_images_from_rfc822_parts(
+            service, message_id, payload.get("parts", [])
+        )
+    except Exception as e:
+        logger.warning("[PAGOS_GMAIL] rfc822 en pipeline: %s", e)
+
+    # Lote IT Master / correos reenviados como archivo: Gmail a veces expone el .eml
+    # como adjunto descargable con filename .eml o message/rfc822, pero sin desglosar
+    # sus hijos image/PDF en el payload del mensaje maestro. El extractor legacy de
+    # message/rfc822 cubre algunos casos, pero no todos. Aquí descargamos cada .eml
+    # explícitamente y lo parseamos con email.parser para sacar sus adjuntos reales.
+    eml_inner_parts: List[Tuple[str, bytes, str]] = []
+    try:
+        for eml_idx, (eml_filename, eml_raw) in enumerate(
+            get_eml_attachments_for_message(service, message_id, payload)
+        ):
+            _eml_headers, eml_atts = parse_eml_bytes(eml_raw)
+            if eml_atts:
+                logger.info(
+                    "[PAGOS_GMAIL] .eml '%s': %d adjunto(s) imagen/PDF extraido(s) para Gemini (msg=%s)",
+                    eml_filename,
+                    len(eml_atts),
+                    message_id,
+                )
+            else:
+                logger.info(
+                    "[PAGOS_GMAIL] .eml '%s': sin adjuntos imagen/PDF internos (msg=%s)",
+                    eml_filename,
+                    message_id,
+                )
+            for att_idx, (fn, raw, mime) in enumerate(eml_atts):
+                safe_fn = fn or f"eml_{eml_idx}_{att_idx}.{ext_for_mime(mime)}"
+                eml_inner_parts.append((f"{eml_filename}__{safe_fn}", raw, mime))
+    except Exception as e:
+        logger.warning("[PAGOS_GMAIL] .eml parser en pipeline: %s", e)
+
+    part_roots: List[dict] = list(payload.get("parts") or [])
+    if not part_roots:
+        mime_root = (payload.get("mimeType") or "").strip().lower()
+        if is_vision_attachment_candidate(mime_root, payload.get("filename") or "") or is_raster_image_mime(mime_root):
+            part_roots = [payload]
+    mime_walk = (
+        _get_inline_images_from_parts(service, message_id, part_roots)
+        if part_roots
+        else []
+    )
+
+    merged: List[Tuple[str, bytes, str, str]] = []
+    merged.extend((a[0], a[1], a[2], "embebida") for a in embedded)
+    merged.extend((a[0], a[1], a[2], "adjunta") for a in attached)
+    merged.extend((a[0], a[1], a[2], "reenvio_eml") for a in rfc822_parts)
+    merged.extend((a[0], a[1], a[2], "reenvio_eml") for a in eml_inner_parts)
+    merged.extend((a[0], a[1], a[2], "mime_recorrido") for a in mime_walk)
+    merged = _expand_word_docx_pipeline_candidates(merged)
+    unique = _dedupe_pipeline_candidates(merged)
+    logger.info(
+        "[PAGOS_GMAIL] msg %s inventario fuentes: incrustados=%d adjuntos=%d "
+        "rfc822/eml=%d mime_recorrido=%d pre_dedupe=%d unicos=%d | unicos=%s",
+        message_id,
+        len(embedded),
+        len(attached),
+        len(rfc822_parts) + len(eml_inner_parts),
+        len(mime_walk),
+        len(merged),
+        len(unique),
+        ", ".join(f"{fn}({origen})" for fn, _, _, origen in unique)[:500] or "ninguno",
+    )
+    return unique
+
+
+def _min_payment_image_bytes() -> int:
+    """Umbral minimo de bytes en get_all_images (legacy); 0 = no filtrar por tamano."""
+    from app.core.config import settings
+    return int(getattr(settings, "PAGOS_GMAIL_MIN_IMAGE_BYTES", 0) or 0)
+
+
+def get_all_images_and_files_for_message(
+    service: Any, message_id: str, payload: dict
+) -> List[Tuple[str, bytes, str]]:
+    """
+    Extrae imágenes/PDFs de todas las fuentes posibles del mensaje:
+    1. Adjuntos directos (imagen/PDF adjunto al email).
+    2. Partes inline MIME (Content-Disposition: inline).
+    3. Imágenes base64 embebidas en HTML del cuerpo.
+    4. Mensajes reenviados (message/rfc822 / Fwd:) — el comprobante está dentro del .eml adjunto.
+    Filtra por tamano si _min_payment_image_bytes() > 0. Devuelve (filename, content_bytes, mime_type) sin duplicados.
+    """
+    min_bytes = _min_payment_image_bytes()
+    seen: set = set()
+    out: List[Tuple[str, bytes, str]] = []
+
+    def _add(items: List[Tuple[str, bytes, str]]) -> None:
+        for filename, content, mime in items:
+            size = len(content)
+            if size < min_bytes:
+                logger.debug("[PAGOS_GMAIL] Descartada (< %d bytes): %s (%d bytes)", min_bytes, filename, size)
+                continue
+            key = (filename, size)
+            if key not in seen:
+                seen.add(key)
+                logger.debug("[PAGOS_GMAIL] Aceptada: %s (%d bytes, %s)", filename, size, mime)
+                out.append((filename, content, mime))
+
+    _add(get_attachments_for_message(service, message_id, payload))
+    _add(_get_inline_images_from_parts(service, message_id, payload.get("parts", [])))
+    _add(_get_images_from_html_body(service, message_id, payload))
+    _add(_get_images_from_rfc822_parts(service, message_id, payload.get("parts", [])))
+
+    if not out:
+        logger.info("[PAGOS_GMAIL] CERO imagenes >= %d bytes para msg %s - todo descartado o correo sin imagenes", min_bytes, message_id)
+    return out
+
+
+def extract_forwarded_sender(full_payload: dict) -> Optional[str]:
+    """
+    Extrae el remitente original de un mensaje reenviado buscando la línea
+    'De: NAME <email>' o 'From: NAME <email>' después del marcador
+    '---------- Forwarded message ----------' en el cuerpo de texto plano.
+    También busca en partes message/rfc822 el header From del mensaje incrustado.
+    Devuelve la cadena 'NAME <email>' o solo 'email' si se encuentra, None si no.
+    """
+    # 1. Intentar con message/rfc822: extraer From del .eml incrustado
+    import email as email_lib
+
+    def _find_rfc822_from(parts: list) -> Optional[str]:
+        for part in parts:
+            mime = (part.get("mimeType") or "").strip().lower()
+            if mime == "message/rfc822":
+                body = part.get("body") or {}
+                data_b64 = body.get("data")
+                if data_b64:
+                    try:
+                        raw = base64.urlsafe_b64decode(data_b64 + "==")
+                        msg = email_lib.message_from_bytes(raw)
+                        return msg.get("From") or msg.get("from")
+                    except Exception:
+                        pass
+            nested = part.get("parts") or []
+            if nested:
+                found = _find_rfc822_from(nested)
+                if found:
+                    return found
+        return None
+
+    rfc_from = _find_rfc822_from(full_payload.get("parts") or [])
+    if rfc_from:
+        return rfc_from.strip()
+
+    # 2. Fallback: parsear el texto plano buscando el marcador de reenvío
+    def _get_plain_text(p: dict) -> str:
+        mime = (p.get("mimeType") or "").lower()
+        if mime == "text/plain":
+            data = (p.get("body") or {}).get("data", "")
+            if data:
+                try:
+                    return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="ignore")
+                except Exception:
+                    pass
+        for sub in (p.get("parts") or []):
+            result = _get_plain_text(sub)
+            if result:
+                return result
+        return ""
+
+    text = _get_plain_text(full_payload)
+    if text:
+        # Buscar después del marcador de reenvío
+        marker = re.search(r"-{5,}\s*Forwarded message\s*-{5,}", text, re.IGNORECASE)
+        search_text = text[marker.end():] if marker else text
+        # "De: NOMBRE <email>" o "From: NOMBRE <email>"
+        m = re.search(r"(?:De|From):\s+(.*?<[^>]+@[^>]+>)", search_text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+        # Sin ángulos: "De: email@dominio.com"
+        m = re.search(r"(?:De|From):\s+([^\s<@,\n]+@[^\s,\n]+)", search_text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+
+    return None
+
+
+def list_gmail_user_label_ids(
+    service: Any,
+) -> tuple[frozenset[str], dict[str, str], bool]:
+    """
+    Lista etiquetas de Gmail con type **user** (creadas por el usuario o por la API como etiquetas de usuario).
+    No incluye etiquetas de sistema (INBOX, UNREAD, CATEGORY_*, STARRED, etc.).
+    Reutiliza la misma respuesta cacheada que ``get_existing_user_label_id`` / ``ensure_user_label_id``.
+
+    Returns:
+        (conjunto de label id, mapa id -> nombre para logs, catalogo_ok).
+        Si ``catalogo_ok`` es False, fallo al listar etiquetas: el pipeline no debe confiar en la omision por etiqueta.
+    """
+    raw = _fetch_gmail_labels_list_raw(service)
+    if raw is None:
+        return frozenset(), {}, False
+    try:
+        ids: list[str] = []
+        id_to_name: dict[str, str] = {}
+        for lb in raw:
+            if (lb.get("type") or "").lower() != "user":
+                continue
+            lid = lb.get("id")
+            if not lid:
+                continue
+            ids.append(lid)
+            id_to_name[str(lid)] = str(lb.get("name") or lid)
+        return frozenset(ids), id_to_name, True
+    except Exception as e:
+        logger.warning("list_gmail_user_label_ids: %s", e)
+        return frozenset(), {}, False
+
+
+def get_existing_user_label_id(service: Any, label_name: str) -> Optional[str]:
+    """
+    Devuelve el id de una etiqueta de usuario por nombre exacto si ya existe en Gmail.
+    No crea la etiqueta (para comprobar si un mensaje debe omitirse sin efectos colaterales).
+    """
+    try:
+        raw = _fetch_gmail_labels_list_raw(service)
+        if raw is None:
+            try:
+                resp = service.users().labels().list(userId="me").execute()
+                raw = list(resp.get("labels", []))
+                _gmail_labels_list_by_service_id[id(service)] = raw
+            except Exception as e2:
+                logger.warning(
+                    "get_existing_user_label_id recuperacion directa %s: %s",
+                    label_name,
+                    e2,
+                )
+                return None
+        for lb in raw:
+            if lb.get("name") == label_name:
+                return lb.get("id")
+    except Exception as e:
+        logger.warning("get_existing_user_label_id %s: %s", label_name, e)
+    return None
+
+
+def ensure_user_label_id(service: Any, label_name: str) -> Optional[str]:
+    """
+    Obtiene el id de una etiqueta de usuario por nombre exacto; la crea si no existe.
+    """
+    try:
+        existing = get_existing_user_label_id(service, label_name)
+        if existing:
+            return existing
+        created = service.users().labels().create(
+            userId="me",
+            body={
+                "name": label_name,
+                "labelListVisibility": "labelShow",
+                "messageListVisibility": "show",
+            },
+        ).execute()
+        invalidate_gmail_labels_list_cache(service)
+        return created.get("id")
+    except Exception as e:
+        logger.warning("ensure_user_label_id %s: %s", label_name, e)
+        return None
+
+
+def get_or_create_pagos_gmail_plantilla_label_ids(
+    service: Any, cache: Optional[Dict[str, Optional[str]]] = None
+) -> Tuple[
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+]:
+    """
+    Resuelve ids para MERCANTIL (A) / BNC (B) / BINANCE (C) / BNV (D) / BANCAMIGA (E) / TESORO (F) / RECIBO (G) con cache opcional por nombre.
+    """
+    c = cache if cache is not None else {}
+    k1, k2, k3, k4, k5, k6, k7 = (
+        PAGOS_GMAIL_LABEL_IMAGEN_1,
+        PAGOS_GMAIL_LABEL_IMAGEN_2,
+        PAGOS_GMAIL_LABEL_IMAGEN_3,
+        PAGOS_GMAIL_LABEL_IMAGEN_4,
+        PAGOS_GMAIL_LABEL_BANCAMIGA,
+        PAGOS_GMAIL_LABEL_TESORO,
+        PAGOS_GMAIL_LABEL_RECIBO,
+    )
+    if k1 not in c:
+        c[k1] = ensure_user_label_id(service, k1)
+    if k2 not in c:
+        c[k2] = ensure_user_label_id(service, k2)
+    if k3 not in c:
+        c[k3] = ensure_user_label_id(service, k3)
+    if k4 not in c:
+        c[k4] = ensure_user_label_id(service, k4)
+    if k5 not in c:
+        c[k5] = ensure_user_label_id(service, k5)
+    if k6 not in c:
+        c[k6] = ensure_user_label_id(service, k6)
+    if k7 not in c:
+        c[k7] = ensure_user_label_id(service, k7)
+    return c[k1], c[k2], c[k3], c[k4], c[k5], c[k6], c[k7]
+
+
+def add_message_star_and_user_labels(
+    service: Any, message_id: str, user_label_ids: List[str]
+) -> None:
+    """Anade STARRED y las etiquetas de usuario indicadas (ids Gmail)."""
+    add_ids = ["STARRED"] + [x for x in user_label_ids if x]
+    try:
+        service.users().messages().modify(
+            userId="me",
+            id=message_id,
+            body={"addLabelIds": add_ids},
+        ).execute()
+    except Exception as e:
+        logger.warning("add_message_star_and_user_labels %s: %s", message_id, e)
+
+
+def _message_label_ids_set(service: Any, message_id: str) -> Optional[Set[str]]:
+    """labelIds actuales del mensaje (minimal); None si falla la API."""
+    try:
+        meta = service.users().messages().get(
+            userId="me", id=message_id, format="minimal"
+        ).execute()
+        return set(meta.get("labelIds") or [])
+    except Exception as e:
+        logger.warning("_message_label_ids_set msg=%s: %s", message_id, e)
+        return None
+
+
+def add_message_user_labels_only(
+    service: Any, message_id: str, user_label_ids: List[str]
+) -> None:
+    """
+    Anade solo etiquetas de usuario (sin estrella). Ej. ERROR EMAIL.
+    Omite ids que el mensaje ya tiene (re-escaneos / varias pasadas no acumulan el mismo id).
+    """
+    add_ids = [x for x in user_label_ids if x]
+    if not add_ids:
+        return
+    try:
+        existing = _message_label_ids_set(service, message_id)
+        if existing is not None:
+            add_ids = [lid for lid in add_ids if lid not in existing]
+        if not add_ids:
+            return
+        service.users().messages().modify(
+            userId="me",
+            id=message_id,
+            body={"addLabelIds": add_ids},
+        ).execute()
+    except Exception as e:
+        logger.warning("add_message_user_labels_only %s: %s", message_id, e)
+
+
+def modify_message_labels_add_remove(
+    service: Any,
+    message_id: str,
+    *,
+    add_label_ids: Optional[List[str]] = None,
+    remove_label_ids: Optional[List[str]] = None,
+) -> None:
+    """
+    Una sola llamada messages.modify: quita y/o anade etiquetas por id.
+    Los ids en add solo se envian si aun no estan en el mensaje (misma razon que add_message_user_labels_only).
+    """
+    add_ids = [x for x in (add_label_ids or []) if x]
+    rem_ids = [x for x in (remove_label_ids or []) if x]
+    if add_ids:
+        existing = _message_label_ids_set(service, message_id)
+        if existing is not None:
+            add_ids = [lid for lid in add_ids if lid not in existing]
+    body: dict[str, Any] = {}
+    if add_ids:
+        body["addLabelIds"] = add_ids
+    if rem_ids:
+        body["removeLabelIds"] = rem_ids
+    if not body:
+        return
+    try:
+        service.users().messages().modify(
+            userId="me", id=message_id, body=body
+        ).execute()
+    except Exception as e:
+        logger.warning("modify_message_labels_add_remove %s: %s", message_id, e)
+
+
+def mark_as_read(service: Any, message_id: str) -> None:
+    """Marca el mensaje como leído en Gmail (quita UNREAD). No se volverá a leer ni a procesar; evita reprocesar desde cero."""
+    try:
+        service.users().messages().modify(userId="me", id=message_id, body={"removeLabelIds": ["UNREAD"]}).execute()
+    except Exception as e:
+        logger.warning("Error marcando mensaje %s como leído: %s", message_id, e)
+
+
+def mark_read_and_clear_star(service: Any, message_id: str) -> None:
+    """Quita UNREAD y STARRED (comprobante reconocido y procesado)."""
+    try:
+        service.users().messages().modify(
+            userId="me",
+            id=message_id,
+            body={"removeLabelIds": ["UNREAD", "STARRED"]},
+        ).execute()
+    except Exception as e:
+        logger.warning("Error mark_read_and_clear_star %s: %s", message_id, e)
+
+
+def mark_starred_and_unread(service: Any, message_id: str) -> None:
+    """Destaca el mensaje y lo deja como no leido (legacy; pipeline actual usa mark_starred_and_read / mark_unread_clear_star)."""
+    try:
+        service.users().messages().modify(
+            userId="me",
+            id=message_id,
+            body={"addLabelIds": ["STARRED", "UNREAD"]},
+        ).execute()
+    except Exception as e:
+        logger.warning("Error mark_starred_and_unread %s: %s", message_id, e)
+
+
+def mark_starred_and_read(service: Any, message_id: str) -> None:
+    """Estrella el mensaje y quita no leido: digitalizacion completa (A/B o C con fila en BD)."""
+    try:
+        service.users().messages().modify(
+            userId="me",
+            id=message_id,
+            body={"addLabelIds": ["STARRED"], "removeLabelIds": ["UNREAD"]},
+        ).execute()
+    except Exception as e:
+        logger.warning("Error mark_starred_and_read %s: %s", message_id, e)
+
+
+def mark_unread_clear_star(service: Any, message_id: str) -> None:
+    """Legacy: quita estrella y deja no leido. Preferir mark_message_unread (el pipeline no gestiona estrellas)."""
+    try:
+        service.users().messages().modify(
+            userId="me",
+            id=message_id,
+            body={"addLabelIds": ["UNREAD"], "removeLabelIds": ["STARRED"]},
+        ).execute()
+    except Exception as e:
+        logger.warning("Error mark_unread_clear_star %s: %s", message_id, e)
+
+
+def mark_message_unread(service: Any, message_id: str) -> None:
+    """Marca el hilo como no leido para revision; no modifica STARRED (estrellas las controla el usuario)."""
+    try:
+        service.users().messages().modify(
+            userId="me",
+            id=message_id,
+            body={"addLabelIds": ["UNREAD"]},
+        ).execute()
+    except Exception as e:
+        logger.warning("Error mark_message_unread %s: %s", message_id, e)
+
+
+# ===========================================================================
+# Modo "Lote IT Master": correo maestro con .eml adjuntos y cedula en asunto
+# ===========================================================================
+
+
+def _is_eml_part(part: dict) -> bool:
+    """True si la parte MIME representa un .eml (rfc822 declarado o filename .eml)."""
+    if not isinstance(part, dict):
+        return False
+    mime = (part.get("mimeType") or "").strip().lower()
+    if mime == "message/rfc822":
+        return True
+    fn = (part.get("filename") or "").strip().lower()
+    return fn.endswith(".eml")
+
+
+def _count_eml_attachments_in_payload(payload: Optional[dict]) -> int:
+    """Cuenta partes .eml/message/rfc822 (no desciende dentro del .eml para no doble-contar)."""
+    if not isinstance(payload, dict):
+        return 0
+    n = 0
+
+    def walk(parts):
+        nonlocal n
+        for p in parts or []:
+            if _is_eml_part(p):
+                n += 1
+                continue
+            walk(p.get("parts") or [])
+
+    walk(payload.get("parts") or [])
+    return n
+
+
+def extract_lote_it_master_cedula_from_subject(subject: Optional[str]) -> Optional[str]:
+    """
+    Devuelve la cedula formateada (V<digitos>) si el asunto es solo numerico (6-9 digitos),
+    o None si no encaja con el patron del lote.
+    """
+    if not subject:
+        return None
+    m = _PAGOS_GMAIL_LOTE_CEDULA_SUBJECT_RE.match(subject)
+    if not m:
+        return None
+    return f"V{m.group(1)}"
+
+
+def is_lote_it_master_message(
+    headers: Dict[str, str],
+    payload: Optional[dict],
+) -> Tuple[bool, Optional[str], int]:
+    """
+    Detecta si un mensaje Gmail es un 'lote IT Master':
+      - From == itmaster@rapicreditca.com, o To/Cc/Bcc contiene itmaster@rapicreditca.com
+        (la cuenta conectada suele ser el buzón receptor),
+      - Subject == solo digitos (6-9),
+      - Hay 1+ partes message/rfc822 o .eml en payload.
+    Devuelve (es_lote, cedula_formateada_V, n_eml_attachments).
+    """
+    try:
+        from_h = (
+            headers.get("from")
+            or headers.get("From")
+            or headers.get("FROM")
+            or ""
+        ).strip()
+    except AttributeError:
+        return False, None, 0
+    sender = (extract_sender_email(from_h) or "").strip().lower()
+    destinatarios_h = " ".join(
+        str(
+            headers.get(k)
+            or headers.get(k.title())
+            or headers.get(k.upper())
+            or ""
+        )
+        for k in ("to", "cc", "bcc", "delivered-to")
+    ).lower()
+    if (
+        sender != PAGOS_GMAIL_LOTE_REMITENTE_IT_MASTER
+        and PAGOS_GMAIL_LOTE_REMITENTE_IT_MASTER not in destinatarios_h
+    ):
+        return False, None, 0
+    subj = (
+        headers.get("subject")
+        or headers.get("Subject")
+        or headers.get("SUBJECT")
+        or ""
+    )
+    cedula = extract_lote_it_master_cedula_from_subject(subj)
+    if not cedula:
+        return False, None, 0
+    n_eml = _count_eml_attachments_in_payload(payload)
+    if n_eml < 1:
+        return False, None, 0
+    return True, cedula, n_eml
+
+
+def get_eml_attachments_for_message(
+    service: Any, message_id: str, payload: Optional[dict]
+) -> List[Tuple[str, bytes]]:
+    """
+    Descarga los adjuntos .eml/message/rfc822 del mensaje. Devuelve [(filename, raw_bytes), ...].
+    No desciende dentro de los .eml (cada .eml se procesa entero por separado).
+    """
+    out: List[Tuple[str, bytes]] = []
+    if not isinstance(payload, dict):
+        return out
+
+    def walk(parts):
+        for p in parts or []:
+            if _is_eml_part(p):
+                fn = (p.get("filename") or "").strip()
+                body = p.get("body") or {}
+                att_id = body.get("attachmentId")
+                inline_data = body.get("data")
+                use_fn = fn or f"adjunto_{message_id[:10]}_{abs(hash(att_id or inline_data or '')) % 10**8}.eml"
+                if att_id:
+                    try:
+                        att = (
+                            service.users()
+                            .messages()
+                            .attachments()
+                            .get(userId="me", messageId=message_id, id=att_id)
+                            .execute()
+                        )
+                        data = att.get("data")
+                        if data:
+                            out.append((use_fn, base64.urlsafe_b64decode(data)))
+                    except Exception as e:
+                        logger.warning(
+                            "[PAGOS_GMAIL] Error descargando .eml %s (msg=%s): %s",
+                            use_fn, message_id, e,
+                        )
+                elif inline_data:
+                    try:
+                        out.append((use_fn, base64.urlsafe_b64decode(inline_data)))
+                    except Exception as e:
+                        logger.warning(
+                            "[PAGOS_GMAIL] Error decodificando .eml inline %s (msg=%s): %s",
+                            use_fn, message_id, e,
+                        )
+                continue
+            walk(p.get("parts") or [])
+
+    walk(payload.get("parts") or [])
+    return out
+
+
+def parse_eml_bytes(eml_bytes: bytes) -> Tuple[Dict[str, str], List[Tuple[str, bytes, str]]]:
+    """
+    Parsea un .eml y devuelve:
+      - headers: dict normalizado en minusculas con (from, to, subject, date, message-id).
+      - attachments: [(filename, raw_bytes, mime_type), ...] con SOLO partes imagen/PDF.
+
+    Reglas de extraccion alineadas con el pipeline:
+      - mimeType en MIME_IMAGE_OR_PDF (incluye image/* y application/pdf).
+      - filename con extension permitida (is_allowed_attachment).
+      - Si no hay filename, se sintetiza uno estable con hash del contenido y ext_for_mime.
+      - Se ignoran partes multipart (recorrido walk salta contenedores).
+    """
+    from email import policy
+    from email.parser import BytesParser
+
+    headers_out: Dict[str, str] = {}
+    attachments_out: List[Tuple[str, bytes, str]] = []
+
+    if not eml_bytes:
+        return headers_out, attachments_out
+
+    try:
+        msg = BytesParser(policy=policy.default).parsebytes(eml_bytes)
+    except Exception as e:
+        logger.warning("[PAGOS_GMAIL] parse_eml_bytes: parse falló (%d bytes): %s", len(eml_bytes), e)
+        return headers_out, attachments_out
+
+    for k in ("From", "To", "Cc", "Subject", "Date", "Message-ID", "Reply-To"):
+        try:
+            v = msg.get(k)
+            if v is not None:
+                headers_out[k.lower()] = str(v).strip()
+        except Exception:
+            continue
+
+    for part in msg.walk():
+        try:
+            if part.is_multipart():
+                continue
+            mime = (part.get_content_type() or "").strip().lower()
+            fn = part.get_filename() or ""
+            if not is_vision_attachment_candidate(mime, fn) and not is_raster_image_mime(mime):
+                continue
+            try:
+                data = part.get_payload(decode=True)
+            except Exception:
+                data = None
+            if not data:
+                continue
+            data_bytes = bytes(data)
+            if len(data_bytes) == 0:
+                continue
+            use_fn = fn.strip() if fn else ""
+            if not use_fn or not is_allowed_attachment(use_fn):
+                ext = ext_for_mime(mime) if mime else "bin"
+                hsh = hashlib.sha1(data_bytes).hexdigest()[:10]
+                use_fn = f"eml_inline_{hsh}.{ext}"
+            norm = normalizar_candidato_descargado(use_fn, data_bytes, mime)
+            if not norm:
+                continue
+            attachments_out.append(norm)
+        except Exception as e:
+            logger.warning("[PAGOS_GMAIL] parse_eml_bytes: error procesando part: %s", e)
+            continue
+
+    return headers_out, attachments_out

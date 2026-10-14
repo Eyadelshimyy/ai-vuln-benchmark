@@ -1,0 +1,819 @@
+"""Top three-segment toolbar: file actions · mode switcher · canvas actions."""
+from functools import partial
+
+from PyQt5 import sip
+from PyQt5.QtCore import QDateTime, QEvent, QSize, QTimer, Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QFont, QPainter, QPixmap
+from PyQt5.QtWidgets import (
+    QApplication, QButtonGroup, QFrame, QHBoxLayout, QLabel, QMenu,
+    QPushButton, QSizePolicy, QWidget,
+)
+
+from .. import app_meta
+from ..ui_kit.control_style import CONTROL_COLORS
+from ..ui_kit.icons import Icons
+from ..ui_kit.menus import apply_rounded_menu_chrome
+from ..ui_kit.popup_trigger import bind_popup_trigger
+from ..ui_kit.motion import POLICY_LIGHT, resolve_policy
+from ..ui_kit.widgets.selection_indicator import (
+    SelectionIndicator,
+    SelectionIndicatorStyle,
+)
+from .widgets.recent_open_popup import RecentOpenPopup
+
+_MODE_LABELS = {
+    "time": "时域",
+    "fft": "频谱",
+    "fft_time": "时频",
+    "order": "阶次",
+    "frf": "频响",
+}
+
+# Icon-only half of the save split. Keep this tighter than a labeled chip so
+# 保存 / 批处理 can share one secondary width without the caret dominating.
+_SAVE_CARET_WIDTH = 20
+
+# Suppress static checked fill while the shared plate owns that chrome.
+# Longhands only: a ``border:`` shorthand here would zero the 6px radius.
+_MOTION_PILL_HOST_QSS = """
+QFrame#modeSegment QPushButton[segment]:checked {
+    background-color: transparent;
+    border-color: transparent;
+}
+QFrame#modeSegment QPushButton[segment]:checked:hover {
+    background-color: transparent;
+    border-color: transparent;
+}
+QFrame#modeSegment QPushButton[segment]:checked:disabled,
+QFrame#modeSegment QPushButton[segment]:checked:disabled:hover,
+QFrame#modeSegment QPushButton[segment]:checked:disabled:pressed,
+QFrame#modeSegment QPushButton[segment]:checked:disabled:focus {
+    background-color: transparent;
+    border-color: transparent;
+}
+"""
+
+
+def _is_living(obj):
+    try:
+        return obj is not None and not sip.isdeleted(obj)
+    except RuntimeError:
+        return False
+
+
+def _make_sep(parent):
+    sep = QFrame(parent)
+    sep.setFrameShape(QFrame.VLine)
+    sep.setFixedWidth(1)
+    sep.setStyleSheet("background: #eef2f7; border: none;")
+    return sep
+
+
+def _make_mode_zone_divider(parent):
+    """Return one symmetrical boundary marker for the analysis-mode zone."""
+    divider = QFrame(parent)
+    divider.setObjectName("modeZoneDivider")
+    divider.setFixedSize(8, 16)
+    tick = QFrame(divider)
+    tick.setObjectName("modeZoneDividerTick")
+    tick.setFixedSize(3, 8)
+    tick.move(2, 4)
+    return divider
+
+
+class _LogoLabel(QLabel):
+    """Brand logo that doubles as a hidden Cockpit entry.
+
+    Three rapid left-clicks emit :pyattr:`triple_clicked`. The gesture is
+    deliberately undiscoverable — the cursor and tooltip are unchanged, so
+    the logo looks and behaves exactly like a static brand mark.
+
+    Qt promotes the second press of a fast sequence into a
+    ``mouseDoubleClickEvent`` (not a second ``mousePressEvent``), so we count
+    both event kinds. A single-shot timer keyed to the platform double-click
+    interval resets the counter once the clicks stop, so only *consecutive*
+    clicks accumulate toward the gesture.
+    """
+
+    triple_clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._clicks = 0
+        self._reset_timer = QTimer(self)
+        self._reset_timer.setSingleShot(True)
+        self._reset_timer.timeout.connect(self._clear)
+
+    def _clear(self):
+        self._clicks = 0
+
+    def _register_click(self):
+        self._clicks += 1
+        if self._clicks >= 3:
+            self._clicks = 0
+            self._reset_timer.stop()
+            self.triple_clicked.emit()
+        else:
+            self._reset_timer.start(QApplication.doubleClickInterval())
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._register_click()
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._register_click()
+        super().mouseDoubleClickEvent(event)
+
+
+class Toolbar(QWidget):
+    # Left segment
+    open_requested = pyqtSignal()
+    recent_menu_about_to_show = pyqtSignal()
+    recent_open_requested = pyqtSignal(str)
+    recent_clear_requested = pyqtSignal()
+    save_project_requested = pyqtSignal()
+    save_project_as_requested = pyqtSignal()
+    close_project_requested = pyqtSignal()
+    batch_requested = pyqtSignal()
+    # Center segment
+    mode_changed = pyqtSignal(str)  # time | fft | fft_time | frf | order
+    # Right segment
+    acquisition_cockpit_requested = pyqtSignal()
+    # Panel toggle signals
+    nav_panel_toggled = pyqtSignal()
+    inspector_panel_toggled = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("surfaceTopBar")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
+        self.setFixedHeight(44)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(4, 2, 4, 2)
+        lay.setSpacing(4)
+
+        # ── panel toggle buttons ─────────────────────────────────────────────
+        self.btn_toggle_nav = QPushButton(self)
+        self.btn_toggle_nav.setIcon(Icons.panel_left())
+        self.btn_toggle_nav.setIconSize(QSize(16, 16))
+        self.btn_toggle_nav.setCheckable(True)
+        self.btn_toggle_nav.setProperty("role", "panel-toggle")
+        self.btn_toggle_nav.setToolTip("收起/展开左侧导航")
+        self.btn_toggle_nav.setFixedSize(28, 22)
+
+        self.btn_toggle_inspector = QPushButton(self)
+        self.btn_toggle_inspector.setIcon(Icons.panel_right())
+        self.btn_toggle_inspector.setIconSize(QSize(16, 16))
+        self.btn_toggle_inspector.setCheckable(True)
+        self.btn_toggle_inspector.setProperty("role", "panel-toggle")
+        self.btn_toggle_inspector.setToolTip("收起/展开右侧检查器")
+        self.btn_toggle_inspector.setFixedSize(28, 22)
+
+        # ── left group ──────────────────────────────────────────────────────
+        self._open_split = self._make_open_split()
+        self._save_split = self._make_save_split()
+        self.btn_batch = QPushButton("批处理", self)
+        self.btn_batch.setIcon(Icons.batch())
+        for button in (
+            self.btn_save_project, self.btn_save_caret, self.btn_batch,
+        ):
+            button.setProperty("role", "secondary")
+
+        # ── center mode segment ─────────────────────────────────────────────
+        self.btn_mode_time = QPushButton("时域", self)
+        self.btn_mode_time.setIcon(Icons.mode_time())
+        self.btn_mode_time.setToolTip("时域（Time Domain）")
+        self.btn_mode_fft = QPushButton("频谱", self)
+        self.btn_mode_fft.setIcon(Icons.mode_fft())
+        self.btn_mode_fft.setToolTip("频谱（FFT）")
+        self.btn_mode_fft_time = QPushButton("时频", self)
+        self.btn_mode_fft_time.setIcon(Icons.mode_fft_time())
+        self.btn_mode_fft_time.setToolTip("时频（FFT vs Time）")
+        self.btn_mode_frf = QPushButton("频响", self)
+        self.btn_mode_frf.setIcon(Icons.mode_frf())
+        self.btn_mode_frf.setToolTip("频响（FRF / 系统辨识）")
+        self.btn_mode_order = QPushButton("阶次", self)
+        self.btn_mode_order.setIcon(Icons.mode_order())
+        self.btn_mode_order.setToolTip("阶次（Order）")
+
+        for b in (self.btn_add, self.btn_save_project,
+                  self.btn_batch,
+                  self.btn_mode_time, self.btn_mode_fft, self.btn_mode_fft_time,
+                  self.btn_mode_frf, self.btn_mode_order):
+            b.setIconSize(QSize(16, 16))
+        self.btn_save_caret.setIconSize(QSize(12, 12))
+        self.btn_open_caret.setIconSize(QSize(12, 12))
+
+        # left layout
+        left = QHBoxLayout()
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(10)
+        for b in (
+            self._open_split,
+            self._save_split,
+            self.btn_batch,
+        ):
+            left.addWidget(b, 0, Qt.AlignVCenter)
+        self.lbl_project_session = QLabel("", self)
+        self.lbl_project_session.setObjectName("toolbarProjectSession")
+        self.lbl_project_session.setAttribute(Qt.WA_StyledBackground, True)
+        self.lbl_project_session.setMaximumWidth(152)
+        self.lbl_project_session.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        self.lbl_project_session.setAlignment(Qt.AlignCenter)
+        session_font = self.lbl_project_session.font()
+        session_font.setWeight(QFont.DemiBold)
+        self.lbl_project_session.setFont(session_font)
+        self.lbl_project_session.hide()
+        left.addWidget(self.lbl_project_session, 0, Qt.AlignVCenter)
+
+        # Wrap left in a QWidget so it has a concrete sizeHint that the
+        # stretch arithmetic can balance against.
+        left_widget = QWidget(self)
+        left_widget.setLayout(left)
+        left_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+        left_widget.setObjectName("toolbarLeftGroup")
+
+        # Center modes live in a self-contained zone.  Its equal inner layout
+        # gaps keep both boundary markers at the same perceived distance from
+        # the first/last mode button; the whole zone is then centered by the
+        # balanced outer side hosts below.
+        center = QHBoxLayout()
+        center.setContentsMargins(0, 0, 0, 0)
+        center.setSpacing(0)
+        segment_frame = QFrame(self)
+        segment_frame.setObjectName("modeSegment")
+        segment_frame.setLayout(center)
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+        self._mode_active_dots = {}
+        for key, b in self._mode_button_pairs():
+            b.setCheckable(True)
+            b.setProperty("segment", key)
+            self._mode_group.addButton(b)
+            center.addWidget(b, 0, Qt.AlignVCenter)
+            dot = QFrame(b)
+            dot.setObjectName("modeActiveDot")
+            dot.setFixedSize(6, 6)
+            dot.hide()
+            self._mode_active_dots[key] = dot
+
+        mode_zone = QFrame(self)
+        mode_zone.setObjectName("toolbarModeZone")
+        mode_zone.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+        mode_zone_layout = QHBoxLayout(mode_zone)
+        mode_zone_layout.setContentsMargins(6, 0, 6, 0)
+        mode_zone_layout.setSpacing(12)
+        left_mode_divider = _make_mode_zone_divider(mode_zone)
+        right_mode_divider = _make_mode_zone_divider(mode_zone)
+        mode_zone_layout.addWidget(left_mode_divider, 0, Qt.AlignVCenter)
+        mode_zone_layout.addWidget(segment_frame, 0, Qt.AlignVCenter)
+        mode_zone_layout.addWidget(right_mode_divider, 0, Qt.AlignVCenter)
+
+        # ── right layout ────────────────────────────────────────────────────
+        right = QHBoxLayout()
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(10)
+        right.addStretch(1)
+
+        self._logo_label = _LogoLabel(self)
+        self._logo_label.setToolTip("博世华域转向系统有限公司\n仅限公司内使用")
+        _logo_src = QPixmap(str(app_meta.asset_path("branding", "bosch_hasco_logo.png")))
+        if not _logo_src.isNull():
+            _app = QApplication.instance()
+            _dpr = _app.devicePixelRatio() if _app is not None else 1.0
+            _dpr = _dpr if _dpr and _dpr >= 1.0 else 1.0
+            _scaled = _logo_src.scaledToWidth(int(190 * _dpr), Qt.SmoothTransformation)
+            _scaled.setDevicePixelRatio(_dpr)
+            self._logo_label.setPixmap(_scaled)
+        right.addWidget(self._logo_label)
+
+        # A right widget of the same fixed width as left_widget keeps the
+        # segment_frame exactly centered while hosting right-aligned controls.
+        right_widget = QWidget(self)
+        right_widget.setLayout(right)
+        right_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+        right_widget.setObjectName("toolbarRightGroup")
+
+        lay.addWidget(self.btn_toggle_nav)
+        lay.addWidget(_make_sep(self))
+        lay.addWidget(left_widget)
+        lay.addStretch(1)
+        lay.addWidget(mode_zone)
+        lay.addStretch(1)
+        lay.addWidget(right_widget)
+        lay.addWidget(_make_sep(self))
+        lay.addWidget(self.btn_toggle_inspector)
+
+        self.btn_mode_time.setChecked(True)
+        self._current_mode = 'time'
+        self._mode_compact = False
+        self._left_action_chip_width = 0
+        self._motion_policy = resolve_policy(None)
+        self._indicator = None
+
+        # Keep mirror width in sync with left_widget after layout is settled.
+        self._left_widget = left_widget
+        self._right_widget = right_widget
+        self._left_layout = left
+        self._right_layout = right
+        self._mode_zone = mode_zone
+        self._mode_segment = segment_frame
+        self._mode_zone_dividers = (left_mode_divider, right_mode_divider)
+        self._pending_mirror_sync = False
+        self._project_session_projection = None
+        self._left_widget.installEventFilter(self)
+        self._right_widget.installEventFilter(self)
+        self._wire()
+        self._sync_mode_active_dots()
+        # QPushButton starts enabled. Apply the empty-session matrix here so
+        # 保存 is gray on first launch; waiting for a mode change or file
+        # activation leaves it lit until the user happens to switch modules.
+        self.set_enabled_for_mode(self._current_mode, has_file=False)
+        self.set_motion_policy(POLICY_LIGHT)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._equalize_left_action_widths()
+        self._sync_mirror()
+        self._apply_mode_compact()
+        self._sync_mode_active_dots()
+        self._snap_mode_indicator()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._equalize_left_action_widths()
+        self._sync_mirror()
+        self._apply_mode_compact()
+        self._sync_mode_active_dots()
+        self._snap_mode_indicator()
+
+    def eventFilter(self, watched, event):
+        if watched in (self._left_widget, self._right_widget) and event.type() in (
+            QEvent.ChildAdded,
+            QEvent.ChildRemoved,
+            QEvent.LayoutRequest,
+        ):
+            self._schedule_mirror_sync()
+        return super().eventFilter(watched, event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(QColor("#dbe2eb"))
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 8, 8)
+        painter.end()
+        super().paintEvent(event)
+
+    def _sync_mirror(self):
+        """Balance both side hosts so the analysis mode zone stays centered."""
+        w = max(
+            self._left_layout.sizeHint().width(),
+            self._right_layout.sizeHint().width(),
+            1,
+        )
+        # Fix both hosts to the same content-aware width.  Mirroring only the
+        # right side works while left content grows, but would shift the zone
+        # when a future top-level action is added on the right.
+        if self._left_widget.width() != w:
+            self._left_widget.setFixedWidth(w)
+        if self._right_widget.width() != w:
+            self._right_widget.setFixedWidth(w)
+
+    def _schedule_mirror_sync(self):
+        if self._pending_mirror_sync:
+            return
+        self._pending_mirror_sync = True
+        QTimer.singleShot(0, self._run_scheduled_mirror_sync)
+
+    def _run_scheduled_mirror_sync(self):
+        self._pending_mirror_sync = False
+        self._equalize_left_action_widths()
+        self._sync_mirror()
+        self._apply_mode_compact()
+        self._snap_mode_indicator()
+
+    def _mode_button_pairs(self):
+        return (
+            ("time", self.btn_mode_time),
+            ("fft", self.btn_mode_fft),
+            ("fft_time", self.btn_mode_fft_time),
+            ("order", self.btn_mode_order),
+            ("frf", self.btn_mode_frf),
+        )
+
+    def _labeled_mode_zone_width(self) -> int:
+        fm = self.fontMetrics()
+        buttons = 0
+        for key, _button in self._mode_button_pairs():
+            text_w = fm.horizontalAdvance(_MODE_LABELS[key])
+            buttons += max(60, 16 + 4 + text_w + 20) + 2
+        return 12 + 16 + 24 + 4 + buttons
+
+    def _mode_zone_budget(self) -> int:
+        left = max(self._left_widget.width(), self._left_widget.sizeHint().width(), 1)
+        nav = max(self.btn_toggle_nav.width(), 28)
+        insp = max(self.btn_toggle_inspector.width(), 28)
+        chrome = nav + insp + 2 + (left * 2) + 40
+        return max(0, self.width() - chrome)
+
+    def _apply_mode_compact(self) -> None:
+        need = self._mode_zone_budget() < self._labeled_mode_zone_width()
+        if need == self._mode_compact:
+            return
+        self._mode_compact = need
+        for key, button in self._mode_button_pairs():
+            button.setText("" if need else _MODE_LABELS[key])
+            button.setProperty("compact", "true" if need else "false")
+            style = button.style()
+            style.unpolish(button)
+            style.polish(button)
+        self._mode_segment.updateGeometry()
+        self._mode_zone.updateGeometry()
+        self._sync_mode_active_dots()
+        self._snap_mode_indicator()
+
+    def is_mode_compact(self) -> bool:
+        return bool(self._mode_compact)
+
+    def _sync_mode_active_dots(self):
+        for key, button in self._mode_button_pairs():
+            dot = self._mode_active_dots[key]
+            dot.move(max(0, button.width() - dot.width() - 5), 4)
+            dot.setVisible(button.isChecked())
+
+    def _secondary_file_chips(self):
+        return (self._save_split, self.btn_batch)
+
+    def _equalize_left_action_widths(self):
+        """Keep 保存 / 批处理 on one secondary width; leave 打开 to content.
+
+        Stretching the primary 打开 chip to 批处理's 3-character width left
+        empty blue padding around a 2-character label, so 打开 read as the
+        fattest of the three even when the outer boxes matched.
+        """
+        chips = self._secondary_file_chips()
+        if self._left_action_chip_width and all(
+            chip.minimumWidth() == self._left_action_chip_width for chip in chips
+        ):
+            return
+        for chip in chips:
+            chip.setMinimumWidth(0)
+        target = max(chip.sizeHint().width() for chip in chips)
+        self._left_action_chip_width = target
+        for chip in chips:
+            chip.setMinimumWidth(target)
+            chip.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+    def _make_open_split(self):
+        """One primary chip: 打开 runs now; the caret lists recent paths."""
+        host = QWidget(self)
+        host.setObjectName("toolbarOpenSplit")
+        host.setAttribute(Qt.WA_StyledBackground, True)
+        host.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        row = QHBoxLayout(host)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+
+        self.btn_add = QPushButton("打开", host)
+        self.btn_add.setObjectName("toolbarOpenMain")
+        self.btn_add.setIcon(Icons.add_file(QColor("#ffffff")))
+        # Opening data is the primary entry point; retain its filled cue while
+        # save/save-as/batch remain secondary file actions.
+        self.btn_add.setProperty("role", "primary")
+        self.btn_add.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        self.btn_add.setToolTip("打开数据文件或项目（.tlproj）")
+
+        self.btn_open_caret = QPushButton(host)
+        self.btn_open_caret.setObjectName("toolbarOpenCaret")
+        self.btn_open_caret.setIcon(Icons.chevron_down(QColor("#ffffff")))
+        self.btn_open_caret.setProperty("role", "primary")
+        self.btn_open_caret.setFixedWidth(_SAVE_CARET_WIDTH)
+        self.btn_open_caret.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.btn_open_caret.setToolTip("最近打开的项目和文件")
+        self.btn_open_caret.setAccessibleName("最近打开的项目和文件")
+        self.btn_open_caret.setProperty("expanded", "false")
+
+        self._recent_popup = RecentOpenPopup(self)
+        self._recent_popup.open_requested.connect(self._emit_recent_open)
+        self._recent_popup.clear_requested.connect(self._emit_recent_clear)
+        self._recent_popup.closed.connect(self._on_recent_popup_closed)
+        self._recent_popup_closed_msecs = 0
+        self.set_recent_entries(())
+
+        row.addWidget(self.btn_add, 1)
+        row.addWidget(self.btn_open_caret, 0)
+        return host
+
+    def _on_open_caret_clicked(self):
+        popup = self._recent_popup
+        if popup.isVisible():
+            popup.close()
+            return
+        if QDateTime.currentMSecsSinceEpoch() - self._recent_popup_closed_msecs < 250:
+            return
+        self.show_recent_popup()
+
+    def show_recent_popup(self):
+        popup = self._recent_popup
+        if popup.isVisible():
+            popup.focus_search(select_all=True)
+            return
+        self.recent_menu_about_to_show.emit()
+        popup.reset_for_show()
+        self._set_caret_expanded(True)
+        popup.show_at(self._open_split)
+
+    def _emit_recent_open(self, path):
+        self.recent_open_requested.emit(path)
+
+    def _emit_recent_clear(self):
+        self.recent_clear_requested.emit()
+
+    def _on_recent_popup_closed(self):
+        self._recent_popup_closed_msecs = QDateTime.currentMSecsSinceEpoch()
+        self._set_caret_expanded(False)
+
+    def _set_caret_expanded(self, expanded):
+        value = "true" if expanded else "false"
+        if self.btn_open_caret.property("expanded") == value:
+            return
+        self.btn_open_caret.setProperty("expanded", value)
+        style = self.btn_open_caret.style()
+        style.unpolish(self.btn_open_caret)
+        style.polish(self.btn_open_caret)
+        self.btn_open_caret.update()
+
+    def set_recent_entries(self, entries):
+        """Project a global-MRU snapshot into the recent-open popup."""
+        self._recent_popup.populate(tuple(entries or ()))
+
+    def _make_save_split(self):
+        """One secondary chip: 保存 runs now; the caret opens 另存为."""
+        host = QWidget(self)
+        host.setObjectName("toolbarSaveSplit")
+        host.setAttribute(Qt.WA_StyledBackground, True)
+        host.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        row = QHBoxLayout(host)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+
+        self.btn_save_project = QPushButton("保存", host)
+        self.btn_save_project.setObjectName("toolbarSaveMain")
+        self.btn_save_project.setIcon(Icons.save_disk())
+        self.btn_save_project.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        self.btn_save_project.setToolTip(
+            "保存到当前 .tlproj 项目（未保存过则提示选择路径）"
+        )
+
+        self.btn_save_caret = QPushButton(host)
+        self.btn_save_caret.setObjectName("toolbarSaveCaret")
+        self.btn_save_caret.setIcon(Icons.chevron_down(QColor("#1769E0")))
+        self.btn_save_caret.setFixedWidth(_SAVE_CARET_WIDTH)
+        self.btn_save_caret.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.btn_save_caret.setToolTip("项目操作")
+        self.btn_save_caret.setAccessibleName("项目操作")
+
+        self._save_menu = apply_rounded_menu_chrome(QMenu(host))
+        bind_popup_trigger(self._save_menu, self.btn_save_caret)
+        self.btn_save_project_as = self._save_menu.addAction("另存为…")
+        self.btn_save_project_as.setIcon(Icons.save_disk())
+        self.btn_save_project_as.setToolTip("将当前会话另存为新的 .tlproj 项目")
+        self._save_menu.addSeparator()
+        self.btn_close_project = self._save_menu.addAction("关闭项目…")
+        self.btn_close_project.setToolTip("结束当前会话并保持应用窗口打开")
+
+        row.addWidget(self.btn_save_project, 1)
+        row.addWidget(self.btn_save_caret, 0)
+        return host
+
+    def _open_save_menu(self):
+        host = self._save_split
+        self._save_menu.popup(host.mapToGlobal(host.rect().bottomLeft()))
+
+    def _emit_save_project_as(self, _checked=False):
+        self.save_project_as_requested.emit()
+
+    def _emit_close_project(self, _checked=False):
+        self.close_project_requested.emit()
+
+    def bind_command_actions(
+        self, open_action, save_action, save_as_action, recent_action=None,
+        close_action=None,
+    ):
+        """Route file chips through the window's command QActions.
+
+        Clicks still emit the existing ``*_requested`` signals so standalone
+        toolbar tests keep working. The window must not *also* connect those
+        signals to the same named slots — that would double-fire.
+        """
+        self.btn_add.clicked.connect(open_action.trigger)
+        self.btn_save_project.clicked.connect(save_action.trigger)
+        self.btn_save_project_as.triggered.connect(save_as_action.trigger)
+        if close_action is not None:
+            self.btn_close_project.triggered.connect(close_action.trigger)
+        if open_action.toolTip():
+            self.btn_add.setToolTip(open_action.toolTip())
+        if save_action.toolTip():
+            self.btn_save_project.setToolTip(save_action.toolTip())
+        if save_as_action.toolTip():
+            self.btn_save_project_as.setToolTip(save_as_action.toolTip())
+        self.btn_save_caret.setToolTip("项目操作")
+        self.btn_save_caret.setAccessibleName("项目操作")
+        if recent_action is not None and recent_action.toolTip():
+            self.btn_open_caret.setToolTip(recent_action.toolTip())
+            self.btn_open_caret.setAccessibleName(recent_action.toolTip())
+
+    def _wire(self):
+        self.btn_add.clicked.connect(self.open_requested)
+        self.btn_open_caret.clicked.connect(self._on_open_caret_clicked)
+        self.btn_save_project.clicked.connect(self.save_project_requested)
+        self.btn_save_caret.clicked.connect(self._open_save_menu)
+        self.btn_save_project_as.triggered.connect(self._emit_save_project_as)
+        self.btn_close_project.triggered.connect(self._emit_close_project)
+        self.btn_batch.clicked.connect(self.batch_requested)
+        # Hidden Cockpit entry: triple-click the brand logo (see _LogoLabel).
+        self._logo_label.triple_clicked.connect(self.acquisition_cockpit_requested)
+        for key, b in self._mode_button_pairs():
+            b.clicked.connect(partial(self._on_mode_button_clicked, key))
+        self.btn_toggle_nav.clicked.connect(self.nav_panel_toggled)
+        self.btn_toggle_inspector.clicked.connect(self.inspector_panel_toggled)
+
+    def _on_mode_button_clicked(self, mode, _checked=False):
+        self._apply_mode(mode, animate=True)
+
+    def _set_mode(self, mode):
+        self._apply_mode(mode, animate=False)
+
+    def _apply_mode(self, mode, *, animate):
+        mapping = dict(self._mode_button_pairs())
+        if mode not in mapping:
+            mode = "time"
+        if mode == self._current_mode:
+            return
+        self._current_mode = mode
+        mapping[mode].setChecked(True)
+        self._sync_mode_active_dots()
+        self._follow_indicator(animate=animate)
+        self.mode_changed.emit(mode)
+
+    def motion_policy(self):
+        return self._motion_policy
+
+    def set_motion_policy(self, policy):
+        """Apply an explicit per-instance policy and snap chrome to the mode."""
+        self._motion_policy = resolve_policy(policy)
+        self._apply_motion_chrome()
+        helper = self._indicator
+        if _is_living(helper):
+            helper.set_motion_policy(self._motion_policy)
+        if self._motion_policy.interpolates():
+            self._snap_indicator()
+        else:
+            self._teardown_visible_indicator()
+
+    @property
+    def _motion_driver(self):
+        helper = self._indicator
+        if not _is_living(helper):
+            return None
+        return helper.driver()
+
+    @property
+    def _selection_pill(self):
+        helper = self._indicator
+        if not _is_living(helper):
+            return None
+        plate = helper._plate
+        if not _is_living(plate):
+            return None
+        return plate
+
+    def _current_mode_button(self):
+        mapping = dict(self._mode_button_pairs())
+        return mapping.get(self._current_mode)
+
+    def _apply_motion_chrome(self):
+        host = self._mode_segment
+        if self._motion_policy.interpolates():
+            host.setStyleSheet(_MOTION_PILL_HOST_QSS)
+            return
+        host.setStyleSheet("")
+
+    def _ensure_indicator(self):
+        helper = self._indicator
+        if _is_living(helper):
+            return helper
+        buttons = tuple(button for _key, button in self._mode_button_pairs())
+        helper = SelectionIndicator(
+            self._mode_segment,
+            buttons=buttons,
+            duration_name="selection_navigation",
+            style=SelectionIndicatorStyle(
+                fill=CONTROL_COLORS["CONTROL_SURFACE_TOP"],
+                fill_bottom=CONTROL_COLORS["CONTROL_ACCENT_WASH"],
+                border=CONTROL_COLORS["CONTROL_ACCENT_HI"],
+                disabled_fill=CONTROL_COLORS["CONTROL_DISABLED_BG"],
+                disabled_border=CONTROL_COLORS["CONTROL_DISABLED_LINE"],
+                radius=6,
+                inset=(1, 0, 1, 0),
+            ),
+        )
+        self._indicator = helper
+        helper.set_motion_policy(self._motion_policy)
+        return helper
+
+    def _snap_indicator(self):
+        if not self._motion_policy.interpolates():
+            self._teardown_visible_indicator()
+            return
+        helper = self._ensure_indicator()
+        if helper is None:
+            return
+        helper.follow(self._current_mode_button(), animate=False)
+        helper.snap_to_selection()
+
+    def _follow_indicator(self, *, animate):
+        if not self._motion_policy.interpolates():
+            self._teardown_visible_indicator()
+            return
+        helper = self._ensure_indicator()
+        if helper is None:
+            return
+        helper.follow(self._current_mode_button(), animate=animate)
+        if not animate:
+            helper.snap_to_selection()
+
+    def _snap_mode_indicator(self):
+        helper = self._indicator
+        if not _is_living(helper) or not self._motion_policy.interpolates():
+            return
+        helper.snap_to_selection()
+
+    def _teardown_visible_indicator(self):
+        helper = self._indicator
+        if not _is_living(helper):
+            return
+        helper.set_motion_policy(self._motion_policy)
+
+    def set_enabled_for_mode(
+        self, mode, has_file, *, can_save=None, can_close=None,
+    ):
+        """Implements the §7.1 enabled-state matrix plus project-session capability."""
+        if can_save is None:
+            can_save = bool(has_file)
+        if can_close is None:
+            can_close = bool(has_file)
+        self._save_split.setEnabled(True)
+        self.btn_save_caret.setEnabled(bool(can_save or can_close))
+        self.btn_save_project.setEnabled(can_save)
+        self.btn_save_project_as.setEnabled(can_save)
+        self.btn_close_project.setEnabled(can_close)
+        self.btn_batch.setEnabled(True)
+
+    def set_project_session_chrome(
+        self, *, display_name, tooltip, dirty, can_save, can_close,
+        bound=False,
+    ):
+        """Project owner projection: name chip, tooltips, and action enablement."""
+        projection = (
+            display_name, tooltip, bool(dirty), bool(can_save),
+            bool(can_close), bool(bound),
+        )
+        if self._project_session_projection == projection:
+            return
+        self._project_session_projection = projection
+        if bound:
+            name = (display_name or "").strip() or "项目"
+            mark = "*" if dirty else ""
+            full = f"{name}{mark}"
+            metrics = self.lbl_project_session.fontMetrics()
+            elided = metrics.elidedText(full, Qt.ElideMiddle, 136)
+            self.lbl_project_session.setText(elided)
+            self.lbl_project_session.setToolTip(tooltip or name)
+            self.lbl_project_session.show()
+        else:
+            self.lbl_project_session.clear()
+            self.lbl_project_session.setToolTip("")
+            self.lbl_project_session.hide()
+        self.set_enabled_for_mode(
+            self._current_mode, has_file=can_save,
+            can_save=can_save, can_close=can_close,
+        )
+        self._schedule_mirror_sync()
+
+    def current_mode(self):
+        return self._current_mode
+
+    def set_nav_open(self, open: bool):
+        """Sync the nav toggle button checked state (checked = panel hidden)."""
+        self.btn_toggle_nav.setChecked(not open)
+
+    def set_inspector_open(self, open: bool):
+        """Sync the inspector toggle button checked state (checked = panel hidden)."""
+        self.btn_toggle_inspector.setChecked(not open)

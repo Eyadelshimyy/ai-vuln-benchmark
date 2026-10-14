@@ -1,0 +1,196 @@
+"""The refresh loop tries ranked clusters until MAX_ISSUES publish.
+
+Driven through the real _run_refresh with the network, the model and the
+embedding model stubbed out, because the behaviour under test is the
+loop's own control flow: a top cluster that yields no claim must fall
+through to the next one rather than end the run (the Action Center
+published nothing on 2026-09-26 when both of its only two candidates
+failed), and the run must still stop at MAX_ISSUES.
+"""
+
+import json
+
+import numpy as np
+import pytest
+
+from app.models import ActionIssue, ApiCache
+from app.pipeline.analyze import action_center
+from app.pipeline.analyze.claims import Claim
+from app.pipeline.fetch.news_feeds import NewsArticle
+
+
+def _article(cluster: int, i: int) -> NewsArticle:
+    return NewsArticle(
+        title=f"Story {cluster} headline {i}",
+        url=f"https://example.com/{cluster}/{i}",
+        source_name=f"Outlet {i}",
+        summary=f"Summary {cluster}-{i}",
+    )
+
+
+CLUSTERS = [[_article(c, i) for i in range(3)] for c in range(1, 7)]
+# Clusters 1, 2 and 4 yield no attributable claim; 3, 5 and 6 do.
+WITH_CLAIMS = {3, 5, 6}
+
+
+def _c(text: str) -> Claim:
+    return Claim(text=text, source_name="Outlet 0", source_url=f"https://example.com/{text.replace(' ', '-')}")
+
+
+def _cluster_number(cluster) -> int:
+    return int(cluster[0].title.split()[1])
+
+
+@pytest.fixture()
+def refresh(monkeypatch):
+    ac = action_center
+    for name in (
+        "check_roll_call_signals", "check_federal_register_signals", "expire_stale_developing_issues",
+        "retire_covered_developing_issues",
+        "_run_periodic_bluesky_posts", "generate_period_summaries",
+        "_update_national_monitors", "_save_timeline_entry",
+        "_prune_stale_api_cache", "_build_full_story", "_cleanup_old_unposted_issues",
+        "_record_generation_sample", "_log_summary_source_consistency", "log_intensifier_usage",
+    ):
+        monkeypatch.setattr(ac, name, lambda *a, **k: None)
+    # Imported inside the function, so stubbed where they live.
+    from app.pipeline.analyze import bluesky_engagement, bluesky_poster
+    monkeypatch.setattr(bluesky_poster, "process_issues_for_bluesky", lambda *a, **k: 0)
+    monkeypatch.setattr(bluesky_engagement, "engage_with_news_posts", lambda *a, **k: None)
+    articles = [a for c in CLUSTERS for a in c]
+    monkeypatch.setattr(ac, "fetch_news_articles", lambda: articles)
+    monkeypatch.setattr(ac, "_filter_policy_relevant", lambda arts: [(a, None) for a in arts])
+    monkeypatch.setattr(ac, "fetch_trending_topics", lambda: [])
+    monkeypatch.setattr(ac, "_cluster_articles", lambda arts: CLUSTERS)
+    monkeypatch.setattr(ac, "_rank_clusters", lambda cl, tr, db: (cl, [1.0 - i / 10 for i in range(len(cl))]))
+    pool = {}
+
+    def dedupe(ranked, scores, n, published):
+        pool["n"] = n
+        return iter(list(enumerate(ranked))[:n])
+
+    monkeypatch.setattr(ac, "_deduplicate_top_clusters", dedupe)
+    rng = np.random.default_rng(7)
+    monkeypatch.setattr(ac, "_embed_texts", lambda texts: rng.normal(size=(len(texts), 8)))
+    # One orthogonal vector per distinct title, so no two issues read as
+    # duplicates of each other (hash() is randomised per process).
+    title_ids: dict[str, int] = {}
+    monkeypatch.setattr(ac, "_embed_texts_sim", lambda texts: [
+        np.eye(64)[title_ids.setdefault(t, len(title_ids))] for t in texts
+    ])
+    monkeypatch.setattr(ac, "_resolve_url", lambda u: u)
+
+    def extract(cluster, locate):
+        return [_c("claim a"), _c("claim b")] if _cluster_number(cluster) in WITH_CLAIMS else []
+
+    monkeypatch.setattr(ac.claim_layer, "extract_claims", extract)
+    monkeypatch.setattr(ac.claim_layer, "extract_body_claims", lambda cluster, locate: [])
+    monkeypatch.setattr(ac.claim_layer, "dedupe_claims", lambda claims: list(dict.fromkeys(claims)))
+    monkeypatch.setattr(ac.claim_layer, "on_topic", lambda claims, cluster: claims)
+    monkeypatch.setattr(ac.claim_layer, "build_lede", lambda claims: "A lede.")
+    monkeypatch.setattr(ac.claim_layer, "build_facts", lambda claims: (["A fact."], ["Outlet 0"], ["https://example.com/a-fact"]))
+    monkeypatch.setattr(ac, "grounding_violations", lambda text, source: [])
+    monkeypatch.setattr(ac, "hedge_and_editorializing_violations", lambda text: [])
+    monkeypatch.setattr(ac, "_classify_issue_policy_areas", lambda t, s: [])
+    monkeypatch.setattr(ac, "_resolve_bills", lambda texts, titles=None, bill_titles=None: [{"id": "hr1-119", "title": "A bill"}])
+    monkeypatch.setattr(ac, "_find_related_explore_docs", lambda *a: [])
+    monkeypatch.setattr(ac, "_find_related_senators", lambda *a: [])
+    monkeypatch.setattr(ac, "_find_related_officials", lambda *a: [])
+    monkeypatch.setattr(ac, "_build_actions_from_data", lambda *a, **k: [])
+    monkeypatch.setattr(ac, "route_committees", lambda *a: [])
+    monkeypatch.setattr(ac, "_open_comment_docs", lambda *a: [])
+    monkeypatch.setattr(ac, "_principal_actor", lambda *a: "class:us_gov")
+    monkeypatch.setattr(ac, "label_principal_actors", lambda db: 0)
+    monkeypatch.setattr(ac, "_find_matching_issue", lambda *a, **k: None)
+    return pool
+
+
+def test_a_failed_top_cluster_falls_through_and_the_run_stops_at_max_issues(db_session, refresh):
+    created = action_center._run_refresh(db_session)
+
+    assert refresh["n"] == action_center.CANDIDATE_POOL > action_center.MAX_ISSUES
+    assert created == action_center.MAX_ISSUES
+    issues = db_session.query(ActionIssue).order_by(ActionIssue.rank).all()
+    # Clusters 1 and 2 had no claim; 3 and 5 publish, into slots 1 and 2.
+    assert [(i.rank, _cluster_number([i])) for i in issues] == [(1, 3), (2, 5)]
+    # Cluster 6 was never tried: both slots were filled after five attempts.
+    row = (
+        db_session.query(ApiCache)
+        .filter(ApiCache.tier == "action-metrics")
+        .order_by(ApiCache.cached_at.desc())
+        .first()
+    )
+    assert json.loads(row.data_json)["counts"]["clusters_attempted"] == 5
+
+
+def test_each_published_issue_gets_its_story_in_the_same_run(db_session, refresh, monkeypatch):
+    """The story is built where the cluster's articles still exist: a
+    later stage has only the stored row, which holds no article text."""
+    built = []
+
+    def story(filtered, claims, summary, facts, source, locate):
+        built.append(_cluster_number(filtered))
+        return f"## Outlet\n\nStory for {_cluster_number(filtered)}."
+
+    monkeypatch.setattr(action_center, "_build_full_story", story)
+    action_center._run_refresh(db_session)
+    issues = db_session.query(ActionIssue).order_by(ActionIssue.rank).all()
+    assert built == [3, 5]
+    assert [i.full_story for i in issues] == ["## Outlet\n\nStory for 3.", "## Outlet\n\nStory for 5."]
+
+
+def test_a_summary_claim_counts_toward_the_two_claim_gate(db_session, refresh, monkeypatch):
+    """With one claim per article a one- or two-article story could rarely
+    reach the two claims an issue needs (2026-10-01: 78 of 300 clusters in
+    three days skipped as too few facts). The summary's claim counts too,
+    after the headline's, so the headline still leads."""
+    ledes = []
+
+    def headline(cluster, locate):
+        return [_c("headline claim")] if _cluster_number(cluster) in WITH_CLAIMS else []
+
+    def body(cluster, locate):
+        # extract_body_claims re-yields the headline's claim too.
+        return headline(cluster, locate) + [_c("summary claim")]
+
+    def lede(claims):
+        ledes.append([c.text for c in claims])
+        return "A lede."
+
+    monkeypatch.setattr(action_center.claim_layer, "extract_claims", headline)
+    monkeypatch.setattr(action_center.claim_layer, "extract_body_claims", body)
+    monkeypatch.setattr(action_center.claim_layer, "build_lede", lede)
+    assert action_center._run_refresh(db_session) == action_center.MAX_ISSUES
+    assert ["headline claim", "summary claim"] in ledes
+    # A cluster whose only claim came from a summary still falls short.
+    issues = db_session.query(ActionIssue).order_by(ActionIssue.rank).all()
+    assert [_cluster_number([i]) for i in issues] == [3, 5]
+
+
+def test_a_summary_claim_that_restates_a_headline_claim_is_one_fact(db_session, refresh, monkeypatch):
+    """dedupe_claims keeps the longer of two nested claims. The headline's
+    shorter one must go with it, or one fact counts twice at the gate."""
+    monkeypatch.setattr(action_center.claim_layer, "extract_claims", lambda cluster, locate: [_c("X sues Y")])
+    monkeypatch.setattr(action_center.claim_layer, "extract_body_claims", lambda cluster, locate: [_c("X sues Y for Z")])
+    monkeypatch.setattr(
+        action_center.claim_layer, "dedupe_claims",
+        lambda claims: [c for c in claims if not any(c != o and c.text in o.text for o in claims)],
+    )
+    assert action_center._run_refresh(db_session) == 0
+
+
+def test_an_issue_names_and_links_the_outlet_of_every_line_it_quotes(db_session, refresh):
+    """The summary is a quoted claim like the facts: it carries its outlet
+    and article, and each fact links the article it was quoted from
+    (2026-10-01: the outlet behind the summary was named only in the
+    source list, so "In the coverage" seemed to be missing an outlet)."""
+    action_center._run_refresh(db_session)
+    issue = db_session.query(ActionIssue).order_by(ActionIssue.rank).first()
+    assert issue.summary_source == "Outlet 0"
+    assert issue.summary_source_url == "https://example.com/claim-a"
+    assert json.loads(issue.fact_source_urls) == ["https://example.com/a-fact"]
+
+
+def test_each_published_issue_records_its_principal_actor(db_session, refresh):
+    action_center._run_refresh(db_session)
+    assert {i.principal_actor for i in db_session.query(ActionIssue).all()} == {"class:us_gov"}

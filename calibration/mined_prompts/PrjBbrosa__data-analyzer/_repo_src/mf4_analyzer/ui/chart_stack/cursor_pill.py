@@ -1,0 +1,2069 @@
+"""CursorPill, _QualityStatusIndicator, and the readout-formatting helpers.
+
+The formatting half of this module is pure text processing: it turns the
+separator-joined HTML the canvases emit on ``cursor_info`` into the pill's
+primary line and its full and mini detail tables. It knows nothing about Qt,
+so it is unit-testable on its own. The result panel itself never attaches a
+hover tooltip on the table; the visible face, the P button, and the
+数值 / 完整 control are the only readouts.
+"""
+import logging
+import re
+from html import escape, unescape
+from math import ceil
+
+from PyQt5.QtCore import QEvent, QRect, QSize, QTimer, Qt, pyqtSignal
+from PyQt5.QtGui import (
+    QColor, QFont, QFontMetrics, QPainter, QPen, QTextCursor, QTextDocument, QTextOption,
+)
+from PyQt5 import sip
+from PyQt5.QtWidgets import (
+    QButtonGroup, QFrame, QHBoxLayout, QLabel, QPushButton, QSizePolicy,
+    QWIDGETSIZE_MAX, QVBoxLayout,
+)
+
+from PyQt5.QtCore import QRectF, QSizeF
+
+from ._helpers import _format_mini_html
+from .cursor_table_layout import choose_table_layout, compute_wcap
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_CURSOR_PILL_RADIUS = 9.0
+_CURSOR_PILL_BG = QColor(255, 255, 255, 235)
+_PINNED_CURSOR_PILL_BG = QColor(255, 255, 255)
+_CURSOR_PILL_BORDER = QColor("#d8e0eb")
+
+# Gap kept between packed title actions and the pill edge.
+_TOGGLE_EDGE_GAP = 4
+_ACTION_BTN = 16
+_CURSOR_PILL_HIGHLIGHT = QColor("#6591df")
+_MODE_OPTION_LABELS = {"mini": "数值", "full": "完整"}
+_MODE_CONTROL_QSS = """
+QFrame#cursorPillModeControl {
+    background-color: #edf1f6;
+    border-width: 0px;
+    border-style: solid;
+    border-color: transparent;
+    border-radius: 4px;
+}
+QPushButton#cursorPillModeOption {
+    background-color: transparent;
+    border-width: 1px;
+    border-style: solid;
+    border-color: transparent;
+    border-radius: 3px;
+    color: #56657A;
+    font-size: 10px;
+    font-weight: 600;
+    padding-top: 1px;
+    padding-bottom: 1px;
+    padding-left: 6px;
+    padding-right: 6px;
+    min-height: 16px;
+}
+QPushButton#cursorPillModeOption:hover:!checked {
+    background-color: rgba(255, 255, 255, 0.55);
+}
+QPushButton#cursorPillModeOption:checked {
+    background-color: #ffffff;
+    border-width: 1px;
+    border-style: solid;
+    border-color: #c3cfdd;
+    color: #175598;
+}
+QPushButton#cursorPillModeOption:focus {
+    border-width: 1px;
+    border-style: solid;
+    border-color: #2167C7;
+}
+QPushButton#cursorPillModeOption:checked:focus {
+    border-width: 1px;
+    border-style: solid;
+    border-color: #2167C7;
+    background-color: #ffffff;
+}
+"""
+_PIN_CHROME_QSS = """
+QPushButton#cursorPillPin, QPushButton#cursorPillClose {
+    background: rgba(100, 116, 139, 0.15);
+    border-width: 1px;
+    border-style: solid;
+    border-color: rgba(100, 116, 139, 0.3);
+    border-radius: 3px;
+    color: #475569;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 0px;
+    min-width: 16px;
+    min-height: 16px;
+    max-width: 16px;
+    max-height: 16px;
+}
+QPushButton#cursorPillPin[pinned="false"]:hover,
+QPushButton#cursorPillClose:hover {
+    background: rgba(100, 116, 139, 0.25);
+}
+QPushButton#cursorPillPin[pinned="false"]:pressed,
+QPushButton#cursorPillClose:pressed {
+    background: rgba(100, 116, 139, 0.40);
+}
+QPushButton#cursorPillPin[pinned="true"] {
+    background: #427de4;
+    border-color: #427de4;
+    color: #ffffff;
+}
+QPushButton#cursorPillPin[pinned="true"]:hover {
+    background: #3b73d4;
+    border-color: #3b73d4;
+}
+"""
+
+_PIN_CHROME_INVALIDATE_EVENTS = frozenset(
+    event_type
+    for event_type in (
+        QEvent.StyleChange,
+        QEvent.FontChange,
+        QEvent.PaletteChange,
+        getattr(QEvent, "DevicePixelRatioChange", None),
+    )
+    if event_type is not None
+)
+
+_CURSOR_HTML_SEP = '<span style="color:#cbd5e1;">  &nbsp;│&nbsp;  </span>'
+
+_COLOR_RE = re.compile(r'color:\s*([^;"\']+)')
+_BOLD_VALUE_RE = re.compile(r'<b[^>]*>(.*?)</b>', re.S)
+_TAG_RE = re.compile(r'<[^>]+>')
+
+# Colours the canvas uses for chrome rather than for a channel — the dimmed
+# "[file]" prefix. Skipped when picking the colour that represents a channel.
+_CURSOR_PREFIX_COLORS = {"#64748b"}
+
+_MINI_VALUE_FONT = "font-family:'SF Mono',Menlo,Consolas,monospace;"
+
+# Shown when even a single primary fragment cannot fit the budget (R6).
+_OUT_OF_SPACE_TEXT = "空间不足"
+
+# Horizontal margins of the pill frame around the content labels (top, right,
+# bottom, left in the current layout order 10,7,10,8).
+_PILL_LEFT_MARGIN = 10
+_PILL_RIGHT_MARGIN = 10
+_PILL_TOP_MARGIN = 7
+_PILL_BOTTOM_MARGIN = 8
+# Trailing clearance between the numeric grid and frame; the shared paint
+# document itself has zero margin so geometry does not depend on Qt defaults.
+_TABLE_EDGE_CLEARANCE = 6.0
+
+logger = logging.getLogger(__name__)
+
+
+def _frequency_cursor_label(label):
+    """Keep the compact frequency table channel-first in mini mode."""
+    text = str(label or '').strip()
+    if text.startswith('[') and ']' in text:
+        text = text.split(']', 1)[-1].strip()
+    if ' · ' in text:
+        text = text.rsplit(' · ', 1)[-1].strip()
+    return text or '曲线'
+
+
+def _format_frequency_dual_html(rows):
+    """Full FFT A/B readout: one compact table block per spectrum curve."""
+    parts = ['<table cellspacing="0" cellpadding="0" '
+             'style="font-size:11px; color:#111827;">']
+    for index, row in enumerate(rows):
+        label, a_value, b_value, delta, unit, color = row[:6]
+        top_pad = '7px' if index else '0'
+        name = escape(str(label or '曲线'))
+        unit_html = escape(str(unit or ''))
+        cell = (f'padding:1px 8px 1px 0; color:{color}; font-family:'
+                "'SF Mono',Menlo,Consolas,monospace;")
+        label_cell = 'padding:1px 4px 1px 0; color:#94a3b8;'
+        parts.append(
+            f'<tr><td colspan="6" style="padding-top:{top_pad}; '
+            f'padding-bottom:2px;"><b style="color:{color};">{name}</b></td></tr>'
+            '<tr>'
+            f'<td style="{label_cell}">A</td>'
+            f'<td style="{cell}" align="right">{a_value:.4g}{unit_html}</td>'
+            f'<td style="{label_cell}; padding-left:8px;">B</td>'
+            f'<td style="{cell}" align="right">{b_value:.4g}{unit_html}</td>'
+            f'<td style="{label_cell}; padding-left:8px;">△</td>'
+            f'<td style="{cell} font-weight:700;" align="right">'
+            f'{delta:+.4g}{unit_html}</td>'
+            '</tr>'
+        )
+    parts.append('</table>')
+    return ''.join(parts)
+
+
+def _format_frequency_mini_html(rows):
+    """Collapsed FFT A/B readout: channel identity plus the useful delta."""
+    parts = ['<table cellspacing="0" cellpadding="0" style="font-size:11px;">']
+    for index, row in enumerate(rows):
+        label, _a_value, _b_value, delta, unit, color = row[:6]
+        top_pad = '5px' if index else '0'
+        name = escape(_frequency_cursor_label(label))
+        unit_html = escape(str(unit or ''))
+        parts.append(
+            '<tr>'
+            f'<td style="padding-top:{top_pad};"><span style="color:{color};">●</span></td>'
+            f'<td style="padding-left:4px; color:{color}; font-weight:600; '
+            f'padding-top:{top_pad};">{name}</td>'
+            f'<td style="padding-left:8px; color:{color}; {_MINI_VALUE_FONT} '
+            f'font-weight:700; padding-top:{top_pad};">△&nbsp;{delta:+.4g}{unit_html}</td>'
+            '</tr>'
+        )
+    parts.append('</table>')
+    return ''.join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Readout formatting (pure text — no Qt)
+# ---------------------------------------------------------------------------
+
+def strip_html(value):
+    """Return ``value`` with tags removed and entities resolved."""
+    return unescape(_TAG_RE.sub('', value or ''))
+
+
+def single_cursor_channel_color(part):
+    """Pick the colour that stands for the channel in one readout segment.
+
+    A segment is typically ``[file]`` in the dimmed prefix colour followed by
+    ``name=<b>value</b>`` in the channel's own colour, so the last colour before
+    the bold value wins and prefix colours are skipped.
+    """
+    colors = [m.group(1).strip() for m in _COLOR_RE.finditer(part or '')]
+    if not colors:
+        return '#111827'
+    value_match = _BOLD_VALUE_RE.search(part or '')
+    if value_match:
+        before_value = part[:value_match.start()]
+        value_colors = [
+            m.group(1).strip()
+            for m in _COLOR_RE.finditer(before_value)
+        ]
+        for color in reversed(value_colors):
+            if color.lower() not in _CURSOR_PREFIX_COLORS:
+                return color
+    for color in reversed(colors):
+        if color.lower() not in _CURSOR_PREFIX_COLORS:
+            return color
+    return colors[-1]
+
+
+def mini_single_cursor_part(part, top_pad):
+    """Render one readout segment as a mini-mode table row: a coloured dot plus
+    the bare value, with the channel name dropped."""
+    color = single_cursor_channel_color(part)
+    value_match = _BOLD_VALUE_RE.search(part or '')
+    if value_match:
+        value = strip_html(value_match.group(1)).strip()
+    else:
+        plain = strip_html(part).strip()
+        value = plain.split('=', 1)[-1].strip() if '=' in plain else plain
+    value = value or '—'
+    mono = _MINI_VALUE_FONT
+    value_html = escape(value)
+    return (
+        '<tr>'
+        f'<td style="padding-top:{top_pad}; padding-right:5px; '
+        'line-height:1.15;">'
+        f'<span style="color:{color};">●</span></td>'
+        f'<td style="padding-top:{top_pad}; color:{color}; '
+        f'line-height:1.15; {mono} font-weight:650;">{value_html}</td>'
+        '</tr>'
+    )
+
+
+def plain_single_cursor_tooltip_line(part):
+    """Flatten one readout segment to ``name=value`` plain text.
+
+    Kept as a formatter helper for snapshot/compat callers. The result panel
+    does not attach this string as a hover tooltip.
+    """
+    plain = strip_html(part).replace('\xa0', ' ').strip()
+    plain = re.sub(r'\s+', ' ', plain)
+    if not plain:
+        return ''
+    if '=' not in plain:
+        return re.sub(r'^\[[^\]]+\]\s*', '', plain).strip()
+    name, value = plain.split('=', 1)
+    name = re.sub(r'^\[[^\]]+\]\s*', '', name).strip()
+    value = value.strip()
+    return f'{name}={value}' if name else value
+
+
+def format_single_cursor_variants(text):
+    """Split a single-cursor readout into ``(primary, full, mini, tooltip)``.
+
+    The first separator-delimited segment is the time readout and stays on the
+    pill's primary line; the rest become one detail row each, rendered twice —
+    full (name and value) and mini (value only). The fourth return value is a
+    plain-text identity dump kept for snapshot/compat callers; the pill does
+    not show it as a hover tooltip. Text with no separator has no per-channel
+    detail and passes straight through as the primary line.
+    """
+    parts = [part for part in (text or '').split(_CURSOR_HTML_SEP) if part]
+    if len(parts) <= 1:
+        return text, '', '', ''
+    full_rows = ['<table cellspacing="0" cellpadding="0">']
+    mini_rows = [
+        '<table cellspacing="0" cellpadding="0" '
+        'style="font-size:12px;">'
+    ]
+    tooltip_lines = []
+    for i, part in enumerate(parts[1:]):
+        top_pad = '2px' if i > 0 else '0'
+        full_rows.append(
+            '<tr><td style="padding-top:'
+            f'{top_pad}; padding-bottom:0; line-height:1.15;">'
+            f'{part}</td></tr>'
+        )
+        mini_rows.append(mini_single_cursor_part(part, top_pad))
+        tooltip_line = plain_single_cursor_tooltip_line(part)
+        if tooltip_line:
+            tooltip_lines.append(tooltip_line)
+    full_rows.append('</table>')
+    mini_rows.append('</table>')
+    return (
+        parts[0],
+        ''.join(full_rows),
+        ''.join(mini_rows),
+        '\n'.join(tooltip_lines),
+    )
+
+
+def format_cursor_info(text, mode):
+    """Return ``(primary, detail)`` for ``text`` under cursor ``mode``.
+
+    Only single-cursor readouts carrying the separator are split; everything
+    else is the primary line verbatim. ``mode`` is required here — resolving it
+    from live state is the caller's job.
+    """
+    if mode != 'single' or _CURSOR_HTML_SEP not in (text or ''):
+        return text, ''
+    primary, detail, _mini_detail, _tooltip = format_single_cursor_variants(text)
+    return primary, detail
+
+
+# ---------------------------------------------------------------------------
+# Widgets
+# ---------------------------------------------------------------------------
+
+class _DocumentLabel(QLabel):
+    """A QLabel compatibility surface whose structured text paints its measured document.
+
+    Legacy setters still use QLabel. Structured readouts explicitly install a
+    document, so Qt cannot apply different hidden wrapping/indent during paint.
+    """
+
+    def __init__(self, text, parent):
+        super().__init__(text, parent)
+        self.document = QTextDocument(self)
+        self._document_active = False
+
+    def setText(self, text):
+        self._document_active = False
+        super().setText(text)
+
+    def clear(self):
+        self._document_active = False
+        super().clear()
+
+    def set_document_html(self, text, width):
+        self.ensurePolished()
+        super().setText(text)
+        self._document_active = True
+        size = self.measure_document(text, width)
+        self.updateGeometry()
+        self.update()
+        return size
+
+    def measure_document(self, text, width):
+        """Configure the paint document without applying intermediate label text."""
+        self.ensurePolished()
+        self.document.setDocumentMargin(0)
+        self.document.setDefaultFont(self.font())
+        option = self.document.defaultTextOption()
+        option.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        self.document.setDefaultTextOption(option)
+        self.document.setHtml(text)
+        self.document.setTextWidth(max(1.0, width))
+        return self.document.size()
+
+    def sizeHint(self):
+        if not self._document_active:
+            return super().sizeHint()
+        margins = self.contentsMargins()
+        size = self.document.size()
+        return QSize(ceil(size.width()) + margins.left() + margins.right(),
+                     ceil(size.height()) + margins.top() + margins.bottom())
+
+    def hasHeightForWidth(self):
+        return False if self._document_active else super().hasHeightForWidth()
+
+    def heightForWidth(self, width):
+        if self._document_active:
+            return self.sizeHint().height()
+        return super().heightForWidth(width)
+
+    def minimumSizeHint(self):
+        if self._document_active:
+            return QSize(0, self.sizeHint().height())
+        return super().minimumSizeHint()
+
+    def paintEvent(self, event):
+        if not self._document_active:
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        try:
+            painter.translate(self.contentsRect().topLeft())
+            self.document.drawContents(painter, QRectF(self.contentsRect().translated(
+                -self.contentsRect().topLeft())))
+        finally:
+            painter.end()
+
+
+class _CursorDisplayModeControl(QFrame):
+    """Exclusive 数值 / 完整 control. Internal values stay mini / full."""
+
+    mode_chosen = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("cursorPillModeControl")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setCursor(Qt.ArrowCursor)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.setStyleSheet(_MODE_CONTROL_QSS)
+        self._mode = "full"
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(2, 1, 2, 1)
+        layout.setSpacing(0)
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+        self._mini_btn = self._make_option("mini")
+        self._full_btn = self._make_option("full")
+        self._group.addButton(self._mini_btn)
+        self._group.addButton(self._full_btn)
+        layout.addWidget(self._mini_btn)
+        layout.addWidget(self._full_btn)
+        self._group.buttonClicked.connect(self._on_button_clicked)
+        self.set_mode("full")
+
+    def _make_option(self, mode):
+        button = QPushButton(_MODE_OPTION_LABELS[mode], self)
+        button.setObjectName("cursorPillModeOption")
+        button.setCheckable(True)
+        button.setAutoExclusive(True)
+        button.setCursor(Qt.ArrowCursor)
+        button.setFocusPolicy(Qt.TabFocus)
+        button.setProperty("displayMode", mode)
+        button.setAccessibleName(_MODE_OPTION_LABELS[mode])
+        button.installEventFilter(self)
+        return button
+
+    def button_for(self, mode):
+        return self._mini_btn if mode == "mini" else self._full_btn
+
+    def current_mode(self):
+        return self._mode
+
+    def set_mode(self, mode):
+        next_mode = "mini" if mode == "mini" else "full"
+        self._mode = next_mode
+        blocked = self._group.blockSignals(True)
+        self._mini_btn.setChecked(next_mode == "mini")
+        self._full_btn.setChecked(next_mode == "full")
+        self._group.blockSignals(blocked)
+        self._refresh_mode_copy()
+        self.updateGeometry()
+
+    def _refresh_mode_copy(self):
+        if self._mode == "mini":
+            tip = "当前为数值：色点、单位和数值"
+            name = "显示模式，当前为数值"
+        else:
+            tip = "当前为完整：通道名、单位和数值"
+            name = "显示模式，当前为完整"
+        self.setToolTip(tip)
+        self.setAccessibleName(name)
+        self._mini_btn.setToolTip(tip)
+        self._full_btn.setToolTip(tip)
+
+    def _on_button_clicked(self, button):
+        mode = "mini" if button is self._mini_btn else "full"
+        if mode == self._mode:
+            self.set_mode(mode)
+            return
+        self.set_mode(mode)
+        self.mode_chosen.emit(mode)
+
+    def eventFilter(self, watched, event):
+        if (
+            event.type() == QEvent.KeyPress
+            and watched in (self._mini_btn, self._full_btn)
+        ):
+            key = event.key()
+            if key in (Qt.Key_Left, Qt.Key_Up):
+                self._activate_mode("mini")
+                self._mini_btn.setFocus(Qt.TabFocusReason)
+                return True
+            if key in (Qt.Key_Right, Qt.Key_Down):
+                self._activate_mode("full")
+                self._full_btn.setFocus(Qt.TabFocusReason)
+                return True
+        return super().eventFilter(watched, event)
+
+    def _activate_mode(self, mode):
+        if mode == self._mode:
+            self.set_mode(mode)
+            return
+        self.set_mode(mode)
+        self.mode_chosen.emit(mode)
+
+    def mousePressEvent(self, event):
+        event.accept()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() in _PIN_CHROME_INVALIDATE_EVENTS:
+            parent = self.parentWidget()
+            if (
+                parent is None
+                or sip.isdeleted(parent)
+                or not getattr(parent, "_title_chrome_ready", False)
+                or getattr(parent, "_title_chrome_updating", False)
+            ):
+                return
+            invalidate = getattr(parent, "_invalidate_title_chrome_width", None)
+            if callable(invalidate):
+                invalidate()
+
+    def sizeHint(self):
+        self.ensurePolished()
+        for button in (self._mini_btn, self._full_btn):
+            button.ensurePolished()
+        layout = self.layout()
+        if layout is not None:
+            return layout.sizeHint().expandedTo(super().sizeHint())
+        return super().sizeHint()
+
+
+class CursorPill(QFrame):
+    """Draggable floating pill with a primary line (time / A·B / ΔT) and an
+    optional detail block (per-channel Min/Max/Avg/△ as RichText). The
+    user can drag it anywhere inside the canvas area."""
+
+    display_mode_changed = pyqtSignal(str)
+    pin_requested = pyqtSignal()
+    unpin_requested = pyqtSignal()
+    close_requested = pyqtSignal()
+    moved = pyqtSignal()
+    # Value strings are unique per sample. The cache is an LRU so a long
+    # live update cannot grow without limit; a structural signature change
+    # still replaces the dict outright.
+    _TEXT_MEASURE_CACHE_LIMIT = 256
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._space_hidden = False
+        self._visibility_requested = False
+        self._pin_role = "live"
+        self._ordinal = 0
+        self._live_hint = ""
+        self._highlighted = False
+        self._pin_role_style_token = None
+        self._pin_hint_geometry_token = None
+        self._pin_chrome_syncing = False
+        self.setObjectName("cursorPill")
+        self.setCursor(Qt.OpenHandCursor)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 7, 10, 8)
+        lay.setSpacing(2)
+        self._primary = _DocumentLabel("", self)
+        self._primary.setObjectName("cursorPillPrimary")
+        self._primary.setVisible(False)
+        self._primary.setTextFormat(Qt.RichText)
+        self._primary.setTextInteractionFlags(Qt.NoTextInteraction)
+        self._primary.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        # Title chrome width is measured from the real widgets; start with no
+        # static button-count reserve so live/pinned packing can diverge.
+        self._primary.setContentsMargins(0, 0, 0, 0)
+        self._detail = _DocumentLabel("", self)
+        self._detail.setObjectName("cursorPillDetail")
+        self._detail.setTextFormat(Qt.RichText)
+        self._detail.setTextInteractionFlags(Qt.NoTextInteraction)
+        self._detail.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._detail.setVisible(False)
+        self._clear_content_tooltip()
+        lay.addWidget(self._primary)
+        lay.addWidget(self._detail)
+        lay.addStretch(1)
+        self._drag_offset = None
+        self._drag_moved = False
+        # User-positioned flag — true after first manual drag, so resize events
+        # respect the chosen spot instead of snapping back to default corner.
+        self._user_placed = False
+        self._mode = "full"
+        self._dual_rows = []
+        self._frequency_dual_rows = []
+        self._single_full_detail = ""
+        self._single_mini_detail = ""
+        self._single_tooltip = ""
+        self._display_projection = None
+        self._display_layout_category = "natural"
+        self._visible_channel_count = 0
+        self._avoidance_restore_anchor = None
+        self._avoidance_obstacle = None
+        # Shared-table layout state (R8). Structural inputs (host size,
+        # font, field/channel sets, mode) rebuild the plan; value-only
+        # updates may grow the retained geometry, never collapse it. These
+        # per-card measurements are transient and excluded from snapshots.
+        self._table_plan = None
+        self._layout_signature = None
+        self._value_envelope_width = 0.0
+        self._primary_envelope_width = 0.0
+        self._primary_envelope_height = 0.0
+        self._branch_envelope_width = 0.0
+        self._frame_envelope_size = QSize()
+        self._name_elisions = ()
+        self._pane_content_width = 0.0
+        # ChartStack supplies the owning canvas's mapped safe rectangle for
+        # managed pills. Standalone/compatibility users retain the parent
+        # contents-rect fallback in ``safe_rect`` below.
+        self._safe_rect_override = None
+        self._host_pending = False
+        self._primary_original = ""
+        self._text_measure_cache = {}
+        self._title_chrome_parts = None
+        self._title_chrome_token = None
+        self._title_chrome_updating = False
+        self._title_chrome_ready = False
+        # Free-floating children pinned to the top-right corner. Repositioned
+        # from adjustSize() and resizeEvent. Create pin/close first so a
+        # StyleChange inside the mode control cannot measure missing widgets.
+        # ``_toggle_btn`` remains the packing alias.
+        self._pin_btn = QPushButton(self)
+        self._pin_btn.setObjectName("cursorPillPin")
+        self._pin_btn.setFixedSize(_ACTION_BTN, _ACTION_BTN)
+        self._pin_btn.setCursor(Qt.ArrowCursor)
+        self._pin_btn.setText("P")
+        self._pin_btn.setToolTip("按 P 固定当前读数")
+        self._pin_btn.setAccessibleName("固定当前读数")
+        self._pin_btn.setProperty("pinned", "false")
+        self._pin_btn.clicked.connect(self._on_pin_clicked)
+        self._close_btn = QPushButton("×", self)
+        self._close_btn.setObjectName("cursorPillClose")
+        self._close_btn.setFixedSize(_ACTION_BTN, _ACTION_BTN)
+        self._close_btn.setCursor(Qt.ArrowCursor)
+        self._close_btn.setToolTip("删除这一张 Pin")
+        self._close_btn.setAccessibleName("删除这一张 Pin")
+        self._close_btn.clicked.connect(self._emit_close)
+        self._pin_btn.setStyleSheet(_PIN_CHROME_QSS)
+        self._close_btn.setStyleSheet(_PIN_CHROME_QSS)
+        self._mode_control = _CursorDisplayModeControl(self)
+        self._toggle_btn = self._mode_control
+        self._mode_control.mode_chosen.connect(self.set_display_mode)
+        self._highlight_timer = QTimer(self)
+        self._highlight_timer.setSingleShot(True)
+        self._highlight_timer.setInterval(900)
+        self._highlight_timer.timeout.connect(self._clear_highlight)
+        self._title_chrome_ready = True
+        self._update_toggle_button()
+        self._sync_pin_chrome()
+        self._position_title_actions()
+
+    def setVisible(self, visible):
+        self._visibility_requested = bool(visible)
+        super().setVisible(bool(visible) and not self._space_hidden)
+
+    def show(self):
+        self.setVisible(True)
+
+    def awaiting_space(self):
+        """Whether a requested visible readout awaits a larger owning pane."""
+        return self._space_hidden and self._visibility_requested
+
+    def _set_space_hidden(self, hidden):
+        was_hidden = self._space_hidden
+        self._space_hidden = bool(hidden)
+        if hidden:
+            super().setVisible(False)
+        elif was_hidden:
+            super().setVisible(self._visibility_requested)
+
+    def _position_toggle(self):
+        self._position_title_actions()
+
+    def _title_action_occupies_slot(self, widget):
+        """True when this chrome widget occupies a right-edge slot.
+
+        ``QWidget.isVisible()`` is False until ancestors are shown, so packing
+        uses ``isVisibleTo(self)``: hidden pin/close take no slot, and live
+        mode chrome still lands on the right edge during pre-show ``adjustSize()``.
+        """
+        if widget is None:
+            return False
+        try:
+            if sip.isdeleted(widget):
+                return False
+        except RuntimeError:
+            return False
+        return widget.isVisibleTo(self)
+
+    def _title_leading_widgets(self):
+        """Left-side title chrome. Identity lives in the primary HTML."""
+        return ()
+
+    def _title_trailing_widgets(self):
+        return tuple(
+            widget
+            for widget in (
+                getattr(self, "_close_btn", None),
+                getattr(self, "_mode_control", None),
+                getattr(self, "_pin_btn", None),
+            )
+            if widget is not None and not sip.isdeleted(widget)
+        )
+
+    def _chrome_pack_size(self, widget):
+        """Width/height actually used when packing title chrome.
+
+        ``sizeHint`` can exceed a fixed-size button after app QSS; the
+        packed rect must respect min/max so measurement matches paint.
+        """
+        if widget is None or sip.isdeleted(widget):
+            return (0, 0)
+        widget.ensurePolished()
+        hint = widget.sizeHint()
+        width = max(int(hint.width()), 1)
+        height = max(int(hint.height()), 1)
+        max_w = widget.maximumWidth()
+        max_h = widget.maximumHeight()
+        if 0 < max_w < QWIDGETSIZE_MAX:
+            width = min(width, max_w)
+        if 0 < max_h < QWIDGETSIZE_MAX:
+            height = min(height, max_h)
+        width = max(width, int(widget.minimumWidth()), 1)
+        height = max(height, int(widget.minimumHeight()), 1)
+        return (width, height)
+
+    def _packed_chrome_width(self, widgets):
+        occupied = []
+        for widget in widgets:
+            if not self._title_action_occupies_slot(widget):
+                continue
+            occupied.append(self._chrome_pack_size(widget)[0])
+        if not occupied:
+            return 0
+        return _TOGGLE_EDGE_GAP + sum(width + _TOGGLE_EDGE_GAP for width in occupied)
+
+    def _measure_title_chrome(self):
+        """Measured (leading, trailing) title-chrome widths.
+
+        This is the single budget source for margins, document width, table
+        layout and the out-of-space path. Do not count buttons by hand.
+        """
+        if not getattr(self, "_title_chrome_ready", False):
+            return (0, 0)
+        widgets = self._title_leading_widgets() + self._title_trailing_widgets()
+        token = (
+            tuple(
+                (
+                    id(widget),
+                    self._title_action_occupies_slot(widget),
+                    self._chrome_pack_size(widget),
+                    widget.font().key() if widget is not None else "",
+                )
+                for widget in widgets
+            ),
+            self._pin_role,
+            self.logicalDpiX(),
+            self.logicalDpiY(),
+        )
+        if self._title_chrome_parts is not None and self._title_chrome_token == token:
+            return self._title_chrome_parts
+        leading = self._packed_chrome_width(self._title_leading_widgets())
+        trailing = self._packed_chrome_width(self._title_trailing_widgets())
+        self._title_chrome_parts = (int(leading), int(trailing))
+        self._title_chrome_token = token
+        return self._title_chrome_parts
+
+    def _title_leading_chrome_width(self):
+        return self._measure_title_chrome()[0]
+
+    def _title_trailing_chrome_width(self):
+        return self._measure_title_chrome()[1]
+
+    def _title_chrome_width(self):
+        """Packed width of all title chrome."""
+        leading, trailing = self._measure_title_chrome()
+        return leading + trailing
+
+    def _invalidate_title_chrome_width(self):
+        self._title_chrome_parts = None
+        self._title_chrome_token = None
+        if (
+            not getattr(self, "_title_chrome_ready", False)
+            or getattr(self, "_title_chrome_updating", False)
+            or sip.isdeleted(self)
+        ):
+            return
+        self._title_chrome_updating = True
+        try:
+            self._sync_title_action_margins()
+        finally:
+            self._title_chrome_updating = False
+
+    def _sync_title_action_margins(self):
+        leading, trailing = self._measure_title_chrome()
+        if self._pin_role == "pinned" and self._display_projection is not None:
+            # Only the first document block reserves the title actions.
+            leading = trailing = 0
+        self._primary.setContentsMargins(leading, 0, trailing, 0)
+
+    def _position_title_actions(self):
+        """Pack visible title chrome from both edges.
+
+        Trailing: × → 数值/完整 → P. Hidden chrome occupies no slot.
+        First-line text uses ``_title_chrome_width()``. Identity (P7) is
+        padded in ``_apply_pinned_primary_layout`` to this row's center.
+        """
+        self._title_chrome_parts = None
+        self._title_chrome_token = None
+        if not getattr(self, "_title_chrome_ready", False):
+            return
+        y = _TOGGLE_EDGE_GAP
+        actions = self._title_leading_widgets() + self._title_trailing_widgets()
+        row_height = max((self._chrome_pack_size(widget)[1] for widget in actions
+                          if self._title_action_occupies_slot(widget)), default=0)
+        left = _TOGGLE_EDGE_GAP
+        for widget in self._title_leading_widgets():
+            if not self._title_action_occupies_slot(widget):
+                continue
+            width, height = self._chrome_pack_size(widget)
+            widget.resize(width, height)
+            widget.move(left, y + (row_height - height) // 2)
+            left += width + _TOGGLE_EDGE_GAP
+            widget.raise_()
+        right = self.width() - _TOGGLE_EDGE_GAP
+        for widget in self._title_trailing_widgets():
+            if not self._title_action_occupies_slot(widget):
+                continue
+            width, height = self._chrome_pack_size(widget)
+            widget.resize(width, height)
+            widget.move(right - width, y + (row_height - height) // 2)
+            right -= width + _TOGGLE_EDGE_GAP
+            widget.raise_()
+        self._sync_title_action_margins()
+
+    def _on_pin_clicked(self):
+        if self._pin_role == "pinned":
+            return
+        if self._live_hint:
+            self.pin_requested.emit()
+
+    def _emit_close(self, _checked=False):
+        self.close_requested.emit()
+
+    def pin_role(self):
+        return self._pin_role
+
+    def ordinal(self):
+        return self._ordinal
+
+    def set_ordinal(self, ordinal):
+        self._ordinal = int(ordinal or 0)
+
+    def set_pin_role(self, role):
+        next_role = "pinned" if role == "pinned" else "live"
+        role_changed = next_role != self._pin_role
+        self._pin_role = next_role
+        if role_changed:
+            self._refresh_pin_role_style()
+        self._sync_pin_hint_geometry()
+
+    def set_live_hint(self, text):
+        self._live_hint = str(text or "")
+        self._sync_pin_hint_geometry()
+
+    def invalidate_pin_chrome(self):
+        """Rebuild pin role style and hint geometry after theme/font/style/DPR."""
+        self._pin_role_style_token = None
+        self._pin_hint_geometry_token = None
+        self._invalidate_title_chrome_width()
+        self._sync_pin_chrome(force=True)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if getattr(self, "_pin_chrome_syncing", True):
+            return
+        if event.type() in _PIN_CHROME_INVALIDATE_EVENTS:
+            self.invalidate_pin_chrome()
+
+    def is_dragging(self):
+        return self._drag_offset is not None
+
+    def flash_highlight(self):
+        self._highlighted = True
+        self.raise_()
+        self.update()
+        self._highlight_timer.start()
+
+    def _clear_highlight(self):
+        self._highlighted = False
+        self.update()
+
+    def _sync_pin_chrome(self, *, force=False):
+        self._refresh_pin_role_style(force=force)
+        self._sync_pin_hint_geometry(force=force)
+
+    def _refresh_pin_role_style(self, *, force=False):
+        """Re-evaluate pin-button QSS for the current role. Skip if unchanged."""
+        token = "true" if self._pin_role == "pinned" else "false"
+        if not force and self._pin_role_style_token == token:
+            return
+        self._pin_chrome_syncing = True
+        try:
+            self._pin_btn.setProperty("pinned", token)
+            self._pin_btn.style().unpolish(self._pin_btn)
+            self._pin_btn.style().polish(self._pin_btn)
+            # Cocoa can retain the native circular close-button paint until
+            # this sibling is polished too. Resolve its QSS before measuring.
+            self._close_btn.style().unpolish(self._close_btn)
+            self._close_btn.style().polish(self._close_btn)
+            self._pin_role_style_token = token
+        finally:
+            self._pin_chrome_syncing = False
+
+    def _sync_pin_hint_geometry(self, *, force=False):
+        """Update live/pinned P chrome and title-action packing without role polish."""
+        pinned = self._pin_role == "pinned"
+        live_tooltip = self._live_hint if not pinned else ""
+        pin_visible = (not pinned) and bool(live_tooltip)
+        tooltip = live_tooltip
+        token = (pinned, pin_visible, tooltip)
+        if not force and self._pin_hint_geometry_token == token:
+            return
+        self._pin_btn.setVisible(pin_visible)
+        self._close_btn.setVisible(pinned)
+        self._pin_btn.setToolTip(tooltip)
+        self._pin_btn.setAccessibleName(
+            "固定当前读数" if pin_visible else ""
+        )
+        self._invalidate_title_chrome_width()
+        self._position_title_actions()
+        self._pin_hint_geometry_token = token
+
+    def adjustSize(self):
+        # Every content/width change funnels through adjustSize(); reposition the
+        # corner toggle here so it never depends on resize-event delivery timing.
+        super().adjustSize()
+        self._position_title_actions()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_title_actions()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+            # Pinned cards are persistent readout surfaces.  Their content
+            # must not blend with the plot ink underneath; live hover chrome
+            # keeps its established translucent treatment.
+            painter.setBrush(
+                _PINNED_CURSOR_PILL_BG
+                if self._pin_role == "pinned" else _CURSOR_PILL_BG
+            )
+            border = _CURSOR_PILL_HIGHLIGHT if self._highlighted else _CURSOR_PILL_BORDER
+            painter.setPen(QPen(border, 1.4 if self._highlighted else 1.0))
+            painter.drawRoundedRect(rect, _CURSOR_PILL_RADIUS, _CURSOR_PILL_RADIUS)
+        finally:
+            painter.end()
+
+    def primary_text(self):
+        return self._primary.text()
+
+    def detail_text(self):
+        return self._detail.text()
+
+    def set_primary(self, text):
+        old_right = self.geometry().right()
+        old_top = self.y()
+        self._primary_original = text or ""
+        self._apply_primary_layout()
+        self.adjustSize()
+        self.move_preserving_right_edge(old_right, old_top)
+
+    # ---- primary budget (R7) ---------------------------------------------
+
+    def _primary_budget(self):
+        """Content width available to the primary line; 0 until geometry."""
+        if self._pane_content_width > 0:
+            return self._pane_content_width
+        safe = self.safe_rect()
+        if safe.width() <= 0:
+            return 0.0
+        return max(0.0, compute_wcap(safe.width()) - 20.0)
+
+    def _apply_primary_layout(self, budget=None):
+        """Apply primary wrapping within ``budget`` (or this pill's width).
+
+        Shared tables deliberately settle to their measured grid width rather
+        than the pane ceiling.  Passing that settled width here keeps a later
+        high-rate primary update from reopening the whitespace the table just
+        removed.
+        """
+        if budget is None:
+            budget = self._primary_budget()
+        text = self._primary_original
+        self._primary.setVisible(bool(text))
+        reserve = self._title_chrome_width()
+        if (budget > 0 and self._pin_role == "pinned"
+                and self._display_projection is not None):
+            self._apply_pinned_primary_layout(text, budget, reserve)
+            return
+        if budget > 0:
+            text = self._primary_for_budget(text, max(1, budget - reserve))
+        if budget > 0:
+            if self._display_projection is None:
+                # Legacy full/mini details retain their intrinsic widths. The
+                # primary has a ceiling, not a permanently occupied grid.
+                budget = min(budget, self._primary_html_width(text) + reserve)
+            self._primary.set_document_html(text, max(1, budget - reserve))
+        else:
+            self._primary.setText(text)
+        if budget > 0:
+            self._primary.setWordWrap(True)
+            self._primary.setMaximumWidth(int(ceil(budget)))
+        else:
+            self._primary.setWordWrap(False)
+            self._primary.setMaximumWidth(16777215)
+
+    def _apply_pinned_primary_layout(self, text, budget, reserve):
+        """Reserve controls on the header only; subsequent rows use full width."""
+        fragments = [part for part in text.split(_CURSOR_HTML_SEP) if part]
+        # Identity always owns the controls row. Never repack it alongside
+        # changing coordinates merely because this frame happens to fit.
+        first = fragments.pop(0) if fragments else ""
+        rows = fragments
+        html = "".join(f'<p style="margin:0;">{row or "&nbsp;"}</p>'
+                       for row in [first] + rows)
+        self._primary.setContentsMargins(0, 0, 0, 0)
+        self._primary.set_document_html(html, budget)
+        cursor = QTextCursor(self._primary.document.begin())
+        block_format = cursor.blockFormat()
+        block_format.setRightMargin(reserve)
+        row_height = max((self._chrome_pack_size(widget)[1]
+                          for widget in self._title_trailing_widgets()
+                          if self._title_action_occupies_slot(widget)), default=0)
+        layout = self._primary.document.begin().layout()
+        if layout is not None and layout.lineCount() > 0:
+            natural = float(layout.lineAt(0).height())
+        else:
+            natural = float(QFontMetrics(self._primary.font()).height())
+        extra = max(0.0, float(row_height) - natural)
+        # Chrome packs from _TOGGLE_EDGE_GAP; the document starts at
+        # _PILL_TOP_MARGIN. Pad the identity line so P7 shares the chrome
+        # row's vertical center instead of sitting 3px lower at the top of
+        # a MinimumHeight box.
+        chrome_center = float(_TOGGLE_EDGE_GAP) + float(row_height) / 2.0
+        primary_y = float(self._primary.y() or _PILL_TOP_MARGIN)
+        top_margin = max(0.0, chrome_center - primary_y - natural / 2.0)
+        block_format.setTopMargin(top_margin)
+        block_format.setBottomMargin(max(0.0, extra - top_margin))
+        cursor.setBlockFormat(block_format)
+        self._primary.document.size()
+        self._primary.setMaximumWidth(ceil(budget))
+        self._primary.updateGeometry()
+
+    def _primary_for_budget(self, text, budget):
+        """Regroup the separator-delimited primary into whole fragments (R7).
+
+        Only readouts with 3–4 ``│``-separated segments (time dual A/B and
+        ΔT/1/ΔT) are regrouped; everything else passes through unchanged and
+        relies on word wrap. Segments are the existing formatting contract —
+        no value is parsed or recomputed.
+        """
+        if not text:
+            return text
+        if self._primary_stable_width(text) <= budget:
+            return text
+        segments = [part for part in text.split(_CURSOR_HTML_SEP) if part]
+        if not 3 <= len(segments) <= 4:
+            return text
+        grouped = (
+            _CURSOR_HTML_SEP.join(segments[:2]) + "<br>"
+            + _CURSOR_HTML_SEP.join(segments[2:])
+        )
+        if self._primary_stable_width(grouped) <= budget:
+            return grouped
+        each = "<br>".join(segments)
+        if self._primary_stable_width(each) <= budget:
+            return each
+        # One segment alone still exceeds the budget: show the short
+        # out-of-space state instead of splitting a number mid-token (R6).
+        return _OUT_OF_SPACE_TEXT
+
+    def _primary_html_width(self, html):
+        self._primary.ensurePolished()
+        doc = QTextDocument()
+        doc.setDocumentMargin(0)
+        doc.setDefaultFont(self._primary.font())
+        doc.setHtml(html)
+        return doc.idealWidth()
+
+    def _primary_stable_width(self, html):
+        """Budget digit advances without changing the real displayed text.
+
+        Proportional digits of the same precision must not cross a wrapping
+        threshold on each sample. Measure the widest same-shape digit variant
+        with the primary font; tags (sizes/colors) remain untouched.
+        """
+        parts = re.split(r'(<[^>]*>|&(?:#\d+|#x[0-9a-fA-F]+|\w+);)', html)
+        shape = ''.join(part if index % 2 else re.sub(r'[0-9]', '#', part)
+                        for index, part in enumerate(parts))
+        key = ('primary-digits', shape, self._primary.font().key())
+        cached = self._text_measure_cache.get(key)
+        if cached is None:
+            cached = max(
+                self._primary_html_width(''.join(
+                    part if index % 2 else re.sub(r'[0-9]', digit, part)
+                    for index, part in enumerate(parts)))
+                for digit in '0123456789'
+            )
+            self._remember_text_measure(key, cached)
+        else:
+            self._remember_text_measure(key, cached)
+        return cached
+
+    def _primary_doc_size(self, width=None):
+        if not (self._primary.text() or "").strip():
+            return QSizeF(0.0, 0.0)
+        return self._primary.document.size()
+
+    def _clear_content_tooltip(self):
+        """The result panel never uses a hover tooltip for readout content."""
+        self.setToolTip("")
+        self._primary.setToolTip("")
+        self._detail.setToolTip("")
+
+    def set_detail_html(self, html):
+        self._clear_display_projection()
+        self._dual_rows = []
+        self._frequency_dual_rows = []
+        self._single_full_detail = ""
+        self._single_mini_detail = ""
+        self._single_tooltip = ""
+        if html:
+            self._detail.setText(html)
+            self._clear_content_tooltip()
+            self._detail.setVisible(True)
+        else:
+            self._detail.clear()
+            self._clear_content_tooltip()
+            self._detail.setVisible(False)
+        self.adjustSize()
+
+    def set_single_detail_html(self, full_html, mini_html, tooltip=""):
+        self._clear_display_projection()
+        self._dual_rows = []
+        self._frequency_dual_rows = []
+        self._single_full_detail = full_html or ""
+        self._single_mini_detail = mini_html or ""
+        self._single_tooltip = tooltip or ""
+        self._refresh_detail()
+        self.adjustSize()
+
+    def snapshot(self):
+        return {
+            "primary": self._primary.text(),
+            "primary_original": self._primary_original,
+            "detail": self.detail_text(),
+            "detail_visible": self.has_detail(),
+            "detail_tooltip": self._detail.toolTip(),
+            "mode": self._mode,
+            "dual_rows": list(self._dual_rows),
+            "frequency_dual_rows": list(self._frequency_dual_rows),
+            "single_full_detail": self._single_full_detail,
+            "single_mini_detail": self._single_mini_detail,
+            "single_tooltip": self._single_tooltip,
+            "display_projection": self._display_projection,
+        }
+
+    def restore_snapshot(self, snapshot):
+        projection = snapshot.get("display_projection")
+        if projection is not None:
+            self._mode = snapshot.get("mode") or "full"
+            if self._mode not in {"full", "mini"}:
+                self._mode = "full"
+            self._primary_original = (
+                snapshot.get("primary_original") or snapshot.get("primary") or ""
+            )
+            self.set_display_projection(projection)
+            return
+        self._clear_display_projection()
+        self._mode = snapshot.get("mode") or "full"
+        if self._mode not in {"full", "mini"}:
+            self._mode = "full"
+        self._primary_original = snapshot.get("primary") or ""
+        self._primary.setText(self._primary_original)
+        self._primary.setVisible(bool(self._primary_original))
+        self._dual_rows = list(snapshot.get("dual_rows") or [])
+        self._frequency_dual_rows = list(
+            snapshot.get("frequency_dual_rows") or []
+        )
+        self._single_full_detail = snapshot.get("single_full_detail") or ""
+        self._single_mini_detail = snapshot.get("single_mini_detail") or ""
+        self._single_tooltip = snapshot.get("single_tooltip") or ""
+        self.set_display_mode(self._mode, emit_signal=False)
+        if (
+            self._dual_rows
+            or self._frequency_dual_rows
+            or self._single_full_detail
+        ):
+            self._refresh_detail()
+        else:
+            detail = snapshot.get("detail") if snapshot.get("detail_visible") else ""
+            if detail:
+                self._detail.setText(detail)
+                self._clear_content_tooltip()
+                self._detail.setVisible(True)
+            else:
+                self._detail.clear()
+                self._clear_content_tooltip()
+                self._detail.setVisible(False)
+        self.adjustSize()
+
+    def has_detail(self):
+        return not self._detail.isHidden() and bool(self._detail.text())
+
+    def clear(self):
+        self._primary.clear()
+        self._primary.setVisible(False)
+        self._primary_original = ""
+        self._detail.clear()
+        self._clear_content_tooltip()
+        self._detail.setVisible(False)
+        self._dual_rows = []
+        self._frequency_dual_rows = []
+        self._single_full_detail = ""
+        self._single_mini_detail = ""
+        self._single_tooltip = ""
+        self._clear_display_projection()
+        self._host_pending = False
+        self.setVisible(False)
+
+    def mark_user_placed(self, value=True):
+        self._user_placed = bool(value)
+
+    def is_user_placed(self):
+        return self._user_placed
+
+    def _release_display_projection(self):
+        """Drop a pending/unavailable projection, including retained geometry.
+
+        Hides the previous detail body and releases the primary minimum
+        height so the next ready sample measures from a clean card.
+        """
+        self._dual_rows = []
+        self._frequency_dual_rows = []
+        self._single_full_detail = ""
+        self._single_mini_detail = ""
+        self._single_tooltip = ""
+        self._clear_content_tooltip()
+        self._detail.clear()
+        self._detail.setVisible(False)
+        self._clear_display_projection()
+
+    def _clear_display_projection(self):
+        self._display_projection = None
+        self._display_layout_category = "natural"
+        self._visible_channel_count = 0
+        self._avoidance_restore_anchor = None
+        self._avoidance_obstacle = None
+        self._reset_table_state()
+
+    def _reset_table_state(self):
+        """Drop every structural measurement/layout artifact (R8 cleanup)."""
+        self._table_plan = None
+        self._layout_signature = None
+        self._value_envelope_width = 0.0
+        self._primary_envelope_width = 0.0
+        self._primary_envelope_height = 0.0
+        self._branch_envelope_width = 0.0
+        self._frame_envelope_size = QSize()
+        self._name_elisions = ()
+        self._text_measure_cache = {}
+        self._pane_content_width = 0.0
+        self._space_hidden = False
+        self._primary.setMinimumHeight(0)
+
+    def safe_rect(self):
+        if self._host_pending:
+            return QRect()
+        if self._safe_rect_override is not None:
+            return QRect(self._safe_rect_override)
+        parent = self.parentWidget()
+        if parent is None:
+            return QRect(self.rect())
+        rect = parent.contentsRect().adjusted(8, 8, -8, -8)
+        return rect if rect.isValid() else QRect(parent.contentsRect())
+
+    def set_safe_rect(self, rect, *, host_pending=False):
+        """Set a parent-coordinate safe rectangle supplied by ChartStack.
+
+        The pill remains parented to the shared stack for compositing, while
+        this override keeps geometry, width budgets and drag clamping inside
+        its own canvas when time-domain split mode is active. ``None`` keeps
+        the legacy parent-contents fallback for standalone callers.
+        ``host_pending=True`` means the owning FFT provider exists but has
+        no usable spectrum rectangle yet; do not fall back to the stack.
+        """
+        if host_pending:
+            changed = (not self._host_pending) or self._safe_rect_override is not None
+            self._host_pending = True
+            self._safe_rect_override = None
+            return changed
+        next_rect = QRect(rect) if rect is not None and rect.isValid() else None
+        changed = self._host_pending or next_rect != self._safe_rect_override
+        self._host_pending = False
+        self._safe_rect_override = next_rect
+        return changed
+
+    def layout_category(self):
+        return self._display_layout_category
+
+    def display_mode(self):
+        return self._mode
+
+    def visible_channel_count(self):
+        return self._visible_channel_count
+
+    def set_display_projection(self, projection):
+        """Show a structured projection and adapt it to the parent safe rect."""
+        if projection is None:
+            self._release_display_projection()
+            return
+        old_right = self.geometry().right()
+        old_top = self.y()
+        if self._avoidance_restore_anchor is not None:
+            # While displaced by a popover, the user anchor is the avoidance
+            # anchor, not the displaced geometry (which would drift).
+            old_right = self._avoidance_restore_anchor[0]
+            old_top = self._avoidance_restore_anchor[1]
+        had_geometry = self.width() > 0 and self.height() > 0
+        self._dual_rows = []
+        self._frequency_dual_rows = []
+        self._single_full_detail = ""
+        self._single_mini_detail = ""
+        self._single_tooltip = ""
+        self._display_projection = projection
+        self.set_display_mode(
+            "mini" if bool(getattr(projection, "mini", False)) else "full",
+            emit_signal=False,
+        )
+        self._clear_content_tooltip()
+        self.reflow_to_parent(
+            preserved_right=old_right if self._user_placed and had_geometry else None,
+            preserved_top=old_top if self._user_placed and had_geometry else None,
+        )
+
+    def _middle_elide_label(self, text, width, measure=None):
+        """Return a width-aware middle elision that keeps both identities visible."""
+        text = str(text or "")
+        if measure is None:
+            measure = self._detail.fontMetrics().horizontalAdvance
+        if measure(text) <= width:
+            return text
+        marker = "..."
+        if measure(marker) >= width:
+            return marker
+        # Preserve a meaningful source prefix and channel suffix when the
+        # available width permits it; these are the two identity cues users
+        # need to distinguish similar long labels.
+        head = min(14, max(1, len(text) - 1))
+        tail = min(12, max(1, len(text) - head))
+        if measure(f"{text[:head]}{marker}{text[-tail:]}") > width:
+            head = tail = 1
+        while head + tail < len(text):
+            candidate = f"{text[:head]}{marker}{text[-tail:]}"
+            if measure(candidate) > width:
+                break
+            if head <= tail:
+                head += 1
+            else:
+                tail += 1
+        return f"{text[:max(1, head - 1)]}{marker}{text[-max(1, tail - 1):]}"
+
+    def _apply_display_projection(self, category, count, *, table_html=None):
+        from .cursor_display import render_cursor_presentation, visible_block_label
+
+        projection = self._display_projection
+        self._display_layout_category = category
+        self._visible_channel_count = min(count, len(projection.blocks))
+        if table_html is not None:
+            self._detail.setWordWrap(False)
+            self._detail.set_document_html(table_html, self._pane_content_width)
+        else:
+            self._detail.setWordWrap(category == "constrained")
+            header_overrides = None
+            if category == "constrained":
+                header_width = max(20, int(self._detail.maximumWidth() * 1.2))
+                omit_prefix = bool(projection.omit_visible_source_prefix)
+                header_overrides = tuple(
+                    self._middle_elide_label(
+                        visible_block_label(block, omit_prefix), header_width
+                    )
+                    for block in projection.blocks[:self._visible_channel_count]
+                )
+            self._detail.setText(render_cursor_presentation(
+                projection,
+                layout_category=category,
+                visible_count=self._visible_channel_count,
+                header_overrides=header_overrides,
+            ))
+        self._clear_content_tooltip()
+        self._detail.setVisible(bool(projection.blocks))
+        self._detail.updateGeometry()
+        if self.layout() is not None:
+            self.layout().activate()
+        self.adjustSize()
+
+    def reflow_to_parent(self, *, preserved_right=None, preserved_top=None):
+        projection = self._display_projection
+        if projection is None:
+            return
+        safe = self.safe_rect()
+        if safe.width() <= 0 or safe.height() <= 0:
+            return
+        if preserved_right is None and self._user_placed:
+            preserved_right = self.geometry().right()
+            preserved_top = self.y()
+
+        self._reflow_shared_table(
+            projection, safe, preserved_right, preserved_top
+        )
+
+    def _reflow_legacy(self, projection, safe, preserved_right, preserved_top):
+        """Previous natural/constrained reflow for non-table projections."""
+        self._detail.setMaximumWidth(16777215)
+        self.layout().setContentsMargins(10, 7, 10, 8)
+        self._apply_display_projection("natural", len(projection.blocks))
+        hint = self.sizeHint()
+        category = (
+            "natural"
+            if hint.width() <= safe.width() and hint.height() <= safe.height()
+            else "constrained"
+        )
+        if category == "constrained":
+            detail_width = max(20, safe.width() - 20)
+            self._detail.setMaximumWidth(detail_width)
+            self.layout().setContentsMargins(10, 1, 10, 1)
+            low = 0
+            high = len(projection.blocks)
+            last_count = None
+            while low < high:
+                count = (low + high + 1) // 2
+                self._apply_display_projection("constrained", count)
+                last_count = count
+                if self.sizeHint().height() <= safe.height():
+                    low = count
+                else:
+                    high = count - 1
+            chosen = low
+            if last_count != chosen:
+                self._apply_display_projection("constrained", chosen)
+            target = self.sizeHint()
+            self.resize(
+                min(target.width(), safe.width()),
+                min(target.height(), safe.height()),
+            )
+        self._settle_position(preserved_right, preserved_top, safe)
+
+    def _settle_position(self, preserved_right, preserved_top, safe):
+        if preserved_right is not None:
+            self.move_preserving_right_edge(
+                preserved_right, preserved_top or safe.top()
+            )
+        elif not self._user_placed:
+            self.move(safe.right() - self.width() + 1, safe.top())
+        self._clamp_to_safe_rect()
+        if (
+            self._avoidance_restore_anchor is not None
+            and self._avoidance_obstacle is not None
+        ):
+            obstacle, gap = self._avoidance_obstacle
+            self.avoid_rect(obstacle, gap=gap)
+
+    # ---- shared table reflow (R4/R5/R8) -----------------------------------
+
+    def _reflow_shared_table(self, projection, safe,
+                             preserved_right, preserved_top):
+        from .cursor_display import visible_block_label
+
+        # New pinned cards receive content before show(). Polish the owner
+        # too, so its first QSS font is not mistaken for a later settings
+        # change that discards the just-published geometry reserve.
+        self.ensurePolished()
+        self._detail.ensurePolished()
+        self._primary.ensurePolished()
+        # The ratio budget is a preference; a fitting horizontal table may
+        # grow up to the owning pane / absolute ceiling.
+        wcap = min(640.0, float(safe.width()))
+        content = max(
+            0.0, wcap - _PILL_LEFT_MARGIN - _PILL_RIGHT_MARGIN - _TABLE_EDGE_CLEARANCE
+        )
+        # Start from the pane's *ceiling*.  It becomes the settled content
+        # width below once the table's actual grid width is known.
+        self._pane_content_width = content
+        # Structural change resets retained geometry. Branch/status rows are
+        # sampled content: their removal clears the text, not the size reserve.
+        signature = self._layout_signature_for(projection)
+        if signature != self._layout_signature:
+            self._layout_signature = signature
+            self._value_envelope_width = 0.0
+            self._primary_envelope_width = 0.0
+            self._primary_envelope_height = 0.0
+            self._branch_envelope_width = 0.0
+            self._frame_envelope_size = QSize()
+            self._primary.setMinimumHeight(0)
+            self._text_measure_cache = {}
+        envelope = self._refresh_value_envelope(projection)
+        label_widths = tuple(
+            self._measure_body_text(label)
+            for label in projection.metric_labels
+        )
+        self._branch_envelope_width = max(
+            self._branch_envelope_width,
+            max((self._measure_body_text(row.branch_label) + 10
+                 for block in projection.blocks for row in block.table_rows
+                 if row.branch_label), default=0.0),
+        )
+        plan = choose_table_layout(
+            content_width=content,
+            value_envelope_width=envelope,
+            field_labels=projection.metric_labels,
+            field_label_widths=label_widths,
+            signal_width=max((self._signal_width(block, projection)
+                              for block in projection.blocks), default=0.0),
+            branch_width=self._branch_envelope_width,
+        )
+        self._table_plan = plan
+        if plan.required_width > content:
+            self._show_space_state(projection, safe, preserved_right, preserved_top)
+            return
+        self._name_elisions = tuple(
+            self._fit_name_html(
+                visible_block_label(
+                    block, bool(projection.omit_visible_source_prefix)
+                ),
+                plan, block.unit_text,
+            )
+            for block in projection.blocks
+        )
+        # A QTextDocument with setTextWidth(content) reports that imposed
+        # width, not its intrinsic table width.  Treating it as a measurement
+        # made every panel expand to Wcap and created the large blank slabs in
+        # the cursor screenshots.  The layout plan's shared column sum is the
+        # width contract; use it as the settled content width instead.
+        # The detail grid keeps its own intrinsic width. The separate header
+        # budget may widen the frame to fit identity and controls together.
+        table_width = (
+            min(content, max((self._signal_width(block, projection)
+                              for block in projection.blocks), default=1.0))
+            if plan.kind == "identity" else min(
+                content,
+                max(1.0, plan.required_width + _TABLE_EDGE_CLEARANCE),
+            )
+        )
+        # Give the title enough room for its widest indivisible fragment plus
+        # actions, independently of the numeric grid's intrinsic width.
+        fragments = [part for part in self._primary_original.split(_CURSOR_HTML_SEP)
+                     if part]
+        primary_min = max((self._primary_stable_width(part) for part in fragments),
+                          default=0.0)
+        if self._pin_role == "pinned":
+            identity_width = self._primary_stable_width(fragments[0]) if fragments else 0
+            pane = max(table_width, ceil(primary_min),
+                       ceil(identity_width) + self._title_chrome_width())
+        else:
+            pane = max(table_width, ceil(primary_min) + self._title_chrome_width())
+        self._primary_envelope_width = max(self._primary_envelope_width, pane)
+        pane = min(wcap - _PILL_LEFT_MARGIN - _PILL_RIGHT_MARGIN,
+                   self._primary_envelope_width)
+
+        self._pane_content_width = table_width
+        self._detail.setMaximumWidth(int(ceil(table_width)))
+        self._apply_primary_layout(pane)
+        self._primary_envelope_height = max(
+            self._primary_envelope_height, self._primary_doc_size(pane).height()
+        )
+        primary_h = self._primary_envelope_height
+        self._primary.setMinimumHeight(ceil(primary_h))
+        available = max(
+            0.0,
+            safe.height()
+            - _PILL_TOP_MARGIN - _PILL_BOTTOM_MARGIN - 2.0
+            - primary_h,
+        )
+        total = len(projection.blocks)
+        low, high = 0, total
+        while low < high:
+            count = (low + high + 1) // 2
+            _w, h = self._measure_html(
+                self._table_html_for_count(projection, count), table_width
+            )
+            if h <= available:
+                low = count
+            else:
+                high = count - 1
+        chosen = low
+        final_html = self._table_html_for_count(projection, chosen)
+        if self._measure_html(final_html, table_width)[1] > available:
+            self._show_space_state(projection, safe, preserved_right, preserved_top)
+            return
+        self._apply_table_html(projection, chosen, final_html)
+        _measured_w, detail_h = self._measure_html(final_html, table_width)
+        # ``setTextWidth`` makes documentSize().width() equal its constraint,
+        # so it is intentionally not used to choose frame width here.
+        frame_w = int(ceil(pane)) + _PILL_LEFT_MARGIN + _PILL_RIGHT_MARGIN
+        frame_h = int(
+            primary_h + 2.0 + detail_h
+        ) + _PILL_TOP_MARGIN + _PILL_BOTTOM_MARGIN
+        self._frame_envelope_size = self._frame_envelope_size.expandedTo(
+            QSize(frame_w, frame_h)
+        )
+        self.resize(min(self._frame_envelope_size.width(), safe.width()),
+                    min(self._frame_envelope_size.height(), safe.height()))
+        self._settle_position(preserved_right, preserved_top, safe)
+        self._set_space_hidden(False)
+
+    def _show_space_state(self, projection, safe, preserved_right, preserved_top):
+        """Keep an unfit readout explicit without splitting a numeric token."""
+        self._primary.hide()
+        width = min(max(1, safe.width() - 20),
+                    ceil(self._measure_body_text(_OUT_OF_SPACE_TEXT)) + self._title_chrome_width())
+        self._pane_content_width = width
+        self._detail.setMaximumWidth(ceil(width))
+        html = f'<span style="font-size:11px;color:#64748b;">{_OUT_OF_SPACE_TEXT}</span>'
+        self._apply_table_html(projection, 0, html)
+        height = ceil(self._detail.document.size().height()) + 15
+        minimum_width = (ceil(self._measure_body_text(_OUT_OF_SPACE_TEXT))
+                         + self._title_chrome_width()
+                         + _PILL_LEFT_MARGIN + _PILL_RIGHT_MARGIN)
+        if safe.height() < height or safe.width() < minimum_width:
+            self._set_space_hidden(True)
+            return
+        self.resize(min(safe.width(), ceil(width) + 20), min(safe.height(), height))
+        self._settle_position(preserved_right, preserved_top, safe)
+        self._set_space_hidden(False)
+
+    def _layout_signature_for(self, projection):
+        return (
+            projection.cursor_mode,
+            projection.x_mode,
+            bool(projection.mini),
+            self.safe_rect().width(), self.safe_rect().height(),
+            self._pin_role, self._ordinal, self._title_chrome_width(),
+            bool(projection.omit_visible_source_prefix),
+            bool(projection.retain_mini_labels),
+            self.font().key(), self._detail.font().key(), self._primary.font().key(),
+            self.logicalDpiX(), self.logicalDpiY(),
+            projection.metric_labels,
+            tuple((str(block.identity), block.channel_label, block.qualified_label,
+                   block.unit_text)
+                  for block in projection.blocks),
+        )
+
+    def _refresh_value_envelope(self, projection):
+        """Width reserve for the formatted value columns (R8).
+
+        Starts from the widest current value text (not the global .4g worst
+        case, which would starve narrow hosts) and only ever grows within a
+        structural period; it never shrinks after a short value. A structural
+        change resets it via ``_layout_signature``.
+        """
+        envelope = self._value_envelope_width
+        for block in projection.blocks:
+            for row in block.table_rows:
+                for text in row.metric_texts:
+                    if text:
+                        envelope = max(envelope, self._measure_mono_text(text))
+        self._value_envelope_width = envelope
+        return envelope
+
+    def _remember_text_measure(self, key, width):
+        cache = self._text_measure_cache
+        if key in cache:
+            del cache[key]
+        cache[key] = width
+        while len(cache) > self._TEXT_MEASURE_CACHE_LIMIT:
+            cache.pop(next(iter(cache)))
+        return width
+
+    def _measure_span(self, text, style):
+        key = (style, str(text))
+        cached = self._text_measure_cache.get(key)
+        if cached is None:
+            doc = QTextDocument()
+            doc.setDocumentMargin(0)
+            doc.setDefaultFont(self._detail.font())
+            doc.setHtml(f'<span style="font-size:11px;{style}">{escape(str(text))}</span>')
+            cached = float(doc.idealWidth())
+        return self._remember_text_measure(key, cached)
+
+    def _measure_mono_text(self, text):
+        # Delta is bold; reserve the wider variant for every shared column.
+        return max(self._measure_span(text, _MINI_VALUE_FONT),
+                   self._measure_span(text, _MINI_VALUE_FONT + "font-weight:700;"))
+
+    def _measure_body_text(self, text):
+        return self._measure_span(text, "font-weight:400;")
+
+    def _measure_name_text(self, text):
+        return self._measure_span(text, "font-weight:600;")
+
+    def _signal_width(self, block, projection):
+        from .cursor_display import visible_block_label
+        name = visible_block_label(block, bool(projection.omit_visible_source_prefix))
+        if projection.mini and not projection.retain_mini_labels:
+            name = ""
+        return (self._measure_name_text(name) + self._measure_body_text("● ")
+                + (self._measure_body_text(block.unit_text) + 6 if block.unit_text else 0)
+                + 16)
+
+    def _measure_html(self, html, width):
+        # The same persistent document is subsequently used by paintEvent.
+        size = self._detail.measure_document(html, width)
+        return size.width(), size.height()
+
+    def _table_html_for_count(self, projection, count):
+        from .cursor_display import render_cursor_presentation
+
+        return render_cursor_presentation(
+            projection,
+            layout_plan=self._table_plan,
+            visible_count=count,
+            header_lines=self._name_elisions,
+        )
+
+    def _apply_table_html(self, projection, count, html):
+        category = "natural" if count >= len(projection.blocks) else "constrained"
+        self._apply_display_projection(category, count, table_html=html)
+
+    def _fit_name_html(self, name, plan, unit=""):
+        # Raw text crosses the renderer seam. Reserve all actual adjacent ink
+        # before eliding; escaped entities must never be measured as letters.
+        budget = max(0.0, plan.name_budget - self._measure_body_text("● ") - 16)
+        if unit:
+            budget = max(0.0, budget - self._measure_body_text(unit) - 6)
+        if budget <= 0:
+            return ("",)
+        return tuple(self._fit_name_lines(str(name or ""), budget, plan.name_max_lines))
+
+    def _fit_name_lines(self, text, budget, max_lines):
+        measure = self._measure_name_text
+        remaining = str(text)
+        lines = []
+        while len(lines) < max_lines - 1 and measure(remaining) > budget:
+            # Keep underscore-delimited engineering names readable too. One
+            # unbroken Rte_* token is not a reason to discard the second line.
+            low, high = 0, len(remaining)
+            while low < high:
+                middle = (low + high + 1) // 2
+                if measure(remaining[:middle]) <= budget:
+                    low = middle
+                else:
+                    high = middle - 1
+            if low == 0:
+                break
+            boundary = max(remaining.rfind(" ", 0, low + 1),
+                           remaining.rfind("_", 0, low))
+            split = boundary + 1 if boundary >= low // 2 else low
+            lines.append(remaining[:split].rstrip())
+            remaining = remaining[split:].lstrip()
+        lines.append(self._middle_elide_label(remaining, budget, measure))
+        return lines
+
+    def _clamp_to_safe_rect(self):
+        safe = self.safe_rect()
+        x = max(safe.left(), min(self.x(), safe.right() - self.width() + 1))
+        y = max(safe.top(), min(self.y(), safe.bottom() - self.height() + 1))
+        self.move(x, y)
+
+    def avoid_rect(self, obstacle, *, gap=8):
+        """Displace away from a parent-coordinate obstacle without drift."""
+        obstacle = QRect(obstacle)
+        padded = obstacle.adjusted(-gap, -gap, gap, gap)
+        if self._avoidance_restore_anchor is not None:
+            self._avoidance_obstacle = (QRect(obstacle), int(gap))
+        if not self.geometry().intersects(padded):
+            return
+        if self._avoidance_restore_anchor is None:
+            self._avoidance_restore_anchor = (self.geometry().right(), self.y())
+            self._avoidance_obstacle = (QRect(obstacle), int(gap))
+        safe = self.safe_rect()
+        left_x = padded.left() - self.width() - 1
+        right_x = padded.right() + 1
+        if left_x >= safe.left():
+            self.move(left_x, self.y())
+        elif right_x + self.width() - 1 <= safe.right():
+            self.move(right_x, self.y())
+        else:
+            above_y = padded.top() - self.height() - 1
+            below_y = padded.bottom() + 1
+            self.move(self.x(), above_y if above_y >= safe.top() else below_y)
+        self._clamp_to_safe_rect()
+
+    def avoid_global_rect(self, obstacle, *, gap=8):
+        """Displace from a screen-coordinate popup rectangle."""
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        obstacle = QRect(obstacle)
+        top_left = parent.mapFromGlobal(obstacle.topLeft())
+        bottom_right = parent.mapFromGlobal(obstacle.bottomRight())
+        self.avoid_rect(QRect(top_left, bottom_right), gap=gap)
+
+    def restore_after_avoidance(self):
+        if self._avoidance_restore_anchor is None:
+            return
+        right, top = self._avoidance_restore_anchor
+        self._avoidance_restore_anchor = None
+        self._avoidance_obstacle = None
+        safe = self.safe_rect()
+        x = int(right) - self.width() + 1
+        x = max(safe.left(), min(x, safe.right() - self.width() + 1))
+        y = max(safe.top(), min(int(top), safe.bottom() - self.height() + 1))
+        self.move(x, y)
+
+    # ---- drag handling ----
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag_offset = e.pos()
+            self._drag_moved = False
+            self.setCursor(Qt.ClosedHandCursor)
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        # The captured press owns this drag until ``mouseReleaseEvent``.  Qt's
+        # synthetic/offscreen moves may omit the button bit even though the
+        # matching release has not arrived yet.
+        if self._drag_offset is not None:
+            parent = self.parentWidget()
+            new_top_left = self.mapToParent(e.pos() - self._drag_offset)
+            if parent is not None:
+                safe = self.safe_rect()
+                x = max(safe.left(), min(
+                    new_top_left.x(), safe.right() - self.width() + 1
+                ))
+                y = max(safe.top(), min(
+                    new_top_left.y(), safe.bottom() - self.height() + 1
+                ))
+                before = self.pos()
+                self.move(x, y)
+                self._drag_moved = self._drag_moved or self.pos() != before
+            else:
+                before = self.pos()
+                self.move(new_top_left)
+                self._drag_moved = self._drag_moved or self.pos() != before
+            self._user_placed = self._user_placed or self._drag_moved
+            e.accept()
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton and self._drag_offset is not None:
+            # Some offscreen/QPA backends deliver a matching release but omit
+            # the intermediate move.  The release position still carries the
+            # user drag delta, so settle it once instead of turning a real
+            # title drag into a no-op.  A stationary click remains stationary.
+            parent = self.parentWidget()
+            if parent is not None and e.pos() != self._drag_offset:
+                new_top_left = self.mapToParent(e.pos() - self._drag_offset)
+                safe = self.safe_rect()
+                x = max(safe.left(), min(
+                    new_top_left.x(), safe.right() - self.width() + 1
+                ))
+                y = max(safe.top(), min(
+                    new_top_left.y(), safe.bottom() - self.height() + 1
+                ))
+                before = self.pos()
+                self.move(x, y)
+                self._drag_moved = self._drag_moved or self.pos() != before
+            self._user_placed = self._user_placed or self._drag_moved
+            self._drag_offset = None
+            self.setCursor(Qt.OpenHandCursor)
+            if self._drag_moved:
+                self.moved.emit()
+            self._drag_moved = False
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
+
+    def set_display_mode(self, mode, emit_signal=True):
+        """Apply an explicit target mode. User clicks emit once; restore does not."""
+        next_mode = "mini" if mode == "mini" else "full"
+        if next_mode == self._mode:
+            self._update_toggle_button()
+            return
+        old_right = self.x() + self.width()
+        old_top = self.y()
+        self._mode = next_mode
+        self._update_toggle_button()
+        if not emit_signal:
+            return
+        if self._display_projection is not None:
+            self.display_mode_changed.emit(self._mode)
+            return
+        self._refresh_detail()
+        self.adjustSize()
+        self.move_preserving_right_edge(old_right, old_top)
+        self.display_mode_changed.emit(self._mode)
+
+    def _toggle_mode(self):
+        self.set_display_mode("mini" if self._mode == "full" else "full")
+
+    def move_preserving_right_edge(self, right_edge, top):
+        safe = self.safe_rect()
+        new_x = int(right_edge) - self.width()
+        new_y = int(top)
+        if safe.isValid() and safe.width() > 0 and safe.height() > 0:
+            new_x = max(safe.left(), min(new_x, safe.right() - self.width() + 1))
+            new_y = max(safe.top(), min(new_y, safe.bottom() - self.height() + 1))
+        elif self.parentWidget() is not None:
+            parent = self.parentWidget()
+            max_x = max(parent.width() - self.width(), 0)
+            max_y = max(parent.height() - self.height(), 0)
+            new_x = max(0, min(new_x, max_x))
+            new_y = max(0, min(new_y, max_y))
+        self.move(new_x, new_y)
+
+    # Backwards-compatible private alias for internal callers.
+    _move_preserving_right_edge = move_preserving_right_edge
+
+    def _update_toggle_button(self):
+        self._mode_control.set_mode(self._mode)
+        self._mode_control.setProperty("cursorPillMode", self._mode)
+        self._mode_control.style().unpolish(self._mode_control)
+        self._mode_control.style().polish(self._mode_control)
+        self._invalidate_title_chrome_width()
+
+    def set_dual_rows(self, rows):
+        self._clear_display_projection()
+        self._dual_rows = rows or []
+        self._frequency_dual_rows = []
+        self._single_full_detail = ""
+        self._single_mini_detail = ""
+        self._single_tooltip = ""
+        self._refresh_detail()
+        if self._dual_rows:
+            self._detail.setVisible(True)
+        self.adjustSize()
+
+    def set_frequency_dual_rows(self, rows):
+        """Set structured FFT A/B rows for full/mini cursor-pill toggling."""
+        self._clear_display_projection()
+        self._frequency_dual_rows = rows or []
+        self._dual_rows = []
+        self._single_full_detail = ""
+        self._single_mini_detail = ""
+        self._single_tooltip = ""
+        self._refresh_detail()
+        if self._frequency_dual_rows:
+            self._detail.setVisible(True)
+        self.adjustSize()
+
+    def _refresh_detail(self):
+        if self._dual_rows:
+            from ..plot_helpers import _format_dual_html
+            html = (
+                _format_dual_html(self._dual_rows)
+                if self._mode == "full"
+                else _format_mini_html(self._dual_rows)
+            )
+        elif self._frequency_dual_rows:
+            html = (
+                _format_frequency_dual_html(self._frequency_dual_rows)
+                if self._mode == "full"
+                else _format_frequency_mini_html(self._frequency_dual_rows)
+            )
+        elif self._single_full_detail:
+            html = (
+                self._single_mini_detail
+                if self._mode == "mini" and self._single_mini_detail
+                else self._single_full_detail
+            )
+        else:
+            html = ""
+        if html:
+            self._detail.setText(html)
+            self._clear_content_tooltip()
+            self._detail.setVisible(True)
+        else:
+            self._detail.clear()
+            self._clear_content_tooltip()
+            self._detail.setVisible(False)
+
+
+class _QualityStatusIndicator(QFrame):
+    """Small hoverable AA status dot overlaid on the chart card chrome."""
+
+    _COLORS = {
+        "idle": QColor("#9ca3af"),
+        "preview": QColor("#60a5fa"),
+        "green": QColor("#22c55e"),
+        "yellow": QColor("#f59e0b"),
+        "red": QColor("#ef4444"),
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("chartQualityIndicator")
+        self.setFixedSize(20, 20)
+        self.setMouseTracking(True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self._state = "idle"
+        self.set_quality_status({
+            "state": "idle",
+            "tooltip": "无曲线",
+        })
+
+    def set_quality_status(self, status):
+        raw = (status or {}).get("state")
+        state = str(raw) if raw else "idle"
+        if state not in self._COLORS:
+            logger.warning(
+                "unknown quality-dot state %r; falling back to idle",
+                state,
+            )
+            state = "idle"
+        self._state = state
+        self.setProperty("qualityState", state)
+        self.setToolTip(str((status or {}).get("tooltip") or "抗锯齿状态未知"))
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            rect = QRectF(self.rect()).adjusted(5.0, 5.0, -5.0, -5.0)
+            painter.setBrush(self._COLORS.get(self._state, self._COLORS["idle"]))
+            painter.setPen(QPen(QColor(255, 255, 255, 230), 1.0))
+            painter.drawEllipse(rect)
+        finally:
+            painter.end()

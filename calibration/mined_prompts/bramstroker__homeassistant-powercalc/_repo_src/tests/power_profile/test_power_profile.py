@@ -1,0 +1,676 @@
+from decimal import Decimal
+from typing import Any
+from unittest.mock import patch
+
+from homeassistant.components.media_player import ATTR_MEDIA_VOLUME_LEVEL
+from homeassistant.const import CONF_ENTITY_ID, STATE_PAUSED, STATE_PLAYING
+from homeassistant.core import HomeAssistant
+import pytest
+from pytest_homeassistant_custom_component.common import MockConfigEntry, RegistryEntryWithDefaults
+
+from custom_components.powercalc.common import SourceEntity
+from custom_components.powercalc.const import (
+    CONF_CALIBRATE,
+    CONF_ENERGY_SENSOR_NAMING,
+    CONF_GAMMA_CURVE,
+    CONF_MANUFACTURER,
+    CONF_MAX_POWER,
+    CONF_MIN_POWER,
+    CONF_MODEL,
+    CONF_POWER,
+    CONF_POWER_CURVE,
+    CONF_POWER_SENSOR_NAMING,
+    DEFAULT_SELF_USAGE_ENERGY_NAME_PATTERN,
+    DEFAULT_SELF_USAGE_POWER_NAME_PATTERN,
+    DOMAIN,
+    CalculationStrategy,
+)
+from custom_components.powercalc.errors import (
+    ModelNotSupportedError,
+    StrategyConfigurationError,
+    UnsupportedStrategyError,
+)
+from custom_components.powercalc.power_profile.library import ModelInfo, ProfileLibrary
+from custom_components.powercalc.power_profile.power_profile import (
+    DeviceType,
+    PowerProfile,
+    is_device_type_supported_for_entity,
+)
+from tests.common import assert_entity_state, get_test_profile_dir, run_powercalc_setup, set_states
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [(None, None), (3, Decimal(3)), (0.1, Decimal("0.1")), ("4.5", Decimal("4.5")), (0, Decimal(0))],
+)
+def test_profile_multiply_factor(hass: HomeAssistant, value: float | str | None, expected: Decimal | None) -> None:
+    profile = PowerProfile(hass, "test", "panels", "", {"multiply_factor": value})
+    assert profile.multiply_factor == expected
+
+
+@pytest.mark.parametrize("value", ["not a number", "[[panel_count]]", "NaN", "Infinity", "-Infinity", True, []])
+def test_invalid_profile_multiply_factor(hass: HomeAssistant, value: object) -> None:
+    profile = PowerProfile(hass, "test", "panels", "", {"multiply_factor": value})
+    with pytest.raises(StrategyConfigurationError, match=r"Invalid multiply_factor .* for test/panels"):
+        _ = profile.multiply_factor
+
+
+async def test_load_lut_profile_from_custom_directory(hass: HomeAssistant) -> None:
+    library = await ProfileLibrary.factory(hass)
+    power_profile = await library.get_profile(
+        ModelInfo("signify", "LCA001"),
+        custom_directory=get_test_profile_dir("signify_LCA001"),
+    )
+    assert power_profile.calculation_strategy == CalculationStrategy.LUT
+    assert power_profile.manufacturer == "signify"
+    assert power_profile.model == "LCA001"
+    assert power_profile.is_strategy_supported(CalculationStrategy.LUT)
+    assert not power_profile.is_strategy_supported(CalculationStrategy.FIXED)
+    assert power_profile.device_type == DeviceType.LIGHT
+    assert power_profile.name == "Hue White and Color Ambiance A19 E26/E27 (Gen 5)"
+    assert not power_profile.aliases
+
+
+async def test_load_fixed_profile(hass: HomeAssistant) -> None:
+    library = await ProfileLibrary.factory(hass)
+    power_profile = await library.get_profile(
+        ModelInfo("dummy", "dummy"),
+        custom_directory=get_test_profile_dir("fixed"),
+    )
+    assert power_profile.calculation_strategy == CalculationStrategy.FIXED
+    assert power_profile.standby_power == 0.5
+    assert power_profile.fixed_config == {CONF_POWER: 50}
+
+    with pytest.raises(UnsupportedStrategyError):
+        _ = power_profile.linear_config
+
+
+async def test_load_linear_profile(hass: HomeAssistant) -> None:
+    library = await ProfileLibrary.factory(hass)
+    power_profile = await library.get_profile(
+        ModelInfo("dummy", "dummy"),
+        custom_directory=get_test_profile_dir("linear"),
+    )
+    assert power_profile.calculation_strategy == CalculationStrategy.LINEAR
+    assert power_profile.standby_power == 0.5
+    assert power_profile.linear_config == {CONF_MIN_POWER: 10, CONF_MAX_POWER: 30}
+
+    with pytest.raises(UnsupportedStrategyError):
+        _ = power_profile.fixed_config
+
+
+async def test_load_linked_profile(hass: HomeAssistant) -> None:
+    library = await ProfileLibrary.factory(hass)
+    power_profile = await library.get_profile(
+        ModelInfo("signify", "LCA007"),
+        custom_directory=get_test_profile_dir("linked_profile"),
+    )
+    assert power_profile.calculation_strategy == CalculationStrategy.LUT
+    assert power_profile.manufacturer == "signify"
+    assert power_profile.model == "LCA007"
+    assert power_profile.name == "Linked profile"
+
+
+async def test_load_sub_profile(hass: HomeAssistant) -> None:
+    library = await ProfileLibrary.factory(hass)
+    power_profile = await library.get_profile(
+        ModelInfo("yeelight", "YLDL01YL/ambilight"),
+    )
+    assert power_profile.calculation_strategy == CalculationStrategy.LUT
+    assert power_profile.manufacturer == "yeelight"
+    assert power_profile.model == "YLDL01YL"
+    assert power_profile.sub_profile == "ambilight"
+
+
+async def test_load_sub_profile_without_model_json(hass: HomeAssistant) -> None:
+    """Test if sub profile can be loaded correctly when the sub directories don't have an own model.json"""
+    library = await ProfileLibrary.factory(hass)
+    power_profile = await library.get_profile(
+        ModelInfo("test", "test/a"),
+        custom_directory=get_test_profile_dir("sub_profile2"),
+    )
+    assert power_profile.calculation_strategy == CalculationStrategy.LUT
+    assert power_profile.manufacturer == "test"
+    assert power_profile.model == "test"
+    assert power_profile.name == "Test"
+    assert power_profile.sub_profile == "a"
+
+
+async def test_switching_sub_profile_does_not_retain_previous_overlay_keys(hass: HomeAssistant) -> None:
+    power_profile = PowerProfile(
+        hass,
+        "test",
+        "test",
+        get_test_profile_dir("sub_profile"),
+        {
+            "name": "Base",
+            "calculation_strategy": CalculationStrategy.FIXED,
+            "fixed_config": {CONF_POWER: 1},
+        },
+        sub_profiles=[
+            ("a", {"name": "Profile A", "fixed_config": {CONF_POWER: 2}, "standby_power": 3}),
+            ("b", {"name": "Profile B", "fixed_config": {CONF_POWER: 4}}),
+        ],
+    )
+
+    await power_profile.select_sub_profile("a")
+    assert power_profile.name == "Profile A"
+    assert power_profile.fixed_config == {CONF_POWER: 2}
+    assert power_profile.standby_power == 3
+
+    await power_profile.select_sub_profile("b")
+    assert power_profile.name == "Profile B"
+    assert power_profile.fixed_config == {CONF_POWER: 4}
+    assert power_profile.standby_power == 0
+
+
+async def test_get_model_directory_root_only_ignores_selected_sub_profile(hass: HomeAssistant) -> None:
+    library = await ProfileLibrary.factory(hass)
+    power_profile = await library.get_profile(
+        ModelInfo("test", "test/a"),
+        custom_directory=get_test_profile_dir("sub_profile2"),
+    )
+
+    assert power_profile.get_model_directory(root_only=True) == get_test_profile_dir("sub_profile2")
+    assert power_profile.get_model_directory() == get_test_profile_dir("sub_profile2/a")
+
+
+def test_default_calculation_strategy_lut(hass: HomeAssistant) -> None:
+    """By default the calculation strategy must be LUT when no strategy is configured"""
+    power_profile = PowerProfile(hass, "signify", "LCT010", "", {})
+    assert power_profile.calculation_strategy == CalculationStrategy.LUT
+
+
+async def test_error_when_sub_profile_not_exists(hass: HomeAssistant) -> None:
+    library = await ProfileLibrary.factory(hass)
+    model_info = ModelInfo("yeelight", "YLDL01YL/ambilight_boo")
+
+    with pytest.raises(ModelNotSupportedError):
+        await library.get_profile(model_info)
+
+
+async def test_unsupported_entity_domain(hass: HomeAssistant) -> None:
+    library = await ProfileLibrary.factory(hass)
+    power_profile = await library.get_profile(
+        ModelInfo("signify", "LCA007"),
+    )
+    assert power_profile.is_entity_domain_supported(
+        RegistryEntryWithDefaults(entity_id="light.test", platform="hue", unique_id="1234"),
+    )
+    assert not power_profile.is_entity_domain_supported(
+        RegistryEntryWithDefaults(entity_id="switch.test", platform="bla", unique_id="1234"),
+    )
+
+
+async def test_hue_switch_supported_entity_domain(hass: HomeAssistant) -> None:
+    library = await ProfileLibrary.factory(hass)
+    power_profile = await library.get_profile(
+        ModelInfo("signify", "LOM001"),
+    )
+    assert power_profile.is_entity_domain_supported(
+        RegistryEntryWithDefaults(
+            entity_id="light.test",
+            unique_id="1234",
+            platform="hue",
+        ),
+    )
+
+
+async def test_vacuum_entity_domain_supported(hass: HomeAssistant) -> None:
+    library = await ProfileLibrary.factory(hass)
+    power_profile = await library.get_profile(
+        ModelInfo("roborock", "s6_maxv"),
+        custom_directory=get_test_profile_dir("vacuum_robot"),
+    )
+    assert power_profile.is_entity_domain_supported(
+        RegistryEntryWithDefaults(
+            entity_id="vacuum.test",
+            unique_id="1234",
+            platform="xiaomi_miio",
+        ),
+    )
+
+
+async def test_light_domain_supported_for_smart_switch_device_type(hass: HomeAssistant) -> None:
+    library = await ProfileLibrary.factory(hass)
+    power_profile = await library.get_profile(
+        ModelInfo("dummy", "dummy"),
+        custom_directory=get_test_profile_dir("smart_switch"),
+    )
+    assert power_profile.is_entity_domain_supported(
+        SourceEntity("light.test", "test", "light"),
+    )
+
+
+def test_media_player_domain_supported_for_set_top_box_device_type() -> None:
+    assert is_device_type_supported_for_entity(
+        DeviceType.SET_TOP_BOX,
+        RegistryEntryWithDefaults(
+            entity_id="media_player.test",
+            unique_id="1234",
+            platform="cast",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "device_type,entity_id",
+    [
+        (DeviceType.AIR_CONDITIONER, "climate.test"),
+        (DeviceType.AIR_PURIFIER, "fan.test"),
+        (DeviceType.HUMIDIFIER, "humidifier.test"),
+        (DeviceType.WATER_HEATER, "water_heater.test"),
+    ],
+)
+def test_entity_domain_supported_for_device_type(device_type: DeviceType, entity_id: str) -> None:
+    assert is_device_type_supported_for_entity(
+        device_type,
+        RegistryEntryWithDefaults(
+            entity_id=entity_id,
+            unique_id="1234",
+            platform="test",
+        ),
+    )
+
+
+async def test_discovery_does_not_break_when_unknown_device_type(hass: HomeAssistant) -> None:
+    library = await ProfileLibrary.factory(hass)
+    power_profile = await library.get_profile(
+        ModelInfo("test", "test"),
+        custom_directory=get_test_profile_dir("unknown_device_type"),
+    )
+    assert not power_profile.is_entity_domain_supported(
+        SourceEntity("switch.test", "test", "switch"),
+    )
+
+
+async def test_selecting_sub_profile_is_ignored(hass: HomeAssistant) -> None:
+    """
+    For power profiles not supporting sub profiles it should ignore setting the sub profile
+    This should not happen anyway
+    """
+    library = await ProfileLibrary.factory(hass)
+    power_profile = await library.get_profile(
+        ModelInfo("dummy", "dummy"),
+        custom_directory=get_test_profile_dir("smart_switch"),
+    )
+
+    await power_profile.select_sub_profile("foo")
+    assert not power_profile.sub_profile
+
+
+async def test_device_type(hass: HomeAssistant) -> None:
+    library = await ProfileLibrary.factory(hass)
+    power_profile = await library.get_profile(
+        ModelInfo("dummy", "dummy"),
+        custom_directory=get_test_profile_dir("media_player"),
+    )
+
+    assert power_profile.device_type == DeviceType.SMART_SPEAKER
+
+
+@pytest.mark.parametrize(
+    "json_data,expected_result",
+    [
+        (
+            {
+                "calculation_strategy": CalculationStrategy.FIXED,
+            },
+            True,
+        ),
+        (
+            {
+                "calculation_strategy": CalculationStrategy.LINEAR,
+            },
+            True,
+        ),
+        (
+            {
+                "calculation_strategy": CalculationStrategy.COMPOSITE,
+                "fields": {
+                    "foo": {
+                        "label": "Foo",
+                        "selector": {"entity": {}},
+                    },
+                },
+            },
+            True,
+        ),
+        (
+            {
+                "calculation_strategy": CalculationStrategy.FIXED,
+                "fixed_config": {
+                    "power": 50,
+                },
+            },
+            False,
+        ),
+        (
+            {
+                "calculation_strategy": CalculationStrategy.LINEAR,
+                "linear_config": {
+                    "min_power": 50,
+                    "max_power": 100,
+                },
+            },
+            False,
+        ),
+        (
+            {
+                "calculation_strategy": CalculationStrategy.MULTI_SWITCH,
+                "multi_switch_config": {
+                    "power": 0.725,
+                    "power_off": 0.225,
+                },
+            },
+            True,
+        ),
+    ],
+)
+async def test_needs_user_configuration(hass: HomeAssistant, json_data: dict[str, Any], expected_result: bool) -> None:
+    power_profile = PowerProfile(
+        hass,
+        manufacturer="test",
+        model="test",
+        directory=get_test_profile_dir("media_player"),
+        json_data=json_data,
+    )
+
+    assert await power_profile.needs_user_configuration == expected_result
+
+
+@pytest.mark.parametrize(
+    "linear_config,expected_result",
+    [
+        (None, True),
+        ({CONF_GAMMA_CURVE: 2.4}, True),
+        ({CONF_POWER_CURVE: ["0 -> 0", "1 -> 1"]}, True),
+        ({CONF_MIN_POWER: 1, CONF_GAMMA_CURVE: 2.4}, True),
+        ({CONF_MAX_POWER: 20, CONF_GAMMA_CURVE: 2.4}, False),
+        ({CONF_CALIBRATE: ["0 -> 1", "255 -> 20"]}, False),
+    ],
+)
+def test_needs_linear_config(
+    hass: HomeAssistant,
+    linear_config: dict[str, Any] | None,
+    expected_result: bool,
+) -> None:
+    json_data: dict[str, Any] = {"calculation_strategy": CalculationStrategy.LINEAR}
+    if linear_config is not None:
+        json_data["linear_config"] = linear_config
+
+    power_profile = PowerProfile(
+        hass,
+        manufacturer="test",
+        model="test",
+        directory=get_test_profile_dir("smart_dimmer"),
+        json_data=json_data,
+    )
+
+    assert power_profile.needs_linear_config == expected_result
+
+
+@pytest.mark.parametrize(
+    "json_data,expected_result",
+    [
+        (
+            {
+                "calculation_strategy": CalculationStrategy.FIXED,
+                "fixed_config": {
+                    "power": 50,
+                },
+            },
+            False,
+        ),
+        (
+            {
+                "calculation_strategy": CalculationStrategy.FIXED,
+            },
+            True,
+        ),
+        (
+            {
+                "calculation_strategy": CalculationStrategy.FIXED,
+                "only_self_usage": True,
+            },
+            False,
+        ),
+        (
+            {
+                "calculation_strategy": CalculationStrategy.LINEAR,
+                "linear_config": {
+                    "min_power": 50,
+                    "max_power": 100,
+                },
+            },
+            False,
+        ),
+        (
+            {
+                "calculation_strategy": CalculationStrategy.LINEAR,
+            },
+            True,
+        ),
+        (
+            {
+                "calculation_strategy": CalculationStrategy.LINEAR,
+                "only_self_usage": True,
+            },
+            False,
+        ),
+    ],
+)
+async def test_needs_fixed_power(hass: HomeAssistant, json_data: dict[str, Any], expected_result: bool) -> None:
+    power_profile = PowerProfile(
+        hass,
+        manufacturer="test",
+        model="test",
+        directory=get_test_profile_dir("smart_switch"),
+        json_data=json_data,
+    )
+
+    assert await power_profile.needs_user_configuration == expected_result
+
+
+@pytest.mark.parametrize(
+    "json_data, expected_sensor_config",
+    [
+        (
+            {"only_self_usage": True},
+            {
+                CONF_ENERGY_SENSOR_NAMING: DEFAULT_SELF_USAGE_ENERGY_NAME_PATTERN,
+                CONF_POWER_SENSOR_NAMING: DEFAULT_SELF_USAGE_POWER_NAME_PATTERN,
+            },
+        ),
+        (
+            {"only_self_usage": True, "sensor_config": {CONF_POWER_SENSOR_NAMING: "{} Custom Power"}},
+            {
+                CONF_ENERGY_SENSOR_NAMING: DEFAULT_SELF_USAGE_ENERGY_NAME_PATTERN,
+                CONF_POWER_SENSOR_NAMING: "{} Custom Power",
+            },
+        ),
+        (
+            {"only_self_usage": True, "sensor_config": {CONF_ENERGY_SENSOR_NAMING: "{} Custom Energy"}},
+            {
+                CONF_ENERGY_SENSOR_NAMING: "{} Custom Energy",
+                CONF_POWER_SENSOR_NAMING: DEFAULT_SELF_USAGE_POWER_NAME_PATTERN,
+            },
+        ),
+        (
+            {"sensor_config": {CONF_POWER_SENSOR_NAMING: "{} Custom Power"}},
+            {CONF_POWER_SENSOR_NAMING: "{} Custom Power"},
+        ),
+        (
+            {},
+            {},
+        ),
+    ],
+)
+async def test_sensor_config_defaults_power_sensor_naming_for_self_usage_profiles(
+    hass: HomeAssistant,
+    json_data: dict[str, Any],
+    expected_sensor_config: dict[str, Any],
+) -> None:
+    power_profile = PowerProfile(
+        hass,
+        manufacturer="test",
+        model="test",
+        directory=get_test_profile_dir("smart_switch"),
+        json_data=json_data,
+    )
+
+    assert power_profile.sensor_config == expected_sensor_config
+
+
+@pytest.mark.parametrize(
+    "test_profile,expected_translation_key",
+    [
+        (
+            "smart_switch",
+            "component.powercalc.common.remarks_smart_switch",
+        ),
+        (
+            "smart_switch_with_pm",
+            None,
+        ),
+        (
+            "smart_dimmer",
+            "component.powercalc.common.remarks_smart_dimmer",
+        ),
+        (
+            "smart_dimmer_with_pm",
+            None,
+        ),
+        (
+            "media_player",
+            None,
+        ),
+    ],
+)
+async def test_discovery_flow_remarks(
+    hass: HomeAssistant,
+    test_profile: str,
+    expected_translation_key: str | None,
+) -> None:
+    library = await ProfileLibrary.factory(hass)
+    power_profile = await library.get_profile(
+        ModelInfo("test", "test"),
+        custom_directory=get_test_profile_dir(test_profile),
+    )
+
+    translations_keys = [
+        "component.powercalc.common.remarks_smart_dimmer",
+        "component.powercalc.common.remarks_smart_switch",
+    ]
+    with patch(
+        "homeassistant.helpers.translation.async_get_cached_translations",
+        return_value={key: key for key in translations_keys},
+    ):
+        assert power_profile.config_flow_discovery_remarks == expected_translation_key
+
+
+async def test_calculation_enabled_condition_is_not_cached(hass: HomeAssistant) -> None:
+    """JSON data is cached per model.
+
+    Previously this caused the `calculation_enabled_condition` placeholder to be replaced with
+    the first entity, after which the same condition was reused for subsequent retrievals because
+    the [[entity]] placeholder was gone. See https://github.com/bramstroker/homeassistant-powercalc/issues/3118
+    """
+    await run_powercalc_setup(hass)
+
+    entry_a = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_ENTITY_ID: "media_player.a",
+            CONF_MANUFACTURER: "sonos",
+            CONF_MODEL: "playbar",
+        },
+    )
+    entry_b = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_ENTITY_ID: "media_player.b",
+            CONF_MANUFACTURER: "sonos",
+            CONF_MODEL: "playbar",
+        },
+    )
+    await hass.config_entries.async_add(entry_a)
+    await hass.config_entries.async_add(entry_b)
+
+    await set_states(
+        hass,
+        [("media_player.a", STATE_PLAYING, {ATTR_MEDIA_VOLUME_LEVEL: 1}), ("media_player.b", STATE_PAUSED)],
+    )
+    assert_entity_state(hass, "sensor.a_power", "26.90")
+    assert_entity_state(hass, "sensor.b_power", "5.20")
+
+
+@pytest.mark.parametrize(
+    "test_profile,expected_result",
+    [
+        (
+            "sub_profile_only_default",
+            True,
+        ),
+        (
+            "sub_profile_match_integration",
+            False,
+        ),
+    ],
+)
+async def test_requires_manual_sub_profile_selection(
+    hass: HomeAssistant,
+    test_profile: str,
+    expected_result: bool,
+) -> None:
+    library = await ProfileLibrary.factory(hass)
+    power_profile = await library.get_profile(
+        ModelInfo("test", "test"),
+        custom_directory=get_test_profile_dir(test_profile),
+    )
+    assert await power_profile.requires_manual_sub_profile_selection == expected_result
+
+
+@pytest.mark.parametrize(
+    "manufacturer,model,custom_dir,expected_result",
+    [
+        ("test", "test", get_test_profile_dir("sub_profile_only_default"), True),
+        (
+            "test",
+            "fixed",
+            None,
+            True,
+        ),
+        (
+            "aeotec",
+            "ZW117",
+            None,
+            False,
+        ),
+    ],
+)
+async def test_is_custom_profile(
+    hass: HomeAssistant,
+    manufacturer: str,
+    model: str,
+    custom_dir: str | None,
+    expected_result: bool,
+) -> None:
+    library = await ProfileLibrary.factory(hass)
+    power_profile = await library.get_profile(ModelInfo(manufacturer, model), custom_directory=custom_dir)
+    assert power_profile.is_custom_profile is expected_result
+
+
+async def test_documentation_url(hass: HomeAssistant) -> None:
+    library = await ProfileLibrary.factory(hass)
+    power_profile = await library.get_profile(
+        ModelInfo("test", "test"),
+        custom_directory=get_test_profile_dir("ups"),
+        process_variables=False,
+    )
+    assert power_profile.documentation_url == "https://docs.powercalc.nl/cookbook/ups/"
+
+
+def test_documentation_url_not_set(hass: HomeAssistant) -> None:
+    power_profile = PowerProfile(hass, "test", "test", "", {})
+    assert power_profile.documentation_url is None

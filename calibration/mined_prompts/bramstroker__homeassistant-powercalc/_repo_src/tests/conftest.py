@@ -1,0 +1,159 @@
+import asyncio
+from collections.abc import Generator
+import contextlib
+from functools import lru_cache
+import gzip
+import inspect
+import json
+import logging
+import os
+from pathlib import Path
+import shutil
+from typing import Any, cast
+from unittest.mock import AsyncMock, Mock, patch
+
+from _pytest.fixtures import SubRequest
+import aiohttp
+import aioresponses.core
+from homeassistant import loader
+from homeassistant.const import CONF_ENTITY_ID
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.storage import STORAGE_DIR
+import pytest
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+)
+
+from custom_components.powercalc.const import (
+    BUILT_IN_LIBRARY_DIR,
+    CONF_FIXED,
+    CONF_POWER,
+    CONF_SENSOR_TYPE,
+    DOMAIN,
+    SensorType,
+)
+from custom_components.powercalc.helpers import get_library_json_path, get_library_path
+from tests.common import get_test_config_dir
+
+# Remove this once aioresponses supports aiohttp 3.14+.
+# See https://github.com/pnuckowski/aioresponses/issues/289.
+_client_response_init = aiohttp.ClientResponse.__init__
+if "stream_writer" in inspect.signature(_client_response_init).parameters:
+    _client_response_init_any = cast(Any, _client_response_init)
+
+    def _patched_client_response_init(self: aiohttp.ClientResponse, *args: object, **kwargs: object) -> None:
+        kwargs.setdefault("stream_writer", Mock(output_size=0))
+        _client_response_init_any(self, *args, **kwargs)
+
+    aiohttp.ClientResponse.__init__ = _patched_client_response_init  # type: ignore[method-assign]
+
+    def _patched_stream_reader_factory(loop: asyncio.AbstractEventLoop | None = None) -> aiohttp.StreamReader:
+        return aiohttp.StreamReader(Mock(), limit=2**16, loop=loop)
+
+    aioresponses.core.stream_reader_factory = _patched_stream_reader_factory
+
+
+@lru_cache(maxsize=1)
+def _load_test_library_json() -> dict[str, Any]:
+    with open(get_library_json_path()) as f:
+        return cast(dict[str, Any], json.load(f))
+
+
+@pytest.fixture(autouse=True)
+def set_logging_levels(request: SubRequest) -> None:
+    logging.getLogger("homeassistant").setLevel(logging.WARNING)
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
+    if "caplog" in request.fixturenames:
+        caplog = request.getfixturevalue("caplog")
+        caplog.set_level(logging.DEBUG, logger="custom_components.powercalc")
+
+
+@pytest.fixture(autouse=True)
+def auto_enable_custom_integrations(request: SubRequest) -> None:
+    if "hass" in request.fixturenames:
+        request.getfixturevalue("enable_custom_integrations")
+
+
+@pytest.fixture(autouse=True)
+def configure_hass_config_dir(request: SubRequest) -> None:
+    if "hass" not in request.fixturenames:
+        return
+    hass = request.getfixturevalue("hass")
+    hass.config.config_dir = get_test_config_dir()
+
+    # The test .storage directory is scratch that survives between runs. The loader prefers a
+    # cached library.json when there is one, so drop it to keep every test starting from the
+    # same state a clean checkout has. Downloaded profiles are kept, they are only a cache.
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(hass.config.path(STORAGE_DIR, BUILT_IN_LIBRARY_DIR, "library.json"))
+
+
+@pytest.fixture(autouse=True)
+async def enable_event_loop_debug() -> None:
+    """Override the plugin default to keep asyncio debug disabled in normal test runs."""
+    asyncio.get_running_loop().set_debug(False)
+
+
+@pytest.fixture
+def enable_custom_integrations(hass: HomeAssistant) -> None:
+    """Enable custom integrations defined in the test dir."""
+    hass.data.pop(loader.DATA_CUSTOM_COMPONENTS)
+
+
+@pytest.fixture(autouse=True)
+def expected_lingering_timers() -> bool:
+    return True
+
+
+@pytest.fixture
+def mock_config_entry() -> MockConfigEntry:
+    """Return the default mocked config entry."""
+    return MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
+            CONF_ENTITY_ID: "input_boolean.test",
+            CONF_FIXED: {
+                CONF_POWER: 50,
+            },
+        },
+        unique_id="aabbccddeeff",
+        title="test",
+    )
+
+
+@pytest.fixture
+def mock_flow_init(hass: HomeAssistant) -> Generator:
+    """Mock hass.config_entries.flow.async_init."""
+    with patch.object(
+        hass.config_entries.flow,
+        "async_init",
+        return_value=AsyncMock(),
+    ) as mock_init:
+        yield mock_init
+
+
+@pytest.fixture(autouse=True)
+def mock_remote_loader(request: SubRequest) -> Generator:
+    if "skip_remote_loader_mocking" in request.keywords:
+        yield
+        return
+
+    def side_effect(manufacturer: str, model: str, storage_path: str, _: str) -> None:
+        source_dir = get_library_path(f"{manufacturer}/{model}")
+        shutil.copytree(source_dir, storage_path, dirs_exist_ok=True)
+        for csv_path in Path(storage_path).rglob("*.csv"):
+            compressed_path = csv_path.with_name(f"{csv_path.name}.gz")
+            compressed_path.write_bytes(gzip.compress(csv_path.read_bytes(), mtime=0))
+            csv_path.unlink()
+
+    remote_loader_class = "custom_components.powercalc.power_profile.loader.remote.RemoteLoader"
+    with (
+        patch(f"{remote_loader_class}.download_profile") as mock_download,
+        patch(f"{remote_loader_class}.load_library_json") as mock_load_lib,
+    ):
+        mock_download.side_effect = side_effect
+
+        # Swallow the prefer_cached argument, the test library is always served from disk.
+        mock_load_lib.side_effect = lambda *_args, **_kwargs: _load_test_library_json()
+        yield

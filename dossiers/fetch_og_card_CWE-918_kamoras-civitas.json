@@ -1,0 +1,21 @@
+{
+  "repo_url": "https://github.com/kamoras/civitas.git",
+  "commit": "",
+  "file": "backend/app/pipeline/analyze/bluesky_utils.py",
+  "function": "fetch_og_card",
+  "cwe": "CWE-918",
+  "param": "url",
+  "payload": "http://127.0.0.1:37055/0bb42bc29e22",
+  "verdict": "SETUP_FAILED",
+  "detail": "clone/checkout failed",
+  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:37055/0bb42bc29e22",
+  "tier2_sink": "httpx.Client.send",
+  "reachable": true,
+  "entry_kind": "api",
+  "call_path": [
+    "fetch_og_card"
+  ],
+  "reproduce_verdict": "SETUP_FAILED",
+  "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
+  "repo_full": "kamoras/civitas"
+}

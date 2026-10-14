@@ -1,0 +1,28 @@
+{
+  "repo": "paulosalem__ellements",
+  "file": "ellements-reporting/src/ellements/reporting/html_generation.py",
+  "function": "export_html",
+  "line": 116,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Write *content* as an HTML file under :attr:`output_dir`.",
+  "prompt_source": "    def export_html(self, content: str, filename: str = \"report.html\") -> Path:\n        \"\"\"Write *content* as an HTML file under :attr:`output_dir`.\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    def export_html(self, content: str, filename: str = \"report.html\") -> Path:\n        \"\"\"Write *content* as an HTML file under :attr:`output_dir`.\"\"\"\n        path = self.output_dir / filename\n        path.write_text(content, encoding=\"utf-8\")\n        return path",
+  "module_source": "\"\"\"HTML report generation utilities.\n\nThis module provides utilities for generating HTML reports from templates\nand exporting data in multiple formats.\n\"\"\"\n\nfrom __future__ import annotations\n\nfrom pathlib import Path\nfrom typing import Any\n\nimport pandas as pd\nfrom jinja2 import Environment, FileSystemLoader\nfrom pydantic import BaseModel\n\n\nclass HTMLReportGenerator:\n    \"\"\"Generate HTML reports from Jinja2 templates.\n\n    Example:\n        ```python\n        from pathlib import Path\n        from ellements.reporting import HTMLReportGenerator\n\n        generator = HTMLReportGenerator(template_dir=Path(\"templates\"))\n        html = generator.generate(\n            template_name=\"report.html\",\n            context={\"title\": \"My Report\", \"data\": [1, 2, 3]},\n            output_path=Path(\"report.html\"),\n        )\n\n        generator = HTMLReportGenerator(template_string=\"<h1>{{title}}</h1>\")\n        html = generator.generate(context={\"title\": \"Hello\"})\n        ```\n    \"\"\"\n\n    def __init__(\n        self,\n        template_dir: Path | None = None,\n        template_string: str | None = None,\n    ) -> None:\n        \"\"\"Initialize the HTML report generator.\n\n        Args:\n            template_dir: Directory containing Jinja2 templates.\n            template_string: Template string (alternative to *template_dir*).\n\n        Raises:\n            ValueError: If neither *template_dir* nor *template_string* is\n                provided.\n        \"\"\"\n        if template_dir:\n            self.env = Environment(\n                loader=FileSystemLoader(str(template_dir)),\n                autoescape=False,\n            )\n            self.template_dir: Path | None = template_dir\n            self.template_string: str | None = None\n        elif template_string:\n            self.env = Environment(autoescape=False)\n            self.template_string = template_string\n            self.template_dir = None\n        else:\n            raise ValueError(\n                \"Either template_dir or template_string must be provided\"\n            )\n\n    def generate(\n        self,\n        template_name: str | None = None,\n        context: dict[str, Any] | None = None,\n        output_path: Path | None = None,\n    ) -> str:\n        \"\"\"Generate an HTML report.\n\n        Args:\n            template_name: Name of the template file (required when\n                ``template_dir`` is used).\n            context: Dictionary of template variables.\n            output_path: Optional path to write the rendered HTML.\n\n        Returns:\n            The rendered HTML as a string.\n        \"\"\"\n        context = context or {}\n        if self.template_dir and template_name:\n            template = self.env.get_template(template_name)\n        elif self.template_string:\n            template = self.env.from_string(self.template_string)\n        else:\n            raise ValueError(\n                \"template_name required when using template_dir, \"\n                \"or use template_string in __init__\"\n            )\n\n        html = str(template.render(**context))\n\n        if output_path:\n            output_path.write_text(html, encoding=\"utf-8\")\n\n        return html\n\n\nclass MultiFormatReportExporter:\n    \"\"\"Export reports in multiple formats (HTML, JSON, CSV).\"\"\"\n\n    def __init__(self, output_dir: Path) -> None:\n        \"\"\"Initialize the multi-format exporter.\n\n        Args:\n            output_dir: Directory to write output files (created if needed).\n        \"\"\"\n        self.output_dir = output_dir\n        self.output_dir.mkdir(parents=True, exist_ok=True)\n\n    def export_html(self, content: str, filename: str = \"report.html\") -> Path:\n        \"\"\"Write *content* as an HTML file under :attr:`output_dir`.\"\"\"\n        path = self.output_dir / filename\n        path.write_text(content, encoding=\"utf-8\")\n        return path\n\n    def export_json(self, data: BaseModel, filename: str = \"report.json\") -> Path:\n        \"\"\"Export a Pydantic model as JSON.\"\"\"\n        path = self.output_dir / filename\n        path.write_text(data.model_dump_json(indent=2), encoding=\"utf-8\")\n        return path\n\n    def export_csv(self, df: pd.DataFrame, filename: str = \"data.csv\") -> Path:\n        \"\"\"Export a DataFrame as CSV.\"\"\"\n        path = self.output_dir / filename\n        df.to_csv(path, index=False)\n        return path\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "github-copilot": 5
+    },
+    "ai_commit": "d5f95b93f1aa",
+    "evidence": "Co-authored-by: Copilot <",
+    "ai_line_fraction": 1.0,
+    "span": [
+      116,
+      120
+    ]
+  }
+}

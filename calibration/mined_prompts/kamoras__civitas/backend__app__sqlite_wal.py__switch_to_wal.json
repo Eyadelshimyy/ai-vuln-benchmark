@@ -1,0 +1,28 @@
+{
+  "repo": "kamoras__civitas",
+  "file": "backend/app/sqlite_wal.py",
+  "function": "switch_to_wal",
+  "line": 18,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Whether `path` is in WAL mode, switching it if it isn't, trying for\nat most `within_s` seconds.",
+  "prompt_source": "def switch_to_wal(path: str, within_s: float) -> bool:\n    \"\"\"Whether `path` is in WAL mode, switching it if it isn't, trying for\n    at most `within_s` seconds.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def switch_to_wal(path: str, within_s: float) -> bool:\n    \"\"\"Whether `path` is in WAL mode, switching it if it isn't, trying for\n    at most `within_s` seconds.\"\"\"\n    deadline = time.monotonic() + within_s\n    while True:\n        remaining = max(deadline - time.monotonic(), 0.01)\n        try:\n            conn = sqlite3.connect(path, timeout=remaining, isolation_level=None)\n            try:\n                if conn.execute(\"PRAGMA journal_mode=WAL\").fetchone()[0].lower() == \"wal\":\n                    return True\n            finally:\n                conn.close()\n        except sqlite3.OperationalError:\n            pass\n        if time.monotonic() >= deadline:\n            return False\n        time.sleep(0.01)",
+  "module_source": "\"\"\"Switching a SQLite file several processes share to WAL.\n\nWAL lets readers go on while a writer writes \u2014 without it a long write in\none process holds every reader in another off until it commits. The switch\nitself needs the file to itself, so while another process holds a\ntransaction it can't happen, and two processes switching at once can have\nSQLite refuse the loser at once rather than wait. So: a short-lived\nconnection of its own (a caller's shared connection keeps its own busy\ntimeout, and its concurrent users never see it changed), retried until\n`within_s` runs out. The mode is persistent in the file, and every\nconnection follows a switch made by another.\n\"\"\"\n\nimport sqlite3\nimport time\n\n\ndef switch_to_wal(path: str, within_s: float) -> bool:\n    \"\"\"Whether `path` is in WAL mode, switching it if it isn't, trying for\n    at most `within_s` seconds.\"\"\"\n    deadline = time.monotonic() + within_s\n    while True:\n        remaining = max(deadline - time.monotonic(), 0.01)\n        try:\n            conn = sqlite3.connect(path, timeout=remaining, isolation_level=None)\n            try:\n                if conn.execute(\"PRAGMA journal_mode=WAL\").fetchone()[0].lower() == \"wal\":\n                    return True\n            finally:\n                conn.close()\n        except sqlite3.OperationalError:\n            pass\n        if time.monotonic() >= deadline:\n            return False\n        time.sleep(0.01)\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 18
+    },
+    "ai_commit": "08c6212d60d2",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 1.0,
+    "span": [
+      18,
+      35
+    ]
+  }
+}

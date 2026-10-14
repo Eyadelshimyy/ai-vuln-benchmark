@@ -1,0 +1,22 @@
+{
+  "repo_url": "https://github.com/PrjBbrosa/data-analyzer.git",
+  "commit": "",
+  "file": "mf4_analyzer/io/asc_can_format.py",
+  "function": "_preflight_asc_format",
+  "cwe": "CWE-22",
+  "param": "fp",
+  "payload": "/tmp/tier2_proof_ye93ahxn/secret_6a114bc0f497.txt",
+  "verdict": "NEEDS_MANUAL",
+  "detail": "target '_preflight_asc_format' is internal (underscore-prefixed or under a private module). An external attacker reaches it only via a public caller / CLI / HTTP entry -- trace that path by hand before disclosing.",
+  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_ye93ahxn/secret_6a114bc0f497.txt (proven by live execution trace; read-traversal, no output echo required)",
+  "tier2_sink": "open",
+  "reachable": true,
+  "entry_kind": "api",
+  "call_path": [
+    "read_asc_outcome",
+    "_preflight_asc_format"
+  ],
+  "reproduce_verdict": "NEEDS_MANUAL",
+  "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
+  "repo_full": "PrjBbrosa/data-analyzer"
+}

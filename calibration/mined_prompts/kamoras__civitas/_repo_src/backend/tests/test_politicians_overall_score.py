@@ -1,0 +1,205 @@
+"""_senator_overall (politicians.py) now delegates its weighted sum to
+score_calculator.compute_overall_score instead of carrying a fourth copy
+of the same SCORE_WEIGHTS formula (senate_pipeline.py, house_pipeline.py,
+and the senator/representative leaderboards were the other three, deduped
+in #82/#83). This locks in its remaining local behavior, the
+all-zero "not yet scored" guard, and that it adds no rounding of its own:
+the page rounds once, for display."""
+
+import json
+
+import pytest
+
+from app.api.politicians import _chamber_rank, _president_overall, _senator_overall, list_politicians
+from app.models import Justice, President, Representative, Senator
+from app.pipeline.analyze.score_calculator import compute_overall_score
+from app.score_display import displayed_score
+
+
+def test_all_zero_scores_means_not_yet_scored():
+    # Explicit 0.0s, not bare construction: SQLAlchemy column defaults
+    # apply at INSERT, not at object construction, so an uncommitted bare
+    # Senator() has None fields, not 0.0 — a different (untested-here)
+    # code path than what a real not-yet-scored DB row looks like.
+    s = Senator(
+        id="S001", name="New Senator", state="CA", party="D",
+        score_funding_independence=0.0, score_promise_persistence=0.0,
+        score_constituent_alignment=0.0, score_funding_diversity=0.0,
+        score_legislative_effectiveness=0.0,
+    )
+    assert _senator_overall(s) is None
+
+
+def test_matches_compute_overall_score():
+    s = Senator(
+        id="S001", name="Test Senator", state="CA", party="D",
+        score_funding_independence=61, score_promise_persistence=72,
+        score_constituent_alignment=48, score_funding_diversity=55,
+        score_legislative_effectiveness=80,
+    )
+    assert _senator_overall(s) == compute_overall_score(s)
+
+
+def test_the_directory_shows_the_scorecards_whole_number():
+    # Sub-scores of a real senator (2026-10-09): overall 62.45, which the
+    # scorecard shows as 62. Rounded to one decimal here first, it became
+    # 62.5 and the directory and the share card showed 63.
+    s = Senator(
+        id="S001", name="Test Senator", state="VT", party="I",
+        score_funding_independence=80.0, score_promise_persistence=0.0,
+        score_constituent_alignment=67.0, score_funding_diversity=81.0,
+        score_legislative_effectiveness=41.0,
+    )
+    assert _senator_overall(s) == 62.45
+    assert displayed_score(_senator_overall(s)) == displayed_score(compute_overall_score(s)) == 62
+
+
+def test_works_for_representatives_too_via_duck_typing():
+    r = Representative(
+        id="R001", name="Test Rep", state="CA", district=1, party="D",
+        score_funding_independence=61, score_promise_persistence=72,
+        score_constituent_alignment=48, score_funding_diversity=55,
+        score_legislative_effectiveness=80,
+    )
+    assert _senator_overall(r) == compute_overall_score(r)
+
+
+class TestPresidentOverall:
+    """2026-07 (#218 review S4): the four President score_* columns are
+    nullable — a dimension that's genuinely inapplicable or not-yet-
+    computed is None, never 0.0 (unlike Senator/Representative's 0.0
+    "not yet scored" sentinel above). `v == 0.0` never matches None, so
+    a fresh, fully-unscored president used to pass the old guard and get
+    a real-looking overall score (compute_president_overall_score's
+    defensive 0.0 fallback) instead of being excluded entirely; the guard
+    also never checked score_historical_legacy at all."""
+
+    def test_fully_unscored_president_returns_none(self):
+        p = President(
+            id="test-99", name="Test President", party="D", number=99,
+            term_start="2029-01-20",
+        )
+        assert _president_overall(p) is None
+
+    def test_only_historical_legacy_present_is_not_treated_as_unscored(self):
+        # Regression: the old guard didn't check score_historical_legacy
+        # at all, but this specifically verifies a president who has ONLY
+        # that dimension (e.g. a fully historical figure pre-dating every
+        # mechanical data source) is still scored, not excluded.
+        p = President(
+            id="test-98", name="Test President", party="D", number=98,
+            term_start="1850-01-20", score_historical_legacy=42.0,
+        )
+        assert _president_overall(p) is not None
+
+    def test_zero_is_a_real_score_not_a_sentinel(self):
+        # Unlike senators/reps, 0.0 is a legitimate (if extreme) computed
+        # value for a president, never a placeholder — must not be
+        # excluded just because every present dimension happens to be 0.
+        p = President(
+            id="test-97", name="Test President", party="D", number=97,
+            term_start="1850-01-20", score_public_mandate=0.0,
+            score_effectiveness=0.0, score_agency_alignment=0.0,
+            score_historical_legacy=0.0,
+        )
+        assert _president_overall(p) == 0.0
+
+
+class TestMalformedRelatedOfficials:
+    """`ActionIssue.related_senators` / `related_officials` are JSON TEXT
+    columns with nothing enforcing the shape of their elements, and
+    `_get_active_issues` indexes those elements as dicts.
+
+    Unguarded, a bare string in one row raised AttributeError inside the
+    profile query — a 500 on `/api/politicians/{id}`, which is the whole
+    profile page for that member, not a missing "active issues" section.
+    The sibling readers in bill_service.py had the same shape; this file
+    covers the third one (see TestMalformedRelatedBillIds there).
+    """
+
+    def _issue(self, db, *, senators=None, officials=None):
+        from app.models import ActionIssue
+        issue = ActionIssue(
+            date="2026-07-01", rank=1, title="Trending", is_current=True,
+            related_senators=senators, related_officials=officials,
+        )
+        db.add(issue)
+        db.flush()
+        return issue
+
+    @pytest.mark.parametrize(
+        "raw",
+        # A mixed list holding one WELL-formed matching entry is the next
+        # test, not this one — there the issue should still be found.
+        ['["sen-warren-ma"]', "[null]", "[123]"],
+        ids=["bare-strings", "nulls", "numbers"],
+    )
+    def test_a_malformed_element_does_not_break_the_lookup(self, db_session, raw):
+        from app.api.politicians import _get_active_issues
+        self._issue(db_session, senators=raw)
+
+        assert _get_active_issues("sen-warren-ma", db_session) == []
+
+    def test_a_well_formed_entry_beside_a_malformed_one_still_matches(self, db_session):
+        from app.api.politicians import _get_active_issues
+        self._issue(db_session, senators='["junk", {"id": "sen-warren-ma"}]')
+
+        result = _get_active_issues("sen-warren-ma", db_session)
+
+        assert [r["title"] for r in result] == ["Trending"]
+
+    def test_malformed_related_officials_is_guarded_too(self, db_session):
+        from app.api.politicians import _get_active_issues
+        self._issue(db_session, senators="[]", officials='["potus"]')
+
+        assert _get_active_issues("potus", db_session) == []
+
+
+class TestChamberRank:
+    """The profile states the rank the leaderboard gives: by the overall
+    score as displayed, ties sharing a standard competition rank, among
+    members serving now."""
+
+    def _rep(self, db, rid, score, current=True):
+        db.add(Representative(
+            id=rid, name=rid, state="TN", district=1, party="R", is_current=current,
+            score_funding_independence=score, score_constituent_alignment=score,
+            score_legislative_effectiveness=score,
+        ))
+
+    def test_rank_among_serving_members_with_ties_sharing(self, db_session):
+        from app.api.politicians import _chamber_rank
+        for rid, score in (("a", 80), ("b", 70), ("c", 70), ("d", 60)):
+            self._rep(db_session, rid, score)
+        self._rep(db_session, "gone", 90, current=False)
+        db_session.commit()
+
+        def rank(rid):
+            return _chamber_rank("house", db_session.get(Representative, rid), db_session)
+
+        assert rank("a") == {"rank": 1, "of": 4}
+        assert rank("b") == rank("c") == {"rank": 2, "of": 4}
+        assert rank("d") == {"rank": 4, "of": 4}
+        # Not serving: the leaderboard doesn't rank them, so neither does the profile.
+        assert rank("gone") is None
+
+    def test_a_president_ranks_among_completed_terms_and_a_sitting_one_not_at_all(self, db_session):
+        """As the president leaderboard ranks them (get_president_leaderboard)."""
+        from app.api.politicians import _chamber_rank
+        from app.models import President
+        for pid, number, score, current in (("a-1", 1, 80.0, False), ("b-2", 2, 60.0, False), ("c-3", 3, 70.0, True)):
+            db_session.add(President(id=pid, name=pid, party="D", number=number, term_start="2001-01-20",
+                                     is_current=current, score_public_mandate=score))
+        db_session.commit()
+        assert _chamber_rank("president", db_session.get(President, "b-2"), db_session) == {"rank": 2, "of": 2}
+        assert _chamber_rank("president", db_session.get(President, "c-3"), db_session) is None
+
+    def test_no_justice_is_ranked_or_scored(self, db_session):
+        # Justice v3: a v2 score left in the database ranks no one, and the
+        # directory says "not scored" (null), never 0.
+        for jid, score in (("a", 90.0), ("b", 40.0)):
+            db_session.add(Justice(id=jid, name=jid, last_name=jid, is_active=True, score_loyalty=score))
+        db_session.commit()
+        assert _chamber_rank("scotus", db_session.get(Justice, "a"), db_session) is None
+        rows = json.loads(list_politicians(branch="scotus", state=None, party=None, q=None, db=db_session).body)
+        assert {(r["id"], r["hasScorecard"], r["overallScore"]) for r in rows} == {("a", True, None), ("b", True, None)}

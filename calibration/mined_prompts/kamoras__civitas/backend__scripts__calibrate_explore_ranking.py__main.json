@@ -1,0 +1,28 @@
+{
+  "repo": "kamoras__civitas",
+  "file": "backend/scripts/calibrate_explore_ranking.py",
+  "function": "main",
+  "line": 26,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main() -> int:\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main() -> int:\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument(\"--write\", action=\"store_true\",\n                        help=\"write app/data/explore_ranking.json\")\n    parser.add_argument(\"--samples\", type=int, default=None)\n    args = parser.parse_args()\n\n    from app.database import SessionLocal\n    from app.pipeline.calibrate_ranking import DEFAULT_SAMPLES, compute_calibration\n\n    db = SessionLocal()\n    try:\n        payload = compute_calibration(db, samples=args.samples or DEFAULT_SAMPLES)\n    finally:\n        db.close()\n\n    if not payload:\n        print(\"No explore documents indexed \u2014 run the explore pipeline first.\")\n        return 1\n\n    for key in (\"field_weights\", \"field_weight_mrr\", \"retriever_resolution_ranks\",\n                \"prior_coverage\", \"prior_weights\", \"filter_survival\",\n                \"candidate_pool\", \"source_diversity_cap\", \"fingerprint\",\n                \"text_shape\"):\n        print(f\"{key:28} {payload[key]}\")\n\n    if args.write:\n        OUTPUT.parent.mkdir(parents=True, exist_ok=True)\n        OUTPUT.write_text(json.dumps(payload, indent=2) + \"\\n\")\n        print(f\"\\nwrote {OUTPUT}\")\n    else:\n        print(\"\\n(dry run \u2014 pass --write to update the bundled bootstrap file)\")\n    return 0",
+  "module_source": "\"\"\"CLI over app/pipeline/calibrate_ranking.compute_calibration.\n\nThe explore pipeline recalibrates on every run, so this exists for two\nnarrower jobs: regenerating the bundled bootstrap file that covers a fresh\ndeploy before its first pipeline run, and inspecting a calibration without\nwaiting for one.\n\n    cd backend && .venv/bin/python scripts/calibrate_explore_ranking.py\n    cd backend && .venv/bin/python scripts/calibrate_explore_ranking.py --write\n\nSee app/pipeline/calibrate_ranking.py for what each value is derived from.\n\"\"\"\n\nimport argparse\nimport json\nimport os\nimport pathlib\nimport sys\n\nsys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))\n\nOUTPUT = (pathlib.Path(__file__).resolve().parent.parent\n          / \"app\" / \"data\" / \"explore_ranking.json\")\n\n\ndef main() -> int:\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument(\"--write\", action=\"store_true\",\n                        help=\"write app/data/explore_ranking.json\")\n    parser.add_argument(\"--samples\", type=int, default=None)\n    args = parser.parse_args()\n\n    from app.database import SessionLocal\n    from app.pipeline.calibrate_ranking import DEFAULT_SAMPLES, compute_calibration\n\n    db = SessionLocal()\n    try:\n        payload = compute_calibration(db, samples=args.samples or DEFAULT_SAMPLES)\n    finally:\n        db.close()\n\n    if not payload:\n        print(\"No explore documents indexed \u2014 run the explore pipeline first.\")\n        return 1\n\n    for key in (\"field_weights\", \"field_weight_mrr\", \"retriever_resolution_ranks\",\n                \"prior_coverage\", \"prior_weights\", \"filter_survival\",\n                \"candidate_pool\", \"source_diversity_cap\", \"fingerprint\",\n                \"text_shape\"):\n        print(f\"{key:28} {payload[key]}\")\n\n    if args.write:\n        OUTPUT.parent.mkdir(parents=True, exist_ok=True)\n        OUTPUT.write_text(json.dumps(payload, indent=2) + \"\\n\")\n        print(f\"\\nwrote {OUTPUT}\")\n    else:\n        print(\"\\n(dry run \u2014 pass --write to update the bundled bootstrap file)\")\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 33
+    },
+    "ai_commit": "0c2669812c41",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 1.0,
+    "span": [
+      26,
+      58
+    ]
+  }
+}

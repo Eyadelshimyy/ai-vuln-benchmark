@@ -1,0 +1,28 @@
+{
+  "repo": "alexandrelheinen__fret",
+  "file": "scripts/release/render_showcase.py",
+  "function": "render_scenario",
+  "line": 62,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Invoke ``video.sh`` for one manifest entry.",
+  "prompt_source": "def render_scenario(\n    scenario: ShowcaseScenario,\n    *,\n    manifest: ShowcaseManifest,\n    output_dir: Path,\n) -> None:\n    \"\"\"Invoke ``video.sh`` for one manifest entry.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def render_scenario(\n    scenario: ShowcaseScenario,\n    *,\n    manifest: ShowcaseManifest,\n    output_dir: Path,\n) -> None:\n    \"\"\"Invoke ``video.sh`` for one manifest entry.\"\"\"\n    output_dir.mkdir(parents=True, exist_ok=True)\n    cmd = _video_argv(scenario, manifest=manifest, output_dir=output_dir)\n    print(\"+\", \" \".join(cmd), flush=True)\n    subprocess.run(cmd, check=True, cwd=_REPO_ROOT)",
+  "module_source": "#!/usr/bin/env python3\n\"\"\"Render one (or all) release showcase scenario(s) from showcase.yml.\"\"\"\n\nfrom __future__ import annotations\n\nimport argparse\nimport subprocess\nimport sys\nfrom pathlib import Path\n\n_REPO_ROOT = Path(__file__).resolve().parents[2]\nsys.path.insert(0, str(_REPO_ROOT / \"scripts\" / \"release\"))\n\nfrom showcase_manifest import (  # noqa: E402\n    ShowcaseManifest,\n    ShowcaseScenario,\n    load_showcase_manifest,\n)\n\n\ndef _video_argv(\n    scenario: ShowcaseScenario,\n    *,\n    manifest: ShowcaseManifest,\n    output_dir: Path,\n) -> list[str]:\n    argv = [\n        str(_REPO_ROOT / \"scripts\" / \"video.sh\"),\n        \"--model\",\n        scenario.model,\n        \"--scenario\",\n        scenario.id,\n        \"--output-dir\",\n        str(output_dir),\n        \"--timing-json\",\n        str(output_dir / scenario.timing_file),\n        \"--fps\",\n        str(scenario.effective_fps(manifest.fps)),\n        \"--width\",\n        str(scenario.effective_width(manifest.width)),\n        \"--height\",\n        str(scenario.effective_height(manifest.height)),\n        \"--collision-backend\",\n        scenario.collision_backend,\n        \"--planner-algorithm\",\n        scenario.planner_algorithm,\n    ]\n    for camera in scenario.cameras:\n        argv.extend([\"--camera\", camera])\n    # Always simulate the full race for release; clip_* only sizes the video\n    # (hold after finish or trim), so a ~38 s race becomes a clean 40 s clip.\n    argv.append(\"--full-duration\")\n    if scenario.clip_duration_s is not None:\n        argv.extend([\"--video-duration\", str(scenario.clip_duration_s)])\n    elif scenario.clip_scale is not None:\n        argv.extend([\"--clip-scale\", str(scenario.clip_scale)])\n    if scenario.physics_mode:\n        argv.append(\"--physics-mode\")\n    return argv\n\n\ndef render_scenario(\n    scenario: ShowcaseScenario,\n    *,\n    manifest: ShowcaseManifest,\n    output_dir: Path,\n) -> None:\n    \"\"\"Invoke ``video.sh`` for one manifest entry.\"\"\"\n    output_dir.mkdir(parents=True, exist_ok=True)\n    cmd = _video_argv(scenario, manifest=manifest, output_dir=output_dir)\n    print(\"+\", \" \".join(cmd), flush=True)\n    subprocess.run(cmd, check=True, cwd=_REPO_ROOT)\n\n\ndef build_parser() -> argparse.ArgumentParser:\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument(\n        \"--scenario\",\n        action=\"append\",\n        dest=\"scenarios\",\n        metavar=\"ID\",\n        help=\"Scenario id to render (repeatable; default: all)\",\n    )\n    parser.add_argument(\n        \"--output-dir\",\n        type=Path,\n        default=_REPO_ROOT / \"showcase_renders\",\n        help=\"Directory for MP4s + timing JSON\",\n    )\n    parser.add_argument(\n        \"--manifest\",\n        type=Path,\n        default=None,\n        help=\"Override path to showcase.yml\",\n    )\n    parser.add_argument(\n        \"--list\",\n        action=\"store_true\",\n        help=\"List scenario ids and exit\",\n    )\n    return parser\n\n\ndef main(argv: list[str] | None = None) -> int:\n    args = build_parser().parse_args(argv)\n    manifest = load_showcase_manifest(args.manifest)\n    if args.list:\n        for item in manifest.scenarios:\n            print(item.id)\n        return 0\n\n    selected = (\n        [manifest.by_id(sid) for sid in args.scenarios]\n        if args.scenarios\n        else list(manifest.scenarios)\n    )\n    for scenario in selected:\n        render_scenario(\n            scenario,\n            manifest=manifest,\n            output_dir=args.output_dir,\n        )\n    return 0\n\n\nif __name__ == \"__main__\":\n    sys.exit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 11
+    },
+    "ai_commit": "c6ba4f0a35df",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      62,
+      72
+    ]
+  }
+}

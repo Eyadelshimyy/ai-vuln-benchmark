@@ -1,0 +1,387 @@
+"""Tests for shared PTR parsing helpers (ptr_common.py). Pure functions —
+no network, no DB, deterministic.
+"""
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+from PIL import Image
+
+from app.pipeline.fetch import ptr_common
+from app.pipeline.fetch.ptr_common import (
+    TradeRow,
+    _parse_ocr_line,
+    classify_transaction_type,
+    extract_ticker,
+    normalize_date,
+    owner_from_cell,
+    parse_amount_range,
+    parse_table_rows,
+)
+
+
+def test_normalize_date_valid():
+    assert normalize_date("1/2/2026") == "2026-01-02"
+    assert normalize_date("12/31/2025") == "2025-12-31"
+
+
+def test_normalize_date_invalid_returns_none():
+    assert normalize_date("not a date") is None
+    assert normalize_date("") is None
+
+
+def test_classify_transaction_type():
+    assert classify_transaction_type("Purchase") == "purchase"
+    assert classify_transaction_type("Sale (Full)") == "sale_full"
+    assert classify_transaction_type("Sale (Partial)") == "sale_partial"
+    assert classify_transaction_type("Exchange") == "exchange"
+    assert classify_transaction_type("something else entirely") is None
+
+
+def test_classify_transaction_type_house_form_letter_codes():
+    """The House electronic PTR form's actual Transaction Type column value
+    is the form's own single-letter code (P/S/E), not the spelled-out word
+    — confirmed live 2026-07-25 against real filings. Every row on every
+    House filing was silently dropped as unparseable until these were
+    recognized (parse_table_rows' final "type is None" guard skips a row
+    it can't classify, same as it does for `something else entirely`
+    above — this is not a new leniency, just closing a real gap in what
+    the form actually prints)."""
+    assert classify_transaction_type("P") == "purchase"
+    assert classify_transaction_type("S (partial)") == "sale_partial"
+    assert classify_transaction_type("S (full)") == "sale_full"
+    assert classify_transaction_type("S") == "sale_full"
+    assert classify_transaction_type("E") == "exchange"
+
+
+def test_parse_amount_range_valid():
+    assert parse_amount_range("$1,001 - $15,000") == (1001.0, 15000.0)
+    assert parse_amount_range("$50,001 - $100,000") == (50001.0, 100000.0)
+
+
+def test_parse_amount_range_missing_second_bound_returns_none():
+    assert parse_amount_range("$1,001") is None
+    assert parse_amount_range("no numbers here") is None
+
+
+def test_parse_amount_range_open_ended_top_bracket():
+    """The top bracket states a floor and no ceiling. It used to fail to
+    parse, which dropped the row — so the largest disclosed transactions
+    were the ones missing from the record."""
+    assert parse_amount_range("Over $50,000,000") == (50000000.0, 50000000.0)
+    assert parse_amount_range("$50,000,001 +") == (50000001.0, 50000001.0)
+    assert parse_amount_range("$1,000,001 or more") == (1000001.0, 1000001.0)
+
+
+def test_parse_amount_range_open_ended_marker_is_required():
+    """A lone figure with no open-ended marker is an unparseable cell, not
+    an open-ended bracket — guessing which it was would invent a floor."""
+    assert parse_amount_range("$50,000,000") is None
+
+
+def test_parse_table_rows_keeps_an_open_ended_top_bracket_row():
+    rows = parse_table_rows(_table(
+        ["SP", "Bitcoin", "P", "10/30/2025", "11/14/2025", "Over $50,000,000"],
+    ))
+    assert len(rows) == 1
+    assert (rows[0].amount_low, rows[0].amount_high) == (50000000.0, 50000000.0)
+
+
+def _table(*rows):
+    header = ["Owner", "Asset", "Transaction Type", "Date", "Notification Date", "Amount"]
+    return [header, *rows]
+
+
+def test_parse_table_rows_happy_path():
+    table = _table(
+        ["SP", "Apple Inc. (AAPL)", "Purchase", "1/2/2026", "2/1/2026", "$1,001 - $15,000"],
+        ["", "Microsoft Corp (MSFT)", "Sale (Full)", "1/5/2026", "2/3/2026", "$15,001 - $50,000"],
+    )
+    rows = parse_table_rows(table)
+    assert len(rows) == 2
+    assert rows[0] == TradeRow(
+        ticker="AAPL",
+        asset_name="Apple Inc. (AAPL)",
+        owner="spouse",
+        transaction_type="purchase",
+        transaction_date="2026-01-02",
+        disclosure_date="2026-02-01",
+        amount_low=1001.0,
+        amount_high=15000.0,
+    )
+    assert rows[1].owner == "self"
+    assert rows[1].transaction_type == "sale_full"
+
+
+def test_owner_from_cell_reads_codes_and_words_and_never_guesses_the_filer():
+    assert [owner_from_cell(c) for c in ("SP", "jt", "DC", "")] == ["spouse", "joint", "dependent", "self"]
+    # The Senate's eFD tables print words, not codes.
+    assert [owner_from_cell(c) for c in ("Spouse", "Joint", "Child", "Dependent Child", "Self")] == [
+        "spouse", "joint", "dependent", "dependent", "self",
+    ]
+    assert owner_from_cell("Trust") == "unknown"
+    # No owner column states no owner; what a blank cell means is the form's.
+    assert owner_from_cell(None) == "unknown"
+    assert owner_from_cell("  ", blank="unknown") == "unknown"
+
+
+def test_parse_table_rows_without_an_owner_column_states_no_owner():
+    table = [
+        ["Asset", "Transaction Type", "Date", "Notification Date", "Amount"],
+        ["Apple Inc. (AAPL)", "Purchase", "1/2/2026", "2/1/2026", "$1,001 - $15,000"],
+    ]
+    assert parse_table_rows(table)[0].owner == "unknown"
+
+
+def test_parse_table_rows_skips_unparseable_rows_without_fabricating():
+    table = _table(
+        # No transaction type, no date, no amount — should be skipped, not guessed.
+        ["", "Some Fund", "", "", "", ""],
+        ["SP", "Apple Inc. (AAPL)", "Purchase", "1/2/2026", "2/1/2026", "$1,001 - $15,000"],
+    )
+    rows = parse_table_rows(table)
+    assert len(rows) == 1
+    assert rows[0].ticker == "AAPL"
+
+
+def test_parse_table_rows_missing_header_returns_empty():
+    # A table that isn't the transactions table (e.g. a cover page) has no
+    # recognizable header — must return [] rather than misparse it.
+    table = [["Filer", "Date Filed"], ["Jane Smith", "1/1/2026"]]
+    assert parse_table_rows(table) == []
+
+
+def test_parse_table_rows_empty_table():
+    assert parse_table_rows([]) == []
+
+
+def test_parse_table_rows_asset_type_column_does_not_shadow_type():
+    """The live Senate eFD layout puts an "Asset Type" column before
+    "Type". The old first-header-containing-any-keyword binding captured
+    "type" at the Asset Type column, so every row's transaction type read
+    "Stock"/"Bond", classify_transaction_type returned None, and the whole
+    filing was silently skipped."""
+    header = ["Transaction Date", "Owner", "Ticker", "Asset Name",
+              "Asset Type", "Type", "Amount"]
+    table = [
+        header,
+        ["1/2/2026", "SP", "AAPL", "Apple Inc. (AAPL)", "Stock",
+         "Purchase", "$1,001 - $15,000"],
+    ]
+    rows = parse_table_rows(table)
+    assert len(rows) == 1
+    assert rows[0].transaction_type == "purchase"
+    assert rows[0].ticker == "AAPL"
+
+
+def test_parse_table_rows_reads_the_senate_ticker_and_asset_type_columns():
+    """The live eFD table (2026-09-29) prints the ticker in its own column,
+    "--" when there is none, and rarely in the asset name: reading only the
+    name left 971 of 1,316 stored Senate trades without a ticker."""
+    table = [
+        ["#", "Transaction Date", "Owner", "Ticker", "Asset Name", "Asset Type", "Type", "Amount", "Comment"],
+        ["5", "08/27/2026", "Joint", "OTIS", "Otis Worldwide Corporation Common Stock", "Stock", "Purchase",
+         "$1,001 - $15,000", "--"],
+        ["3", "08/04/2026", "Joint", "--", "Electronic Arts Inc. (EA)", "Stock", "Sale (Full)",
+         "$1,001 - $15,000", "--"],
+        ["2", "08/14/2026", "Joint", "--", "AvalonBay Communities, Inc. Common Stock", "Stock", "Exchange",
+         "$1,001 - $15,000", "--"],
+        ["1", "08/19/2026", "Self", "BRK.B", "Berkshire Hathaway Inc. Class B", "Stock", "Purchase",
+         "$1,001 - $15,000", "--"],
+    ]
+    rows = parse_table_rows(table)
+    assert [r.ticker for r in rows] == ["OTIS", "EA", None, "BRK.B"]
+    assert {r.asset_type for r in rows} == {"Stock"}
+
+
+def test_parse_table_rows_reads_the_house_wrapped_notification_date_header():
+    """pdfplumber's header row from House filing 20030387, verbatim: every
+    header wraps. "Notification\nDate" never matched "notification date",
+    so all 4,681 stored House trades were dated disclosed the day they were
+    made. The row is also verbatim, 2015 included: the filer's typo, which
+    is stored as filed."""
+    table = [
+        ["ID", "Owner", "Asset", "Transaction\nType", "Date", "Notification\nDate", "Amount",
+         "Cap.\nGains >\n$200?"],
+        ["", "", "Danaher Corporation Common Stock\n(DHR) [ST]", "P", "05/08/2015", "05/15/2025",
+         "$15,001 -\n$50,000", ""],
+    ]
+    rows = parse_table_rows(table)
+    assert (rows[0].transaction_date, rows[0].disclosure_date) == ("2015-05-08", "2025-05-15")
+    assert rows[0].ticker == "DHR"
+
+
+def test_extract_ticker_finds_a_real_ticker():
+    assert extract_ticker("Apple Inc. (AAPL)") == "AAPL"
+
+
+def test_extract_ticker_rejects_the_word_the():
+    """"Kroger Co (The)"/"Cigna Group (The)" are real company names whose
+    trailing parenthetical isn't a ticker — confirmed live on a
+    presidential 278-T (2026-08 audit): both stored ticker="THE" before
+    this fix. No real US equity ticker is the word "the"."""
+    assert extract_ticker("KROGER CO (THE)") is None
+    assert extract_ticker("Some Municipal Bond Fund") is None
+
+
+class TestParseOcrLine:
+    """_parse_ocr_line — the per-line parser behind ocr_extract_rows.
+    Every line here is real tesseract output from a live presidential
+    278-T (2026-08 audit), not a hand-written idealized sample: OCR noise
+    on this form is a fairly unpredictable mix of stray brackets, glued
+    punctuation, and misread characters."""
+
+    def test_a_clean_line_parses_correctly(self):
+        row = _parse_ocr_line("2 |Ametek Inc purchase 6/23/2026, No|$15,001 - $50,000")
+        assert row is not None
+        assert row.asset_name == "Ametek Inc"
+        assert row.transaction_type == "purchase"
+        assert row.transaction_date == "2026-06-23"
+        assert row.amount_low == 15001.0
+        assert row.amount_high == 50000.0
+        # The line carries no owner column: not stated, never the filer's.
+        assert row.owner == "unknown"
+        # The old parser required a ticker match to accept ANY row, silently
+        # dropping ~95% of a real filing's transactions because this form
+        # prints none at all — see extract_ticker's docstring.
+        assert row.ticker is None
+
+    def test_leading_row_number_does_not_pollute_the_amount(self):
+        """The confirmed live bug: the fallback-only version of this
+        parser extracted (1, 6) as the amount pair — the leading row
+        number and a digit from the date — instead of ($1,001, $15,000)."""
+        row = _parse_ocr_line("1 Goldman Sachs Group Inc purchase 6/23/2026) No] $1,001 - $15,000")
+        assert row is not None
+        assert row.amount_low == 1001.0
+        assert row.amount_high == 15000.0
+
+    def test_a_misread_row_number_does_not_prevent_parsing(self):
+        # "s" instead of a digit — OCR misreading a cramped row-number
+        # column as a stray letter.
+        row = _parse_ocr_line("s Howmet Aerospace Inc purchase 6/23/2026 No| $15,003 - $50,000")
+        assert row is not None
+        assert "Howmet Aerospace" in row.asset_name
+        # "$15,003" is no range the form prints: the upper bound names it.
+        assert row.amount_low == 15001.0
+        assert row.amount_high == 50000.0
+
+    def test_a_bracket_glued_directly_onto_the_type_keyword_still_parses(self):
+        row = _parse_ocr_line("7 KIMBERLY CLARK CORPORATION [purchase 6/12/2026 Yes |$15,001 - $50,000")
+        assert row is not None
+        assert row.asset_name.strip() == "KIMBERLY CLARK CORPORATION"
+        assert row.amount_low == 15001.0
+        assert row.amount_high == 50000.0
+
+    def test_a_double_hyphen_amount_separator_still_parses(self):
+        row = _parse_ocr_line("853 MAXLINEAR INC CLASS CLASS A purchase 6/22/2026 No|$15,001-- $50,000")
+        assert row is not None
+        assert row.amount_low == 15001.0
+        assert row.amount_high == 50000.0
+
+    def test_one_misread_bound_is_recovered_from_the_other(self):
+        """A misread digit produced a real, live "$31,001 - $15,000". The
+        form prints one range ending at $15,000, so that is the range."""
+        row = _parse_ocr_line("535 EXXON MOBIL CORP [purchase 6/23/2026 No|$31,001 - $15,000")
+        assert (row.amount_low, row.amount_high) == (1001.0, 15000.0)
+
+    def test_an_amount_matching_no_range_the_form_prints_is_dropped(self):
+        assert _parse_ocr_line("535 EXXON MOBIL CORP [purchase 6/23/2026 No|$31,004 - $15,007") is None
+
+    def test_a_bonds_maturity_is_not_read_as_its_trade_date(self):
+        """The old loose fallback took a line's first date: on a bond, its
+        maturity. Stored live as a trade on 2078-12-15 (2026-09)."""
+        line = ("UNITED RENTALS NORTH AMER INC SENIOR SECURED NOTES REG S DUE 12/15/2078 08.000% "
+                "DISCRETIONARY ORDER IF THIS CONFIRMATION IS IN CONNECTION WITH A SALE PI")
+        assert _parse_ocr_line(line) is None
+
+    def test_a_date_outside_the_filings_window_is_not_read(self):
+        line = "7 KIMBERLY CLARK CORPORATION [purchase 6/12/2026 Yes |$15,001 - $50,000"
+        assert _parse_ocr_line(line, not_after="2026-06-01") is None
+        assert _parse_ocr_line(line, not_before="2026-06-13") is None
+        assert _parse_ocr_line(line, "2025-01-20", "2026-07-01").transaction_date == "2026-06-12"
+
+    def test_a_missing_amount_is_dropped_not_fabricated(self):
+        # This exact row's dollar bracket did not survive OCR at all —
+        # nothing to extract, so no row rather than a guessed one.
+        row = _parse_ocr_line("36 Federated Hermes Government Obligations Fund purchase 6/3/2026")
+        assert row is None
+
+    def test_an_ocr_garbled_type_keyword_is_dropped_not_guessed(self):
+        # "yurchase" for "purchase" — an OCR misread this parser can't
+        # recover from, and shouldn't guess at.
+        row = _parse_ocr_line(
+            "3 International Flavors & Fragrances Inc yurchase 6/23/2026 No] $1,001 - $15,000"
+        )
+        assert row is None
+
+    def test_a_line_with_no_transaction_data_is_dropped(self):
+        assert _parse_ocr_line("OGE Form 278-T (Updated February 2024)") is None
+        assert _parse_ocr_line("") is None
+
+
+class TestScannedTableReading:
+    """A scanned 278-T read by where its words sit (_ocr_table_page), on the
+    word boxes tesseract gave for a real page (the President's Jan 14, 2026
+    filing, page 2). tesseract's plain text lists the page's descriptions,
+    then its types and dates, then its amounts, so a line parser paired a
+    bond with the next row's date or its own maturity."""
+
+    @staticmethod
+    def _read(not_before="2025-01-20", not_after="2026-01-14"):
+        fixture = json.loads((Path(__file__).parent / "fixtures_278t_scanned_page_words.json").read_text())
+
+        class Page:
+            def to_image(self, resolution):
+                return SimpleNamespace(original=Image.new("L", tuple(fixture["size"]), 255))
+
+        # CI has no tesseract: the page's recorded word boxes, and no second
+        # read of each cell (the rows below read from the words alone).
+        with patch("pytesseract.image_to_data", return_value=fixture["data"]), \
+                patch.object(ptr_common, "_ocr_cell", return_value=""):
+            return ptr_common._ocr_table_page(Page(), not_before, not_after)
+
+    def test_each_row_keeps_its_own_date_and_amount(self):
+        rows, unread = self._read()
+        by_asset = {r.asset_name: r for r in rows}
+        washington = by_asset["WASHINGTON ST HEALT 5% DUE 09/01/38"]
+        assert (washington.transaction_date, washington.amount_low, washington.amount_high) == (
+            "2025-11-26", 1_000_001.0, 5_000_000.0,
+        )
+        assert by_asset["PENNSYLVANIA ST 5.25% DUE 11/01/39"].transaction_date == "2025-11-28"
+        # The page's 29 rows are each read or counted, none guessed.
+        assert len(rows) + unread == 29
+
+    def test_no_maturity_or_out_of_window_date_and_only_the_forms_ranges(self):
+        rows, _ = self._read()
+        # A date is one inside the window or none at all, never a maturity.
+        assert all("2025-01-20" <= r.transaction_date <= "2026-01-14" for r in rows if r.transaction_date)
+        assert all((r.amount_low, r.amount_high) in ptr_common.AMOUNT_BRACKETS for r in rows)
+
+    def test_a_row_whose_date_alone_is_illegible_is_kept_only_when_asked(self):
+        dated = ptr_common.TradeRow(None, "APPLE INC", "unknown", "purchase", "2026-03-02", "2026-05-14", 1001.0, 15000.0)
+        undated = ptr_common.TradeRow(None, "COMCAST CORP", "unknown", "purchase", None, "2026-05-14", 1001.0, 15000.0)
+        pdf = SimpleNamespace(pages=[object()])
+        with patch.object(ptr_common, "_ocr_table_page", return_value=([dated, undated], 1)):
+            assert ptr_common.ocr_extract_rows(pdf) == [dated]
+            assert ptr_common.ocr_extract_rows(pdf, keep_undated=True) == [dated, undated]
+
+    def test_the_form_words_as_ocr_misreads_them(self):
+        assert ptr_common.ocr_transaction_type("purchaso") == "purchase"
+        assert ptr_common.ocr_transaction_type("salo") == "sale_full"
+        assert ptr_common.ocr_transaction_type("PURSUANT") is None
+        assert ptr_common.window_date("14/19/2025", None, None) is None
+        assert ptr_common.window_date("12/10/25", "2025-01-20", None) == "2025-12-10"
+        assert ptr_common.form_bracket("Over $50,000,000") == (50_000_000.0, 50_000_000.0)
+        assert ptr_common.form_bracket("$250,004 - $500,000") == (250_001.0, 500_000.0)
+
+
+def test_ocr_that_could_not_run_raises_rather_than_reading_nothing():
+    """An empty read of a scan drops its older reading on re-read; a page
+    that couldn't be OCR'd at all must not look like one."""
+    pdf = SimpleNamespace(pages=[object(), object()])
+    with patch.object(ptr_common, "_ocr_table_page", side_effect=OSError("tesseract crashed")), \
+            pytest.raises(RuntimeError):
+        ptr_common.ocr_extract_rows(pdf)

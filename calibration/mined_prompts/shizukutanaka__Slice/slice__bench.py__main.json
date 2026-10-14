@@ -1,0 +1,28 @@
+{
+  "repo": "shizukutanaka__Slice",
+  "file": "slice/bench.py",
+  "function": "main",
+  "line": 92,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function (parameters: argv).",
+  "prompt_source": "def main(argv=None) -> int:\n    \"\"\"Implement the `main` function (parameters: argv).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main(argv=None) -> int:\n    argv = list(sys.argv[1:] if argv is None else argv)\n    report = run()\n    ok, fails = gate(report)\n    if \"--json\" in argv:\n        print(json.dumps(report, indent=2))\n    else:\n        print(f\"estimate: {report['ms_per_estimate']}ms/image \"\n              f\"({report['cases']} cases x{report['repeats']})\")\n        print(f\"detection={report['detection_rate']} \"\n              f\"observed={report['observed_rate']} \"\n              f\"err={report['mean_error_px']}px \"\n              f\"oks={report['mean_oks']}\")\n    for f in fails:\n        print(f\"FAIL {f}\", file=sys.stderr)\n    return 0 if ok else 1",
+  "module_source": "\"\"\"slice.bench: estimator benchmark + regression gate.\n\nTimes `estimate()` and scores it against `evaluate.draw_case` ground\ntruth (detection rate, mean positional error, OKS). Usable as a\nmodule and as a CLI gate:\n\n    python -m slice.bench            # report + exit 1 on gate fail\n    python -m slice.bench --json     # machine-readable report only\n\nAccuracy thresholds are the gate (deterministic); timing is reported\nbut never gated \u2014 CI machines vary too much for a wall-clock budget.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nimport sys\nimport time\nfrom typing import List, Optional, Tuple\n\nfrom . import evaluate, oks\nfrom .pose import HeuristicPoseEstimator\nfrom .skeleton import Joint, OBSERVED, Skeleton\n\n# gate: deterministic accuracy thresholds at *measured* current\n# levels \u2014 they pin today's accuracy as a regression detector, they\n# are not accuracy claims (mid-chain joints sit ~30px off the\n# fixture truth because truth marks silhouette edges while the\n# estimator places anatomical centers)\nMIN_DETECTION = 0.9\nMIN_OBSERVED = 0.8\nMAX_MEAN_ERROR_PX = 20.0\nMIN_OKS = 0.5\n\n\ndef _truth_skeleton(truth, w, h) -> Skeleton:\n    # truth fixtures claim to be the observed reference \u2014 say so\n    return Skeleton(w, h, {n: Joint(n, x, y, 1.0, OBSERVED,\n                                    \"ground truth fixture\")\n                           for n, (x, y) in truth.items()})\n\n\ndef run(cases: Optional[List] = None, repeats: int = 1) -> dict:\n    \"\"\"Measure latency + accuracy over ground-truth fixture cases.\"\"\"\n    est = HeuristicPoseEstimator()\n    if cases is None:\n        cases = [evaluate.draw_case(),\n                 evaluate.draw_case(width=240, height=320)]\n    t0 = time.perf_counter()\n    for _ in range(max(1, repeats)):\n        for bmp, _truth in cases:\n            est.estimate(bmp)\n    ms = (time.perf_counter() - t0) * 1000 / (len(cases) * max(1, repeats))\n\n    metrics = evaluate.evaluate([(b, t) for b, t in cases], est)\n    oks_vals = []\n    for bmp, truth in cases:\n        skel = est.estimate(bmp)\n        gt = _truth_skeleton(truth, skel.image_width, skel.image_height)\n        v = oks.oks(gt, skel)\n        if v is not None:\n            oks_vals.append(v)\n    return {\n        \"cases\": len(cases),\n        \"repeats\": max(1, repeats),\n        \"ms_per_estimate\": round(ms, 1),\n        \"detection_rate\": metrics[\"detection_rate\"],\n        \"observed_rate\": metrics[\"observed_rate\"],\n        \"mean_error_px\": metrics[\"mean_error_px\"],\n        \"mean_oks\": round(sum(oks_vals) / len(oks_vals), 4)\n        if oks_vals else None,\n    }\n\n\ndef gate(report: dict) -> Tuple[bool, List[str]]:\n    \"\"\"Deterministic accuracy gate; timing is reported, not gated.\"\"\"\n    fails = []\n    if report[\"detection_rate\"] < MIN_DETECTION:\n        fails.append(f\"detection {report['detection_rate']} \"\n                     f\"< {MIN_DETECTION}\")\n    if report[\"observed_rate\"] < MIN_OBSERVED:\n        fails.append(f\"observed {report['observed_rate']} \"\n                     f\"< {MIN_OBSERVED}\")\n    if report[\"mean_error_px\"] > MAX_MEAN_ERROR_PX:\n        fails.append(f\"mean_error {report['mean_error_px']}px \"\n                     f\"> {MAX_MEAN_ERROR_PX}px\")\n    if report[\"mean_oks\"] is not None and report[\"mean_oks\"] < MIN_OKS:\n        fails.append(f\"oks {report['mean_oks']} < {MIN_OKS}\")\n    return not fails, fails\n\n\ndef main(argv=None) -> int:\n    argv = list(sys.argv[1:] if argv is None else argv)\n    report = run()\n    ok, fails = gate(report)\n    if \"--json\" in argv:\n        print(json.dumps(report, indent=2))\n    else:\n        print(f\"estimate: {report['ms_per_estimate']}ms/image \"\n              f\"({report['cases']} cases x{report['repeats']})\")\n        print(f\"detection={report['detection_rate']} \"\n              f\"observed={report['observed_rate']} \"\n              f\"err={report['mean_error_px']}px \"\n              f\"oks={report['mean_oks']}\")\n    for f in fails:\n        print(f\"FAIL {f}\", file=sys.stderr)\n    return 0 if ok else 1\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 16
+    },
+    "ai_commit": "d0d94199df91",
+    "evidence": "author/committer='Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      92,
+      107
+    ]
+  }
+}

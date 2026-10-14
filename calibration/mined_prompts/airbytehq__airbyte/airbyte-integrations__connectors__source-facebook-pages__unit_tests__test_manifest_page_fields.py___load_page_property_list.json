@@ -1,0 +1,28 @@
+{
+  "repo": "airbytehq__airbyte",
+  "file": "airbyte-integrations/connectors/source-facebook-pages/unit_tests/test_manifest_page_fields.py",
+  "function": "_load_page_property_list",
+  "line": 23,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `_load_page_property_list` function.",
+  "prompt_source": "def _load_page_property_list():\n    \"\"\"Implement the `_load_page_property_list` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def _load_page_property_list():\n    manifest_path = os.path.join(\n        os.path.dirname(__file__),\n        \"..\",\n        \"source_facebook_pages\",\n        \"manifest.yaml\",\n    )\n    with open(manifest_path) as manifest_file:\n        manifest = yaml.safe_load(manifest_file)\n    return manifest[\"definitions\"][\"page_query_properties\"][\"property_list\"]",
+  "module_source": "#\n# Copyright (c) 2023 Airbyte, Inc., all rights reserved.\n#\n\nimport json\nimport os\nfrom pathlib import Path\n\nimport yaml\n\n\nDEPRECATED_PAGE_FIELDS = [\n    \"current_location\",\n    \"genre\",\n    \"network\",\n    \"parking\",\n    \"start_info\",\n    \"live_videos\",\n]\nSCHEMAS_PATH = Path(__file__).parents[1] / \"source_facebook_pages\" / \"schemas\"\n\n\ndef _load_page_property_list():\n    manifest_path = os.path.join(\n        os.path.dirname(__file__),\n        \"..\",\n        \"source_facebook_pages\",\n        \"manifest.yaml\",\n    )\n    with open(manifest_path) as manifest_file:\n        manifest = yaml.safe_load(manifest_file)\n    return manifest[\"definitions\"][\"page_query_properties\"][\"property_list\"]\n\n\ndef _load_schema_properties(schema_name):\n    schema = json.loads((SCHEMAS_PATH / schema_name).read_text())\n    return schema[\"properties\"]\n\n\ndef test_page_request_omits_deprecated_fields():\n    property_list = _load_page_property_list()\n    deprecated_fields = set(property_list) & set(DEPRECATED_PAGE_FIELDS)\n    assert not deprecated_fields, f\"Deprecated fields still requested: {sorted(deprecated_fields)}\"\n\n\ndef test_page_request_still_includes_supported_fields():\n    property_list = _load_page_property_list()\n    supported_fields = {\"id\", \"name\", \"about\", \"category\"}\n    assert supported_fields <= set(property_list)\n\n\ndef test_page_schemas_omit_deprecated_fields():\n    page_properties = _load_schema_properties(\"page.json\")\n    shared_page_properties = _load_schema_properties(\"shared/page.json\")\n    deprecated_fields = set(DEPRECATED_PAGE_FIELDS)\n\n    assert not deprecated_fields & set(page_properties)\n    assert not deprecated_fields & set(shared_page_properties)\n    assert {\"id\", \"name\", \"about\"} <= set(page_properties)\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 10
+    },
+    "ai_commit": "fab60c167460",
+    "evidence": "author/committer='devin-ai-integration[bot] <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      23,
+      32
+    ]
+  }
+}

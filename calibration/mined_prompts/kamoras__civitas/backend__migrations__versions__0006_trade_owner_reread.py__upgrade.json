@@ -1,0 +1,28 @@
+{
+  "repo": "kamoras__civitas",
+  "file": "backend/migrations/versions/0006_trade_owner_reread.py",
+  "function": "upgrade",
+  "line": 34,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `upgrade` function.",
+  "prompt_source": "def upgrade() -> None:\n    \"\"\"Implement the `upgrade` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def upgrade() -> None:\n    for table in _TABLES:\n        with op.batch_alter_table(table) as batch_op:\n            batch_op.add_column(sa.Column(\"parser_version\", sa.Integer(), server_default=\"1\", nullable=False))\n        op.execute(f\"UPDATE {table} SET owner = 'unknown' WHERE parse_confidence = 'ocr' AND owner = 'self'\")\n        op.execute(f\"UPDATE {table} SET parser_version = 2 WHERE parse_confidence = 'ocr'\")",
+  "module_source": "\"\"\"trade owners: version the PTR parser, stop guessing OCR owners\n\nEach trade table gets parser_version: which ptr_common.PARSER_VERSION read\nthe row. Version 1 (every existing row) read eFD's electronic tables with\nthe House's owner codes only, while eFD prints the owner as a word\n(\"Spouse\", \"Joint\", \"Child\", \"Self\" \u2014 173 rows across 25 filings, checked\n2026-09-27), so every such Senate trade was stored as the senator's own;\nit also read a table with no owner column as the filer's. The stock\npipeline reads version-1 filings again (_reread_trades).\n\nRows read by OCR never read an owner column; their \"self\" was a guess and\nbecomes \"unknown\", which is exactly what version 2 reads from those scans,\nso they are marked version 2 and not fetched again.\n\nExpand-only: columns with a default, and an owner value the previous\nimage's schema already reads (DisclosureOwner).\n\nRevision ID: 0006\nRevises: 0005\nCreate Date: 2026-09-27\n\"\"\"\nfrom alembic import op\nimport sqlalchemy as sa\n\n\nrevision = \"0006\"\ndown_revision = \"0005\"\nbranch_labels = None\ndepends_on = None\n\n_TABLES = (\"stock_trades\", \"rep_stock_trades\", \"president_trades\")\n\n\ndef upgrade() -> None:\n    for table in _TABLES:\n        with op.batch_alter_table(table) as batch_op:\n            batch_op.add_column(sa.Column(\"parser_version\", sa.Integer(), server_default=\"1\", nullable=False))\n        op.execute(f\"UPDATE {table} SET owner = 'unknown' WHERE parse_confidence = 'ocr' AND owner = 'self'\")\n        op.execute(f\"UPDATE {table} SET parser_version = 2 WHERE parse_confidence = 'ocr'\")\n\n\ndef downgrade() -> None:\n    for table in _TABLES:\n        with op.batch_alter_table(table) as batch_op:\n            batch_op.drop_column(\"parser_version\")\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 6
+    },
+    "ai_commit": "95f1ac1cbb10",
+    "evidence": "Co-authored-by: Claude <noreply@anthropic.com>",
+    "ai_line_fraction": 1.0,
+    "span": [
+      34,
+      39
+    ]
+  }
+}

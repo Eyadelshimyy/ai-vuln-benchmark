@@ -1,0 +1,376 @@
+"""Tests for New Hampshire's confirmed-general-candidate strategy
+(state_candidates_nh.py).
+
+fixtures_nh_elections_root.html, fixtures_nh_results_index.html, and
+fixtures_nh_democratic_page.html are REAL, trimmed excerpts of the
+actual live pages (fetched 2026-09-10/11) — the real three-hop anchor
+shape this module's own discovery depends on, including a real decoy
+("US Senator Belknap", a per-county breakdown link that also parses as
+a Senate office) proving the "summary" text filter actually does its
+job rather than only being tested against a page with nothing to
+filter.
+
+The xlsx fixture rows below are built with `_workbook()` (not
+downloaded), but every value is REAL: two real counties (Belknap,
+Carroll) from the actual downloaded 2026 U.S. Senate Democratic and
+Republican exports, including the real cross-party write-in columns
+(a Democratic candidate's own small vote count inside the Republican
+file, and vice versa) and the real data quirk that motivated the
+no-suffix fallback — Richard A. McMenamon II's own party suffix is
+genuinely dropped ("Richard A. McMenamon " with no ", r") in the real
+Republican file specifically, confirmed by comparing it against the
+same candidate's correctly-suffixed column in the real Democratic
+file's own cross-tabulation.
+"""
+
+from pathlib import Path
+
+import pytest
+
+from app.pipeline.fetch import state_candidates_nh as nh
+from tests.xlsx_helpers import _workbook
+
+FIXTURES = Path(__file__).parent
+ROOT_HTML = (FIXTURES / "fixtures_nh_elections_root.html").read_text()
+INDEX_HTML = (FIXTURES / "fixtures_nh_results_index.html").read_text()
+DEM_PAGE_HTML = (FIXTURES / "fixtures_nh_democratic_page.html").read_text()
+REP_PAGE_HTML = DEM_PAGE_HTML.replace("democratic", "republican").replace("Democratic", "Republican")
+
+
+# Real rows, real 2026 U.S. Senate Democratic export, trimmed to two
+# real counties. Sununu (the real Republican nominee) appears with his
+# own real, small cross-party write-in count on the Democratic ballot;
+# McMenamon appears WITH his real ", r" suffix here (only the
+# Republican file drops it — see REP_ROWS below).
+DEM_ROWS = [
+    [None, "State of New Hampshire - Primary Election"],
+    ["September 08, 2026", "United States Senator - Democratic"],
+    ["Summary By Counties", "David Jarvis, d", "Chris Pappas, d", "John E. Sununu, r", "Richard A. McMenamon II, r", "Write-Ins "],
+    ["Belknap", "50", "4954", "13", "0", "3"],
+    ["Carroll", "42", "5098", "6", "0", "2"],
+    ["TOTALS", "92", "10052", "19", "0", "5"],
+]
+
+# Real rows, real 2026 U.S. Senate Republican export, same two
+# counties. Pappas (the real Democratic nominee) appears with his own
+# real, small cross-party write-in count here. McMenamon's own real
+# column genuinely carries NO ", r" suffix in this actual file — the
+# live data quirk _office_choices' no-suffix fallback exists for.
+REP_ROWS = [
+    [None, "State of New Hampshire - Primary Election"],
+    ["September 08, 2026", "United States Senator - Republican"],
+    ["Summary By Counties", "Tom Alciere, r", "John E. Sununu, r", "Richard A. McMenamon ", "Chris Pappas, d", "Write-Ins "],
+    ["Belknap", "0", "13", "0", "66", "16"],
+    ["Carroll", "0", "6", "1", "67", "5"],
+    ["TOTALS", "0", "19", "1", "133", "21"],
+]
+
+
+class TestLinks:
+    def test_extracts_href_and_text_from_real_anchor_markup(self):
+        links = nh._links(DEM_PAGE_HTML)
+        assert ("/sites/g/files/ehbemt561/files/inline-documents/sonh/2026-sp-us-senator-summary-democratic.xlsx", "US Senator Summary") in links
+
+
+class TestOfficeChoices:
+    def test_democratic_file_keeps_only_its_own_party_and_excludes_the_cross_listed_republican(self):
+        rows = nh._xlsx_rows(_workbook(DEM_ROWS), skip=2)
+        choices = dict(nh._office_choices(rows, "d"))
+        # Exactly the two county rows, summed: if TOTALS (92/10052/...)
+        # were summed in as a third "county", Pappas would be 2x his real
+        # total; and the Write-Ins column is no candidate.
+        assert choices == {"Chris Pappas": 4954 + 5098, "David Jarvis": 50 + 42}
+        assert "John E. Sununu" not in choices  # the other party's real cross-tab, not a genuine total
+        assert "Richard A. McMenamon II" not in choices
+
+    def test_republican_file_keeps_the_suffix_less_candidate_via_the_fallback(self):
+        """Real regression: McMenamon's own column carries no ", r"
+        suffix in the real Republican file -- must still be counted as
+        this file's own party, not silently dropped."""
+        rows = nh._xlsx_rows(_workbook(REP_ROWS), skip=2)
+        choices = dict(nh._office_choices(rows, "r"))
+        assert choices["John E. Sununu"] == 13 + 6
+        assert choices["Richard A. McMenamon"] == 0 + 1
+        assert "Chris Pappas" not in choices  # the other party's real cross-tab
+
+# The real three-hop discovery chain, both parties' pages.
+PAGES = {
+    "/elections": ROOT_HTML,
+    "state-primary-election-results": INDEX_HTML,
+    "democratic-state-primary": DEM_PAGE_HTML,
+    "republican-state-primary": REP_PAGE_HTML,
+}
+# Every federal workbook those pages link (House files reuse the Senate rows).
+FEDERAL_FILES = {
+    "us-senator-summary-democratic": _workbook(DEM_ROWS),
+    "us-senator-summary-republican": _workbook(REP_ROWS),
+    "congressional-district-1-democratic": _workbook(DEM_ROWS),
+    "congressional-district-1-republican": _workbook(REP_ROWS),
+}
+
+
+def _patch(monkeypatch, texts: dict[str, str], files: dict[str, bytes], held=None):
+    async def fake_text(client, url, label):
+        for needle, html in texts.items():
+            if needle in url:
+                return html
+        return None
+
+    async def fake_bytes(client, url, label):
+        for needle, content in files.items():
+            if needle in url:
+                return content
+        return None
+
+    monkeypatch.setattr(nh, "_get_text", fake_text)
+    monkeypatch.setattr(nh, "_get_bytes", fake_bytes)
+    monkeypatch.setattr(nh, "primary_date", lambda state, year: held)
+
+
+class TestDiscoverOfficeLinks:
+    @pytest.mark.asyncio
+    async def test_finds_the_real_senate_summary_and_house_district_for_both_parties(self, monkeypatch):
+        _patch(monkeypatch, PAGES, {})
+        offices = await nh._discover_office_links(None, 2026)
+        assert set(offices.keys()) == {("S", None), ("H", 1)}
+        assert "summary-democratic" in offices[("S", None)]["d"]
+        assert "summary-republican" in offices[("S", None)]["r"]
+        # The real per-county decoy link ("US Senator Belknap") must
+        # never win the ("S", None) slot over the real summary link.
+        assert "belknap" not in offices[("S", None)]["d"].lower()
+
+    @pytest.mark.asyncio
+    async def test_two_different_links_for_the_same_office_are_refused_not_guessed(self, monkeypatch):
+        """Never observed live (only Senate publishes per-county
+        breakdowns today, already excluded by the "summary" filter), but
+        if a second real link ever parsed to the same office/district/
+        party as one already found, silently keeping whichever came last
+        would risk confirming the wrong candidate with no error."""
+        dem_with_duplicate_house_link = DEM_PAGE_HTML.replace(
+            "</a><br>\n",
+            '</a><br>\n<a href="/sites/g/files/ehbemt561/files/inline-documents/sonh/decoy-cd1-democratic.xlsx">'
+            "Representative in Congress District No. 1</a><br>\n",
+            1,
+        )
+        _patch(monkeypatch, {**PAGES, "democratic-state-primary": dem_with_duplicate_house_link}, {})
+        offices = await nh._discover_office_links(None, 2026)
+        assert "d" not in offices.get(("H", 1), {})
+        assert "r" in offices.get(("H", 1), {})  # the OTHER party's own real link is unaffected
+
+    @pytest.mark.asyncio
+    async def test_no_results_page_for_this_year_yet_is_healthy_empty(self, monkeypatch):
+        _patch(monkeypatch, {"/elections": "<a href=\"/2024-election-results\">2024 Election Results</a>"}, {})
+        assert await nh._discover_office_links(None, 2026) == {}
+
+    @pytest.mark.asyncio
+    async def test_root_fetch_failure_is_not_silently_healthy(self, monkeypatch):
+        _patch(monkeypatch, {}, {})
+        assert await nh._discover_office_links(None, 2026) is None
+
+
+class TestFetchConfirmedCandidates:
+    def _full_patch(self, monkeypatch, held=None):
+        _patch(monkeypatch, PAGES, FEDERAL_FILES, held=held)
+
+    @pytest.mark.asyncio
+    async def test_confirms_the_real_nominees_once_settled(self, monkeypatch):
+        self._full_patch(monkeypatch, held="2026-01-01")  # long past any settle_days floor
+        records = await nh.fetch_confirmed_candidates(None, 2026, "NH", {})
+        by_seat = {(r["office"], r["district"], r["party"]): r["last_name"] for r in records}
+        assert by_seat[("S", None, "D")] == "Pappas"
+        assert by_seat[("S", None, "R")] == "Sununu"
+        assert by_seat[("H", 1, "D")] == "Pappas"
+        assert by_seat[("H", 1, "R")] == "Sununu"
+
+    @pytest.mark.asyncio
+    async def test_withheld_before_settle_days_even_though_files_already_exist(self, monkeypatch):
+        """Real files appeared within 2 days of the real primary -- a
+        live count, not a certified one. Must not confirm early just
+        because the download already succeeds. `held` is set in the
+        future rather than a near-real date, so `_settled`'s own
+        `(now - held).days >= settle_days` is guaranteed negative (never
+        settled) regardless of what day this test actually runs on —
+        an ordinary recent date would quietly stop proving anything once
+        real time caught up past the real settle_days floor."""
+        self._full_patch(monkeypatch, held="2099-01-01")
+        assert await nh.fetch_confirmed_candidates(None, 2026, "NH", {}) == []
+
+    @pytest.mark.asyncio
+    async def test_no_cached_primary_date_does_not_block(self, monkeypatch):
+        """held is None (calendar not cached yet) skips the gate rather
+        than blocking forever — matches ma_pd43's own established
+        fallback behavior for the identical shape."""
+        self._full_patch(monkeypatch, held=None)
+        records = await nh.fetch_confirmed_candidates(None, 2026, "NH", {})
+        assert records  # not withheld
+
+    @pytest.mark.asyncio
+    async def test_no_year_page_yet_is_healthy_empty(self, monkeypatch):
+        _patch(monkeypatch, {"/elections": "<a href=\"/2024-election-results\">2024 Election Results</a>"}, {}, held="2026-01-01")
+        assert await nh.fetch_confirmed_candidates(None, 2026, "NH", {}) == []
+
+    @pytest.mark.asyncio
+    async def test_a_file_download_failure_fails_the_whole_fetch(self, monkeypatch):
+        _patch(monkeypatch, PAGES, {}, held="2026-01-01")  # discovery succeeds, but every file download 404s
+        assert await nh.fetch_confirmed_candidates(None, 2026, "NH", {}) is None
+
+
+# ── Statewide: the Governor ───────────────────────────────────────────
+#
+# fixtures_nh_democratic_page_statewide.html holds three REAL anchors off
+# the live 2026 Democratic State Primary page (fetched 2026-09-28): the
+# "Governor Summary" workbook, one of its ten per-county breakdowns
+# ("Governor Belknap", the decoy the summary rule must refuse), and
+# "Executive Council District 1", read one seat per district.
+#
+# The rows are the real 2026 Governor Summary exports, trimmed to two
+# counties. Statewide the real totals are Cinde Warmington 126,626 (the
+# only Democrat on the ballot) and Kelly Ayotte 100,920 to Shaun Fife's 4,418
+# on the Republican side; Ayotte's 2,643 write-ins on the Democratic ballot
+# (Belknap 193 + Carroll 90 here) must stay out of the Democratic count.
+
+STATEWIDE_ANCHORS = (FIXTURES / "fixtures_nh_democratic_page_statewide.html").read_text()
+DEM_PAGE_SW = DEM_PAGE_HTML + STATEWIDE_ANCHORS
+REP_PAGE_SW = DEM_PAGE_SW.replace("democratic", "republican").replace("Democratic", "Republican")
+
+GOV_DEM_ROWS = [
+    [None, "State of New Hampshire - Primary Election"],
+    [None, "Governor - Democratic"],
+    ["Summary By Counties", "Cinde Warmington, d", "Kelly Ayotte, r", "Shaun Fife, r", "Bob Wayne McClory, r", "", "Write-Ins"],
+    ["Belknap", "5326", "193", "2", "0", "", "59"],
+    ["Carroll", "5542", "90", "0", "0", "", "56"],
+    ["TOTALS", "10868", "283", "2", "0", "0", "115"],
+]
+GOV_REP_ROWS = [
+    [None, "State of New Hampshire - Primary Election"],
+    [None, "Governor - Republican"],
+    ["Summary By Counties", "Kelly Ayotte, r", "Shaun Fife, r", "Bob Wayne McClory, r", "Cinde Warmington, d", "", "Write-Ins"],
+    ["Belknap", "6591", "266", "185", "28", "", "29"],
+    ["Carroll", "5560", "235", "217", "19", "", "8"],
+    ["TOTALS", "12151", "501", "402", "47", "0", "37"],
+]
+
+
+# Real anchor and rows off the live 2026 primary pages and their
+# "Executive Council District N" workbooks (fetched 2026-09-28), trimmed
+# to two towns plus the file's own TOTALS row (never summed: see
+# _office_choices).
+EC4_ANCHOR = (
+    '<a class="file file--mime-application-vnd-openxmlformats-officedocument-spreadsheetml-sheet '
+    'file--x-office-spreadsheet" data-entity-type="file" '
+    'data-entity-uuid="08ccb5b8-6bcb-4d3f-bd5a-1f621f8b0859" '
+    'filename="2026-sp-executive-council-4-democratic.xlsx" '
+    'href="/sites/g/files/ehbemt561/files/inline-documents/sonh/2026-sp-executive-council-4-democratic.xlsx">'
+    'Executive Council District 4</a>'
+)
+EC1_DEM_ROWS = [
+    [None, "State of New Hampshire - Primary Election"],
+    [None, "Executive Council - District No. 1 Democratic"],
+    ["SEPTEMBER 08, 2026", "Luz Bay, d", "Joseph D. Kenney, r", "", "Write-Ins "],
+    ["Albany", "76", "", "", ""],
+    ["Alexandria", "134", "", "", ""],
+    ["TOTALS", "26664", "47", "0", "77"],
+]
+EC1_REP_ROWS = [
+    [None, "State of New Hampshire - Primary Election"],
+    [None, "Executive Council - District No. 1 Republican"],
+    ["SEPTEMBER 08, 2026", "Joseph D. Kenney, r", "Luz Bay, d", "", "Write-Ins "],
+    ["Albany", "56", "1", "", "0"],
+    ["Alexandria", "183", "2", "", "2"],
+    ["TOTALS", "20775", "62", "0", "102"],
+]
+EC4_DEM_ROWS = [
+    [None, "State of New Hampshire - Primary Election"],
+    [None, "Executive Council - District No. 4 Democratic"],
+    ["SEPTEMBER 08, 2026", "Jim O'Connell, d", "Terese M. Bastarache, r", "Harriet E. Cady, r", "John Stephen, r", "",
+     "Write-Ins "],
+    ["Allenstown", "334", "", "", "", "", "0"],
+    ["Auburn", "564", "", "", "35", "", "2"],
+    ["TOTALS", "22817", "4", "0", "35", "0", "91"],
+]
+EC4_REP_ROWS = [
+    [None, "State of New Hampshire - Primary Election"],
+    [None, "Executive Council - District No. 4 Republican"],
+    ["SEPTEMBER 08, 2026", "Terese M. Bastarache, r", "Harriet E. Cady, r", "John Stephen, r", "Jim O'Connell, d", "",
+     "Write-Ins "],
+    ["Allenstown", "47", "56", "253", "3", "", "1"],
+    ["Auburn", "76", "81", "536", "", "", "2"],
+    ["TOTALS", "2543", "1877", "14261", "33", "0", "37"],
+]
+STATEWIDE_FILES = {
+    "governor-summary-democratic": _workbook(GOV_DEM_ROWS),
+    "governor-summary-republican": _workbook(GOV_REP_ROWS),
+    "executive-council-1-democratic": _workbook(EC1_DEM_ROWS),
+    "executive-council-1-republican": _workbook(EC1_REP_ROWS),
+}
+
+
+class TestStatewide:
+    def _patch_sw(self, monkeypatch, dem_page=DEM_PAGE_SW, rep_page=REP_PAGE_SW, **extra_files):
+        _patch(monkeypatch, {
+            **PAGES, "democratic-state-primary": dem_page, "republican-state-primary": rep_page,
+        }, {**FEDERAL_FILES, **STATEWIDE_FILES, **extra_files}, held="2026-01-01")
+
+    @pytest.mark.asyncio
+    async def test_discovers_the_governor_summary_and_the_council_districts(self, monkeypatch):
+        self._patch_sw(monkeypatch)
+        offices = await nh._discover_office_links(None, 2026, statewide=True)
+        # Not "Governor Belknap": a per-county breakdown of a statewide race.
+        assert set(offices) == {("S", None), ("H", 1), ("governor", None), ("executive_council", "1")}
+        assert offices[("governor", None)]["d"].endswith("governor-summary-democratic.xlsx")
+        assert offices[("governor", None)]["r"].endswith("governor-summary-republican.xlsx")
+
+    @pytest.mark.asyncio
+    async def test_without_the_opt_in_the_governor_is_not_discovered(self, monkeypatch):
+        self._patch_sw(monkeypatch)
+        offices = await nh._discover_office_links(None, 2026)
+        assert set(offices) == {("S", None), ("H", 1)}
+
+    @pytest.mark.asyncio
+    async def test_resolves_the_real_governor_nominees(self, monkeypatch):
+        self._patch_sw(monkeypatch)
+        records = await nh.fetch_confirmed_candidates(None, 2026, "NH", {"statewide_offices": True})
+        governor = [r for r in records if r["office"] == "governor"]
+        assert sorted(governor, key=lambda r: r["party"]) == [
+            {"office": "governor", "district": None, "party": "D", "last_name": "Cinde Warmington"},
+            {"office": "governor", "district": None, "party": "R", "last_name": "Kelly Ayotte"},
+        ]
+        # The federal records are unchanged by the opt-in.
+        assert {(r["office"], r["party"]) for r in records if r["office"] in ("S", "H")} == {
+            ("S", "D"), ("S", "R"), ("H", "D"), ("H", "R"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_executive_council_is_read_one_seat_per_district(self, monkeypatch):
+        """A statewide body seated by district is listed per district, like
+        the legislature (the one rule for every such body). Each party page
+        links one workbook per district -- no "Summary", no per-county
+        breakdown -- and only its own party's columns count: John Stephen's
+        35 Democratic-ballot write-ins stay out, and in the real Republican
+        District 4 file he took 14,261 to Bastarache's 2,543 and Cady's
+        1,877 (the rows below are two of its 33 towns)."""
+        dem_page = DEM_PAGE_SW + EC4_ANCHOR
+        rep_page = dem_page.replace("democratic", "republican").replace("Democratic", "Republican")
+        self._patch_sw(monkeypatch, dem_page, rep_page, **{
+            "executive-council-4-democratic": _workbook(EC4_DEM_ROWS),
+            "executive-council-4-republican": _workbook(EC4_REP_ROWS),
+        })
+        records = await nh.fetch_confirmed_candidates(None, 2026, "NH", {"statewide_offices": True})
+        council = sorted(
+            (r["district"], r["party"], r["last_name"]) for r in records if r["office"] == "executive_council"
+        )
+        assert council == [
+            ("1", "D", "Luz Bay"), ("1", "R", "Joseph D. Kenney"),
+            ("4", "D", "Jim O'Connell"), ("4", "R", "John Stephen"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_federal_pages_with_no_governor_summary_fail_rather_than_say_none(self, monkeypatch):
+        """New Hampshire elects a governor every even year. Pages that list
+        federal contests but no Governor Summary would otherwise be stored
+        as a confirmed "no statewide offices"."""
+        self._patch_sw(monkeypatch, dem_page=DEM_PAGE_HTML,
+                       rep_page=REP_PAGE_HTML)
+        assert await nh.fetch_confirmed_candidates(None, 2026, "NH", {"statewide_offices": True}) is None
+        # ...and without the opt-in the same pages are simply federal.
+        assert await nh.fetch_confirmed_candidates(None, 2026, "NH", {})

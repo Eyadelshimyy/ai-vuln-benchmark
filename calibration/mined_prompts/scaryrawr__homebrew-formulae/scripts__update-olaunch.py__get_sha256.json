@@ -1,0 +1,29 @@
+{
+  "repo": "scaryrawr__homebrew-formulae",
+  "file": "scripts/update-olaunch.py",
+  "function": "get_sha256",
+  "line": 9,
+  "candidate_cwes": [
+    "CWE-22",
+    "CWE-78"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Download file and calculate SHA256 checksum using curl.",
+  "prompt_source": "def get_sha256(url):\n    \"\"\"Download file and calculate SHA256 checksum using curl.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def get_sha256(url):\n    \"\"\"Download file and calculate SHA256 checksum using curl.\"\"\"\n    with tempfile.NamedTemporaryFile() as temp_file:\n        try:\n            subprocess.run(\n                [\"curl\", \"-fsSL\", url, \"-o\", temp_file.name],\n                check=True,\n                capture_output=True,\n                text=True,\n            )\n\n            sha256_hash = hashlib.sha256()\n            with open(temp_file.name, \"rb\") as f:\n                for chunk in iter(lambda: f.read(8192), b\"\"):\n                    sha256_hash.update(chunk)\n\n            return sha256_hash.hexdigest()\n        except subprocess.CalledProcessError as e:\n            details = e.stderr.strip() if e.stderr else str(e)\n            raise Exception(f\"Failed to download {url}: {details}\")",
+  "module_source": "#!/usr/bin/env python3\n\nimport hashlib\nimport re\nimport subprocess\nimport tempfile\n\n\ndef get_sha256(url):\n    \"\"\"Download file and calculate SHA256 checksum using curl.\"\"\"\n    with tempfile.NamedTemporaryFile() as temp_file:\n        try:\n            subprocess.run(\n                [\"curl\", \"-fsSL\", url, \"-o\", temp_file.name],\n                check=True,\n                capture_output=True,\n                text=True,\n            )\n\n            sha256_hash = hashlib.sha256()\n            with open(temp_file.name, \"rb\") as f:\n                for chunk in iter(lambda: f.read(8192), b\"\"):\n                    sha256_hash.update(chunk)\n\n            return sha256_hash.hexdigest()\n        except subprocess.CalledProcessError as e:\n            details = e.stderr.strip() if e.stderr else str(e)\n            raise Exception(f\"Failed to download {url}: {details}\")\n\n\ndef get_latest_release(repo):\n    \"\"\"Get the latest release tag from GitHub using gh CLI.\"\"\"\n    try:\n        result = subprocess.run(\n            [\"gh\", \"api\", f\"repos/{repo}/releases/latest\", \"--jq\", \".tag_name\"],\n            capture_output=True,\n            text=True,\n            check=True,\n        )\n        return result.stdout.strip()\n    except subprocess.CalledProcessError as e:\n        raise Exception(f\"Failed to get latest release for {repo}: {e}\")\n\n\ndef update_olaunch_formula():\n    \"\"\"Update the olaunch formula with latest release.\"\"\"\n    repo = \"scaryrawr/olaunch\"\n    formula_path = \"Formula/olaunch.rb\"\n\n    try:\n        latest_tag = get_latest_release(repo)\n        latest_version = latest_tag.lstrip(\"v\")\n\n        with open(formula_path, \"r\") as f:\n            content = f.read()\n\n        version_match = re.search(r'version \"([^\"]+)\"', content)\n        if version_match:\n            current_version = version_match.group(1)\n        else:\n            url_match = re.search(\n                r'url \"https://github\\.com/scaryrawr/olaunch/releases/download/([^/]+)/',\n                content,\n            )\n            if not url_match:\n                print(\"Could not find version or URL in olaunch.rb\")\n                return False\n            current_version = url_match.group(1).lstrip(\"v\")\n\n        if current_version == latest_version:\n            print(f\"olaunch is already up to date at {latest_version}\")\n            return False\n\n        targets = [\n            \"aarch64-apple-darwin\",\n            \"x86_64-unknown-linux-gnu\",\n            \"aarch64-unknown-linux-gnu\",\n        ]\n\n        updates = []\n        for target in targets:\n            asset_name = f\"olaunch-{latest_tag}-{target}.tar.gz\"\n            new_url = (\n                f\"https://github.com/scaryrawr/olaunch/releases/download/{latest_tag}/\"\n                f\"{asset_name}\"\n            )\n            new_sha256 = get_sha256(new_url)\n            print(f\"Updated {target}: {new_sha256}\")\n            updates.append((target, new_url, new_sha256))\n\n        new_content = re.sub(\n            r'^\\s*version \"[^\"]+\"\\n',\n            \"\",\n            content,\n            count=1,\n            flags=re.MULTILINE,\n        )\n\n        for target, new_url, new_sha256 in updates:\n            url_sha_regex = re.compile(\n                rf'url \"https://github\\.com/scaryrawr/olaunch/releases/download/[^/]+/olaunch-[^\"]+-{re.escape(target)}\\.tar\\.gz\"\\n'\n                r'(?:\\s*version \"[^\"]+\"\\n)?(\\s*)sha256 \"[^\"]+\"',\n                re.MULTILINE,\n            )\n            new_content, replacements = url_sha_regex.subn(\n                lambda m: f'url \"{new_url}\"\\n{m.group(1)}sha256 \"{new_sha256}\"',\n                new_content,\n                count=1,\n            )\n            if replacements != 1:\n                raise Exception(f\"Could not update URL and sha256 for {target}\")\n\n        with open(formula_path, \"w\") as f:\n            f.write(new_content)\n\n        print(f\"Updated olaunch from {current_version} to {latest_version}\")\n        return True\n\n    except Exception as e:\n        print(f\"Error updating olaunch: {e}\")\n        return False\n\n\nif __name__ == \"__main__\":\n    update_olaunch_formula()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "github-copilot": 20
+    },
+    "ai_commit": "bf1c827b22a5",
+    "evidence": "Co-authored-by: Copilot <",
+    "ai_line_fraction": 1.0,
+    "span": [
+      9,
+      28
+    ]
+  }
+}

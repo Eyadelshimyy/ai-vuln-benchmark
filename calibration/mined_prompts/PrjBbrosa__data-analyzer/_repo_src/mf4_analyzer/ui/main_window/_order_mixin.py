@@ -1,0 +1,1193 @@
+"""OrderMixin: COT Order analysis worker dispatch and render methods."""
+
+from dataclasses import replace
+
+import numpy as np
+
+from PyQt5.QtWidgets import QMessageBox
+
+from ... import db_reference
+from ...signal import (
+    assess_speed_for_order,
+    order_angle_sample_count,
+    resolve_order_nfft,
+    revolutions_from_rpm,
+)
+from ...signal.analysis_defaults import DEFAULT_ANALYSIS_WINDOW, DEFAULT_ORDER_RES
+from ...signal.fft import unconstrained_window_nfft
+from ...signal.order import order_facts_from_result
+from ...signal.spectrogram import SpectrogramAnalyzer
+from ..pg_canvas.heatmap_canvas import DEFAULT_HEATMAP_INTERP
+from ...qt_analysis_shared import amplitude_mode_is_db
+from ..compute_feedback import ComputeOutcome
+from ..analysis_result_state import bind_result, mark_pending, snapshot_request
+from ._sentinel import _INSPECTOR_TIME_RANGE
+from ._state_holders import (
+    OrderHeatmapRenderInputs,
+    canvas_previous_db_reference,
+    composite_source_id,
+    heatmap_slice_snapshot,
+    widget_raster_metrics,
+)
+from .ultraview_coordinator import notify_ultraview_plot
+
+
+class OrderMixin:
+    """Domain adapter for COT Order input collection and rendering.
+
+    ``AnalysisJobService`` owns worker lifecycle, FIFO queueing and progress;
+    every job carries its own cache/render context back to this mixin.
+    """
+
+    def _order_sig_for(self, source, time_range=_INSPECTOR_TIME_RANGE):
+        """Fetch + range-gate an explicit Order signal source ``(fid, ch)``.
+        Returns ``(t, sig)`` or ``(None, None)``. V7b: the split queue must
+        fetch a NON-focused pane's source, not the inspector selection."""
+        if not source:
+            return None, None
+        fid, ch = source
+        if fid not in self.files:
+            return None, None
+        fd = self.files[fid]
+        if ch not in fd.data.columns:
+            return None, None
+        t = fd.time_array
+        sig = fd.data[ch].values
+        if time_range is _INSPECTOR_TIME_RANGE:
+            resolver = getattr(self, "_resolve_job_time_range", None)
+            if callable(resolver):
+                time_range = resolver("order", time_range)
+            elif self.inspector.top.range_enabled():
+                time_range = self.inspector.top.range_values()
+            else:
+                time_range = None
+        if time_range is not None and t is not None:
+            t, sig = self._mask_time_range(t, sig, time_range=time_range)
+        return t, sig
+
+    def _order_rpm_for(self, rpm_source, n, time_range=_INSPECTOR_TIME_RANGE,
+                       t_sig=None, *, params=None):
+        """Fetch + range-gate + scale an explicit Order RPM source. ``n`` is
+        the signal length the rpm must match. Returns the scaled rpm array or
+        ``None`` (caller skips the pane). The scale factor is the current
+        inspector ``rpm_factor`` — shared across panes like the COT params.
+
+        Multi-rate support: when the (range-gated) motor-speed channel does
+        NOT match the signal length ``n`` and a signal time axis ``t_sig`` is
+        supplied, the motor speed is interpolated onto ``t_sig`` (e.g. a 1 kHz
+        speed channel upsampled to a 48 kHz signal axis). This NEVER downsamples
+        the wideband signal — it only raises the speed to the signal's rate so
+        the COT core sees three equal-length, same-time-base arrays. The motor
+        speed's own time axis must be strictly increasing; otherwise alignment
+        is unsafe and the pane is skipped (``None``), matching the prior
+        length-mismatch behaviour. EPS: ``rpm`` is the motor speed (order base).
+        """
+        ctx = self.inspector.order_ctx
+        p = params if isinstance(params, dict) else None
+        rpm_mode = None if p is None else p.get('rpm_mode')
+        if rpm_mode is None:
+            rpm_mode = getattr(ctx, 'rpm_mode', lambda: 'channel')()
+        if rpm_mode == 'manual':
+            if p is not None and 'manual_rpm' in p:
+                value = float(p['manual_rpm'])
+            else:
+                value = float(ctx.manual_rpm())
+            return np.full(int(n), value, dtype=float)
+        if not rpm_source:
+            return None
+        fid, ch = rpm_source
+        if fid not in self.files:
+            return None
+        fd = self.files[fid]
+        if ch not in fd.data.columns:
+            return None
+        if p is not None and 'rpm_factor' in p:
+            factor = p['rpm_factor']
+        else:
+            factor = self.inspector.order_ctx.rpm_factor()
+        rpm = fd.data[ch].values.copy() * factor
+        t_rpm = fd.time_array
+        if time_range is _INSPECTOR_TIME_RANGE:
+            resolver = getattr(self, "_resolve_job_time_range", None)
+            if callable(resolver):
+                time_range = resolver("order", time_range)
+            elif self.inspector.top.range_enabled():
+                time_range = self.inspector.top.range_values()
+            else:
+                time_range = None
+        if time_range is not None and t_rpm is not None:
+            t_rpm, rpm = self._mask_time_range(
+                t_rpm, rpm, time_range=time_range)
+        if len(rpm) != n:
+            aligned = self._align_rpm_to_signal_axis(rpm, t_rpm, t_sig, n)
+            if aligned is None:
+                return None
+            return aligned
+        return rpm
+
+    @staticmethod
+    def _align_rpm_to_signal_axis(rpm, t_rpm, t_sig, n):
+        """Interpolate motor speed ``rpm`` (on its own axis ``t_rpm``) onto the
+        signal time axis ``t_sig`` so the result is length ``n``. Returns the
+        aligned array, or ``None`` when alignment is unsafe (missing/degenerate
+        time axes, or either axis not strictly increasing). Pure upsample/
+        resample of the speed channel — the signal is never touched.
+
+        Same-source files share the time origin and overlapping span, so
+        ``np.interp`` (which clamps to endpoint values outside the range) is
+        safe without extrapolation here.
+        """
+        if t_sig is None or t_rpm is None:
+            return None
+        t_sig_arr = np.asarray(t_sig, dtype=float).reshape(-1)
+        t_rpm_arr = np.asarray(t_rpm, dtype=float).reshape(-1)
+        rpm_arr = np.asarray(rpm, dtype=float).reshape(-1)
+        if t_sig_arr.size != n or t_rpm_arr.size != rpm_arr.size:
+            return None
+        if t_rpm_arr.size < 2 or t_sig_arr.size < 2:
+            return None
+        if not np.all(np.isfinite(t_rpm_arr)) or not np.all(np.isfinite(t_sig_arr)):
+            return None
+        # Both the source (xp) and the query (x) axes must be strictly
+        # increasing for np.interp to be well-defined / monotone-safe.
+        if np.any(np.diff(t_rpm_arr) <= 0) or np.any(np.diff(t_sig_arr) <= 0):
+            return None
+        aligned = np.interp(t_sig_arr, t_rpm_arr, rpm_arr)
+        if aligned.size != n:
+            return None
+        return aligned
+
+    # Revolution counting and the angle-domain sample count are pure numerics
+    # shared with the batch auto-NFFT resolver, so they live in
+    # ``signal.adaptive``.  These two names stay as thin delegations because
+    # they are the window-side contract the inspector preview provider and the
+    # existing tests call.
+    _order_revolutions = staticmethod(revolutions_from_rpm)
+    _order_angle_sample_count = staticmethod(order_angle_sample_count)
+
+    def _order_preview_revs(self):
+        """Revolution count for the inspector auto-NFFT preview, or ``None``.
+
+        Pull-based hook registered via ``OrderContextual.set_auto_nfft_provider``:
+        fetches the currently selected order signal + RPM (gated to the inspector
+        time range, mirroring ``_order_effective_params_for_source``) and returns
+        total revolutions, so the displayed 自动(N) tracks ``resolve_order_nfft``
+        instead of the data-blind ``samples_per_rev / order_res`` upper bound.
+        Returns ``None`` when no usable selection/data exists (the preview then
+        falls back to the naive estimate). Never raises — it feeds a paint path.
+        """
+        try:
+            t, sig = self._order_sig_for(self.inspector.order_ctx.current_signal())
+            if sig is None or len(sig) < 2:
+                return None
+            rpm = self._order_rpm_for(
+                self.inspector.order_ctx.current_rpm(), len(sig), t_sig=t
+            )
+            if rpm is None:
+                return None
+            fs = float(self.inspector.order_ctx.fs())
+            t_arr = np.asarray(t, dtype=float) if t is not None else np.array([])
+            if len(t_arr) < 2 or np.any(np.diff(t_arr) <= 0):
+                t_arr = np.arange(len(sig), dtype=float) / fs
+            revs = self._order_revolutions(rpm, t_arr)
+            return revs if revs > 0.0 else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _resolve_order_effective_params(p, rpm, t):
+        """Return COT params with a concrete NFFT for auto mode."""
+        out = dict(p)
+        nfft = out.get('nfft')
+        auto = (
+            nfft is None
+            or out.get('nfft_mode') == 'auto'
+            or str(nfft) == '自动'
+        )
+        samples_per_rev = int(out.get('samples_per_rev', 256))
+        out['samples_per_rev'] = samples_per_rev
+        if auto:
+            n_angle = order_angle_sample_count(
+                samples_per_rev,
+                rpm,
+                t,
+            )
+            effective = resolve_order_nfft(
+                samples_per_rev,
+                out.get('order_res', DEFAULT_ORDER_RES),
+                n_angle,
+                overlap=0.75,
+            )
+            out['nfft'] = int(effective)
+            out['nfft_effective'] = int(effective)
+            out['nfft_mode'] = 'auto'
+            out['n_angle_samples'] = int(n_angle)
+        else:
+            effective = int(nfft)
+            out['nfft'] = effective
+            out['nfft_effective'] = effective
+            out['nfft_mode'] = 'fixed'
+        return out
+
+    @staticmethod
+    def _order_compute_cache_params(p, rpm_source, time_range):
+        nfft = p.get('nfft_effective', p.get('nfft'))
+        if nfft is None:
+            nfft = p.get('nfft_preview') or 256
+        rpm_mode = p.get('rpm_mode', 'channel')
+        # 规约：凡进入 COT 计算的用户可调参数都必须在此登记，否则改了不刷新。
+        # window is a COTParams field consumed by COTOrderAnalyzer.compute
+        # (it builds the analysis window from it); registering it here keeps
+        # the key field-aligned with the dataclass so a window change forces a
+        # recompute instead of reusing a result built with the old window.
+        return {
+            'nfft': int(nfft),
+            'nfft_mode': p.get('nfft_mode', 'fixed'),
+            'window': p.get('window', DEFAULT_ANALYSIS_WINDOW),
+            'max_order': p.get('max_order'),
+            'order_res': p.get('order_res'),
+            'time_res': p.get('time_res'),
+            'samples_per_rev': p.get('samples_per_rev'),
+            'rpm_factor': p.get('rpm_factor'),
+            'rpm_mode': rpm_mode,
+            'manual_rpm': (
+                float(p.get('manual_rpm', 1000.0))
+                if rpm_mode == 'manual'
+                else None
+            ),
+            'fs': p.get('fs'),
+            'weighting': str(p.get('weighting', 'None')),
+            'rpm_source': (
+                None
+                if rpm_mode == 'manual'
+                else list(rpm_source) if rpm_source else None
+            ),
+            'time_range': time_range,
+        }
+
+    def _order_analysis_cache_key(self, fid, ch, p, rpm_source, time_range):
+        return self.analysis_caches['order'].make_key(
+            fid,
+            ch,
+            self._order_compute_cache_params(p, rpm_source, time_range),
+        )
+
+    def _order_view_is_uncomputed(self, state) -> bool:
+        """True when the View has a signal but is missing RPM or a cache hit."""
+        panes = tuple(getattr(state, "panes", ()) or ())
+        if not panes:
+            return False
+        pane = panes[0]
+        sources = tuple(getattr(pane, "sources", ()) or ())
+        if not sources:
+            return False
+        params = self._compute_params_overlay_state("order", state)
+        rpm_mode = params.get("rpm_mode")
+        if rpm_mode is None:
+            rpm_mode = self.inspector.order_ctx.rpm_mode()
+        if rpm_mode != "manual" and not getattr(pane, "rpm_source", None):
+            return True
+        fid, ch = sources[0]
+        key = self._analysis_cache_key_for_view_source(
+            "order", state, pane, 0, fid, ch,
+        )
+        return self.analysis_caches["order"].get(key) is None
+
+    def _cancel_order_page_transition_cover(self, view_id=None) -> None:
+        """Drop a pending Order cover before a live result replaces it."""
+        token = getattr(self.chart_stack, "_page_transition_target", None)
+        if token is None or token.section != "order":
+            return
+        if view_id is not None and str(token.view_id) != str(view_id):
+            return
+        self.chart_stack.cancel_page_transition("order-live-result")
+
+    def _order_effective_params_for_source(self, p, fid, ch, rpm_source, time_range):
+        t, sig = self._order_sig_for((fid, ch), time_range=time_range)
+        if sig is None or len(sig) < 100:
+            return None
+        rpm = self._order_rpm_for(
+            rpm_source, len(sig), time_range=time_range, t_sig=t, params=p)
+        if rpm is None:
+            return None
+        fs = p.get('fs') or self.inspector.order_ctx.fs()
+        t_arr = np.asarray(t, dtype=float) if t is not None else np.array([])
+        if len(t_arr) < 2 or np.any(np.diff(t_arr) <= 0):
+            t_arr = np.arange(len(sig), dtype=float) / float(fs)
+        from ...analysis_time_axis import prepare_analysis_time_axis
+        _axis, analysis_fs, _facts = prepare_analysis_time_axis(
+            t_arr, fs, materialize=False,
+        )
+        return self._resolve_order_effective_params(
+            dict(p, fs=analysis_fs), rpm, t_arr,
+        )
+
+    def _warn_if_order_speed_unsuitable(self, rpm):
+        ok, message = assess_speed_for_order(rpm)
+        if ok:
+            return True
+        self.toast(message, "warning")
+        self.statusBar.showMessage(message)
+        return False
+
+    def _recompute_restored_order_view(self, view_id):
+        """Fill the Order cache from persisted panes; plot only if active."""
+        state = self._analysis_state_by_id("order", view_id)
+        if state is None:
+            return
+        mgr = self.analysis_managers["order"]
+        is_active = mgr.get(mgr.active) is state
+        plot_live = is_active and self.chart_stack.current_mode() == "order"
+        if plot_live:
+            self.chart_stack.ensure_analysis_page_ready("order")
+        page = self._analysis_page("order")
+        cache = self.analysis_caches["order"]
+        jobs = []
+        for pane_idx, pane in enumerate(state.panes):
+            sources = pane.sources
+            if not sources:
+                continue
+            fid, ch = sources[0]
+            rpm_source = pane.rpm_source
+            blocker = getattr(self, "_analysis_restore_time_range_block_reason", None)
+            if callable(blocker):
+                reason = blocker("order", state, pane_idx)
+                if reason:
+                    toast = getattr(self, "toast", None)
+                    if callable(toast):
+                        toast(reason, "warning")
+                    status = getattr(self, "statusBar", None)
+                    if status is not None:
+                        status.showMessage(reason)
+                    continue
+            built = self._build_order_job(
+                pane_idx, fid, ch, rpm_source, state=state, warn=False
+            )
+            if built is None:
+                continue
+            _job, ctx = built
+            analysis_key = ctx.get("analysis_key")
+            cached = cache.get(analysis_key) if analysis_key is not None else None
+            if cached is not None:
+                self._store_analysis_result(
+                    "order", state.view_id, pane_idx, analysis_key, cached
+                )
+                if plot_live and pane_idx < page.pane_count():
+                    self._render_order_on(
+                        page.pane_canvas(pane_idx), cached, source=(fid, ch)
+                    )
+                continue
+            jobs.append(built)
+        if jobs:
+            self._start_order_batch(jobs)
+
+    def do_order_time(self):
+        """Compute the WHOLE active Order view — every pane (V7b).
+
+        Each pane carries one signal source ``(fid, ch)`` plus its own
+        ``rpm_source``. For every pane we build the analysis cache key and
+        either render a cache HIT onto that pane's canvas immediately, or
+        submit a context-carrying service job. The focused pane is submitted
+        first; a single (non-split) pane yields one job.
+
+        Re-entry while a worker is running drops the whole new request with
+        ``正在计算…``. A pane whose source/rpm is unfetchable is skipped
+        without aborting the queue.
+        """
+        # V7 Step 5: capture the active Order view (params + per-pane sources +
+        # rpm_source) so a later view switch renders from analysis_caches.
+        if not self._offer_analysis_time_range_before_compute('order'):
+            return
+        self._capture_active_analysis_view('order')
+        # Preserve the established UI policy: a second click reports busy and
+        # drops rather than implicitly replacing the active batch.
+        if self._analysis_jobs.is_running('order'):
+            self._emit_compute_feedback(
+                ComputeOutcome(),
+                busy=True,
+                section_label="时间-阶次",
+            )
+            return
+        self._order_outcome = None
+        state = self._analysis_state_for_dispatch('order')
+        self._clear_analysis_view_viewports(state)
+        cache = self.analysis_caches['order']
+        routed = self._comparison_routes('order')
+
+        focus = self._dispatch_focus_index('order', state)
+        pane_order = sorted(
+            self._dispatch_pane_indices('order', state),
+            key=lambda i: (i != focus, i),
+        )
+        jobs = []
+        any_source = False
+        outcome = ComputeOutcome()
+        self._order_outcome = outcome
+        for pane_idx in pane_order:
+            sources = state.panes[pane_idx].sources
+            if not sources:
+                continue
+            any_source = True
+            fid, ch = sources[0]
+            rpm_source = state.panes[pane_idx].rpm_source
+            pane = state.panes[pane_idx]
+            mark_pending(pane)
+            request = snapshot_request(state, pane)
+            if routed:
+                analysis_key = self._analysis_cache_key_for_view_source(
+                    'order', state, pane, pane_idx, fid, ch,
+                )
+            else:
+                analysis_key = self._analysis_cache_key(
+                    'order', fid, ch,
+                    rpm_source=tuple(rpm_source) if rpm_source else None,
+                    pane_idx=pane_idx)
+            cached = cache.get(analysis_key)
+            if cached is not None:
+                self._store_analysis_result(
+                    'order', state.view_id, pane_idx, analysis_key, cached)
+                if not bind_result(pane, request, (analysis_key,)):
+                    continue
+                self._replace_analysis_pane_pins('order', state.view_id, pane_idx, (analysis_key,))
+                canvas = self._dispatch_canvas('order', state, pane_idx)
+                if canvas is not None:
+                    self._render_order_on(canvas, cached, source=(fid, ch))
+                outcome.cached += 1
+            else:
+                built = self._build_order_job(
+                    pane_idx, fid, ch, rpm_source,
+                    state=state if routed else None,
+                )
+                if built is None:
+                    mark_pending(pane)
+                jobs.append(built if built is not None else (None, {'pane_idx': pane_idx}))
+
+        if not jobs:
+            if not any_source:
+                self._order_outcome = None
+                # No captured pane source → legacy inspector-selection path so
+                # the standalone-signal UX + existing tests are unchanged.
+                self._do_order_time_single()
+                return
+            self._emit_compute_feedback(outcome, section_label="时间-阶次")
+            self._order_outcome = None
+            return
+
+        self._start_order_batch(jobs)
+
+    def _do_order_time_single(self):
+        """Legacy single-source Order path: compute the inspector's selected
+        signal/rpm onto the primary canvas. Kept for the standalone-signal UX
+        and the pre-V7b tests."""
+        state = self._analysis_state_for_dispatch('order')
+        pane_idx = self._dispatch_focus_index('order', state)
+        mark_pending(state.panes[pane_idx])
+        sig_data = self.inspector.order_ctx.current_signal()
+        rpm_data = self.inspector.order_ctx.current_rpm()
+        if not sig_data:
+            self.toast("请选择有效信号", "warning")
+            return
+        page = self._analysis_page('order')
+        built = self._build_order_job(
+            page.focused_index(), sig_data[0], sig_data[1],
+            tuple(rpm_data) if rpm_data else None,
+        )
+        if built is None:
+            self.inspector.order_ctx.set_progress("")
+            return
+        self._order_outcome = None
+        _job, context = built
+        cached = self.analysis_caches['order'].get(context.get('analysis_key'))
+        if cached is not None:
+            self._on_order_job_finished(context, cached)
+            return
+        self._start_order_batch([built])
+
+    def _start_order_batch(self, jobs):
+        total = len(jobs)
+        if self._analysis_jobs.progress_token('order') is None:
+            self._analysis_jobs.set_progress_token(
+                'order',
+                self._begin_compute_progress(
+                    "阶次 1/%d" % total,
+                    total=1000,
+                    process_events=False,
+                ),
+            )
+        self.statusBar.showMessage('计算时间-阶次谱 (COT)...')
+        self.inspector.order_ctx.set_progress("计算中...")
+        self._analysis_jobs.submit_batch('order', jobs)
+
+    def _finish_order_outcome_feedback(self):
+        outcome = getattr(self, '_order_outcome', None)
+        if outcome is None:
+            return
+        self._emit_compute_feedback(outcome, section_label="时间-阶次")
+        self._order_outcome = None
+
+    def _build_order_job(self, pane_idx, fid, ch, rpm_source, *, state=None,
+                         warn=True):
+        """Prepare one COT job and its immutable render/cache context."""
+        from ...signal.order_cot import COTOrderAnalyzer, COTParams
+        if state is not None:
+            pane = state.panes[pane_idx]
+            time_range = self._normalize_analysis_time_range(pane.time_range)
+            op = self._compute_params_overlay_state('order', state)
+            view_id = state.view_id
+        else:
+            time_range = self._pane_time_range_for('order', pane_idx)
+            op = dict(self.inspector.order_ctx.compute_params())
+            view_id = self.analysis_managers['order'].get(
+                self.analysis_managers['order'].active
+            ).view_id
+        t, sig = self._order_sig_for((fid, ch), time_range=time_range)
+        if sig is None:
+            outcome = getattr(self, '_order_outcome', None)
+            if outcome is not None:
+                outcome.skipped.append("源通道缺失")
+            return None
+        if len(sig) < 100:
+            outcome = getattr(self, '_order_outcome', None)
+            if outcome is not None:
+                outcome.skipped.append("信号过短")
+            return None
+        rpm = self._order_rpm_for(
+            rpm_source, len(sig), time_range=time_range, t_sig=t, params=op)
+        if rpm is None:
+            outcome = getattr(self, '_order_outcome', None)
+            if outcome is not None:
+                outcome.skipped.append("缺转速")
+            return None
+        if warn:
+            self._warn_if_order_speed_unsuitable(rpm)
+        fs = op.get('fs') or self.inspector.order_ctx.fs()
+        # Audit fix R6/C7: COT requires strictly monotonic ``t``; synthesise a
+        # uniform grid from the inspector fs when the timestamps are degenerate.
+        t_arr = np.asarray(t, dtype=float) if t is not None else np.array([])
+        if len(t_arr) < 2 or np.any(np.diff(t_arr) <= 0):
+            t_arr = np.arange(len(sig), dtype=float) / float(fs)
+        from ...analysis_time_axis import prepare_analysis_time_axis
+        t_arr, fs, time_facts = prepare_analysis_time_axis(t_arr, fs)
+        op = dict(op, fs=fs)
+        orig_auto = (
+            op.get('nfft') is None
+            or op.get('nfft_mode') == 'auto'
+            or str(op.get('nfft')) == '自动'
+        )
+        op = self._resolve_order_effective_params(op, rpm, t_arr)
+        try:
+            p = COTParams(
+                samples_per_rev=int(op.get('samples_per_rev', 256)),
+                nfft=int(op.get('nfft_effective', op['nfft'])),
+                window=op.get('window', DEFAULT_ANALYSIS_WINDOW),
+                max_order=float(op['max_order']),
+                order_res=float(op['order_res']),
+                time_res=float(op['time_res']),
+                fs=fs,
+                weighting=str(op.get('weighting', 'None')),
+            )
+        except Exception as e:
+            outcome = getattr(self, '_order_outcome', None)
+            if outcome is not None:
+                outcome.failed += 1
+            elif warn:
+                QMessageBox.critical(self, "错误", str(e))
+            return None
+        analysis_key = self._order_analysis_cache_key(
+            fid,
+            ch,
+            op,
+            rpm_source=tuple(rpm_source) if rpm_source else None,
+            time_range=time_range,
+        )
+        owner = state
+        if owner is None:
+            order_mgr = self.analysis_managers['order']
+            owner = order_mgr.get(order_mgr.active) if order_mgr.views else None
+        pane_token = None
+        if owner is not None and 0 <= int(pane_idx) < len(owner.panes):
+            pane_token = id(owner.panes[int(pane_idx)])
+        ctx = {
+            'analysis_key': analysis_key,
+            'pane_idx': pane_idx,
+            'pane_token': pane_token,
+            'source': (fid, ch),
+            # Capture at dispatch: completion may land after the user switched
+            # Views, so the callback must not read the then-active view.
+            'view_id': view_id,
+        }
+        if owner is not None and 0 <= int(pane_idx) < len(owner.panes):
+            ctx['request_snapshot'] = replace(
+                snapshot_request(owner, owner.panes[int(pane_idx)]),
+                sources=((fid, ch),), time_range=time_range,
+                rpm_source=tuple(rpm_source) if rpm_source else None,
+            )
+
+        samples_per_rev = int(op.get('samples_per_rev', 256))
+        order_res = float(op['order_res'])
+        if orig_auto:
+            nfft_requested = unconstrained_window_nfft(
+                samples_per_rev, 1.0 / order_res, floor=256, ceil=16384,
+            )
+            if nfft_requested is None:
+                nfft_requested = int(op.get('nfft_effective', op['nfft']))
+        else:
+            nfft_requested = int(op.get('nfft_effective', op['nfft']))
+        n_samples = len(sig)
+
+        def job(
+            worker, _sig=sig, _rpm=rpm, _t=t_arr, _p=p,
+            _req=nfft_requested, _n=n_samples, _order_res=order_res,
+            _time_facts=time_facts,
+        ):
+            result = COTOrderAnalyzer.compute(
+                _sig,
+                _rpm,
+                _t,
+                _p,
+                progress_callback=worker.progress.emit,
+                cancel_token=worker.cancelled,
+            )
+            result.effective = order_facts_from_result(
+                result,
+                _rpm,
+                n_samples=_n,
+                order_res_requested=_order_res,
+                nfft_requested=_req,
+            )
+            if _time_facts is not None:
+                from dataclasses import replace
+                result.effective = replace(result.effective, time_axis=_time_facts)
+            return result
+
+        return job, ctx
+
+    def _order_label_resolution(self, source, order_params):
+        """Resolve this render's dB reference (spec §15 C3, Task 7): each
+        pane's SINGLE source resolves independently -- honoring the
+        section's current Auto/Manual View mode -- rather than reusing the
+        FOCUSED pane's control value for a non-focused pane's render.
+
+        ``source`` is ``None`` only for direct-call test doubles that never
+        wire a real ``(fid, ch)``; those keep the historical
+        ``order_params['db_reference']`` numeric default degraded through
+        the shared validator so existing callers are unaffected.
+        """
+        if source is not None:
+            if 'db_reference_mode' in order_params:
+                return self._resolve_db_reference_for_source('order', source, params=order_params)
+            return self._resolve_db_reference_for_source('order', source)
+        return db_reference.degraded_numeric_resolution(order_params)
+
+    def _current_order_heatmap_inputs(self, canvas, result, source):
+        """Snapshot the display inputs the next Order paint or retain check reads."""
+        ctx = self.inspector.order_ctx
+        order_params = ctx.current_params() if hasattr(ctx, "current_params") else {}
+        order_params = self._analysis_params_for_canvas('order', canvas, order_params)
+        resolution = self._order_label_resolution(source, order_params)
+        inputs = self._order_render_inputs(
+            canvas, result, source, order_params, resolution,
+        )
+        return replace(inputs, db_value=float(resolution.value))
+
+    def _order_render_inputs(self, canvas, result, source, order_params, resolution, color_policy=None):
+        """Build the frozen display snapshot. Paint reads this object only."""
+        from ..pg_canvas.heatmap_canvas import time_axis_display_extent
+
+        result_params = getattr(result, "params", None)
+        weighting = str(
+            getattr(result_params, "weighting", None)
+            or order_params.get("weighting", "None")
+        )
+        amplitude_mode = (
+            "amplitude_db"
+            if amplitude_mode_is_db(
+                order_params.get("amplitude_mode", "Amplitude dB")
+            )
+            else "amplitude"
+        )
+        resolver = getattr(self, "_heatmap_color_policy_for_canvas", None)
+        if color_policy is None and callable(resolver):
+            color_policy = resolver("order", canvas, order_params, resolution, source, amplitude_mode)
+        x_extent = time_axis_display_extent(
+            result.times,
+            params=result_params,
+            metadata=getattr(result, "metadata", None),
+            fallback=(float(result.times[0]), float(result.times[-1])),
+        )
+        slice_dir, slice_x, slice_y = heatmap_slice_snapshot(canvas)
+        x_origin, x_lim, y_origin, y_lim = self._heatmap_viewport_snapshot(
+            "order", canvas,
+        )
+        width, height, dpr = widget_raster_metrics(canvas)
+        tick_x, tick_y = self._heatmap_tick_counts()
+        return OrderHeatmapRenderInputs(
+            signal_title=str(self.inspector.order_ctx.combo_sig.currentText()),
+            order_resolution_text=f"{result.params.order_res}",
+            amplitude_mode=amplitude_mode,
+            weighting=weighting,
+            db_reference_mode=str(order_params.get("db_reference_mode", "") or ""),
+            db_value=float(resolution.value),
+            db_unit=str(resolution.unit or ""),
+            db_quantity=str(resolution.quantity or ""),
+            db_source=str(resolution.source or ""),
+            db_warning=str(resolution.warning or ""),
+            z_auto=color_policy.z_auto if color_policy is not None else bool(order_params.get("z_auto", False)),
+            z_floor=color_policy.z_floor if color_policy is not None else float(order_params.get("z_floor", -30.0)),
+            z_ceiling=color_policy.z_ceiling if color_policy is not None else float(order_params.get("z_ceiling", 0.0)),
+            x_auto=bool(order_params.get("x_auto", True)),
+            x_min=float(order_params.get("x_min", 0.0)),
+            x_max=float(order_params.get("x_max", 0.0)),
+            y_auto=bool(order_params.get("y_auto", True)),
+            y_min=float(order_params.get("y_min", 0.0)),
+            y_max=float(order_params.get("y_max", 0.0)),
+            cmap=self._heatmap_cmap_for_canvas("order", canvas),
+            interp=str(DEFAULT_HEATMAP_INTERP),
+            tick_x=tick_x,
+            tick_y=tick_y,
+            source_id=composite_source_id(source),
+            x_origin=x_origin,
+            y_origin=y_origin,
+            x_lim=x_lim,
+            y_lim=y_lim,
+            slice_dir=slice_dir,
+            slice_x=slice_x,
+            slice_y=slice_y,
+            seed_slice=getattr(canvas, "_slice_curve", None) is not None,
+            canvas_width=width,
+            canvas_height=height,
+            canvas_dpr=dpr,
+            previous_db_reference=None if color_policy is not None else canvas_previous_db_reference(canvas),
+            levels_are_resolved=color_policy is not None,
+            x_extent=(float(x_extent[0]), float(x_extent[1])),
+            y_extent=(float(result.orders[0]), float(result.orders[-1])),
+        )
+
+    def _paint_order_heatmap(self, canvas, result, inputs):
+        """Draw ``inputs`` onto ``canvas``. Display knobs are not re-read here."""
+        resolution = db_reference.DbReferenceResolution(
+            value=float(inputs.db_value),
+            unit=inputs.db_unit,
+            quantity=inputs.db_quantity,
+            source=inputs.db_source,
+            warning=inputs.db_warning,
+        )
+        output_scale = "db" if inputs.amplitude_mode == "amplitude_db" else "linear"
+        amplitude_label = db_reference.format_amplitude_label(
+            resolution, weighting=inputs.weighting, output_scale=output_scale,
+        )
+        z_unit_suffix = (
+            db_reference.format_reference_note(
+                resolution, weighting=inputs.weighting,
+            )
+            if output_scale == "db" else None
+        )
+        raw = result.amplitude.T
+        matrix = raw
+        plot_amp_mode = inputs.amplitude_mode
+        # Spec §8.3.1: diff THIS render's reference against the snapshot in
+        # ``inputs``, so a manual window tracks the unclipped matrix. A test
+        # double without the method keeps the historical no-shift behaviour.
+        reference_delta = None
+        if inputs.amplitude_mode == "amplitude_db":
+            matrix = SpectrogramAnalyzer.amplitude_to_db(
+                matrix, reference=inputs.db_value,
+            )
+            plot_amp_mode = "amplitude"
+            delta_fn = getattr(canvas, "reference_delta_since_last_render", None)
+            if not inputs.levels_are_resolved and callable(delta_fn):
+                if hasattr(canvas, "_last_db_reference"):
+                    canvas._last_db_reference = inputs.previous_db_reference
+                reference_delta = delta_fn(inputs.db_value)
+        z_floor = float(inputs.z_floor)
+        z_ceiling = float(inputs.z_ceiling)
+        vmin_override = None
+        vmax_override = None
+        shifted_manual_levels = None
+        if inputs.amplitude_mode == "amplitude_db":
+            if inputs.z_auto:
+                from ..pg_canvas.heatmap_canvas import _auto_db_window
+                window = _auto_db_window(matrix)
+                if window is not None:
+                    vmin_override, vmax_override = window
+            elif reference_delta is not None:
+                z_floor += reference_delta
+                z_ceiling += reference_delta
+                shifted_manual_levels = (z_floor, z_ceiling)
+        if inputs.amplitude_mode == "amplitude_db":
+            amplitude_valid_mask = np.isfinite(raw) & (raw > 0)
+        else:
+            amplitude_valid_mask = np.isfinite(raw)
+        canvas._amplitude_mode = inputs.amplitude_mode
+        setter = getattr(canvas, "set_overlay_source", None)
+        if callable(setter):
+            setter(inputs.source_id)
+        canvas.plot_or_update_heatmap(
+            matrix=matrix,
+            amplitude_valid_mask=amplitude_valid_mask,
+            x_extent=inputs.x_extent,
+            y_extent=inputs.y_extent,
+            x_label="Time (s)",
+            y_label="Order",
+            title=(
+                f"时间-阶次谱 - {inputs.signal_title} "
+                f"(分辨率:{inputs.order_resolution_text})"
+            ),
+            cmap=inputs.cmap,
+            interp=inputs.interp,
+            cbar_label=amplitude_label,
+            amplitude_mode=plot_amp_mode,
+            amplitude_label=amplitude_label,
+            z_unit_suffix=z_unit_suffix,
+            z_auto=inputs.z_auto,
+            z_floor=z_floor,
+            z_ceiling=z_ceiling,
+            vmin=vmin_override,
+            vmax=vmax_override,
+            x_auto=inputs.x_auto,
+            x_min=float(inputs.x_min),
+            x_max=float(inputs.x_max),
+            y_auto=inputs.y_auto,
+            y_min=float(inputs.y_min),
+            y_max=float(inputs.y_max),
+            x_coords=result.times,
+            y_coords=result.orders,
+        )
+        ctx = self.inspector.order_ctx
+        echo_levels = (not inputs.levels_are_resolved
+                       and self._analysis_canvas_updates_controls("order", canvas))
+        if echo_levels and inputs.z_auto and inputs.amplitude_mode == "amplitude_db" and vmin_override is not None:
+            for spin, val in (
+                (ctx.spin_z_floor, vmin_override),
+                (ctx.spin_z_ceiling, vmax_override),
+            ):
+                spin.blockSignals(True)
+                spin.setValue(val)
+                spin.blockSignals(False)
+        elif echo_levels and shifted_manual_levels is not None:
+            for spin, val in (
+                (ctx.spin_z_floor, shifted_manual_levels[0]),
+                (ctx.spin_z_ceiling, shifted_manual_levels[1]),
+            ):
+                spin.blockSignals(True)
+                spin.setValue(val)
+                spin.blockSignals(False)
+        if inputs.seed_slice:
+            canvas._seed_slice()
+        canvas.set_tick_density(inputs.tick_x, inputs.tick_y)
+        project = getattr(self, "_project_heatmap_pane_appearance", None)
+        if callable(project):
+            project("order", canvas)
+
+    def _render_order_on(self, canvas, result, source=None):
+        """Multi-pane variant: draw an Order COT ``result`` on an arbitrary
+        order heatmap canvas using the current OrderContextual display knobs.
+        Pure canvas draw — no preset/status side-effects (those stay in
+        ``_render_order_time``). ``source`` is the ``(fid, ch)`` this
+        specific pane/result came from -- required for a per-pane-accurate
+        dB-reference resolution (spec §15 C3)."""
+        ctx = self.inspector.order_ctx
+        order_params = ctx.current_params() if hasattr(ctx, "current_params") else {}
+        order_params = self._analysis_params_for_canvas('order', canvas, order_params)
+        resolution = self._order_label_resolution(source, order_params)
+        resolver = getattr(self, "_heatmap_color_policy_for_canvas", None)
+        amplitude_mode = ("amplitude_db" if amplitude_mode_is_db(
+            order_params.get("amplitude_mode", "Amplitude dB")) else "amplitude")
+        from ...heatmap_color_policy import HeatmapColorPolicyError
+
+        try:
+            policy = (resolver("order", canvas, order_params, resolution, source, amplitude_mode)
+                      if callable(resolver) else None)
+        except HeatmapColorPolicyError as error:
+            self._reject_heatmap_color_render("order", canvas, source, error)
+            return
+        inputs = replace(
+            self._order_render_inputs(
+                canvas, result, source, order_params, resolution, color_policy=policy,
+            ),
+            db_value=float(resolution.value),
+        )
+        self._paint_order_heatmap(canvas, result, inputs)
+        complete = getattr(self, "_complete_heatmap_color_render", None)
+        if policy is not None and callable(complete):
+            complete("order", canvas, policy)
+        self._restore_analysis_canvas_viewport("order", canvas)
+        # After the viewport restore, so the signature records the pane
+        # limits the next entry will read.
+        finish = getattr(self, "_finish_heatmap_color_presentation", None)
+        if callable(finish):
+            finish("order", canvas, inputs, result)
+        else:
+            notify_ultraview_plot(self, "order", "heatmap-plot")
+            commit = getattr(self, "_commit_heatmap_reveal", None)
+            if callable(commit):
+                commit("order", canvas, inputs, result)
+        if self._comparison_routes("order"):
+            comp = self._comparison()
+            focus = comp.focused("order") if comp is not None else None
+            target = comp.target_for_canvas(canvas) if comp is not None else None
+            if (
+                focus is not None
+                and target is not None
+                and str(focus[0]) == str(target.view_id)
+                and int(focus[1]) == int(target.pane_index)
+            ):
+                focused_state = self._analysis_state_by_id("order", target.view_id)
+                self._sync_order_effective_facts(focused_state)
+        else:
+            page = self._analysis_page("order")
+            focused = (
+                page.peek_pane_canvas(page.focused_index())
+                if page is not None else None
+            )
+            if focused is not None and canvas is focused:
+                self._sync_order_effective_facts()
+
+    def _render_order_time(self, result, *, emit_feedback=True, source=None):
+        # Wave 3 / Task 3.2: pull HEAD-parity display knobs from the
+        # OrderContextual. Inspector exposes amplitude_mode ∈
+        # {'Amplitude dB', 'Amplitude'} and dynamic ∈
+        # {'30 dB', '50 dB', '80 dB', 'Auto'}; canvas expects the
+        # internal token 'amplitude_db' / 'amplitude' for the first.
+        # `result.amplitude` is (frames, orders) → transpose so imshow
+        # gets (rows=Y_orders, cols=X_times); x_extent=times, y_extent=orders.
+        self._render_order_on(self.canvas_order, result, source=source)
+        batch_params = dict(self.inspector.order_ctx.current_params())
+        batch_params['fs'] = result.params.fs
+        batch_params['rpm_factor'] = self.inspector.order_ctx.rpm_factor()
+        self._remember_batch_preset(
+            "当前时间-阶次", "order_time",
+            self.inspector.order_ctx.current_signal(),
+            batch_params,
+            rpm_signal=self.inspector.order_ctx.current_rpm(),
+            target_canvas=self.canvas_order,
+        )
+        if emit_feedback:
+            self.statusBar.showMessage(
+                f'完成 | {len(result.times)} 时间点 × {len(result.orders)} 阶次'
+            )
+            self.toast(
+                f"时间-阶次谱完成 · {len(result.times)} × {len(result.orders)}",
+                "success",
+            )
+
+    def _on_order_job_finished(self, ctx, result):
+        analysis_key = ctx.get('analysis_key')
+        if analysis_key is not None:
+            self._store_analysis_result(
+                'order',
+                ctx.get('view_id'),
+                ctx.get('pane_idx', 0),
+                analysis_key,
+                result,
+            )
+        outcome = getattr(self, '_order_outcome', None)
+        if outcome is not None:
+            outcome.computed += 1
+        # A7: an inactive View keeps the dispatch pin and skips the live draw.
+        # A still-active View whose request changed keeps the cache entry under
+        # the old key and does not publish that result as current.
+        decision = self._order_completion_decision(ctx)
+        if decision == 'reject':
+            self._unpublish_analysis_completion('order', ctx)
+            return
+        request = ctx.get('request_snapshot')
+        if request is not None:
+            state = self._analysis_state_by_id('order', ctx.get('view_id'))
+            pane_idx = int(ctx.get('pane_idx', 0))
+            if not bind_result(state.panes[pane_idx], request, (analysis_key,) if analysis_key is not None else ()):
+                self._unpublish_analysis_completion('order', ctx)
+                return
+            self._replace_analysis_pane_pins('order', state.view_id, pane_idx, (analysis_key,))
+        if decision == 'keep':
+            return
+        self._cancel_order_page_transition_cover(ctx.get('view_id'))
+        # V7b: render onto the SPECIFIC pane this job was computed for.
+        # ``_render_order_time`` (preset + status + toast side-effects) runs
+        # only for the primary pane (0); compare panes get a pure canvas draw.
+        # A comparison paints the bound canvas for the dispatching view.
+        pane_idx = ctx.get('pane_idx', 0)
+        source = ctx.get('source')
+        try:
+            pane_idx = int(pane_idx)
+        except (TypeError, ValueError):
+            pane_idx = 0
+        if self._comparison_routes('order'):
+            canvas = self._canvas_for_completion(
+                'order', ctx.get('view_id'), pane_idx,
+            )
+            if canvas is not None:
+                self._render_order_on(canvas, result, source=source)
+            if self._completion_updates_focus('order', ctx):
+                self.statusBar.showMessage(
+                    f'完成 | {len(result.times)} 时间点 × {len(result.orders)} 阶次'
+                )
+            return
+        page = self._analysis_page('order')
+        if pane_idx == 0:
+            self._render_order_time(
+                result, emit_feedback=outcome is None, source=source)
+        elif pane_idx < page.pane_count():
+            self._render_order_on(
+                page.pane_canvas(pane_idx), result, source=source)
+        else:
+            self._render_order_time(
+                result, emit_feedback=outcome is None, source=source)
+
+    def _order_completion_decision(self, ctx) -> str:
+        """``draw``, ``keep`` (inactive A7), or ``reject`` (not the current request)."""
+        state = self._analysis_state_by_id('order', ctx.get('view_id'))
+        if state is None:
+            return 'reject'
+        try:
+            pane_idx = int(ctx.get('pane_idx', 0))
+        except (TypeError, ValueError):
+            return 'reject'
+        if not (0 <= pane_idx < len(state.panes)):
+            return 'reject'
+        pane = state.panes[pane_idx]
+        token = ctx.get('pane_token')
+        if token is not None and token != id(pane):
+            return 'reject'
+        request = ctx.get('request_snapshot')
+        if request is not None and request.revision != pane.request_revision:
+            return 'reject'
+        source = ctx.get('source')
+        if source:
+            source = tuple(source)
+            if source[0] not in getattr(self, 'files', {}):
+                return 'reject'
+            live = list(pane.sources or [])
+            if live and tuple(live[0]) != source:
+                return 'reject'
+        if request is None and self._order_completion_request_changed(state, pane, pane_idx, ctx):
+            return 'reject'
+        if not self._analysis_completion_is_visible('order', ctx):
+            return 'keep'
+        return 'draw'
+
+    def _order_current_cache_key(self, state, pane, pane_idx):
+        sources = list(pane.sources or [])
+        if not sources:
+            return None
+        fid, ch = sources[0]
+        if fid not in getattr(self, 'files', {}):
+            return None
+        time_range = self._normalize_analysis_time_range(
+            getattr(pane, 'time_range', None),
+        )
+        params = self._compute_params_overlay_state('order', state)
+        rpm_source = getattr(pane, 'rpm_source', None)
+        return self._analysis_cache_key(
+            'order', fid, ch,
+            rpm_source=tuple(rpm_source) if rpm_source else None,
+            pane_idx=pane_idx,
+            params=params,
+            time_range=time_range,
+        )
+
+    def _order_completion_request_changed(self, state, pane, pane_idx, ctx) -> bool:
+        """True when a real cache key disagrees with the pane's current request.
+
+        A non-tuple ``analysis_key`` is not a compute identity. Callers that
+        inject a placeholder still follow the view-id gate.
+        """
+        completed = ctx.get('analysis_key')
+        if not isinstance(completed, tuple):
+            return False
+        current = self._order_current_cache_key(state, pane, pane_idx)
+        if current is None:
+            return True
+        return completed != current
+
+    def _sync_order_effective_facts(self, state=None):
+        """Re-fill the Inspector facts card from the focused order result."""
+        ctx = self.inspector.order_ctx
+        if state is None:
+            mgr = self.analysis_managers.get('order')
+            if mgr is None or not mgr.views:
+                ctx.clear_effective_facts()
+                return
+            state = mgr.get(mgr.active)
+        page = self._analysis_page('order')
+        idx = page.focused_index()
+        if self._comparison_routes('order'):
+            comp = self._comparison()
+            focus = comp.focused('order') if comp is not None else None
+            if focus is not None and str(focus[0]) == str(getattr(state, 'view_id', '')):
+                idx = int(focus[1])
+        if state is None or not (0 <= idx < len(state.panes)):
+            ctx.clear_effective_facts()
+            return
+        pane = state.panes[idx]
+        binding = pane.result_binding
+        if binding is None or not binding.request.sources:
+            ctx.clear_effective_facts()
+            return
+        sources = list(binding.request.sources)
+        fid, ch = sources[0]
+        time_range = binding.request.time_range
+        result = self.analysis_caches['order'].get(binding.keys[0])
+        facts = getattr(result, 'effective', None) if result is not None else None
+        if facts is None:
+            ctx.clear_effective_facts()
+            return
+        _t, sig = self._order_sig_for((fid, ch), time_range=time_range)
+        self._publish_analysis_effective_facts(
+            ctx, facts, sig=sig, fid=fid, sources=sources,
+        )
+        if binding.stale:
+            ctx.mark_effective_facts_stale()
+
+    def _on_order_job_failed(self, _ctx, message):
+        # A single pane's failure must not abort the service FIFO batch.
+        #
+        # V8 minor: use the non-modal ``toast`` (symmetric with
+        # ``_on_fft_time_failed``) instead of ``QMessageBox.critical``. A
+        # modal exec() raised mid-queue spins a nested event loop that can
+        # re-enter the compute pump (and hangs under offscreen Qt with no
+        # user to click OK — lesson qmessagebox-static-warning-hangs-offscreen).
+        request = _ctx.get('request_snapshot')
+        state = self._analysis_state_by_id('order', _ctx.get('view_id'))
+        pane_idx = int(_ctx.get('pane_idx', 0))
+        if request is not None:
+            if state is None or not 0 <= pane_idx < len(state.panes):
+                return
+            pane = state.panes[pane_idx]
+            if _ctx.get('pane_token', id(pane)) != id(pane) or request.revision != pane.request_revision:
+                return
+            mark_pending(pane)
+            if (
+                self.chart_stack.current_mode() != 'order'
+                or not self._analysis_completion_is_visible('order', _ctx)
+                or not self._completion_updates_focus('order', _ctx)
+                or self._dispatch_focus_index('order', state) != pane_idx
+            ):
+                return
+            self._sync_order_effective_facts(state)
+        msg = str(message)
+        outcome = getattr(self, '_order_outcome', None)
+        if outcome is not None:
+            outcome.failed += 1
+        else:
+            self.toast(msg, "error")
+        self.statusBar.showMessage(f"阶次分析错误: {msg}")
+
+    def _on_order_job_progress(self, done, total):
+        """Project service-owned batch progress onto the existing UI bar."""
+        token = self._analysis_jobs.progress_token('order')
+        if token is None:
+            return
+        completed, total_jobs = self._analysis_jobs.progress_counts('order')
+        total_jobs = max(1, total_jobs)
+        job_index = min(completed + 1, total_jobs)
+        label = f"阶次 {job_index}/{total_jobs}"
+        self._update_compute_progress(
+            done, total, label=label, token=token,
+        )
+        if done == total and not self._analysis_jobs.is_running('order'):
+            self._finish_compute_progress(token=token)
+            self._analysis_jobs.clear_progress_token('order')
+            self.inspector.order_ctx.set_progress("")
+            self._finish_order_outcome_feedback()
+            self._finish_analysis_restore_if_idle()

@@ -1,0 +1,868 @@
+"""Tests for election_pipeline.py: lock acquisition (mirrors
+test_house_pipeline.py's pattern), and the pure roster-sync/financial-
+prioritization/snapshot helper functions directly."""
+
+import asyncio
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta
+from unittest.mock import patch
+
+import pytest
+
+from app.config import settings
+from app.models import (
+    Candidate,
+    ElectionPipelineRun,
+    PipelineStatus,
+    Race,
+    RaceCoverageItem,
+    ScoreSnapshot,
+)
+from app.pipeline import election_pipeline
+from app.time_utils import utcnow
+
+
+@pytest.fixture(autouse=True)
+def _job_leases_granted():
+    """These tests stub the database a lease lives in; the leases the
+    nightly steps hold are tested in test_database_reset.TestLease."""
+    from contextlib import asynccontextmanager
+
+    from app.pipeline.lease import Granted
+
+    @asynccontextmanager
+    async def granted(_tier, **_kw):
+        yield Granted(None)
+
+    with patch("app.pipeline.lease.job_async", granted):
+        yield
+
+
+@contextmanager
+def _mock_downstream_pipeline_phases():
+    """One composed context manager patching every real phase
+    run_election_pipeline runs AFTER roster sync, for use as a single
+    item inside a caller's own `with (...)` tuple (same idiom as
+    test_ollama_client.py's `_patched_httpx`) — matches this suite's
+    existing parenthesized-multi-patch style (test_house_pipeline.py)
+    rather than introducing ExitStack, which nothing else here uses.
+
+    Each phase already has its own dedicated tests elsewhere; left
+    unmocked here, they run for real inside a real make_async_client()
+    context — genuine network attempts to every state's confirmed-
+    candidates vendor, every ballot-lookup link, RSS feeds, etc., each
+    with its own real retry/backoff on failure.
+
+    Confirmed live (2026-09-05): with only fetch_all_candidates mocked,
+    this file's two run_election_pipeline() tests took ~275s and ~50s
+    locally — and their real-network dependence made a "fast" CI job's
+    duration swing between ~9 and ~15 minutes (once actually timing out)
+    across otherwise-unrelated commits. This exists so a test of the
+    LOCK/cycle-selection behavior doesn't also pay for (and flake on)
+    every downstream phase's real I/O.
+    """
+    with (
+        # Runs at the start of roster sync, before the phases below; left
+        # unmocked it reads senate.gov live (its own tests are in
+        # test_election_calendar.py).
+        patch("app.pipeline.fetch.senate_classes.refresh_senate_classes", return_value=False),
+        patch("app.pipeline.election_pipeline._refresh_financials", return_value=0),
+        patch("app.pipeline.election_pipeline._sync_ballot_measures", return_value={"skipped": True}),
+        # Imported at election_pipeline's module scope, so its own
+        # namespace is what gets patched.
+        patch("app.pipeline.election_pipeline.crawl_for_new_sources", return_value={}),
+        patch("app.pipeline.election_pipeline.sync_confirmed_candidates", return_value={}),
+        patch("app.pipeline.election_pipeline.sync_ballot_filings", return_value={}),
+        patch("app.pipeline.fetch.ballot_lookup.refresh_link_verification", return_value={"failed": 0}),
+        patch("app.pipeline.analyze.election_coverage.ingest_race_coverage", return_value=0),
+        patch("app.pipeline.analyze.election_bluesky.post_race_coverage_updates", return_value=0),
+    ):
+        yield
+
+
+class TestElectionPipelineLock:
+    def test_skips_when_a_recent_run_is_already_marked_running(self, db_session):
+        db_session.add(ElectionPipelineRun(
+            started_at=utcnow() - timedelta(minutes=5), status=PipelineStatus.RUNNING,
+        ))
+        db_session.commit()
+
+        with patch("app.pipeline.election_pipeline.SessionLocal", return_value=db_session):
+            result = asyncio.run(election_pipeline.run_election_pipeline())
+
+        assert result == {"status": "skipped", "reason": "already_running"}
+        assert db_session.query(ElectionPipelineRun).count() == 1
+        assert election_pipeline.is_election_pipeline_running() is False
+
+    def test_stale_running_row_is_cleared_before_a_fresh_attempt(self, db_session):
+        stale = ElectionPipelineRun(
+            started_at=utcnow() - timedelta(hours=13), status=PipelineStatus.RUNNING,
+        )
+        db_session.add(stale)
+        db_session.commit()
+        stale_id = stale.id
+
+        # fetch_all_candidates mocked to fail fast, and every downstream
+        # phase mocked off too — only the lock's clear-then-acquire
+        # behavior is under test here.
+        with (
+            patch("app.pipeline.election_pipeline.SessionLocal", return_value=db_session),
+            patch(
+                "app.pipeline.election_pipeline.fetch_all_candidates",
+                side_effect=RuntimeError("network mocked off"),
+            ),
+            _mock_downstream_pipeline_phases(),
+        ):
+            asyncio.run(election_pipeline.run_election_pipeline())
+
+        cleared = db_session.query(ElectionPipelineRun).filter(ElectionPipelineRun.id == stale_id).one()
+        assert cleared.status == PipelineStatus.STALE
+        assert db_session.query(ElectionPipelineRun).count() == 2  # stale row + fresh one
+
+    def test_a_failure_in_one_downstream_phase_does_not_abort_the_rest(self, db_session):
+        """run_election_pipeline wraps each phase in its own try/except-
+        continue (see the module's own comments) specifically so one
+        phase's failure doesn't take down the phases after it. Every
+        other test in this file mocks every downstream phase to a
+        harmless success, which never exercises that recovery path —
+        this is the one place it's checked directly, by making
+        confirmed-candidates raise and confirming coverage ingestion
+        (two phases later) still runs and the run still reaches
+        COMPLETED, not stuck mid-run or marked failed."""
+        db_session.commit()
+
+        with (
+            patch("app.pipeline.election_pipeline.SessionLocal", return_value=db_session),
+            patch(
+                "app.pipeline.election_pipeline.fetch_all_candidates",
+                side_effect=RuntimeError("network mocked off"),
+            ),
+            patch("app.pipeline.fetch.senate_classes.refresh_senate_classes", return_value=False),
+            patch("app.pipeline.election_pipeline._refresh_financials", return_value=0),
+            patch("app.pipeline.election_pipeline._sync_ballot_measures", return_value={"skipped": True}),
+            patch(
+                "app.pipeline.election_pipeline.sync_confirmed_candidates",
+                side_effect=RuntimeError("confirmed-candidates phase mocked to fail"),
+            ),
+            patch("app.pipeline.election_pipeline.crawl_for_new_sources", return_value={}),
+            patch("app.pipeline.election_pipeline.sync_ballot_filings", return_value={}),
+            patch("app.pipeline.fetch.ballot_lookup.refresh_link_verification", return_value={"failed": 0}),
+            patch(
+                "app.pipeline.analyze.election_coverage.ingest_race_coverage", return_value=3,
+            ) as mock_ingest,
+            patch("app.pipeline.analyze.election_bluesky.post_race_coverage_updates", return_value=0),
+        ):
+            result = asyncio.run(election_pipeline.run_election_pipeline())
+
+        mock_ingest.assert_called_once()  # reached despite the earlier phase raising
+        run = db_session.query(ElectionPipelineRun).one()
+        assert run.status == PipelineStatus.COMPLETED
+        assert result["status"] == "completed"
+
+
+class TestCurrentElectionCycle:
+    """current_election_cycle() replaces what used to be a frozen
+    CURRENT_ELECTION_CYCLE = 2026 constant, so the pipeline (and the
+    /elections/races filter) point at the next cycle automatically once
+    an election is over, with no code change — "over" meaning its results
+    have stopped moving and had their grace period (election_phase), not
+    the morning after polls close."""
+
+    def test_during_2026_cycle_returns_2026(self, db_session):
+        with patch("app.election_phase.election_today", return_value=date(2026, 7, 25)):
+            assert election_pipeline.current_election_cycle(db_session) == 2026
+
+    def test_morning_after_2026_election_day_is_still_2026(self, db_session):
+        """Counting is still going on: this used to say 2028."""
+        with patch("app.election_phase.election_today", return_value=date(2026, 11, 4)):
+            assert election_pipeline.current_election_cycle(db_session) == 2026
+
+    def test_after_the_results_window_returns_2028(self, db_session):
+        with patch("app.election_phase.election_today", return_value=date(2026, 12, 1)):
+            assert election_pipeline.current_election_cycle(db_session) == 2028
+
+    def test_run_election_pipeline_defaults_to_current_cycle(self, db_session):
+        seen_cycles = []
+
+        async def _fake_fetch_all_candidates(client, db, cycle, office):
+            seen_cycles.append(cycle)
+            return []
+
+        with (
+            patch("app.pipeline.election_pipeline.SessionLocal", return_value=db_session),
+            patch("app.election_phase.election_today", return_value=date(2027, 2, 1)),
+            patch(
+                "app.pipeline.election_pipeline.fetch_all_candidates",
+                side_effect=_fake_fetch_all_candidates,
+            ),
+            _mock_downstream_pipeline_phases(),
+        ):
+            asyncio.run(election_pipeline.run_election_pipeline())
+
+        assert seen_cycles == [2028, 2028]  # once for House, once for Senate
+
+
+@pytest.mark.parametrize("office, state, district, expected", [
+    pytest.param("S", "GA", None, "2026-SEN-GA", id="senate"),
+    pytest.param("H", "CA", 12, "2026-HOUSE-CA-12", id="house"),
+    pytest.param("H", "WY", None, "2026-HOUSE-WY-0", id="house_at_large_defaults_to_zero"),
+])
+def test_race_id(office, state, district, expected):
+    assert election_pipeline._race_id(2026, office, state, district) == expected
+
+
+class TestSyncRoster:
+    def _raw(self, **overrides):
+        # candidate_election_year=2026 by default: _sync_roster re-validates
+        # every record's own election year (_on_ballot_in) so a wrong
+        # upstream match can't mint a phantom race — records without a
+        # confirmed 2026 election are skipped BY DESIGN.
+        defaults = dict(
+            candidate_id="S6GA001", state="GA", office="S", name="OSSOFF, JON",
+            party="DEM", incumbent_challenge="I", has_raised_funds=True,
+            candidate_election_year=2026,
+        )
+        defaults.update(overrides)
+        return defaults
+
+    def test_creates_race_and_candidate(self, db_session):
+        synced = election_pipeline._sync_roster(db_session, 2026, [self._raw()])
+        assert synced == 1
+        race = db_session.query(Race).filter(Race.id == "2026-SEN-GA").one()
+        assert race.office == "S"
+        # GA's Class II seat IS up in 2026 — a plain race, not a special.
+        assert race.is_special is False
+        cand = db_session.query(Candidate).filter(Candidate.id == "S6GA001").one()
+        assert cand.name == "OSSOFF, JON"
+        assert cand.race_id == "2026-SEN-GA"
+
+    def test_a_house_candidate_is_placed_in_this_cycles_district(self, db_session):
+        """FEC's district_number is the candidate's LATEST election's (a
+        real record, H2TX35144, reads 35, 35, 37 for 2022, 2024, 2026, with
+        district_number 37): the year's own election_districts entry
+        decides. A made-up candidate who files for 2028 in a new district."""
+        raw = self._raw(
+            candidate_id="H0TX99001", state="TX", office="H", name="EXAMPLE, PAT",
+            district_number=37,
+            election_years=[2022, 2024, 2026, 2028], election_districts=["35", "35", "35", "37"],
+        )
+        assert election_pipeline._sync_roster(db_session, 2026, [raw]) == 1
+        assert db_session.query(Candidate).filter(Candidate.id == "H0TX99001").one().race_id == "2026-HOUSE-TX-35"
+
+    def test_an_at_large_district_reads_as_zero(self, db_session):
+        raw = self._raw(
+            candidate_id="H6WY001", state="WY", office="H", name="SMITH, A",
+            district_number=0, election_years=[2026], election_districts=["00"],
+        )
+        assert election_pipeline._sync_roster(db_session, 2026, [raw]) == 1
+        assert db_session.query(Candidate).filter(Candidate.id == "H6WY001").one().race_id == "2026-HOUSE-WY-0"
+
+    def test_election_years_list_alone_confirms_the_ballot(self, db_session):
+        # Some FEC records carry the cycle only in election_years, not in
+        # candidate_election_year — either field confirming 2026 is enough.
+        raw = self._raw(candidate_election_year=None, election_years=[2024, 2026])
+        synced = election_pipeline._sync_roster(db_session, 2026, [raw])
+        assert synced == 1
+
+    def test_record_for_a_future_cycle_is_rejected(self, db_session):
+        """An early 2028 declarer must not mint a 2026 race (2026-07 review
+        F1: the original cycle= query fabricated phantom Senate races in
+        ~15 states from exactly these records)."""
+        raw = self._raw(
+            candidate_id="S8GA001", candidate_election_year=2028,
+            election_years=[2028],
+        )
+        synced = election_pipeline._sync_roster(db_session, 2026, [raw])
+        assert synced == 0
+        assert db_session.query(Race).count() == 0
+        assert db_session.query(Candidate).count() == 0
+
+    def test_non_state_filings_rejected(self, db_session):
+        """DC and territorial delegate filings (PR/GU/...) are not federal
+        House/Senate races and must not appear in the roster."""
+        raws = [
+            self._raw(candidate_id="H6PR001", state="PR", office="H"),
+            self._raw(candidate_id="H6DC001", state="DC", office="H"),
+            self._raw(candidate_id="H6GU001", state="GU", office="H"),
+        ]
+        synced = election_pipeline._sync_roster(db_session, 2026, raws)
+        assert synced == 0
+        assert db_session.query(Race).count() == 0
+        assert db_session.query(Candidate).count() == 0
+
+    def test_senate_candidate_outside_class_rotation_gets_special_race(self, db_session):
+        """FL and OH have no regular (Class II) Senate seat in 2026, so a
+        2026 Senate candidate there can only be running in a special
+        election — keyed with a -SPECIAL suffix and flagged is_special."""
+        raws = [
+            self._raw(candidate_id="S6FL001", state="FL"),
+            self._raw(candidate_id="S6OH001", state="OH"),
+        ]
+        synced = election_pipeline._sync_roster(db_session, 2026, raws)
+        assert synced == 2
+
+        fl = db_session.query(Race).filter(Race.id == "2026-SEN-FL-SPECIAL").one()
+        assert fl.is_special is True
+        oh = db_session.query(Race).filter(Race.id == "2026-SEN-OH-SPECIAL").one()
+        assert oh.is_special is True
+
+    def _calendar(self, monkeypatch, senate_states):
+        from app.pipeline.fetch import state_election_dates as dates
+        cache = {"2026-_CALENDAR": {"read": "2026-09-26"}}
+        for st in senate_states:
+            cache[f"2026-{st}"] = {"senate": "2026-11-03"}
+        monkeypatch.setattr(dates, "_cache", cache)
+
+    def test_no_senate_race_where_the_calendar_lists_none(self, db_session, monkeypatch):
+        """NY and HI hold no Senate election in 2026. Serial filers with no
+        money and no FEC candidate status used to mint a 'special
+        election' in each."""
+        self._calendar(monkeypatch, ["GA", "FL", "OH"])
+        raws = [
+            self._raw(candidate_id="S6NY001", state="NY", candidate_status="N"),
+            self._raw(candidate_id="S6HI001", state="HI", candidate_status="N"),
+            self._raw(candidate_id="S6FL001", state="FL"),
+        ]
+        synced = election_pipeline._sync_roster(db_session, 2026, raws)
+
+        assert synced == 1
+        assert {r.id for r in db_session.query(Race)} == {"2026-SEN-FL-SPECIAL"}
+
+    def test_a_phantom_senate_race_already_on_file_is_removed(self, db_session, monkeypatch):
+        db_session.add(Race(id="2026-SEN-NY-SPECIAL", cycle_year=2026, office="S", state="NY",
+                            district=None, is_special=True))
+        db_session.add(Candidate(id="S6NY001", race_id="2026-SEN-NY-SPECIAL", name="SOLOMON, GAVIN",
+                                 party="REP"))
+        db_session.commit()
+        self._calendar(monkeypatch, ["GA"])
+
+        election_pipeline._sync_roster(db_session, 2026, [self._raw()])
+
+        assert {r.id for r in db_session.query(Race)} == {"2026-SEN-GA"}
+        assert db_session.query(Candidate).filter(Candidate.id == "S6NY001").count() == 0
+
+    def test_an_unread_calendar_leaves_the_class_rotation_in_charge(self, db_session, monkeypatch):
+        from app.pipeline.fetch import state_election_dates as dates
+        monkeypatch.setattr(dates, "_cache", {})
+        synced = election_pipeline._sync_roster(db_session, 2026, [self._raw(candidate_id="S6FL001", state="FL")])
+        assert synced == 1
+
+    def test_candidate_status_stored(self, db_session):
+        election_pipeline._sync_roster(
+            db_session, 2026, [self._raw(candidate_status="C")],
+        )
+        cand = db_session.query(Candidate).one()
+        assert cand.candidate_status == "C"
+
+    def test_house_candidate_gets_district(self, db_session):
+        election_pipeline._sync_roster(db_session, 2026, [self._raw(
+            candidate_id="H6CA12001", state="CA", office="H",
+            district_number=12,
+        )])
+        race = db_session.query(Race).filter(Race.id == "2026-HOUSE-CA-12").one()
+        assert race.district == 12
+
+    def test_house_at_large_district_zero_is_accepted(self, db_session):
+        # FEC's own "00" convention for a single-district state — a real
+        # seat, not the missing-district case below.
+        synced = election_pipeline._sync_roster(db_session, 2026, [self._raw(
+            candidate_id="H6WY001", state="WY", office="H", district_number=0,
+        )])
+        assert synced == 1
+        race = db_session.query(Race).filter(Race.id == "2026-HOUSE-WY-0").one()
+        assert race.district == 0
+
+    def test_house_candidate_with_out_of_range_district_is_rejected(self, db_session):
+        # 2026-08-26 audit: phantom Race rows for districts that don't
+        # exist (FL-59, GA-23, IL-51, NY-28 — real max for GA is 14),
+        # populated with garbage-looking FEC filings. GA-23 has no
+        # entry in district_pvi.json's real 435-seat map.
+        synced = election_pipeline._sync_roster(db_session, 2026, [self._raw(
+            candidate_id="H6GA023001", state="GA", office="H", district_number=23,
+        )])
+        assert synced == 0
+        assert db_session.query(Race).count() == 0
+        assert db_session.query(Candidate).count() == 0
+
+    def test_house_candidate_with_missing_district_is_rejected(self, db_session):
+        # Same audit: a null-district House row with an empty candidate
+        # name and party "UNK" — clearly garbage, not a real at-large
+        # filing (those carry district_number=0, not a missing field).
+        synced = election_pipeline._sync_roster(db_session, 2026, [self._raw(
+            candidate_id="H6AZ000001", state="AZ", office="H",
+        )])
+        assert synced == 0
+        assert db_session.query(Race).count() == 0
+
+    def test_updates_existing_candidate_without_duplicating(self, db_session):
+        election_pipeline._sync_roster(db_session, 2026, [self._raw(has_raised_funds=False)])
+        election_pipeline._sync_roster(db_session, 2026, [self._raw(has_raised_funds=True)])
+
+        assert db_session.query(Candidate).count() == 1
+        cand = db_session.query(Candidate).one()
+        assert cand.has_raised_funds is True
+
+    def test_malformed_record_skipped_without_failing_the_batch(self, db_session):
+        good = self._raw()
+        bad = {"candidate_id": None, "state": "GA", "office": "S"}  # missing candidate_id
+        synced = election_pipeline._sync_roster(db_session, 2026, [bad, good])
+        assert synced == 1
+        assert db_session.query(Candidate).count() == 1
+
+    def test_invalid_office_skipped(self, db_session):
+        weird = self._raw(candidate_id="P6US001", office="P")  # presidential, not H/S
+        synced = election_pipeline._sync_roster(db_session, 2026, [weird])
+        assert synced == 0
+        assert db_session.query(Candidate).count() == 0
+
+
+class TestPrioritizeForFinancialRefresh:
+    def _add_candidate(self, db, cand_id, race_id, **overrides):
+        db.add(Race(id=race_id, cycle_year=2026, office="S", state=race_id[-2:]))
+        defaults = dict(name=cand_id, party="DEM")
+        defaults.update(overrides)
+        db.add(Candidate(id=cand_id, race_id=race_id, **defaults))
+
+    def test_never_synced_before_previously_synced(self, db_session):
+        # "old" is synced but well past the cache TTL — still in the pool,
+        # just behind the never-synced candidate.
+        self._add_candidate(
+            db_session, "old", "2026-SEN-GA",
+            last_financials_sync=utcnow() - timedelta(hours=settings.PIPELINE_CACHE_TTL_HOURS + 24),
+        )
+        self._add_candidate(db_session, "new", "2026-SEN-TX", last_financials_sync=None)
+        db_session.commit()
+
+        ordered = election_pipeline._prioritize_for_financial_refresh(db_session, limit=10)
+        assert [c.id for c in ordered] == ["new", "old"]
+
+    def test_recently_synced_candidate_excluded_entirely(self, db_session):
+        """A candidate synced within the FEC cache TTL would be served from
+        ApiCache anyway — re-selecting it burns a batch slot reading back
+        identical numbers (2026-07 review M3), so it must drop out of the
+        pool, not merely sort last."""
+        self._add_candidate(
+            db_session, "fresh", "2026-SEN-GA",
+            incumbent_challenge="I",  # even top priority doesn't override the TTL floor
+            last_financials_sync=utcnow() - timedelta(hours=1),
+        )
+        self._add_candidate(
+            db_session, "stale", "2026-SEN-TX",
+            last_financials_sync=utcnow() - timedelta(hours=settings.PIPELINE_CACHE_TTL_HOURS + 1),
+        )
+        db_session.commit()
+
+        ordered = election_pipeline._prioritize_for_financial_refresh(db_session, limit=10)
+        assert [c.id for c in ordered] == ["stale"]
+
+    def test_incumbents_before_fundraisers_before_others(self, db_session):
+        self._add_candidate(
+            db_session, "other", "2026-SEN-GA",
+            incumbent_challenge="C", has_raised_funds=False,
+        )
+        self._add_candidate(
+            db_session, "fundraiser", "2026-SEN-TX",
+            incumbent_challenge="C", has_raised_funds=True,
+        )
+        self._add_candidate(
+            db_session, "incumbent", "2026-SEN-NY",
+            incumbent_challenge="I", has_raised_funds=False,
+        )
+        db_session.commit()
+
+        ordered = election_pipeline._prioritize_for_financial_refresh(db_session, limit=10)
+        assert [c.id for c in ordered] == ["incumbent", "fundraiser", "other"]
+
+    def test_respects_limit(self, db_session):
+        for i in range(5):
+            self._add_candidate(db_session, f"c{i}", f"2026-SEN-{'GA' if i == 0 else 'X' + str(i)}")
+        db_session.commit()
+
+        ordered = election_pipeline._prioritize_for_financial_refresh(db_session, limit=2)
+        assert len(ordered) == 2
+
+    def test_overdue_candidate_goes_ahead_of_priority(self, db_session):
+        """Incumbents and fundraisers re-enter the pool every cache TTL and
+        used to fill every batch, so a candidate the FEC flags as not
+        having raised money went unrefreshed for two months."""
+        ttl = timedelta(hours=settings.PIPELINE_CACHE_TTL_HOURS + 1)
+        self._add_candidate(
+            db_session, "incumbent", "2026-SEN-GA", incumbent_challenge="I",
+            last_financials_sync=utcnow() - ttl,
+        )
+        self._add_candidate(
+            db_session, "starved", "2026-SEN-TX", has_raised_funds=False,
+            last_financials_sync=utcnow() - timedelta(days=election_pipeline.FINANCIALS_OVERDUE_DAYS + 1),
+        )
+        db_session.commit()
+
+        ordered = election_pipeline._prioritize_for_financial_refresh(db_session, limit=1)
+        assert [c.id for c in ordered] == ["starved"]
+
+
+# Trimmed from the FEC's /candidate/{id}/totals/ rows as cached live on
+# 2026-10-08, sorted the way fetch_candidate_financials returns them.
+_ELECTION_FULL_2026 = {
+    "candidate_election_year": 2026, "cycle": None, "election_full": True,
+    "coverage_end_date": "2026-06-30T00:00:00", "contributions": 87603239.28,
+    "disbursements": 55398788.04, "last_cash_on_hand_end_period": 42587451.0,
+    "individual_itemized_contributions": 50000000.0,
+}
+_TWO_YEAR_2026 = {
+    "candidate_election_year": 2026, "cycle": 2026, "election_full": False,
+    "coverage_end_date": "2026-06-30T00:00:00", "contributions": 68696041.05,
+    "disbursements": 40000000.0, "last_cash_on_hand_end_period": 42587451.0,
+}
+_PRIOR_ELECTION = {
+    "candidate_election_year": 2024, "cycle": None, "election_full": True,
+    "coverage_end_date": "2024-12-31T00:00:00", "contributions": 1604699.27,
+    "disbursements": 1500000.0, "last_cash_on_hand_end_period": 597195.09,
+}
+
+
+class TestRaceElectionTotals:
+    def test_whole_election_period_preferred(self):
+        rows = [_TWO_YEAR_2026, _ELECTION_FULL_2026, _PRIOR_ELECTION]
+        assert election_pipeline.race_election_totals(rows, 2026) is _ELECTION_FULL_2026
+
+    def test_any_row_for_the_election_when_no_full_one(self):
+        assert election_pipeline.race_election_totals([_TWO_YEAR_2026], 2026) is _TWO_YEAR_2026
+
+    def test_an_earlier_elections_money_is_not_this_races(self):
+        assert election_pipeline.race_election_totals([_PRIOR_ELECTION], 2026) is None
+        assert election_pipeline.race_election_totals([], 2026) is None
+
+
+class TestRefreshFinancials:
+    def _run(self, db, totals):
+        async def fake_fetch(client, db_, cand_id):
+            return totals
+
+        with patch.object(election_pipeline, "fetch_candidate_financials", fake_fetch):
+            return asyncio.run(election_pipeline._refresh_financials(db, None, 10))
+
+    def _candidate(self, db, **fields):
+        db.add(Race(id="2026-HOUSE-GA-10", cycle_year=2026, office="H", state="GA", district=10))
+        db.add(Candidate(id="H4GA10071", race_id="2026-HOUSE-GA-10", name="A", party="REP", **fields))
+        db.commit()
+        return db.get(Candidate, "H4GA10071")
+
+    def test_stores_this_elections_figures_and_their_end_date(self, db_session):
+        cand = self._candidate(db_session)
+        assert self._run(db_session, [_ELECTION_FULL_2026, _PRIOR_ELECTION]) == 1
+        assert cand.contributions == 87603239.28
+        assert cand.cash_on_hand == 42587451.0
+        assert cand.individual_itemized_contributions == 50000000.0
+        assert cand.financials_through == "2026-06-30"
+        assert cand.last_financials_sync is not None
+
+    def test_only_an_earlier_election_clears_what_was_stored(self, db_session):
+        """Null, not the 2024 race's money and not the last sync's figures:
+        no report for this election yet is not $0 and not someone else's
+        campaign."""
+        cand = self._candidate(
+            db_session, contributions=1604699.27, cash_on_hand=597195.09,
+            disbursements=1.0, individual_itemized_contributions=1.0,
+            last_financials_sync=utcnow() - timedelta(days=30),
+        )
+        self._run(db_session, [_PRIOR_ELECTION])
+        assert (cand.contributions, cand.cash_on_hand, cand.disbursements,
+                cand.individual_itemized_contributions, cand.financials_through) == (None,) * 5
+        assert cand.last_financials_sync > utcnow() - timedelta(minutes=1)
+
+
+class TestSnapshotCandidates:
+    def test_snapshots_only_candidates_with_cash_on_hand(self, db_session):
+        db_session.add(Race(id="2026-SEN-GA", cycle_year=2026, office="S", state="GA"))
+        db_session.add(Candidate(
+            id="c1", race_id="2026-SEN-GA", name="A", party="DEM",
+            cash_on_hand=1000.0, contributions=1200.0, disbursements=200.0,
+        ))
+        db_session.add(Candidate(id="c2", race_id="2026-SEN-GA", name="B", party="REP"))
+        db_session.commit()
+
+        count = election_pipeline._snapshot_candidates(db_session)
+        assert count == 1
+        snap = db_session.query(ScoreSnapshot).filter(ScoreSnapshot.entity_type == "candidate").one()
+        assert snap.entity_id == "c1"
+        assert snap.overall_score == 1000.0
+        assert snap.score_1 == 1200.0
+        assert snap.score_2 == 200.0
+
+    def test_second_call_same_day_replaces_not_duplicates(self, db_session):
+        db_session.add(Race(id="2026-SEN-GA", cycle_year=2026, office="S", state="GA"))
+        db_session.add(Candidate(id="c1", race_id="2026-SEN-GA", name="A", party="DEM", cash_on_hand=1000.0))
+        db_session.commit()
+
+        election_pipeline._snapshot_candidates(db_session)
+        election_pipeline._snapshot_candidates(db_session)
+
+        assert db_session.query(ScoreSnapshot).filter(ScoreSnapshot.entity_type == "candidate").count() == 1
+
+    def test_unchanged_figures_next_day_write_no_new_snapshot(self, db_session):
+        """Changed-only snapshotting (2026-07 review): FEC totals for most
+        candidates only move when a quarterly filing lands, so a nightly
+        unconditional snapshot would add millions of no-information rows."""
+        db_session.add(Race(id="2026-SEN-GA", cycle_year=2026, office="S", state="GA"))
+        db_session.add(Candidate(
+            id="c1", race_id="2026-SEN-GA", name="A", party="DEM",
+            cash_on_hand=1000.0, contributions=1200.0, disbursements=200.0,
+        ))
+        db_session.commit()
+
+        day1 = utcnow()
+        day2 = day1 + timedelta(days=1)
+        with patch("app.pipeline.election_pipeline.utcnow", return_value=day1):
+            first = election_pipeline._snapshot_candidates(db_session)
+        with patch("app.pipeline.election_pipeline.utcnow", return_value=day2):
+            second = election_pipeline._snapshot_candidates(db_session)
+
+        assert first == 1   # first sight always writes
+        assert second == 0  # identical figures — skipped
+        assert db_session.query(ScoreSnapshot).filter(ScoreSnapshot.entity_type == "candidate").count() == 1
+
+    def test_changed_figures_next_day_write_a_new_snapshot(self, db_session):
+        db_session.add(Race(id="2026-SEN-GA", cycle_year=2026, office="S", state="GA"))
+        cand = Candidate(
+            id="c1", race_id="2026-SEN-GA", name="A", party="DEM",
+            cash_on_hand=1000.0, contributions=1200.0, disbursements=200.0,
+        )
+        db_session.add(cand)
+        db_session.commit()
+
+        day1 = utcnow()
+        day2 = day1 + timedelta(days=1)
+        with patch("app.pipeline.election_pipeline.utcnow", return_value=day1):
+            election_pipeline._snapshot_candidates(db_session)
+
+        cand.cash_on_hand = 2000.0  # a new filing landed
+        db_session.commit()
+        with patch("app.pipeline.election_pipeline.utcnow", return_value=day2):
+            written = election_pipeline._snapshot_candidates(db_session)
+
+        assert written == 1
+        assert db_session.query(ScoreSnapshot).filter(ScoreSnapshot.entity_type == "candidate").count() == 2
+
+
+class TestPruneStaleCoverage:
+    def _item(self, db, url, fetched_at):
+        db.add(RaceCoverageItem(
+            race_id="2026-SEN-GA", source_type="news", source_name="AP News",
+            title="t", url=url, fetched_at=fetched_at,
+        ))
+
+    def test_deletes_items_past_retention_and_keeps_recent_ones(self, db_session):
+        db_session.add(Race(id="2026-SEN-GA", cycle_year=2026, office="S", state="GA"))
+        self._item(db_session, "https://apnews.com/old", utcnow() - timedelta(days=91))
+        self._item(db_session, "https://apnews.com/recent", utcnow() - timedelta(days=30))
+        db_session.commit()
+
+        deleted = election_pipeline._prune_stale_coverage(db_session)
+
+        assert deleted == 1
+        remaining = db_session.query(RaceCoverageItem).one()
+        assert remaining.url == "https://apnews.com/recent"
+
+
+class TestBallotSync:
+    @pytest.fixture(autouse=True)
+    def _campaign_clock(self, monkeypatch):
+        """A campaign date unless a test says otherwise: after election day
+        the ballot is final and every ballot step stands aside."""
+        monkeypatch.setattr("app.election_phase.election_today", lambda: date(2026, 10, 1))
+
+    def test_summarises_which_states_answered(self, db_session):
+        confirm = {
+            "AK": {"status": "ok", "confirmed": 6},
+            "NY": {"status": "failed", "confirmed": 0},
+        }
+        with (
+            patch("app.pipeline.election_pipeline.SessionLocal", return_value=db_session),
+            patch("app.pipeline.election_pipeline.sync_confirmed_candidates", return_value=confirm),
+            patch("app.pipeline.election_pipeline.sync_ballot_filings", return_value={"NC": 3}),
+        ):
+            result = asyncio.run(election_pipeline.run_ballot_sync(2026))
+        assert result == {
+            "status": "ok", "confirmed": 6, "statesOk": ["AK"], "statesFailed": ["NY"],
+            "filings": {"NC": 3},
+        }
+
+    def test_a_held_elections_ballot_is_not_re_read(self, db_session):
+        """After election day the site stays on the election just held, but
+        its ballot sources move on: Oklahoma's one "next election" page and
+        a candidate list past its election answer "not published yet",
+        which would unwrite a certified ballot. The ballot stands as read."""
+        with (
+            patch("app.election_phase.election_today", return_value=date(2026, 11, 10)),
+            patch("app.pipeline.election_pipeline.SessionLocal", return_value=db_session),
+            patch("app.pipeline.election_pipeline.sync_confirmed_candidates") as confirm,
+            patch("app.pipeline.election_pipeline.sync_ballot_filings") as filings,
+        ):
+            result = asyncio.run(election_pipeline.run_ballot_sync())
+        confirm.assert_not_called()
+        filings.assert_not_called()
+        assert result["status"] == "skipped"
+        assert result["reason"] == election_pipeline.ELECTION_HELD
+
+    def test_the_nightly_run_skips_a_held_elections_ballot_but_still_prunes(self, db_session):
+        import json
+
+        with (
+            patch("app.election_phase.election_today", return_value=date(2026, 11, 10)),
+            patch("app.pipeline.election_pipeline.SessionLocal", return_value=db_session),
+            patch("app.pipeline.election_pipeline.fetch_all_candidates", return_value=[]) as roster,
+            _mock_downstream_pipeline_phases(),
+            patch("app.pipeline.election_pipeline.crawl_for_new_sources") as crawl,
+            patch("app.pipeline.election_pipeline.sync_confirmed_candidates") as confirm,
+            patch("app.pipeline.election_pipeline._sync_ballot_measures") as measures,
+            patch("app.pipeline.election_pipeline._prune_past_measures", return_value=0) as prune,
+        ):
+            asyncio.run(election_pipeline.run_election_pipeline(2026))
+        roster.assert_not_called()
+        crawl.assert_not_called()
+        confirm.assert_not_called()
+        measures.assert_not_called()
+        prune.assert_called_once()
+        run = db_session.query(ElectionPipelineRun).order_by(ElectionPipelineRun.id.desc()).first()
+        steps = {s["key"]: s for s in json.loads(run.progress_detail)}
+        for key in ("roster_sync", "confirmed_candidates", "ballot_measures"):
+            assert steps[key]["status"] == "skipped"
+            assert steps[key]["detail"] == f"skipped: {election_pipeline.ELECTION_HELD}"
+
+    def test_the_nightly_ballot_and_coverage_steps_yield_their_leases(self, db_session):
+        """A ballot sync or coverage refresh in another process holds its
+        lease: the nightly steps step aside rather than write beside it."""
+        from contextlib import asynccontextmanager
+
+        from app.pipeline import lease
+
+        def run(refused_tiers):
+            @asynccontextmanager
+            async def leases(tier, **_kw):
+                yield lease.Granted(lease.refusal_text(lease.REFUSED_HELD, tier) if tier in refused_tiers else None)
+
+            with (
+                patch("app.pipeline.lease.job_async", leases),
+                patch("app.pipeline.election_pipeline.SessionLocal", return_value=db_session),
+                patch("app.pipeline.election_pipeline.fetch_all_candidates", return_value=[]),
+                _mock_downstream_pipeline_phases(),
+                patch("app.pipeline.election_pipeline.sync_confirmed_candidates", return_value={}) as nightly_sync,
+                patch("app.pipeline.analyze.election_coverage.ingest_race_coverage", return_value=0) as ingest,
+            ):
+                asyncio.run(election_pipeline.run_election_pipeline())
+            return nightly_sync.call_count, ingest.call_count
+
+        free = run(refused_tiers=())
+        assert free[1] == 1 and free[0] > 0, free  # the steps are reached when their leases are free
+        assert run(refused_tiers=(lease.BALLOT_SYNC, lease.COVERAGE_REFRESH)) == (0, 0)
+        assert not election_pipeline.ballot_tracker().is_running
+
+    def test_the_crawl_runs_nightly_and_is_reported_when_the_sync_steps_aside(self, db_session):
+        """The crawl runs before, and outside, the ballot sync's guards: a
+        sync in flight costs the sync step, not the crawl, and the skipped
+        phase's detail still reports what the crawl changed or failed at."""
+        import json
+        from contextlib import asynccontextmanager
+
+        from app.pipeline import lease
+
+        @asynccontextmanager
+        async def leases(tier, **_kw):
+            yield lease.Granted("Ballot sync is already running" if tier == lease.BALLOT_SYNC else None)
+
+        with (
+            patch("app.pipeline.lease.job_async", leases),
+            patch("app.pipeline.election_pipeline.SessionLocal", return_value=db_session),
+            patch("app.pipeline.election_pipeline.fetch_all_candidates", return_value=[]),
+            _mock_downstream_pipeline_phases(),
+            patch("app.pipeline.election_pipeline.utcnow", return_value=datetime(2026, 9, 29, 3)),  # a Tuesday
+            patch(
+                "app.pipeline.election_pipeline.crawl_for_new_sources",
+                return_value={
+                    "NM": "adopted results", "WY": "none", "ZZ": "error", "KS": "kept",
+                    "OR": "failing since 2026-09-20", "UT": "rejected; filings adopted (2/3 matched)",
+                    "ID": "unproven",
+                },
+            ) as crawl,
+            patch("app.pipeline.election_pipeline.sync_confirmed_candidates") as nightly_sync,
+        ):
+            asyncio.run(election_pipeline.run_election_pipeline(2026))
+        crawl.assert_called_once()
+        nightly_sync.assert_not_called()
+        run = db_session.query(ElectionPipelineRun).order_by(ElectionPipelineRun.id.desc()).first()
+        step = next(s for s in json.loads(run.progress_detail) if s.get("key") == "confirmed_candidates")
+        assert step["status"] == "skipped"
+        assert step["detail"] == (
+            "skipped: Ballot sync is already running; crawl: NM adopted results, "
+            "OR failing since 2026-09-20, UT rejected; filings adopted (2/3 matched), ZZ error"
+        )
+
+    def test_a_crawl_that_raises_does_not_cost_the_sync(self, db_session):
+        import json
+        from contextlib import asynccontextmanager
+
+        from app.pipeline import lease
+
+        @asynccontextmanager
+        async def leases(tier, **_kw):
+            yield lease.Granted(None)
+
+        with (
+            patch("app.pipeline.lease.job_async", leases),
+            patch("app.pipeline.election_pipeline.SessionLocal", return_value=db_session),
+            patch("app.pipeline.election_pipeline.fetch_all_candidates", return_value=[]),
+            _mock_downstream_pipeline_phases(),
+            patch("app.pipeline.election_pipeline.crawl_for_new_sources", side_effect=RuntimeError("boom")),
+            patch("app.pipeline.election_pipeline._confirmed_candidates_phase", return_value="synced") as phase,
+        ):
+            asyncio.run(election_pipeline.run_election_pipeline(2026))
+        phase.assert_called_once()
+        run = db_session.query(ElectionPipelineRun).order_by(ElectionPipelineRun.id.desc()).first()
+        step = next(s for s in json.loads(run.progress_detail) if s.get("key") == "confirmed_candidates")
+        assert step["status"] == "done" and step["detail"] == "synced"
+
+    def test_a_lease_that_cannot_be_taken_fails_only_its_phases(self, db_session):
+        """Taking a step's lease can raise (the database): that fails the
+        coverage/posting phases, and the run goes on to its snapshot and
+        completes."""
+        from contextlib import asynccontextmanager
+
+        from app.pipeline import lease
+
+        @asynccontextmanager
+        async def leases(tier, **_kw):
+            if tier == lease.COVERAGE_REFRESH:
+                raise RuntimeError("database mocked off")
+            yield lease.Granted(None)
+
+        with (
+            patch("app.pipeline.lease.job_async", leases),
+            patch("app.pipeline.election_pipeline.SessionLocal", return_value=db_session),
+            patch("app.pipeline.election_pipeline.fetch_all_candidates", return_value=[]),
+            _mock_downstream_pipeline_phases(),
+            patch("app.pipeline.election_pipeline._snapshot_candidates", return_value=0) as snapshot,
+        ):
+            asyncio.run(election_pipeline.run_election_pipeline())
+        snapshot.assert_called_once()
+        run = db_session.query(ElectionPipelineRun).order_by(ElectionPipelineRun.id.desc()).first()
+        assert run.status == "completed"
+        from app.pipeline.analyze.election_coverage import coverage_tracker
+
+        assert not coverage_tracker().is_running
+
+    def test_the_nightly_ballot_phase_steps_aside_while_a_sync_is_running(self, db_session):
+        # Two passes writing the same Candidate rows at once is what this
+        # prevents; the sync in flight is doing the same step anyway.
+        tracker = election_pipeline.ballot_tracker()
+        token = tracker.start()
+        try:
+            with (
+                patch("app.pipeline.election_pipeline.SessionLocal", return_value=db_session),
+                patch("app.pipeline.election_pipeline.fetch_all_candidates", return_value=[]),
+                _mock_downstream_pipeline_phases(),
+                patch("app.pipeline.election_pipeline.sync_confirmed_candidates") as nightly_sync,
+            ):
+                asyncio.run(election_pipeline.run_election_pipeline(2026))
+        finally:
+            tracker.stop(token)
+        nightly_sync.assert_not_called()

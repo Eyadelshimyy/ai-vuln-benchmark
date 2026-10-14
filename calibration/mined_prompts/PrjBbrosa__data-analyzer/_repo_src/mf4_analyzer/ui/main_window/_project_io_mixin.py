@@ -1,0 +1,3134 @@
+"""ProjectIOMixin: file load/close and .tlproj save/open for MainWindow."""
+
+import inspect
+import json
+import logging
+import os
+from pathlib import Path
+from time import monotonic
+
+from PyQt5.QtCore import QEventLoop, QSettings, Qt
+from PyQt5.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
+
+from ...blf_dbc_candidates import (
+    AUTO_PROBE_LIMIT,
+    candidate_status,
+    dbc_candidate_identity,
+    deduplicate_dbc_sets,
+    frame_id_histogram,
+    load_dbc_frame_ids,
+    normalize_dbc_paths,
+    prefilter_candidates,
+    rank_candidates,
+)
+from ...io import (
+    DEFAULT_SOURCE_ADAPTER_REGISTRY, DataLoader, FileData, HAS_ASAMMDF,
+)
+from ...io.file_data import TimeAxisProvenance
+from ...io.loader import (
+    AUDIO_VIDEO_EXTS,
+    NO_CAN_FRAMES_MESSAGE,
+    format_dropped_channels_notice,
+    format_fs_estimated_notice,
+    format_renamed_channels_notice,
+    format_skipped_channels_notice,
+    format_skipped_vars_notice,
+)
+from ...ui_kit.message_box_buttons import fit_message_box_buttons_to_text
+
+
+logger = logging.getLogger(__name__)
+
+
+DATA_FILE_GLOB = DEFAULT_SOURCE_ADAPTER_REGISTRY.file_dialog_glob
+_MEDIA_ADAPTER = next(
+    adapter for adapter in DEFAULT_SOURCE_ADAPTER_REGISTRY.adapters
+    if adapter.key == "media"
+)
+AUDIO_VIDEO_GLOB = " ".join(
+    f"*{extension}" for extension in sorted(_MEDIA_ADAPTER.extensions)
+)
+PROJECT_OR_DATA_FILTER = (
+    f"所有支持的文件 ({DATA_FILE_GLOB} *.tlproj);;"
+    f"项目 (*.tlproj);;数据文件 ({DATA_FILE_GLOB});;"
+    f"音视频文件 ({AUDIO_VIDEO_GLOB})"
+)
+OPEN_FILES_FILTER = (
+    f"所有支持的文件 ({DATA_FILE_GLOB});;"
+    f"数据文件 ({DATA_FILE_GLOB});;"
+    f"音视频文件 ({AUDIO_VIDEO_GLOB})"
+)
+AUDIO_VIDEO_FILE_FILTER = f"音视频文件 ({AUDIO_VIDEO_GLOB})"
+BLF_DBC_RECENT_SETTINGS_KEY = "blf/recent_dbc_path_sets"
+BLF_DBC_RECENT_MAX = 20
+
+
+class ProjectIOMixin:
+    """Domain mixin: data-file load/close and project (.tlproj) IO.
+
+    ``QFileDialog`` is resolved via ``sys.modules`` at call time so the
+    smoke-suite ``patch('mf4_analyzer.ui.main_window.QFileDialog.
+    getOpenFileNames', ...)`` reaches these call sites (the patch targets
+    a class attribute, but the runtime lookup keeps it robust against
+    name-rebinding patches too).
+
+    ``open_acquisition_cockpit`` intentionally stays in window.py because
+    the cockpit test patches ``main_window.importlib`` at the package
+    namespace, which the window module owns.
+    """
+
+    #: Set while a project restore is in flight. ChannelScopeMixin reads it to
+    #: suppress auto-attach; ``_reset_empty_workspace_session`` also reads it
+    #: so ``open_project``'s intermediate ``close_all`` does not collapse
+    #: Views. Only this mixin writes it -- the default lives here as a class
+    #: attribute so the guard has exactly one owning file (spec D-E2).
+    _restoring_project = False
+    _opening_project = False
+    #: Contextual copy for the shared Save/Discard/Cancel prompt. ``leave``
+    #: keeps the existing window-close / open-replace wording; ``close`` and
+    #: ``new`` are product session-end intents and default to Cancel.
+    _unsaved_prompt_intent = "leave"
+
+    def _note_user_project_mutation(self, token=None):
+        """Publish one persistable user mutation. No-op while restoring."""
+        holder = getattr(self, "_project_dirty", None)
+        if holder is None:
+            return False
+        self._bind_project_dirty_chrome_listener()
+        return holder.mark_user_mutation(token)
+
+    def _on_pinned_cursor_intent_changed(self):
+        self._note_user_project_mutation(token="pinned_cursor")
+        ultraview = getattr(self, "_ultraview", None)
+        request = getattr(ultraview, "request_pinned_cursor_capture", None)
+        if callable(request):
+            request()
+
+    def _drop_pinned_cursor_identities(self, *, fids=(), channels=()):
+        """Remove closed source/channel identities from View/Pane pin records."""
+        controller = getattr(
+            getattr(self, "chart_stack", None), "_pinned_cursors", None,
+        )
+        if controller is None:
+            return
+        filter_fn = controller.filter_collection_identities
+        view_manager = getattr(self, "view_manager", None)
+        for state in getattr(view_manager, "views", ()) or ():
+            collection = getattr(state, "pinned_cursors", None)
+            if collection is None:
+                continue
+            state.pinned_cursors = filter_fn(
+                collection, fids=fids, channels=channels,
+            )
+        for manager in (getattr(self, "analysis_managers", None) or {}).values():
+            for state in getattr(manager, "views", ()) or ():
+                for pane in getattr(state, "panes", ()) or ():
+                    collection = getattr(pane, "pinned_cursors", None)
+                    if collection is None:
+                        continue
+                    pane.pinned_cursors = filter_fn(
+                        collection, fids=fids, channels=channels,
+                    )
+        controller.drop_closed_identities(fids=fids, channels=channels)
+
+    def _on_project_semantic_views_changed(self):
+        self._note_user_project_mutation()
+
+    def _on_project_filter_changed(self):
+        sync = getattr(self, "_sync_focused_view_time_filter", None)
+        if callable(sync):
+            sync()
+        self._note_user_project_mutation()
+
+    def _on_markup_revision_changed(self):
+        """Mark a persistent chart annotation without delaying its signal."""
+        self._note_user_project_mutation(token="markup")
+
+    def _project_session_is_dirty(self):
+        holder = getattr(self, "_project_dirty", None)
+        if holder is None:
+            return False
+        digest = None
+        if holder.saved_digest is not None:
+            try:
+                digest = self._canonical_session_digest()
+            except Exception:
+                logger.exception("project dirty digest calculation failed")
+                return True
+            holder.reconcile_saved_digest(digest)
+        return holder.session_needs_guard(digest)
+
+    def _reconcile_project_dirty_with_canonical_session(self):
+        """Reconcile explicit history navigation against the saved payload.
+
+        This is called only after a successful Undo/Redo-style semantic
+        transition.  It deliberately stays out of plot, paint, and preview
+        capture paths.
+        """
+        holder = getattr(self, "_project_dirty", None)
+        if holder is None or holder.saved_digest is None:
+            return False
+        self._bind_project_dirty_chrome_listener()
+        try:
+            digest = self._canonical_session_digest()
+        except Exception:
+            logger.exception("project dirty digest reconciliation failed")
+            return False
+        return holder.reconcile_saved_digest(digest)
+
+    def _canonical_session_digest(self):
+        """Canonical payload hash at a leave decision. Not for paint/replot."""
+        snapshot = self._snapshot_focused_view_readonly()
+        from .. import project_io as pio
+        holder = getattr(self, "_project_dirty", None)
+        path = getattr(self, "_project_path", None)
+        if path is None and holder is not None:
+            path = holder.path
+        if path is None:
+            return None
+        doc = self._assemble_project_document(path)
+        idx = getattr(self, "_focused_view_idx", None)
+        if snapshot is not None and isinstance(idx, int) and (
+            0 <= idx < len(doc.views)
+        ):
+            doc.views[idx] = snapshot.to_dict()
+        return pio.canonical_project_digest(doc)
+
+    def _snapshot_focused_view_readonly(self):
+        """Copy the focused time View and capture live controls into the copy.
+
+        Leave-guard review must see the on-screen camera and remarks, but
+        Cancel must not persist them, emit ``views_changed``, or alter the
+        ViewState instance owned by the manager.
+        """
+        from copy import deepcopy
+
+        idx = getattr(self, "_focused_view_idx", None)
+        views = getattr(getattr(self, "view_manager", None), "views", ())
+        if not isinstance(idx, int) or not (0 <= idx < len(views)):
+            return None
+        snapshot = deepcopy(self.view_manager.get(idx))
+        if self.chart_stack.current_mode() != "time":
+            return snapshot
+        if self._time_render_busy() or getattr(self, "_applying_view", False):
+            return snapshot
+        canvas = self._canvas_for_view_index(idx) or self.canvas_time
+        self._view_bridge.capture_controls_into(snapshot, self, canvas)
+        self._view_bridge.capture_canvas_ranges_into(snapshot, canvas)
+        return snapshot
+
+    def _project_session_display_name(self):
+        """Short name for prompts and chrome. Path is identity; this is display."""
+        path = getattr(self, "_project_path", None)
+        if path is None:
+            holder = getattr(self, "_project_dirty", None)
+            path = getattr(holder, "path", None) if holder is not None else None
+        if path:
+            return Path(path).name
+        return "未命名项目"
+
+    def _unsaved_project_prompt_copy(self, intent="leave"):
+        """Contextual labels for the shared leave prompt. Same action ids."""
+        name = self._project_session_display_name()
+        if intent == "close":
+            return {
+                "title": "关闭项目",
+                "text": (
+                    f"“{name}”有未保存的更改。"
+                    "关闭后将结束当前会话（文件、View、分析与 Board）。"
+                ),
+                "save_label": "保存并关闭",
+                "discard_label": "不保存并关闭",
+                "default_action_id": "cancel",
+            }
+        return {
+            "title": "未保存的项目",
+            "text": "项目有未保存的更改。是否保存？",
+            "save_label": "保存",
+            "discard_label": "不保存",
+            "default_action_id": "save",
+        }
+
+    def _unsaved_project_prompt_buttons(self):
+        """Build the shared Save / Don't Save / Cancel box. Does not exec."""
+        from ...ui_kit.message_dialog import build_unsaved_project_dialog
+
+        copy_fn = getattr(self, "_unsaved_project_prompt_copy", None)
+        if callable(copy_fn):
+            copy = copy_fn(getattr(self, "_unsaved_prompt_intent", "leave"))
+            dialog = build_unsaved_project_dialog(self, **copy)
+        else:
+            dialog = build_unsaved_project_dialog(self)
+        return (
+            dialog,
+            dialog.button("save"),
+            dialog.button("discard"),
+            dialog.button("cancel"),
+        )
+
+    def _prompt_unsaved_project(self):
+        """Return ``'save'``, ``'discard'``, or ``'cancel'``."""
+        dialog, _save_btn, _discard_btn, _cancel_btn = (
+            self._unsaved_project_prompt_buttons()
+        )
+        dialog.exec_()
+        result = dialog.message_result
+        if result is None or result.action_id not in {"save", "discard", "cancel"}:
+            return "cancel"
+        return result.action_id
+
+    def confirm_leave_unsaved_project(self, *, intent="leave"):
+        """Shared Save / Don't Save / Cancel guard. Does not destroy the window."""
+        from .project_dirty import DirtyGuardResult
+
+        holder = getattr(self, "_project_dirty", None)
+        if holder is not None and holder.guard_open:
+            return DirtyGuardResult.CANCELLED
+        previous_intent = getattr(self, "_unsaved_prompt_intent", "leave")
+        self._unsaved_prompt_intent = intent or "leave"
+        if not self._project_session_is_dirty():
+            self._unsaved_prompt_intent = previous_intent
+            return DirtyGuardResult.PROCEED_DISCARDED
+        if holder is not None:
+            holder.guard_open = True
+        try:
+            choice = self._prompt_unsaved_project()
+            if choice == "save":
+                try:
+                    ok = bool(self.save_project_via_dialog())
+                except (OSError, TypeError, ValueError):
+                    logger.exception("unsaved-project save failed")
+                    ok = False
+                if ok:
+                    return DirtyGuardResult.PROCEED_SAVED
+                return DirtyGuardResult.CANCELLED
+            if choice == "discard":
+                return DirtyGuardResult.PROCEED_DISCARDED
+            return DirtyGuardResult.CANCELLED
+        finally:
+            self._unsaved_prompt_intent = previous_intent
+            if holder is not None:
+                holder.guard_open = False
+
+    def open_files_or_project(self):
+        """统一打开入口：文件对话框同时接受数据文件和 .tlproj。"""
+        import sys as _sys
+        _pkg = _sys.modules.get('mf4_analyzer.ui.main_window')
+        _QFileDialog = getattr(_pkg, 'QFileDialog', QFileDialog) if _pkg is not None else QFileDialog
+        fps, _ = _QFileDialog.getOpenFileNames(
+            self, "打开", "", PROJECT_OR_DATA_FILTER,
+        )
+        if not fps:
+            return
+        self._open_paths(fps)
+
+    def _open_paths(self, paths):
+        """共享分发：数据文件追加；单个 .tlproj 替换（先确认）；项目+文件先开项目再
+        追加；≥2 个项目拒绝。由「打开」菜单和拖放共用，行为零分叉。"""
+        from pathlib import Path
+        projects = [p for p in paths if Path(p).suffix.lower() == ".tlproj"]
+        data_files = [p for p in paths if Path(p).suffix.lower() != ".tlproj"]
+
+        if len(projects) >= 2:
+            QMessageBox.warning(self, "无法打开", "一次只能打开一个项目（.tlproj）。")
+            return
+
+        if projects:
+            from .project_dirty import DirtyGuardResult
+            result = self.confirm_leave_unsaved_project()
+            if result is DirtyGuardResult.CANCELLED:
+                return
+            self.open_project(projects[0])
+            self._open_data_paths(data_files)
+            return
+
+        self._open_data_paths(data_files)
+
+    # Heavy-load confirm: wall-clock is dominated by parse+decode on the GUI
+    # thread. ASC alone is ~60 MB/s parse; with DBC/decode use a conservative
+    # ~25 MB/s so 10×400 MB ≈ 3 minutes is called out before starting.
+    _HEAVY_LOAD_TOTAL_BYTES = 300 * 1024 * 1024
+    _HEAVY_LOAD_FILE_BYTES = 150 * 1024 * 1024
+    _HEAVY_LOAD_MANY_FILES = 5
+    _HEAVY_LOAD_MANY_TOTAL_BYTES = 100 * 1024 * 1024
+    _HEAVY_LOAD_ESTIMATE_BYTES_PER_SEC = 25 * 1024 * 1024
+
+    def _format_byte_size(self, nbytes: int) -> str:
+        n = float(max(0, int(nbytes)))
+        for unit, scale in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+            if n >= scale or unit == "KB":
+                value = n / scale
+                if value >= 10:
+                    return f"{value:.0f} {unit}"
+                return f"{value:.1f} {unit}"
+        return f"{int(n)} B"
+
+    def _estimate_heavy_load_seconds(self, total_bytes: int) -> int:
+        return max(
+            1,
+            int(round(total_bytes / float(self._HEAVY_LOAD_ESTIMATE_BYTES_PER_SEC))),
+        )
+
+    def _should_confirm_heavy_load(self, weights) -> bool:
+        weights = [max(1, int(w)) for w in (weights or ())]
+        if not weights:
+            return False
+        total = sum(weights)
+        if total >= self._HEAVY_LOAD_TOTAL_BYTES:
+            return True
+        if any(w >= self._HEAVY_LOAD_FILE_BYTES for w in weights):
+            return True
+        if (
+            len(weights) >= self._HEAVY_LOAD_MANY_FILES
+            and total >= self._HEAVY_LOAD_MANY_TOTAL_BYTES
+        ):
+            return True
+        return False
+
+    def _confirm_heavy_load(self, data_files, weights) -> bool:
+        """Ask before a likely multi-minute, UI-blocking import batch."""
+        total = sum(max(1, int(w)) for w in weights)
+        est_sec = self._estimate_heavy_load_seconds(total)
+        if est_sec < 60:
+            est_text = f"约 {est_sec} 秒"
+        elif est_sec < 3600:
+            est_text = f"约 {max(1, int(round(est_sec / 60)))} 分钟"
+        else:
+            est_text = f"约 {est_sec / 3600:.1f} 小时"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("加载可能较久")
+        box.setText(
+            f"即将加载 {len(data_files)} 个文件（共 {self._format_byte_size(total)}）。"
+        )
+        box.setInformativeText(
+            f"按体积粗估可能需要 {est_text} 或更久，期间界面可能暂时无响应"
+            "（进度条会尽量更新）。是否继续？"
+        )
+        cont = box.addButton("继续加载", QMessageBox.AcceptRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        fit_message_box_buttons_to_text(box)
+        box.setDefaultButton(cont)
+        box.exec_()
+        return box.clickedButton() is cont
+
+    def _open_data_paths(self, data_files):
+        """Load one user-selected batch with a weighted, truthful status bar.
+
+        A file's byte size is the only universally available work estimate
+        across CSV/MDF/BLF/etc.  BLF/ASC refine their own fraction from reader
+        progress (byte ``tell`` or a frame-based fallback); formats whose
+        libraries expose no safe incremental callback show an indeterminate
+        busy bar for that file, then jump when it completes.
+        """
+        data_files = list(data_files or ())
+        if not data_files:
+            return
+
+        unique_files = []
+        seen_paths = set()
+        duplicate_count = 0
+        for path in data_files:
+            identity = os.path.normcase(
+                os.path.realpath(os.path.abspath(os.fspath(path)))
+            )
+            if identity in seen_paths:
+                duplicate_count += 1
+                continue
+            seen_paths.add(identity)
+            unique_files.append(path)
+        data_files = unique_files
+        if duplicate_count:
+            self.toast(f"已跳过 {duplicate_count} 个重复文件", "info")
+
+        weights = []
+        for path in data_files:
+            try:
+                weights.append(max(1, int(Path(path).stat().st_size)))
+            except (OSError, TypeError, ValueError):
+                weights.append(1)
+        if self._should_confirm_heavy_load(weights):
+            if not self._confirm_heavy_load(data_files, weights):
+                self.statusBar.showMessage("已取消加载")
+                self.toast("已取消加载", "info")
+                return
+        total_weight = max(1, sum(weights))
+        fractions = [0.0] * len(data_files)
+        last_paint_at = 0.0
+        token = self._begin_compute_progress(
+            f"加载文件 0/{len(data_files)}",
+            total=1000,
+        )
+
+        def report(index, fraction, phase=""):
+            """Advance one file monotonically and repaint at most 25 FPS.
+
+            ``fraction < 0`` means indeterminate busy for formats without a
+            safe incremental loader callback.
+            """
+            nonlocal last_paint_at
+            if not (0 <= index < len(fractions)):
+                return
+            label = f"加载 {index + 1}/{len(data_files)}"
+            if phase:
+                label += f" · {phase}"
+            if float(fraction) < 0:
+                last_paint_at = monotonic()
+                self._update_compute_progress(
+                    0,
+                    0,
+                    label=label,
+                    token=token,
+                    flush_events=True,
+                )
+                return
+            fraction = max(0.0, min(1.0, float(fraction)))
+            if fraction > fractions[index]:
+                fractions[index] = fraction
+            now = monotonic()
+            if (
+                fraction < 1.0
+                and now - last_paint_at < 0.04
+            ):
+                return
+            last_paint_at = now
+            done = int(round(
+                1000 * sum(
+                    weight * progress
+                    for weight, progress in zip(weights, fractions)
+                ) / total_weight
+            ))
+            # The status bar has deliberately limited width.  Keep its live
+            # label scannable; the active filename remains in the normal
+            # status message set by _load_one.
+            self._update_compute_progress(
+                done,
+                1000,
+                label=label,
+                token=token,
+                flush_events=True,
+            )
+
+        try:
+            self._wwt_import.begin_open_batch()
+            can_log_paths = [
+                path for path in data_files
+                if self._is_can_log_path(path)
+            ]
+            if len(can_log_paths) >= 2:
+                before_fids = set(self.files)
+                self._load_blf_batch(
+                    can_log_paths,
+                    ordered_paths=data_files,
+                    progress_callback=lambda input_index, _path, fraction, phase: report(
+                        input_index, fraction, phase,
+                    ),
+                )
+                for fid in self.files:
+                    if fid in before_fids:
+                        continue
+                    self._recent_files.record_file(str(self.files[fid].filepath))
+                return
+
+            # Multi-file batch: suppress per-file success / analysis-attach
+            # toasts and emit one aggregated toast after the loop (F11;
+            # mirrors ``_close_files`` notify=False aggregation).
+            batch_load = len(data_files) > 1
+            batch_attached = []
+            loaded_files = 0
+            for index, fp in enumerate(data_files):
+                before_fids = set(self.files)
+                self._load_one(
+                    fp,
+                    progress_callback=lambda fraction, phase, i=index: report(
+                        i, fraction, phase,
+                    ),
+                    notify=not batch_load,
+                )
+                added = set(self.files) != before_fids
+                report(
+                    index,
+                    1.0,
+                    "已加载" if added else "已跳过",
+                )
+                if added:
+                    loaded_files += 1
+                    self._recent_files.record_file(fp)
+                if batch_load:
+                    batch_attached.extend(
+                        getattr(self, "_last_source_load_attached", ()) or ()
+                    )
+            announced = False
+            if batch_load and batch_attached:
+                mode = self.chart_stack.current_mode()
+                if mode in self.analysis_managers:
+                    resolved = self._active_analysis_view_state(mode)
+                    if resolved is not None:
+                        section, _mgr, state = resolved
+                        self._toast_analysis_files_attached(
+                            section, state, batch_attached,
+                        )
+                        announced = True
+            if batch_load and loaded_files and not announced:
+                self.statusBar.showMessage(
+                    f"✅ 已加载 {loaded_files} 个文件 | 共 {len(self.files)} 文件"
+                )
+                self.toast(f"已加载 {loaded_files} 个文件", "success")
+        finally:
+            self._wwt_import.end_open_batch()
+            self._finish_compute_progress(token=token)
+
+    def save_project_via_dialog(self):
+        """「保存」handler: overwrite the current .tlproj if one is open,
+        otherwise fall back to Save-As."""
+        if self._project_path is not None:
+            return bool(self.save_project(self._project_path))
+        return bool(self.save_project_as_via_dialog())
+
+    def save_project_as_via_dialog(self):
+        """「另存为」handler: always prompt for a new .tlproj path."""
+        from pathlib import Path
+        from PyQt5.QtWidgets import QFileDialog
+        start = str(self._project_path) if self._project_path is not None else ""
+        fp, _ = QFileDialog.getSaveFileName(self, "另存为项目", start, "TraceLab 项目 (*.tlproj)")
+        if not fp:
+            return False
+        if not fp.lower().endswith(".tlproj"):
+            fp = fp + ".tlproj"
+        return bool(self.save_project(Path(fp)))
+
+    def _confirm_degraded_project_save(self, health):
+        """Confirm overwrite/save-as after a degraded project restore.
+
+        Default button is Cancel. Stage 1 does not persist unresolved refs;
+        saving freezes the current missing state. Tests monkeypatch this seam.
+        """
+        n_missing = len(getattr(health, "missing_paths", ()) or ())
+        n_analysis = len(getattr(health, "dropped_analysis_refs", ()) or ())
+        n_time = len(getattr(health, "dropped_time_refs", ()) or ())
+        summary = []
+        if n_missing:
+            summary.append(f"缺失文件：{n_missing}")
+        if n_analysis:
+            summary.append(f"跳过的分析 View/Pane 来源：{n_analysis}")
+        if n_time:
+            summary.append(f"跳过的时域通道引用：{n_time}")
+        box = QMessageBox(self)
+        box.setWindowTitle("项目恢复不完整")
+        box.setIcon(QMessageBox.Warning)
+        box.setText(
+            "本次打开项目时有文件或分析来源缺失。"
+            "Stage 1 不会保存未解析的引用；继续保存会固化当前缺失状态。"
+        )
+        if summary:
+            box.setInformativeText("\n".join(summary))
+        save_btn = box.addButton("仍要保存", QMessageBox.AcceptRole)
+        cancel = box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(cancel)
+        fit_message_box_buttons_to_text(box)
+        box.exec_()
+        return box.clickedButton() is save_btn
+
+    def _write_project_document(self, doc, path):
+        """Write seam for ``save_project`` (tests monkeypatch this)."""
+        from .. import project_io as pio
+        pio.save_project_to_json(doc, path)
+
+    def load_files(self):
+        import sys as _sys
+        _pkg = _sys.modules.get('mf4_analyzer.ui.main_window')
+        _QFileDialog = getattr(_pkg, 'QFileDialog', QFileDialog) if _pkg is not None else QFileDialog
+        fps, _ = _QFileDialog.getOpenFileNames(
+            self, "选择文件", "", OPEN_FILES_FILTER)
+        self._open_data_paths(fps)
+
+    def load_file(self, path) -> None:
+        """Public Analyzer handoff for single-file loads.
+
+        Stage 5 of the Acquisition Cockpit plan
+        (``docs/analyzer/acquisition/plans/2026-05-15-acquisition-cockpit-ui-implementation.md``)
+        wires Cockpit's review modal to this method. Spec §Architecture
+        Contract / Analyzer Handoff pins the contract:
+
+        - Public method, accepts ``str | Path``.
+        - Thin wrapper around the existing private ``_load_one(fp)`` flow.
+        - Cockpit MUST NOT call ``_load_one`` directly.
+
+        The delegated transaction also performs the shared post-load attachment
+        step used by every supported source format and surfaces the same
+        bottom progress indicator as file-picker and drag-drop imports.
+        """
+        self._open_data_paths([str(path)])
+
+    def _register_file_data(self, fp, data, chs, units, *,
+                            fs=None,
+                            source_metadata=None, channel_metadata=None,
+                            label_suffix=""):
+        fid = f"f{self._fc}"; self._fc += 1
+        kwargs = dict(
+            source_metadata=source_metadata,
+            channel_metadata=channel_metadata,
+            label_suffix=label_suffix,
+        )
+        # Pre-check the constructor signature instead of sniffing TypeError
+        # text for "fs" (CPython 3.10+ wording drifted; any unrelated TypeError
+        # mentioning "fs" used to be swallowed). Same structured-dispatch
+        # idea as NO_CAN_FRAMES_MESSAGE.
+        file_data_accepts_fs = "fs" in inspect.signature(FileData).parameters
+        if fs is not None and file_data_accepts_fs:
+            kwargs["fs"] = fs
+        fd = FileData(fp, data, chs, units, len(self.files), **kwargs)
+        if fs is not None and not file_data_accepts_fs:
+            try:
+                fd.rebuild_time_axis(float(fs))
+            except Exception:
+                fd.fs = float(fs)
+        self.files[fid] = fd
+        channels = (
+            fd.get_signal_channels()
+            if hasattr(fd, "get_signal_channels")
+            else chs
+        )
+        self.navigator_order.register_file(fid, channels)
+        self.navigator.add_file(fid, fd)
+        self.canvas_time.invalidate_envelope_cache("file loaded")
+        self.canvas_time.invalidate_monotonicity_cache()
+        # Unified entry point: also clears analysis_caches for this fid in
+        # case the same fid integer was previously used by a now-closed file
+        # (问题① fix).
+        self._invalidate_all_analysis_caches_for_fid(fid)
+        self._refresh_channel_dependent_controls()
+        is_audio_source = getattr(fd, "is_audio_source", None)
+        try:
+            is_audio = bool(is_audio_source()) if callable(is_audio_source) else False
+        except Exception:
+            is_audio = False
+        if is_audio:
+            signal_channels = (
+                fd.get_signal_channels()
+                if hasattr(fd, "get_signal_channels")
+                else chs
+            )
+            if signal_channels:
+                apply_audio_default = getattr(
+                    self, "_apply_audio_weighting_default", None
+                )
+                if callable(apply_audio_default):
+                    apply_audio_default((fid, signal_channels[0]))
+        if fd.time_array is not None and len(fd.time_array):
+            current_hi = self.inspector.top.spin_end.maximum()
+            new_hi = max(current_hi, fd.time_array[-1])
+            self.inspector.top.set_range_limits(0, new_hi)
+            # Expanding limits is required so a longer source can display.
+            # Do not write spin values: that leaked the first file's last
+            # timestamp into analysis compute boxes (R1). Time-domain still
+            # syncs from the visible xlim after plot.
+        self._note_user_project_mutation()
+        refresh_chip = getattr(self, "_refresh_time_axis_provenance_chips", None)
+        if callable(refresh_chip):
+            refresh_chip()
+        return fd
+
+    def _toast_io_load_diagnostics(self, *source_metadatas):
+        """Surface load-time diagnostics that previously lived only in metadata.
+
+        Template: HDF ``dropped_channels`` → formatter → warning toast. Same
+        exit for WWT/TDMS skips, MAT skipped vars, ZFD estimated fs,
+        collision renames, and HDF ``warnings`` (A5 factor estimates).
+        Aggregates across multi-group loads into one toast per diagnostic
+        kind; file-level lists copied into every raster group are deduped.
+        """
+        dropped = []
+        skipped_channels = []
+        skipped_vars = []
+        renamed = []
+        load_warnings = []
+        fs_estimated = False
+        seen_skip_names = set()
+        seen_var_names = set()
+        seen_dropped_keys = set()
+        seen_renamed_keys = set()
+        seen_warning_texts = set()
+        for smeta in source_metadatas:
+            if not smeta:
+                continue
+            for entry in smeta.get("dropped_channels") or []:
+                key = (
+                    entry.get("name") if isinstance(entry, dict) else entry
+                )
+                if key in seen_dropped_keys:
+                    continue
+                seen_dropped_keys.add(key)
+                dropped.append(entry)
+            for entry in smeta.get("skipped_channels") or []:
+                key = (
+                    entry.get("name") if isinstance(entry, dict) else entry
+                )
+                if key in seen_skip_names:
+                    continue
+                seen_skip_names.add(key)
+                skipped_channels.append(entry)
+            for entry in smeta.get("skipped_vars") or []:
+                key = (
+                    entry.get("name") if isinstance(entry, dict) else entry
+                )
+                if key in seen_var_names:
+                    continue
+                seen_var_names.add(key)
+                skipped_vars.append(entry)
+            for entry in smeta.get("renamed_channels") or []:
+                if isinstance(entry, dict):
+                    key = (entry.get("original"), entry.get("renamed"))
+                else:
+                    key = entry
+                if key in seen_renamed_keys:
+                    continue
+                seen_renamed_keys.add(key)
+                renamed.append(entry)
+            for entry in smeta.get("warnings") or []:
+                text = str(entry).strip()
+                if not text or text in seen_warning_texts:
+                    continue
+                seen_warning_texts.add(text)
+                load_warnings.append(text)
+            if smeta.get("fs_estimated"):
+                fs_estimated = True
+
+        for notice in (
+            format_dropped_channels_notice(dropped),
+            format_skipped_channels_notice(skipped_channels),
+            format_skipped_vars_notice(skipped_vars),
+            format_fs_estimated_notice(fs_estimated),
+            format_renamed_channels_notice(renamed),
+            *load_warnings,
+        ):
+            if notice:
+                self.toast(notice, "warning")
+
+    def _consume_wwt_import_outcome(self, outcome):
+        """Surface degraded-data diagnostics from a WWT View import."""
+        if outcome is None or getattr(self, "_restoring_project", False):
+            return
+        summary = getattr(outcome, "summary", "") or ""
+        if summary:
+            self.toast(summary, "warning")
+
+    def _is_can_log_path(self, path) -> bool:
+        """True for Vector BLF or evidence-matched CANoe ASC CAN logs."""
+        suffix = Path(path).suffix.lower()
+        if suffix == ".blf":
+            return True
+        if suffix != ".asc":
+            return False
+        try:
+            from ...io.asc_can_format import sniff_canoe_asc
+            return bool(sniff_canoe_asc(path))
+        except Exception:
+            return False
+
+    def _load_one(
+        self,
+        fp,
+        *,
+        blf_dbc_paths=None,
+        blf_frames=None,
+        blf_dbc_validated=False,
+        progress_callback=None,
+        notify=True,
+    ):
+        """Load one path and run the shared post-load attach step.
+
+        ``notify`` gates per-file success toast/statusBar and the
+        analysis-mode attach toast (defaults True so single-file callers
+        keep one toast per load). ``_open_data_paths`` passes
+        ``notify=False`` for multi-file batches and emits one aggregated
+        toast itself — same shape as ``_close_files`` /
+        ``_close(..., notify=False)``.
+        """
+        before_fids = set(self.files)
+        try:
+            return self._load_one_impl(
+                fp,
+                blf_dbc_paths=blf_dbc_paths,
+                blf_frames=blf_frames,
+                blf_dbc_validated=blf_dbc_validated,
+                progress_callback=progress_callback,
+                notify=notify,
+            )
+        finally:
+            new_fids = [fid for fid in self.files if fid not in before_fids]
+            self._last_source_load_attached = self._on_source_load_finished(
+                new_fids, notify=notify,
+            )
+
+    def _load_one_impl(
+        self,
+        fp,
+        *,
+        blf_dbc_paths=None,
+        blf_frames=None,
+        blf_dbc_validated=False,
+        progress_callback=None,
+        notify=True,
+    ):
+        def report(fraction, phase):
+            if callable(progress_callback):
+                progress_callback(float(fraction), str(phase))
+
+        def announce_loaded(status, toast_msg):
+            if not notify:
+                return
+            self.statusBar.showMessage(status)
+            self.toast(toast_msg, "success")
+
+        try:
+            self.statusBar.showMessage(f"加载: {fp}");
+            # Paint the status message only; queued input must not re-enter
+            # the importer or switch Views mid-load (same lesson as above).
+            QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+            p = Path(fp);
+            ext = p.suffix.lower()
+            report(0.0, "准备")
+            report(0.05, "读取数据")
+            is_canoe_asc = False
+            load_metadata = None
+            if ext == ".asc":
+                from ...io.asc_can_format import sniff_canoe_asc
+                try:
+                    is_canoe_asc = bool(sniff_canoe_asc(p))
+                except ImportError:
+                    raise
+                except Exception:
+                    is_canoe_asc = False
+            if ext in ('.mf4', '.mdf'):
+                if not HAS_ASAMMDF: QMessageBox.critical(self, "错误", "asammdf 未安装"); return
+                report(-1.0, "读取 MF4")
+                data, chs, units = DataLoader.load_mf4(fp)
+                load_metadata = dict(
+                    getattr(data, "attrs", {}).get("source_metadata") or {}
+                )
+            elif ext in ('.xlsx', '.xls'):
+                report(-1.0, "读取 Excel")
+                data, chs, units = DataLoader.load_excel(fp)
+            elif ext in AUDIO_VIDEO_EXTS:
+                report(-1.0, "读取音视频")
+                data, chs, units, fs, smeta = DataLoader.load_audio_video(fp)
+                fd = self._register_file_data(
+                    fp, data, chs, units, fs=fs, source_metadata=smeta)
+                self._update_info()
+                announce_loaded(
+                    f"✅ 已加载音轨: {p.name} ({len(data)} 采样 @ {fs:.0f} Hz) | 共 {len(self.files)} 文件",
+                    f"已加载音轨 {p.name}",
+                )
+                return
+            elif ext == '.blf' or is_canoe_asc:
+                fmt = "BLF" if ext == ".blf" else "CANoe ASC"
+                source_kind = "blf" if ext == ".blf" else "canoe_asc"
+                asc_read_warnings = []
+                frames = blf_frames
+                if frames is None:
+                    frames = DataLoader.read_blf_frames(
+                        fp,
+                        # Three-arg form so the ASC coordinator's real phase
+                        # (预检/快速解析/兼容解析重试) reaches the progress
+                        # UI instead of being dropped; plain BLF reads still
+                        # call with two args and take the default (P1-2).
+                        progress_callback=lambda current, total, phase="读取 CAN 帧": report(
+                            0.05 + 0.40 * current / max(1, total),
+                            phase,
+                        ),
+                        warning_callback=asc_read_warnings.append,
+                    )
+                else:
+                    report(0.05, "复用已读取 CAN 帧")
+                dbc_paths = None
+                if blf_dbc_paths:
+                    dbc_paths = list(self._canonical_blf_dbc_paths(blf_dbc_paths))
+                    if not blf_dbc_validated:
+                        dbc_paths = self._validated_blf_dbc_paths(
+                            p,
+                            dbc_paths,
+                            frames=frames,
+                            progress_callback=lambda current, total: report(
+                                0.45 + 0.10 * current / max(1, total),
+                                "校验 DBC",
+                            ),
+                        )
+                if not dbc_paths:
+                    if blf_frames is not None:
+                        raise ValueError("BLF 批量导入缺少已验证的 DBC")
+                    dbc_paths = self._resolve_blf_dbc_paths(
+                        p,
+                        frames=frames,
+                        progress_callback=lambda current, total: report(
+                            0.45 + 0.10 * current / max(1, total),
+                            "匹配 DBC",
+                        ),
+                    )
+                if not dbc_paths:
+                    self.statusBar.showMessage(f"已取消 {fmt}: {p.name}")
+                    return
+                decode_start = 0.05 if blf_frames is not None else 0.55
+                decode_span = 0.90 if blf_frames is not None else 0.40
+                data, chs, units = DataLoader.load_blf_frames(
+                    frames,
+                    dbc_paths=dbc_paths,
+                    progress_callback=lambda current, total: report(
+                        decode_start + decode_span * current / max(1, total),
+                        "解码信号",
+                    ),
+                )
+                report(0.96, "登记通道")
+                source_metadata = {
+                    "source_kind": source_kind,
+                    "dbc_paths": list(dbc_paths),
+                    "warnings": asc_read_warnings,
+                }
+                self._register_file_data(
+                    fp, data, chs, units,
+                    source_metadata=source_metadata,
+                )
+                self._remember_blf_dbc_paths(dbc_paths)
+                self._update_info()
+                mode = f"DBC×{len(dbc_paths)} 解码"
+                announce_loaded(
+                    f"✅ 已加载 {fmt}: {p.name} ({len(data)} 行 · {mode}) | 共 {len(self.files)} 文件",
+                    f"已加载 {p.name} · {mode}",
+                )
+                # ASC fallback warnings (P1-2): read_asc_outcome().warning
+                # used to reach only logger.warning via _log_fallback, never
+                # any user-visible surface. The status bar is a dead end
+                # (SurfaceStatusBar.showMessage is logic-only, review P1-5),
+                # so this rides the same toast exit as every other source's
+                # load-time diagnostics (unconditional, matching TDMS/HDF/
+                # WWT/ZFD/MAT above — diagnostics still surface even when
+                # ``notify`` suppresses the generic success toast).
+                self._toast_io_load_diagnostics(source_metadata)
+                report(1.0, "已加载")
+                return
+            elif ext == '.tdms':
+                report(-1.0, "读取 TDMS")
+                data, chs, units, fs, smeta = DataLoader.load_tdms(fp)
+                self._register_file_data(
+                    fp, data, chs, units, fs=fs, source_metadata=smeta)
+                self._update_info()
+                announce_loaded(
+                    f"✅ 已加载 TDMS: {p.name} ({len(data)} 行) | 共 {len(self.files)} 文件",
+                    f"已加载 TDMS {p.name} · {len(data)} 行",
+                )
+                self._toast_io_load_diagnostics(smeta)
+                return
+            elif ext == '.hdf':
+                report(-1.0, "读取 HDF")
+                groups = DataLoader.load_hdf(fp)
+                for g in groups:
+                    self._register_file_data(
+                        fp, g["data"], g["channels"], g["units"],
+                        source_metadata=g["source_metadata"],
+                        channel_metadata=g["channel_metadata"],
+                        label_suffix=g["label_suffix"])
+                self._update_info()
+                announce_loaded(
+                    f"✅ 已加载: {p.name} → {len(groups)} 组 | 共 {self.navigator.file_list_count()} 个源文件",
+                    f"已加载 {p.name} · {len(groups)} 组",
+                )
+                self._toast_io_load_diagnostics(
+                    *(g.get("source_metadata") for g in groups))
+                return
+            elif ext == '.asc':
+                report(-1.0, "读取 ASCII")
+                data, chs, units, fs, smeta = DataLoader.load_ascii(fp)
+                self._register_file_data(
+                    fp, data, chs, units, fs=fs, source_metadata=smeta)
+                self._update_info()
+                announce_loaded(
+                    f"✅ 已加载 ASCII: {p.name} ({len(data)} 行) | 共 {len(self.files)} 文件",
+                    f"已加载 ASCII {p.name} · {len(data)} 行",
+                )
+                return
+            elif ext == '.wwt':
+                report(-1.0, "读取 WWT")
+                from ..view_state import is_reusable_blank_view
+                reuse_blank = bool(
+                    self.view_manager.views
+                    and is_reusable_blank_view(self.view_manager.get(0))
+                )
+                loaded = DataLoader.load_wwt_document(fp)
+                groups = list(loaded.groups)
+                before = set(self.files)
+                for g in groups:
+                    self._register_file_data(
+                        fp, g["data"], g["channels"], g["units"],
+                        source_metadata=g["source_metadata"],
+                        channel_metadata=g["channel_metadata"],
+                        label_suffix=g["label_suffix"])
+                new_fids = [fid for fid in self.files if fid not in before]
+                self._update_info()
+                announce_loaded(
+                    f"✅ 已加载 WWT: {p.name} → {len(groups)} 组 | 共 {self.navigator.file_list_count()} 个源文件",
+                    f"已加载 {p.name} · {len(groups)} 组",
+                )
+                restoring = bool(getattr(self, "_restoring_project", False))
+                if not restoring:
+                    # skipped_channels is consumed by the WWT import summary
+                    # (auxiliaries are no longer in that list). Keep renamed
+                    # and other generic notices.
+                    toast_metas = []
+                    for group in groups:
+                        smeta = dict(group.get("source_metadata") or {})
+                        smeta.pop("skipped_channels", None)
+                        toast_metas.append(smeta)
+                    self._toast_io_load_diagnostics(*toast_metas)
+                    coordinator = getattr(self, "_wwt_import", None)
+                    offer = getattr(coordinator, "offer_layout", None)
+                    outcome = (
+                        offer(loaded.document, new_fids, reuse_blank=reuse_blank)
+                        if callable(offer) else None
+                    )
+                    self._consume_wwt_import_outcome(outcome)
+                return
+            elif ext == '.zfd':
+                report(-1.0, "读取 ZFD")
+                groups = DataLoader.load_zfd(fp)
+                for g in groups:
+                    self._register_file_data(
+                        fp, g["data"], g["channels"], g["units"],
+                        source_metadata=g["source_metadata"],
+                        channel_metadata=g["channel_metadata"],
+                        label_suffix=g["label_suffix"])
+                self._update_info()
+                announce_loaded(
+                    f"✅ 已加载 ZFD: {p.name} → {len(groups)} 组 | 共 {self.navigator.file_list_count()} 个源文件",
+                    f"已加载 {p.name} · {len(groups)} 组",
+                )
+                self._toast_io_load_diagnostics(
+                    *(g.get("source_metadata") for g in groups))
+                return
+            elif ext == '.mat':
+                report(-1.0, "读取 MAT")
+                groups = DataLoader.load_mat(fp)
+                for g in groups:
+                    self._register_file_data(
+                        fp, g["data"], g["channels"], g["units"],
+                        source_metadata=g["source_metadata"],
+                        channel_metadata=g["channel_metadata"],
+                        label_suffix=g["label_suffix"])
+                self._update_info()
+                announce_loaded(
+                    f"✅ 已加载 MAT: {p.name} → {len(groups)} 组 | 共 {self.navigator.file_list_count()} 个源文件",
+                    f"已加载 {p.name} · {len(groups)} 组",
+                )
+                self._toast_io_load_diagnostics(
+                    *(g.get("source_metadata") for g in groups))
+                return
+            else:
+                report(-1.0, "读取表格")
+                data, chs, units = DataLoader.load_csv(fp)
+            fd = self._register_file_data(
+                fp, data, chs, units, source_metadata=load_metadata,
+            )
+            # User-request 2026-05-20: do NOT auto-select channel[0] on file
+            # load. The canvas opens empty; the user picks the channel(s)
+            # they want explicitly. Any previously-checked channels on
+            # *other* loaded files remain checked and visible — their fids
+            # are unaffected by the freshly minted ``fid`` above.
+            self._update_info()
+            announce_loaded(
+                f"✅ 已加载: {p.name} ({len(data)} 行) | 共 {len(self.files)} 文件",
+                f"已加载 {p.name} · {len(data)} 行",
+            )
+            self._toast_io_load_diagnostics(load_metadata)
+            report(1.0, "已加载")
+        except ImportError as e:
+            self._show_load_import_error(e)
+        except Exception as e:
+            if self._offer_extension_manager_for(e):
+                self._show_load_import_error(e)
+            else:
+                QMessageBox.critical(self, "错误", str(e))
+
+    def _offer_extension_manager_for(self, exc) -> bool:
+        from .command_coordinator import extension_import_offers_manager
+
+        return extension_import_offers_manager(exc)
+
+    def _show_load_import_error(self, exc) -> None:
+        text = (
+            self._format_load_import_error(exc)
+            if isinstance(exc, ImportError)
+            else (str(exc).strip() or "无法加载该文件")
+        )
+        if not self._offer_extension_manager_for(exc):
+            QMessageBox.critical(self, "错误", text)
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Critical)
+        box.setWindowTitle("错误")
+        box.setText(text)
+        box.setInformativeText("可打开扩展管理安装或修复对应组件；安装前请先关闭本程序。")
+        open_btn = box.addButton("打开扩展管理", QMessageBox.ActionRole)
+        box.addButton("关闭", QMessageBox.RejectRole)
+        fit_message_box_buttons_to_text(box)
+        box.exec_()
+        if box.clickedButton() is open_btn:
+            opener = getattr(self, "open_extension_manager", None)
+            if callable(opener):
+                opener()
+
+    def _format_load_import_error(self, exc: ImportError) -> str:
+        """User-facing text for a missing optional loader dependency.
+
+        Task5 lets CANoe ``.asc`` sniffing raise ``ImportError`` instead of
+        falling through to tabular ASCII. The dialog must name python-can
+        rather than dump a traceback or a bare ``No module named 'can'``.
+        """
+        text = str(exc).strip()
+        name = getattr(exc, "name", None)
+        looks_like_can = (
+            name == "can"
+            or "python-can" in text.lower()
+            or "no module named 'can'" in text.lower()
+        )
+        if looks_like_can and "python-can" not in text:
+            return (
+                "python-can 未安装，无法识别或读取 CANoe ASC / BLF。"
+                "请先 pip install python-can"
+            )
+        return text or "缺少依赖，无法加载该文件"
+
+    def _canonical_blf_dbc_paths(self, dbc_paths):
+        return normalize_dbc_paths(dbc_paths)
+
+    def _blf_dbc_settings(self):
+        try:
+            from ..inspector_sections._helpers import _preset_settings
+            return _preset_settings()
+        except Exception:
+            return QSettings("MF4Analyzer", "DataAnalyzer")
+
+    def _clean_blf_dbc_history(self, history):
+        cleaned = []
+        seen = set()
+        for paths in reversed(history or []):
+            key = self._canonical_blf_dbc_paths(paths)
+            identity = dbc_candidate_identity(key)
+            if not identity or identity in seen:
+                continue
+            if not all(Path(p).exists() for p in key):
+                continue
+            seen.add(identity)
+            cleaned.append(list(key))
+        cleaned.reverse()
+        return cleaned[-BLF_DBC_RECENT_MAX:]
+
+    def _load_recent_blf_dbc_history(self):
+        raw = self._blf_dbc_settings().value(BLF_DBC_RECENT_SETTINGS_KEY, "")
+        if not raw:
+            return []
+        if isinstance(raw, (list, tuple)):
+            parsed = raw
+        else:
+            try:
+                parsed = json.loads(str(raw))
+            except (TypeError, ValueError):
+                return []
+        history = self._clean_blf_dbc_history(parsed)
+        if history != parsed:
+            self._save_recent_blf_dbc_history(history)
+        return history
+
+    def _save_recent_blf_dbc_history(self, history=None):
+        history = self._clean_blf_dbc_history(
+            history if history is not None
+            else getattr(self, "_blf_dbc_history", [])
+        )
+        settings = self._blf_dbc_settings()
+        settings.setValue(
+            BLF_DBC_RECENT_SETTINGS_KEY,
+            json.dumps(history, ensure_ascii=False),
+        )
+        settings.sync()
+        return history
+
+    def _remember_blf_dbc_paths(self, dbc_paths):
+        key = self._canonical_blf_dbc_paths(dbc_paths)
+        if not key:
+            return
+        identity = dbc_candidate_identity(key)
+        history = list(getattr(self, "_blf_dbc_history", []))
+        history = [
+            paths for paths in history
+            if dbc_candidate_identity(paths) != identity
+        ]
+        history.append(list(key))
+        self._blf_dbc_history = self._save_recent_blf_dbc_history(history)
+
+    def _candidate_blf_dbc_paths(self, path):
+        candidates = []
+        seen = set()
+
+        def add(paths):
+            key = self._canonical_blf_dbc_paths(paths)
+            identity = dbc_candidate_identity(key)
+            if not identity or identity in seen:
+                return
+            seen.add(identity)
+            candidates.append(list(key))
+
+        for paths in reversed(getattr(self, "_blf_dbc_history", [])):
+            add(paths)
+
+        nearby = set()
+        # A log batch is commonly arranged as ``<run>/<case>/<file>.blf``
+        # with shared DBCs at ``<run>``.  Search only the immediate small
+        # ancestor scope; do not turn an import into an expensive home-folder
+        # crawl.
+        for folder in list(Path(path).parents)[:4]:
+            for pattern in ("*.dbc", "*.DBC"):
+                nearby.update(folder.glob(pattern))
+        for dbc in sorted(nearby, key=lambda p: p.name.lower()):
+            add([dbc])
+        return candidates
+
+    def request_blf_dbc_probe_cancel(self):
+        """Ask an in-flight DBC probe to stop at its next checkpoint."""
+        self._blf_dbc_probe_cancel_requested = True
+
+    def _begin_blf_dbc_probe_cancel_scope(self):
+        """Arm the cancel predicate for one probe run.
+
+        The window's visibility at probe start is the baseline: a window
+        that was never shown (batch intake, headless callers, tests) must
+        not be read as "the user closed it".
+        """
+        self._blf_dbc_probe_cancel_requested = False
+        is_visible = getattr(self, "isVisible", None)
+        self._blf_dbc_probe_was_visible = bool(
+            is_visible() if callable(is_visible) else False
+        )
+
+    def _blf_dbc_probe_cancelled(self):
+        """Cancel predicate handed to the loader's bounded DBC probe.
+
+        Probing runs on the GUI thread while the status-bar progress pumps
+        events, so closing the window mid-probe is a real cancel signal —
+        without it a multi-candidate probe over a large log keeps decoding
+        into a window that is already gone.
+        """
+        if getattr(self, "_blf_dbc_probe_cancel_requested", False):
+            return True
+        if not getattr(self, "_blf_dbc_probe_was_visible", False):
+            return False
+        from PyQt5 import sip
+        try:
+            if sip.isdeleted(self):
+                return True
+        except (RuntimeError, TypeError):
+            return True
+        return not bool(self.isVisible())
+
+    def _probe_blf_dbc_candidates(
+        self, path, *, frames=None, progress_callback=None,
+    ):
+        self._begin_blf_dbc_probe_cancel_scope()
+        dbc_sets = deduplicate_dbc_sets(self._candidate_blf_dbc_paths(path))
+        blf_id_counts = frame_id_histogram(frames) if frames is not None else {}
+        candidates = []
+        dbc_frame_id_cache = {}
+        for index, dbc_paths in enumerate(dbc_sets):
+            try:
+                dbc_frame_ids = set()
+                for dbc_path in dbc_paths:
+                    if dbc_path not in dbc_frame_id_cache:
+                        dbc_frame_id_cache[dbc_path] = load_dbc_frame_ids([dbc_path])
+                    dbc_frame_ids.update(dbc_frame_id_cache[dbc_path])
+                dbc_frame_ids = frozenset(dbc_frame_ids)
+            except ImportError:
+                raise
+            except Exception:
+                logger.warning(
+                    "DBC 预筛解析失败，按零 ID 重叠处理: %s",
+                    dbc_paths,
+                    exc_info=True,
+                )
+                dbc_frame_ids = frozenset()
+            candidates.append({
+                "paths": list(dbc_paths),
+                "identity": dbc_candidate_identity(dbc_paths),
+                "recent_rank": len(dbc_sets) - index,
+                "dbc_frame_ids": dbc_frame_ids,
+                "probe": None,
+                "probe_attempted": False,
+            })
+        candidates = prefilter_candidates(candidates, blf_id_counts)
+
+        probe_budget = min(AUTO_PROBE_LIMIT, len(candidates))
+        progress_total = max(1, probe_budget * 1000)
+        for probe_index, candidate in enumerate(candidates[:probe_budget]):
+            candidate["probe_attempted"] = True
+
+            def report_candidate(current, total, *, index=probe_index):
+                if callable(progress_callback):
+                    progress_callback(
+                        index * 1000 + 1000 * current // max(1, total),
+                        progress_total,
+                    )
+
+            try:
+                if frames is None:
+                    probe = DataLoader.probe_blf_dbc(
+                        str(path), candidate["paths"],
+                        progress_callback=report_candidate,
+                        cancel_check=self._blf_dbc_probe_cancelled,
+                    )
+                else:
+                    probe = DataLoader.probe_blf_dbc_frames(
+                        frames, candidate["paths"],
+                        progress_callback=report_candidate,
+                        cancel_check=self._blf_dbc_probe_cancelled,
+                    )
+            except ImportError:
+                raise
+            except ValueError as exc:
+                if NO_CAN_FRAMES_MESSAGE in str(exc):
+                    raise
+                continue
+            except Exception:
+                logger.warning(
+                    "DBC 候选探测失败，按未校验处理: %s",
+                    candidate["paths"],
+                    exc_info=True,
+                )
+                continue
+            candidate["probe"] = probe
+            if callable(progress_callback):
+                progress_callback((probe_index + 1) * 1000, progress_total)
+
+        if callable(progress_callback) and candidates:
+            progress_callback(progress_total, progress_total)
+        selectable = [
+            candidate for candidate in candidates
+            if candidate_status(candidate) != "mismatch"
+        ]
+        return rank_candidates(selectable)
+
+    def _format_blf_dbc_paths(self, dbc_paths):
+        names = [Path(p).name for p in dbc_paths]
+        if len(names) == 1:
+            return names[0]
+        return f"DBC×{len(names)}: " + ", ".join(names[:3]) + (
+            "..." if len(names) > 3 else ""
+        )
+
+    #: Loader reasons rendered for humans; unknown reasons pass through raw
+    #: so a new loader state is visible rather than silently swallowed.
+    _BLF_PROBE_REASON_TEXT = {
+        "cancelled": "已取消",
+        "truncated_sample": "文件截断",
+        "corrupt_sample": "样本损坏",
+        "no_frames": "无 CAN 帧",
+    }
+
+    def _format_blf_probe_reason(self, reason):
+        if not reason:
+            return ""
+        return self._BLF_PROBE_REASON_TEXT.get(str(reason), str(reason))
+
+    def _format_blf_dbc_candidate(self, candidate):
+        probe = candidate["probe"]
+        status = candidate_status(candidate)
+        if status == "unverified":
+            score = candidate.get("structural_score")
+            overlap = (
+                f" · CAN ID 预筛 {score.matched_id_count} 个"
+                if score is not None else ""
+            )
+            return (
+                f"{self._format_blf_dbc_paths(candidate['paths'])} "
+                f"· 未校验{overlap}"
+            )
+        reason = probe.estimate_unavailable_reason
+        if status == "incomplete":
+            # The probe stopped early, so neither "matches" nor "does not
+            # match" is true. Say what actually happened instead.
+            reason_text = self._format_blf_probe_reason(reason)
+            status_text = "探测未完成"
+            if reason_text:
+                status_text = f"{status_text}（{reason_text}）"
+        else:
+            status_text = {"strong": "强匹配", "weak": "弱匹配"}.get(
+                status, "不匹配",
+            )
+        parts = [
+            f"{self._format_blf_dbc_paths(candidate['paths'])}",
+            status_text,
+            (
+                f"CAN ID {probe.matched_frame_id_count}/"
+                f"{probe.total_frame_id_count}"
+            ),
+        ]
+        matched = probe.matched_frame_count
+        total = probe.total_frame_count
+        if matched is not None and total:
+            # This is the ID-overlap count (frames whose id the DBC defines),
+            # not a decode-success count — do not call it a "match" like the
+            # decode line below does.
+            parts.append(f"ID 命中 {matched}/{total}")
+        sample_n = probe.decode_sample_count
+        decoded = probe.decoded_sample_count
+        if sample_n:
+            percent = 100.0 * decoded / sample_n
+            # Only a genuinely full scan may claim full-decode confidence.
+            label = (
+                "完整解码"
+                if str(probe.sampling_strategy) == "complete"
+                else "抽样解码"
+            )
+            parts.append(f"{label} {decoded}/{sample_n} ({percent:.0f}%)")
+        elif reason and status != "incomplete":
+            parts.append(f"抽样不足（{self._format_blf_probe_reason(reason)}）")
+        parts.append(f"信号 {len(probe.signal_names)}")
+        return " · ".join(parts)
+
+    def _accept_blf_dbc_candidate(
+        self, path, candidate, *, frames=None, progress_callback=None,
+    ):
+        """Validate a deferred candidate only after explicit user selection."""
+        if candidate.get("probe") is not None:
+            return list(candidate["paths"])
+        validated = self._validated_blf_dbc_paths(
+            path,
+            candidate["paths"],
+            frames=frames,
+            progress_callback=progress_callback,
+        )
+        if validated:
+            return validated
+        action = self._ask_blf_dbc_mismatch_action(path, candidate["paths"])
+        if action == "retry":
+            return self._choose_blf_dbc_with_retry(
+                path, frames=frames, progress_callback=progress_callback,
+            )
+        return None
+
+    def resolve_blf_dbc_paths_for_batch(self, paths):
+        """Reuse the single-file CAN-log/DBC tip+picker path for BatchSheet intake.
+
+        Covers Vector BLF and evidence-matched CANoe ASC. Returns a non-empty
+        ``dbc_paths`` list, or ``None`` when the user cancels.  BatchSheet keeps
+        one sheet-level ``source_context``; multi-file ``individual`` therefore
+        resolves via the first CAN log only (see
+        ``docs/analyzer/specs/2026-08-10-batch-blf-dbc-context-reuse-spec.md``).
+        """
+        blf_paths = [
+            Path(path) for path in (paths or ())
+            if self._is_can_log_path(path)
+        ]
+        if not blf_paths:
+            return []
+        if len(blf_paths) == 1:
+            return self._resolve_blf_dbc_paths(blf_paths[0])
+
+        action = self._ask_blf_batch_dbc_action(blf_paths)
+        if action == "batch":
+            return self._choose_blf_dbc_with_retry(blf_paths[0])
+        if action == "individual":
+            return self._resolve_blf_dbc_paths(blf_paths[0])
+        return None
+
+    def _resolve_blf_dbc_paths(self, path, *, frames=None, progress_callback=None):
+        candidates = self._probe_blf_dbc_candidates(
+            path,
+            frames=frames,
+            progress_callback=progress_callback,
+        )
+        if not candidates:
+            message = (
+                f"未找到可自动匹配 {path.name} 的 DBC。\n"
+                "需要选择一个 DBC 后才能打开该 BLF。"
+            )
+            if not self._ask_open_blf_dbc_dialog(path, message):
+                return None
+            return self._choose_blf_dbc_with_retry(
+                path, frames=frames, progress_callback=progress_callback,
+            )
+
+        if len(candidates) == 1:
+            action = self._ask_blf_dbc_candidate_action(path, candidates[0])
+            if action == "use":
+                return self._accept_blf_dbc_candidate(
+                    path,
+                    candidates[0],
+                    frames=frames,
+                    progress_callback=progress_callback,
+                )
+            if action == "choose":
+                return self._choose_blf_dbc_with_retry(
+                    path, frames=frames, progress_callback=progress_callback,
+                )
+            return None
+
+        selected = self._ask_multiple_blf_dbc_candidates(path, candidates)
+        if selected == "choose":
+            return self._choose_blf_dbc_with_retry(
+                path, frames=frames, progress_callback=progress_callback,
+            )
+        if selected:
+            selected_identity = dbc_candidate_identity(selected)
+            candidate = next(
+                (
+                    item for item in candidates
+                    if item["identity"] == selected_identity
+                ),
+                None,
+            )
+            if candidate is not None:
+                return self._accept_blf_dbc_candidate(
+                    path,
+                    candidate,
+                    frames=frames,
+                    progress_callback=progress_callback,
+                )
+            return list(selected)
+        return None
+
+    def _validated_blf_dbc_paths(
+        self, path, dbc_paths, *, frames=None, progress_callback=None,
+    ):
+        key = list(self._canonical_blf_dbc_paths(dbc_paths))
+        if not key:
+            return None
+        self._begin_blf_dbc_probe_cancel_scope()
+        try:
+            if frames is None:
+                probe = DataLoader.probe_blf_dbc(
+                    str(path), key,
+                    progress_callback=progress_callback,
+                    cancel_check=self._blf_dbc_probe_cancelled,
+                )
+            else:
+                probe = DataLoader.probe_blf_dbc_frames(
+                    frames, key,
+                    progress_callback=progress_callback,
+                    cancel_check=self._blf_dbc_probe_cancelled,
+                )
+        except Exception:
+            logger.warning(
+                "DBC 校验探测失败，按未验证处理: %s", key, exc_info=True,
+            )
+            return None
+        return key if probe.is_match else None
+
+    def _load_blf_batch(
+        self, paths, progress_callback=None, *, ordered_paths=None,
+    ):
+        """Import one multi-BLF user action with a DBC choice scoped to it.
+
+        We deliberately hold raw frames for only one file at a time.  Each
+        file is parsed once, its shared batch DBC is checked against those
+        in-memory frames, and the same frames are decoded if compatible.
+        Later drops call this method again and can never inherit ``dbc_paths``.
+        """
+        paths = [Path(path) for path in paths]
+        ordered_paths = [
+            Path(path) for path in (
+                ordered_paths if ordered_paths is not None else paths
+            )
+        ]
+
+        def report(index, path, fraction, phase):
+            if callable(progress_callback):
+                progress_callback(index, path, fraction, phase)
+
+        if len(paths) < 2:
+            for index, path in enumerate(ordered_paths):
+                self._load_one(
+                    str(path),
+                    progress_callback=lambda fraction, phase, i=index, p=path: report(
+                        i, p, fraction, phase,
+                    ),
+                )
+                report(index, path, 1.0, "已处理")
+            return
+
+        action = self._ask_blf_batch_dbc_action(paths)
+        if action == "individual":
+            for index, path in enumerate(ordered_paths):
+                self._load_one(
+                    str(path),
+                    progress_callback=lambda fraction, phase, i=index, p=path: report(
+                        i, p, fraction, phase,
+                    ),
+                )
+                report(index, path, 1.0, "已处理")
+            return
+        if action != "batch":
+            self.statusBar.showMessage("已取消 BLF 批量导入")
+            return
+
+        dbc_paths = self._prompt_blf_dbc(paths[0])
+        if not dbc_paths:
+            self.statusBar.showMessage("已取消 BLF 批量导入")
+            return
+
+        loaded = 0
+        skipped = 0
+        blf_index = -1
+        for index, path in enumerate(ordered_paths):
+            if not self._is_can_log_path(path):
+                before_fids = set(self.files)
+                self._load_one(
+                    str(path),
+                    progress_callback=lambda fraction, phase, i=index, p=path: report(
+                        i, p, fraction, phase,
+                    ),
+                )
+                report(
+                    index,
+                    path,
+                    1.0,
+                    "已加载" if set(self.files) != before_fids else "已跳过",
+                )
+                continue
+            blf_index += 1
+            try:
+                frames = DataLoader.read_blf_frames(
+                    str(path),
+                    progress_callback=lambda current, total, i=index, p=path: report(
+                        i,
+                        p,
+                        0.05 + 0.40 * current / max(1, total),
+                        "读取 CAN 帧",
+                    ),
+                )
+            except Exception as exc:
+                QMessageBox.critical(self, "无法读取 BLF", f"{path.name}\n{exc}")
+                skipped += 1
+                report(index, path, 1.0, "读取失败")
+                continue
+
+            while True:
+                try:
+                    probe = DataLoader.probe_blf_dbc_frames(
+                        frames,
+                        dbc_paths,
+                        progress_callback=lambda current, total, i=index, p=path: report(
+                            i,
+                            p,
+                            0.45 + 0.10 * current / max(1, total),
+                            "校验 DBC",
+                        ),
+                    )
+                except Exception as exc:
+                    probe = None
+                    detail = str(exc)
+                else:
+                    detail = ""
+                if probe is not None and probe.is_match:
+                    before_fids = set(self.files)
+                    self._load_one(
+                        str(path),
+                        blf_dbc_paths=dbc_paths,
+                        blf_frames=frames,
+                        blf_dbc_validated=True,
+                        progress_callback=lambda fraction, phase, i=index, p=path: report(
+                            i,
+                            p,
+                            0.55 + 0.45 * fraction,
+                            phase,
+                        ),
+                    )
+                    if any(fid not in before_fids for fid in self.files):
+                        loaded += 1
+                        phase = "已加载"
+                    else:
+                        # `_load_one_impl` presents a decode failure itself;
+                        # keep the batch completion summary truthful instead
+                        # of counting a failed registration as imported.
+                        skipped += 1
+                        phase = "已跳过"
+                    report(index, path, 1.0, phase)
+                    break
+
+                action = self._ask_blf_batch_mismatch_action(
+                    path,
+                    dbc_paths,
+                    len(paths) - blf_index - 1,
+                    detail=detail,
+                )
+                if action == "choose":
+                    replacement = self._prompt_blf_dbc(path)
+                    if replacement:
+                        # From this unmatched file onward use the replacement.
+                        # Files already decoded remain explicitly associated
+                        # with their original DBC in source metadata.
+                        dbc_paths = replacement
+                        continue
+                    action = "cancel"
+                if action == "skip":
+                    skipped += 1
+                    report(index, path, 1.0, "已跳过")
+                    break
+                self.statusBar.showMessage(
+                    f"已停止 BLF 批量导入：已加载 {loaded} 个，跳过 {skipped} 个"
+                )
+                return
+
+        self.statusBar.showMessage(
+            f"✅ BLF 批量导入完成：{loaded} 个，跳过 {skipped} 个"
+        )
+
+    def _ask_blf_batch_dbc_action(self, paths):
+        """Ask how one multi-file user action should resolve DBCs."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle("批量导入 CAN 日志")
+        box.setText(f"本次添加了 {len(paths)} 个 CAN 日志文件。")
+        box.setInformativeText(
+            "统一选择的 DBC 会应用到本次全部文件；下次导入仍会重新确认。"
+        )
+        batch = box.addButton("统一选择 DBC", QMessageBox.AcceptRole)
+        individual = box.addButton("逐个选择", QMessageBox.ActionRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        fit_message_box_buttons_to_text(box)
+        box.setDefaultButton(batch)
+        box.exec_()
+        if box.clickedButton() is batch:
+            return "batch"
+        if box.clickedButton() is individual:
+            return "individual"
+        return "cancel"
+
+    def _ask_blf_batch_mismatch_action(
+        self, path, dbc_paths, remaining_count, *, detail="",
+    ):
+        """Handle a per-file exception without silently decoding with a wrong DBC."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("批量 DBC 不匹配")
+        box.setText(
+            f"{self._format_blf_dbc_paths(dbc_paths)} 无法解码 {path.name}。"
+        )
+        if remaining_count > 0:
+            informative = (
+                "可为当前文件重选 DBC，并应用到后续 "
+                f"{remaining_count} 个 BLF；已加载文件不会被悄悄替换。"
+            )
+            choose_text = "重选当前及后续 DBC"
+        else:
+            informative = "可为当前文件重选 DBC；已加载文件不会被悄悄替换。"
+            choose_text = "重选当前 DBC"
+        box.setInformativeText(informative + (f"\n{detail}" if detail else ""))
+        choose = box.addButton(choose_text, QMessageBox.AcceptRole)
+        skip = box.addButton("跳过此文件", QMessageBox.ActionRole)
+        box.addButton("停止剩余导入", QMessageBox.RejectRole)
+        fit_message_box_buttons_to_text(box)
+        box.setDefaultButton(choose)
+        box.exec_()
+        if box.clickedButton() is choose:
+            return "choose"
+        if box.clickedButton() is skip:
+            return "skip"
+        return "cancel"
+
+    def _choose_blf_dbc_with_retry(
+        self, path, *, frames=None, progress_callback=None,
+    ):
+        while True:
+            dbc_paths = self._prompt_blf_dbc(path)
+            if not dbc_paths:
+                return None
+            try:
+                if frames is None:
+                    probe = DataLoader.probe_blf_dbc(
+                        str(path),
+                        dbc_paths,
+                        progress_callback=progress_callback,
+                    )
+                else:
+                    probe = DataLoader.probe_blf_dbc_frames(
+                        frames,
+                        dbc_paths,
+                        progress_callback=progress_callback,
+                    )
+            except Exception as exc:
+                action = self._ask_blf_dbc_mismatch_action(
+                    path, dbc_paths, detail=str(exc)
+                )
+                if action == "retry":
+                    continue
+                return None
+            if probe.is_match:
+                return list(dbc_paths)
+            action = self._ask_blf_dbc_mismatch_action(path, dbc_paths)
+            if action != "retry":
+                return None
+
+    def _ask_open_blf_dbc_dialog(
+        self, path, message, icon=QMessageBox.Information
+    ):
+        box = QMessageBox(self)
+        box.setIcon(icon)
+        box.setWindowTitle("选择 DBC")
+        box.setText(message)
+        choose = box.addButton("选择 DBC", QMessageBox.AcceptRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(choose)
+        fit_message_box_buttons_to_text(box)
+        box.exec_()
+        return box.clickedButton() is choose
+
+    def _ask_blf_dbc_candidate_action(self, path, candidate):
+        probe = candidate["probe"]
+        status = candidate_status(candidate)
+        is_weak = status == "weak"
+        box = QMessageBox(self)
+        box.setIcon(
+            QMessageBox.Warning
+            if is_weak or status == "unverified"
+            else QMessageBox.Information
+        )
+        box.setWindowTitle("确认 DBC")
+        if status == "unverified":
+            box.setText(
+                f"{self._format_blf_dbc_paths(candidate['paths'])} 尚未完整校验 "
+                f"{path.name}。\n是否现在校验并使用？"
+            )
+            use_text = "校验并使用"
+        elif is_weak:
+            box.setText(
+                f"{self._format_blf_dbc_paths(candidate['paths'])} 只能部分匹配 "
+                f"{path.name}。\n是否仍使用该 DBC 解码？"
+            )
+            use_text = "仍然使用"
+        else:
+            box.setText(
+                f"检测到 {path.name} 可使用已匹配的 "
+                f"{self._format_blf_dbc_paths(candidate['paths'])} 解码。\n"
+                "是否使用？"
+            )
+            use_text = "使用此 DBC"
+        box.setInformativeText(self._format_blf_dbc_candidate(candidate))
+        use = box.addButton(use_text, QMessageBox.AcceptRole)
+        choose = box.addButton("选择其他 DBC", QMessageBox.ActionRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(use)
+        fit_message_box_buttons_to_text(box)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is use:
+            return "use"
+        if clicked is choose:
+            return "choose"
+        return "cancel"
+
+    def _ask_multiple_blf_dbc_candidates(self, path, candidates):
+        items = [self._format_blf_dbc_candidate(c) for c in candidates]
+        other = "选择其他 DBC..."
+        items.append(other)
+        choice, ok = QInputDialog.getItem(
+            self,
+            "选择 DBC",
+            f"检测到多个可匹配 {path.name} 的 DBC，请确认：",
+            items,
+            0,
+            False,
+        )
+        if not ok:
+            return None
+        if choice == other:
+            return "choose"
+        try:
+            idx = items.index(choice)
+        except ValueError:
+            return None
+        if idx >= len(candidates):
+            return None
+        return list(candidates[idx]["paths"])
+
+    def _ask_blf_dbc_mismatch_action(self, path, dbc_paths, detail=""):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("DBC 不匹配")
+        box.setText(
+            f"选择的 {self._format_blf_dbc_paths(dbc_paths)} 无法解码 "
+            f"{path.name}。\n请重新选择 DBC。"
+        )
+        if detail:
+            box.setInformativeText(detail)
+        retry = box.addButton("重新选择", QMessageBox.AcceptRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(retry)
+        fit_message_box_buttons_to_text(box)
+        box.exec_()
+        return "retry" if box.clickedButton() is retry else "cancel"
+
+    def _prompt_blf_dbc(self, path):
+        """Chained DBC picker shown when opening a ``.blf``.
+
+        Returns the list of chosen ``.dbc`` paths, or ``[]`` if the user
+        cancels — the BLF UI flow treats cancel as "do not open this file".
+        ``QFileDialog`` is resolved via ``sys.modules`` so smoke tests can patch
+        it the same way they patch the main open dialog (and so ``_load_one``
+        never pops a real dialog under test)."""
+        import sys as _sys
+        _pkg = _sys.modules.get('mf4_analyzer.ui.main_window')
+        _QFileDialog = getattr(_pkg, 'QFileDialog', QFileDialog) if _pkg is not None else QFileDialog
+        dbcs, _ = _QFileDialog.getOpenFileNames(
+            self, f"为 {path.name} 选择 DBC（取消则不打开）", "",
+            "CAN 数据库 (*.dbc);;所有文件 (*)",
+        )
+        return list(dbcs)
+
+    def _purge_closed_source(self, fid):
+        """Delete one logical source's owner state. No projection, replot, or toast.
+
+        Batch close loops this helper per fid; the caller owns the single
+        final sync / canvas reset / preview invalidation / toast.
+        """
+        fid = str(fid)
+        if fid not in self.files:
+            return None
+        name = self.files[fid].short_name
+        # Cache invalidation site 2: drop entries for this file before
+        # we discard the FileData — capture fid so the per-data_id filter
+        # can match. Same for the monotonicity cache (custom-x source
+        # may also be this file).
+        self.canvas_time.invalidate_envelope_cache(
+            "file closed", data_id=fid
+        )
+        self.canvas_time.invalidate_monotonicity_cache(custom_xaxis_fid=fid)
+        # All analysis caches (legacy LRU + per-section AnalysisResultCache)
+        # must be cleared before we release the FileData. Use the unified
+        # single entry point so the 'fft' and 'order' caches are also cleared
+        # (previously two separate calls; now one, semantically equivalent).
+        self._invalidate_all_analysis_caches_for_fid(fid)
+        self._remove_file_from_all_time_views(fid)
+        self._remove_file_from_all_analysis_views(fid)
+        self._drop_pinned_cursor_identities(fids=(fid,))
+        del self.files[fid]
+        self.navigator_order.remove_fid(fid)
+        self.navigator.remove_file(fid, emit=False)
+        self._note_user_project_mutation()
+        return name
+
+    def _ultraview_time_view_ids_to_preserve(self):
+        """Return live Time View ids that remain manually referenced by a Board."""
+        uv = getattr(self, "_ultraview", None)
+        if uv is None or getattr(uv, "is_shutdown", False):
+            return ()
+        workspace = getattr(uv, "workspace", None)
+        if workspace is None:
+            return ()
+        from ...ultraview_core.board_ops import all_refs
+        referenced = {
+            str(ref.view_id)
+            for board in getattr(workspace, "boards", ()) or ()
+            for ref in all_refs(board)
+            if getattr(ref, "section", None) == "time"
+            and str(getattr(ref, "view_id", "") or "")
+        }
+        if not referenced:
+            return ()
+        return tuple(
+            str(state.view_id)
+            for state in self.view_manager.views
+            if str(getattr(state, "view_id", "") or "") in referenced
+        )
+
+    def _reset_empty_workspace_session(self):
+        """One session-reset transaction when the last logical source is gone.
+
+        Interactive close that empties ``self.files`` must land on a single
+        default empty View per manager, time-axis X, default time-range /
+        filter, and a cleared cursor pill. Project load/restore intermediate
+        empties must not run this (``_restoring_project`` / ``_opening_project``
+        / ``_applying_view``). Does not touch QSettings, recent files, presets,
+        or the six global cursor-display preference bits.
+        """
+        if self.files:
+            return False
+        if getattr(self, "_restoring_project", False):
+            return False
+        if getattr(self, "_opening_project", False):
+            return False
+        if getattr(self, "_applying_view", False):
+            return False
+
+        ctrl = getattr(getattr(self, "_analysis_context", None), "time_range", None)
+        if ctrl is not None:
+            ctrl.clear_all()
+
+        teardown_comparison = getattr(self, "_teardown_comparison_display", None)
+        if callable(teardown_comparison):
+            teardown_comparison()
+
+        view_manager = getattr(self, "view_manager", None)
+        if view_manager is not None:
+            preserved_ids = self._ultraview_time_view_ids_to_preserve()
+            if not preserved_ids:
+                view_manager.reset_to_single_default()
+            else:
+                # An UltraView Board owns only a stable View reference, not
+                # its old source state.  Closing the last source must therefore
+                # leave each referenced View as a fresh empty View with the
+                # same id, so the Board can show a stale/missing card instead
+                # of silently turning it into an orphan.
+                view_manager.reset_to_defaults_preserving_ids(preserved_ids)
+        for manager in (getattr(self, "analysis_managers", None) or {}).values():
+            reset = getattr(manager, "reset_to_single_default", None)
+            if callable(reset):
+                reset()
+
+        custom_xaxis = getattr(self, "_custom_xaxis", None)
+        if custom_xaxis is not None:
+            custom_xaxis.clear()
+        sync_xaxis = getattr(self, "_sync_inspector_to_xaxis_spec", None)
+        if callable(sync_xaxis) and custom_xaxis is not None:
+            sync_xaxis(custom_xaxis.spec)
+
+        top = getattr(getattr(self, "inspector", None), "top", None)
+        if top is not None:
+            top.set_range_enabled(False, silent=True)
+            top._range_checked_by_mode = {}
+            top.set_range_limits(0, 0)
+            top.set_range_values(0, 0)
+
+        filter_panel = getattr(getattr(self, "inspector", None), "filter_panel", None)
+        if filter_panel is not None:
+            restore = getattr(filter_panel, "restore_payload", None)
+            if callable(restore):
+                from ..view_state import default_time_filter
+
+                restore(default_time_filter())
+            else:
+                filter_panel.set_kind("低通")
+                filter_panel.set_cutoff(100.0)
+                filter_panel.set_band(100.0, 2000.0)
+                filter_panel.set_order(4)
+                filter_panel.chk_orig.setChecked(True)
+                filter_panel.chk_filt.setChecked(True)
+                filter_panel.set_enabled(False)
+
+        chart_stack = getattr(self, "chart_stack", None)
+        if chart_stack is not None:
+            chart_stack.clear_cursor_pill()
+            controller = getattr(chart_stack, "_pinned_cursors", None)
+            if controller is not None:
+                controller.clear_all()
+        # ``active_changed`` above synchronously applies the active Time View,
+        # including its record-tree projection.  The close presenter uses this
+        # to avoid performing the same projection a second time.
+        return view_manager is not None
+
+    def _present_after_sources_closed(self):
+        """One-shot navigator / record-tree projection after one or more purges."""
+        reset_projected_time_view = False
+        if not self.files:
+            reset_projected_time_view = self._reset_empty_workspace_session()
+        mode = self.chart_stack.current_mode()
+        if mode == "time":
+            if not reset_projected_time_view:
+                resolved = self._focused_time_view_state()
+                if resolved is not None:
+                    self._project_view_controls(resolved[0])
+                elif self.view_manager.views:
+                    self._project_view_controls(self.view_manager.active)
+                else:
+                    self._sync_record_curve_tree()
+        else:
+            if mode in self.analysis_managers:
+                mgr = self.analysis_managers[mode]
+                self._project_analysis_attachments(mode, mgr.get(mgr.active))
+            self._sync_record_curve_tree()
+        self._refresh_analysis_candidates()
+        refresh_range = getattr(
+            self, "_refresh_analysis_time_range_after_source_loss", None,
+        )
+        if callable(refresh_range):
+            refresh_range()
+        self._active = self.navigator._active_fid  # navigator picks fallback
+        self._update_info()
+        refresh_chip = getattr(self, "_refresh_time_axis_provenance_chips", None)
+        if callable(refresh_chip):
+            refresh_chip()
+
+    def _invalidate_ultraview_previews_for_time_views(self, view_ids):
+        """Drop stored UltraView pixels for Time Views; keep View/Board identity."""
+        uv = getattr(self, "_ultraview", None)
+        if uv is None or getattr(uv, "is_shutdown", False):
+            return
+        invalidate = getattr(uv, "_invalidate_previews_for_time_views", None)
+        if callable(invalidate):
+            invalidate(view_ids)
+
+    def _drop_unmapped_wwt_records_on_restore(self, states):
+        """Drop wwt_record bindings whose catalog index is gone; prune hidden ids."""
+        from ..time_curve_bindings import (
+            drop_missing_wwt_record_bindings,
+            prune_hidden_curve_binding_ids,
+        )
+
+        dropped = []
+        for state in states or ():
+            kept, missing = drop_missing_wwt_record_bindings(
+                getattr(state, "curve_bindings", None) or [],
+                self.files,
+                view_id=str(getattr(state, "view_id", "") or ""),
+            )
+            state.curve_bindings = kept
+            state.hidden_curve_binding_ids = prune_hidden_curve_binding_ids(
+                getattr(state, "hidden_curve_binding_ids", None),
+                kept,
+            )
+            dropped.extend(missing)
+        if not dropped:
+            return dropped
+        health = getattr(self, "_project_restore_health", None)
+        if health is not None:
+            health.dropped_time_refs.extend(dropped)
+            health.degraded = True
+        return dropped
+
+    def _migrate_legacy_channel_bindings_on_restore(self, states):
+        """Adopt only live-proven ordinary legacy bindings before first plot."""
+        from ..time_curve_bindings import (
+            migrate_legacy_channel_bindings,
+            prune_channel_axis_groups_for_live_files,
+        )
+
+        migrated = []
+        for state in states or ():
+            prune_channel_axis_groups_for_live_files(state, self.files)
+            migrated.extend(migrate_legacy_channel_bindings(state, self.files))
+        return migrated
+
+    def _project_is_bound(self):
+        path = getattr(self, "_project_path", None)
+        if path is not None:
+            return True
+        holder = getattr(self, "_project_dirty", None)
+        return bool(getattr(holder, "path", None)) if holder is not None else False
+
+    def _project_close_available(self):
+        if self._project_is_bound():
+            return True
+        if self.files:
+            return True
+        holder = getattr(self, "_project_dirty", None)
+        return bool(holder is not None and holder.is_dirty)
+
+    def _project_session_can_save(self):
+        if self._project_is_bound() or self.files:
+            return True
+        holder = getattr(self, "_project_dirty", None)
+        return bool(holder is not None and holder.is_dirty)
+
+    def _project_session_path_tooltip(self):
+        path = getattr(self, "_project_path", None)
+        if path is None:
+            holder = getattr(self, "_project_dirty", None)
+            path = getattr(holder, "path", None) if holder is not None else None
+        if path:
+            return str(path)
+        return "未命名项目"
+
+    def _project_save_tooltip(self):
+        path = getattr(self, "_project_path", None)
+        if path is None:
+            holder = getattr(self, "_project_dirty", None)
+            path = getattr(holder, "path", None) if holder is not None else None
+        if path:
+            return f"保存到 {path}"
+        return "首次保存请选择项目位置"
+
+    def _project_window_title(self):
+        from ... import app_meta
+
+        name = self._project_session_display_name()
+        holder = getattr(self, "_project_dirty", None)
+        mark = "*" if holder is not None and holder.is_dirty else ""
+        if not self._project_is_bound():
+            return app_meta.WINDOW_TITLE
+        return f"{name}{mark} — {app_meta.WINDOW_TITLE}"
+
+    def _bind_project_dirty_chrome_listener(self):
+        holder = getattr(self, "_project_dirty", None)
+        binder = getattr(holder, "bind_dirty_bool_listener", None)
+        if callable(binder):
+            binder(self._on_project_dirty_bool_changed)
+
+    def _on_project_dirty_bool_changed(self, _dirty):
+        self._refresh_project_session_chrome()
+
+    def _project_session_chrome_snapshot(self):
+        holder = getattr(self, "_project_dirty", None)
+        dirty = bool(holder is not None and holder.is_dirty)
+        return (
+            self._project_session_display_name(),
+            self._project_session_path_tooltip(),
+            self._project_save_tooltip(),
+            dirty,
+            self._project_session_can_save(),
+            self._project_close_available(),
+            self._project_is_bound(),
+            self._project_window_title(),
+        )
+
+    def _refresh_project_session_chrome(self):
+        """Project owner projection for navigator/toolbar/title/QAction state."""
+        self._bind_project_dirty_chrome_listener()
+        snapshot = self._project_session_chrome_snapshot()
+        if getattr(self, "_projected_project_session_chrome", None) == snapshot:
+            return
+        self._projected_project_session_chrome = snapshot
+        (
+            display_name, path_tooltip, save_tooltip, dirty,
+            can_save, can_close, bound, title,
+        ) = snapshot
+        nav = getattr(self, "navigator", None)
+        setter = getattr(nav, "set_close_project_available", None)
+        if callable(setter):
+            setter(can_close)
+        toolbar = getattr(self, "toolbar", None)
+        chrome = getattr(toolbar, "set_project_session_chrome", None)
+        if callable(chrome):
+            chrome(
+                display_name=display_name,
+                tooltip=path_tooltip,
+                dirty=dirty,
+                can_save=can_save,
+                can_close=can_close,
+                bound=bound,
+            )
+        elif toolbar is not None:
+            set_enabled = getattr(toolbar, "set_enabled_for_mode", None)
+            if callable(set_enabled):
+                set_enabled(
+                    toolbar.current_mode(),
+                    has_file=can_save,
+                    can_save=can_save,
+                    can_close=can_close,
+                )
+            if hasattr(toolbar, "btn_save_project"):
+                toolbar.btn_save_project.setToolTip(save_tooltip)
+        if toolbar is not None and hasattr(toolbar, "btn_save_project"):
+            toolbar.btn_save_project.setToolTip(save_tooltip)
+        coord = getattr(self, "_command_coordinator", None)
+        if coord is not None:
+            from ..command_registry import CommandId
+
+            save_action = coord.action(CommandId.SAVE_PROJECT)
+            save_action.setEnabled(can_save)
+            save_action.setToolTip(save_tooltip)
+            coord.action(CommandId.SAVE_PROJECT_AS).setEnabled(can_save)
+            coord.action(CommandId.CLOSE_PROJECT).setEnabled(can_close)
+        set_title = getattr(self, "setWindowTitle", None)
+        if callable(set_title):
+            set_title(title)
+
+    def _removal_empties_workspace(self, fids):
+        targets = {str(fid) for fid in (fids or ()) if str(fid) in self.files}
+        if not targets:
+            return False
+        return set(map(str, self.files)) <= targets
+
+    def _confirm_last_source_removal(self, fids, uses, *, bound, dirty):
+        """Prompt once before the last logical sources disappear. Default Cancel."""
+        from ...ui_kit.message_dialog import build_last_source_dialog
+
+        formatter = getattr(self, "_format_source_use_summary", None)
+        summary = formatter(uses) if callable(formatter) else ""
+        dialog = build_last_source_dialog(
+            self,
+            bound=bound,
+            dirty=dirty,
+            project_name=self._project_session_display_name(),
+            summary_text=summary,
+        )
+        dialog.exec_()
+        result = dialog.message_result
+        if result is None or result.action_id not in {
+            "close", "save_close", "discard_close", "keep", "cancel",
+        }:
+            return "cancel"
+        return result.action_id
+
+    def _decide_source_removal(self, fids, uses):
+        """Return ``abort``, ``remove``, ``close_project``, or ``confirm_deps``.
+
+        Last-source close-project decisions finish the product transaction
+        here so the caller does not also purge.
+        """
+        if self._project_session_in_restore():
+            return "confirm_deps"
+        if not self._removal_empties_workspace(fids):
+            return "confirm_deps"
+        bound = self._project_is_bound()
+        dirty = bool(self._project_session_is_dirty())
+        if not bound and not dirty:
+            return "confirm_deps"
+        action = self._confirm_last_source_removal(
+            fids, uses, bound=bound, dirty=dirty,
+        )
+        if action == "keep":
+            return "remove"
+        if action == "close":
+            self.close_project(already_confirmed=True)
+            return "close_project"
+        if action == "discard_close":
+            self.close_project(already_confirmed=True)
+            return "close_project"
+        if action == "save_close":
+            try:
+                ok = bool(self.save_project_via_dialog())
+            except (OSError, TypeError, ValueError):
+                logger.exception("last-source save failed")
+                ok = False
+            if not ok:
+                return "abort"
+            self.close_project(already_confirmed=True)
+            return "close_project"
+        return "abort"
+
+    def _close(self, fid, *, force=False, notify=True):
+        """Close one logical source (fid).
+
+        ``notify`` gates the aggregatable tail (record-tree sync, plot-state
+        reset, UltraView preview invalidation, statusBar, toast). It defaults
+        to True so the single-file close path stays one sync / one reset /
+        one toast. ``_close_files`` passes ``notify=False`` for multi-source
+        physical-file groups and emits one aggregated summary itself instead
+        (spec: group close must not spam N toasts / N full canvas resets)."""
+        if fid not in self.files:
+            return
+        from .analysis_source_scope import collect_source_uses
+
+        uses = collect_source_uses(
+            fid,
+            time_views=self.view_manager.views,
+            analysis_managers=self.analysis_managers,
+        )
+        if not force:
+            decision = self._decide_source_removal((fid,), uses)
+            if decision == "abort":
+                return
+            if decision == "close_project":
+                return
+            if decision == "confirm_deps" and uses and not self._confirm_global_file_close(
+                uses, files=(fid,),
+            ):
+                return
+        affected = (
+            self._time_view_ids_using_fids((fid,)) if notify else ()
+        )
+        name = self._purge_closed_source(fid)
+        if name is None:
+            return
+        if notify:
+            self._present_after_sources_closed()
+            self._reset_plot_state(scope='file')
+            self._invalidate_ultraview_previews_for_time_views(affected)
+            self.statusBar.showMessage(f"已关闭 | 剩余 {len(self.files)} 文件")
+            self.toast(f"已关闭 {name}", "info")
+
+    def save_project(self, path):
+        """Serialize the current session (open files + all Views) to a
+        reference-only ``.tlproj`` JSON file. No UI entry point yet — this is
+        the callable used by tests and a future menu/button."""
+        from pathlib import Path
+        from .. import project_io as pio
+        path = Path(path)
+
+        health = getattr(self, "_project_restore_health", None)
+        if (
+            health is not None
+            and health.degraded
+            and not self._confirm_degraded_project_save(health)
+        ):
+            return False
+
+        self._capture_focused_view()
+        # Flush each analysis section's live UI state into its active view so
+        # the last (uncommitted) inspector edit / source / compare toggle is
+        # serialized rather than lost. UltraView is not a source workspace.
+        current_mode = self.chart_stack.current_mode()
+        uv = getattr(self, "_ultraview", None)
+        if uv is not None and current_mode in {"time", *self.analysis_managers}:
+            uv.note_source_mode(current_mode)
+        if current_mode in self.analysis_managers or current_mode == "time":
+            saved_mode = current_mode
+        else:
+            saved_mode = "time"
+        for sec in self.analysis_managers:
+            self._capture_active_analysis_view(
+                sec, capture_sources=(sec == current_mode))
+
+        doc = self._assemble_project_document(path, saved_mode=saved_mode)
+        # Preview pixels are an optional acceleration layer.  Publish the
+        # complete sidecar before atomically replacing the authoritative JSON;
+        # on failure, keep semantic Board state saveable and surface it.
+        sidecar_warnings = []
+        uv = getattr(self, "_ultraview", None)
+        if uv is not None:
+            sidecar_warnings = uv.save_preview_sidecar(path)
+            doc.ultraview = uv.to_project_payload()
+        digest = pio.canonical_project_digest(doc)
+        self._write_project_document(doc, path)
+        self._project_path = path
+        if health is not None:
+            health.clear()
+        dirty = getattr(self, "_project_dirty", None)
+        if dirty is not None:
+            dirty.mark_saved(path, digest=digest)
+        self.statusBar.showMessage(f"已保存项目: {path.name}")
+        self.toast("已保存项目", "success")
+        if sidecar_warnings:
+            self.toast("项目已保存，预览未保存", "warning")
+        self._recent_files.record_project(str(path))
+        self._refresh_project_session_chrome()
+        return True
+
+    def _analysis_views_payload(self) -> dict:
+        """Analysis views plus optional cross-view relations, keyed by view id."""
+        payload = {}
+        dropped_relation = False
+        comp = self._comparison() if hasattr(self, "_comparison") else None
+        for sec, mgr in self.analysis_managers.items():
+            block = {
+                "active": mgr.active,
+                "views": [view.to_dict() for view in mgr.views],
+            }
+            if comp is not None:
+                alive = {str(view.view_id) for view in mgr.views}
+                relations = comp.relations_payload(sec)
+                kept = {}
+                for host_id, row in relations.items():
+                    peer_id = str((row or {}).get("peer") or "")
+                    if str(host_id) in alive and peer_id in alive:
+                        kept[host_id] = row
+                    else:
+                        dropped_relation = True
+                if kept:
+                    block["comparisons"] = kept
+            payload[sec] = block
+        if dropped_relation:
+            logger.info(
+                "Dropped analysis comparison rows whose host or peer view is gone"
+            )
+        return payload
+
+    def _assemble_project_document(self, path, saved_mode=None):
+        """Build the save-path ``ProjectDocument`` without writing it.
+
+        Used by ``save_project`` and by the leave-guard digest. Does not
+        capture live inspector/canvas state; callers that persist must flush
+        first. Guard-time digest skips that capture so Cancel is zero mutation.
+        """
+        from pathlib import Path
+        from .. import project_io as pio
+
+        path = Path(path)
+        if saved_mode is None:
+            current_mode = self.chart_stack.current_mode()
+            if current_mode in self.analysis_managers or current_mode == "time":
+                saved_mode = current_mode
+            else:
+                saved_mode = "time"
+        uv = getattr(self, "_ultraview", None)
+        file_refs = []
+        ordered_fids = [
+            fid for fid in self.navigator_order.file_fids() if fid in self.files
+        ]
+        for fid in self.files:
+            if fid not in ordered_fids:
+                ordered_fids.append(fid)
+        for fid in ordered_fids:
+            fd = self.files[fid]
+            abs_p = str(Path(fd.filepath).resolve())
+            dbc_refs = [
+                pio.make_path_ref(str(Path(dbc).resolve()), path)
+                for dbc in fd.source_metadata.get("dbc_paths", [])
+            ]
+            provenance = getattr(fd, "time_axis_provenance", None)
+            if provenance is not None and hasattr(provenance, "to_dict"):
+                provenance = provenance.to_dict()
+            elif not isinstance(provenance, dict):
+                provenance = None
+            file_refs.append(pio.ProjectFileRef(
+                fid=fid,
+                path_abs=abs_p,
+                path_rel=pio.make_relative(abs_p, path),
+                fs=float(fd.fs),
+                time_source=fd._time_source,
+                dbc_refs=dbc_refs,
+                channel_order=list(self.navigator_order.channel_order(fid)),
+                time_axis_provenance=provenance,
+            ))
+
+        vm = {
+            "active": int(self.view_manager.active),
+            "split_pairs": {
+                str(host): int(src)
+                for host, src in self.view_manager._split_pairs.items()
+            },
+        }
+        return pio.ProjectDocument(
+            active_file=self._active,
+            current_mode=saved_mode,
+            files=file_refs,
+            views=[v.to_dict() for v in self.view_manager.views],
+            view_manager=vm,
+            analysis_views=self._analysis_views_payload(),
+            filter=None,
+            ultraview=None if uv is None else uv.to_project_payload(),
+        )
+
+    def _restore_project_file_refs(self, doc, path, pio):
+        from ._state_holders import ProjectFileRestoreResult
+
+        from ...io.head_hdf import classify_saved_hdf_sampling
+
+        fid_map = {}
+        missing_paths = []
+        missing_old_fids = []
+        timebase_notices = []
+        pending_by_path = {}
+        for ref in doc.files:
+            resolved = pio.resolve_file_path(ref, path)
+            if resolved is None:
+                missing_paths.append(ref.path_abs)
+                missing_old_fids.append(ref.fid)
+                continue
+            key = str(resolved)
+            if not pending_by_path.get(key):
+                before = set(self.files.keys())
+                dbc_paths = pio.resolve_dbc_paths(ref, path)
+                self._load_one(key, blf_dbc_paths=dbc_paths)
+                new_fids = [f for f in self.files.keys() if f not in before]
+                if not new_fids:
+                    missing_paths.append(ref.path_abs)
+                    missing_old_fids.append(ref.fid)
+                    continue
+                pending_by_path[key] = new_fids
+            new_fid = pending_by_path[key].pop(0)
+            fid_map[ref.fid] = new_fid
+            fd = self.files[new_fid]
+            decision = classify_saved_hdf_sampling(
+                fd.source_metadata,
+                fd.channel_metadata,
+                saved_fs=ref.fs,
+                time_source=ref.time_source,
+                channel_order=getattr(ref, "channel_order", ()) or (),
+            )
+            skip_saved_rate = (
+                decision is not None
+                and decision.action in {"keep-verified", "unproven"}
+            )
+            if decision is not None and decision.notice:
+                timebase_notices.append(decision.notice)
+            # Older projects persisted automatic analysis repair on the source.
+            # Reload original file timing instead; each analysis now prepares
+            # its own grid. Explicit legacy source calibration stays compatible.
+            # A corrected HEAD HDF axis is not divided by channel count, and a
+            # manual override is restored at the saved rate rather than scaled.
+            if not skip_saved_rate and ref.time_source != "auto_rebuilt":
+                fd.fs = float(ref.fs)
+            if not skip_saved_rate and ref.time_source in ("generated", "manual"):
+                try:
+                    fd.rebuild_time_axis(
+                        float(ref.fs), reason="project_restore",
+                    )
+                except TypeError:
+                    fd.rebuild_time_axis(float(ref.fs))
+                # ``rebuild_time_axis(reason='manual')`` would stamp an
+                # interactive override. During project restore the persisted
+                # ``time_source`` remains authoritative: a loader-generated
+                # axis must not be promoted merely because we reconstructed
+                # it at the saved sampling rate, and ``auto_rebuilt`` must
+                # stay distinguishable from a popover Accept.
+                fd._time_source = ref.time_source
+            raw_provenance = getattr(ref, "time_axis_provenance", None)
+            if (
+                not skip_saved_rate
+                and raw_provenance
+                and ref.time_source != "auto_rebuilt"
+            ):
+                fd.time_axis_provenance = TimeAxisProvenance.from_dict(
+                    raw_provenance,
+                )
+            else:
+                fd.time_axis_provenance = None
+            if getattr(ref, "channel_order", None):
+                self.navigator_order.apply_channel_order(new_fid, ref.channel_order)
+        desired = [
+            fid_map[ref.fid] for ref in doc.files if ref.fid in fid_map
+        ]
+        self.navigator_order.set_file_order(desired)
+        self.navigator.project_file_order(self.navigator_order.file_fids())
+        for fid in self.navigator_order.file_fids():
+            self.navigator.channel_list.project_channel_order(
+                fid, self.navigator_order.channel_order(fid)
+            )
+        refresh_chip = getattr(self, "_refresh_time_axis_provenance_chips", None)
+        if callable(refresh_chip):
+            refresh_chip()
+        return ProjectFileRestoreResult(
+            fid_map=fid_map,
+            missing_paths=missing_paths,
+            missing_old_fids=missing_old_fids,
+            timebase_notices=timebase_notices,
+        )
+
+    def open_project(self, path):
+        """Restore a session from a ``.tlproj`` file: re-read referenced source
+        files (skipping missing ones), reinstall saved Views with fids remapped
+        to freshly minted ids, and select the saved active file / mode."""
+        from pathlib import Path
+        from .. import project_io as pio
+        path = Path(path)
+
+        for section in getattr(self, "analysis_managers", {}) or {}:
+            page = self._analysis_page(section)
+            if page is not None:
+                page._overlay_session_bound = False
+
+        try:
+            doc = pio.load_project_from_json(path)
+        except pio.UnsupportedProjectVersion:
+            QMessageBox.warning(
+                self,
+                "无法打开",
+                "该工程由更新版本的 TraceLab 保存（工程格式 v4），"
+                "请升级到 v8.3.0 或更高",
+            )
+            return
+        dirty = getattr(self, "_project_dirty", None)
+        if dirty is not None:
+            dirty.begin_restore()
+        try:
+            self._open_project_restoring(doc, path, pio, dirty)
+        finally:
+            if dirty is not None:
+                dirty.end_restore()
+
+    def _open_project_restoring(self, doc, path, pio, dirty):
+        from PyQt5.QtWidgets import QMessageBox
+        from ..view_state import ViewState
+        # Hold the restore guard across close_all so the empty-workspace
+        # session reset does not collapse Views that the project is about
+        # to reinstall. Auto-attach stays suppressed for the file-ref
+        # restore that follows (same as before this wrap).
+        old_restoring = getattr(self, "_restoring_project", False)
+        self._restoring_project = True
+        try:
+            self.close_all(force=True)
+            # Fresh restore: clear any stale auto-recompute queue from a prior open.
+            self._analysis_restore_pending = set()
+            restore = self._restore_project_file_refs(doc, path, pio)
+        finally:
+            self._restoring_project = old_restoring
+
+        fid_map = restore.fid_map
+        missing = list(restore.missing_paths)
+        dropped_time = pio.collect_dropped_time_refs(doc.views, fid_map)
+        dropped_analysis = pio.collect_dropped_analysis_refs(
+            doc.analysis_views, fid_map,
+        )
+        health = getattr(self, "_project_restore_health", None)
+        timebase_notices = list(getattr(restore, "timebase_notices", ()) or ())
+        if health is not None:
+            health.adopt_restore(
+                missing_paths=missing,
+                missing_old_fids=restore.missing_old_fids,
+                dropped_time_refs=dropped_time,
+                dropped_analysis_refs=dropped_analysis,
+                timebase_notices=timebase_notices,
+            )
+        for notice in timebase_notices:
+            self.toast(notice, "warning")
+
+        remapped = pio.remap_view_fids(doc.views, fid_map)
+        states = [ViewState.from_dict(v) for v in remapped]
+        if not states:
+            states = [self.view_manager._make(0)]
+        self._drop_unmapped_wwt_records_on_restore(states)
+        # Binding → ordinary-channel conversion needs freshly loaded source
+        # arrays and the remapped current Custom-X resolver; doing it here
+        # keeps pure JSON decoding conservative and finishes before the first
+        # active View is projected or plotted.
+        self._migrate_legacy_channel_bindings_on_restore(states)
+        self.view_manager.views = states
+        self.view_manager._split_pairs = {
+            int(host): int(src)
+            for host, src in (doc.view_manager.get("split_pairs") or {}).items()
+            if 0 <= int(host) < len(states) and 0 <= int(src) < len(states)
+        }
+        active_idx = int(doc.view_manager.get("active", 0))
+        self.view_manager.active = max(0, min(active_idx, len(states) - 1))
+        self.view_manager._set_active_split_from_pairs()
+        self.view_manager.views_changed.emit()
+
+        # Hold this through analysis-view apply AND the Time-view plot so
+        # live navigator capture cannot overwrite persisted FFT sources.
+        # Project restore applies intent only; numeric results require an
+        # explicit Compute click, including for previously computed Views.
+        self._opening_project = True
+        try:
+            # Restore each analysis section's view list (fids remapped to the
+            # freshly minted ids). An old project without analysis_views yields
+            # an empty remapped dict -> every section keeps its default view.
+            from ..project_io import remap_analysis_view_fids
+            from ..analysis_view_state import AnalysisViewState
+            coord = getattr(self, "_startup_coordinator", None)
+            if coord is not None:
+                # Drop project-A ready closures; prepared charts may stay.
+                coord.invalidate_session()
+            remapped = remap_analysis_view_fids(doc.analysis_views, fid_map)
+            self._teardown_comparison_display()
+            dropped_comparison = False
+            for sec, mgr in self.analysis_managers.items():
+                block = remapped.get(sec)
+                if not block or not block.get("views"):
+                    continue
+                mgr.views = [AnalysisViewState.from_dict(v) for v in block["views"]]
+                mgr.active = min(int(block.get("active", 0)), len(mgr.views) - 1)
+                _payload, dropped = self._install_analysis_comparisons(sec, block)
+                if dropped:
+                    dropped_comparison = True
+                mgr.views_changed.emit()
+                # Restore structure/params/sources without submitting work.
+                mgr.active_changed.emit(mgr.active)
+            if dropped_comparison:
+                self.toast(
+                    "View 对比已结束：目标 View 不在此项目中", "warning",
+                )
+                self.statusBar.showMessage("View 对比已结束")
+
+            uv = getattr(self, "_ultraview", None)
+            uv_warnings = []
+            if uv is not None and not getattr(uv, "is_shutdown", False):
+                uv_warnings = uv.restore_project_state(
+                    getattr(doc, "ultraview", None), project_path=path
+                )
+
+            self._active = fid_map.get(doc.active_file)
+            # Route the mode through the toolbar's programmatic setter (not
+            # chart_stack.set_mode directly): _set_mode checks the matching
+            # segment button AND emits mode_changed -> _on_mode_changed, which
+            # syncs chart_stack + inspector + toolbar enabled-state together.
+            self.toolbar._set_mode(doc.current_mode)
+
+            if health is not None and health.degraded:
+                lines = []
+                if missing:
+                    lines.append(
+                        "以下文件找不到，已跳过：\n" + "\n".join(missing)
+                    )
+                n_analysis = len(health.dropped_analysis_refs)
+                if n_analysis:
+                    lines.append(
+                        f"另有 {n_analysis} 处分析 View/Pane 来源因文件缺失已跳过。"
+                    )
+                n_time = len(health.dropped_time_refs)
+                if n_time:
+                    lines.append(
+                        f"另有 {n_time} 处时域通道引用因文件缺失已跳过。"
+                    )
+                lines.append(
+                    "再次保存前会提示确认：Stage 1 不会保留未解析引用，"
+                    "保存会固化当前缺失状态。"
+                )
+                QMessageBox.warning(
+                    self, "部分文件缺失",
+                    "\n\n".join(lines),
+                )
+            elif missing:
+                # Defensive: missing paths without a health holder still warn.
+                QMessageBox.warning(
+                    self, "部分文件缺失",
+                    "以下文件找不到，已跳过：\n" + "\n".join(missing),
+                )
+
+            if uv_warnings:
+                # Coordinator already logged each restore warning (single owner).
+                self.toast(
+                    f"总览布局有 {len(uv_warnings)} 项无法识别，已按合法值恢复",
+                    "warning",
+                )
+
+            # The project's files/views are loaded by this point, so the
+            # document is "open" regardless of whether the final view render
+            # succeeds — record the path BEFORE the render guard so a render
+            # hiccup doesn't leave 保存项目 prompting Save-As for an
+            # already-open project.
+            self._project_path = path
+            self._recent_files.record_project(str(path))
+            if dirty is not None:
+                baseline = self._assemble_project_document(path)
+                dirty.adopt_restored_session(
+                    path=path,
+                    digest=pio.canonical_project_digest(baseline),
+                )
+            self._refresh_project_session_chrome()
+
+            try:
+                self._apply_active_view(self.view_manager.active)
+            except Exception:
+                self.statusBar.showMessage(
+                    f"已打开项目: {path.name}（渲染恢复失败）")
+                self.toast("恢复渲染失败，请手动点计算", "warning")
+                return
+        finally:
+            self._opening_project = False
+
+        self.statusBar.showMessage(
+            f"已打开项目: {path.name}；分析结果未保存，请点击计算")
+
+    def _project_filter_payload(self):
+        fp = getattr(getattr(self, "inspector", None), "filter_panel", None)
+        if fp is None:
+            return None
+        return {
+            "enabled": bool(fp.is_enabled()),
+            "spec": fp.filter_spec().to_dict(),
+            "show_original": bool(fp.show_original()),
+            "show_filtered": bool(fp.show_filtered()),
+        }
+
+    def _restore_project_filter(self, payload):
+        fp = getattr(getattr(self, "inspector", None), "filter_panel", None)
+        if fp is None:
+            return
+        if not payload:
+            fp.set_enabled(False)
+            return
+        from ...signal.filters import FilterSpec
+
+        spec = FilterSpec.from_dict(payload.get("spec"))
+        label_for_kind = {
+            "low": "低通",
+            "high": "高通",
+            "band": "带通",
+            "bandstop": "带阻",
+        }.get(spec.kind, "低通")
+        fp.set_kind(label_for_kind)
+        if spec.kind in ("band", "bandstop"):
+            fp.set_band(spec.cutoff_lo, spec.cutoff_hi)
+        else:
+            fp.set_cutoff(spec.cutoff)
+        fp.set_order(spec.order)
+        fp.chk_orig.setChecked(bool(payload.get("show_original", True)))
+        fp.chk_filt.setChecked(bool(payload.get("show_filtered", True)))
+        fp.set_enabled(bool(payload.get("enabled", False)))
+
+    def _project_session_in_restore(self):
+        return bool(
+            getattr(self, "_restoring_project", False)
+            or getattr(self, "_opening_project", False)
+        )
+
+    def _unbind_project_save_target(self):
+        """Drop both path representations and the saved digest after session end.
+
+        Internal restore must not call this: ``open_project`` reuses
+        ``close_all(force=True)`` and then binds the incoming project.
+        """
+        if self._project_session_in_restore():
+            return
+        self._project_path = None
+        dirty = getattr(self, "_project_dirty", None)
+        if dirty is None:
+            return
+        restore_depth = dirty.restore_depth
+        close_teardown = dirty.close_teardown_started
+        dirty.clear()
+        dirty.restore_depth = restore_depth
+        dirty.close_teardown_started = close_teardown
+
+    def _invalidate_session_owned_deferred_work(self):
+        """Make in-flight restore/compute/render work fail closed for this session."""
+        abort = getattr(self, "_abort_analysis_restore", None)
+        if callable(abort):
+            abort()
+        self._analysis_restore_pending = set()
+        gate = getattr(self, "_time_render", None)
+        if gate is not None:
+            clear = getattr(gate, "clear_pending_switch", None)
+            if callable(clear):
+                clear()
+            if hasattr(gate, "pending_section_view"):
+                gate.pending_section_view = None
+        coordinator = getattr(self, "_fft_time_coordinator", None)
+        if coordinator is not None:
+            coordinator.invalidate_all()
+        frf_coordinator = getattr(self, "_frf_coordinator", None)
+        if frf_coordinator is not None:
+            frf_coordinator.invalidate_all()
+        jobs = getattr(self, "_analysis_jobs", None)
+        if jobs is not None:
+            clear_token = getattr(jobs, "clear_progress_token", None)
+            if callable(clear_token):
+                clear_token("restore")
+
+    def _reset_ultraview_project_state(self):
+        uv = getattr(self, "_ultraview", None)
+        if uv is None or getattr(uv, "is_shutdown", False):
+            return
+        reset = getattr(uv, "reset_project_state", None)
+        if callable(reset):
+            reset()
+
+    def _purge_empty_bound_session_contents(self):
+        """Cleanup path when ``close_all`` would early-return on zero files."""
+        stack = getattr(self, "chart_stack", None)
+        if stack is not None:
+            stack.cancel_page_transition("files-closed")
+        health = getattr(self, "_project_restore_health", None)
+        if health is not None:
+            health.clear()
+        canvas_time = getattr(self, "canvas_time", None)
+        if canvas_time is not None:
+            canvas_time.invalidate_envelope_cache("all files closed")
+            canvas_time.invalidate_monotonicity_cache()
+        for cache in getattr(self, "analysis_caches", {}).values():
+            cache.clear()
+        for section in list(getattr(self, "analysis_caches", {}) or ()):
+            clear_pins = getattr(self, "_clear_analysis_section_pins", None)
+            if callable(clear_pins):
+                clear_pins(section)
+        ctrl = getattr(getattr(self, "_analysis_context", None), "time_range", None)
+        if ctrl is not None:
+            ctrl.clear_all()
+        self._reset_empty_workspace_session()
+        reset_plot = getattr(self, "_reset_plot_state", None)
+        if callable(reset_plot):
+            reset_plot(scope="all")
+        refresh_chip = getattr(self, "_refresh_time_axis_provenance_chips", None)
+        if callable(refresh_chip):
+            refresh_chip()
+
+    def _commit_project_session_end(self):
+        """Destructive half of close/new: invalidate, clean owners, unbind."""
+        self._invalidate_session_owned_deferred_work()
+        teardown_comparison = getattr(self, "_teardown_comparison_display", None)
+        if callable(teardown_comparison):
+            teardown_comparison()
+        if self.files:
+            self.close_all(force=True)
+        else:
+            self._purge_empty_bound_session_contents()
+        # ``close_all`` skips UltraView reset when files are already empty.
+        self._reset_ultraview_project_state()
+        health = getattr(self, "_project_restore_health", None)
+        if health is not None:
+            health.clear()
+        self._unbind_project_save_target()
+        self._refresh_project_session_chrome()
+        update_info = getattr(self, "_update_info", None)
+        if callable(update_info):
+            update_info()
+
+    def close_project(self, *, already_confirmed=False, intent="close"):
+        """Product close: leave-guard, then end the session and unbind the path.
+
+        ``close_all`` remains the internal source-unload helper used by
+        project restore. Only an already-confirmed caller (last-source
+        dialog) may skip the leave prompt.
+        """
+        from .project_dirty import DirtyGuardResult
+
+        if self._project_session_in_restore():
+            logger.warning("close_project ignored during project restore")
+            return False
+        if not already_confirmed:
+            result = self.confirm_leave_unsaved_project(intent=intent)
+            if result is DirtyGuardResult.CANCELLED:
+                return False
+        self._commit_project_session_end()
+        self.statusBar.showMessage("已关闭项目")
+        return True
+
+    def close_all(self, *, force=False):
+        stack = getattr(self, "chart_stack", None)
+        if stack is not None:
+            stack.cancel_page_transition("files-closed")
+        health = getattr(self, "_project_restore_health", None)
+        uv = getattr(self, "_ultraview", None)
+        if not self.files:
+            if health is not None:
+                health.clear()
+            return
+        from .analysis_source_scope import collect_source_uses
+
+        fids = list(self.files.keys())
+        if not force:
+            uses = []
+            for fid in fids:
+                uses.extend(
+                    collect_source_uses(
+                        fid,
+                        time_views=self.view_manager.views,
+                        analysis_managers=self.analysis_managers,
+                    )
+                )
+            if not self._confirm_global_file_close(
+                uses, files=fids, close_all=True
+            ):
+                return
+        ctrl = getattr(getattr(self, "_analysis_context", None), "time_range", None)
+        if ctrl is not None:
+            ctrl.clear_all()
+        coord = getattr(self, "_startup_coordinator", None)
+        if coord is not None:
+            coord.invalidate_session()
+        if uv is not None and not getattr(uv, "is_shutdown", False):
+            uv.reset_project_state()
+        n = len(self.files)
+        # Cache invalidation site 2 (close-all variant): wipe everything.
+        self.canvas_time.invalidate_envelope_cache("all files closed")
+        self.canvas_time.invalidate_monotonicity_cache()
+        # Per-section analysis caches: every entry is now stale (close-all
+        # variant of the per-fid invalidate in ``_close``).
+        for cache in self.analysis_caches.values():
+            cache.clear()
+        for section in list(self.analysis_caches):
+            self._clear_analysis_section_pins(section)
+        # FftTimeCoordinator holds in-flight pending contexts that cache.clear()
+        # above does NOT touch — drop them too so a fft_time job still running
+        # when all files close cannot resurrect a dead-fid result into the
+        # just-cleared cache (N1; mirrors _close's per-fid coordinator.invalidate).
+        coordinator = getattr(self, "_fft_time_coordinator", None)
+        if coordinator is not None:
+            coordinator.invalidate_all()
+        frf_coordinator = getattr(self, "_frf_coordinator", None)
+        if frf_coordinator is not None:
+            frf_coordinator.invalidate_all()
+        for fid in list(self.files.keys()):
+            self._remove_file_from_all_time_views(fid)
+            self._remove_file_from_all_analysis_views(fid)
+            self._drop_pinned_cursor_identities(fids=(fid,))
+            del self.files[fid]
+            self.navigator_order.remove_fid(fid)
+            self.navigator.remove_file(fid, emit=False)
+        self._active = None
+        if health is not None:
+            health.clear()
+        self._refresh_analysis_candidates()
+        self._update_info()
+        # Empty-files plot_time() often skips the successful-render tail that
+        # would otherwise sync record rows. Clear presentation here, not after
+        # a successful replot.
+        self._sync_record_curve_tree()
+        controller = getattr(
+            getattr(self, "chart_stack", None), "_pinned_cursors", None,
+        )
+        if controller is not None:
+            controller.clear_all()
+        self._reset_empty_workspace_session()
+        self._reset_plot_state(scope='all')
+        self.statusBar.showMessage("已关闭全部")
+        self.toast(f"已关闭全部 {n} 个文件", "info")
+        refresh_chip = getattr(self, "_refresh_time_axis_provenance_chips", None)
+        if callable(refresh_chip):
+            refresh_chip()

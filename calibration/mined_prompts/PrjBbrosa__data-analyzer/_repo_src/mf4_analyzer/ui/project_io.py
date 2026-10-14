@@ -1,0 +1,915 @@
+"""JSON serialization for TraceLab project sessions (.tlproj).
+
+Reference-only: stores file *paths* (+ per-file fs/time_source overrides) and
+the full View list — never parsed data. Mirrors ``batch_preset_io.py``'s
+versioned save/load shape. Pure (no Qt, no MainWindow) so it round-trips
+through tests without a running app.
+
+Canonical dirty digest (Task 5A) hashes :func:`project_document_to_payload`,
+the same object :func:`save_project_to_json` writes. Do not maintain a
+parallel "approximate" serializer for close/replace review.
+
+Field inventory
+---------------
+Stable top-level keys (exactly :data:`PROJECT_PAYLOAD_KEYS`):
+
+* ``schema_version`` — codec version (currently 4); not user content.
+* ``active_file`` — navigator active fid.
+* ``current_mode`` — persisted chart mode (``time`` / analysis sections;
+  UltraView is not a source workspace and falls back to ``time`` on load).
+* ``files`` — ``ProjectFileRef`` rows: ``fid``, ``path_abs``, ``path_rel``,
+  ``fs``, ``time_source``, optional ``time_axis_provenance`` (additive;
+  absent in older v3 documents), ``dbc_refs[{path_abs, path_rel}]``,
+  ``channel_order`` (navigator order is semantic).
+* ``views`` — TimeDomain ``ViewState.to_dict()`` rows (name, tab_color,
+  view_id, attached_file_ids, checked, hidden_channels, colors, plot_mode,
+  cursor_mode, xlim, ylims, overlay_primary, axis_opts, remarks,
+  cursor_placement, curve_bindings, hidden_curve_binding_ids, time_filter,
+  chart_appearance, optional pinned_cursors). Retired WWT display keys
+  ``x_viewport_intent`` / ``native_ticks`` are stripped. ``time_filter`` is
+  the authority for time-domain filter intent. ``chart_appearance`` holds
+  View-local chart-options title / Y label / log / grid and filter-companion
+  colors. ``pinned_cursors`` is optional P-key pin intent; missing → empty.
+* ``view_manager`` — ``{active, split_pairs}``.
+* ``analysis_views`` — per section ``{active, views: AnalysisViewState.to_dict()}``
+  (schema, name, tab_color, view_id, attached_file_ids, panes, params,
+  compare). Pane rows persist sources / rpm / FRF io / time_range / xlim /
+  ylim / ylims / effective_time_range / cursor_mode / remarks /
+  cursor_placement / optional pinned_cursors.
+  ``PaneState.source_time_view_id`` is **not** written.
+  Optional ``comparisons`` on the same section block is
+  ``{host_view_id: {peer, axis_linked, levels_locked}}``. Absent or empty
+  means no cross-view relation. It is not ``AnalysisViewState.compare``,
+  and it does not store canvases, results, or process-local tokens.
+* ``filter`` — compatibility input for schema 1–3 (project-level Inspector
+  filter). Schema 4 writes ``null``; time-domain Views own ``time_filter``.
+* ``ultraview`` — ``workspace_to_payload`` Board/workspace blob (schema,
+  workspace.{active_board_id, show_card_actions, boards}, optional
+  ``preview_sidecar`` descriptor). Preview **pixels** live in a sidecar
+  file, not this JSON.
+
+Runtime-only (never in the payload; must not mark dirty): selection, focus,
+hover, popup, render/envelope cache, analysis numeric results, job progress,
+toast, QWidget/QImage objects, restore/open guards, UltraView presentation
+digest / captured preview buffers. User preferences (QSettings) are also
+outside ``.tlproj``.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+import tempfile
+from collections.abc import Mapping, Sequence
+
+from .pinned_cursor_state import (
+    collection_from_dict,
+    collection_to_dict,
+    remap_collection_fids,
+)
+from .time_xaxis import CustomXAxisSpec, EXACT_SOURCE, PER_SOURCE_NAME
+from .view_overlay_state import remap_remarks
+from .view_state import (
+    default_time_filter,
+    normalize_time_filter,
+    remap_chart_appearance,
+)
+
+SCHEMA_VERSION = 4
+SUPPORTED_SCHEMA_VERSIONS = {1, 2, 3, 4}
+_SOURCE_MODES = frozenset({"time", "fft", "fft_time", "frf", "order"})
+
+# Top-level keys of the object ``save_project_to_json`` writes. List order
+# here is documentation; digest canonicalization sorts dict keys.
+PROJECT_PAYLOAD_KEYS = (
+    "schema_version",
+    "active_file",
+    "current_mode",
+    "files",
+    "views",
+    "view_manager",
+    "analysis_views",
+    "filter",
+    "ultraview",
+)
+
+# Keys that are session/runtime and must never appear in the canonical
+# payload (top-level or nested). Top-level ``filter`` remains in the
+# payload for codec compatibility (schema 4 writes null) and is
+# intentionally absent from this set.
+PROJECT_RUNTIME_ONLY_KEYS = frozenset({
+    "selection",
+    "selected",
+    "focus",
+    "hover",
+    "popup",
+    "render_cache",
+    "envelope_cache",
+    "job_progress",
+    "toast",
+    "preview_pixels",
+    "qwidget",
+    "qimage",
+    "image",
+    "presentation",
+    "captured_digest",
+    "runtime",
+    "lru",
+    "restore_pending",
+    "opening_project",
+    "restoring_project",
+    "snapshot",
+    "left_snapshot",
+    "inspector_snapshot",
+})
+
+
+def _project_json_default(value):
+    """Encode the small set of scalar-like values admitted by project state.
+
+    The same fallback is deliberately shared by the on-disk and canonical
+    encoders.  Unknown runtime objects remain errors instead of becoming a
+    silently persisted representation.
+    """
+    if isinstance(value, Path):
+        return str(value)
+    item = getattr(value, "item", None)
+    if callable(item):
+        scalar = item()
+        if scalar is not value:
+            return scalar
+    raise TypeError(
+        f"Object of type {type(value).__name__} is not JSON serializable"
+    )
+
+
+def _json_object_key(key) -> str:
+    """Mirror JSON's supported mapping-key spelling before canonical sorting."""
+    if isinstance(key, str):
+        return key
+    if key is None:
+        return "null"
+    if isinstance(key, bool):
+        return "true" if key else "false"
+    if isinstance(key, float):
+        if key != key:
+            return "NaN"
+        if key == float("inf"):
+            return "Infinity"
+        if key == float("-inf"):
+            return "-Infinity"
+    return str(key)
+
+
+def _json_ready(value):
+    """Normalize mapping keys using the same representation the disk uses.
+
+    ``json.dumps(sort_keys=True)`` cannot compare an otherwise valid mixture
+    such as ``{7: ..., "axis": ...}``.  The normal form keeps disk and digest
+    semantics aligned while retaining list order as user intent.
+    """
+    if isinstance(value, Mapping):
+        return {
+            _json_object_key(key): _json_ready(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    return value
+
+
+def _project_json_dumps(payload, *, sort_keys=False, indent=None) -> str:
+    """Single JSON codec for project files and their canonical digest."""
+    return json.dumps(
+        _json_ready(payload),
+        ensure_ascii=False,
+        default=_project_json_default,
+        allow_nan=True,
+        sort_keys=sort_keys,
+        indent=indent,
+        separators=(",", ":") if indent is None else None,
+    )
+
+
+class UnsupportedProjectVersion(ValueError):
+    """Raised when reading a .tlproj whose schema_version is unknown."""
+
+    def __init__(self, schema_version):
+        self.schema_version = schema_version
+        super().__init__(
+            f"project schema_version={schema_version} not supported "
+            f"(this app reads v{SCHEMA_VERSION})"
+        )
+
+
+@dataclass
+class ProjectPathRef:
+    path_abs: str
+    path_rel: str | None
+
+
+@dataclass
+class ProjectFileRef:
+    fid: str
+    path_abs: str
+    path_rel: str | None
+    fs: float
+    time_source: str
+    dbc_refs: list = field(default_factory=list)  # list[ProjectPathRef]
+    channel_order: list[str] = field(default_factory=list)
+    time_axis_provenance: dict | None = None
+
+
+@dataclass
+class ProjectDocument:
+    active_file: str | None
+    current_mode: str
+    files: list = field(default_factory=list)        # list[ProjectFileRef]
+    views: list = field(default_factory=list)         # list[dict] (ViewState.to_dict)
+    view_manager: dict = field(default_factory=dict)  # {"active": int, "split_pairs": {}}
+    # {"fft"|"fft_time"|"order": {"active": int, "views": [AnalysisViewState.to_dict()]}}
+    analysis_views: dict = field(default_factory=dict)
+    filter: dict | None = None
+    ultraview: dict | None = None
+
+
+def project_document_to_payload(doc: ProjectDocument) -> dict:
+    """Qt-free JSON object written by :func:`save_project_to_json`.
+
+    This is the canonical persistable snapshot. Dirty digest and close/replace
+    review must hash this object, not a second hand-built mapping.
+    """
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "active_file": doc.active_file,
+        "current_mode": doc.current_mode,
+        "files": [
+            {
+                "fid": r.fid,
+                "path_abs": r.path_abs,
+                "path_rel": r.path_rel,
+                "fs": float(r.fs),
+                "time_source": r.time_source,
+                "time_axis_provenance": getattr(
+                    r, "time_axis_provenance", None,
+                ),
+                "dbc_refs": [
+                    {
+                        "path_abs": d.path_abs,
+                        "path_rel": d.path_rel,
+                    }
+                    for d in getattr(r, "dbc_refs", [])
+                ],
+                "channel_order": [
+                    str(name) for name in (getattr(r, "channel_order", None) or [])
+                    if str(name).strip()
+                ],
+            }
+            for r in doc.files
+        ],
+        "views": [_retire_view_display_fields(view) for view in doc.views],
+        "view_manager": doc.view_manager,
+        "analysis_views": doc.analysis_views,
+        "filter": doc.filter,
+        "ultraview": doc.ultraview,
+    }
+
+
+def canonical_project_digest(source) -> str:
+    """SHA-256 of the save-path payload with dict keys sorted.
+
+    List order is semantic (file / View / channel order) and is preserved.
+    ``source`` is a :class:`ProjectDocument` or an already-built payload dict.
+    """
+    if isinstance(source, ProjectDocument):
+        payload = project_document_to_payload(source)
+    elif isinstance(source, dict):
+        payload = source
+    else:
+        raise TypeError(
+            f"canonical digest expects ProjectDocument or dict, "
+            f"not {type(source).__name__}"
+        )
+    blob = _project_json_dumps(payload, sort_keys=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def save_project_to_json(doc: ProjectDocument, path) -> None:
+    path = Path(path)
+    payload = project_document_to_payload(doc)
+    _write_text_atomic(
+        path,
+        _project_json_dumps(payload, indent=2),
+    )
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Replace one project document only after its complete sibling is durable.
+
+    ``.tlproj`` is the authoritative session state.  UltraView's optional
+    preview sidecar can therefore safely be published before this call: an
+    interrupted project save leaves an unreferenced sidecar generation, never
+    a partially-written JSON document that points to it.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=target.parent,
+        prefix=f".{target.stem}.",
+        suffix=f"{target.suffix}.tmp",
+        delete=False,
+    )
+    temporary = Path(handle.name)
+    try:
+        with handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def load_project_from_json(path) -> ProjectDocument:
+    path = Path(path)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid project JSON: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("project JSON must be a JSON object")
+
+    version = raw.get("schema_version")
+    if version is None:
+        version = 1
+    if version not in SUPPORTED_SCHEMA_VERSIONS:
+        raise UnsupportedProjectVersion(version)
+
+    files = [
+        ProjectFileRef(
+            fid=str(f["fid"]),
+            path_abs=str(f["path_abs"]),
+            path_rel=f.get("path_rel"),
+            fs=float(f.get("fs", 1000.0)),
+            time_source=str(f.get("time_source", "generated")),
+            time_axis_provenance=(
+                f.get("time_axis_provenance")
+                if isinstance(f.get("time_axis_provenance"), dict)
+                else None
+            ),
+            dbc_refs=[
+                ProjectPathRef(
+                    path_abs=str(d["path_abs"]),
+                    path_rel=d.get("path_rel"),
+                )
+                for d in f.get("dbc_refs", [])
+            ],
+            channel_order=[
+                str(name).strip()
+                for name in (f.get("channel_order") or [])
+                if str(name).strip()
+            ],
+        )
+        for f in raw.get("files", [])
+    ]
+    mode = str(raw.get("current_mode", "time"))
+    if mode not in _SOURCE_MODES:
+        mode = "time"
+    uv_payload = raw.get("ultraview")
+    if uv_payload is not None and not isinstance(uv_payload, dict):
+        uv_payload = None
+    legacy_filter = raw.get("filter") if version >= 2 else None
+    views = _apply_time_filter_codec(
+        [
+            _retire_view_display_fields(view)
+            for view in raw.get("views", [])
+        ],
+        legacy_filter,
+        version,
+    )
+    return ProjectDocument(
+        active_file=raw.get("active_file"),
+        current_mode=mode,
+        files=files,
+        views=views,
+        view_manager=dict(raw.get("view_manager", {})),
+        analysis_views=dict(raw.get("analysis_views", {})),
+        filter=legacy_filter,
+        ultraview=uv_payload,
+    )
+
+
+def make_relative(path_abs: str, project_path) -> str | None:
+    """Path of ``path_abs`` relative to the .tlproj dir; None across drives."""
+    try:
+        return os.path.relpath(path_abs, Path(project_path).parent)
+    except ValueError:
+        return None
+
+
+def make_path_ref(path_abs: str, project_path) -> ProjectPathRef:
+    return ProjectPathRef(
+        path_abs=str(Path(path_abs).resolve()),
+        path_rel=make_relative(str(Path(path_abs).resolve()), project_path),
+    )
+
+
+def resolve_path_ref(ref: ProjectPathRef, project_path) -> "Path | None":
+    project_dir = Path(project_path).parent
+    if ref.path_rel:
+        cand = (project_dir / ref.path_rel).resolve()
+        if cand.exists():
+            return cand
+    cand = Path(ref.path_abs)
+    if cand.exists():
+        return cand
+    return None
+
+
+def resolve_file_path(ref: ProjectFileRef, project_path) -> "Path | None":
+    """Locate a referenced file: path_rel (relative to the .tlproj) first,
+    then path_abs. Returns None when neither exists."""
+    project_dir = Path(project_path).parent
+    if ref.path_rel:
+        cand = (project_dir / ref.path_rel).resolve()
+        if cand.exists():
+            return cand
+    cand = Path(ref.path_abs)
+    if cand.exists():
+        return cand
+    return None
+
+
+def resolve_dbc_paths(ref: ProjectFileRef, project_path) -> list[str]:
+    paths = []
+    refs = list(getattr(ref, "dbc_refs", []) or [])
+    if not refs:
+        return []
+    for dbc_ref in refs:
+        resolved = resolve_path_ref(dbc_ref, project_path)
+        if resolved is None:
+            return []
+        paths.append(str(resolved))
+    return paths
+
+
+def _encode_channel_key(fid: str, channel: str) -> str:
+    # Matches ui.view_state._encode_channel_key exactly.
+    return json.dumps([fid, channel], ensure_ascii=False, separators=(",", ":"))
+
+
+def _apply_time_filter_codec(views, legacy_filter, version):
+    """Attach View-owned time_filter; copy schema 1–3 top-level filter once."""
+    out = []
+    for view in views:
+        if not isinstance(view, dict):
+            out.append(view)
+            continue
+        row = dict(view)
+        if "time_filter" in row and row["time_filter"] is not None:
+            row["time_filter"] = normalize_time_filter(row.get("time_filter"))
+        elif version < 4 and legacy_filter:
+            row["time_filter"] = normalize_time_filter(legacy_filter)
+        else:
+            row["time_filter"] = default_time_filter()
+        out.append(row)
+    return out
+
+
+def _retire_view_display_fields(view):
+    """Drop retired WWT display policy from a serialized Time View payload."""
+    if not isinstance(view, dict):
+        return view
+    result = dict(view)
+    result.pop("x_viewport_intent", None)
+    axis = result.get("axis_opts")
+    if not isinstance(axis, dict):
+        return result
+    axis = dict(axis)
+    axis.pop("native_ticks", None)
+    axis.pop("x_viewport_intent", None)
+    result["axis_opts"] = axis
+    return result
+
+
+def _remap_channel_axis_groups(value, fid_map: dict) -> dict[str, str]:
+    """Remap valid persisted channel-axis memberships, dropping stale fids."""
+    if not isinstance(value, dict):
+        return {}
+    groups: dict[str, str] = {}
+    for raw_key, raw_axis_id in value.items():
+        if not isinstance(raw_key, str):
+            continue
+        try:
+            key = json.loads(raw_key)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(key, (list, tuple)) or len(key) != 2:
+            continue
+        old_fid = str(key[0] or "").strip()
+        channel = str(key[1] or "").strip()
+        axis_id = str(raw_axis_id or "").strip()
+        if not old_fid or not channel or not axis_id or old_fid not in fid_map:
+            continue
+        groups[_encode_channel_key(fid_map[old_fid], channel)] = axis_id
+    return groups
+
+
+def _remap_pinned_cursors(raw, fid_map: dict):
+    """Rewrite known pin fids; drop unknown fids. Missing payload stays missing."""
+    if raw is None:
+        return None
+    return collection_to_dict(
+        remap_collection_fids(collection_from_dict(raw), fid_map)
+    )
+
+
+def remap_view_fids(views: list, fid_map: dict) -> list:
+    """Rewrite the fid of every channel reference in a list of
+    ``ViewState.to_dict()`` payloads, dropping references whose fid is absent
+    from ``fid_map`` (the file went missing on load)."""
+    out = []
+    for view in views:
+        v = _retire_view_display_fields(view)
+
+        if "attached_file_ids" in view:
+            v["attached_file_ids"] = [
+                fid_map[fid]
+                for fid in view.get("attached_file_ids", [])
+                if fid in fid_map
+            ]
+        else:
+            v["attached_file_ids"] = list(fid_map.values())
+
+        v["checked"] = [
+            [fid_map[fid], ch]
+            for fid, ch in (tuple(x) for x in view.get("checked", []))
+            if fid in fid_map
+        ]
+        v["hidden_channels"] = [
+            [fid_map[fid], ch]
+            for fid, ch in (tuple(x) for x in view.get("hidden_channels", []))
+            if fid in fid_map
+        ]
+
+        new_colors = {}
+        for key, color in (view.get("colors") or {}).items():
+            fid, ch = json.loads(key)
+            if fid in fid_map:
+                new_colors[_encode_channel_key(fid_map[fid], ch)] = color
+        v["colors"] = new_colors
+
+        # ylims keys are the same composite encoding as colors
+        # (``_view_state_channel_key`` / ``json.dumps([fid, name])``). Older
+        # projects may omit the field entirely — treat that as empty.
+        new_ylims = {}
+        for key, ylim in (view.get("ylims") or {}).items():
+            try:
+                decoded = json.loads(key)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                # Legacy display-name keys: keep as-is so restore can still
+                # match ``legacy_lines.get(name)`` on the canvas.
+                new_ylims[key] = ylim
+                continue
+            if not (isinstance(decoded, (list, tuple)) and len(decoded) == 2):
+                new_ylims[key] = ylim
+                continue
+            fid, ch = decoded
+            if fid in fid_map:
+                new_ylims[_encode_channel_key(fid_map[fid], ch)] = ylim
+        v["ylims"] = new_ylims
+
+        op = view.get("overlay_primary")
+        v["overlay_primary"] = (
+            [fid_map[op[0]], op[1]] if op and op[0] in fid_map else None
+        )
+
+        axis = dict(v.get("axis_opts") or {})
+        channel_axis_groups = _remap_channel_axis_groups(
+            axis.get("channel_axis_groups"), fid_map,
+        )
+        if channel_axis_groups:
+            axis["channel_axis_groups"] = channel_axis_groups
+        else:
+            axis.pop("channel_axis_groups", None)
+        signature = axis.get("frf_source_signature")
+        if isinstance(signature, dict):
+            input_source = signature.get("input")
+            output_source = signature.get("output")
+            if (
+                isinstance(input_source, (list, tuple))
+                and len(input_source) == 2
+                and isinstance(output_source, (list, tuple))
+                and len(output_source) == 2
+                and input_source[0] in fid_map
+                and output_source[0] in fid_map
+            ):
+                mapped_signature = dict(signature)
+                mapped_signature["input"] = [
+                    fid_map[input_source[0]], input_source[1]
+                ]
+                mapped_signature["output"] = [
+                    fid_map[output_source[0]], output_source[1]
+                ]
+                axis["frf_source_signature"] = mapped_signature
+            else:
+                axis.pop("frf_source_signature", None)
+        if "x_axis" in axis:
+            spec = CustomXAxisSpec.from_axis_opts(axis["x_axis"])
+            if spec.resolver == PER_SOURCE_NAME:
+                mapped_spec = spec
+            elif spec.resolver == EXACT_SOURCE and spec.source_fid in fid_map:
+                mapped_spec = replace(spec, source_fid=fid_map[spec.source_fid])
+            else:
+                mapped_spec = CustomXAxisSpec(label=spec.label)
+            axis["x_axis"] = mapped_spec.to_axis_opts()
+        if axis or "axis_opts" in view:
+            v["axis_opts"] = axis
+
+        v["remarks"] = remap_remarks(view.get("remarks"), fid_map)
+        # cursor_placement has no fid; keep the payload as copied above.
+        v["pinned_cursors"] = _remap_pinned_cursors(
+            view.get("pinned_cursors"), fid_map,
+        )
+
+        from .time_curve_bindings import (
+            prune_hidden_curve_binding_ids,
+            remap_curve_bindings,
+        )
+        bindings = remap_curve_bindings(
+            view.get("curve_bindings") or [], fid_map
+        )
+        v["curve_bindings"] = [
+            binding.to_dict()
+            for binding in bindings
+        ]
+        v["hidden_curve_binding_ids"] = prune_hidden_curve_binding_ids(
+            view.get("hidden_curve_binding_ids"), bindings,
+        )
+        v["chart_appearance"] = remap_chart_appearance(
+            view.get("chart_appearance"), fid_map,
+        )
+
+        out.append(v)
+    return out
+
+
+def normalize_analysis_comparisons(raw, view_ids) -> tuple[dict, list]:
+    """Keep host → peer rows whose ids still exist.
+
+    Flags must be real bools (``bool("false")`` is true, so a non-bool is
+    stored as off). Extra keys are dropped. A non-dict payload drops the
+    whole block. Returns ``(payload, dropped_host_ids)``.
+    """
+    ids = {str(item) for item in view_ids if str(item or "")}
+    if raw is None:
+        return {}, []
+    if not isinstance(raw, dict):
+        return {}, ["comparisons"]
+    kept = {}
+    dropped = []
+    for host, row in raw.items():
+        host_id = str(host or "")
+        if not isinstance(row, dict):
+            if host_id:
+                dropped.append(host_id)
+            continue
+        peer = row.get("peer")
+        peer_id = str(peer) if isinstance(peer, str) and peer else ""
+        if (
+            not host_id
+            or host_id not in ids
+            or not peer_id
+            or peer_id not in ids
+            or peer_id == host_id
+        ):
+            if host_id:
+                dropped.append(host_id)
+            continue
+        kept[host_id] = {
+            "peer": peer_id,
+            "axis_linked": row.get("axis_linked") is True,
+            "levels_locked": row.get("levels_locked") is True,
+        }
+    return kept, dropped
+
+
+def remap_analysis_view_fids(analysis_views: dict, fid_map: dict) -> dict:
+    """Rewrite fids inside analysis_views payloads; drop refs whose fid
+    is absent from ``fid_map`` (same contract as remap_view_fids).
+
+    Schema 7 ``attached_file_ids`` are remapped in order. Older payloads
+    without the field derive attachments from remapped pane roles only —
+    never from the full project file set.
+    """
+    from ..heatmap_color_policy import normalize_heatmap_color_basis
+    from .analysis_view_state import (
+        analysis_view_source_fids,
+        normalize_analysis_attachments,
+        remap_pane_chart_appearances,
+    )
+
+    out = {}
+    for section, block in (analysis_views or {}).items():
+        views = []
+        for view in block.get("views", []):
+            v = dict(view)
+            panes = []
+            for pane in view.get("panes", []):
+                pn = dict(pane)
+                pn["sources"] = [
+                    [fid_map[fid], ch]
+                    for fid, ch in (tuple(s) for s in pane.get("sources", []))
+                    if fid in fid_map
+                ]
+                rpm = pane.get("rpm_source")
+                pn["rpm_source"] = (
+                    [fid_map[rpm[0]], rpm[1]]
+                    if rpm and rpm[0] in fid_map else None
+                )
+                for role in ("input_source", "output_source"):
+                    source = pane.get(role)
+                    pn[role] = (
+                        [fid_map[source[0]], source[1]]
+                        if source and source[0] in fid_map else None
+                    )
+                pn["remarks"] = remap_remarks(pane.get("remarks"), fid_map)
+                pn["pinned_cursors"] = _remap_pinned_cursors(
+                    pane.get("pinned_cursors"), fid_map,
+                )
+                if "chart_appearances" in pane:
+                    appearances = remap_pane_chart_appearances(
+                        pane.get("chart_appearances"), fid_map,
+                    )
+                    if appearances:
+                        pn["chart_appearances"] = appearances
+                    else:
+                        pn.pop("chart_appearances", None)
+                if "heatmap_color_basis" in pane:
+                    basis = normalize_heatmap_color_basis(pane["heatmap_color_basis"])
+                    if basis is None and pane["heatmap_color_basis"] is not None:
+                        import logging
+                        logging.getLogger(__name__).warning(
+                            "dropping corrupt heatmap_color_basis during source remap",
+                        )
+                    if basis is not None and basis["source"][0] in fid_map:
+                        basis["source"][0] = fid_map[basis["source"][0]]
+                        pn["heatmap_color_basis"] = basis
+                    else:
+                        pn.pop("heatmap_color_basis", None)
+                panes.append(pn)
+            v["panes"] = panes
+            if "attached_file_ids" in view:
+                v["attached_file_ids"] = normalize_analysis_attachments(
+                    fid_map[fid]
+                    for fid in view.get("attached_file_ids", [])
+                    if fid in fid_map
+                )
+            else:
+                v["attached_file_ids"] = analysis_view_source_fids(v)
+            views.append(v)
+        section_out = {"active": int(block.get("active", 0)), "views": views}
+        comparisons = block.get("comparisons")
+        if isinstance(comparisons, dict):
+            import copy
+            section_out["comparisons"] = copy.deepcopy(comparisons)
+        out[section] = section_out
+    return out
+
+
+def collect_dropped_analysis_refs(analysis_views: dict, fid_map: dict) -> list[tuple]:
+    """Pane roles whose source fid is absent from ``fid_map`` after restore.
+
+    Returns ``(section, view_id, pane_idx, role)`` tuples. Roles are
+    ``signal`` (overlay sources), ``rpm``, ``input``, ``output``, and
+    ``pin`` (unknown-fid pinned-cursor identities).
+    """
+    dropped: list[tuple] = []
+    for section, block in (analysis_views or {}).items():
+        for view in block.get("views", []) or []:
+            view_id = str(view.get("view_id") or view.get("name") or "")
+            for pane_idx, pane in enumerate(view.get("panes", []) or []):
+                for source in pane.get("sources", []) or []:
+                    if (
+                        isinstance(source, (list, tuple))
+                        and len(source) >= 1
+                        and source[0] not in fid_map
+                    ):
+                        dropped.append((section, view_id, pane_idx, "signal"))
+                rpm = pane.get("rpm_source")
+                if (
+                    isinstance(rpm, (list, tuple))
+                    and len(rpm) >= 1
+                    and rpm[0] not in fid_map
+                ):
+                    dropped.append((section, view_id, pane_idx, "rpm"))
+                for field_name, role in (
+                    ("input_source", "input"),
+                    ("output_source", "output"),
+                ):
+                    source = pane.get(field_name)
+                    if (
+                        isinstance(source, (list, tuple))
+                        and len(source) >= 1
+                        and source[0] not in fid_map
+                    ):
+                        dropped.append((section, view_id, pane_idx, role))
+                for _fid, _channel in _dropped_pin_identities(
+                    pane.get("pinned_cursors"), fid_map,
+                ):
+                    dropped.append((section, view_id, pane_idx, "pin"))
+    return dropped
+
+
+def collect_dropped_time_refs(views: list, fid_map: dict) -> list[tuple]:
+    """Time-View channel refs whose fid is absent from ``fid_map``.
+
+    Returns ``(view_id_or_name, fid, channel)`` tuples from ``checked``,
+    curve bindings, and unknown-fid pinned-cursor identities.
+    """
+    dropped: list[tuple] = []
+    for view in views or []:
+        view_id = str(view.get("view_id") or view.get("name") or "")
+        for item in view.get("checked", []) or []:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            fid, channel = item[0], item[1]
+            if fid not in fid_map:
+                dropped.append((view_id, fid, channel))
+        from .time_curve_bindings import collect_dropped_binding_refs
+        dropped.extend(
+            collect_dropped_binding_refs(
+                view.get("curve_bindings") or [], fid_map, view_id=view_id
+            )
+        )
+        for fid, channel in _dropped_pin_identities(
+            view.get("pinned_cursors"), fid_map,
+        ):
+            dropped.append((view_id, fid, channel))
+    return dropped
+
+
+def _dropped_pin_identities(raw, fid_map: dict) -> list[tuple[object, object]]:
+    """Return ``(fid, channel)`` pairs that ``remap_collection_fids`` would drop."""
+    if not isinstance(raw, Mapping):
+        return []
+    records = raw.get("records")
+    if not isinstance(records, Sequence) or isinstance(
+        records, (str, bytes, bytearray)
+    ):
+        return []
+    mapping = fid_map if isinstance(fid_map, Mapping) else {}
+    dropped: list[tuple[object, object]] = []
+    seen: set[tuple[object, object]] = set()
+
+    def _emit(fid, channel) -> None:
+        key = (fid, channel)
+        if key in seen:
+            return
+        seen.add(key)
+        dropped.append(key)
+
+    for item in records:
+        if not isinstance(item, Mapping):
+            continue
+        axis = item.get("axis_identity")
+        axis_fid = None
+        axis_channel = ""
+        axis_missing = False
+        if isinstance(axis, (list, tuple)) and len(axis) >= 1:
+            axis_fid = axis[0]
+            if len(axis) > 1:
+                axis_channel = axis[1]
+            axis_missing = axis_fid not in mapping
+        bindings_raw = item.get("bindings") or ()
+        parsed: list[tuple[object, object]] = []
+        if isinstance(bindings_raw, Sequence) and not isinstance(
+            bindings_raw, (str, bytes, bytearray, Mapping)
+        ):
+            for binding in bindings_raw:
+                if not isinstance(binding, Mapping):
+                    continue
+                fid = binding.get("fid")
+                if not fid:
+                    continue
+                parsed.append((fid, binding.get("channel") or ""))
+        kept = any(fid in mapping for fid, _channel in parsed)
+        drop_whole = axis_missing or not kept
+        if drop_whole:
+            if axis_fid is not None:
+                _emit(axis_fid, axis_channel)
+            for fid, channel in parsed:
+                _emit(fid, channel)
+        else:
+            for fid, channel in parsed:
+                if fid not in mapping:
+                    _emit(fid, channel)
+    return dropped

@@ -1,0 +1,294 @@
+"""Guard what a published release promises about itself.
+
+v0.16.1 shipped four assets — two AppImages of ~100 MB, a wheel and an sdist —
+with no checksum, no signature and no provenance, in a project that pins the
+digest of all 67 models it downloads. It also built the same version three times
+on three runners (`build-and-release`, `build-appimage-arm64`, `publish-pypi`),
+so the wheel on PyPI was never the wheel on the GitHub release, and a checksum
+for one would not have described the other.
+
+These tests pin the shape of the fix: build once, publish that, and cover every
+artifact with one manifest. Parsed as text rather than YAML on purpose — the
+sibling workflow guards do the same, and the only YAML parser on hand reaches
+the venv transitively through pre-commit.
+"""
+
+import re
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+RELEASE = REPO_ROOT / ".github" / "workflows" / "release.yml"
+
+#: The artifact holding the wheel and sdist that every other job consumes.
+DIST_ARTIFACT = "python-dist"
+
+#: Container and builder action pins must stay identical to flatpak.yml.
+#: The builder runs privileged, so the image must be an immutable digest, not
+#: the moving gnome-50 tag. Digest is the gnome-50 OCI index as of 2026-09-06.
+_FLATPAK_CI = REPO_ROOT / ".github" / "workflows" / "flatpak.yml"
+_FLATPAK_IMAGE = (
+    "ghcr.io/flathub-infra/flatpak-github-actions:gnome-50"
+    "@sha256:1fb2df10a57276f90806e1f35454048e30bf1855b7b4ff4808c9ee55887bd852"
+)
+_FLATPAK_BUILDER = (
+    "flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3"
+)
+_FLATPAK_TAG_ONLY = re.compile(
+    r"image:\s*ghcr\.io/flathub-infra/flatpak-github-actions:gnome-50\s*$",
+    re.M,
+)
+
+
+def _text() -> str:
+    return RELEASE.read_text(encoding="utf-8")
+
+
+def _without_comments(text: str) -> str:
+    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+
+def _jobs() -> dict:
+    """job name -> its block of the workflow, split on the 2-space indent."""
+    text = _text()
+    start = text.index("\njobs:\n")
+    headers = list(re.finditer(r"^  ([a-z0-9][a-z0-9-]*):$", text[start:], re.M))
+    assert headers, "no jobs found; release.yml's layout moved"
+
+    jobs = {}
+    for index, header in enumerate(headers):
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(text) - start
+        jobs[header.group(1)] = text[start:][header.start() : end]
+    return jobs
+
+
+def _needs(block: str) -> set:
+    match = re.search(r"^    needs: (.+)$", block, re.M)
+    if not match:
+        return set()
+    return set(re.findall(r"[a-z0-9][a-z0-9-]*", match.group(1)))
+
+
+def _permissions(block: str) -> dict:
+    match = re.search(r"^    permissions:\n((?:      \S+: \S+.*\n)+)", block, re.M)
+    if not match:
+        return {}
+    return dict(re.findall(r"^      (\S+): (\S+)", match.group(1), re.M))
+
+
+def _top_level_permissions() -> dict:
+    text = _text()
+    match = re.search(r"^permissions:\n((?:  \S+: \S+.*\n)+)", text, re.M)
+    assert match, "release.yml declares no top-level permissions"
+    return dict(re.findall(r"^  (\S+): (\S+)", match.group(1), re.M))
+
+
+def test_the_release_is_built_exactly_once():
+    """Three builds meant three sets of bytes and no `SOURCE_DATE_EPOCH`, so
+    neither a checksum nor an attestation could speak for the whole release."""
+    builds = _without_comments(_text()).count("python -m build")
+    assert builds == 1, f"the release is built {builds} times; build once and pass the artifact"
+
+
+def test_the_build_timestamp_is_pinned_to_the_tagged_commit():
+    """Otherwise re-running the tag produces bytes the published checksum no
+    longer matches."""
+    block = _jobs()["build-and-release"]
+    assert "SOURCE_DATE_EPOCH=" in block
+    assert block.index("SOURCE_DATE_EPOCH=") < block.index(
+        "python -m build\n"
+    ), "SOURCE_DATE_EPOCH is set after the build, which is the same as not setting it"
+
+
+def test_every_consumer_downloads_the_build_instead_of_repeating_it():
+    jobs = _jobs()
+    for name in ("build-appimage-arm64", "publish-pypi"):
+        block = jobs[name]
+        assert "actions/download-artifact" in block, f"{name} does not consume the build"
+        assert f"name: {DIST_ARTIFACT}" in block, f"{name} downloads some other artifact"
+        assert "python -m build" not in _without_comments(
+            block
+        ), f"{name} rebuilds what build-and-release already published"
+
+
+def _jobs_that_attach_to_the_release() -> set:
+    return {
+        name
+        for name, block in _jobs().items()
+        if "gh release upload" in block or "softprops/action-gh-release" in block
+    }
+
+
+def test_the_manifest_waits_for_every_artifact_it_has_to_cover():
+    """A SHA256SUMS listing three of the four files is worse than none: the
+    missing one is indistinguishable from a tampered one. The aarch64 AppImage
+    lands in its own job after the release exists, which is what makes this
+    ordering a real constraint rather than a formality."""
+    jobs = _jobs()
+    assert "publish-checksums" in jobs, "nothing generates a checksum manifest"
+
+    producers = _jobs_that_attach_to_the_release() - {"publish-checksums"}
+    missing = producers - _needs(jobs["publish-checksums"])
+    assert not missing, f"publish-checksums runs before {sorted(missing)} attach their artifacts"
+
+
+def test_the_manifest_covers_every_kind_of_artifact_we_publish():
+    block = _jobs()["publish-checksums"]
+    assert "merge-multiple: true" in block, "it collects one artifact, not all of them"
+    checksum_line = re.search(r"sha256sum -- (.+)$", block, re.M)
+    assert checksum_line, "publish-checksums does not generate SHA256SUMS"
+    for pattern in ("*.whl", "*.tar.gz", "*.AppImage", "*.flatpak", "*.snap"):
+        assert pattern in checksum_line.group(1), f"{pattern} is published but unchecksummed"
+
+
+def test_provenance_is_generated_from_the_published_manifest():
+    """Attesting a second glob would let the file users check and the set we
+    attest drift apart."""
+    block = _jobs()["publish-checksums"]
+    assert "actions/attest-build-provenance" in block, "no build provenance is generated"
+    assert (
+        "subject-checksums: dist/SHA256SUMS" in block
+    ), "provenance is not driven by the manifest we publish"
+    assert _permissions(block).get("attestations") == "write"
+
+
+def test_pypi_is_published_without_a_stored_token():
+    text = _text()
+    assert "PYPI_API_TOKEN" not in text, "trusted publishing needs no API token"
+    assert "TWINE_PASSWORD" not in text
+    block = _jobs()["publish-pypi"]
+    assert "pypa/gh-action-pypi-publish" in block
+    assert _permissions(block).get("id-token") == "write"
+
+
+def test_only_the_jobs_that_need_it_can_mint_an_oidc_token():
+    """`id-token: write` at the top level handed one to publish-aur too, which
+    runs a third-party action holding our AUR signing key."""
+    assert "id-token" not in _top_level_permissions()
+    minters = {
+        name for name, block in _jobs().items() if _permissions(block).get("id-token") == "write"
+    }
+    assert minters == {"publish-pypi", "publish-checksums"}, minters
+
+
+def test_the_release_notes_tell_users_how_to_verify_the_download():
+    """Publishing a manifest nobody is told about verifies nothing."""
+    body = _jobs()["build-and-release"]
+    assert "SHA256SUMS" in body, "the release notes never mention the manifest"
+    assert "sha256sum -c" in body, "the notes do not show how to check it"
+    assert "gh attestation verify" in body, "the notes do not show how to check provenance"
+
+
+def test_flatpak_release_jobs_reuse_ci_builder_pins():
+    """Release bundles must be the same builder image and action commit as CI.
+
+    Attach is a separate ubuntu-latest job: the builder image is Freedesktop
+    SDK and does not ship GitHub CLI, unlike the AppImage runners.
+    """
+    assert "@sha256:" in _FLATPAK_IMAGE, "the builder image pin must be a digest, not a tag"
+
+    ci = _FLATPAK_CI.read_text(encoding="utf-8")
+    assert _FLATPAK_IMAGE in ci, "flatpak.yml image pin moved; update this test"
+    assert not _FLATPAK_TAG_ONLY.search(ci), "flatpak.yml pins the mutable gnome-50 tag"
+    assert _FLATPAK_BUILDER in ci, "flatpak.yml action pin moved; update this test"
+
+    jobs = _jobs()
+    for name, arch, runner in (
+        ("build-flatpak-amd64", "x86_64", "ubuntu-latest"),
+        ("build-flatpak-arm64", "aarch64", "ubuntu-24.04-arm"),
+    ):
+        block = jobs[name]
+        assert _FLATPAK_IMAGE in block, f"{name} does not use the CI builder image"
+        assert not _FLATPAK_TAG_ONLY.search(block), f"{name} pins the mutable gnome-50 tag"
+        assert "options: --privileged" in block, f"{name} is not a privileged container"
+        assert _FLATPAK_BUILDER in block, f"{name} does not use the pinned builder action"
+        assert f"arch: {arch}" in block
+        assert (
+            f"cache-key: flatpak-builder-{arch}-${{{{ hashFiles('packaging/flatpak/**') }}}}"
+            in block
+        ), (
+            f"{name} cache-key must start with flatpak-builder-{arch} so the "
+            "action's restore-keys prefix matches after it appends -${arch}"
+        )
+        assert f"runs-on: {runner}" in block
+        assert f"Vocalinux-${{{{ steps.get_version.outputs.VERSION }}}}-{arch}.flatpak" in block
+        assert "actions/upload-artifact" in block, f"{name} does not upload a workflow artifact"
+        assert "gh release upload" not in block, f"{name} cannot run gh in the builder image"
+        assert "python -m build" not in _without_comments(block)
+
+    attach = jobs["attach-flatpak"]
+    assert _needs(attach) >= {
+        "build-and-release",
+        "build-flatpak-amd64",
+        "build-flatpak-arm64",
+    }
+    assert "gh release upload" in attach
+    assert "--clobber" in attach
+    assert "dist/*.flatpak" in attach
+    assert _permissions(attach).get("contents") == "write"
+
+
+def test_the_release_notes_document_flatpak_bundles():
+    """Users need the Flathub runtime, --user install, and the no-store caveats."""
+    body = _jobs()["build-and-release"]
+    assert "flatpak install --user" in body
+    assert "org.gnome.Platform//50" in body
+    assert "no auto-update" in body
+    assert "not on Flathub" in body
+    assert "Vocalinux-__VERSION__-x86_64.flatpak" in body
+
+
+def test_the_remote_install_guidance_only_runs_when_the_remote_publishes():
+    """The notes recommend `flatpak install` of the `.flatpakref` only for a
+    tag the remote will actually carry: stable, with both publish secrets
+    configured — the same gates publish-flatpak-remote applies. Otherwise the
+    prominent command would point at a remote that never gets this release."""
+    body = _jobs()["build-and-release"]
+    assert (
+        "steps.flatpak_notes.outputs.flatpak" in body
+    ), "the Flatpak notes must come from the conditional step, not inline text"
+    for secret in ("FLATPAK_GPG_PRIVATE_KEY", "FLATPAK_REPO_TOKEN"):
+        assert f"secrets.{secret}" in body, f"the notes do not gate on {secret}"
+    assert "*alpha*|*beta*|*rc*" in body, "the notes do not detect prerelease tags"
+    assert "__FLATPAKREF_URL__" in body, "the notes do not publish the .flatpakref path"
+    # Clean installs without Flathub cannot resolve the GNOME runtime from the
+    # remote alone: the manual path has to add flathub first.
+    assert "remote-add --if-not-exists flathub" in body
+
+
+def test_the_flatpak_remote_publishes_signed_and_secret_gated():
+    """#785's self-hosted OSTree remote signs with a provisioned GPG key and
+    pushes to VocaHQ/vocalinux-flatpak, never to the release — and it skips
+    itself instead of failing the release while secrets are unconfigured.
+    """
+    block = _jobs()["publish-flatpak-remote"]
+    assert _needs(block) >= {
+        "build-and-release",
+        "build-flatpak-amd64",
+        "build-flatpak-arm64",
+    }, "the remote must not publish bundles still building or lead the GitHub Release"
+    for secret in ("FLATPAK_GPG_PRIVATE_KEY", "FLATPAK_REPO_TOKEN"):
+        assert f"secrets.{secret}" in block, f"{secret} is not wired into the job"
+    assert "build-import-bundle" in block
+    assert "--gpg-sign" in block, "the remote must sign what it publishes"
+    assert "--generate-static-deltas" in block, "updates would re-download whole apps"
+    assert "external_repository" in block, "the tap repo gets no push without it"
+    assert "gh release upload" not in block, "the remote is not a release asset"
+    assert _permissions(block).get("id-token") != "write"
+
+
+def test_the_remote_publish_is_stable_gated_and_keeps_history():
+    """A prerelease tag must not reach `flatpak update` users, and a transient
+    checkout failure must not be mistaken for a first publish — the empty-repo
+    path would drop the objects clients still delta from."""
+    block = _jobs()["publish-flatpak-remote"]
+    job_if = re.search(r"^    if: (.+)$", block, re.M)
+    assert job_if, "the job is not gated to stable tags"
+    for marker in ("alpha", "beta", "rc"):
+        assert f"contains(github.ref, '{marker}')" in job_if.group(1)
+    assert (
+        "ls-remote --exit-code" in block
+    ), "no explicit check decides whether the remote was published before"
+    assert (
+        "continue-on-error" not in block
+    ), "a tolerated checkout failure falls through to the empty-repo path"
+    assert ".flatpakref" in block, "no app ref is written for one-command installs"

@@ -1,0 +1,273 @@
+"""Town-level ballot content via Google Civic Information API's
+voterInfoQuery — candidate contests and referendums for one CURATED town's
+representative address (see town_directory.py).
+
+Never called with a visitor's address. voterInfoQuery is address-keyed, and
+the whole reason the statewide feature (each state's own measure list,
+ballot_measures_pdf.py) exists instead of this is that sending a VISITOR's
+address off-box is the one
+thing this platform's architecture exists to prevent. This module only ever
+sends a fixed, publicly-known civic-building address that WE chose — the
+input is the same for every visitor who picks that town, so nothing
+visitor-specific ever leaves the server.
+
+That said, this is a real approximation, not a precinct-accurate lookup:
+voterInfoQuery resolves to the ONE precinct the representative address is
+in, and a town can contain more than one (a different school board seat,
+water district, or city council ward a few blocks over). Town-level, not
+county- or state-level, was chosen specifically to keep that error small,
+but it is still an error, and the frontend must say so next to whatever renders from here.
+
+Field names below are verified two ways, not assumed from prose:
+
+1. Against Google's public Discovery Document
+   (https://www.googleapis.com/discovery/v1/apis/civicinfo/v2/rest, no
+   API key needed) — the same machine-readable schema Google's own
+   client libraries are generated from. Confirmed there: `contests` is
+   the top-level response array; Contest carries both `office`/
+   `candidates` (candidate contests) and `referendumTitle`/
+   `referendumSubtitle`/`referendumText`/`referendumUrl`/
+   `referendumPassageThreshold` (measures) on the SAME schema with no
+   fixed `type` enum distinguishing them — confirming `type` free-texts
+   across jurisdictions and referendumTitle's presence is the only
+   reliable discriminator, as this parser already assumed; Candidate
+   carries `name`/`party`/`candidateUrl` as used below.
+
+2. Against a real authenticated call: confirmed the key works, the
+   request reaches Google and comes back well-formed, and — the thing
+   the schema alone couldn't show — that `contests` can be MISSING from
+   the response entirely, not just empty, when Google has election
+   metadata for an address but no contest-level data for it.
+   `_parse_contests`'s `payload.get("contests") or []` already handled
+   this; now it's a verified real shape, not just defensive coding.
+
+ELECTION COVERAGE IS TIME-LIMITED, confirmed the same way: querying
+`elections.electionQuery` lists only primaries within days of their own
+election date — nothing for a general still months out, for any state,
+not just the pilot towns. voterInfoQuery without an explicit electionId
+auto-selects from that index and returns "Election unknown" when
+nothing matches, which
+every pilot town in town_directory.json does today. This is not a bug
+in this module or a wrong address — Google populates general-election
+data close to the election, and this feature's `ingest_failed` state is
+the correct, honest thing to show until that happens. Every field is
+still read defensively (`_text`) regardless: an upstream shape change
+later should cost us a field, not the whole lookup.
+"""
+
+import logging
+from collections.abc import Awaitable, Callable
+
+import httpx
+
+from app.config import settings
+from app.database import off_loop
+from app.election_phase import active_election
+from app.pipeline.cache import api_cache_get, api_cache_set_async
+from app.pipeline.fetch.town_directory import address_for_town
+
+logger = logging.getLogger(__name__)
+
+# Discovery document's rootUrl (https://civicinfo.googleapis.com/) + the
+# voterInfoQuery method's path (civicinfo/v2/voterinfo) — NOT
+# www.googleapis.com/civicinfo/v2, which is legacy generic routing that
+# still reaches the real API but isn't the address the API's own schema
+# declares as canonical.
+CIVIC_BASE = "https://civicinfo.googleapis.com/civicinfo/v2"
+
+# Shorter than the platform's default 72h API cache: election content is
+# corrected continuously through a cycle, and a stale local ballot is
+# exactly the failure this feature can't have.
+TOWN_CACHE_TTL_HOURS = 12
+
+
+def _text(raw: dict, *keys: str) -> str | None:
+    """First non-empty string among `keys`, or None: a shape change should
+    cost us a field, not the whole lookup."""
+    for key in keys:
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def is_configured() -> bool:
+    """Whether town lookups can run at all. Independent of the statewide
+    ballot measures, which are read from each state's own office and need
+    no key."""
+    return bool(settings.GOOGLE_CIVIC_API_KEY)
+
+
+def _parse_candidate_contest(raw: dict) -> dict | None:
+    office = _text(raw, "office")
+    if not office:
+        return None
+    candidates = []
+    for cand in raw.get("candidates") or []:
+        if not isinstance(cand, dict):
+            continue
+        name = _text(cand, "name")
+        if not name:
+            continue
+        candidates.append({
+            "name": name,
+            "party": _text(cand, "party"),
+            "candidateUrl": _text(cand, "candidateUrl"),
+        })
+    # `district` (an ElectoralDistrict: id/name/scope, verified against
+    # the Discovery Document's own schema) names the electoral district
+    # this contest is FOR — not read by this module's own town-level
+    # feature (a town-level contest is never itself a statewide/
+    # district-scoped race worth disambiguating further), but real and
+    # needed by state_candidates_civic.py: a bare House office label
+    # ("U.S. Representative") carries no district number of its own, and
+    # `district.scope == "congressional"` + `district.id` is the actual,
+    # schema-guaranteed way to get one, rather than trying to parse a
+    # number out of free text.
+    district = raw.get("district")
+    return {
+        "kind": "contest",
+        "office": office,
+        "candidates": candidates,
+        "district": {
+            "id": _text(district, "id") if isinstance(district, dict) else None,
+            "scope": _text(district, "scope") if isinstance(district, dict) else None,
+        } if isinstance(district, dict) else None,
+    }
+
+
+def _parse_referendum(raw: dict) -> dict | None:
+    title = _text(raw, "referendumTitle")
+    if not title:
+        return None
+    return {
+        "kind": "measure",
+        "title": title,
+        "subtitle": _text(raw, "referendumSubtitle"),
+        "text": _text(raw, "referendumText", "referendumBrief"),
+        "url": _text(raw, "referendumUrl"),
+        "passageThreshold": _text(raw, "referendumPassageThreshold"),
+    }
+
+
+def _parse_contests(payload: dict) -> list[dict]:
+    parsed = []
+    for raw in payload.get("contests") or []:
+        if not isinstance(raw, dict):
+            continue
+        # Referendum fields take priority: a contest carrying
+        # referendumTitle is a measure regardless of what `type` says,
+        # since `type` free-texts across jurisdictions ("Referendum",
+        # "Ballot Measure", ...) and the referendum fields are the
+        # reliable discriminator.
+        item = _parse_referendum(raw) or _parse_candidate_contest(raw)
+        if item:
+            parsed.append(item)
+    return parsed
+
+
+async def _election_id(
+    client: httpx.AsyncClient, db, state: str, spend: Callable[[int], Awaitable[None]] | None,
+) -> str | None:
+    """Google's id for the site's general election (from its elections
+    index, cached like a lookup), or None when it lists none yet or the
+    index can't be read. Without it, voterinfo answers "Election unknown"
+    for an election the index already lists (verified 2026-10-08), and
+    could pick an off-cycle election of its own (state_candidates_civic
+    passes it for the same reason)."""
+    day = await off_loop(db, lambda session: active_election(session).election_day.isoformat())
+    cache_key = f"civic-election-id-{day}"
+    cached = await off_loop(db, lambda session: api_cache_get(session, "google_civic", cache_key, max_age_hours=TOWN_CACHE_TTL_HOURS))
+    if cached is not None:
+        return cached.get("id")
+    if spend is not None:
+        await spend(1)
+    try:
+        response = await client.get(f"{CIVIC_BASE}/elections", params={"key": settings.GOOGLE_CIVIC_API_KEY}, timeout=30.0)
+        response.raise_for_status()
+        elections = response.json().get("elections") or []
+    except httpx.HTTPStatusError as exc:
+        logger.warning("Civic elections index failed: HTTP %d", exc.response.status_code)
+        return None
+    except Exception:
+        logger.exception("Civic elections index failed")
+        return None
+    scopes = {"ocd-division/country:us", f"ocd-division/country:us/state:{state.lower()}"}
+    match = next((
+        str(e["id"]) for e in elections
+        if isinstance(e, dict) and e.get("electionDay") == day and e.get("ocdDivisionId") in scopes
+    ), None)
+    await api_cache_set_async(db, "google_civic", cache_key, {"id": match}, normal_ttl_hours=TOWN_CACHE_TTL_HOURS)
+    return match
+
+
+async def fetch_town_ballot(
+    client: httpx.AsyncClient, db, state: str, town: str,
+    spend: Callable[[int], Awaitable[None]] | None = None,
+) -> dict | None:
+    """Contests and measures at `town`'s representative address, or None
+    on missing config, an unknown town, or a fetch/parse failure.
+
+    None here means "we could not get an answer" — the caller renders
+    that as the town's own ingest_failed, same tri-state discipline the
+    statewide measure readers use (ballot_measures_pdf), never as "no
+    local races".
+
+    `spend(1)` is charged before a lookup the cache can't answer (a public
+    route's upstream budget, api/rate_limit.py); it raises to refuse one.
+    """
+    if not is_configured():
+        return None
+
+    address = address_for_town(state, town)
+    if address is None:
+        return None
+
+    cache_key = f"civic-town-{state.upper()}-{town.casefold()}"
+    cached = await off_loop(db, lambda session: api_cache_get(session, "google_civic", cache_key, max_age_hours=TOWN_CACHE_TTL_HOURS))
+    if cached is not None:
+        return _to_result(cached, address)
+
+    election_id = await _election_id(client, db, state, spend)
+    params = {"key": settings.GOOGLE_CIVIC_API_KEY, "address": address}
+    if election_id:
+        params["electionId"] = election_id
+    if spend is not None:
+        await spend(1)
+    try:
+        response = await client.get(f"{CIVIC_BASE}/voterinfo", params=params, timeout=30.0)
+        response.raise_for_status()
+        payload = response.json()
+    except httpx.HTTPStatusError as exc:
+        # HTTPStatusError's own message embeds the full request URL, which
+        # carries `key` as a query param — logging it via logger.exception()
+        # would put the live Civic Info key in the server logs on every
+        # non-2xx response. Status code only, never the exception's own
+        # message.
+        logger.warning(
+            "Civic Info lookup failed for %s, %s: HTTP %d",
+            town, state, exc.response.status_code,
+        )
+        return None
+    except Exception:
+        logger.exception("Civic Info lookup failed for %s, %s", town, state)
+        return None
+
+    await api_cache_set_async(db, "google_civic", cache_key, payload, normal_ttl_hours=TOWN_CACHE_TTL_HOURS)
+    return _to_result(payload, address)
+
+
+def _to_result(payload: dict, address: str) -> dict:
+    # `election` is real per the Discovery Document (VoterInfoResponse's
+    # top-level `election` field) — surfaced so the caller can disclose
+    # WHICH election these contests are actually for. Google auto-selects
+    # from its own index (no electionId passed), and that index only
+    # carries elections close to their own date, so what comes back could
+    # be an odd/off-cycle election, not necessarily this cycle's general.
+    election = payload.get("election") or {}
+    return {
+        "contests": _parse_contests(payload),
+        "address": address,
+        "election_name": _text(election, "name"),
+        "election_date": _text(election, "electionDay"),
+    }

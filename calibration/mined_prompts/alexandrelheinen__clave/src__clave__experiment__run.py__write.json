@@ -1,0 +1,28 @@
+{
+  "repo": "alexandrelheinen__clave",
+  "file": "src/clave/experiment/run.py",
+  "function": "write",
+  "line": 115,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Write the record as JSON.\n\nArgs:\n    path: Destination file.",
+  "prompt_source": "    def write(self, path: Path) -> None:\n        \"\"\"Write the record as JSON.\n\n        Args:\n            path: Destination file.\n        \"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    def write(self, path: Path) -> None:\n        \"\"\"Write the record as JSON.\n\n        Args:\n            path: Destination file.\n        \"\"\"\n        path.write_text(json.dumps(asdict(self), indent=2, sort_keys=True) + \"\\n\")",
+  "module_source": "\"\"\"The run record.\n\nA number nobody can trace to its inputs is an anecdote. A run record carries\nwhat produced a result: the seed, a digest of the configuration, the artifacts\nconsumed with the digests they had, and the environment that executed it.\n\nIt serializes as JSON so a later tool can read it without importing this\npackage, which matters because the tool comparing two runs may outlive the code\nthat wrote them.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nimport platform\nimport sys\nfrom dataclasses import asdict, dataclass, field\nfrom datetime import UTC, datetime\nfrom hashlib import sha256\nfrom importlib import metadata\nfrom pathlib import Path\nfrom typing import Any\n\nfrom clave.corpus.manifest import Manifest\nfrom clave.errors import UnknownArtifactError\n\n_TRACKED = (\"numpy\", \"torch\")\n\n\ndef config_digest(config: dict[str, Any]) -> str:\n    \"\"\"Digest a configuration so two identical ones are identifiable as such.\n\n    The serialization sorts keys, so key order cannot make two equivalent\n    configurations look different.\n\n    Args:\n        config: The configuration mapping.\n\n    Returns:\n        A lowercase hexadecimal SHA-256 digest.\n    \"\"\"\n    canonical = json.dumps(config, sort_keys=True, separators=(\",\", \":\"))\n    return sha256(canonical.encode()).hexdigest()\n\n\ndef environment() -> dict[str, str]:\n    \"\"\"Describe the interpreter and the declared dependencies present now.\n\n    Returns:\n        A mapping of component name to version. A dependency that is not\n        installed is reported as absent rather than omitted, so a reader can\n        tell the difference between \"not installed\" and \"not recorded\".\n    \"\"\"\n    env = {\n        \"python\": platform.python_version(),\n        \"platform\": platform.platform(),\n        \"implementation\": sys.implementation.name,\n    }\n    for name in _TRACKED:\n        try:\n            env[name] = metadata.version(name)\n        except metadata.PackageNotFoundError:\n            env[name] = \"absent\"\n    return env\n\n\n@dataclass(frozen=True)\nclass RunRecord:\n    \"\"\"Everything needed to trace a result back to what produced it.\"\"\"\n\n    seed: int\n    config_sha256: str\n    artifacts: dict[str, str | None]\n    environment: dict[str, str]\n    started_at: str = field(\n        default_factory=lambda: datetime.now(UTC).isoformat(timespec=\"seconds\")\n    )\n\n    @classmethod\n    def create(\n        cls,\n        seed: int,\n        config: dict[str, Any],\n        artifact_names: list[str],\n        manifest: Manifest,\n    ) -> RunRecord:\n        \"\"\"Build a record, refusing inputs the manifest cannot identify.\n\n        Args:\n            seed: The seed the run was executed with.\n            config: The run configuration.\n            artifact_names: Names of the corpus artifacts consumed.\n            manifest: The manifest those names must appear in.\n\n        Returns:\n            The run record.\n\n        Raises:\n            UnknownArtifactError: If any name is absent from the manifest. An\n                unidentifiable input makes the whole record untrustworthy, so\n                this fails before anything is written.\n        \"\"\"\n        unknown = [name for name in artifact_names if name not in manifest]\n        if unknown:\n            raise UnknownArtifactError(\n                f\"not described by the manifest: {', '.join(sorted(unknown))}\"\n            )\n        return cls(\n            seed=seed,\n            config_sha256=config_digest(config),\n            artifacts={name: manifest[name].sha256 for name in artifact_names},\n            environment=environment(),\n        )\n\n    def write(self, path: Path) -> None:\n        \"\"\"Write the record as JSON.\n\n        Args:\n            path: Destination file.\n        \"\"\"\n        path.write_text(json.dumps(asdict(self), indent=2, sort_keys=True) + \"\\n\")\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 7
+    },
+    "ai_commit": "f24169df4490",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 1.0,
+    "span": [
+      115,
+      121
+    ]
+  }
+}

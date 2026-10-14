@@ -1,0 +1,685 @@
+import pytest
+
+from PyQt5.QtCore import QPoint, QRect, Qt
+from PyQt5.QtGui import QColor
+from PyQt5.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QDialog,
+    QFrame,
+    QLabel,
+    QPushButton,
+    QScrollArea,
+    QWidget,
+)
+
+from mf4_analyzer.ui.channel_config import ChannelConfigPreview, ChannelSelectionConfig
+from mf4_analyzer.ui.channel_config_transfer import parse_transfer, serialize_transfer
+from mf4_analyzer.ui_kit.control_style import CONTROL_HEIGHTS
+from mf4_analyzer.ui_kit.dialog_geometry import (
+    SCREEN_MARGIN,
+    FrameInsets,
+    IntRect,
+    as_rect,
+)
+from mf4_analyzer.ui.widgets.channel_config_manager import ChannelConfigManagerDialog
+
+
+def _config(config_id, name, channels, units=None, updated="2026-07-21T10:00:00+00:00"):
+    return ChannelSelectionConfig.create(
+        config_id,
+        name,
+        channels,
+        now=updated,
+        channel_unit_hints=units or {},
+    )
+
+
+def _preview():
+    return ChannelConfigPreview(
+        target_file_count=3,
+        available_names=frozenset({"EPS_CRC", "Torque"}),
+        unit_hints=(("EPS_CRC", ""), ("Torque", "Nm")),
+        inconsistent_unit_names=frozenset({"Torque"}),
+    )
+
+
+def _dialog(qtbot, configs, selected_id=None, checked=None):
+    dialog = ChannelConfigManagerDialog(
+        configs,
+        selected_id=selected_id,
+        preview=_preview(),
+        checked_channel_hints=checked or {"EPS_CRC": "", "Torque": "Nm"},
+        id_factory=iter(("new-1", "new-2", "new-3", "new-4", "new-5")).__next__,
+    )
+    qtbot.addWidget(dialog)
+    # Dirty dialogs must not open a live modal during test teardown.
+    dialog._confirm_discard_changes = lambda: True
+    dialog.show()
+    return dialog
+
+
+def _patch_available_work_area(monkeypatch, width, height, *, insets=None):
+    monkeypatch.setattr(
+        "mf4_analyzer.ui_kit.dialog_geometry.resolve_available_rect",
+        lambda **_kwargs: IntRect(0, 0, int(width), int(height)),
+    )
+    frame = insets if insets is not None else FrameInsets()
+    monkeypatch.setattr(
+        "mf4_analyzer.ui_kit.dialog_geometry.frame_insets_of",
+        lambda _widget: frame,
+    )
+
+
+def _widget_rect_in(host, widget):
+    top_left = widget.mapTo(host, QPoint(0, 0))
+    return QRect(top_left, widget.size())
+
+
+def _assert_frame_in_safe_area(widget, available: IntRect):
+    safe = available.adjusted(
+        SCREEN_MARGIN, SCREEN_MARGIN, -SCREEN_MARGIN, -SCREEN_MARGIN
+    )
+    frame = as_rect(widget.frameGeometry())
+    assert safe.contains_rect(frame), f"{frame} not in safe {safe}"
+    assert widget.width() <= available.width - 2 * SCREEN_MARGIN
+    assert widget.height() <= available.height - 2 * SCREEN_MARGIN
+
+
+def test_manager_matches_html_sidebar_detail_and_preview_structure(qtbot):
+    dialog = _dialog(
+        qtbot,
+        [_config("drive", "动力分析", ("EPS_CRC", "Missing", "Torque"), {"Torque": "Nm"})],
+        "drive",
+    )
+
+    assert dialog.objectName() == "channelConfigManagerHtml"
+    assert dialog.sidebar.width() == 310
+    assert dialog.config_count.text() == "1"
+    assert dialog.config_row_widget("drive").name_label.text() == "动力分析"
+    assert dialog.config_row_widget("drive").count_label.text() == "3 CH"
+    assert dialog.channel_table.columnCount() == 5
+    assert dialog.channel_table.item(0, 1).text() == "EPS_CRC"
+    assert dialog.channel_table.item(1, 3).text().endswith("缺失")
+    assert dialog.channel_table.item(2, 2).text() == "Nm"
+    assert dialog.detail_meta.text().startswith("3 个通道 · 更新于")
+    assert dialog.match_chip.text().endswith("2 个已匹配")
+    assert dialog.missing_chip.text().endswith("1 个缺失")
+    assert dialog.btn_close.text() == "关闭"
+    assert dialog.btn_save.text() == "保存更改"
+    assert not hasattr(dialog, "config_table")
+
+
+def test_normal_config_switch_clears_channel_filter_and_selection(qtbot):
+    dialog = _dialog(
+        qtbot,
+        [_config("drive", "动力分析", ("EPS_CRC", "Torque")), _config("thermal", "温度", ("Temp",))],
+        "drive",
+    )
+    dialog.channel_search.setText("Torque")
+    dialog._set_channel_chosen("Torque", True)
+
+    dialog._on_config_row_clicked("thermal")
+
+    assert dialog.active_config_id == "thermal"
+    assert dialog.channel_search.text() == ""
+    assert dialog._chosen_channels == set()
+    assert dialog.detail_title.text() == "温度"
+
+
+@pytest.mark.parametrize("search_name", ["config_search", "channel_search"])
+def test_empty_search_escape_rejects_manager(qapp, qtbot, search_name):
+    from PyQt5.QtTest import QSignalSpy
+
+    dialog = _dialog(
+        qtbot,
+        [_config("drive", "动力分析", ("EPS_CRC", "Torque"))],
+        "drive",
+    )
+    search = getattr(dialog, search_name)
+    search.setFocus(Qt.OtherFocusReason)
+    qapp.processEvents()
+    rejected = QSignalSpy(dialog.rejected)
+
+    qtbot.keyClick(search, Qt.Key_Escape)
+    qapp.processEvents()
+
+    assert len(rejected) == 1
+    assert dialog.result() == QDialog.Rejected
+    assert not dialog.isVisible()
+
+
+def test_batch_selection_is_separate_from_active_config_and_exits_cleanly(qtbot):
+    dialog = _dialog(
+        qtbot,
+        [_config("drive", "动力分析", ("EPS_CRC",)), _config("thermal", "温度", ("Temp",))],
+        "drive",
+    )
+
+    dialog.btn_batch.click()
+    row = dialog.config_row_widget("thermal")
+    assert row is not None and row.checkbox is not None
+    qtbot.mouseClick(row.checkbox, Qt.LeftButton)
+
+    assert dialog.active_config_id == "drive"
+    assert dialog._batch_config_ids == {"thermal"}
+    assert dialog.btn_delete_configs.text() == "删除 1 个配置"
+    assert dialog.btn_batch.isHidden()
+    assert not dialog.batch_actions.isHidden()
+
+    dialog.btn_exit_batch.click()
+    assert dialog._batch_config_ids == set()
+    assert dialog.active_config_id == "drive"
+    assert not dialog.btn_batch.isHidden()
+
+
+def test_channel_selection_add_remove_and_undo_stay_in_draft(qtbot):
+    original = _config("drive", "动力分析", ("EPS_CRC", "Torque"), {"Torque": "Nm"})
+    dialog = _dialog(qtbot, [original], "drive", checked={"EPS_CRC": "", "Torque": "Nm", "New": "V"})
+
+    dialog._select_visible_channels()
+    assert dialog._chosen_channels == {"EPS_CRC", "Torque"}
+    assert dialog.btn_remove_channels.text() == "移除所选 2"
+    dialog._clear_channel_selection()
+    assert dialog._chosen_channels == set()
+    dialog._add_current_checked()
+    assert dialog.drafts[0].channel_names == ("EPS_CRC", "Torque", "New")
+
+    dialog._remove_channels(("EPS_CRC",))
+    assert dialog.drafts[0].channel_names == ("Torque", "New")
+    assert original.channel_names == ("EPS_CRC", "Torque")
+    assert dialog.toast.isVisible()
+    assert dialog.toast_action.isVisible()
+    dialog.toast_action.click()
+
+    assert dialog.drafts[0].channel_names == ("EPS_CRC", "Torque", "New")
+
+
+def test_new_copy_rename_and_delete_are_draft_only(qtbot, monkeypatch):
+    dialog = _dialog(
+        qtbot,
+        [_config("drive", "动力分析", ("EPS_CRC",)), _config("thermal", "温度", ("Temp",))],
+        "drive",
+    )
+    monkeypatch.setattr(dialog, "_open_rename_dialog", lambda: None)
+
+    dialog.btn_new.click()
+    assert dialog.active_config_id == "new-1"
+    assert dialog.drafts[0].name == "未命名配置"
+    assert dialog.drafts[0].channel_names == ("EPS_CRC", "Torque")
+    assert dialog._rename_active_to("转向基础") is True
+    dialog.btn_copy.click()
+    assert dialog.drafts[0].name == "转向基础 副本"
+
+    dialog.btn_delete_config.click()
+    assert [config.name for config in dialog.drafts] == ["转向基础", "动力分析", "温度"]
+    assert dialog.is_dirty() is True
+
+
+def test_import_export_and_one_save_signal_use_current_draft(qtbot):
+    dialog = _dialog(qtbot, [_config("drive", "动力分析", ("EPS_CRC",))], "drive")
+    imported = _config("incoming", "转向基础", ("Torque",), {"Torque": "Nm"})
+
+    result = dialog.import_payload(serialize_transfer([imported]), conflict_mode="keep")
+
+    assert result.imported_count == 1
+    assert [config.name for config in dialog.drafts] == ["动力分析", "转向基础"]
+    assert b'"config_id"' not in dialog.export_payload(current_only=False)
+    with qtbot.waitSignal(dialog.save_requested, timeout=200) as saved:
+        dialog.btn_save.click()
+    assert [item.name for item in saved.args[0]] == ["动力分析", "转向基础"]
+
+
+def test_import_preview_exposes_file_conflict_and_two_counts(qtbot):
+    dialog = _dialog(qtbot, [_config("drive", "动力分析", ("EPS_CRC",))], "drive")
+    incoming = _config("incoming", "动力分析", ("Torque",), {"Torque": "Nm"})
+
+    preview, conflict_mode = dialog._build_import_preview_dialog(
+        "shared.tracelab-config.json", parse_transfer(serialize_transfer([incoming]))
+    )
+    qtbot.addWidget(preview)
+
+    assert conflict_mode.currentData() == "keep"
+    file_meta = preview.findChild(QLabel, "channelConfigHtmlImportFile")
+    assert "shared.tracelab-config.json" in file_meta.text()
+    assert "1 个同名配置" in file_meta.text()
+    assert [label.text() for label in preview.findChildren(QLabel, "channelConfigHtmlImportStatValue")] == ["1", "1"]
+
+
+def test_empty_draft_config_cannot_emit_save_and_uses_toast_feedback(qtbot):
+    dialog = _dialog(qtbot, [_config("drive", "动力分析", ("EPS_CRC",))], "drive")
+    dialog._remove_channels(("EPS_CRC",))
+
+    with qtbot.assertNotEmitted(dialog.save_requested):
+        dialog.btn_save.click()
+    assert "没有通道" in dialog.toast_text.text()
+
+
+def test_dirty_reject_uses_one_confirm_seam(qtbot, monkeypatch):
+    dialog = _dialog(qtbot, [_config("drive", "动力分析", ("EPS_CRC",))], "drive")
+    monkeypatch.setattr(dialog, "_open_rename_dialog", lambda: None)
+    dialog.btn_new.click()
+    monkeypatch.setattr(dialog, "_confirm_discard_changes", lambda: False)
+
+    dialog.reject()
+    assert dialog.isVisible()
+
+    monkeypatch.setattr(dialog, "_confirm_discard_changes", lambda: True)
+    dialog.reject()
+    assert not dialog.isVisible()
+
+
+def test_manager_geometry_preserves_html_controls_at_minimum_size(qtbot, monkeypatch):
+    _patch_available_work_area(monkeypatch, 1920, 1080)
+    dialog = _dialog(
+        qtbot,
+        [_config("drive", "动力分析", ("EPS_CRC", "Torque", "Long_Channel_Name"))],
+        "drive",
+    )
+    assert dialog.size().width() == 1180
+    assert dialog.size().height() == 680
+
+    dialog.resize(940, 680)
+    qtbot.wait(20)
+
+    controls = (
+        dialog.btn_import,
+        dialog.btn_new,
+        dialog.btn_batch,
+        dialog.btn_export,
+        dialog.btn_rename,
+        dialog.btn_copy,
+        dialog.btn_delete_config,
+        dialog.btn_select_channels,
+        dialog.btn_clear_channels,
+        dialog.btn_remove_channels,
+        dialog.btn_add_current,
+        dialog.btn_close,
+        dialog.btn_save,
+    )
+    assert dialog.CONTROL_HEIGHT == CONTROL_HEIGHTS["base"]
+    assert all(control.height() == CONTROL_HEIGHTS["base"] for control in controls)
+    assert dialog.config_search.height() == CONTROL_HEIGHTS["base"]
+    assert dialog.channel_search.height() == CONTROL_HEIGHTS["base"]
+    assert dialog.sidebar.width() == 310
+    assert dialog.config_summary.height() == 28
+    assert dialog.view_summary.height() == 28
+    assert dialog.channel_table.columnWidth(1) >= 240
+    assert dialog.channel_table.rowHeight(0) == 49
+    assert dialog.btn_save.geometry().bottom() <= dialog.height() - 10
+
+
+@pytest.mark.parametrize("work", [(800, 600), (640, 360)])
+def test_manager_fits_compact_work_area_with_visible_actions(qtbot, monkeypatch, qapp, work):
+    width, height = work
+    _patch_available_work_area(monkeypatch, width, height)
+    dialog = _dialog(
+        qtbot,
+        [_config("drive", "动力分析", ("EPS_CRC", "Torque", "Long_Channel_Name"))],
+        "drive",
+    )
+    qtbot.waitExposed(dialog)
+    qapp.processEvents()
+
+    available = IntRect(0, 0, width, height)
+    _assert_frame_in_safe_area(dialog, available)
+    assert dialog.minimumWidth() <= dialog.width()
+    assert dialog.minimumHeight() <= dialog.height()
+    assert isinstance(dialog.body_scroll, QScrollArea)
+    assert dialog.channel_table.verticalScrollBarPolicy() != Qt.ScrollBarAlwaysOff
+    assert dialog.config_scroll is not None
+
+    assert dialog.btn_save.isVisible()
+    assert dialog.btn_close.isVisible()
+    host = dialog.rect()
+    save_rect = _widget_rect_in(dialog, dialog.btn_save)
+    close_rect = _widget_rect_in(dialog, dialog.btn_close)
+    assert host.contains(save_rect)
+    assert host.contains(close_rect)
+    assert save_rect.width() > 0 and save_rect.height() > 0
+    assert close_rect.width() > 0 and close_rect.height() > 0
+    assert dialog.btn_save.height() == CONTROL_HEIGHTS["base"]
+    assert dialog.btn_close.height() == CONTROL_HEIGHTS["base"]
+
+
+def test_inline_dialogs_fit_injected_compact_budget(qtbot, monkeypatch, qapp):
+    _patch_available_work_area(monkeypatch, 640, 360)
+    dialog = _dialog(
+        qtbot,
+        [_config("drive", "动力分析", ("EPS_CRC", "Torque"))],
+        "drive",
+    )
+    qtbot.waitExposed(dialog)
+    qapp.processEvents()
+    available = IntRect(0, 0, 640, 360)
+    incoming = _config("incoming", "动力分析", ("Torque",), {"Torque": "Nm"})
+
+    rename, edit = dialog._build_rename_dialog("动力分析")
+    qtbot.addWidget(rename)
+    rename.show()
+    qtbot.waitExposed(rename)
+    qapp.processEvents()
+    _assert_frame_in_safe_area(rename, available)
+    confirm = next(btn for btn in rename.findChildren(QPushButton) if btn.text() == "保存名称")
+    cancel = next(btn for btn in rename.findChildren(QPushButton) if btn.text() == "取消")
+    _assert_unique_default(rename, confirm)
+    assert rename.rect().contains(_widget_rect_in(rename, confirm))
+    assert rename.rect().contains(_widget_rect_in(rename, cancel))
+    assert edit.returnPressed is not None
+
+    preview, combo = dialog._build_import_preview_dialog(
+        "shared.tracelab-config.json", parse_transfer(serialize_transfer([incoming]))
+    )
+    qtbot.addWidget(preview)
+    preview.show()
+    qtbot.waitExposed(preview)
+    qapp.processEvents()
+    _assert_frame_in_safe_area(preview, available)
+    assert preview.minimumWidth() <= preview.width() <= 640 - 2 * SCREEN_MARGIN
+    import_confirm = next(
+        btn for btn in preview.findChildren(QPushButton) if btn.text() == "导入配置"
+    )
+    import_cancel = next(
+        btn for btn in preview.findChildren(QPushButton) if btn.text() == "取消"
+    )
+    _assert_unique_default(preview, import_confirm)
+    assert preview.rect().contains(_widget_rect_in(preview, import_confirm))
+    assert preview.rect().contains(_widget_rect_in(preview, import_cancel))
+    assert combo.currentData() == "keep"
+
+    discard = dialog._build_discard_dialog()
+    qtbot.addWidget(discard)
+    discard.show()
+    qtbot.waitExposed(discard)
+    qapp.processEvents()
+    _assert_frame_in_safe_area(discard, available)
+    keep = next(btn for btn in discard.findChildren(QPushButton) if btn.text() == "继续编辑")
+    abandon = next(btn for btn in discard.findChildren(QPushButton) if btn.text() == "放弃修改")
+    _assert_unique_default(discard, keep)
+    assert not abandon.isDefault()
+    assert abandon.autoDefault() is False
+    assert discard.rect().contains(_widget_rect_in(discard, keep))
+    assert discard.rect().contains(_widget_rect_in(discard, abandon))
+
+
+def test_manager_ordinary_controls_render_on_base_track_with_production_qss(qapp, qtbot):
+    from mf4_analyzer.ui_kit import load_stylesheet
+
+    previous = qapp.styleSheet()
+    load_stylesheet(qapp)
+    try:
+        dialog = _dialog(
+            qtbot,
+            [_config("drive", "动力分析", ("EPS_CRC", "Torque", "Long_Channel_Name"))],
+            "drive",
+        )
+        qtbot.wait(20)
+        controls = {
+            "import": dialog.btn_import,
+            "new": dialog.btn_new,
+            "batch": dialog.btn_batch,
+            "export": dialog.btn_export,
+            "rename": dialog.btn_rename,
+            "copy": dialog.btn_copy,
+            "delete": dialog.btn_delete_config,
+            "select": dialog.btn_select_channels,
+            "clear": dialog.btn_clear_channels,
+            "remove": dialog.btn_remove_channels,
+            "add": dialog.btn_add_current,
+            "close": dialog.btn_close,
+            "save": dialog.btn_save,
+            "config search": dialog.config_search,
+            "channel search": dialog.channel_search,
+        }
+        assert {name: control.height() for name, control in controls.items()} == {
+            name: CONTROL_HEIGHTS["base"] for name in controls
+        }
+    finally:
+        qapp.setStyleSheet(previous)
+
+
+def test_manager_search_icons_stay_transparent_chips_under_qss(qapp, qtbot):
+    """Dialog-wide QToolButton chrome must not paint white pills in SearchField."""
+    from mf4_analyzer.ui_kit import load_stylesheet
+
+    previous = qapp.styleSheet()
+    load_stylesheet(qapp)
+    try:
+        dialog = _dialog(
+            qtbot,
+            [_config("drive", "动力分析", ("EPS_CRC", "Torque"))],
+            "drive",
+        )
+        qtbot.waitExposed(dialog)
+        qapp.processEvents()
+
+        for field in (dialog.config_search, dialog.channel_search):
+            search = field._search_button
+            clear = field._clear_button
+            assert search.objectName() == "searchFieldIconButton"
+            assert search.width() == 18
+            assert search.height() == 18
+            assert search.x() < 12
+            assert not clear.isVisible()
+            assert search.autoRaise()
+    finally:
+        qapp.setStyleSheet(previous)
+
+
+def test_manager_export_menu_uses_rounded_popup_shell(qapp, qtbot):
+    from PyQt5.QtCore import Qt
+    from mf4_analyzer.ui_kit import load_stylesheet
+    from mf4_analyzer.ui_kit.popup_shell import POPUP_SHELL_FLAGS
+
+    previous = qapp.styleSheet()
+    load_stylesheet(qapp)
+    try:
+        dialog = _dialog(
+            qtbot,
+            [_config("drive", "动力分析", ("EPS_CRC",))],
+            "drive",
+        )
+        menu = dialog.btn_export.menu()
+        assert menu is not None
+        assert menu.testAttribute(Qt.WA_TranslucentBackground)
+        assert (menu.windowFlags() & POPUP_SHELL_FLAGS) == POPUP_SHELL_FLAGS
+        labels = [action.text() for action in menu.actions() if action.text()]
+        assert labels == ["导出当前配置", "导出全部配置"]
+    finally:
+        qapp.setStyleSheet(previous)
+
+
+def test_manager_channel_checkboxes_align_with_name_column_under_qss(qapp, qtbot):
+    from mf4_analyzer.ui_kit import load_stylesheet
+
+    previous = qapp.styleSheet()
+    load_stylesheet(qapp)
+    try:
+        dialog = _dialog(
+            qtbot,
+            [_config("drive", "动力分析", ("EPS_CRC", "speed"))],
+            "drive",
+        )
+        qtbot.waitExposed(dialog)
+        qapp.processEvents()
+
+        header_check = dialog.master_channel
+        header_name = dialog.channel_name_header
+        header_check_c = header_check.mapTo(dialog, header_check.rect().center())
+        header_name_c = header_name.mapTo(dialog, header_name.rect().center())
+        assert abs(header_check_c.y() - header_name_c.y()) <= 3
+
+        cell = dialog.channel_table.cellWidget(0, 0)
+        check = cell.findChild(QCheckBox)
+        viewport = dialog.channel_table.viewport()
+        name_rect = dialog.channel_table.visualRect(
+            dialog.channel_table.model().index(0, 1)
+        )
+        check_c = check.mapTo(viewport, check.rect().center())
+        assert abs(check_c.y() - name_rect.center().y()) <= 3
+
+        row_check_c = check.mapTo(dialog, check.rect().center())
+        assert abs(header_check_c.x() - row_check_c.x()) <= 3
+        assert header_check.width() == 20
+        assert check.width() == 20
+
+        head = dialog.findChild(QFrame, "channelConfigHtmlChannelHead")
+        host = dialog.findChild(QWidget, "channelConfigHtmlCheckHost")
+        assert head is not None
+        assert host is not None
+        image = head.grab().toImage()
+        sample = host.mapTo(head, QPoint(1, host.height() // 2))
+        pixel = QColor(image.pixel(sample.x(), sample.y()))
+        header_bg = QColor("#f8fafc")
+        assert pixel.name() != "#ffffff"
+        assert abs(pixel.red() - header_bg.red()) <= 12
+        assert abs(pixel.green() - header_bg.green()) <= 12
+        assert abs(pixel.blue() - header_bg.blue()) <= 12
+    finally:
+        qapp.setStyleSheet(previous)
+
+
+def test_channel_checkbox_cell_remains_centered_for_selected_rows(qtbot):
+    dialog = _dialog(qtbot, [_config("drive", "动力分析", ("EPS_CRC", "Torque"))], "drive")
+    dialog._set_channel_chosen("Torque", True)
+
+    selected_cell = dialog.channel_table.cellWidget(1, 0)
+    check = selected_cell.findChild(QCheckBox)
+    assert check.isChecked()
+    assert abs(check.geometry().center().x() - selected_cell.rect().center().x()) <= 1
+    assert selected_cell.property("chosen") is True
+
+
+def _assert_unique_default(dialog, confirm):
+    from PyQt5.QtWidgets import QPushButton
+
+    defaults = [btn for btn in dialog.findChildren(QPushButton) if btn.isDefault()]
+    assert defaults == [confirm], (
+        f"expected unique default {confirm.text()!r}, got "
+        f"{[btn.text() for btn in defaults]}"
+    )
+    for btn in dialog.findChildren(QPushButton):
+        if btn is confirm:
+            continue
+        assert btn.autoDefault() is False, (
+            f"{btn.text()!r} must not be autoDefault when {confirm.text()!r} is default"
+        )
+
+
+def test_channel_config_manager_has_one_explicit_save_default(qtbot):
+    dialog = _dialog(
+        qtbot,
+        [_config("drive", "动力分析", ("EPS_CRC", "Torque"))],
+        "drive",
+    )
+    _assert_unique_default(dialog, dialog.btn_save)
+    assert dialog.btn_import.autoDefault() is False
+
+
+def test_dangerous_confirmation_escape_and_return_are_safe(qapp, qtbot):
+    from PyQt5.QtCore import QTimer, Qt
+    from PyQt5.QtTest import QSignalSpy
+
+    dialog = ChannelConfigManagerDialog(
+        [_config("drive", "动力分析", ("EPS_CRC",))],
+        selected_id="drive",
+        preview=_preview(),
+        id_factory=iter(("new-1", "new-2")).__next__,
+    )
+    qtbot.addWidget(dialog)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+    dialog.btn_copy.click()
+    qapp.processEvents()
+    assert dialog.is_dirty()
+    drafts_before = dialog.drafts
+    save_spy = QSignalSpy(dialog.save_requested)
+
+    for key in (Qt.Key_Escape, Qt.Key_Return):
+        seen = {}
+
+        def _inspect_and_key(target_key=key, bucket=seen):
+            box = next(
+                widget
+                for widget in dialog.findChildren(QDialog)
+                if widget.objectName() == "channelConfigHtmlDiscardDialog"
+                and widget.isVisible()
+            )
+            keep = next(
+                btn for btn in box.findChildren(QPushButton) if btn.text() == "继续编辑"
+            )
+            discard = next(
+                btn for btn in box.findChildren(QPushButton) if btn.text() == "放弃修改"
+            )
+            bucket["keep_default"] = keep.isDefault()
+            bucket["discard_default"] = discard.isDefault()
+            bucket["discard_auto"] = discard.autoDefault()
+            qtbot.keyClick(box, target_key)
+
+        QTimer.singleShot(0, _inspect_and_key)
+        dialog.reject()
+        qapp.processEvents()
+        assert seen.get("keep_default")
+        assert not seen.get("discard_default")
+        assert seen.get("discard_auto") is False
+        assert dialog.isVisible()
+        assert dialog.is_dirty()
+        assert dialog.drafts == drafts_before
+        assert len(save_spy) == 0
+
+    dialog._confirm_discard_changes = lambda: True
+
+
+def test_channel_table_space_and_delete_modify_draft_only(qapp, qtbot):
+    original = _config("drive", "动力分析", ("EPS_CRC", "Torque", "Temp"))
+    dialog = _dialog(
+        qtbot,
+        [original, _config("thermal", "温度", ("Temp",))],
+        "drive",
+    )
+    qtbot.waitExposed(dialog)
+    table = dialog.channel_table
+    row = dialog.config_row_widget("drive")
+    check = table.cellWidget(0, 0).findChild(QCheckBox)
+    baseline = dialog.drafts
+
+    assert table.focusPolicy() & Qt.TabFocus
+    assert table.selectionMode() != 0
+    assert row is not None
+    assert row.focusPolicy() & Qt.TabFocus
+    assert row.accessibleName() == "动力分析"
+    assert check is not None
+    assert check.focusPolicy() & Qt.TabFocus
+    assert check.isChecked() is False
+    assert dialog.master_channel.focusPolicy() & Qt.TabFocus
+
+    table.setCurrentCell(0, 1)
+    table.setFocus(Qt.TabFocusReason)
+    qapp.processEvents()
+    qtbot.keyClick(table, Qt.Key_Space)
+    qapp.processEvents()
+
+    assert dialog._chosen_channels == {"EPS_CRC"}
+    assert dialog.drafts == baseline
+    assert original.channel_names == ("EPS_CRC", "Torque", "Temp")
+    assert dialog.is_dirty() is False
+
+    table.setCurrentCell(0, 1)
+    table.setFocus(Qt.TabFocusReason)
+    qapp.processEvents()
+    qtbot.keyClick(table, Qt.Key_Delete)
+    qapp.processEvents()
+
+    assert dialog.drafts[0].config_id == "drive"
+    assert dialog.drafts[0].channel_names == ("Torque", "Temp")
+    assert original.channel_names == ("EPS_CRC", "Torque", "Temp")
+    assert dialog.is_dirty() is True
+    assert dialog.btn_save.isDefault()
+
+    dialog.config_search.setFocus(Qt.TabFocusReason)
+    qapp.processEvents()
+    before = dialog.drafts[0].channel_names
+    qtbot.keyClick(dialog.config_search, Qt.Key_Delete)
+    qapp.processEvents()
+    assert dialog.drafts[0].channel_names == before
+    assert QApplication.focusWidget() is dialog.config_search or dialog.config_search.hasFocus()

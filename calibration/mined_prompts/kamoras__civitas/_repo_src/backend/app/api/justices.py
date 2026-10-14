@@ -1,0 +1,73 @@
+"""Supreme Court justice API endpoints."""
+
+import asyncio
+import logging
+
+from fastapi import APIRouter, Depends, Header, HTTPException
+from sqlalchemy.orm import Session
+
+from app.api.auth import check_pipeline_token
+from app.database import SessionLocal, get_db
+from app.api.response_helpers import (
+    CACHE_TTL_DETAIL_S,
+    CACHE_TTL_LIST_S,
+    cached_json as _cached_json,
+)
+from app.services.justice_service import (
+    get_all_justices,
+    get_justice,
+    get_justice_leaderboard,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/justices")
+
+
+@router.get("/leaderboard")
+def leaderboard(db: Session = Depends(get_db)):
+    """All sitting justices, by seniority: not ranked or scored (justice v3)."""
+    data = get_justice_leaderboard(db)
+    return _cached_json([e.model_dump(by_alias=True) for e in data], max_age=CACHE_TTL_LIST_S)
+
+
+@router.post("/pipeline/trigger")
+async def trigger_pipeline(authorization: str | None = Header(default=None)):
+    """Trigger a justice data pipeline run (fetches from Oyez API)."""
+    check_pipeline_token(authorization)
+
+    from app.background import start_writer
+
+    start_writer(_run_pipeline_background, name="justice-pipeline")
+    return {"status": "started", "message": "Justice pipeline triggered"}
+
+
+def _run_pipeline_background():
+    from app.pipeline import lease
+    from app.pipeline.justice_pipeline import run_justice_pipeline
+
+    db = SessionLocal()
+    try:
+        with lease.job(lease.JUSTICE_PIPELINE) as held:
+            if held:
+                asyncio.run(run_justice_pipeline(db))
+    except Exception as e:
+        logger.error("Justice pipeline failed: %s", e, exc_info=True)
+    finally:
+        db.close()
+
+
+@router.get("/{justice_id}")
+def detail(justice_id: str, db: Session = Depends(get_db)):
+    """Single justice detail by id (the Oyez slug)."""
+    result = get_justice(db, justice_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Justice not found")
+    return _cached_json(result.model_dump(by_alias=True), max_age=CACHE_TTL_DETAIL_S)
+
+
+@router.get("")
+def list_all(db: Session = Depends(get_db)):
+    """All active justices."""
+    data = get_all_justices(db)
+    return _cached_json([j.model_dump(by_alias=True) for j in data], max_age=CACHE_TTL_LIST_S)

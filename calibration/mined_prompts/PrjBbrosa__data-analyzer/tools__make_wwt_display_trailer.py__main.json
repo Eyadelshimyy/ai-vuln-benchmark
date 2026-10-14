@@ -1,0 +1,28 @@
+{
+  "repo": "PrjBbrosa__data-analyzer",
+  "file": "tools/make_wwt_display_trailer.py",
+  "function": "main",
+  "line": 29,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function (parameters: argv).",
+  "prompt_source": "def main(argv: list[str]) -> int:\n    \"\"\"Implement the `main` function (parameters: argv).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main(argv: list[str]) -> int:\n    src = Path(argv[1]) if len(argv) > 1 else DEFAULT_SRC\n    if not src.is_file():\n        print(f\"\u627e\u4e0d\u5230\u6e90\u6587\u4ef6: {src}\uff08testdoc \u6837\u672c\u4e0d\u5165\u5e93\uff09\")\n        return 1\n    data = src.read_bytes()\n    start = disp.find_trailer(data)\n    if start < 0:\n        print(f\"{src} \u6ca1\u6709 DatenFenste \u5c3e\u5757\")\n        return 1\n    trailer = data[start:]\n    before = disp.read_display_text(trailer)\n    trailer = disp.set_display_text(\n        trailer, title=\"\", comment=\"\", annotations=(), editor=\"TraceLab\",\n    )\n    after = disp.read_display_text(trailer)\n\n    DEST.parent.mkdir(parents=True, exist_ok=True)\n    DEST.write_bytes(trailer)\n    print(f\"\u6e90: {src.name}  \u5c3e\u5757 {len(trailer)} B  \"\n          f\"\u66f2\u7ebf\u8868 {disp.declared_record_count(trailer, 0)} \u6761\u8bb0\u5f55\")\n    print(f\"\u2192 {DEST.relative_to(ROOT)}\")\n    print(\"\u6e05\u7a7a\u7684\u4f1a\u8bdd\u6587\u672c:\")\n    for line in before[\"annotations\"]:\n        if line:\n            print(f\"  - {line[:70]!r}\")\n    for key in (\"title\", \"comment\", \"editor\"):\n        if before[key]:\n            print(f\"  {key}: {before[key]!r} \u2192 {after[key]!r}\")\n    return 0",
+  "module_source": "#!/usr/bin/env python3\n\"\"\"\u751f\u6210 clean-room \u5bfc\u51fa\u7528\u7684 WinWert \u663e\u793a\u5c3e\u5757\u8d44\u6e90\u3002\n\n\u6765\u6e90\u662f **WinWert \u81ea\u5df1\u5199\u7684\u6587\u4ef6**\uff1a\u7528\u6237\u7528 WinWert \u76f4\u63a5\u628a ``.mat`` \u5bfc\u6210 ``.wwt``\n\uff08`testdoc/exporttowwt/175rpm_-45deg-270tighten.wwt`\uff09\u3002\u90a3\u4efd\u6587\u4ef6\u7684\u6b63\u6587\u6b63\u662f\nclean-room \u5f62\u72b6\uff08``Zeit`` + N\u00d7``Real`` float64\uff09\uff0c\u6240\u4ee5\u5b83\u7684 ``DatenFenste2``\n\u5c3e\u5757\u662f\u300cWinWert \u4e3a\u8fd9\u79cd\u6b63\u6587\u5199\u7684\u663e\u793a\u914d\u7f6e\u300d\u2014\u2014\u62ff\u5b83\u5f53\u9aa8\u67b6\uff0c\u9a8c\u8bc1\u7ed3\u8bba\u53ef\u4ee5\u76f4\u63a5\u8fc1\u79fb\u3002\n\n\u62bd\u53d6\u65f6\u628a\u6e90\u6587\u4ef6\u7684\u4f1a\u8bdd\u6587\u672c\u6e05\u7a7a\uff08\u9875\u811a\u6ce8\u91ca / \u6807\u9898 / \u6ce8\u91ca / \u7f72\u540d\uff09\uff0c\u8d44\u6e90\u672c\u8eab\u4e0d\u5e26\n\u4efb\u4f55\u5ba2\u6237\u7684\u53f0\u67b6\u7f16\u53f7\u3001\u8bd5\u9a8c\u89c4\u8303\u6216\u64cd\u4f5c\u5458\u59d3\u540d\uff1b\u6bcf\u6b21\u5bfc\u51fa\u518d\u5199\u5165\u672c\u6b21\u7684\u6807\u9898\u4e0e\u6ce8\u91ca\u3002\n\nUsage:\n    PYTHONPATH=. .venv/bin/python tools/make_wwt_display_trailer.py [\u6e90.wwt]\n\"\"\"\nfrom __future__ import annotations\n\nimport sys\nfrom pathlib import Path\n\nROOT = Path(__file__).resolve().parents[1]\nsys.path.insert(0, str(ROOT))\n\nfrom mf4_analyzer.io import wwt_display as disp\n\nDEFAULT_SRC = ROOT / \"testdoc\" / \"exporttowwt\" / \"175rpm_-45deg-270tighten.wwt\"\nDEST = ROOT / \"assets\" / \"wwt\" / \"winwert_display_trailer.bin\"\n\n\ndef main(argv: list[str]) -> int:\n    src = Path(argv[1]) if len(argv) > 1 else DEFAULT_SRC\n    if not src.is_file():\n        print(f\"\u627e\u4e0d\u5230\u6e90\u6587\u4ef6: {src}\uff08testdoc \u6837\u672c\u4e0d\u5165\u5e93\uff09\")\n        return 1\n    data = src.read_bytes()\n    start = disp.find_trailer(data)\n    if start < 0:\n        print(f\"{src} \u6ca1\u6709 DatenFenste \u5c3e\u5757\")\n        return 1\n    trailer = data[start:]\n    before = disp.read_display_text(trailer)\n    trailer = disp.set_display_text(\n        trailer, title=\"\", comment=\"\", annotations=(), editor=\"TraceLab\",\n    )\n    after = disp.read_display_text(trailer)\n\n    DEST.parent.mkdir(parents=True, exist_ok=True)\n    DEST.write_bytes(trailer)\n    print(f\"\u6e90: {src.name}  \u5c3e\u5757 {len(trailer)} B  \"\n          f\"\u66f2\u7ebf\u8868 {disp.declared_record_count(trailer, 0)} \u6761\u8bb0\u5f55\")\n    print(f\"\u2192 {DEST.relative_to(ROOT)}\")\n    print(\"\u6e05\u7a7a\u7684\u4f1a\u8bdd\u6587\u672c:\")\n    for line in before[\"annotations\"]:\n        if line:\n            print(f\"  - {line[:70]!r}\")\n    for key in (\"title\", \"comment\", \"editor\"):\n        if before[key]:\n            print(f\"  {key}: {before[key]!r} \u2192 {after[key]!r}\")\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main(sys.argv))\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 30
+    },
+    "ai_commit": "de63f76a4772",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 1.0,
+    "span": [
+      29,
+      58
+    ]
+  }
+}

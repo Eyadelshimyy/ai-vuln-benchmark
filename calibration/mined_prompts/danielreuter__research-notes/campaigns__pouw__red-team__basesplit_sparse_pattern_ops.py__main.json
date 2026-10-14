@@ -1,0 +1,28 @@
+{
+  "repo": "danielreuter__research-notes",
+  "file": "campaigns/pouw/red-team/basesplit_sparse_pattern_ops.py",
+  "function": "main",
+  "line": 17,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main():\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main():\n    ap = argparse.ArgumentParser()\n    ap.add_argument(\"--src\", required=True, help=\"an ops/<family> directory from basesplit_e2e_rows.py\")\n    ap.add_argument(\"--out\", required=True)\n    a = ap.parse_args()\n    M, N, K = map(int, open(os.path.join(a.src, \"dims.txt\")).read().split())\n    rng = np.random.default_rng(12)\n    nonzero = np.array([c for c in range(16) if c & 7], dtype=np.uint8)\n    for name, kept in ((\"pairs2\", 2), (\"pairs1\", 1)):\n        d = os.path.join(a.out, name)\n        os.makedirs(d, exist_ok=True)\n        codes = np.zeros((M, K // 8, 4, 2), dtype=np.uint8)\n        for i in range(M):\n            for c in range(K // 8):\n                for p in rng.choice(4, kept, replace=False):\n                    codes[i, c, p] = rng.choice(nonzero, 2)\n        codes = codes.reshape(M, K)\n        codes.tofile(os.path.join(d, \"A.codes\"))\n        codes.tofile(os.path.join(d, \"DA.codes\"))\n        for f in (\"dims.txt\", \"A.scales\", \"B.codes\", \"B.scales\", \"split.npz\"):\n            shutil.copy(os.path.join(a.src, f), d)\n        np.zeros((M, N), np.float32).tofile(os.path.join(d, \"C.f32\"))",
+  "module_source": "\"\"\"Operand sets that isolate the sparse kernel's correctness from the base split's \u0394A (for `basesplit_e2e_sm120.cu check`).\n\n  pairs2: every 8-chunk has exactly two of its four aligned pairs nonzero (both codes of each kept pair nonzero), at\n          random pair positions: the most the hardware's sparse rule allows.\n  pairs1: every 8-chunk has exactly one nonzero pair, at a random position: the shape of the split's \u0394A, which sits\n          almost entirely on pair 0 (the sample positions at block offsets 0 and 8).\nA.codes = DA.codes, so the dense and sparse variants compute the same product and each is checked against the exact sum.\nScales and B are the flat family's own (`basesplit_e2e_rows.py`), so the exponent bookkeeping (split.npz) carries over.\n\"\"\"\nimport argparse\nimport os\nimport shutil\n\nimport numpy as np\n\n\ndef main():\n    ap = argparse.ArgumentParser()\n    ap.add_argument(\"--src\", required=True, help=\"an ops/<family> directory from basesplit_e2e_rows.py\")\n    ap.add_argument(\"--out\", required=True)\n    a = ap.parse_args()\n    M, N, K = map(int, open(os.path.join(a.src, \"dims.txt\")).read().split())\n    rng = np.random.default_rng(12)\n    nonzero = np.array([c for c in range(16) if c & 7], dtype=np.uint8)\n    for name, kept in ((\"pairs2\", 2), (\"pairs1\", 1)):\n        d = os.path.join(a.out, name)\n        os.makedirs(d, exist_ok=True)\n        codes = np.zeros((M, K // 8, 4, 2), dtype=np.uint8)\n        for i in range(M):\n            for c in range(K // 8):\n                for p in rng.choice(4, kept, replace=False):\n                    codes[i, c, p] = rng.choice(nonzero, 2)\n        codes = codes.reshape(M, K)\n        codes.tofile(os.path.join(d, \"A.codes\"))\n        codes.tofile(os.path.join(d, \"DA.codes\"))\n        for f in (\"dims.txt\", \"A.scales\", \"B.codes\", \"B.scales\", \"split.npz\"):\n            shutil.copy(os.path.join(a.src, f), d)\n        np.zeros((M, N), np.float32).tofile(os.path.join(d, \"C.f32\"))\n\n\nif __name__ == \"__main__\":\n    main()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 22
+    },
+    "ai_commit": "ebba7c7ae1a7",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      17,
+      38
+    ]
+  }
+}

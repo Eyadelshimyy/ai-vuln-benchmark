@@ -1,0 +1,663 @@
+"""
+Whisper.cpp model information and hardware detection for Vocalinux.
+
+This module provides model metadata and hardware acceleration detection
+for whisper.cpp, supporting Vulkan, CUDA, and CPU backends.
+"""
+
+import logging
+import math
+import os
+import re
+import subprocess
+from functools import lru_cache
+from typing import Optional
+
+from .host_process import host_env
+from .model_checksums import whispercpp_revision
+from .paths import is_within_directory, models_dir
+
+logger = logging.getLogger(__name__)
+
+# Whisper.cpp model information
+# Models are downloaded from Hugging Face (ggml format).
+#
+# The revision is pinned rather than tracking `main`: model_checksums.txt holds a
+# sha256 per file, and a file replaced upstream would turn every download into a
+# checksum failure. Both the pin and the digests are refreshed together by
+# scripts/generate-model-checksums.py.
+_WHISPERCPP_REPO_SLUG = "ggerganov/whisper.cpp"
+_WHISPERCPP_REPO = f"https://huggingface.co/{_WHISPERCPP_REPO_SLUG}/resolve"
+
+# TinyDiarize (tdrz) ships from its own upstream repository — the main one
+# carries only dictation weights. The repo is static since 2023, so the
+# commit is pinned here rather than in model_checksums.txt like the others.
+_TDRZ_REPO = "akashmjn/tinydiarize-whisper.cpp"
+_TDRZ_REVISION = "d44ba793fc67e509623a88a409723311fa677744"
+
+#: Catalog model for speaker-turn diarization. TinyDiarize emits
+#: ``[SPEAKER_TURN]`` markup rather than plain text, so it is fetchable through
+#: the catalog but must never be offered or accepted as a dictation model:
+#: bracketed tokens would type noise into the focused window.
+TDRZ_MODEL = "small.en-tdrz"
+
+#: whisper.cpp catalog models that are not usable for keystroke dictation.
+NON_DICTATION_MODELS = frozenset({TDRZ_MODEL})
+
+
+def whispercpp_model_file(model_name: str) -> str:
+    """Return the ggml file name upstream publishes for ``model_name``.
+
+    "large" is an alias the UI offers; upstream only ships the versioned file.
+    """
+    file_model_name = "large-v3" if model_name == "large" else model_name
+    return f"ggml-{file_model_name}.bin"
+
+
+def _model_url(model_name: str) -> str:
+    """Build the Hugging Face URL for a ggml whisper.cpp model."""
+    if model_name in NON_DICTATION_MODELS:
+        repo, revision = _WHISPERCPP_SIDE_SOURCES[model_name]
+        return (
+            f"https://huggingface.co/{repo}/resolve/{revision}/{whispercpp_model_file(model_name)}"
+        )
+    return f"{_WHISPERCPP_REPO}/{whispercpp_revision()}/{whispercpp_model_file(model_name)}"
+
+
+_WHISPERCPP_MODEL_SPECS = [
+    ("tiny", 74, "39M", "Fastest, lowest accuracy"),
+    ("tiny.en", 74, "39M", "English-only tiny model"),
+    ("tiny-q5_1", 15, "39M", "Quantized tiny model, lowest memory"),
+    ("tiny.en-q5_1", 15, "39M", "Quantized English-only tiny model"),
+    ("tiny-q8_0", 32, "39M", "Q8 quantized tiny model"),
+    ("base", 141, "74M", "Fast, good for basic use"),
+    ("base.en", 141, "74M", "English-only base model"),
+    ("base-q5_1", 60, "74M", "Quantized base model, lower memory"),
+    ("base.en-q5_1", 60, "74M", "Quantized English-only base model"),
+    ("base-q8_0", 82, "74M", "Q8 quantized base model"),
+    ("small", 465, "244M", "Balanced speed/accuracy"),
+    ("small.en", 465, "244M", "English-only small model"),
+    ("small-q5_1", 163, "244M", "Quantized small model, lower memory"),
+    ("small.en-q5_1", 163, "244M", "Quantized English-only small model"),
+    ("small-q8_0", 190, "244M", "Q8 quantized small model"),
+    ("medium", 1463, "769M", "High accuracy, slower"),
+    ("medium.en", 1463, "769M", "English-only medium model"),
+    ("medium-q5_0", 568, "769M", "Quantized medium model, lower memory"),
+    ("medium.en-q5_0", 568, "769M", "Quantized English-only medium model"),
+    ("medium-q8_0", 823, "769M", "Q8 quantized medium model"),
+    ("large-v1", 2952, "1550M", "Legacy large v1 model"),
+    ("large-v2", 2952, "1550M", "Legacy large v2 model"),
+    ("large-v2-q5_0", 1170, "1550M", "Quantized large v2 model, lower memory"),
+    ("large-v2-q8_0", 1660, "1550M", "Q8 quantized large v2 model"),
+    ("large", 2952, "1550M", "Highest accuracy, maps to large v3"),
+    ("large-v3-q5_0", 1170, "1550M", "Quantized large v3 model, lower memory"),
+    ("large-v3-turbo", 1620, "809M", "High accuracy, lower memory than large"),
+    ("large-v3-turbo-q5_0", 574, "809M", "Quantized large v3 Turbo model"),
+    ("large-v3-turbo-q8_0", 874, "809M", "Q8 quantized large v3 Turbo model"),
+    ("small.en-tdrz", 465, "244M", "TinyDiarize speaker-turn model, English-only"),
+]
+
+#: Repository ``(slug, pinned_revision)`` for catalog models hosted outside the
+#: main whisper.cpp repository. Keyed by model name; also drives
+#: :func:`whispercpp_model_source`.
+_WHISPERCPP_SIDE_SOURCES = {
+    TDRZ_MODEL: (_TDRZ_REPO, _TDRZ_REVISION),
+}
+
+WHISPERCPP_MODEL_INFO = {
+    spec[0]: {
+        "size_mb": spec[1],
+        "params": spec[2],
+        "desc": spec[3],
+        "url": _model_url(spec[0]),
+    }
+    for spec in _WHISPERCPP_MODEL_SPECS
+}
+
+# Available models list
+AVAILABLE_MODELS = list(WHISPERCPP_MODEL_INFO.keys())
+
+MODEL_SIZES = ["tiny", "base", "small", "medium", "large"]
+
+MODEL_VARIANTS_BY_SIZE = {
+    "tiny": ["tiny", "tiny.en", "tiny-q5_1", "tiny.en-q5_1", "tiny-q8_0"],
+    "base": ["base", "base.en", "base-q5_1", "base.en-q5_1", "base-q8_0"],
+    "small": [
+        "small",
+        "small.en",
+        "small-q5_1",
+        "small.en-q5_1",
+        "small-q8_0",
+    ],
+    "medium": ["medium", "medium.en", "medium-q5_0", "medium.en-q5_0", "medium-q8_0"],
+    "large": [
+        "large",
+        "large-v3-q5_0",
+        "large-v3-turbo",
+        "large-v3-turbo-q5_0",
+        "large-v3-turbo-q8_0",
+        "large-v2",
+        "large-v2-q5_0",
+        "large-v2-q8_0",
+        "large-v1",
+    ],
+}
+
+
+def get_model_size(model_name: str) -> str:
+    """Return the top-level whisper.cpp size bucket for a model variant."""
+    model_name = model_name.lower()
+    if model_name.startswith("large"):
+        return "large"
+    return model_name.split(".", 1)[0].split("-", 1)[0]
+
+
+def get_model_variants(model_size: str) -> list[str]:
+    """Return available whisper.cpp variants for a size bucket."""
+    return list(MODEL_VARIANTS_BY_SIZE.get(model_size.lower(), []))
+
+
+def default_variant_for_size(model_size: str, language_is_english: bool) -> Optional[str]:
+    """Return the default specialization for a size bucket and language."""
+    variants = get_model_variants(model_size)
+    if not variants:
+        return None
+
+    english_variant = f"{model_size}.en"
+    if language_is_english and english_variant in variants:
+        return english_variant
+
+    standard_variant = "large" if model_size == "large" else model_size
+    if standard_variant in variants:
+        return standard_variant
+
+    return variants[0]
+
+
+def is_english_only_model(model_name: str) -> bool:
+    """Return whether a whisper.cpp model variant is English-only."""
+    return ".en" in model_name.lower()
+
+
+def is_dictation_model(model_name: str) -> bool:
+    """Return whether a catalog model is a valid keystroke-dictation model."""
+    return model_name in WHISPERCPP_MODEL_INFO and model_name not in NON_DICTATION_MODELS
+
+
+def whispercpp_model_source(model_name: str) -> tuple[str, str]:
+    """Return the ``(repo_slug, pinned_revision)`` hosting a catalog model.
+
+    Main-repository models return an empty revision: their digests are pinned
+    to the commit recorded in ``model_checksums.txt`` and re-resolved by
+    ``scripts/generate-model-checksums.py`` each run. Models hosted in a
+    separate repository pin their own commit in this module, the same way
+    parakeet bundles pin theirs.
+    """
+    source = _WHISPERCPP_SIDE_SOURCES.get(model_name)
+    if source is not None:
+        return source
+    return _WHISPERCPP_REPO_SLUG, ""
+
+
+# Compute backend types
+class ComputeBackend:
+    """Compute backend options for whisper.cpp."""
+
+    VULKAN = "vulkan"
+    CUDA = "cuda"
+    CPU = "cpu"
+
+
+# Match install.sh: these are not usable whisper.cpp GPUs for auto-select.
+_SOFTWARE_VULKAN_NAME_MARKERS = (
+    "llvmpipe",
+    "swiftshader",
+    "lavapipe",
+    "zink",
+    "virtio",
+    "venus",
+)
+
+# Real vulkaninfo --summary headers look like "GPU0:"; some older/alternate
+# tools print "GPU id = 0". Accept both so hybrid detection does not silently
+# fall through to CUDA when Vulkan is present.
+_VULKANINFO_GPU_HEADER_RE = re.compile(
+    r"^(?:GPU(\d+)\s*:|GPU\s+id\s*[:=]\s*(\d+))\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_vulkaninfo_gpu_header(line: str) -> Optional[int]:
+    """Return a GPU index from a vulkaninfo device header line, if present."""
+    match = _VULKANINFO_GPU_HEADER_RE.match(line.strip())
+    if not match:
+        return None
+    return int(match.group(1) or match.group(2))
+
+
+def _is_software_vulkan_name(name: Optional[str]) -> bool:
+    """Return True when a Vulkan device name looks like a software renderer."""
+    if not name:
+        return False
+    lowered = name.lower()
+    return any(marker in lowered for marker in _SOFTWARE_VULKAN_NAME_MARKERS)
+
+
+def _classify_vulkan_device_type(type_val: str, name: Optional[str]) -> str:
+    """Map vulkaninfo deviceType/name to discrete, integrated, software, or other."""
+    if _is_software_vulkan_name(name) or "CPU" in type_val.upper():
+        return "software"
+    upper = type_val.upper()
+    if "DISCRETE" in upper:
+        return "discrete"
+    if "INTEGRATED" in upper:
+        return "integrated"
+    return "other"
+
+
+def _is_software_vulkan_device(device: dict) -> bool:
+    """Return True when a parsed Vulkan device should not be auto-selected."""
+    return device.get("device_type") == "software" or _is_software_vulkan_name(device.get("name"))
+
+
+def _hardware_vulkan_devices(devices: Optional[list[dict]] = None) -> list[dict]:
+    """Return Vulkan devices that are not software renderers."""
+    if devices is None:
+        devices = detect_vulkan_devices()
+    return [device for device in devices if not _is_software_vulkan_device(device)]
+
+
+def _append_vulkan_device(
+    devices: list[dict],
+    current_index: Optional[int],
+    current_name: Optional[str],
+    current_type: str,
+) -> None:
+    """Append a parsed Vulkan device when index and name are both known."""
+    if current_index is None or current_name is None:
+        return
+    device_type = current_type
+    if _is_software_vulkan_name(current_name):
+        device_type = "software"
+    devices.append(
+        {
+            "index": current_index,
+            "name": current_name,
+            "device_type": device_type,
+        }
+    )
+
+
+def _run_vulkaninfo_stdout() -> str:
+    """Return vulkaninfo output, falling back when --summary is missing or empty."""
+    commands = (["vulkaninfo", "--summary"], ["vulkaninfo"])
+    for args in commands:
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, timeout=8, env=host_env())
+        except FileNotFoundError:
+            return ""
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.debug(f"vulkaninfo {args} failed: {exc}")
+            continue
+
+        stdout = result.stdout or ""
+        if "deviceName" in stdout or _VULKANINFO_GPU_HEADER_RE.search(stdout):
+            return stdout
+        if result.returncode == 0 and stdout.strip():
+            return stdout
+    return ""
+
+
+@lru_cache(maxsize=1)
+def detect_vulkan_devices() -> list[dict]:
+    """Enumerate all Vulkan-capable GPU devices.
+
+    Returns:
+        List of dicts with keys: index (int), name (str),
+        device_type (str: "discrete", "integrated", "software", or "other").
+    """
+    devices: list[dict] = []
+    stdout = _run_vulkaninfo_stdout()
+    if not stdout:
+        return devices
+
+    current_index = None
+    current_name = None
+    current_type = "other"
+
+    for line in stdout.split("\n"):
+        stripped = line.strip()
+        header_index = _parse_vulkaninfo_gpu_header(stripped)
+
+        if header_index is not None:
+            _append_vulkan_device(devices, current_index, current_name, current_type)
+            current_index = header_index
+            current_name = None
+            current_type = "other"
+            continue
+
+        if "deviceName" in stripped and "=" in stripped:
+            current_name = stripped.split("=", 1)[-1].strip()
+
+        if "deviceType" in stripped and "=" in stripped:
+            type_val = stripped.split("=", 1)[-1].strip()
+            current_type = _classify_vulkan_device_type(type_val, current_name)
+
+    _append_vulkan_device(devices, current_index, current_name, current_type)
+    return devices
+
+
+def _prefer_discrete_vulkan_device() -> Optional[int]:
+    """Return the index of the preferred hardware Vulkan GPU (discrete if available)."""
+    devices = _hardware_vulkan_devices()
+    for device in devices:
+        if device["device_type"] == "discrete":
+            return device["index"]
+    return devices[0]["index"] if devices else None
+
+
+def _vulkan_device_name_by_index(devices: list[dict], device_index: Optional[int]) -> Optional[str]:
+    """Resolve a Vulkan device name by GPU index (not list position)."""
+    if not devices:
+        return None
+    if device_index is None:
+        return devices[0]["name"]
+    for device in devices:
+        if device["index"] == device_index:
+            return device["name"]
+    return devices[0]["name"]
+
+
+@lru_cache(maxsize=1)
+def detect_vulkan_support() -> tuple[bool, Optional[str]]:
+    """Detect if Vulkan is available and get device info.
+
+    When multiple Vulkan GPUs exist, prefers the discrete GPU.
+
+    Returns:
+        Tuple of (is_available, device_name)
+    """
+    devices = detect_vulkan_devices()
+    hardware = _hardware_vulkan_devices(devices)
+    if hardware:
+        preferred_idx = _prefer_discrete_vulkan_device()
+        device_name = _vulkan_device_name_by_index(hardware, preferred_idx)
+        logger.info(f"Vulkan support detected: {device_name}")
+        return True, device_name
+
+    logger.debug("Vulkan detection failed")
+    return False, None
+
+
+@lru_cache(maxsize=1)
+def detect_cuda_support() -> tuple[bool, Optional[str]]:
+    """
+    Detect if NVIDIA CUDA is available and get device info.
+
+    Returns:
+        Tuple of (is_available, device_info)
+    """
+    try:
+        # Check for nvidia-smi
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=host_env(),
+        )
+        if result.returncode == 0:
+            gpu_info = result.stdout.strip().split(",")
+            if gpu_info:
+                gpu_name = gpu_info[0].strip()
+                gpu_memory = gpu_info[1].strip() if len(gpu_info) > 1 else "unknown"
+                logger.info(f"CUDA support detected: {gpu_name} ({gpu_memory})")
+                return True, f"{gpu_name} ({gpu_memory})"
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+        logger.debug(f"CUDA detection failed: {e}")
+
+    return False, None
+
+
+@lru_cache(maxsize=1)
+def detect_compute_backend() -> tuple[str, str]:
+    """
+    Detect the best available compute backend.
+
+    Priority order: Vulkan > CUDA > CPU
+
+    Returns:
+        Tuple of (backend_type, backend_info)
+    """
+    # Try Vulkan first (supports AMD, Intel, NVIDIA)
+    has_vulkan, vulkan_info = detect_vulkan_support()
+    if has_vulkan and vulkan_info:
+        return ComputeBackend.VULKAN, vulkan_info
+
+    # Try CUDA next (NVIDIA only)
+    has_cuda, cuda_info = detect_cuda_support()
+    if has_cuda and cuda_info:
+        return ComputeBackend.CUDA, cuda_info
+
+    # Fall back to CPU
+    cpu_info = detect_cpu_info()
+    return ComputeBackend.CPU, cpu_info
+
+
+@lru_cache(maxsize=1)
+def detect_cpu_info() -> str:
+    """
+    Detect CPU information for CPU backend.
+
+    Returns:
+        CPU info string
+    """
+    try:
+        # Try to get CPU model from /proc/cpuinfo
+        with open("/proc/cpuinfo", "r") as f:
+            for line in f:
+                if "model name" in line:
+                    cpu_name = line.split(":")[1].strip()
+                    return cpu_name
+    except Exception as e:
+        logger.debug(f"Could not read CPU info: {e}")
+
+    # Fallback to nproc
+    try:
+        result = subprocess.run(
+            ["nproc"], capture_output=True, text=True, timeout=2, env=host_env()
+        )
+        if result.returncode == 0:
+            cpu_count = result.stdout.strip()
+            return f"{cpu_count} cores"
+    except Exception:
+        pass
+
+    return "CPU"
+
+
+def _parse_cuda_vram_gib(backend_info: str) -> Optional[float]:
+    """Parse VRAM in GiB from nvidia-smi-style backend info.
+
+    Accepts MiB/MB/GiB/GB (case-insensitive). MiB and MB are converted by
+    dividing by 1024. Returns None when no size can be parsed.
+    """
+    if not isinstance(backend_info, str) or not backend_info:
+        return None
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(gi?b|mi?b)", backend_info, flags=re.IGNORECASE)
+    if not match:
+        return None
+    amount = float(match.group(1))
+    unit = match.group(2).lower()
+    if unit in {"mb", "mib"}:
+        amount /= 1024.0
+    return amount
+
+
+def get_recommended_model() -> tuple[str, str]:
+    """
+    Get the recommended whisper.cpp model based on system configuration.
+
+    Returns:
+        Tuple of (model_name, reason)
+    """
+    try:
+        import psutil
+
+        ram_gb = math.ceil(psutil.virtual_memory().total / (1024**3))
+
+        # Detect available compute backends
+        backend, backend_info = detect_compute_backend()
+
+        if backend == ComputeBackend.VULKAN:
+            # Vulkan can handle larger models efficiently
+            if ram_gb >= 8:
+                return "small", f"Vulkan GPU with {ram_gb}GB RAM"
+            else:
+                return "base", f"Vulkan GPU with {ram_gb}GB RAM"
+        elif backend == ComputeBackend.CUDA:
+            vram_gb = _parse_cuda_vram_gib(backend_info or "")
+            if vram_gb is not None:
+                if vram_gb >= 8:
+                    return "medium", f"CUDA GPU with {vram_gb:g}GB VRAM"
+                if vram_gb >= 4:
+                    return "small", f"CUDA GPU with {vram_gb:g}GB VRAM"
+                return "base", "CUDA GPU with limited VRAM"
+            return "small", "CUDA GPU detected"
+        else:
+            # CPU-only recommendations based on RAM
+            if ram_gb >= 16:
+                return "base", f"{ram_gb}GB RAM - CPU inference"
+            elif ram_gb >= 8:
+                return "tiny", f"{ram_gb}GB RAM - optimized for speed"
+            else:
+                return "tiny", f"Limited RAM ({ram_gb}GB) - fastest model"
+
+    except ImportError:
+        logger.debug("psutil not available for system detection")
+
+    # Default recommendation
+    return "tiny", "Default recommendation"
+
+
+def _model_file_path(model_name: str) -> str:
+    """Resolve the model file path without touching the filesystem."""
+    whispercpp_dir = os.path.join(models_dir(), "whispercpp")
+
+    model_info = WHISPERCPP_MODEL_INFO.get(model_name)
+    if model_info and model_info.get("url"):
+        return os.path.join(whispercpp_dir, os.path.basename(model_info["url"]))
+
+    return os.path.join(whispercpp_dir, f"ggml-{model_name}.bin")
+
+
+def get_model_path(model_name: str) -> str:
+    """
+    Get the path where a model should be stored.
+
+    Args:
+        model_name: Name of the model (for example tiny, base, small, medium, large)
+
+    Returns:
+        Path to the model file
+    """
+    model_path = _model_file_path(model_name)
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    return model_path
+
+
+def is_model_downloaded(model_name: str) -> bool:
+    """
+    Check if a whisper.cpp model is downloaded.
+
+    A read-only probe: it must not create the models directory, so it resolves
+    the file path without get_model_path's makedirs side effect.
+
+    Args:
+        model_name: Name of the model
+
+    Returns:
+        True if model exists, False otherwise
+    """
+    return os.path.exists(_model_file_path(model_name))
+
+
+def on_disk_stand_in(variant: str, size: str, language_is_english: bool) -> str:
+    """Prefer a downloaded weight of the same size over fetching a sibling.
+
+    A resolved variant whose weights are absent stands down for a downloaded
+    same-size weight that can serve the language: an English-only weight
+    stands in only when English is wanted. The resolved variant itself wins
+    whenever it is already downloaded, so the ``.en`` preference and explicit
+    picks are kept whenever their files are present.
+    """
+    if is_model_downloaded(variant):
+        return variant
+
+    candidates = [
+        name
+        for name in get_model_variants(size)
+        if is_model_downloaded(name) and (language_is_english or not is_english_only_model(name))
+    ]
+    if not candidates:
+        return variant
+
+    def rank(name: str) -> tuple:
+        # Closest to what was derived: English-only first when English is
+        # wanted, the plain multilingual next, quantized ones last.
+        english_first = 0 if language_is_english and is_english_only_model(name) else 1
+        quantized = 1 if "-q" in name else 0
+        return (english_first, quantized, name)
+
+    chosen = min(candidates, key=rank)
+    logger.info("whisper.cpp model %s is not downloaded; using same-size %s", variant, chosen)
+    return chosen
+
+
+def list_downloaded_models() -> list[str]:
+    """Return catalog model names whose files are present on disk."""
+    return [name for name in AVAILABLE_MODELS if is_model_downloaded(name)]
+
+
+def delete_model(model_name: str) -> str:
+    """Delete a downloaded whisper.cpp model file.
+
+    Returns:
+        The removed filesystem path.
+
+    Raises:
+        ValueError: Unknown model name, or path outside the models directory.
+        FileNotFoundError: The model file is not present.
+        OSError: The file could not be removed.
+    """
+    if model_name not in WHISPERCPP_MODEL_INFO:
+        raise ValueError(f"Unknown whisper.cpp model: {model_name}")
+
+    model_path = get_model_path(model_name)
+    whispercpp_dir = os.path.join(models_dir(), "whispercpp")
+    if not is_within_directory(model_path, whispercpp_dir):
+        raise ValueError("Refusing to delete a path outside the whisper.cpp models directory")
+    if not os.path.isfile(model_path):
+        raise FileNotFoundError(model_path)
+
+    os.remove(model_path)
+    logger.info("Deleted whisper.cpp model %s (%s)", model_name, model_path)
+    return model_path
+
+
+def get_backend_display_name(backend: str) -> str:
+    """
+    Get a user-friendly display name for a compute backend.
+
+    Args:
+        backend: Backend type (vulkan, cuda, cpu)
+
+    Returns:
+        Display name string
+    """
+    names = {
+        ComputeBackend.VULKAN: "Vulkan GPU",
+        ComputeBackend.CUDA: "NVIDIA CUDA",
+        ComputeBackend.CPU: "CPU",
+    }
+    return names.get(backend, backend.upper())

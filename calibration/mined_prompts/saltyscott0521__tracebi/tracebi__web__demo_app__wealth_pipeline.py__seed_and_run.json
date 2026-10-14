@@ -1,0 +1,28 @@
+{
+  "repo": "saltyscott0521__tracebi",
+  "file": "tracebi/web/demo_app/wealth_pipeline.py",
+  "function": "seed_and_run",
+  "line": 75,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Seed the raw tables and run every layer, upstream first.",
+  "prompt_source": "def seed_and_run() -> None:\n    \"\"\"Seed the raw tables and run every layer, upstream first.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def seed_and_run() -> None:\n    \"\"\"Seed the raw tables and run every layer, upstream first.\"\"\"\n    seed_source_tables()\n    for layer in LAYERS:\n        runner.run(layer)",
+  "module_source": "\"\"\"Medallion pipeline for the demo app's ``wealth_model``.\n\nLanding \u2192 Manipulation \u2192 Final over the same demo database as the sales\npipeline: raw holdings and branches land, get cleaned, and the final layer\naggregates assets under management by branch into ``gold_aum_by_branch``.\n\nThe wealth model itself is generated in memory, so the raw tables are seeded\nfrom it, the way the sales pipeline seeds from ``sales_model``. Definition and\nexecution are separate exactly as in ``pipeline.py``: with a durable\n``TRACEBI_DEMO_DB_URL`` importing this only defines layers; without one it\nseeds and runs itself, because nothing else can have.\n\"\"\"\nfrom sqlalchemy import create_engine\n\nfrom tracebi import DataModel, FinalLayer, LandingLayer, ManipulationLayer, PipelineRunner\nfrom tracebi.model_registry import get_model\nfrom tracebi.web.demo_app.pipeline import _DB_URL, DURABLE_DB, db\n\n_wealth = get_model(\"wealth_model\")\n_holdings_raw = _wealth.load(\"holdings\").to_pandas()[\n    [\"holding_id\", \"account_id\", \"client_id\", \"branch_id\", \"product_id\", \"units\", \"market_value\", \"cost_basis\"]]\n_branches_raw = _wealth.load(\"branches\").to_pandas()\n\n\ndef seed_source_tables() -> None:\n    \"\"\"Write the raw tables the Landing layers read. Execution, not definition.\"\"\"\n    engine = create_engine(_DB_URL)\n    _holdings_raw.to_sql(\"holdings_raw\", con=engine, if_exists=\"replace\", index=False)\n    _branches_raw.to_sql(\"branches_raw\", con=engine, if_exists=\"replace\", index=False)\n\n\n_holdings_landing = LandingLayer(\n    connector=db, source=\"holdings_raw\", description=\"Raw holdings\",\n    sink=db, sink_table=\"holdings_bronze\")\n_branches_landing = LandingLayer(\n    connector=db, source=\"branches_raw\", description=\"Raw branches\",\n    sink=db, sink_table=\"branches_bronze\")\n_holdings_manip = (\n    ManipulationLayer(source=db, source_table=\"holdings_bronze\", sink=db, sink_table=\"holdings_silver\")\n    .drop_nulls(subset=[\"holding_id\", \"branch_id\"]).deduplicate(subset=[\"holding_id\"]))\n_branches_manip = (\n    ManipulationLayer(source=db, source_table=\"branches_bronze\", sink=db, sink_table=\"branches_silver\")\n    .drop_nulls().deduplicate(subset=[\"branch_id\"]))\n\n# What the Final layer reads: the cleaned tables, joined the star-schema way.\nwealth_pipeline_model = DataModel(\"wealth_pipeline_model\")\nwealth_pipeline_model.add_connector(db)\nwealth_pipeline_model.add_table(\"holdings_silver\", connector=\"demo_db\", source=\"holdings_silver\")\nwealth_pipeline_model.add_table(\"branches_silver\", connector=\"demo_db\", source=\"branches_silver\")\nwealth_pipeline_model.add_dimension(\n    name=\"dim_branch\", table_name=\"branches_silver\", key_col=\"branch_id\", attributes=[\"branch\", \"region\"])\nwealth_pipeline_model.add_fact(\n    name=\"fact_holdings\", table_name=\"holdings_silver\",\n    measures=[\"market_value\", \"cost_basis\", \"units\"], foreign_keys={\"dim_branch\": \"branch_id\"})\n\n_final = FinalLayer(\n    model=wealth_pipeline_model, fact=\"fact_holdings\",\n    measures={\"market_value\": \"sum\", \"cost_basis\": \"sum\"}, dimensions=[\"dim_branch.branch\"],\n    sink=db, sink_table=\"gold_aum_by_branch\")\n\nrunner = PipelineRunner(db_url=_DB_URL)\nrunner.register(_holdings_landing, name=\"holdings_bronze\", schedule=\"0 * * * *\")\nrunner.register(_branches_landing, name=\"branches_bronze\", schedule=\"0 * * * *\")\nrunner.register(_holdings_manip, name=\"holdings_silver\", schedule=\"15 * * * *\", depends_on=\"holdings_bronze\")\nrunner.register(_branches_manip, name=\"branches_silver\", schedule=\"15 * * * *\", depends_on=\"branches_bronze\")\nrunner.register(_final, name=\"aum_by_branch\", schedule=\"30 6 * * *\", depends_on=\"holdings_silver\")\n\n# The model this pipeline is about, for the app's model switcher: it lands raw\n# tables seeded from wealth_model and aggregates them by branch.\nrunner.model = \"wealth_model\"\n\nLAYERS = [\"holdings_bronze\", \"branches_bronze\", \"holdings_silver\", \"branches_silver\", \"aum_by_branch\"]\n\n\ndef seed_and_run() -> None:\n    \"\"\"Seed the raw tables and run every layer, upstream first.\"\"\"\n    seed_source_tables()\n    for layer in LAYERS:\n        runner.run(layer)\n\n\nif not DURABLE_DB:\n    seed_and_run()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 5
+    },
+    "ai_commit": "769738076fac",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 1.0,
+    "span": [
+      75,
+      79
+    ]
+  }
+}

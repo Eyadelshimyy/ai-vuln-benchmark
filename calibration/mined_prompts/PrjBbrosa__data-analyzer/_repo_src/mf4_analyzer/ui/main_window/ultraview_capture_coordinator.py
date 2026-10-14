@@ -1,0 +1,2601 @@
+"""UltraView capture owner: PreviewStore, digest, timers, and sidecar.
+
+MainWindow still talks to ``UltraViewCoordinator``. This coordinator is the
+single capture/store/timer owner; the façade constructs one instance and keeps
+thin delegates. Workspace mutation stays on ``UltraViewWorkspaceController``.
+"""
+from __future__ import annotations
+
+import logging
+import re
+import weakref
+from collections.abc import Callable
+from dataclasses import dataclass, fields, is_dataclass
+from functools import partial
+from pathlib import Path
+from time import monotonic
+from typing import Any
+
+from PyQt5 import sip
+from PyQt5.QtCore import QObject, QTimer
+from PyQt5.QtGui import QImage
+from PyQt5.QtWidgets import QWidget
+
+from ...diagnostics import throttled
+from ...render_profile import source_revision_for
+from ...ultraview_core.board_ops import (
+    active_board,
+    all_refs,
+    free_grid_placement_for,
+    placed_ref_set,
+    set_workspace_preview_sidecar,
+)
+from ...ultraview_core.grid_geometry import (
+    canonical_screen_metrics,
+    inner_reading_box,
+)
+from ...ultraview_core.model import (
+    PreviewMeta,
+    SECTION_AXIS_KIND,
+    SOURCE_SECTIONS,
+    UltraViewRef,
+    UltraViewWorkspaceState,
+)
+from ...ultraview_core.serialization import (
+    presentation_digest,
+    workspace_to_payload,
+)
+from ..ultraview_capture_facts import (
+    CAPABILITY_OK,
+    MIN_CAPTURE_EDGE as _MIN_CAPTURE_EDGE,
+    collect_widget_capture_facts,
+    finite_or_none,
+    hide_transient_overlays,
+    iter_overlay_hosts as _iter_overlay_hosts,
+    widget_visible_and_sized,
+)
+from ..chart_stack.ultraview.preview_store import (
+    MAX_PREVIEW_RAW_EDGE,
+    PreviewStore,
+    ResidencyRequest,
+    RESIDENCY_TIER_FOCUS,
+    RESIDENCY_TIER_ACTIVE_VISIBLE,
+    RESIDENCY_TIER_ACTIVE_PLACED,
+    RESIDENCY_TIER_INACTIVE_PLACED,
+    RESIDENCY_TIER_TRAY,
+)
+from ..chart_stack.ultraview.viewport import (
+    SMOOTH_DELAY_MS,
+    focus_grab_scale,
+    needs_focus_recapture,
+)
+from ..chart_stack.ultraview.preview_sidecar import (
+    SidecarImagePayload,
+    open_preview_sidecar,
+    publish_sidecar_image,
+    save_preview_sidecar,
+)
+from ..image_utils import pixmap_as_device_pixel_image
+from .ultraview_runtime import PresentationRuntimeFacts, PresentationRuntimeLedger
+
+logger = logging.getLogger(__name__)
+
+_IDLE_CAPTURE_MS = 120
+_SIDECAR_LOAD_BATCH = 2
+_DIGEST_RETRY_LIMIT = 3
+RESOLUTION_STALE_RATIO = 1.25
+RESOLUTION_STALE_TOAST = "预览分辨率较低，打开源 View 后可更新"
+_HEATMAP_SECTIONS = frozenset({"fft_time", "order"})
+_PIXEL_AFFECTING_SIGNALS = frozenset(
+    {
+        "visible_range_changed",
+        "markup_revision_changed",
+        "dual_cursor_info",
+        "manual_zoom_changed",
+    }
+)
+# Section/View switches call these while UltraView is closed. They have no
+# immediate thumbnail or inspect consumer, so a hidden Board only marks the
+# ref deferred. User sync, add-to-board, pin commit, focus inspect, leaving
+# for UltraView, resolution/focus residency, and unknown reasons still grab.
+_AUTOMATIC_SWITCH_PREVIEW_REASONS = frozenset(
+    {
+        "time-render",
+        "plot",
+        "order-plot",
+        "frf-plot",
+        "frf-restore-plot",
+        "fft-time-plot",
+        "fft-plot",
+        "fft-single-plot",
+        "analysis-restore-plot",
+        "idle",
+    }
+)
+_HTML_TAG = re.compile(r"<[^>]+>")
+_CAPTURE_SKIP_LEVELS = {
+    "no-result": logging.DEBUG,
+    "digest-changed": logging.DEBUG,
+}
+_SECTION_X_UNIT = {
+    "time": "s",
+    "fft": "Hz",
+    "fft_time": "s",
+    "frf": "Hz",
+    "order": "s",
+}
+
+
+def _pin_revision(value):
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pin_intent_row(intent, *, data_revision=None) -> list:
+    if intent is None:
+        return []
+    anchor = getattr(intent, "anchor", None)
+    return [
+        str(getattr(intent, "record_id", "") or ""),
+        int(getattr(intent, "ordinal", 0) or 0),
+        str(getattr(intent, "mode", "") or ""),
+        str(getattr(intent, "domain", "") or ""),
+        finite_or_none(getattr(intent, "x", None)),
+        finite_or_none(getattr(intent, "ax", None)),
+        finite_or_none(getattr(intent, "bx", None)),
+        str(getattr(intent, "presentation", "full") or "full"),
+        getattr(intent, "panel_expanded", False) is True,
+        str(getattr(anchor, "h_edge", "right") if anchor is not None else "right"),
+        str(getattr(anchor, "v_edge", "top") if anchor is not None else "top"),
+        finite_or_none(getattr(anchor, "nx", None) if anchor is not None else None),
+        finite_or_none(getattr(anchor, "ny", None) if anchor is not None else None),
+        _pin_revision(data_revision),
+    ]
+
+
+def _pin_rows_from_collection(collection) -> list:
+    records = getattr(collection, "records", None) or ()
+    return [_pin_intent_row(item) for item in records]
+
+
+def _as_pin_payload(value) -> list:
+    if not value:
+        return []
+    rows = []
+    for item in value:
+        if isinstance(item, (list, tuple)):
+            rows.append(list(item))
+        else:
+            rows.append(item)
+    return rows
+
+
+@dataclass(frozen=True)
+class CaptureRuntimeCounts:
+    """Read-only lifecycle facts for diagnostics and teardown gates."""
+
+    bindings: int
+    queued_grabs: int
+    unstable_widgets: int
+    hook_connections: int
+    hooked_widgets: int
+    destroy_watches: int
+    idle_pending: int
+    sidecar_pending: int
+    active_timers: int
+
+
+def _alive(obj) -> bool:
+    if obj is None:
+        return False
+    try:
+        return not sip.isdeleted(obj)
+    except (RuntimeError, TypeError):
+        return True
+def _plain_text(value) -> str:
+    if not value:
+        return ""
+    return _HTML_TAG.sub("", str(value)).strip()
+def read_markup_revision(widget) -> int:
+    if widget is None or not _alive(widget):
+        return 0
+    return collect_widget_capture_facts(widget).markup_revision
+
+
+def _freeze_pair(value):
+    """Exact ``(lo, hi)`` floats, or None.
+
+    Canvases compare viewports with ``!=`` on the tuples they already
+    captured (line ``capture_xy_viewport``, heatmap ``viewRange``). This
+    does not add a tolerance.
+    """
+    if value is None:
+        return None
+    try:
+        lo, hi = value
+    except (TypeError, ValueError):
+        return None
+    lo_f = finite_or_none(lo)
+    hi_f = finite_or_none(hi)
+    if lo_f is None or hi_f is None:
+        return None
+    return (lo_f, hi_f)
+
+
+def _freeze_viewport(value):
+    if value is None:
+        return None
+    try:
+        first, second = value
+    except (TypeError, ValueError):
+        return None
+    if isinstance(first, (tuple, list)):
+        return (_freeze_pair(first), _freeze_pair(second))
+    return _freeze_pair(value)
+
+
+def _visible_range_fact(host):
+    capture = getattr(host, "capture_xy_viewport", None)
+    if callable(capture):
+        try:
+            return _freeze_viewport(capture())
+        except (RuntimeError, TypeError, ValueError):
+            return None
+    xlim = None
+    ylims = ()
+    xlim_fn = getattr(host, "get_visible_xlim", None)
+    ylim_fn = getattr(host, "get_visible_ylims", None)
+    if callable(xlim_fn):
+        try:
+            xlim = _freeze_pair(xlim_fn())
+        except (RuntimeError, TypeError, ValueError):
+            xlim = None
+    if callable(ylim_fn):
+        try:
+            raw = ylim_fn() or {}
+            ylims = tuple(
+                sorted(
+                    (repr(key), _freeze_pair(span))
+                    for key, span in dict(raw).items()
+                )
+            )
+        except (RuntimeError, TypeError, ValueError, AttributeError):
+            ylims = ()
+    if xlim is None and not ylims and not callable(xlim_fn) and not callable(ylim_fn):
+        return _freeze_viewport(getattr(host, "visible_range", None))
+    return (xlim, ylims)
+
+
+def _markup_fact(host):
+    reader = getattr(host, "capture_markup_revision", None)
+    if callable(reader):
+        try:
+            return int(reader() or 0)
+        except (RuntimeError, TypeError, ValueError):
+            return 0
+    try:
+        return int(getattr(host, "markup_revision", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _dual_cursor_fact(host):
+    reader = getattr(host, "capture_cursor_facts", None)
+    if not callable(reader):
+        return (False, None)
+    try:
+        dual, geometry = reader()
+    except (RuntimeError, TypeError, ValueError):
+        return (False, None)
+    if not dual:
+        return (False, None)
+    return (True, geometry)
+def _channel_pair(key):
+    if key is None:
+        return None
+    try:
+        fid, channel = key
+    except (TypeError, ValueError):
+        return None
+    return [str(fid), str(channel)]
+class _ResultIdentityRef:
+    """Callable identity token for result-generation (UVL-A12).
+
+    Weakref when the result supports it, so a GC'd object cannot recycle
+    ``id()`` into a false "unchanged" match. Analysis-cache payloads are
+    often tuples/ndarrays, and tests use ``object()`` — none of those can
+    be weakly referenced. Those keep a strong token so same-object
+    re-notify does not bump; replacement still compares with ``is``.
+    """
+
+    __slots__ = ("_ref", "_obj")
+
+    def __init__(self, result) -> None:
+        try:
+            self._ref = weakref.ref(result)
+            self._obj = None
+        except TypeError:
+            self._ref = None
+            self._obj = result
+
+    def __call__(self):
+        if self._ref is not None:
+            return self._ref()
+        return self._obj
+def _stable_source_revision(revision):
+    """Content fingerprint for UltraView digest; drop ndarray ``id()``.
+
+    ``source_revision_for`` includes object ids so in-place mutation of a
+    held array is visible. ``Series.to_numpy()`` / ``np.asarray`` often
+    return a new wrapper each call, so those ids churn while the samples
+    do not. A presentation digest that includes them never matches the
+    queued capture, and the Board stays missing.
+    """
+    if revision is None:
+        return None
+    try:
+        kind = revision[0]
+        items = list(revision)
+    except (TypeError, IndexError):
+        return None
+    if kind == "explicit":
+        return items
+    if kind == "probed" and len(items) >= 9:
+        return [kind, *items[3:]]
+    return items
+def _array_from_column(column):
+    if column is None:
+        return None
+    to_numpy = getattr(column, "to_numpy", None)
+    if callable(to_numpy):
+        return to_numpy(copy=False)
+    values = getattr(column, "values", None)
+    if values is not None:
+        return values
+    return column
+def _display_target_size(display) -> tuple[int, int] | None:
+    if display is None:
+        return None
+    try:
+        width, height = int(display[0]), int(display[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if width < _MIN_CAPTURE_EDGE or height < _MIN_CAPTURE_EDGE:
+        return None
+    return (width, height)
+
+
+def needs_resolution_recapture(
+    reading_box: tuple[int, int],
+    cache_logical: tuple[int, int],
+    *,
+    ratio: float = RESOLUTION_STALE_RATIO,
+) -> bool:
+    """True when either reading-box edge exceeds cache logical size × ``ratio``.
+
+    Spec D11 uses a strict greater-than against ``1.25``. A missing cache is
+    not resolution-stale (that is ``STATUS_MISSING``). Comparison is in
+    logical pixels so Retina and DPR=1 share geometry.
+    """
+    try:
+        box_w, box_h = int(reading_box[0]), int(reading_box[1])
+        cache_w, cache_h = int(cache_logical[0]), int(cache_logical[1])
+    except (TypeError, ValueError, IndexError):
+        return False
+    if box_w < 1 or box_h < 1 or cache_w < 1 or cache_h < 1:
+        return False
+    threshold = float(ratio) if ratio > 0 else RESOLUTION_STALE_RATIO
+    return box_w > cache_w * threshold or box_h > cache_h * threshold
+
+
+def resolution_grab_scale(
+    native_size: tuple[float, float],
+    target_device_size: tuple[float, float],
+    *,
+    max_edge: float,
+) -> float:
+    """Scale a source-widget grab to ``target_logical × DPR`` device pixels."""
+    native_w = max(1.0, float(native_size[0]))
+    native_h = max(1.0, float(native_size[1]))
+    target_w = max(1.0, float(target_device_size[0]))
+    target_h = max(1.0, float(target_device_size[1]))
+    scale = max(target_w / native_w, target_h / native_h, 1.0)
+    produced = max(native_w, native_h) * scale
+    limit = max(1.0, float(max_edge))
+    if produced > limit:
+        scale *= limit / produced
+    return max(1.0, float(scale))
+def _digest_leaf(value):
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value
+    if isinstance(value, tuple):
+        return [_digest_leaf(item) for item in value]
+    if isinstance(value, list):
+        return [_digest_leaf(item) for item in value]
+    if is_dataclass(value) and not isinstance(value, type):
+        # Analysis cache keys are not all tuples: FRF keys are frozen
+        # dataclasses (``FrfCacheKey``). Passing one through unchanged used to
+        # reach ``presentation_digest`` as an unserializable leaf, so every FRF
+        # View holding a pinned result had no digest at all — and a ref with no
+        # digest never captures. The class name is part of the encoding so a
+        # dataclass can never collide with a plain mapping of the same shape.
+        return {
+            "__dataclass__": type(value).__name__,
+            "fields": {
+                field.name: _digest_leaf(getattr(value, field.name))
+                for field in fields(value)
+            },
+        }
+    # Anything still unknown falls through to ``_canonical_json_value``, which
+    # is the single authority on what is digest-stable. Do not coerce with
+    # ``str()`` here: a default ``repr`` carries the object address, which
+    # would make the digest differ every run and pin every card to stale.
+    return value
+
+
+class UltraViewCaptureCoordinator(QObject):
+    """Own PreviewStore, canvas bindings, capture queue, digest, and sidecar."""
+
+    def __init__(
+        self,
+        *,
+        window: Callable[[], Any],
+        is_inactive: Callable[[], bool],
+        page: Callable[[], Any],
+        push_preview: Callable[..., None],
+        workspace: Callable[[], UltraViewWorkspaceState],
+        sheet_visible: Callable[[], bool],
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._window_impl = window
+        self._is_inactive = is_inactive
+        self._page_impl = page
+        self._push_preview_impl = push_preview
+        self._workspace_impl = workspace
+        self._sheet_visible_impl = sheet_visible
+        self._store = PreviewStore(parent=self)
+        self._store.images_dropped.connect(self._on_store_images_dropped)
+        self._bindings: dict[int, tuple[UltraViewRef, Any]] = {}
+        self._queued: dict[tuple, QTimer] = {}
+        self._unstable: dict[int, tuple] = {}
+        self._axis_edit_waits: dict[tuple, tuple] = {}
+        self._axis_edit_controller = None
+        self._hooks: list[tuple[Any, Any, Any]] = []
+        self._hooked_ids: set[int] = set()
+        self._destroy_watched: set[int] = set()
+        self._idle_pending: dict[UltraViewRef, tuple[Any, float]] = {}
+        self._idle_timer = QTimer(self)
+        self._idle_timer.setSingleShot(True)
+        self._idle_timer.setInterval(_IDLE_CAPTURE_MS)
+        self._idle_timer.timeout.connect(self._on_idle_capture_timeout)
+        self._focus_timer = QTimer(self)
+        self._focus_timer.setSingleShot(True)
+        self._focus_timer.setInterval(SMOOTH_DELAY_MS)
+        self._focus_timer.timeout.connect(self._on_focus_residency_timeout)
+        self._sidecar_generation = 0
+        self._sidecar_pending: list[SidecarImagePayload] = []
+        self._sidecar_timer = QTimer(self)
+        self._sidecar_timer.setSingleShot(True)
+        self._sidecar_timer.setInterval(0)
+        self._sidecar_timer.timeout.connect(self._on_sidecar_load_timeout)
+        self._digest_retries: dict[UltraViewRef, int] = {}
+        self._result_refs: dict[tuple, _ResultIdentityRef] = {}
+        self._result_generation: dict[tuple, int] = {}
+        self._runtime = PresentationRuntimeLedger()
+        self._presentation_revision: dict[UltraViewRef, int] = {}
+        # Session-only fact snapshots. Compared, never persisted, never
+        # mixed into presentation_digest.
+        self._presentation_fingerprints: dict[UltraViewRef, tuple] = {}
+        self._manual_zoom_by_host: dict[int, bool] = {}
+        self._dual_cursor_text_by_host: dict[int, str] = {}
+        self._deferred_preview_refs: set[UltraViewRef] = set()
+        self._resolution_stale_notified: set[UltraViewRef] = set()
+        # A target canvas can be correct while a local page handoff is still
+        # presenting its previous frame.  Keep UltraView's expensive export
+        # capture out of that 240 ms presentation window; the controller's
+        # finished/cancelled signal, not a guessed delay, resumes it.
+        self._page_transition_waits: dict[tuple, tuple] = {}
+
+    @property
+    def store(self) -> PreviewStore:
+        return self._store
+
+    def has_pending_capture(self, ref: UltraViewRef) -> bool:
+        """Return whether ``ref`` still owns a queued grab."""
+        return any(key and key[0] == ref for key in self._queued)
+
+    def runtime_counts(self) -> CaptureRuntimeCounts:
+        """Expose immutable lifecycle counts without leaking owner containers."""
+        timers = (
+            self._idle_timer,
+            self._focus_timer,
+            self._sidecar_timer,
+            *self._queued.values(),
+        )
+        return CaptureRuntimeCounts(
+            bindings=len(self._bindings),
+            queued_grabs=len(self._queued),
+            unstable_widgets=len(self._unstable),
+            hook_connections=len(self._hooks),
+            hooked_widgets=len(self._hooked_ids),
+            destroy_watches=len(self._destroy_watched),
+            idle_pending=len(self._idle_pending),
+            sidecar_pending=len(self._sidecar_pending),
+            active_timers=sum(int(timer.isActive()) for timer in timers),
+        )
+
+    @property
+    def _window(self):
+        return self._window_impl()
+
+    @property
+    def _workspace(self) -> UltraViewWorkspaceState:
+        return self._workspace_impl()
+
+    def _inactive(self) -> bool:
+        return bool(self._is_inactive())
+
+    def page(self):
+        return self._page_impl()
+
+    def _push_preview(self, ref: UltraViewRef, *, usable: bool = True) -> None:
+        return self._push_preview_impl(ref, usable=usable)
+
+    def _sheet_visible(self) -> bool:
+        return bool(self._sheet_visible_impl())
+
+    def reset_capture_state(self) -> None:
+        """Stop capture work and drop pixels. Does not touch workspace or page."""
+        self._drop_all_timers()
+        self._disconnect_hooks()
+        if _alive(self._store):
+            self._store.clear()
+        self._bindings.clear()
+        self._unstable.clear()
+        self._axis_edit_waits.clear()
+        self._result_refs.clear()
+        self._result_generation.clear()
+        self._digest_retries.clear()
+        self._runtime.clear()
+        self._presentation_revision.clear()
+        self._presentation_fingerprints.clear()
+        self._manual_zoom_by_host.clear()
+        self._dual_cursor_text_by_host.clear()
+        self._deferred_preview_refs.clear()
+        self._resolution_stale_notified.clear()
+
+    def shutdown_capture(self) -> None:
+        """Final close path: reset capture and forget destroy watches."""
+        self.reset_capture_state()
+        self._destroy_watched.clear()
+
+    def load_preview_sidecar(self, project_path, workspace_payload, descriptor) -> list[str]:
+        opened = open_preview_sidecar(project_path, workspace_payload, descriptor)
+        warnings = [
+            f"{item.code}: {item.detail}" if item.detail else item.code
+            for item in opened.warnings
+        ]
+        if opened.ok and opened.images:
+            self._queue_sidecar_images(opened.images)
+        return warnings
+
+    def prioritize_sidecar_queue(self) -> None:
+        self._prioritize_sidecar_queue()
+
+    def bind_canvas(self, canvas, ref: UltraViewRef | None) -> None:
+        if self._inactive():
+            return
+        if canvas is None or not _alive(canvas):
+            return
+        ident = id(canvas)
+        if ref is None:
+            self._bindings.pop(ident, None)
+            self._unstable.pop(ident, None)
+            return
+        self._bindings[ident] = (ref, weakref.ref(canvas))
+        self._ensure_stability_hooks(canvas)
+        self._ensure_axis_edit_hook()
+        self._watch_canvas_destroyed(canvas)
+        # A restore emits range signals while the canvas is still bound to
+        # the outgoing ref. Commit the incoming ref from the settled widget
+        # instead of treating that transient signal as a fact change.
+        if not self._signal_is_cross_view_restore(ref, canvas, canvas):
+            self._commit_presentation_fingerprint(ref, canvas)
+
+    def bound_ref_for(self, canvas) -> UltraViewRef | None:
+        if canvas is None:
+            return None
+        item = self._bindings.get(id(canvas))
+        return None if item is None else item[0]
+
+    def offer_capture_bound_canvas(
+        self, canvas, incoming_ref: UltraViewRef | None = None
+    ) -> None:
+        """Grab the currently bound ref before the canvas scene is overwritten.
+
+        Must run synchronously: a queued grab would see the new binding and
+        drop the old frame (UV-A18). Same-view replot does not capture the
+        outgoing frame.         Hidden secondary widgets are skipped.
+        """
+        if self._inactive():
+            return
+        if canvas is None or not _alive(canvas):
+            return
+        try:
+            if not canvas.isVisible():
+                return
+        except RuntimeError:
+            return
+        ref = self.bound_ref_for(canvas)
+        if ref is None:
+            return
+        if incoming_ref is not None and ref == incoming_ref:
+            return
+        self._try_publish_now(ref, canvas, "leaving-bound-canvas")
+
+    def request_capture(self, ref, widget, reason: str) -> None:
+        if self._inactive():
+            return
+        if ref is None or widget is None or not _alive(widget):
+            return
+        try:
+            if not widget.isVisible():
+                return
+        except RuntimeError:
+            return
+        if self._defer_capture_for_axis_edit(ref, widget, reason):
+            return
+        if self._defer_capture_for_page_transition(ref, widget, reason):
+            return
+        captured = collect_widget_capture_facts(widget)
+        if captured.capability != CAPABILITY_OK:
+            self._warn_capture(
+                ref, widget, reason, captured.degrade_reason or "unsupported-host"
+            )
+            self._push_preview(ref, usable=False)
+            return
+        if not captured.has_real_result:
+            self._warn_capture(ref, widget, reason, "no-result")
+            self._push_preview(ref, usable=False)
+            return
+        digest = self.current_digest_for(ref)
+        if digest is None:
+            self._warn_capture(ref, widget, reason, "digest-unavailable")
+            return
+        if (
+            self._has_current_preview(ref, digest)
+            and not self._needs_focus_recapture(ref)
+            and not self._needs_resolution_recapture(ref)
+        ):
+            self._deferred_preview_refs.discard(ref)
+            return
+        if self._defer_hidden_automatic_preview(reason):
+            self._deferred_preview_refs.add(ref)
+            return
+        key = (ref, digest)
+        self._drop_queued_for_ref(ref, keep=key)
+        if key in self._queued:
+            return
+        self._ensure_stability_hooks(widget)
+        if not self._is_stable(widget, ref.section, facts=captured):
+            self._unstable[id(widget)] = (ref, digest, reason, weakref.ref(widget))
+            return
+        self._unstable.pop(id(widget), None)
+        if ref.section in _HEATMAP_SECTIONS or self._hosts_heatmap(widget):
+            self._queue_heatmap_grab(key, ref, widget, digest, reason)
+            return
+        self._queue_grab(key, ref, widget, digest, reason)
+
+    def _defer_capture_for_page_transition(self, ref, widget, reason: str) -> bool:
+        """Resume an automatic target-preview grab after a real handoff.
+
+        This never delays a leaving-source capture (that path calls
+        ``_try_publish_now`` directly).  It also does not use a duration as a
+        readiness proxy: the page-transition owner emits after its natural
+        target paint and either finishes the compositor or cancels it.
+        """
+        window = self._window
+        stack = getattr(window, "chart_stack", None) if window is not None else None
+        matches = getattr(stack, "has_page_transition_target", None)
+        controller_getter = getattr(stack, "page_transition", None)
+        if not callable(matches) or not callable(controller_getter):
+            return False
+        try:
+            if not matches(ref.section, ref.view_id):
+                return False
+            controller = controller_getter()
+        except (RuntimeError, TypeError):
+            return False
+        if controller is None:
+            return False
+        key = (ref, id(widget), str(reason))
+        if key in self._page_transition_waits:
+            return True
+        owner_ref = weakref.ref(self)
+        widget_ref = weakref.ref(widget)
+
+        def resume(*_args):
+            owner = owner_ref()
+            if owner is None:
+                return
+            owner._resume_page_transition_capture(key)
+
+        try:
+            controller.transition_finished.connect(resume)
+            controller.transition_cancelled.connect(resume)
+        except (RuntimeError, TypeError):
+            return False
+        self._page_transition_waits[key] = (
+            controller, resume, ref, widget_ref, str(reason),
+        )
+        return True
+
+    def _ensure_axis_edit_hook(self) -> None:
+        """Listen only to the controller's public edit-settlement contract."""
+        window = self._window
+        stack = getattr(window, "chart_stack", None) if window is not None else None
+        controller = getattr(stack, "_pinned_cursors", None)
+        if controller is None or controller is self._axis_edit_controller:
+            return
+        signal = getattr(controller, "axis_edit_state_changed", None)
+        if signal is None:
+            return
+        try:
+            signal.connect(self._on_axis_edit_state_changed)
+        except (RuntimeError, TypeError):
+            return
+        self._axis_edit_controller = controller
+        self._hooks.append((controller, signal, self._on_axis_edit_state_changed))
+
+    def _axis_edits_settled(self, widget) -> bool:
+        self._ensure_axis_edit_hook()
+        controller = self._axis_edit_controller
+        settled = getattr(controller, "axis_edit_is_settled", None)
+        if not callable(settled):
+            return True
+        for host in _iter_overlay_hosts(widget):
+            try:
+                if not settled(host):
+                    return False
+            except (RuntimeError, TypeError):
+                return False
+        return True
+
+    def _defer_capture_for_axis_edit(self, ref, widget, reason: str) -> bool:
+        if self._axis_edits_settled(widget):
+            return False
+        self._axis_edit_waits[(ref, id(widget))] = (
+            ref,
+            weakref.ref(widget),
+            str(reason),
+        )
+        return True
+
+    @staticmethod
+    def _widget_has_overlay_host(widget, canvas) -> bool:
+        return any(host is canvas for host in _iter_overlay_hosts(widget))
+
+    def _on_axis_edit_state_changed(self, canvas, active: bool) -> None:
+        if self._inactive():
+            return
+        if active:
+            for ref, widget_ref in list(self._bindings.values()):
+                widget = widget_ref() if widget_ref is not None else None
+                if widget is None or not _alive(widget):
+                    continue
+                if not self._widget_has_overlay_host(widget, canvas):
+                    continue
+                self._drop_queued_for_ref(ref)
+                self._axis_edit_waits[(ref, id(widget))] = (
+                    ref,
+                    weakref.ref(widget),
+                    "pinned-cursor",
+                )
+            return
+        for key, (ref, widget_ref, reason) in list(self._axis_edit_waits.items()):
+            widget = widget_ref() if widget_ref is not None else None
+            if widget is None or not _alive(widget):
+                self._axis_edit_waits.pop(key, None)
+                continue
+            if not self._axis_edits_settled(widget):
+                continue
+            self._axis_edit_waits.pop(key, None)
+            self.request_capture(ref, widget, reason)
+
+    def _resume_page_transition_capture(self, key) -> None:
+        entry = self._page_transition_waits.pop(key, None)
+        if entry is None:
+            return
+        controller, slot, ref, widget_ref, reason = entry
+        for signal in (
+            getattr(controller, "transition_finished", None),
+            getattr(controller, "transition_cancelled", None),
+        ):
+            if signal is None:
+                continue
+            try:
+                signal.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+        widget = widget_ref()
+        if widget is not None and _alive(widget):
+            self.request_capture(ref, widget, reason)
+
+    def _clear_page_transition_waits(self, *, widget_id=None) -> None:
+        keys = tuple(self._page_transition_waits)
+        for key in keys:
+            if widget_id is not None and key[1] != widget_id:
+                continue
+            entry = self._page_transition_waits.pop(key)
+            controller, slot = entry[:2]
+            for signal in (
+                getattr(controller, "transition_finished", None),
+                getattr(controller, "transition_cancelled", None),
+            ):
+                if signal is None:
+                    continue
+                try:
+                    signal.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+
+    def request_visible_section_capture(self, section: str, reason: str = "plot") -> None:
+        if self._inactive():
+            return
+        window = self._window
+        if window is None:
+            return
+        ref = self._active_ref(section)
+        if ref is None:
+            return
+        widget = self._visible_widget_for(section)
+        if widget is None:
+            return
+        self.bind_canvas(widget, ref)
+        self.request_capture(ref, widget, reason)
+
+    def notify_result_stored(self, section, view_id, pane_idx, key, result) -> None:
+        """Bump generation when the stored result object is new, replaced, or gone.
+
+        Same-object repeat notify is a real path and must not bump. Identity
+        is a weakref when possible so a GC'd object cannot recycle its
+        ``id()`` into a false "unchanged" comparison (UVL-A12). Objects that
+        cannot be weakly referenced keep a strong token and still compare
+        with ``is`` — unconditional TypeError bump would jitter digest on
+        cache-hit re-notify of tuples/ndarrays.
+        """
+        if self._inactive():
+            return
+        slot = self._generation_slot(section, view_id, pane_idx, key)
+        previous = self._result_refs.get(slot)
+        if previous is not None and previous() is result:
+            return
+        self._result_generation[slot] = int(self._result_generation.get(slot, 0)) + 1
+        self._result_refs[slot] = _ResultIdentityRef(result)
+
+    def result_generation_for(self, section, view_id, pane_idx, key) -> int:
+        slot = self._generation_slot(section, view_id, pane_idx, key)
+        return int(self._result_generation.get(slot, 0))
+
+    def presentation_payload_for(self, ref: UltraViewRef) -> dict | None:
+        window = self._window
+        if window is None or ref is None:
+            return None
+        if ref.section == "time":
+            return self._time_payload(window, ref)
+        if ref.section in SOURCE_SECTIONS:
+            return self._analysis_payload(window, ref)
+        return None
+
+    def current_digest_for(self, ref: UltraViewRef) -> str | None:
+        payload = self.presentation_payload_for(ref)
+        if payload is None:
+            return None
+        try:
+            return presentation_digest(payload)
+        except (TypeError, ValueError) as exc:
+            # The exception names the offending leaf; a bare "digest failed"
+            # does not, and that is the whole diagnosis when a section stops
+            # producing previews.
+            self._warn_digest(ref, exc)
+            return None
+
+    def set_pinned_from_board(self, board) -> None:
+        """Compatibility name for P0 callers; residency is Workspace-wide."""
+        active = active_board(self._workspace)
+        sizes = self._card_display_sizes()
+        dpr = self._device_pixel_ratio()
+        requests = []
+        for candidate in self._workspace.boards:
+            if candidate.board_id == active.board_id:
+                placed = placed_ref_set(candidate)
+                for ref in placed:
+                    self._refresh_resolution_state(ref)
+                    display_target = _display_target_size(sizes.get(ref))
+                    preview = self._preview_pixel_size(ref)
+                    resolution_target = self._resolution_target_device(ref, dpr)
+                    if display_target is not None and needs_focus_recapture(
+                        display_target, preview
+                    ):
+                        requests.append(
+                            ResidencyRequest(
+                                ref,
+                                tier=RESIDENCY_TIER_FOCUS,
+                                target_size=display_target,
+                            )
+                        )
+                    else:
+                        tier = (
+                            RESIDENCY_TIER_ACTIVE_VISIBLE
+                            if self._active_card_visible(ref)
+                            else RESIDENCY_TIER_ACTIVE_PLACED
+                        )
+                        target = (
+                            resolution_target
+                            if self._store.is_resolution_stale(ref)
+                            else display_target
+                        )
+                        requests.append(
+                            ResidencyRequest(ref, tier=tier, target_size=target)
+                        )
+                requests.extend(
+                    ResidencyRequest(ref, tier=RESIDENCY_TIER_TRAY)
+                    for ref in candidate.unplaced
+                )
+            else:
+                requests.extend(
+                    ResidencyRequest(ref, tier=RESIDENCY_TIER_INACTIVE_PLACED)
+                    for ref in placed_ref_set(candidate)
+                )
+                requests.extend(
+                    ResidencyRequest(ref, tier=RESIDENCY_TIER_TRAY)
+                    for ref in candidate.unplaced
+                )
+        self._store.set_residency_requests(requests)
+        self._recapture_resolution_stale_refs()
+        if self._sheet_visible():
+            self.consume_deferred_previews()
+
+    def _active_card_visible(self, ref: UltraViewRef) -> bool:
+        page = self.page()
+        if page is None:
+            return False
+        card = page.card_widget(ref.section, ref.view_id)
+        scroll = page.board_scroll_area()
+        if card is None or scroll is None:
+            return False
+        try:
+            rect = card.rect()
+            center = card.mapTo(scroll.viewport(), rect.center())
+            return scroll.viewport().rect().contains(center)
+        except RuntimeError:
+            return False
+
+    def _card_display_sizes(self) -> dict:
+        page = self.page()
+        if page is None:
+            return {}
+        try:
+            return dict(page.card_display_sizes())
+        except RuntimeError:
+            return {}
+
+    def _preview_pixel_size(self, ref: UltraViewRef) -> tuple[int, int]:
+        record = self._store.get(ref)
+        image = getattr(record, "image", None) if record is not None else None
+        if image is None or not PreviewStore.image_valid(image):
+            return (0, 0)
+        return (int(image.width()), int(image.height()))
+
+    def _device_pixel_ratio(self) -> float:
+        """Logical-to-device scale of the Board's current screen.
+
+        PreviewStore keeps DPR-normalized raw pixels. Resolution compare and
+        recapture targets divide/multiply by this so Retina and DPR=1 share
+        the same logical geometry (Spec D11).
+        """
+        for widget in (self.page(), self._window):
+            if widget is None:
+                continue
+            getter = getattr(widget, "devicePixelRatioF", None)
+            if not callable(getter):
+                continue
+            try:
+                ratio = float(getter())
+            except (RuntimeError, TypeError, ValueError):
+                continue
+            if ratio > 0.0:
+                return max(1.0, ratio)
+        return 1.0
+
+    def _preview_logical_size(self, ref: UltraViewRef) -> tuple[int, int] | None:
+        raw_w, raw_h = self._preview_pixel_size(ref)
+        if raw_w <= 0 or raw_h <= 0:
+            return None
+        dpr = self._device_pixel_ratio()
+        return (
+            max(1, int(round(raw_w / dpr))),
+            max(1, int(round(raw_h / dpr))),
+        )
+
+    def _inner_reading_box_logical(self, ref: UltraViewRef) -> tuple[int, int] | None:
+        board = active_board(self._workspace)
+        item = free_grid_placement_for(board, ref)
+        if item is not None:
+            metrics = canonical_screen_metrics(board.free_grid)
+            _x, _y, width, height = inner_reading_box(item.rect, metrics)
+            if width >= 1 and height >= 1:
+                return (int(width), int(height))
+        sizes = self._card_display_sizes()
+        target = sizes.get(ref)
+        if target is None:
+            return None
+        try:
+            width, height = int(target[0]), int(target[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+        if width < 1 or height < 1:
+            return None
+        dpr = self._device_pixel_ratio()
+        return (
+            max(1, int(round(width / dpr))),
+            max(1, int(round(height / dpr))),
+        )
+
+    def _resolution_target_device(
+        self, ref: UltraViewRef, dpr: float | None = None
+    ) -> tuple[int, int] | None:
+        reading = self._inner_reading_box_logical(ref)
+        if reading is None:
+            return None
+        scale = self._device_pixel_ratio() if dpr is None else max(1.0, float(dpr))
+        return _display_target_size(
+            (
+                max(1, int(round(reading[0] * scale))),
+                max(1, int(round(reading[1] * scale))),
+            )
+        )
+
+    def _refresh_resolution_state(self, ref: UltraViewRef) -> None:
+        reading = self._inner_reading_box_logical(ref)
+        cache = self._preview_logical_size(ref)
+        stale = bool(
+            reading is not None
+            and cache is not None
+            and needs_resolution_recapture(reading, cache)
+        )
+        self._store.mark_resolution_stale(ref, stale)
+
+    def _needs_resolution_recapture(self, ref: UltraViewRef) -> bool:
+        reading = self._inner_reading_box_logical(ref)
+        cache = self._preview_logical_size(ref)
+        if reading is None or cache is None:
+            return False
+        if not needs_resolution_recapture(reading, cache):
+            return False
+        record = self._store.get(ref)
+        image = getattr(record, "image", None) if record is not None else None
+        if image is None or not PreviewStore.image_valid(image):
+            return False
+        if max(image.width(), image.height()) >= MAX_PREVIEW_RAW_EDGE:
+            return False
+        widget = self._widget_for_ref(ref)
+        if widget is None:
+            return True
+        try:
+            native_w = max(1.0, float(widget.width()) * float(widget.devicePixelRatioF()))
+            native_h = max(1.0, float(widget.height()) * float(widget.devicePixelRatioF()))
+        except RuntimeError:
+            return True
+        scale = self._grab_scale(widget, ref)
+        next_w = native_w * scale
+        next_h = native_h * scale
+        return image.width() + 1 < next_w or image.height() + 1 < next_h
+
+    def _widget_for_resolution_recapture(self, ref: UltraViewRef):
+        widget = self._widget_for_ref(ref)
+        if widget is not None:
+            return widget
+        candidate = self._visible_widget_for(ref.section)
+        if candidate is not None and self._active_ref(ref.section) == ref:
+            return candidate
+        return None
+
+    def _recapture_resolution_stale_refs(self) -> None:
+        """Grab a larger preview for undersized caches. Preview bits only."""
+        if self._inactive():
+            return
+        notify_not_resident = False
+        for board in self._workspace.boards:
+            for ref in placed_ref_set(board):
+                self._refresh_resolution_state(ref)
+                if not self._store.is_resolution_stale(ref):
+                    self._resolution_stale_notified.discard(ref)
+                    continue
+                if not self._needs_resolution_recapture(ref):
+                    continue
+                widget = self._widget_for_resolution_recapture(ref)
+                if widget is None:
+                    logger.debug(
+                        "resolution_stale view not resident section=%s view_id=%s",
+                        ref.section,
+                        ref.view_id,
+                    )
+                    if ref not in self._resolution_stale_notified:
+                        notify_not_resident = True
+                        self._resolution_stale_notified.add(ref)
+                    continue
+                self._resolution_stale_notified.discard(ref)
+                self.bind_canvas(widget, ref)
+                self.request_capture(ref, widget, "resolution")
+        if notify_not_resident:
+            self._toast(RESOLUTION_STALE_TOAST, "info")
+
+    def _needs_focus_recapture(self, ref: UltraViewRef) -> bool:
+        request = self._store.residency_request(ref)
+        if request is None or request.tier != RESIDENCY_TIER_FOCUS:
+            return False
+        record = self._store.get(ref)
+        image = getattr(record, "image", None) if record is not None else None
+        if image is None or not PreviewStore.image_valid(image):
+            return True
+        if max(image.width(), image.height()) >= MAX_PREVIEW_RAW_EDGE:
+            return False
+        target = request.target_size
+        if target is None:
+            return False
+        preview = (image.width(), image.height())
+        if not needs_focus_recapture(target, preview):
+            return False
+        widget = self._widget_for_ref(ref)
+        if widget is None:
+            return True
+        try:
+            native_w = max(1.0, float(widget.width()) * float(widget.devicePixelRatioF()))
+            native_h = max(1.0, float(widget.height()) * float(widget.devicePixelRatioF()))
+        except RuntimeError:
+            return True
+        scale = self._grab_scale(widget, ref)
+        next_w = native_w * scale
+        next_h = native_h * scale
+        return image.width() + 1 < next_w or image.height() + 1 < next_h
+
+    def _on_camera_settled(self) -> None:
+        if self._inactive():
+            return
+        self._focus_timer.start()
+
+    def _on_focus_residency_timeout(self) -> None:
+        if self._inactive():
+            return
+        self.set_pinned_from_board(active_board(self._workspace))
+        self._recapture_focus_refs()
+
+    def _recapture_focus_refs(self) -> None:
+        for board in self._workspace.boards:
+            for ref in placed_ref_set(board):
+                if not self._needs_focus_recapture(ref):
+                    continue
+                widget = self._widget_for_ref(ref)
+                if widget is None:
+                    candidate = self._visible_widget_for(ref.section)
+                    if candidate is not None and self._active_ref(ref.section) == ref:
+                        widget = candidate
+                if widget is None:
+                    continue
+                self.bind_canvas(widget, ref)
+                self.request_capture(ref, widget, "focus")
+
+    def _queue_sidecar_images(self, images: tuple[SidecarImagePayload, ...]) -> None:
+        self._sidecar_pending = list(images)
+        self._prioritize_sidecar_queue()
+        if self._sidecar_pending and not self._inactive():
+            self._sidecar_timer.start()
+
+    def _prioritize_sidecar_queue(self) -> None:
+        if not self._sidecar_pending:
+            return
+        active = set(all_refs(active_board(self._workspace)))
+        self._sidecar_pending.sort(key=lambda item: 0 if item.ref in active else 1)
+
+    def _on_sidecar_load_timeout(self) -> None:
+        generation = self._sidecar_generation
+        if self._inactive() or generation != self._sidecar_generation:
+            self._sidecar_pending.clear()
+            return
+        batch = self._sidecar_pending[:_SIDECAR_LOAD_BATCH]
+        self._sidecar_pending = self._sidecar_pending[_SIDECAR_LOAD_BATCH:]
+        members = {
+            ref for board in self._workspace.boards for ref in all_refs(board)
+        }
+        for payload in batch:
+            if self._inactive() or generation != self._sidecar_generation:
+                self._sidecar_pending.clear()
+                return
+            if payload.ref not in members:
+                continue
+            try:
+                publish_sidecar_image(self._store, payload)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            self._push_preview(payload.ref)
+        if (
+            self._sidecar_pending
+            and not self._inactive()
+            and generation == self._sidecar_generation
+        ):
+            self._sidecar_timer.start()
+
+    def save_preview_sidecar(self, project_path) -> list[str]:
+        """Publish optional shared preview pixels before the project JSON commit."""
+        if self._inactive():
+            return []
+        self._publish_deferred_previews_for_save()
+        saved = save_preview_sidecar(
+            project_path, workspace_to_payload(self._workspace), self._store
+        )
+        if saved.ok:
+            set_workspace_preview_sidecar(self._workspace, saved.descriptor)
+            return []
+        # A new Save As must never retain a relative descriptor that points to
+        # the original project's sibling sidecar directory.  Same-path saves
+        # can keep their last known-good descriptor when the optional refresh
+        # fails, preserving an already valid acceleration layer.
+        existing = self._workspace.preview_sidecar
+        if existing is None and isinstance(self._workspace.opaque_payload, dict):
+            existing = self._workspace.opaque_payload.get("preview_sidecar")
+        descriptor_path = existing.get("path") if isinstance(existing, dict) else None
+        expected_prefix = f"{Path(project_path).name}.ultraview/"
+        if not isinstance(descriptor_path, str) or not descriptor_path.startswith(expected_prefix):
+            set_workspace_preview_sidecar(self._workspace, None)
+        return [
+            f"{item.code}: {item.detail}" if item.detail else item.code
+            for item in saved.warnings
+        ]
+
+    def capture_leaving_source(self, section: str) -> None:
+        window = self._window
+        if window is None or section not in SOURCE_SECTIONS:
+            return
+        if section == "time":
+            self._capture_visible_time_refs("leaving-source-for-ultraview")
+        else:
+            self.request_visible_section_capture(
+                section, "leaving-source-for-ultraview"
+            )
+        # open_ultraview presents the sheet after this returns. The 0 ms
+        # shot is that show, not a readiness delay.
+        self._schedule_deferred_preview_consume()
+
+    def capture_before_section_hidden(self, section: str) -> None:
+        """Commit deferred pixels while their source is still visible.
+
+        A hidden Section cannot satisfy capture's visibility contract on a
+        later Board open/save. Like UV-A18's before-rebind offer, this is a
+        synchronous final opportunity; unchanged refs do not grab again.
+        Preserve the normal stability and digest checks.
+        """
+        if self._inactive():
+            return
+        for ref in tuple(self._deferred_preview_refs):
+            if ref.section != section:
+                continue
+            widget = self._bound_widget_for(ref)
+            if widget is None or not _alive(widget) or not widget.isVisible():
+                continue
+            if self._try_publish_now(ref, widget, "leaving-section"):
+                self._deferred_preview_refs.discard(ref)
+                self._drop_queued_for_ref(ref)
+                self._idle_pending.pop(ref, None)
+
+    def _capture_visible_time_refs(self, reason: str) -> None:
+        window = self._window
+        stack = getattr(window, "chart_stack", None)
+        manager = getattr(window, "view_manager", None)
+        if stack is None or manager is None or not manager.views:
+            return
+        active = manager.get(manager.active)
+        refs = [UltraViewRef("time", active.view_id)]
+        if callable(getattr(stack, "split_active", None)) and stack.split_active():
+            partner_idx = manager.partner_for(manager.active)
+            if partner_idx is not None:
+                partner = manager.get(partner_idx)
+                refs.append(UltraViewRef("time", partner.view_id))
+        for ref in refs:
+            widget = self._time_canvas_for_ref(ref)
+            if widget is None:
+                continue
+            self.bind_canvas(widget, ref)
+            self.request_capture(ref, widget, reason)
+
+    def request_pinned_cursor_capture(self) -> None:
+        """Capture the active owner output after a committed pin mutation."""
+        if self._inactive():
+            return
+        window = self._window
+        stack = getattr(window, "chart_stack", None) if window is not None else None
+        mode_getter = getattr(stack, "current_mode", None)
+        mode = mode_getter() if callable(mode_getter) else None
+        if mode == "time":
+            self._capture_visible_time_refs("pinned-cursor")
+        elif mode in SOURCE_SECTIONS:
+            self.request_visible_section_capture(mode, "pinned-cursor")
+
+    def _time_canvas_for_ref(self, ref: UltraViewRef):
+        """Resolve time-domain canvas by pane ownership, not click-focus.
+
+        Active View ↔ primary ``canvas_time``; split partner ↔ secondary.
+        Focused pane is ignored so "加入总览" cannot publish the wrong View.
+        """
+        if ref is None or ref.section != "time":
+            return None
+        window = self._window
+        stack = getattr(window, "chart_stack", None) if window is not None else None
+        manager = getattr(window, "view_manager", None) if window is not None else None
+        if stack is None or manager is None or not manager.views:
+            return None
+        active = manager.get(manager.active)
+        if str(getattr(active, "view_id", "")) == ref.view_id:
+            return getattr(stack, "canvas_time", None)
+        if not callable(getattr(stack, "split_active", None)) or not stack.split_active():
+            return None
+        partner_idx = manager.partner_for(manager.active)
+        if partner_idx is None:
+            return None
+        partner = manager.get(partner_idx)
+        if str(getattr(partner, "view_id", "")) != ref.view_id:
+            return None
+        secondary = getattr(stack, "secondary_canvas", None)
+        return secondary() if callable(secondary) else None
+
+    def _ref_exists(self, ref: UltraViewRef) -> bool:
+        if ref.section == "time":
+            return self._time_state(self._window, ref.view_id) is not None
+        resolved = self._analysis_state(self._window, ref.section, ref.view_id)
+        return resolved is not None
+
+    def _defer_hidden_automatic_preview(self, reason: str) -> bool:
+        if self._sheet_visible():
+            return False
+        return str(reason) in _AUTOMATIC_SWITCH_PREVIEW_REASONS
+
+    def _schedule_deferred_preview_consume(self) -> None:
+        if self._inactive() or not self._deferred_preview_refs:
+            return
+        if self._sheet_visible():
+            self.consume_deferred_previews()
+            return
+        QTimer.singleShot(0, self.consume_deferred_previews)
+
+    def consume_deferred_previews(self) -> None:
+        """Fill deferred previews once UltraView can show them.
+
+        Visible thumbnails are scheduled first, through the existing per-ref
+        idle timer. Refs whose canvas is not currently bound stay deferred
+        until a later show or a project save that can still see that canvas.
+        """
+        if not _alive(self) or self._inactive() or not self._deferred_preview_refs:
+            return
+        if not self._sheet_visible():
+            return
+        for ref in self._deferred_recapture_order():
+            if ref not in self._deferred_preview_refs:
+                continue
+            widget = self._bound_widget_for(ref)
+            if widget is None:
+                continue
+            self.schedule_idle_capture(ref, widget)
+
+    def _deferred_recapture_order(self) -> list[UltraViewRef]:
+        board = active_board(self._workspace)
+        placed = [item.ref for item in (getattr(board, "free_grid", None) or ())]
+        if not placed:
+            placed = list(placed_ref_set(board))
+        page = self.page()
+        card_for = getattr(page, "card_widget", None) if page is not None else None
+        scroll_getter = getattr(page, "board_scroll_area", None) if page is not None else None
+        scroll = scroll_getter() if callable(scroll_getter) else None
+        visible = []
+        hidden = []
+        for index, ref in enumerate(placed):
+            if ref not in self._deferred_preview_refs:
+                continue
+            rank = self._thumbnail_rank(card_for, scroll, ref, index)
+            if rank[0] == 0:
+                visible.append(rank)
+            else:
+                hidden.append(rank)
+        visible.sort()
+        hidden.sort()
+        ordered = [item[-1] for item in visible]
+        ordered.extend(item[-1] for item in hidden)
+        rest = [ref for ref in self._deferred_preview_refs if ref not in ordered]
+        return ordered + rest
+
+    def _thumbnail_rank(self, card_for, scroll, ref, index):
+        if not callable(card_for) or scroll is None:
+            return (1, index, 0, ref)
+        try:
+            card = card_for(ref.section, ref.view_id)
+            if card is None:
+                return (1, index, 0, ref)
+            rect = card.rect()
+            origin = card.mapTo(scroll.viewport(), rect.topLeft())
+            center = card.mapTo(scroll.viewport(), rect.center())
+            on_screen = bool(scroll.viewport().rect().contains(center))
+            return (
+                0 if on_screen else 1,
+                int(origin.y()),
+                int(origin.x()),
+                ref,
+            )
+        except (RuntimeError, TypeError, AttributeError):
+            return (1, index, 0, ref)
+
+    def _publish_deferred_previews_for_save(self) -> None:
+        """Grab deferred refs whose canvas is still on screen before save."""
+        for ref in list(self._deferred_preview_refs):
+            widget = self._bound_widget_for(ref)
+            if widget is None or not _alive(widget):
+                continue
+            try:
+                visible = bool(widget.isVisible())
+            except RuntimeError:
+                continue
+            if not visible:
+                continue
+            if self._try_publish_now(ref, widget, "project-save"):
+                self._deferred_preview_refs.discard(ref)
+                continue
+            digest = self.current_digest_for(ref)
+            if digest is not None and self._has_current_preview(ref, digest):
+                self._deferred_preview_refs.discard(ref)
+
+    def _signal_is_cross_view_restore(self, ref, sender, widget) -> bool:
+        """True when this signal belongs to a view restore, not the bound ref.
+
+        Time restores set ``_applying_view`` for the whole projection, and
+        the canvas is still bound to the outgoing View while that runs.
+        Analysis restores keep the same page widget but the active View has
+        already changed. Split time panes are not the active View and must
+        still record their own zoom.
+        """
+        if ref is None:
+            return False
+        if ref.section == "time":
+            window = self._window
+            return bool(window is not None and getattr(window, "_applying_view", False))
+        active = self._active_ref(ref.section)
+        if active is None or active == ref:
+            return False
+        visible = self._visible_widget_for(ref.section)
+        if visible is None:
+            return False
+        if sender is visible or widget is visible:
+            return True
+        try:
+            return self._widget_has_overlay_host(visible, sender) or (
+                self._widget_has_overlay_host(visible, widget)
+            )
+        except (RuntimeError, TypeError):
+            return False
+
+    def _note_presentation_signal_args(self, sender, args) -> None:
+        if sender is None or len(args) != 1:
+            return
+        payload = args[0]
+        ident = id(sender)
+        if isinstance(payload, bool):
+            self._manual_zoom_by_host[ident] = bool(payload)
+            return
+        if isinstance(payload, str):
+            self._dual_cursor_text_by_host[ident] = payload
+
+    def _presentation_fingerprint(self, widget) -> tuple:
+        hosts = list(_iter_overlay_hosts(widget))
+        if not hosts:
+            hosts = [widget]
+        rows = []
+        for host in hosts:
+            ident = id(host)
+            rows.append(
+                (
+                    _visible_range_fact(host),
+                    _markup_fact(host),
+                    _dual_cursor_fact(host),
+                    self._dual_cursor_text_by_host.get(ident),
+                    self._manual_zoom_by_host.get(ident),
+                )
+            )
+        return tuple(rows)
+
+    def _commit_presentation_fingerprint(self, ref, widget) -> bool:
+        """Record ``widget``'s facts. Return True only when they changed."""
+        try:
+            current = self._presentation_fingerprint(widget)
+        except RuntimeError:
+            return False
+        previous = self._presentation_fingerprints.get(ref)
+        self._presentation_fingerprints[ref] = current
+        if previous is None or previous == current:
+            return False
+        self.bump_presentation_revision(ref)
+        return True
+
+    def presentation_revision_for(self, ref: UltraViewRef) -> int:
+        return int(self._presentation_revision.get(ref, 0) or 0)
+
+    def bump_presentation_revision(self, ref: UltraViewRef) -> int:
+        """Session-only counter for digest-external pixel-affecting source state.
+
+        Not persisted, not added to presentation_digest.  Temporary inspect
+        freshness is digest + this revision.
+        """
+        next_value = int(self._presentation_revision.get(ref, 0) or 0) + 1
+        self._presentation_revision[ref] = next_value
+        return next_value
+
+    def invalidate_preview(self, ref: UltraViewRef) -> None:
+        """Drop stored pixels and in-flight grabs. Board membership is unchanged.
+
+        Queued capture callbacks keep the existing digest/generation guard:
+        after this bump they cannot republish the pre-close frame.
+        """
+        if self._inactive() or ref is None:
+            return
+        self._drop_queued_for_ref(ref)
+        self._idle_pending.pop(ref, None)
+        for ident, payload in list(self._unstable.items()):
+            if payload and payload[0] == ref:
+                self._unstable.pop(ident, None)
+        self.bump_presentation_revision(ref)
+        self._presentation_fingerprints.pop(ref, None)
+        self._deferred_preview_refs.discard(ref)
+        if _alive(self._store):
+            self._store.drop(ref)
+
+    def _on_store_images_dropped(self, refs) -> None:
+        if self._inactive():
+            return
+        for ref in refs or ():
+            if isinstance(ref, UltraViewRef):
+                self._push_preview(ref)
+
+    def _time_payload(self, window, ref: UltraViewRef) -> dict | None:
+        state = self._time_state(window, ref.view_id)
+        if state is None:
+            return None
+        facts = self._runtime_facts_for(ref)
+        filter_payload = self._filter_payload(window, state)
+        return {
+            "attached_file_ids": [str(fid) for fid in (state.attached_file_ids or [])],
+            "checked": [
+                pair for key in (state.checked or [])
+                if (pair := _channel_pair(key)) is not None
+            ],
+            "hidden_channels": [
+                pair for key in (state.hidden_channels or [])
+                if (pair := _channel_pair(key)) is not None
+            ],
+            "colors": [
+                [*_channel_pair(key), str(color)]
+                for key, color in (state.colors or {}).items()
+                if _channel_pair(key) is not None
+            ],
+            "plot_mode": str(state.plot_mode or ""),
+            "xlim": self._pair(state.xlim),
+            "ylims": {
+                str(name): self._pair(span)
+                for name, span in (state.ylims or {}).items()
+            },
+            "overlay_primary": _channel_pair(state.overlay_primary),
+            "axis_opts": dict(state.axis_opts or {}),
+            "chart_appearance": dict(
+                getattr(state, "chart_appearance", None) or {}
+            ),
+            "filter": filter_payload,
+            "data_signatures": self._time_data_signatures(window, state),
+            "markup_revision": facts.markup_revision,
+            **self._cursor_payload(window, ref, state),
+        }
+
+    def _analysis_payload(self, window, ref: UltraViewRef) -> dict | None:
+        resolved = self._analysis_state(window, ref.section, ref.view_id)
+        if resolved is None:
+            return None
+        _mgr, state = resolved
+        facts = self._runtime_facts_for(ref)
+        pane_count = len(state.panes)
+        if facts.visible_pane_count is not None:
+            pane_count = int(facts.visible_pane_count)
+        panes = []
+        for pane_idx, pane in enumerate(state.panes[:pane_count]):
+            keys = self._pane_cache_keys(window, ref.section, ref.view_id, pane_idx)
+            panes.append({
+                "sources": [_channel_pair(key) for key in (pane.sources or [])],
+                "rpm_source": _channel_pair(pane.rpm_source),
+                "input_source": _channel_pair(pane.input_source),
+                "output_source": _channel_pair(pane.output_source),
+                "time_range": self._pair(pane.time_range),
+                "effective_time_range": self._pair(pane.effective_time_range),
+                "xlim": self._pair(pane.xlim),
+                "ylim": self._pair(pane.ylim),
+                "ylims": {
+                    str(name): self._pair(span)
+                    for name, span in (pane.ylims or {}).items()
+                },
+                "cache_keys": [self._digest_key(key) for key in keys],
+                "result_generation": [
+                    self.result_generation_for(
+                        ref.section, ref.view_id, pane_idx, key
+                    )
+                    for key in keys
+                ],
+            })
+        return {
+            "panes": panes,
+            "params": dict(state.params or {}),
+            "compare": dict(state.compare or {}),
+            "pane_count": pane_count,
+            "markup_revision": facts.markup_revision,
+            **self._cursor_payload(window, ref, state),
+        }
+
+    def _time_data_signatures(self, window, state) -> list:
+        files = getattr(window, "files", None) or {}
+        signatures = []
+        seen = set()
+        keys = list(state.checked or [])
+        if state.overlay_primary is not None:
+            keys.append(state.overlay_primary)
+        axis_opts = state.axis_opts or {}
+        x_axis = axis_opts.get("x_axis") or {}
+        source_fid = x_axis.get("source_fid") or x_axis.get("fid")
+        channel = x_axis.get("channel")
+        if source_fid and channel:
+            keys.append((str(source_fid), str(channel)))
+        for key in keys:
+            pair = _channel_pair(key)
+            if pair is None:
+                continue
+            token = tuple(pair)
+            if token in seen:
+                continue
+            seen.add(token)
+            signatures.append([pair, self._channel_signature(files, pair[0], pair[1])])
+        return signatures
+
+    def _channel_signature(self, files, fid, channel):
+        fd = files.get(fid) if hasattr(files, "get") else None
+        if fd is None:
+            return None
+        data = getattr(fd, "data", None)
+        if data is None:
+            return None
+        columns = getattr(data, "columns", ())
+        if channel not in columns:
+            return None
+        time_axis = getattr(fd, "time_array", None)
+        values = _array_from_column(data[channel])
+        try:
+            return _stable_source_revision(source_revision_for(time_axis, values))
+        except (TypeError, ValueError):
+            return None
+
+    def _filter_payload(self, window, state=None) -> dict:
+        payload = getattr(state, "time_filter", None)
+        if isinstance(payload, dict):
+            spec = payload.get("spec") if isinstance(payload.get("spec"), dict) else {}
+            return {
+                "enabled": bool(payload.get("enabled", False)),
+                "spec": dict(spec),
+                "show_original": bool(payload.get("show_original", True)),
+                "show_filtered": bool(payload.get("show_filtered", False)),
+            }
+        getter = getattr(window, "_time_filter_config_for_view", None)
+        if callable(getter) and state is not None:
+            views = getattr(getattr(window, "view_manager", None), "views", None) or []
+            idx = next(
+                (
+                    index for index, item in enumerate(views)
+                    if getattr(item, "view_id", None) == getattr(state, "view_id", None)
+                ),
+                None,
+            )
+            resolved = getter(idx)
+            if isinstance(resolved, dict):
+                spec = resolved.get("spec") if isinstance(resolved.get("spec"), dict) else {}
+                return {
+                    "enabled": bool(resolved.get("enabled", False)),
+                    "spec": dict(spec),
+                    "show_original": bool(resolved.get("show_original", True)),
+                    "show_filtered": bool(resolved.get("show_filtered", False)),
+                }
+        return {
+            "enabled": False,
+            "spec": {},
+            "show_original": True,
+            "show_filtered": False,
+        }
+
+    def _pane_cache_keys(self, window, section, view_id, pane_idx) -> list:
+        """Pinned cache keys for one pane, in a run-to-run stable order.
+
+        ``AnalysisPinBook`` stores each slot as a ``set``, so a multi-source
+        pane (an FFT overlay is the common case) hands back a different
+        ordering in every process — string hashing is salted per run. The
+        digest is persisted alongside the preview and compared after restart,
+        so an unordered list would make those cards read STALE forever on a
+        View nobody touched. ``repr`` orders tuple and dataclass keys alike;
+        the value only has to be deterministic, not meaningful.
+        """
+        pins = getattr(window, "_analysis_pins", None)
+        slot = (section, str(view_id), int(pane_idx))
+        if pins is not None and slot in pins:
+            return sorted(pins[slot], key=repr)
+        return []
+
+    def _cursor_payload(self, window, ref: UltraViewRef, state) -> dict:
+        widget = self._bound_widget_for(ref)
+        live = (
+            widget is not None
+            and _alive(widget)
+            and bool(widget.isVisible())
+        )
+        stored = self._runtime.get(ref)
+        dual = str(getattr(state, "cursor_mode", None) or "off") == "dual"
+        if live:
+            captured = collect_widget_capture_facts(widget)
+            geometry = [list(item) for item in captured.cursor_geometries]
+            pill = None
+            if dual:
+                pill = captured.pill_fingerprint
+                if pill is None:
+                    pill = self._pill_fingerprint(window, widget)
+                elif not isinstance(pill, list):
+                    pill = list(pill)
+        elif stored is not None:
+            geometry = [
+                list(item) if isinstance(item, tuple) else item
+                for item in (stored.cursor_geometry or ())
+            ]
+            pill = (
+                list(stored.pill_fingerprint)
+                if stored.pill_fingerprint is not None
+                else None
+            )
+        else:
+            geometry = []
+            pill = None
+        return {
+            "cursor_mode": str(getattr(state, "cursor_mode", None) or "off"),
+            "cursor_geometry": geometry,
+            "pill": pill,
+            "pins": self._pin_payload(window, ref, state, widget=widget, stored=stored),
+        }
+
+    def _pin_payload(self, window, ref, state, *, widget, stored) -> list:
+        pins = None
+        if widget is not None and _alive(widget):
+            pins = self._pin_fingerprint(window, widget)
+        if pins is None and stored is not None and stored.pin_fingerprint is not None:
+            pins = stored.pin_fingerprint
+        if pins is None:
+            pins = self._pin_fingerprint_from_state(state, ref)
+        return _as_pin_payload(pins)
+
+    def _pin_fingerprint(self, window, widget):
+        stack = getattr(window, "chart_stack", None) if window is not None else None
+        getter = getattr(stack, "pinned_cursor_fingerprint", None)
+        if not callable(getter):
+            return None
+        rows = []
+        for host in _iter_overlay_hosts(widget):
+            try:
+                value = getter(host)
+            except (TypeError, RuntimeError):
+                continue
+            if not value:
+                continue
+            rows.extend(_as_pin_payload(value))
+        return rows
+
+    def _pin_fingerprint_from_state(self, state, ref) -> list:
+        if state is None:
+            return []
+        if getattr(ref, "section", None) == "time":
+            return _pin_rows_from_collection(
+                getattr(state, "pinned_cursors", None)
+            )
+        rows = []
+        for pane in getattr(state, "panes", ()) or ():
+            rows.extend(
+                _pin_rows_from_collection(getattr(pane, "pinned_cursors", None))
+            )
+        return rows
+
+    def _pill_fingerprint(self, window, widget):
+        stack = getattr(window, "chart_stack", None) if window is not None else None
+        if stack is None:
+            return None
+        fingerprint = getattr(stack, "cursor_pill_fingerprint", None)
+        if not callable(fingerprint):
+            return None
+        hosts = list(_iter_overlay_hosts(widget))
+        canvas = hosts[0] if hosts else widget
+        try:
+            value = fingerprint(canvas)
+        except (TypeError, RuntimeError):
+            return None
+        if value is None:
+            return None
+        try:
+            items = list(value)
+        except TypeError:
+            return None
+        primary = _plain_text(items[0] if items else "")
+        detail = _plain_text(items[1] if len(items) > 1 else "")
+        return [primary, detail]
+
+    def _has_current_preview(self, ref, digest: str) -> bool:
+        record = self._store.get(ref)
+        captured_revision = int(getattr(record, "captured_revision", 0) or 0)
+        return (
+            record is not None
+            and record.captured_digest == digest
+            and captured_revision == int(self._presentation_revision.get(ref, 0) or 0)
+            and PreviewStore.image_valid(getattr(record, "image", None))
+        )
+
+    def _try_publish_now(self, ref, widget, reason: str) -> bool:
+        if self._inactive():
+            return False
+        captured = collect_widget_capture_facts(widget)
+        if captured.capability != CAPABILITY_OK:
+            self._warn_capture(
+                ref, widget, reason, captured.degrade_reason or "unsupported-host"
+            )
+            self._push_preview(ref, usable=False)
+            return False
+        if not captured.has_real_result:
+            self._warn_capture(ref, widget, reason, "no-result")
+            self._push_preview(ref, usable=False)
+            return False
+        digest = self.current_digest_for(ref)
+        if digest is None:
+            self._warn_capture(ref, widget, reason, "digest-unavailable")
+            return False
+        if (
+            self._has_current_preview(ref, digest)
+            and not self._needs_focus_recapture(ref)
+            and not self._needs_resolution_recapture(ref)
+        ):
+            return True
+        if not self._is_stable(widget, ref.section, facts=captured):
+            self._warn_capture(ref, widget, reason, "unstable")
+            return False
+        return self._publish_grab(ref, widget, digest, reason)
+
+    def _queue_grab(self, key, ref, widget, digest, reason) -> None:
+        if self._inactive():
+            return
+        widget_ref = weakref.ref(widget)
+        coord_ref = weakref.ref(self)
+
+        def _fire():
+            coord = coord_ref()
+            if coord is None or coord._inactive():
+                return
+            canvas = widget_ref()
+            if canvas is None or not _alive(canvas):
+                return
+            coord._publish_grab(ref, canvas, digest, reason)
+
+        self._start_timer(key, _fire)
+
+    def _queue_heatmap_grab(self, key, ref, widget, digest, reason) -> None:
+        if self._inactive():
+            return
+        widget_ref = weakref.ref(widget)
+        coord_ref = weakref.ref(self)
+
+        def _after_layout():
+            coord = coord_ref()
+            if coord is None or coord._inactive():
+                return
+            canvas = widget_ref()
+            if canvas is None or not _alive(canvas):
+                return
+            coord._queue_grab(key, ref, canvas, digest, reason)
+
+        def _after_first_turn():
+            coord = coord_ref()
+            if coord is None or coord._inactive():
+                return
+            canvas = widget_ref()
+            if canvas is None or not _alive(canvas):
+                return
+            coord._start_timer(key, _after_layout)
+
+        self._start_timer(key, _after_first_turn)
+
+    def _publish_grab(self, ref, widget, digest, reason) -> bool:
+        if self._inactive():
+            return False
+        if not _alive(widget):
+            return False
+        if self._defer_capture_for_axis_edit(ref, widget, reason):
+            return False
+        bound = self.bound_ref_for(widget)
+        if bound is not None and bound != ref:
+            return False
+        current = self.current_digest_for(ref)
+        if current != digest:
+            self._warn_capture(ref, widget, reason, "digest-changed")
+            self._requeue_after_digest_change(ref, widget, reason)
+            return False
+        if not self._widget_visible_and_sized(widget):
+            return False
+        captured = collect_widget_capture_facts(widget)
+        if not self._is_stable(widget, ref.section, facts=captured):
+            self._unstable[id(widget)] = (
+                ref, digest, reason, weakref.ref(widget)
+            )
+            return False
+        if captured.capability != CAPABILITY_OK:
+            self._warn_capture(
+                ref, widget, reason, captured.degrade_reason or "unsupported-host"
+            )
+            self._push_preview(ref, usable=False)
+            return False
+        if not captured.has_real_result:
+            self._warn_capture(ref, widget, reason, "no-result")
+            self._push_preview(ref, usable=False)
+            return False
+        with hide_transient_overlays(widget, section=ref.section):
+            image = self._grab_image(widget, ref)
+        if image is None:
+            self._warn_capture(ref, widget, reason, "grab-invalid")
+            return False
+        revision = int(self._presentation_revision.get(ref, 0) or 0)
+        meta = self._preview_meta(ref, digest)
+        published = bool(
+            self._store.publish(
+                ref, image, digest=digest, meta=meta, revision=revision
+            )
+        )
+        if published:
+            self._digest_retries.pop(ref, None)
+            self._runtime.commit(ref, self._facts_from_widget(widget))
+            self._presentation_fingerprints[ref] = self._presentation_fingerprint(widget)
+            self._deferred_preview_refs.discard(ref)
+            self._refresh_resolution_state(ref)
+            self._push_preview(ref)
+        return published
+
+    def _grab_scale(self, widget, ref) -> float:
+        if ref is None:
+            return 1.0
+        request = self._store.residency_request(ref)
+        try:
+            width = max(1, int(widget.width()))
+            height = max(1, int(widget.height()))
+            dpr = float(widget.devicePixelRatioF())
+        except RuntimeError:
+            return 1.0
+        native_w = max(1.0, width * dpr)
+        native_h = max(1.0, height * dpr)
+        if (
+            request is not None
+            and request.tier == RESIDENCY_TIER_FOCUS
+            and request.target_size is not None
+        ):
+            target_w, target_h = request.target_size
+            return focus_grab_scale(
+                (native_w, native_h),
+                (target_w, target_h),
+                max_edge=MAX_PREVIEW_RAW_EDGE,
+            )
+        target = None
+        if request is not None and request.target_size is not None:
+            target = request.target_size
+        else:
+            target = self._resolution_target_device(ref, dpr)
+        if target is None:
+            return 1.0
+        reading = self._inner_reading_box_logical(ref)
+        cache = self._preview_logical_size(ref)
+        if reading is None or cache is None:
+            return 1.0
+        if not needs_resolution_recapture(reading, cache):
+            return 1.0
+        return resolution_grab_scale(
+            (native_w, native_h),
+            target,
+            max_edge=MAX_PREVIEW_RAW_EDGE,
+        )
+
+    def _grab_image(self, widget, ref=None) -> QImage | None:
+        pixmap = None
+        window = self._window
+        stack = getattr(window, "chart_stack", None) if window is not None else None
+        flush = getattr(getattr(stack, "_pinned_cursors", None), "flush_layout", None)
+        if callable(flush):
+            try:
+                flush()
+            except (RuntimeError, TypeError):
+                pass
+        grab_pres = getattr(stack, "grab_presentation_pixmap", None)
+        scale = self._grab_scale(widget, ref)
+        reuse_source = getattr(stack, "transition_source_pixmap_for", None)
+        if ref is not None and callable(reuse_source):
+            try:
+                pixmap = reuse_source(
+                    ref.section, ref.view_id, widget, scale=scale,
+                )
+            except (RuntimeError, TypeError, ValueError):
+                pixmap = None
+        if callable(grab_pres):
+            if pixmap is None:
+                try:
+                    try:
+                        # The automatic coordinator captures the canvas bound
+                        # to the outgoing ref, not the stack overlay.  It must
+                        # preserve an active page handoff; explicit user
+                        # copy/export retains the default cancellation
+                        # behavior in ChartStack.
+                        pixmap = grab_pres(
+                            widget,
+                            scale=scale,
+                            cancel_page_transition=False,
+                            auto_preview=True,
+                        )
+                    except TypeError:
+                        # Compatibility seam for an older/mocked ChartStack
+                        # that has not gained the presentation-only argument.
+                        pixmap = grab_pres(widget, scale=scale)
+                except (TypeError, RuntimeError):
+                    pixmap = None
+            if pixmap is not None and pixmap.isNull():
+                pixmap = None
+        if pixmap is None:
+            grab_combined = getattr(widget, "grab_combined_pixmap", None)
+            if callable(grab_combined):
+                pixmap = grab_combined(scale=scale)
+            elif callable(getattr(widget, "grab_pixmap", None)):
+                pixmap = widget.grab_pixmap(scale=scale)
+            elif isinstance(widget, QWidget):
+                pixmap = widget.grab()
+        image = pixmap_as_device_pixel_image(pixmap)
+        if image is None:
+            return None
+        if image.width() < _MIN_CAPTURE_EDGE or image.height() < _MIN_CAPTURE_EDGE:
+            return None
+        return image
+
+    def _widget_has_any_real_result(self, widget) -> bool:
+        """True if any overlay host currently shows a computed/plotted result.
+
+        All-empty panes must not grab. A split analysis page with one live
+        pane is eligible; the composite grab is still one ref. Unsupported
+        hosts are not treated as an empty-but-eligible View.
+        """
+        captured = collect_widget_capture_facts(widget)
+        return captured.capability == CAPABILITY_OK and captured.has_real_result
+
+    def _is_stable(self, widget, section: str, *, facts=None) -> bool:
+        captured = facts if facts is not None else collect_widget_capture_facts(widget)
+        if captured.capability != CAPABILITY_OK:
+            return False
+        if not captured.is_stable:
+            return False
+        window = self._window
+        jobs = getattr(window, "_analysis_jobs", None) if window is not None else None
+        if jobs is not None and section in _HEATMAP_SECTIONS | {"frf"}:
+            if jobs.is_running(section):
+                return False
+        return True
+
+    def _widget_visible_and_sized(self, widget) -> bool:
+        return widget_visible_and_sized(widget)
+
+    def _hosts_heatmap(self, widget) -> bool:
+        for host in _iter_overlay_hosts(widget):
+            if hasattr(host, "plot_or_update_heatmap"):
+                return True
+        return False
+
+    def _ensure_stability_hooks(self, widget) -> None:
+        for host in _iter_overlay_hosts(widget):
+            ident = id(host)
+            if ident in self._hooked_ids or not _alive(host):
+                continue
+            quality = getattr(host, "quality_status_changed", None)
+            if quality is not None:
+                quality.connect(self._on_quality_status_changed)
+                self._hooks.append((host, quality, self._on_quality_status_changed))
+            layout = getattr(host, "layout_geometry_changed", None)
+            if layout is not None:
+                layout.connect(self._on_layout_geometry_changed)
+                self._hooks.append((host, layout, self._on_layout_geometry_changed))
+            for name in (
+                "visible_range_changed",
+                "cursor_info",
+                "dual_cursor_info",
+                "markup_revision_changed",
+                "manual_zoom_changed",
+            ):
+                signal = getattr(host, name, None)
+                if signal is None:
+                    continue
+                slot = (
+                    self._on_idle_presentation_signal
+                    if name in _PIXEL_AFFECTING_SIGNALS
+                    else self._on_idle_source_signal
+                )
+                signal.connect(slot)
+                self._hooks.append((host, signal, slot))
+            self._hooked_ids.add(ident)
+
+    def _watch_canvas_destroyed(self, canvas) -> None:
+        ident = id(canvas)
+        if ident in self._destroy_watched:
+            return
+        canvas.destroyed.connect(partial(self._on_canvas_destroyed, ident))
+        self._destroy_watched.add(ident)
+
+    def _on_canvas_destroyed(self, ident: int, *_args) -> None:
+        if not _alive(self):
+            return
+        self._clear_page_transition_waits(widget_id=ident)
+        self._bindings.pop(ident, None)
+        self._unstable.pop(ident, None)
+        self._manual_zoom_by_host.pop(ident, None)
+        self._dual_cursor_text_by_host.pop(ident, None)
+        for key in [key for key in self._axis_edit_waits if key[1] == ident]:
+            self._axis_edit_waits.pop(key, None)
+        self._hooked_ids.discard(ident)
+        self._destroy_watched.discard(ident)
+        kept = []
+        for obj, signal, slot in self._hooks:
+            if id(obj) == ident or not _alive(obj):
+                self._hooked_ids.discard(id(obj))
+                continue
+            kept.append((obj, signal, slot))
+        self._hooks = kept
+
+    def _on_quality_status_changed(self, *_args) -> None:
+        if self._inactive():
+            return
+        self._reconsider_pending(self.sender())
+
+    def _on_layout_geometry_changed(self, *_args) -> None:
+        if self._inactive():
+            return
+        self._reconsider_pending(self.sender())
+
+    def _reconsider_pending(self, sender) -> None:
+        if self._inactive() or sender is None:
+            return
+        for ident, pending in list(self._unstable.items()):
+            ref, _digest, reason, widget_ref = pending
+            target = widget_ref() if widget_ref is not None else None
+            if target is None or not _alive(target):
+                self._unstable.pop(ident, None)
+                continue
+            hosts = [target, *list(_iter_overlay_hosts(target))]
+            if sender is target or sender in hosts:
+                self.request_capture(ref, target, reason)
+
+    def _active_ref(self, section: str) -> UltraViewRef | None:
+        window = self._window
+        if window is None:
+            return None
+        if section == "time":
+            manager = getattr(window, "view_manager", None)
+            if manager is None or not manager.views:
+                return None
+            state = manager.get(manager.active)
+            return UltraViewRef("time", state.view_id)
+        resolved = self._analysis_state(window, section, None)
+        if resolved is None:
+            return None
+        _mgr, state = resolved
+        return UltraViewRef(section, state.view_id)
+
+    def _visible_widget_for(self, section: str):
+        window = self._window
+        if window is None:
+            return None
+        if section == "time":
+            stack = getattr(window, "chart_stack", None)
+            if stack is not None and callable(getattr(stack, "focused_canvas", None)):
+                return stack.focused_canvas()
+            return getattr(window, "canvas_time", None)
+        stack = getattr(window, "chart_stack", None)
+        if stack is not None and section in {"fft", "fft_time", "frf", "order"}:
+            ensure = getattr(stack, "ensure_analysis_page_ready", None)
+            if callable(ensure):
+                ensure(section)
+        return self._analysis_page(window, section)
+
+    def _toast(self, message: str, level: str) -> None:
+        window = self._window
+        host = None
+        if window is not None and self._sheet_visible():
+            sheet = getattr(window, "_ultraview_sheet", None)
+            if sheet is not None and _alive(sheet):
+                host = sheet
+        if host is None:
+            host = window
+        toast = getattr(host, "toast", None) if host is not None else None
+        if callable(toast):
+            toast(message, level)
+
+    def _widget_for_ref(self, ref: UltraViewRef):
+        return self._bound_widget_for(ref)
+
+    def _bound_widget_for(self, ref: UltraViewRef):
+        for _ident, (bound, handle) in list(self._bindings.items()):
+            if bound != ref:
+                continue
+            widget = handle()
+            if widget is None or not _alive(widget):
+                continue
+            if self.bound_ref_for(widget) == ref:
+                return widget
+        return None
+
+    def _facts_from_widget(self, widget) -> PresentationRuntimeFacts:
+        pane_count = getattr(widget, "pane_count", None)
+        visible = int(pane_count()) if callable(pane_count) else None
+        captured = collect_widget_capture_facts(widget)
+        geometry = tuple(captured.cursor_geometries)
+        dual = captured.cursor_dual
+        pill = captured.pill_fingerprint if dual else None
+        if pill is None and dual:
+            pill = self._pill_fingerprint(self._window, widget)
+        if pill is not None and not isinstance(pill, tuple):
+            pill = tuple(pill)
+        pins = self._pin_fingerprint(self._window, widget)
+        if pins is not None:
+            pins = tuple(
+                tuple(row) if isinstance(row, list) else row
+                for row in pins
+            )
+        return PresentationRuntimeFacts(
+            markup_revision=captured.markup_revision,
+            visible_pane_count=visible,
+            cursor_geometry=geometry,
+            pill_fingerprint=pill,
+            pin_fingerprint=pins,
+        )
+
+    def _runtime_facts_for(self, ref: UltraViewRef) -> PresentationRuntimeFacts:
+        widget = self._bound_widget_for(ref)
+        live = widget is not None and _alive(widget)
+        stored = self._runtime.get(ref)
+        if live and bool(widget.isVisible()):
+            facts = self._facts_from_widget(widget)
+            self._runtime.commit(ref, facts)
+            return facts
+        if live:
+            live_facts = self._facts_from_widget(widget)
+            pin_fingerprint = live_facts.pin_fingerprint
+            if pin_fingerprint is None and stored is not None:
+                pin_fingerprint = stored.pin_fingerprint
+            facts = PresentationRuntimeFacts(
+                markup_revision=live_facts.markup_revision,
+                visible_pane_count=live_facts.visible_pane_count,
+                cursor_geometry=stored.cursor_geometry if stored is not None else (),
+                pill_fingerprint=(
+                    stored.pill_fingerprint if stored is not None else None
+                ),
+                pin_fingerprint=pin_fingerprint,
+            )
+            self._runtime.commit(ref, facts)
+            return facts
+        if stored is not None:
+            return stored
+        return PresentationRuntimeFacts()
+
+    def _time_state(self, window, view_id: str):
+        manager = getattr(window, "view_manager", None)
+        if manager is None:
+            return None
+        target = str(view_id)
+        for state in manager.views:
+            if str(getattr(state, "view_id", "")) == target:
+                return state
+        return None
+
+    def _analysis_state(self, window, section: str, view_id: str | None):
+        managers = getattr(window, "analysis_managers", None) or {}
+        manager = managers.get(section)
+        if manager is None or not manager.views:
+            return None
+        if view_id is None:
+            return manager, manager.get(manager.active)
+        target = str(view_id)
+        for state in manager.views:
+            if str(getattr(state, "view_id", "")) == target:
+                return manager, state
+        return None
+
+    def _analysis_page(self, window, section: str):
+        getter = getattr(window, "_analysis_page", None)
+        if callable(getter):
+            return getter(section)
+        return None
+
+    def _preview_meta(self, ref: UltraViewRef, digest: str) -> PreviewMeta:
+        window = self._window
+        title = ""
+        source_summary = ""
+        tab_color = ""
+        x_range = None
+        if window is not None and ref.section == "time":
+            state = self._time_state(window, ref.view_id)
+            if state is not None:
+                title = str(state.name or "")
+                tab_color = str(state.tab_color or "")
+                source_summary = self._source_summary(window, state.attached_file_ids)
+                x_range = self._pair(state.xlim)
+        elif window is not None:
+            resolved = self._analysis_state(window, ref.section, ref.view_id)
+            if resolved is not None:
+                _mgr, state = resolved
+                title = str(state.name or "")
+                tab_color = str(state.tab_color or "")
+                source_summary = self._source_summary(window, state.attached_file_ids)
+                if state.panes:
+                    x_range = self._pair(state.panes[0].xlim)
+        return PreviewMeta(
+            ref=ref,
+            captured_digest=digest,
+            axis_kind=SECTION_AXIS_KIND.get(ref.section),
+            x_unit=_SECTION_X_UNIT.get(ref.section, ""),
+            x_range=x_range,
+            title=title,
+            source_summary=source_summary,
+            tab_color=tab_color,
+        )
+
+    def _source_summary(self, window, fids) -> str:
+        files = getattr(window, "files", None) or {}
+        names = []
+        for fid in fids or ():
+            fd = files.get(fid) if hasattr(files, "get") else None
+            if fd is None:
+                continue
+            names.append(
+                str(
+                    getattr(fd, "short_name", None)
+                    or getattr(fd, "filename", None)
+                    or fid
+                )
+            )
+        return " · ".join(names)
+
+    @staticmethod
+    def _pair(value):
+        if value is None:
+            return None
+        try:
+            lo, hi = value
+            return (float(lo), float(hi))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _generation_slot(section, view_id, pane_idx, key):
+        return (str(section), str(view_id or ""), int(pane_idx or 0), key)
+
+    @staticmethod
+    def _digest_key(key):
+        if isinstance(key, tuple):
+            return [_digest_leaf(item) for item in key]
+        return _digest_leaf(key)
+
+    def _warn_capture(self, ref, widget, reason, detail) -> None:
+        canvas_type = type(widget).__name__ if widget is not None else "none"
+        level = _CAPTURE_SKIP_LEVELS.get(detail, logging.WARNING)
+        if reason == "leaving-bound-canvas" and detail == "unstable":
+            # Best-effort outgoing capture must not grab an unfinished scene.
+            level = logging.DEBUG
+        throttled(
+            logger,
+            # Expected skips must not consume the burst budget for a fault.
+            f"ultraview-capture:{ref.section}:{ref.view_id}:{detail}:{level}",
+            level,
+            "UltraView capture skipped (%s/%s) section=%s view_id=%s canvas=%s",
+            reason,
+            detail,
+            ref.section,
+            ref.view_id,
+            canvas_type,
+        )
+
+    def _warn_digest(self, ref, exc) -> None:
+        throttled(
+            logger,
+            f"ultraview-digest:{ref.section}:{ref.view_id}",
+            logging.WARNING,
+            "UltraView presentation digest failed section=%s view_id=%s: %s",
+            ref.section,
+            ref.view_id,
+            exc,
+        )
+
+    def _start_timer(self, key, callback) -> None:
+        if self._inactive():
+            return
+        existing = self._queued.pop(key, None)
+        if existing is not None:
+            existing.stop()
+            existing.deleteLater()
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        coord_ref = weakref.ref(self)
+
+        def _fire():
+            coord = coord_ref()
+            if coord is None or coord._inactive():
+                return
+            current = coord._queued.get(key)
+            if current is timer:
+                coord._queued.pop(key, None)
+            timer.deleteLater()
+            callback()
+
+        timer.timeout.connect(_fire)
+        self._queued[key] = timer
+        timer.start(0)
+
+    def _drop_queued_for_ref(self, ref, keep=None) -> None:
+        for key in [item for item in self._queued if item[0] == ref and item != keep]:
+            timer = self._queued.pop(key)
+            timer.stop()
+            timer.deleteLater()
+
+    def _binding_for_idle_sender(self, sender):
+        if sender is None:
+            return None, None
+        ref = self.bound_ref_for(sender)
+        if ref is not None:
+            return ref, sender
+        for _ident, (bound, handle) in list(self._bindings.items()):
+            widget = handle()
+            if widget is None or not _alive(widget):
+                continue
+            if sender is widget:
+                return bound, widget
+            try:
+                hosts = list(_iter_overlay_hosts(widget))
+            except (TypeError, RuntimeError):
+                continue
+            if sender in hosts:
+                return bound, widget
+        return None, None
+
+    def schedule_idle_capture(self, ref, widget=None) -> None:
+        if self._inactive() or ref is None:
+            return
+        if not self._sheet_visible():
+            return
+        if widget is None:
+            widget = self._bound_widget_for(ref)
+        self._idle_pending[ref] = (
+            weakref.ref(widget) if widget is not None else None,
+            monotonic(),
+        )
+        if not self._idle_timer.isActive():
+            self._idle_timer.start()
+
+    def _on_idle_presentation_signal(self, *_args) -> None:
+        """Bump revision only when a pixel-affecting fact actually changed.
+
+        Idle recapture itself stays gated on sheet visibility. A hidden
+        Board does not grab. The fingerprint is session-only and is not
+        part of ``presentation_digest``.
+        """
+        if self._inactive():
+            return
+        sender = self.sender()
+        ref, widget = self._binding_for_idle_sender(sender)
+        if ref is None or widget is None:
+            return
+        if self._signal_is_cross_view_restore(ref, sender, widget):
+            return
+        self._note_presentation_signal_args(sender, _args)
+        if not self._commit_presentation_fingerprint(ref, widget):
+            return
+        if not self._sheet_visible():
+            # The fact changed, but nobody is looking at the Board. Opening
+            # UltraView or saving the project consumes this set.
+            self._deferred_preview_refs.add(ref)
+            return
+        self.schedule_idle_capture(ref, widget)
+
+    def _on_idle_source_signal(self, *_args) -> None:
+        if self._inactive() or not self._sheet_visible():
+            return
+        ref, widget = self._binding_for_idle_sender(self.sender())
+        if ref is None:
+            return
+        self.schedule_idle_capture(ref, widget)
+
+    def _on_idle_capture_timeout(self) -> None:
+        now = monotonic()
+        due: list[tuple[UltraViewRef, Any]] = []
+        keep: dict[UltraViewRef, tuple[Any, float]] = {}
+        for ref, payload in list(self._idle_pending.items()):
+            widget_ref, stamped_at = payload
+            elapsed_ms = (now - stamped_at) * 1000.0
+            if elapsed_ms + 0.5 >= _IDLE_CAPTURE_MS:
+                due.append((ref, widget_ref))
+            else:
+                keep[ref] = (widget_ref, stamped_at)
+        self._idle_pending = keep
+        if self._inactive() or not self._sheet_visible():
+            return
+        for ref, widget_ref in due:
+            widget = widget_ref() if widget_ref is not None else None
+            if widget is None or not _alive(widget):
+                widget = self._bound_widget_for(ref)
+            if widget is None:
+                continue
+            self._push_preview(ref)
+            self.request_capture(ref, widget, "idle")
+        if self._idle_pending:
+            remaining_ms = min(
+                _IDLE_CAPTURE_MS - (monotonic() - stamped_at) * 1000.0
+                for _ref, (_widget_ref, stamped_at) in self._idle_pending.items()
+            )
+            self._idle_timer.start(max(1, int(remaining_ms)))
+
+    def _requeue_after_digest_change(self, ref, widget, reason: str) -> None:
+        if self._inactive() or ref is None:
+            return
+        if widget is None or not _alive(widget):
+            return
+        tries = self._digest_retries.get(ref, 0)
+        if tries >= _DIGEST_RETRY_LIMIT:
+            self._warn_capture(ref, widget, reason, "digest-retry-exhausted")
+            return
+        self._digest_retries[ref] = tries + 1
+        self.request_capture(ref, widget, reason)
+
+    def _drop_all_timers(self) -> None:
+        self._idle_timer.stop()
+        self._idle_pending.clear()
+        self._axis_edit_waits.clear()
+        self._digest_retries.clear()
+        self._focus_timer.stop()
+        self._sidecar_timer.stop()
+        self._sidecar_pending.clear()
+        self._sidecar_generation += 1
+        for timer in list(self._queued.values()):
+            timer.stop()
+            timer.deleteLater()
+        self._queued.clear()
+        self._clear_page_transition_waits()
+
+    def _disconnect_hooks(self) -> None:
+        for obj, signal, slot in self._hooks:
+            if not _alive(obj):
+                continue
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                continue
+        self._hooks.clear()
+        self._hooked_ids.clear()
+        self._axis_edit_controller = None

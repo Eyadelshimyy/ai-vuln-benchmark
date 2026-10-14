@@ -1,0 +1,663 @@
+"""Sponsorship analysis: leadership scores (PageRank) and ideology scores (SVD).
+
+Adapted from GovTrack's methodology (Tauberer 2012, "Observing the
+Unobservables in the U.S. Congress").  Both analyses operate on a
+senator-senator cosponsorship matrix derived from congressional bill data.
+
+Matrix construction:
+    P[sponsor_row][cosponsor_row] += edge_weight for each cosponsorship
+    event (1.0 unless a weight_fn is supplied — see
+    _cosponsorship_edge_weight below). Diagonal starts as identity (each
+    senator "sponsors" their own bills). Cell values are square-rooted to
+    flatten outliers (Tauberer 2012).
+
+Leadership (PageRank, Brin & Page 1998):
+    Columns are normalized to form a Markov transition matrix.  The
+    stationary distribution (computed via power iteration) gives a
+    leadership score: senators whose bills attract cosponsors from other
+    influential senators rank higher.
+
+    Cosponsorship-network centrality alone can't tell a substantive bill
+    from a message bill introduced purely for the cosponsor list — a
+    senator who signs onto ten resolutions with zero chance of passing
+    accrues the same network weight as one who cosponsors ten bills that
+    actually became law (external critique, 2026-07; see
+    ENACTED_EDGE_WEIGHT/ADVANCED_EDGE_WEIGHT/STALLED_EDGE_WEIGHT below for how this is addressed).
+
+Ideology (SVD/PCA, Poole & Rosenthal 1985):
+    The second right-singular vector of the cosponsorship matrix captures
+    the dominant ideological dimension.  This is oriented so that
+    Republicans have positive values (right) and Democrats have negative
+    values (left).  The score is blind to party labels; ideology emerges
+    purely from behavioral patterns. Unlike Leadership, this intentionally
+    does NOT weight edges by bill outcome — a symbolic resolution that
+    never advances is often exactly where partisan alignment shows up most
+    clearly, so down-weighting it would remove signal rather than noise.
+"""
+
+import logging
+import statistics
+
+import numpy as np
+
+from app.pipeline.analyze.score_calculator import _ADVANCEMENT_ACTION_KEYWORDS
+
+logger = logging.getLogger(__name__)
+
+# Cosponsorship-edge weights by bill outcome, replacing the prior flat 1.0
+# per cosponsorship. Calibrated 2026-07 against the live Senate/House
+# cosponsorship-enrichment corpus (see PR description for the population
+# breakdown): most recently-sponsored bills never advance within the
+# 2-year window this data is sampled from, so a stalled bill still needs a
+# real (non-zero) weight to avoid collapsing the matrix into near-total
+# sparsity — it remains genuine evidence of a cosponsorship relationship,
+# just weaker evidence of productive collaboration than a bill that
+# cleared a real procedural hurdle. Same [floor, 1.0] shape as every other
+# calibrated scale in this codebase (e.g. score_calculator.py's
+# volume_factor): stalled is not zeroed out, just discounted.
+ENACTED_EDGE_WEIGHT = 1.0
+ADVANCED_EDGE_WEIGHT = 0.6
+STALLED_EDGE_WEIGHT = 0.3
+
+
+def _cosponsorship_edge_weight(bill: dict) -> float | None:
+    """How much a single cosponsorship of `bill` should count toward
+    Legislative Leadership's PageRank — see the weight tiers' calibration
+    note. None when the bill carries no outcome data at all (an enrichment
+    path that doesn't fetch isLaw/latestAction); see _edge_weight_fn."""
+    if bill.get("isLaw"):
+        return ENACTED_EDGE_WEIGHT
+    action = bill.get("latestAction")
+    if action is None:
+        return None
+    if any(kw in action.lower() for kw in _ADVANCEMENT_ACTION_KEYWORDS):
+        return ADVANCED_EDGE_WEIGHT
+    return STALLED_EDGE_WEIGHT
+
+
+def _edge_weight_fn(bills_data: list[dict]):
+    """_cosponsorship_edge_weight with unknown outcomes filled by the mean
+    weight of this run's bills whose outcome IS known.
+
+    A bill with no outcome data used to get the ENACTED weight — the
+    maximum — so a sponsor whose bills came through the outcome-less path
+    looked like one whose bills all became law. Missing data should be
+    neutral: the typical known bill, not the best case (or the worst)."""
+    known = [w for w in (_cosponsorship_edge_weight(b) for b in bills_data) if w is not None]
+    default = sum(known) / len(known) if known else ENACTED_EDGE_WEIGHT
+
+    def weight(bill: dict) -> float:
+        w = _cosponsorship_edge_weight(bill)
+        return default if w is None else w
+
+    return weight
+
+
+def _build_cosponsorship_matrix(
+    bills_data: list[dict],
+    cosponsors_map: dict[str, list[dict]],
+    senator_bioguide_ids: set[str],
+    weight_fn=None,
+) -> tuple[dict[str, int], int, np.ndarray]:
+    """Build the senator-senator cosponsorship matrix.
+
+    Args:
+        bills_data: List of bill dicts, each with "billId" and
+            "sponsorBioguide".
+        cosponsors_map: bill_id → list of cosponsor dicts (each has
+            "bioguideId").
+        senator_bioguide_ids: Set of bioguide IDs for senators in the
+            current cohort.
+        weight_fn: optional bill dict -> float, applied per cosponsorship
+            edge (defaults to a flat 1.0 for every edge). Leadership/
+            PageRank passes _edge_weight_fn(bills_data); Ideology/SVD
+            intentionally leaves this at the default — see module
+            docstring for why.
+
+    Returns:
+        (id_to_row, n_senators, P) where id_to_row maps bioguideId to
+        matrix index, n_senators is the matrix dimension, and P is the
+        N×N cosponsorship matrix.
+    """
+    id_to_row: dict[str, int] = {}
+
+    def row(bio_id: str) -> int:
+        if bio_id not in id_to_row:
+            id_to_row[bio_id] = len(id_to_row)
+        return id_to_row[bio_id]
+
+    for bio_id in senator_bioguide_ids:
+        row(bio_id)
+
+    cells: list[tuple[int, int, float]] = []
+    for bill in bills_data:
+        sponsor_bio = bill.get("sponsorBioguide")
+        if not sponsor_bio or sponsor_bio not in senator_bioguide_ids:
+            continue
+        sponsor_idx = row(sponsor_bio)
+        bill_id = bill.get("billId", "")
+        weight = weight_fn(bill) if weight_fn else 1.0
+        for cosponsor in cosponsors_map.get(bill_id, []):
+            cosponsor_bio = cosponsor.get("bioguideId", "")
+            if not cosponsor_bio or cosponsor_bio not in senator_bioguide_ids:
+                continue
+            if cosponsor_bio == sponsor_bio:
+                continue
+            cosponsor_idx = row(cosponsor_bio)
+            cells.append((sponsor_idx, cosponsor_idx, weight))
+
+    n = len(id_to_row)
+    P = np.identity(n, dtype=float)
+    for sponsor_idx, cosponsor_idx, weight in cells:
+        P[sponsor_idx, cosponsor_idx] += weight
+
+    # Elementwise sqrt (all cells are >= 0: identity diagonal + nonnegative
+    # cosponsorship weights) — vectorized instead of an O(n^2) Python loop.
+    P = np.sqrt(P)
+
+    return id_to_row, n, P
+
+
+def _rescale(u: np.ndarray, log_scale: bool = False) -> list[float]:
+    """Rescale a vector to [0, 1].
+
+    When log_scale is True, applies a log transform that maps the median
+    to 0.5, giving better spread for power-law distributions (typical of
+    PageRank output).
+    """
+    u_min, u_max = float(np.min(u)), float(np.max(u))
+    if u_max - u_min < 1e-12:
+        return [0.5] * len(u)
+    u = (u - u_min) / (u_max - u_min)
+
+    if log_scale:
+        m = float(np.median(u))
+        denom = 2 * m - 1
+        if abs(denom) > 1e-9:
+            s = -(m ** 2) / denom
+            # When median >= 0.5, s goes negative (log of a negative value is
+            # undefined), so we fall back to the linear scale already computed
+            # above. The linear scale is still informative; the log transform
+            # primarily helps when PageRank is heavily left-skewed (many low
+            # scorers), which isn't the case when median >= 0.5.
+            if s > 0:
+                u = np.log(u + s)
+                u_min2, u_max2 = float(np.min(u)), float(np.max(u))
+                if u_max2 - u_min2 > 1e-12:
+                    u = (u - u_min2) / (u_max2 - u_min2)
+
+    return [float(v) for v in u]
+
+
+def compute_leadership_scores(
+    bills_data: list[dict],
+    cosponsors_map: dict[str, list[dict]],
+    senator_bioguide_ids: set[str],
+    senator_parties: dict[str, str] | None = None,
+) -> dict[str, float]:
+    """Compute PageRank-based legislative leadership scores.
+
+    Returns a dict mapping bioguideId → leadership score (0.0 to 1.0).
+    Higher values indicate senators whose bills attract more cosponsors
+    from other influential senators (Brin & Page 1998).
+    """
+    if len(senator_bioguide_ids) < 5:
+        return {}
+
+    id_to_row, n, P = _build_cosponsorship_matrix(
+        bills_data, cosponsors_map, senator_bioguide_ids,
+        weight_fn=_edge_weight_fn(bills_data),
+    )
+    if n < 5:
+        return {}
+
+    P_pr = np.copy(P)
+    min_data = 10.0
+    for col in range(n):
+        s = np.sum(P_pr[:, col])
+        if s < min_data:
+            P_pr[:, col] += (min_data - s) / n
+            s = min_data
+        P_pr[:, col] /= s
+
+    damping = 0.85
+    v = np.ones((n, 1)) / n
+    x = np.ones((n, 1)) / n
+
+    for _ in range(500):
+        y = damping * np.dot(P_pr, x)
+        w = np.sum(np.abs(x)) - np.sum(np.abs(y))
+        y = y + w * v
+        if np.sum(np.abs(y - x)) < 1e-10:
+            break
+        x = y
+
+    scores = _rescale(x.flatten(), log_scale=True)
+
+    row_to_id = {v: k for k, v in id_to_row.items()}
+    return {row_to_id[i]: scores[i] for i in range(n) if row_to_id[i] in senator_bioguide_ids}
+
+
+def compute_ideology_scores(
+    bills_data: list[dict],
+    cosponsors_map: dict[str, list[dict]],
+    senator_bioguide_ids: set[str],
+    senator_parties: dict[str, str],
+) -> dict[str, float]:
+    """Compute SVD-based ideology scores from cosponsorship patterns.
+
+    Returns a dict mapping bioguideId → ideology score (0.0 to 1.0).
+    Values near 0.0 indicate left/Democratic alignment, values near 1.0
+    indicate right/Republican alignment, derived purely from cosponsorship
+    behavior without using party labels as input (Tauberer 2012).
+    """
+    if len(senator_bioguide_ids) < 10:
+        return {}
+
+    id_to_row, n, P = _build_cosponsorship_matrix(
+        bills_data, cosponsors_map, senator_bioguide_ids,
+    )
+    if n < 10:
+        return {}
+
+    try:
+        _u, _s, vh = np.linalg.svd(P)
+    except np.linalg.LinAlgError:
+        logger.warning("SVD failed for ideology analysis")
+        return {}
+
+    if vh.shape[0] < 2:
+        return {}
+
+    spectrum = vh[1, :]
+
+    row_to_id = {v: k for k, v in id_to_row.items()}
+    r_idx = [i for i in range(n) if senator_parties.get(row_to_id.get(i)) == "R"]
+    d_idx = [i for i in range(n) if senator_parties.get(row_to_id.get(i)) == "D"]
+    r_scores = [spectrum[i] for i in r_idx]
+    # SVD leaves the sign of each singular vector arbitrary, so pin it:
+    # orient the axis so the Republican cohort mean is positive. If there is
+    # no usable R cohort (empty, or a near-zero mean in a party-balanced
+    # projection), fall back to a deterministic anchor — the first
+    # bioguide-sorted member with a non-negligible coordinate — so the axis
+    # orientation is reproducible across environments instead of flipping
+    # with SVD's implementation-defined sign (which would swap the
+    # progressive/conservative ideology labels built from these scores).
+    sign = 0.0
+    if r_scores:
+        r_mean = sum(r_scores) / len(r_scores)
+        if abs(r_mean) > 1e-9:
+            sign = r_mean / abs(r_mean)
+    if sign == 0.0:
+        for bid in sorted(senator_bioguide_ids):
+            i = id_to_row.get(bid)
+            if i is not None and abs(spectrum[i]) > 1e-9:
+                sign = spectrum[i] / abs(spectrum[i])
+                break
+    if sign != 0.0:
+        spectrum = spectrum * sign
+
+    scores = _rescale(spectrum)
+
+    # 2026-07: pinning the sign only fixes orientation — it does
+    # nothing to confirm the second singular vector is actually the
+    # partisan axis in the first place. In a sparse/unusual window (few
+    # cosponsorship events, an off-cycle session) it can just as easily
+    # capture some other dominant pattern, and the sign-pin above would
+    # still confidently orient noise. Real production (2026-07, current
+    # Senate, 53 R / 45 D): R_mean=0.796, D_mean=0.277 on this same
+    # rescaled scale, a 0.52 gap — a healthy signal is large, not
+    # marginal. 0.15 is a conservative floor (well under a third of that
+    # measured gap) chosen without a directly-observed degenerate example
+    # to compare against (this codebase has never actually produced a
+    # bad axis to measure) — below it, the safer failure is publishing
+    # nothing this run rather than a confidently-oriented coin flip that
+    # feeds the ideology labels and partisan-depth priors.
+    _MIN_PARTY_MEAN_SEPARATION = 0.15
+    if r_idx and d_idx:
+        r_mean_final = sum(scores[i] for i in r_idx) / len(r_idx)
+        d_mean_final = sum(scores[i] for i in d_idx) / len(d_idx)
+        if abs(r_mean_final - d_mean_final) < _MIN_PARTY_MEAN_SEPARATION:
+            logger.warning(
+                "Ideology axis failed validation (R/D mean separation %.3f < %.2f) — "
+                "withholding ideology scores this run",
+                abs(r_mean_final - d_mean_final), _MIN_PARTY_MEAN_SEPARATION,
+            )
+            return {}
+
+    return {row_to_id[i]: scores[i] for i in range(n) if row_to_id[i] in senator_bioguide_ids}
+
+
+# Minimum members of a party before its own ideology distribution is trusted
+# to define within-party terciles. Below it (e.g. the 2-3 Independents, or a
+# tiny minority in a lopsided cohort) the fixed global cutoffs are used
+# instead — too few points to place a stable 33rd/67th percentile.
+_MIN_PARTY_SIZE_FOR_RELATIVE_BOUNDS = 5
+
+# Fixed global fallback cutoffs on the [0,1] ideology scale, used when no
+# cohort-relative bounds are supplied for a party (small party, or a caller
+# that doesn't compute them). D/R keep the original 0.30/0.70 split.
+_DEFAULT_DR_BOUNDS = (0.30, 0.70)
+
+
+def party_ideology_bounds(
+    members: list[tuple[float | None, str | None]],
+    min_party_size: int = _MIN_PARTY_SIZE_FOR_RELATIVE_BOUNDS,
+) -> dict[str, tuple[float, float]]:
+    """Per-party (low, high) ideology label thresholds = the 33rd/67th
+    percentiles of each party's OWN ideology-score distribution across the
+    cohort.
+
+    Why: the ideology score is min-max-rescaled across the whole chamber
+    (compute_ideology_scores), so its distribution is bimodal — two party
+    clusters with an empty middle. Fixed absolute cutoffs (0.30/0.70) then
+    fall in that empty valley, so the "moderate/centrist" band captures ~0%
+    of members and every D reads "progressive", every R "conservative" —
+    the label collapses to party identity even though the WITHIN-party
+    spread is real and large (DW-NOMINATE). Scoring each member against their own party's terciles
+    makes "moderate Democrat" mean moderate AMONG Democrats — the same
+    cohort-relative, recomputed-every-run pattern this module already uses
+    for bipartisanship and score_calculator uses for seat-relative alignment.
+
+    ``members``: (ideology_score, party) for every scored member of the
+    cohort. Parties with fewer than ``min_party_size`` scored members are
+    omitted from the result; describe_senator_position then falls back to the
+    fixed global cutoffs for them.
+    """
+    by_party: dict[str, list[float]] = {}
+    for score, party in members:
+        if score is not None and party in ("D", "R"):
+            by_party.setdefault(party, []).append(float(score))
+    bounds: dict[str, tuple[float, float]] = {}
+    for party, scores in by_party.items():
+        if len(scores) < min_party_size:
+            continue
+        lo = float(np.quantile(scores, 1.0 / 3.0))
+        hi = float(np.quantile(scores, 2.0 / 3.0))
+        if hi > lo:  # guard a degenerate all-identical party distribution
+            bounds[party] = (lo, hi)
+    return bounds
+
+
+def describe_senator_position(
+    ideology: float,
+    leadership: float,
+    party: str,
+    years_in_office: float | None = None,
+    ideology_bounds: tuple[float, float] | None = None,
+) -> str:
+    """Generate a GovTrack-style description of a senator's position.
+
+    Uses the ideology × leadership grid to produce labels like
+    "progressive Democrat leader" or "conservative Republican follower"
+    (Tauberer 2012).
+
+    ``ideology_bounds`` is this member's own party's (low, high) ideology
+    thresholds from party_ideology_bounds() — the 33rd/67th percentiles of
+    that party's distribution in the current cohort. When supplied, the
+    progressive/moderate/centrist (D) and centrist/moderate/conservative (R)
+    bands are relative to the party, so each captures ~a third of it instead
+    of collapsing to party identity (see party_ideology_bounds for the full
+    rationale). When None (a caller that doesn't compute them, or a party too
+    small for a stable distribution), the fixed global 0.30/0.70 cutoffs are
+    used — preserving prior behavior.
+
+    ``years_in_office`` gates the leader/follower role by tenure. Raw
+    cosponsorship-PageRank leadership is structurally a function of network
+    size, which takes years to build, so a freshman's near-zero score
+    reflects time in office, not follower behavior — GovTrack itself refuses
+    to compute a leadership score for members with fewer than ~10 sponsored
+    bills for exactly this reason, and warns the score "doesn't necessarily
+    make a legislator any better or worse." Rather than brand juniors
+    "follower", the score is shrunk toward neutral by the same tenure
+    confidence Legislative Effectiveness's leadership component already uses
+    (score_calculator.LEADERSHIP_TENURE_FULL_CREDIT_YEARS), so a low-tenure
+    member lands in the unlabeled middle instead of at "follower". When
+    ``years_in_office`` is None (unknown) the score is used as-is, preserving
+    the prior behavior. This honors the platform's "seniority alone is never
+    penalized" design principle (AGENTS.md) for the displayed label, not just
+    the effectiveness score.
+    """
+    from app.pipeline.analyze.score_calculator import (
+        LEADERSHIP_TENURE_FULL_CREDIT_YEARS,
+    )
+    # ideology is already rescaled to [0, 1] with 0 = most-left, 1 = most-
+    # right (see compute_ideology_scores). D/R bands are relative to the
+    # member's own party (ideology_bounds — the party's 33rd/67th
+    # percentiles) when supplied, so ~a third of the party reads
+    # progressive/moderate/centrist; otherwise the fixed 0.30/0.70 cutoffs
+    # apply. Independents keep the fixed 0.35/0.65 split — there are too few
+    # of them to define a within-party distribution, and a narrower middle
+    # band better matches GovTrack's original three-way split for
+    # unaffiliated members (Tauberer 2012).
+    if party == "D":
+        lo, hi = ideology_bounds or _DEFAULT_DR_BOUNDS
+        ideo_label = (
+            "progressive" if ideology < lo
+            else "centrist" if ideology > hi
+            else "moderate"
+        )
+        party_label = "Democrat"
+    elif party == "R":
+        lo, hi = ideology_bounds or _DEFAULT_DR_BOUNDS
+        ideo_label = (
+            "centrist" if ideology < lo
+            else "conservative" if ideology > hi
+            else "moderate"
+        )
+        party_label = "Republican"
+    else:
+        ideo_label = (
+            "left-leaning" if ideology < 0.35
+            else "right-leaning" if ideology > 0.65
+            else "centrist"
+        )
+        party_label = "Independent"
+
+    # leadership is the rescaled PageRank score (see compute_leadership_scores),
+    # already log-spread across [0, 1] to counter its power-law distribution
+    # (most senators cluster low, a few attract disproportionate cosponsor
+    # weight) — top/bottom quartile on that spread scale is a meaningfully
+    # large gap in raw influence, not just a quartile of a linear scale.
+    #
+    # Tenure-shrink toward neutral 0.5 before thresholding so a junior member
+    # isn't labeled "follower" for not having had time to build a
+    # cosponsorship network (see the docstring). Unknown tenure -> no shrink.
+    if years_in_office is None:
+        leadership_adj = leadership
+    else:
+        conf = min(max(years_in_office, 0.0) / LEADERSHIP_TENURE_FULL_CREDIT_YEARS, 1.0)
+        leadership_adj = leadership * conf + 0.5 * (1 - conf)
+    if leadership_adj > 0.75:
+        role = "leader"
+    elif leadership_adj < 0.25:
+        role = "follower"
+    else:
+        role = ""
+
+    parts = [ideo_label, party_label]
+    if role:
+        parts.append(role)
+    return " ".join(parts)
+
+
+# The fewest measured members a party needs for its own median to anchor
+# the receive rate: the same floor the whole cohort needs (len(raw_rates)
+# < 10 returns nothing), so a party is never held to a noisier anchor than
+# the chamber would be.
+_MIN_PARTY_COHORT = 10
+
+
+def compute_bipartisanship_scores(
+    bills_data: list[dict],
+    cosponsors_map: dict[str, list[dict]],
+    member_parties: dict[str, str],
+    min_interactions: int = 5,
+    direction: str = "both",
+) -> dict[str, float]:
+    """Cross-party coalition breadth from cosponsorship behavior.
+
+    Modeled on the Lugar Center Bipartisan Index (Lugar Center &
+    Georgetown McCourt School, 2014-): a member's willingness to work
+    across the aisle is measured on both sides of sponsorship —
+
+      * receiving: of the cosponsors a member attracts to their own
+        bills, what share come from the other party; and
+      * giving: of the bills a member chooses to cosponsor, what share
+        are sponsored by the other party.
+
+    Both directions matter: attracting cross-party support shows bills
+    written for a broad constituency, and lending support across the
+    aisle shows engagement beyond the member's base (Harbridge 2015,
+    "Is Bipartisanship Dead?", Cambridge UP).
+
+    ``direction`` selects which side(s) feed the rate:
+      * "both" (default): the Lugar-style blend above — the display/
+        profile measure this function has always computed.
+      * "receive": only the receiving side — of the cosponsors a member
+        attracts to their OWN bills, what share come from the other
+        party. This is the specific construct Harbridge-Yong, Volden &
+        Wiseman (2023, "The Bipartisan Path to Effective Lawmaking,"
+        J. Politics 85:3) show predicts legislative effectiveness: "it
+        is the attraction of bipartisan cosponsors, rather than the
+        offer of bipartisan cosponsorships, that matters." Used by
+        Legislative Effectiveness's coalition-attraction component
+        (score_calculator), which must not cite HVW's finding while
+        quietly measuring a blend they explicitly distinguish it from.
+
+    Scores are normalized to a cohort median (median -> 0.5, 2x the median
+    or better -> 1.0), recomputed from the observed cohort every run. For
+    "both" that is the pooled chamber median, the Lugar Index's own
+    convention, and half the blend (giving) is the member's own choice.
+    For "receive" it is the median of the member's own party (v6.25):
+    a sponsor can only attract cosponsors the other party is willing to
+    give, and the two parties are not equally willing. Measured on
+    Congress.gov cosponsor lists (random samples of bills with at least
+    one cosponsor, 2026-10-01), Republican-sponsored bills drew the larger
+    cross-party share in both a Democratic and a Republican majority:
+    117th House 19.0% vs 15.8% (n=152 R / 256 D bills), Senate 35.3% vs
+    29.4%; 119th House 26.7% vs 25.6%, Senate 38.7% vs 33.4%. So it is
+    party, not majority status. Pooled, it put the Democratic median
+    member at 29-33 on the 0-100 component and the Republican at 62-67,
+    a gap set by the other party's cosponsoring rather than by the member.
+    Compared within the party, every sponsor faces the same pool.
+    Members of neither major party are assigned the side they cosponsor
+    with most (caucus inference, consistent with normalize_votes);
+    members with fewer than ``min_interactions`` observed interactions
+    in the selected direction are omitted (callers treat missing as
+    neutral, and the confidence grade reflects the thin data).
+
+    Returns bioguideId -> [0, 1].
+    """
+    if direction not in ("both", "receive"):
+        raise ValueError(f"direction must be 'both' or 'receive', got {direction!r}")
+    def _norm_party(p: str | None) -> str | None:
+        if not p:
+            return None
+        p = p.strip().upper()[:1]
+        return p if p in ("D", "R") else None
+
+    sponsor_party_by_bill: dict[str, str] = {}
+    sponsor_bio_by_bill: dict[str, str] = {}
+    for b in bills_data:
+        sp = _norm_party(b.get("sponsorParty"))
+        if sp and b.get("billId"):
+            sponsor_party_by_bill[b["billId"]] = sp
+            if b.get("sponsorBioguide"):
+                sponsor_bio_by_bill[b["billId"]] = b["sponsorBioguide"]
+
+    # First pass: per-member cross/total counts on both directions, and
+    # D/R giving profile for caucus inference of Independents.
+    give_total: dict[str, int] = {}
+    give_cross_d: dict[str, int] = {}  # cosponsored a D-sponsored bill
+    give_cross_r: dict[str, int] = {}
+    recv_total: dict[str, int] = {}
+    recv_from_d: dict[str, int] = {}
+    recv_from_r: dict[str, int] = {}
+
+    for bill_id, sponsor_party in sponsor_party_by_bill.items():
+        sponsor_bio = sponsor_bio_by_bill.get(bill_id)
+        for co in cosponsors_map.get(bill_id, []):
+            co_bio = co.get("bioguideId", "")
+            if not co_bio or co_bio == sponsor_bio:
+                continue
+            co_party = _norm_party(co.get("party")) or _norm_party(
+                member_parties.get(co_bio)
+            )
+            give_total[co_bio] = give_total.get(co_bio, 0) + 1
+            if sponsor_party == "D":
+                give_cross_d[co_bio] = give_cross_d.get(co_bio, 0) + 1
+            else:
+                give_cross_r[co_bio] = give_cross_r.get(co_bio, 0) + 1
+            if sponsor_bio:
+                recv_total[sponsor_bio] = recv_total.get(sponsor_bio, 0) + 1
+                if co_party == "D":
+                    recv_from_d[sponsor_bio] = recv_from_d.get(sponsor_bio, 0) + 1
+                elif co_party == "R":
+                    recv_from_r[sponsor_bio] = recv_from_r.get(sponsor_bio, 0) + 1
+
+    def _side(bio: str) -> str | None:
+        p = _norm_party(member_parties.get(bio))
+        if p:
+            return p
+        d, r = give_cross_d.get(bio, 0), give_cross_r.get(bio, 0)
+        if d + r == 0:
+            return None
+        return "D" if d >= r else "R"
+
+    raw_rates: dict[str, float] = {}
+    for bio in set(give_total) | set(recv_total):
+        side = _side(bio)
+        if side is None:
+            continue
+        cross = 0
+        total = 0
+        if direction == "both":
+            gt = give_total.get(bio, 0)
+            if gt:
+                cross += give_cross_r.get(bio, 0) if side == "D" else give_cross_d.get(bio, 0)
+                total += gt
+        rt = recv_total.get(bio, 0)
+        if rt:
+            cross += recv_from_r.get(bio, 0) if side == "D" else recv_from_d.get(bio, 0)
+            total += rt
+        if total >= min_interactions:
+            raw_rates[bio] = cross / total
+
+    if len(raw_rates) < 10:
+        return {}
+
+    # True median (averages the two central values for even-sized cohorts).
+    # `sorted(...)[len//2]` returned the upper-middle element, biasing the
+    # normalizer's anchor high — which pushed members whose crossing rate sits
+    # just above the real midpoint below the 0.5 Coalition-Breadth threshold
+    # and handed them the below-median seat-safety discount they shouldn't get.
+    median = statistics.median(raw_rates.values())
+    by_side: dict[str, list[float]] = {}
+    for bio, rate in raw_rates.items():
+        by_side.setdefault(_side(bio) or "?", []).append(rate)
+    logger.info(
+        "Cross-party cosponsorship (%s): pooled median %.3f; per party %s",
+        direction, median,
+        {s: round(statistics.median(v), 3) for s, v in sorted(by_side.items())},
+    )
+    if median <= 0:
+        # Degenerate cohort (no observed crossing anywhere): fall back to
+        # an absolute scale where 30% cross-party interactions = 1.0.
+        return {bio: min(r / 0.30, 1.0) for bio, r in raw_rates.items()}
+
+    if direction == "receive":
+        # Each party against its own median (docstring). A party with too
+        # few measured members to have a stable median, or none crossing
+        # at all, falls back to the pooled one.
+        anchors = {
+            side: statistics.median(v)
+            for side, v in by_side.items()
+            if len(v) >= _MIN_PARTY_COHORT and statistics.median(v) > 0
+        }
+        return {
+            bio: min(r / (2.0 * anchors.get(_side(bio) or "?", median)), 1.0)
+            for bio, r in raw_rates.items()
+        }
+
+    return {bio: min(r / (2.0 * median), 1.0) for bio, r in raw_rates.items()}

@@ -1,0 +1,1533 @@
+"""Tests for the shared bulk-results adapter (state_candidates_tabular.py).
+
+The fixture is a real cut of North Carolina's official 2026-03-03 primary
+export (fetched live 2026-08-12), keeping the multi-precinct rows that make
+aggregation load-bearing, plus an "NC HOUSE OF REPRESENTATIVES DISTRICT
+022" contest as a control — a STATE house race whose label looks federal at
+a glance and must never be picked up as one.
+"""
+
+import io
+import os
+import zipfile
+
+import httpx
+import pytest
+
+from app.pipeline.fetch import state_candidates_tabular as tb
+from tests.xlsx_helpers import _workbook
+
+_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures_nc_results_export.tsv")
+_FORMAT = {
+    "delimiter": "\t", "encoding": "utf-8",
+    "contest_column": "Contest Name", "choice_column": "Choice",
+    "party_column": "Choice Party", "votes_column": "Total Votes",
+}
+
+
+def _fixture_bytes() -> bytes:
+    with open(_FIXTURE, "rb") as fh:
+        return fh.read()
+
+
+_ONE_PRIMARY = {"url": "https://example.gov/results", "runoff": False}
+
+
+def _serve(monkeypatch, content, stage=_ONE_PRIMARY):
+    """Discovery yields the one `stage`, and its download serves `content`
+    (None: the download fails)."""
+    async def fake_discover(client, state, year, discovery):
+        return [stage]
+
+    async def fake_get(client, url, label):
+        return None if content is None else _Resp(content=content)
+
+    monkeypatch.setattr(tb, "_discover_urls", fake_discover)
+    monkeypatch.setattr(tb, "_get", fake_get)
+
+
+class TestVotes:
+    def test_parses_thousands_separators(self):
+        assert tb._votes("1,234") == 1234
+
+    def test_non_numeric_contributes_nothing_rather_than_raising(self):
+        assert tb._votes("n/a") == 0
+        assert tb._votes("") == 0
+        assert tb._votes(None) == 0
+
+
+class TestRows:
+    def test_reads_a_plain_delimited_export(self):
+        rows = tb._rows(_fixture_bytes(), _FORMAT)
+        assert len(rows) > 100
+        assert "Contest Name" in rows[0]
+
+    def test_transparently_unzips_a_single_member_archive(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("results_pct.txt", _fixture_bytes())
+        rows = tb._rows(buf.getvalue(), _FORMAT)
+        assert len(rows) > 100
+
+    def test_ambiguous_multi_member_archive_is_refused(self):
+        """Two candidate members means the configured shape no longer
+        matches reality — parsing an arbitrary one would be a guess."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("a.txt", _fixture_bytes())
+            zf.writestr("b.txt", _fixture_bytes())
+        assert tb._rows(buf.getvalue(), _FORMAT) is None
+
+    def test_corrupt_zip_returns_none_rather_than_raising(self):
+        assert tb._rows(b"PK\x03\x04garbage", _FORMAT) is None
+
+
+class TestTally:
+    def test_sums_a_candidate_across_every_precinct_row(self):
+        """These exports are one row per precinct per choice — a single
+        row's value is a fraction of the real total."""
+        rows = tb._rows(_fixture_bytes(), _FORMAT)
+        tally = tb._tally(rows, _FORMAT)
+        foxx = tally["US HOUSE OF REPRESENTATIVES DISTRICT 05 (REP)"]["votes"]
+        name = next(n for n in foxx if "Foxx" in n)
+        single_row = max(
+            tb._votes(r["Total Votes"]) for r in rows if r["Choice"] == name
+        )
+        assert foxx[name] > single_row
+
+
+class TestXlsxRows:
+    """An xlsx is a zip of XML, so the standard library reads it — no
+    Excel dependency for the states (California among them) that publish
+    results in no other machine-readable format."""
+
+    def test_reads_a_workbook_into_header_keyed_rows(self):
+        payload = _workbook([
+            ["Contest Name", "Candidate Name", "Vote Total"],
+            ["United States Representative District 10", "Mark DeSaulnier", "9830"],
+        ])
+        rows = tb._rows(payload, {"format": "xlsx"})
+        assert rows == [{
+            "Contest Name": "United States Representative District 10",
+            "Candidate Name": "Mark DeSaulnier",
+            "Vote Total": "9830",
+        }]
+
+    def test_non_workbook_payload_returns_none_rather_than_raising(self):
+        assert tb._rows(b"not a zip at all", {"format": "xlsx"}) is None
+        assert tb._rows(b"PK\x03\x04corrupt", {"format": "xlsx"}) is None
+
+    def test_a_row_with_an_omitted_interior_cell_does_not_shift_later_columns(self):
+        """Real bug, real data: Maine's per-town xlsx exports omit a
+        wholly-blank cell from a row's XML entirely rather than writing
+        an empty one (verified live 2026-09-09 against a real UOCAVA
+        summary row with no county name). Reading cells by POSITION among
+        whichever <c> elements a row happens to contain -- rather than by
+        each cell's own r="B2" column reference -- silently shifted every
+        later value one column left whenever an earlier cell was missing,
+        misattributing a vote total to the wrong candidate with no error.
+        Cell B (Municipality) is omitted here exactly like Maine's real
+        row; the fix must still place "150" under "Votes" (column C), not
+        under "Municipality" (column B)."""
+        payload = _workbook([
+            ["County", "Municipality", "Votes"],
+            ["CUM", None, "150"],
+        ])
+        rows = tb._rows(payload, {"format": "xlsx"})
+        assert rows == [{"County": "CUM", "Municipality": "", "Votes": "150"}]
+
+    def test_skip_lines_drops_leading_rows_before_the_real_header(self):
+        """New Hampshire's own per-office exports open with two title/
+        date rows before the real candidate-name header row — the xlsx
+        counterpart to the delimited-text path's own skip_lines
+        handling just above _xlsx_rows, extended here since no xlsx
+        state needed it before."""
+        payload = _workbook([
+            ["State of New Hampshire - Primary Election"],
+            ["September 08, 2026", "United States Senator - Democratic"],
+            ["Summary By Counties", "Chris Pappas, d"],
+            ["Belknap", "4954"],
+        ])
+        rows = tb._rows(payload, {"format": "xlsx", "skip_lines": 2})
+        assert rows == [{"Summary By Counties": "Belknap", "Chris Pappas, d": "4954"}]
+
+
+class TestTopTwo:
+    """California runs one all-party contest and advances the top two, so
+    a same-party pair is a correct result, not a bug."""
+
+    _FMT = {
+        "delimiter": "\t", "encoding": "utf-8",
+        "contest_column": "Contest Name", "choice_column": "Candidate Name",
+        "party_column": "Party Name", "votes_column": "Vote Total",
+    }
+    _TSV = (
+        "Contest Name\tCandidate Name\tParty Name\tVote Total\n"
+        "United States Representative District 4\tMike Thompson\tDemocratic\t900\n"
+        "United States Representative District 4\tNiki Jones\tDemocratic\t700\n"
+        "United States Representative District 4\tRon Bauer\tRepublican\t300\n"
+        "United States Representative District 9\tPat Nolan\tNo Party Preference\t800\n"
+        "United States Representative District 9\tAmy Reed\tDemocratic\t600\n"
+        "United States Representative District 9\tJoe Katz\tRepublican\t100\n"
+    ).encode()
+
+    async def _run(self, monkeypatch, advance_count):
+        _serve(monkeypatch, self._TSV)
+        return await tb.fetch_confirmed_candidates(
+            None, 2026, "CA",
+            {"advance_count": advance_count, "format": self._FMT},
+        )
+
+    @pytest.mark.asyncio
+    async def test_advances_two_of_the_same_party(self, monkeypatch):
+        records = await self._run(monkeypatch, 2)
+        d4 = [r for r in records if r["district"] == 4]
+        assert sorted(r["last_name"] for r in d4) == ["Jones", "Thompson"]
+        assert all(r["party"] == "D" for r in d4)
+
+    @pytest.mark.asyncio
+    async def test_no_party_preference_candidate_still_advances(self, monkeypatch):
+        """Party is incidental under top-two — dropping an NPP leader
+        would hide the actual front-runner."""
+        records = await self._run(monkeypatch, 2)
+        nolan = next(r for r in records if r["last_name"] == "Nolan")
+        assert nolan["party"] == ""
+        # What the state printed is what the ballot says: the page shows
+        # it rather than the FEC filing's code.
+        assert nolan["party_label"] == "No Party Preference"
+
+    @pytest.mark.asyncio
+    async def test_a_state_office_keeps_a_party_it_has_no_code_for(self, monkeypatch):
+        """California's Assembly, 2026-10-09: a Peace and Freedom nominee
+        and two No Party Preference ones were shown with no party at all."""
+        tsv = (
+            "Contest Name\tCandidate Name\tParty Name\tVote Total\n"
+            "State Assembly Member District 63\tPat Placeholder\tRepublican\t900\n"
+            "State Assembly Member District 63\tLee Placeholder\tPeace and Freedom\t500\n"
+            "State Assembly Member District 63\tSam Placeholder\tDemocratic\t400\n"
+        ).encode()
+        _serve(monkeypatch, tsv)
+        records = await tb.fetch_confirmed_candidates(
+            None, 2026, "CA", {"advance_count": 2, "statewide_offices": True, "format": self._FMT},
+        )
+        by_name = {r["last_name"]: r for r in records}
+        assert by_name["Lee Placeholder"]["party"] == "O"
+        assert by_name["Lee Placeholder"]["party_label"] == "Peace and Freedom"
+        assert "party_label" not in by_name["Pat Placeholder"]
+
+    @pytest.mark.asyncio
+    async def test_same_data_as_a_party_primary_would_take_only_the_leader(
+        self, monkeypatch,
+    ):
+        """Guards the advance_count switch itself: one-nominee semantics
+        must still drop everyone but the winner."""
+        records = await self._run(monkeypatch, 1)
+        assert [r["last_name"] for r in records if r["district"] == 4] == ["Thompson"]
+
+
+class TestExcludeChoices:
+    """Georgia's workbook appends a per-contest "Total Votes" row in the
+    same shape as a candidate — with an empty party and choice id. Left in,
+    it doubles the denominator and wins any uncontested race outright."""
+
+    _FMT = dict(_FORMAT, exclude_choices=["Total Votes"])
+    _TSV = (
+        "Contest Name\tChoice\tChoice Party\tTotal Votes\n"
+        "US House of Representatives - District 13 - Rep\tJonathan Chavez\tREP\t25547\n"
+        "US House of Representatives - District 13 - Rep\tTotal Votes\t\t25547\n"
+    ).encode()
+
+    def test_summary_row_is_not_counted_as_a_candidate(self):
+        tally = tb._tally(tb._rows(self._TSV, self._FMT), self._FMT)
+        votes = tally["US House of Representatives - District 13 - Rep"]["votes"]
+        assert set(votes) == {"Jonathan Chavez"}
+
+    def test_without_exclusion_the_summary_row_would_win(self):
+        """Pins why the config exists: the uncontested candidate ties the
+        summary row, and a tie yields nobody at all."""
+        tally = tb._tally(tb._rows(self._TSV, _FORMAT), _FORMAT)
+        votes = tally["US House of Representatives - District 13 - Rep"]["votes"]
+        assert "Total Votes" in votes
+
+
+class TestRunoffOverride:
+    """A runoff state's second contest decides every race its primary left
+    short of the threshold. Georgia's 2026 Senate is the live case: nobody
+    cleared 50% in May, and Collins beat Dooley in the June runoff."""
+
+    _FMT = {
+        "delimiter": "\t", "encoding": "utf-8",
+        "contest_column": "Contest Name", "choice_column": "Choice",
+        "party_column": "Choice Party", "votes_column": "Total Votes",
+    }
+    _PRIMARY = (
+        "Contest Name\tChoice\tChoice Party\tTotal Votes\n"
+        "US Senate - Rep\tMike Collins\tREP\t369642\n"
+        "US Senate - Rep\tDerek Dooley\tREP\t300000\n"
+        "US Senate - Rep\tBuddy Carter\tREP\t229223\n"
+    ).encode()
+    _RUNOFF = (
+        "Contest Name\tChoice\tChoice Party\tTotal Votes\n"
+        "US Senate - Rep\tMike Collins\tREP\t500000\n"
+        "US Senate - Rep\tDerek Dooley\tREP\t400000\n"
+    ).encode()
+
+    async def _run(self, monkeypatch, payloads):
+        async def fake_discover(client, state, year, discovery):
+            # Last stage is the runoff, as real discovery orders them.
+            return [
+                {"url": f"https://example.gov/{i}", "runoff": i == len(payloads) - 1 and len(payloads) > 1}
+                for i in range(len(payloads))
+            ]
+
+        seen = iter(payloads)
+
+        async def fake_get(client, url, label):
+            return _Resp(content=next(seen))
+
+        monkeypatch.setattr(tb, "_discover_urls", fake_discover)
+        monkeypatch.setattr(tb, "_get", fake_get)
+        return await tb.fetch_confirmed_candidates(
+            None, 2026, "GA",
+            {"runoff_threshold_pct": 50.0, "format": self._FMT},
+        )
+
+    @pytest.mark.asyncio
+    async def test_primary_alone_confirms_nobody_below_the_threshold(self, monkeypatch):
+        assert await self._run(monkeypatch, [self._PRIMARY]) == []
+
+    @pytest.mark.asyncio
+    async def test_runoff_resolves_the_seat_the_primary_left_open(self, monkeypatch):
+        records = await self._run(monkeypatch, [self._PRIMARY, self._RUNOFF])
+        assert [r["last_name"] for r in records] == ["Collins"]
+
+    @pytest.mark.asyncio
+    async def test_two_same_day_party_primaries_do_not_erase_each_other(
+        self, monkeypatch,
+    ):
+        """Virginia runs separate Democratic and Republican primary
+        elections on the same day. They are different races for the same
+        seat, so the second stage must not overwrite the first."""
+        dem = (
+            "Contest Name\tChoice\tChoice Party\tTotal Votes\n"
+            "Member, U.S. House of Representatives District 2\tElaine Luria\tDemocratic\t900\n"
+        ).encode()
+        rep = (
+            "Contest Name\tChoice\tChoice Party\tTotal Votes\n"
+            "Member, U.S. House of Representatives District 2\tJen Kiggans\tRepublican\t800\n"
+        ).encode()
+        records = await self._run(monkeypatch, [dem, rep])
+        assert sorted(r["last_name"] for r in records) == ["Kiggans", "Luria"]
+
+    @pytest.mark.asyncio
+    async def test_runoff_is_not_itself_thresholded(self, monkeypatch):
+        """A runoff is decisive by construction — applying the 50% rule to
+        it again would discard the very result that resolves the race."""
+        close = (
+            "Contest Name\tChoice\tChoice Party\tTotal Votes\n"
+            "US Senate - Rep\tMike Collins\tREP\t51\n"
+            "US Senate - Rep\tDerek Dooley\tREP\t49\n"
+        ).encode()
+        records = await self._run(monkeypatch, [self._PRIMARY, close])
+        assert [r["last_name"] for r in records] == ["Collins"]
+
+    async def _run_one_pending(self, monkeypatch, source):
+        dem = (
+            "Contest Name\tChoice\tChoice Party\tTotal Votes\n"
+            "Governor\tAbigail Spanberger\tDemocratic\t900\n"
+            "Member, U.S. House of Representatives District 2\tElaine Luria\tDemocratic\t900\n"
+        ).encode()
+
+        async def fake_discover(client, state, year, discovery):
+            # The Democratic election is certified; the Republican one,
+            # held the same day, is not yet.
+            return [
+                {"url": "https://example.gov/dem", "runoff": False, "held": "2026-06-16", "official": True},
+                {"url": "https://example.gov/rep", "runoff": False, "held": "2099-06-16", "official": False},
+            ]
+
+        async def fake_get(client, url, label):
+            assert url.endswith("/dem"), url
+            return _Resp(content=dem)
+
+        monkeypatch.setattr(tb, "_discover_urls", fake_discover)
+        monkeypatch.setattr(tb, "_get", fake_get)
+        return await tb.fetch_confirmed_candidates(None, 2026, "VA", {
+            "format": self._FMT, "discovery": {"require_official": True, "settle_days": 30}, **source,
+        })
+
+    @pytest.mark.asyncio
+    async def test_a_runoff_owed_but_not_yet_listed_marks_the_state_offices_incomplete(self, monkeypatch):
+        """Georgia-style: the primary has settled and the runoff election
+        is not listed yet. A state contest short of the majority is owed
+        it, so the primary alone is not the state-office ballot."""
+        primary = (
+            "Contest Name\tChoice\tChoice Party\tTotal Votes\n"
+            "US Senate - Rep\tMike Collins\tREP\t600000\n"
+            "US Senate - Rep\tDerek Dooley\tREP\t300000\n"
+            "Lieutenant Governor - Rep\tBurt Jones\tREP\t400\n"
+            "Lieutenant Governor - Rep\tSomeone Else\tREP\t350\n"
+            "Lieutenant Governor - Rep\tA Third\tREP\t250\n"
+        ).encode()
+
+        _serve(monkeypatch, primary)
+        source = {"runoff_threshold_pct": 50.0, "format": self._FMT, "statewide_offices": True,
+                  "discovery": {"runoff_name_regex": "General Primary Runoff"}}
+        result = await tb.fetch_confirmed_candidates(None, 2026, "GA", source)
+        assert [(r["office"], r["last_name"]) for r in result] == [("S", "Collins")]
+        assert result.state_offices_incomplete is True
+        # A state with no runoff stage (North Carolina's second primary is
+        # only on request) is not held open by a short contest.
+        no_stage = {**source, "discovery": {}}
+        result = await tb.fetch_confirmed_candidates(None, 2026, "NC", no_stage)
+        assert not getattr(result, "state_offices_incomplete", False)
+
+    async def _run_ga_judicial(self, monkeypatch, justice_votes):
+        rows = (
+            "Contest Name\tChoice\tChoice Party\tTotal Votes\n"
+            "US Senate - Rep\tMike Collins\tREP\t600000\n"
+            "US Senate - Rep\tDerek Dooley\tREP\t300000\n"
+            "Lieutenant Governor - Rep\tBurt Jones\tREP\t900\n"
+            "Lieutenant Governor - Rep\tSomeone Else\tREP\t100\n"
+            f"Justice of the Supreme Court - Bethel\tCharlie Bethel\t\t{justice_votes[0]}\n"
+            f"Justice of the Supreme Court - Bethel\tA Challenger\t\t{justice_votes[1]}\n"
+        ).encode()
+
+        _serve(monkeypatch, rows)
+        return await tb.fetch_confirmed_candidates(None, 2026, "GA", {
+            "runoff_threshold_pct": 50.0, "format": self._FMT, "statewide_offices": True,
+            "judicial_offices": True, "judicial_resolution": "decided_before_general",
+            "discovery": {"runoff_name_regex": "General Primary Runoff"},
+        })
+
+    @pytest.mark.asyncio
+    async def test_a_judgeship_decided_outright_is_not_owed_a_runoff(self, monkeypatch):
+        """Georgia publishes no judgeship (decided_before_general), so its
+        rule names nobody for every one. That is not a runoff owed: with a
+        majority winner (87.5%), the state offices are the whole read."""
+        result = await self._run_ga_judicial(monkeypatch, (875, 125))
+        assert not getattr(result, "state_offices_incomplete", False)
+        assert {(r["office"], r["last_name"]) for r in result} == {("S", "Collins"), ("lt_governor", "Burt Jones")}
+
+    @pytest.mark.asyncio
+    async def test_a_judgeship_with_no_majority_is_owed_its_runoff(self, monkeypatch):
+        result = await self._run_ga_judicial(monkeypatch, (500, 500))
+        assert result.state_offices_incomplete is True
+
+    @pytest.mark.asyncio
+    async def test_one_stage_pending_publishes_no_state_offices(self, monkeypatch):
+        """Read alone, the settled party's election would be taken for
+        the whole ballot and the pending party's nominees deleted. Its
+        federal rows still stand."""
+        result = await self._run_one_pending(monkeypatch, {"statewide_offices": True})
+        assert [(r["office"], r["last_name"]) for r in result] == [("H", "Luria")]
+        assert result.state_offices_incomplete is True
+
+    @pytest.mark.asyncio
+    async def test_one_stage_pending_still_confirms_federal_only(self, monkeypatch):
+        result = await self._run_one_pending(monkeypatch, {})
+        assert [(r["office"], r["last_name"]) for r in result] == [("H", "Luria")]
+        assert not getattr(result, "state_offices_incomplete", False)
+
+
+class TestHouseFromColumns:
+    """Virginia's export names its federal races "Member, House of
+    Representatives (2nd District)" — no "U.S." prefix, and an ordinal
+    parse_office doesn't read (pinned in test_state_candidates_common's
+    TestOfficeFromColumns). Its own DistrictType column is the
+    discriminator the label lacks. Rows are the real 2026-08-04 shape.
+    """
+
+    _FMT = {
+        "delimiter": ",", "encoding": "utf-8",
+        "contest_column": "OfficeTitle", "choice_column": "CandidateName",
+        "party_column": "Party", "votes_column": "TOTAL_VOTES",
+        "house_from_columns": {
+            "type_column": "DistrictType", "type_value": "congressional",
+            "district_column": "DistrictName",
+        },
+    }
+    _CSV = (
+        "CandidateName,TOTAL_VOTES,Party,DistrictType,DistrictName,OfficeTitle\n"
+        "Elaine G. Luria,33658,Democratic,congressional,02,"
+        '"Member, House of Representatives (2nd District)"\n'
+        "Patrick B. Mosolf,566,Democratic,congressional,02,"
+        '"Member, House of Representatives (2nd District)"\n'
+        "Bert Mizusawa,85,Republican,state,United States Of America,"
+        '"Member, United States Senate"\n'
+        "Some Supervisor,999,Democratic,county,ARLINGTON COUNTY,"
+        '"Member County Board (Arlington County)"\n'
+    ).encode()
+
+    def test_the_office_is_resolved_from_the_columns(self):
+        tally = tb._tally(tb._rows(self._CSV, self._FMT), self._FMT)
+        entry = tally["Member, House of Representatives (2nd District)"]
+        # The zero-padded "02" must not become district 0 or "02".
+        assert entry["office"] == ("H", 2)
+
+    def test_rows_the_spec_does_not_cover_fall_back_to_the_label(self):
+        """Only the configured office is resolved from columns: the Senate
+        label already parses on its own, and a county board race must stay
+        unrecognisable to both routes."""
+        tally = tb._tally(tb._rows(self._CSV, self._FMT), self._FMT)
+        assert tally["Member, United States Senate"]["office"] is None
+        assert tb.parse_office("Member, United States Senate") == ("S", None)
+        assert tally["Member County Board (Arlington County)"]["office"] is None
+        assert tb.parse_office("Member County Board (Arlington County)") is None
+
+    @pytest.mark.asyncio
+    async def test_yields_the_federal_nominees_only(self, monkeypatch):
+        _serve(monkeypatch, self._CSV)
+        records = await tb.fetch_confirmed_candidates(
+            None, 2026, "VA", {"format": self._FMT},
+        )
+        # display_name rides along on every FEDERAL record so the shared
+        # matcher can break a same-surname tie it would otherwise refuse
+        # (see _match_candidate); it is never used to reject a match the
+        # surname already resolved uniquely.
+        assert records == [
+            {"office": "H", "district": 2, "party": "D", "last_name": "Luria",
+             "display_name": "Elaine G. Luria"},
+            {"office": "S", "district": None, "party": "R", "last_name": "Mizusawa",
+             "display_name": "Bert Mizusawa"},
+        ]
+
+class TestColumnJoining:
+    """Florida splits across columns what other states keep in one label:
+    a contest is (RaceName, PartyCode) and a candidate is (first, last).
+    Rows are the real 2026-08-18 file's shape."""
+
+    _FMT = {
+        "delimiter": "\t",
+        "contest_column": ["RaceName", "PartyCode"],
+        "choice_column": ["CanNameFirst", "CanNameLast"],
+        "party_column": "PartyCode", "votes_column": "CanVotes",
+        "house_from_columns": {
+            "type_column": "RaceCode", "type_value": "USR",
+            "district_column": "Juris1num",
+        },
+    }
+    _TSV = (
+        "RaceCode\tRaceName\tPartyCode\tJuris1num\tCanNameFirst\tCanNameLast\tCanVotes\n"
+        "USR\tRepresentative in Congress, District 25\tDEM\t025\tDebbie\tWasserman Schultz\t900\n"
+        "USR\tRepresentative in Congress, District 25\tDEM\t025\tJen\tPerelman\t400\n"
+        "USR\tRepresentative in Congress, District 25\tREP\t025\tCarla\tSpalding\t700\n"
+    ).encode()
+
+    def test_the_party_code_keeps_two_primaries_for_one_seat_apart(self):
+        """Without the party column in the key, both parties' primaries
+        for a seat tally as ONE race and the bigger one wins the seat
+        outright — the Democratic winner here would beat the Republican
+        winner and the seat would show a single nominee."""
+        tally = tb._tally(tb._rows(self._TSV, self._FMT), self._FMT)
+        assert set(tally) == {
+            "Representative in Congress, District 25 DEM",
+            "Representative in Congress, District 25 REP",
+        }
+
+    @pytest.mark.asyncio
+    async def test_yields_one_nominee_per_party(self, monkeypatch):
+        _serve(monkeypatch, self._TSV, tb._stage("https://example.gov/fl.txt"))
+        records = await tb.fetch_confirmed_candidates(
+            None, 2026, "FL", {"format": self._FMT},
+        )
+        assert sorted((r["party"], r["last_name"]) for r in records) == [
+            ("D", "Schultz"), ("R", "Spalding"),
+        ]
+        assert all(r["district"] == 25 for r in records)
+
+
+class TestHeaderlessColumns:
+    """Minnesota publishes one semicolon file with NO header row, so the
+    columns are named positionally in config."""
+
+    _FMT = {
+        "delimiter": ";",
+        "columns": ["state", "county", "precinct", "office_id", "office_name",
+                    "district", "candidate_id", "candidate", "suffix", "incumbent",
+                    "party", "reporting", "total_precincts", "votes", "percent", "total"],
+        "contest_column": ["office_name", "party"],
+        "choice_column": "candidate", "party_column": "party", "votes_column": "votes",
+    }
+    _TXT = (
+        "MN;01;;0111;U.S. Representative District 8;8;0301;Pete Stauber;;;R;51;51;2273;87.29;2604\n"
+        "MN;02;;0111;U.S. Representative District 8;8;0301;Pete Stauber;;;R;51;51;1000;87.29;2604\n"
+        "MN;01;;0111;U.S. Representative District 8;8;0302;Anthony Hamilton;;;R;51;51;331;12.71;2604\n"
+        "MN;01;;0111;U.S. Representative District 8;8;0401;Luke Gulbranson;;;DFL;51;51;256;16.30;1571\n"
+        "MN;01;;0111;U.S. Representative District 8;8;0402;John Munter;;;DFL;51;51;900;8.27;1571\n"
+    ).encode()
+
+    def test_positional_columns_are_read(self):
+        rows = tb._rows(self._TXT, self._FMT)
+        assert rows[0]["candidate"] == "Pete Stauber"
+        assert rows[0]["office_name"] == "U.S. Representative District 8"
+
+    @pytest.mark.asyncio
+    async def test_votes_sum_across_counties_and_dfl_is_democratic(self, monkeypatch):
+        """Minnesota's Democrats are the DFL, and every candidate appears
+        once per county."""
+        _serve(monkeypatch, self._TXT, tb._stage("https://example.gov/mn.txt"))
+        records = await tb.fetch_confirmed_candidates(None, 2026, "MN", {"format": self._FMT})
+        assert sorted((r["party"], r["last_name"]) for r in records) == [
+            ("D", "Munter"), ("R", "Stauber"),
+        ]
+
+
+class TestSkipLines:
+    """Hawaii's file opens with its own format banner before the header."""
+
+    def test_the_banner_line_is_dropped(self):
+        payload = (b"#FormatVersion 1\n"
+                   b"Contest Title\tCandidate Name\tTotal Votes\n"
+                   b'"U.S. Representative, Dist I"\t"CASE, Ed"\t63784\n')
+        rows = tb._rows(payload, {"delimiter": "\t", "skip_lines": 1})
+        assert rows[0]["Candidate Name"] == "CASE, Ed"
+
+
+class TestPrimaryDateTemplating:
+    """A state whose results file is addressed by election date can be
+    reached without crawling that state for the date — the national
+    calendar supplies it. Minnesota needs exactly this: its files are open
+    while the page listing them sits behind a bot manager."""
+
+    _DISCOVERY = {
+        "mode": "direct_url",
+        "url": "https://files.example.gov/{primary_date_compact}/allraces.txt",
+    }
+
+    @pytest.mark.asyncio
+    async def test_the_known_primary_date_fills_the_url(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.pipeline.fetch.state_election_dates.primary_date",
+            lambda state, year: "2026-08-11",
+        )
+        stages = await tb._discover_urls(None, "MN", 2026, self._DISCOVERY)
+        assert stages == [tb._stage(
+            "https://files.example.gov/20260811/allraces.txt", held="2026-08-11",
+        )]
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_date_yields_nothing_rather_than_a_broken_url(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.pipeline.fetch.state_election_dates.primary_date",
+            lambda state, year: None,
+        )
+        assert await tb._discover_urls(None, "MN", 2026, self._DISCOVERY) == []
+
+
+class TestHtmlTableReader:
+    """Maryland publishes results as HTML tables under headings and offers
+    no downloadable file at all. A table alone never says which contest it
+    is — the heading above it does — so rows carry the heading stack."""
+
+    _PAGE = b"""
+    <html><body>
+      <h1>Official 2026 Primary Election Results for Representative in Congress</h1>
+      <h2>Representative in Congress</h2>
+      <h3>District 1</h3>
+      <h4>Democratic Candidates - Vote for 1</h4>
+      <table>
+        <tr><th>Name</th><th>Party</th><th>Total</th></tr>
+        <tr><td>Dan Schwartz</td><td>Democratic</td><td>18,317</td></tr>
+        <tr><td>Totals</td><td></td><td>18,317</td></tr>
+      </table>
+      <h4>Republican Candidates - Vote for 1</h4>
+      <table>
+        <tr><th>Name</th><th>Party</th><th>Total</th></tr>
+        <tr><td>Andy Harris</td><td>Republican</td><td>44,000</td></tr>
+      </table>
+      <h3>District 2</h3>
+      <h4>Democratic Candidates - Vote for 1</h4>
+      <table>
+        <tr><th>Name</th><th>Party</th><th>Total</th></tr>
+        <tr><td>Johnny Olszewski</td><td>Democratic</td><td>30,000</td></tr>
+      </table>
+    </body></html>
+    """
+    _FMT = {
+        "format": "html_table",
+        "contest_column": ["heading_2", "heading_3", "heading_4"],
+        "choice_column": "Name", "party_column": "Party", "votes_column": "Total",
+        "exclude_choices": ["Totals"],
+    }
+
+    def test_rows_carry_the_heading_they_appeared_under(self):
+        rows = tb._rows(self._PAGE, self._FMT)
+        first = rows[0]
+        assert first["Name"] == "Dan Schwartz"
+        assert first["heading_2"] == "Representative in Congress"
+        assert first["heading_3"] == "District 1"
+
+    def test_a_new_heading_clears_the_deeper_ones(self):
+        """District 2's rows must not inherit District 1's party heading
+        or anything else nested under it."""
+        rows = tb._rows(self._PAGE, self._FMT)
+        olszewski = next(r for r in rows if r["Name"].startswith("Johnny"))
+        assert olszewski["heading_3"] == "District 2"
+
+    @pytest.mark.asyncio
+    async def test_both_parties_survive_the_same_district(self, monkeypatch):
+        """The party heading is part of the contest key: without it, both
+        parties' candidates for a district tally as ONE race and the
+        weaker party's nominee is dropped."""
+        _serve(monkeypatch, self._PAGE, tb._stage("https://example.gov/md.html"))
+        records = await tb.fetch_confirmed_candidates(
+            None, 2026, "MD", {"format": self._FMT},
+        )
+        assert sorted((r["district"], r["party"], r["last_name"]) for r in records) == [
+            (1, "D", "Schwartz"), (1, "R", "Harris"), (2, "D", "Olszewski"),
+        ]
+
+    def test_a_page_that_is_not_a_results_table_yields_nothing(self):
+        assert tb._rows(b"<html><body><p>no tables here</p></body></html>",
+                        {"format": "html_table"}) is None
+
+
+class TestLandingPageDiscovery:
+    """Florida publishes one dated file per election and no way to list
+    them, so the link comes off the page the state keeps current."""
+
+    _DISCOVERY = {
+        "mode": "landing_page",
+        "page_url": "https://example.gov/Downloads",
+        "link_regex": r"https://files\.example\.gov/\d{8}_Results\.txt",
+    }
+
+    def _page(self, *names):
+        links = "".join(f'<a href="https://files.example.gov/{n}">x</a>' for n in names)
+        return f"<html>{links}</html>"
+
+    @pytest.mark.asyncio
+    async def test_the_page_url_is_templated_by_cycle_too(self, monkeypatch):
+        """A state that files results under a per-cycle path needs the
+        PAGE templated, not just the link pattern, or nothing is ever
+        found there again."""
+        asked = []
+
+        async def fake_get(client, url, label):
+            asked.append(url)
+            return _Resp(text=self._page("20260818_Results.txt"))
+
+        monkeypatch.setattr(tb, "_get", fake_get)
+        await tb._discover_urls(None, "MD", 2026, dict(
+            self._DISCOVERY, page_url="https://example.gov/{year}/results/index.html",
+        ))
+        assert asked == ["https://example.gov/2026/results/index.html"]
+
+    @pytest.mark.asyncio
+    async def test_reads_this_cycles_file_off_the_page(self, monkeypatch):
+        async def fake_get(client, url, label):
+            return _Resp(text=self._page("20260818_Results.txt"))
+
+        monkeypatch.setattr(tb, "_get", fake_get)
+        stages = await tb._discover_urls(None, "FL", 2026, self._DISCOVERY)
+        assert stages == [tb._stage(
+            "https://files.example.gov/20260818_Results.txt", held="2026-08-18",
+        )]
+
+    @pytest.mark.asyncio
+    async def test_the_general_elections_own_file_is_never_used(self, monkeypatch):
+        """After November the page shows the GENERAL's file. Confirming
+        nominees from the election they are nominees FOR would be
+        backwards — and would quietly start naming November's winners."""
+        async def fake_get(client, url, label):
+            return _Resp(text=self._page("20261103_Results.txt"))
+
+        monkeypatch.setattr(tb, "_get", fake_get)
+        assert await tb._discover_urls(None, "FL", 2026, self._DISCOVERY) == []
+
+    @pytest.mark.asyncio
+    async def test_with_both_listed_the_primary_wins(self, monkeypatch):
+        async def fake_get(client, url, label):
+            return _Resp(text=self._page("20261103_Results.txt", "20260818_Results.txt"))
+
+        monkeypatch.setattr(tb, "_get", fake_get)
+        stages = await tb._discover_urls(None, "FL", 2026, self._DISCOVERY)
+        assert [s["held"] for s in stages] == ["2026-08-18"]
+
+
+class TestWithheld:
+    """One gate for every vendor: a state that asks for it names nobody
+    until its own certification flag says so, or its certification
+    deadline passes."""
+
+    _GATED = {"require_official": True, "settle_days": 30}
+
+    def test_a_certified_stage_passes(self):
+        assert tb._withheld(tb._stage("u", official=True), self._GATED) is False
+
+    def test_a_vendor_with_no_flag_at_all_passes_on_the_deadline(self):
+        """Florida publishes no certification flag anywhere — the window
+        is the only gate it has."""
+        assert tb._withheld(tb._stage("u", held="2000-01-01"), self._GATED) is False
+        # ... and an uncertified stage still inside the window is withheld.
+        assert tb._withheld(tb._stage("u", held="2999-01-01"), self._GATED) is True
+
+    def test_a_state_that_does_not_ask_for_the_gate_is_never_withheld(self):
+        assert tb._withheld(tb._stage("u", held="2999-01-01"), {}) is False
+
+
+class TestSosApiReportDiscovery:
+    """Georgia's portal hides its workbook behind a three-hop API, and the
+    blob filename carries a GUID that changes on every republish — so it
+    must be read each run, never hardcoded."""
+
+    _JURISDICTION = {
+        "id": "09378a07-e6cf-4f66-be7c-ca4aa534f99a",
+        "elections": [
+            {"publicElectionId": "GeneralPrimary51926", "electionDate": "2026-05-19",
+             "name": [{"languageId": "en", "text": "May 19, 2026 - General Primary"}]},
+            {"publicElectionId": "06162026GeneralPrimaryRunoff", "electionDate": "2026-06-16",
+             "name": [{"languageId": "en", "text": "June 16th, 2026 General Primary Runoff"}]},
+            {"publicElectionId": "GeneralPrimary2024", "electionDate": "2024-05-21",
+             "name": [{"languageId": "en", "text": "May 21, 2024 - General Primary"}]},
+        ],
+    }
+    _DISCOVERY = {
+        "mode": "sos_api_report",
+        "jurisdiction_url": "https://example.gov/api/jurisdictions/Georgia",
+        "election_url": "https://example.gov/api/elections/Georgia/{election_id}",
+        "cdn_url": "https://example.gov/cdn/{jurisdiction_id}/{blob}",
+        "election_name_regex": "General Primary(?!.*Runoff)",
+        "runoff_name_regex": "General Primary Runoff",
+        "report_name": "Total Votes Excel",
+    }
+
+    def _fake_get(self):
+        async def fake_get(client, url, label):
+            if "jurisdictions" in url:
+                return _Resp(json_body=self._JURISDICTION)
+            blob = f"Total Votes {url.rsplit('/', 1)[-1]}.xlsx"
+            return _Resp(json_body={"publicReportCategories": [
+                {"reports": [{"reportName": "Total Votes Excel", "blobName": blob}]},
+            ]})
+        return fake_get
+
+    @pytest.mark.asyncio
+    async def test_returns_primary_then_runoff_for_the_right_cycle(self, monkeypatch):
+        monkeypatch.setattr(tb, "_get", self._fake_get())
+        urls = await tb._discover_urls(None, "GA", 2026, self._DISCOVERY)
+
+        assert len(urls) == 2
+        assert "GeneralPrimary51926" in urls[0]["url"]
+        assert urls[0]["runoff"] is False
+        assert "Runoff" in urls[1]["url"] and urls[1]["runoff"] is True
+        # 2024's General Primary matches the same name pattern and must be
+        # excluded by the electionDate year alone.
+        assert "2024" not in urls[0]["url"]
+
+    @pytest.mark.asyncio
+    async def test_a_list_of_patterns_fetches_every_matching_election(
+        self, monkeypatch,
+    ):
+        """Virginia publishes its two same-day party primaries as separate
+        elections, so both must be discovered — one pattern each, rather
+        than one loose pattern, so a special election can't slip in."""
+        jurisdiction = {"id": "va", "elections": [
+            {"publicElectionId": "2026-August-Democratic-Primary",
+             "electionDate": "2026-08-04",
+             "name": [{"text": "2026 August Democratic Primary"}]},
+            {"publicElectionId": "2026-August-Republican-Primary",
+             "electionDate": "2026-08-04",
+             "name": [{"text": "2026 August Republican Primary"}]},
+        ]}
+
+        async def fake_get(client, url, label):
+            if "jurisdictions" in url:
+                return _Resp(json_body=jurisdiction)
+            return _Resp(json_body={"publicReportCategories": [{"reports": [
+                {"reportName": "Total Votes Excel",
+                 "blobName": f"{url.rsplit('/', 1)[-1]}.csv"},
+            ]}]})
+
+        monkeypatch.setattr(tb, "_get", fake_get)
+        urls = await tb._discover_urls(None, "VA", 2026, dict(
+            self._DISCOVERY,
+            election_name_regex=["Democratic Primary", "Republican Primary"],
+            runoff_name_regex=None,
+        ))
+
+        assert len(urls) == 2
+        assert "Democratic" in urls[0]["url"] and "Republican" in urls[1]["url"]
+        # Same-day party primaries are both primaries — neither overrides
+        # the other, and both are subject to any runoff threshold.
+        assert [u["runoff"] for u in urls] == [False, False]
+
+    @pytest.mark.asyncio
+    async def test_blob_name_is_url_quoted(self, monkeypatch):
+        """The real blob names contain spaces."""
+        monkeypatch.setattr(tb, "_get", self._fake_get())
+        urls = await tb._discover_urls(None, "GA", 2026, self._DISCOVERY)
+        assert " " not in urls[0]["url"]
+        assert "%20" in urls[0]["url"]
+
+    @pytest.mark.asyncio
+    async def test_a_cycle_with_no_matching_election_yields_nothing(self, monkeypatch):
+        monkeypatch.setattr(tb, "_get", self._fake_get())
+        assert await tb._discover_urls(None, "GA", 2030, self._DISCOVERY) == []
+
+    @pytest.mark.asyncio
+    async def test_uncertified_election_is_refused_when_official_required(
+        self, monkeypatch,
+    ):
+        """The live case: Washington was still counting its 2026-08-04
+        primary days later. Confirming a nominee from a count that is still
+        moving is exactly the failure this module exists to prevent, so an
+        uncertified election yields nothing and lights up on its own at
+        certification."""
+        async def fake_get(client, url, label):
+            if "jurisdictions" in url:
+                return _Resp(json_body=self._JURISDICTION)
+            return _Resp(json_body={
+                "isOfficialResults": False,
+                "publicReportCategories": [
+                    {"reports": [{"reportName": "Total Votes Excel", "blobName": "x.xlsx"}]},
+                ],
+            })
+
+        monkeypatch.setattr(tb, "_get", fake_get)
+        stages = await tb._discover_urls(None, "WA", 2026, self._DISCOVERY)
+        # Discovery reports what the portal said; the gate decides.
+        assert stages and all(s["official"] is False for s in stages)
+        strict = dict(self._DISCOVERY, require_official=True)
+        assert all(tb._withheld(s, strict) for s in stages)
+        # Without the flag the same payload is still usable — the gate is
+        # opt-in per state, since a portal that never sets the field would
+        # otherwise be permanently withheld.
+        assert not any(tb._withheld(s, self._DISCOVERY) for s in stages)
+
+    @pytest.mark.asyncio
+    async def test_a_withheld_state_is_empty_not_a_failed_fetch(self, monkeypatch):
+        """The distinction the pipeline reports on: a state that published
+        results nobody has certified yet is HEALTHY and confirms nobody
+        ([]), while a state whose file can't be found at all is a failure
+        (None). Collapsing the two would report Washington and Virginia as
+        broken every run for the weeks between voting and certification."""
+        async def withheld(client, state, year, discovery):
+            return [{"url": None, "runoff": False}]
+
+        async def nothing(client, state, year, discovery):
+            return []
+
+        monkeypatch.setattr(tb, "_discover_urls", withheld)
+        assert await tb.fetch_confirmed_candidates(None, 2026, "WA", {}) == []
+
+        monkeypatch.setattr(tb, "_discover_urls", nothing)
+        assert await tb.fetch_confirmed_candidates(None, 2026, "WA", {}) is None
+
+    @pytest.mark.asyncio
+    async def test_settle_days_releases_an_election_the_portal_never_flagged(
+        self, monkeypatch,
+    ):
+        """Utah's 2026 primary was canvassed and certified on 2026-07-22 —
+        the signed state canvass report sits on this same portal — and
+        isOfficialResults was still false a month later. Without the
+        window, that state confirms nobody forever while looking healthy."""
+        async def fake_get(client, url, label):
+            if "jurisdictions" in url:
+                return _Resp(json_body=self._JURISDICTION)
+            return _Resp(json_body={
+                "isOfficialResults": False,
+                "electionDate": "2026-05-19",
+                "publicReportCategories": [
+                    {"reports": [{"reportName": "Total Votes Excel", "blobName": "x.xlsx"}]},
+                ],
+            })
+
+        monkeypatch.setattr(tb, "_get", fake_get)
+        strict = dict(self._DISCOVERY, require_official=True, settle_days=30)
+        assert await tb._discover_urls(None, "GA", 2026, strict) != []
+
+    def test_an_election_inside_the_window_is_still_withheld(self):
+        assert tb._settled({"electionDate": "2999-01-01"}, 30) is False
+
+    def test_no_window_configured_never_releases(self):
+        """settle_days is opt-in: without it require_official is absolute."""
+        assert tb._settled({"electionDate": "2000-01-01"}, None) is False
+
+    def test_an_unparsable_election_date_does_not_release(self):
+        assert tb._settled({"electionDate": None}, 30) is False
+
+
+class TestDiscoverUrl:
+    @pytest.mark.asyncio
+    async def test_direct_url_substitutes_the_cycle_year(self):
+        url = await tb._discover_urls(
+            None, "XX", 2026,
+            {"mode": "direct_url", "url": "https://example.gov/{year}/results.csv"},
+        )
+        assert url == [tb._stage("https://example.gov/2026/results.csv")]
+
+    @pytest.mark.asyncio
+    async def test_direct_url_with_no_date_of_its_own_falls_back_to_the_calendar(
+        self, monkeypatch,
+    ):
+        """New Mexico's results URL carries no election id or date — it
+        always serves whichever election is current — so it has no way to
+        date itself the way a per-cycle path or a dated filename can. The
+        national calendar is the only source left standing."""
+        monkeypatch.setattr(
+            "app.pipeline.fetch.state_election_dates.primary_date",
+            lambda state, year: "2026-06-02",
+        )
+        url = await tb._discover_urls(
+            None, "NM", 2026,
+            {"mode": "direct_url", "url": "https://example.gov/results.csv",
+             "date_from_calendar": True},
+        )
+        assert url == [tb._stage("https://example.gov/results.csv", held="2026-06-02")]
+
+    @pytest.mark.asyncio
+    async def test_s3_listing_picks_the_earliest_matching_key(self, monkeypatch):
+        """Within a cycle the first matching election is the primary that
+        decides nominees; a later folder is the general or a second
+        primary."""
+        listing = (
+            "<ListBucketResult>"
+            "<Contents><Key>ENRS/2026_03_03/results_pct_20260303.zip</Key></Contents>"
+            "<Contents><Key>ENRS/2026_11_03/results_pct_20261103.zip</Key></Contents>"
+            "<Contents><Key>ENRS/2026_03_03/absentee_20260303.zip</Key></Contents>"
+            "</ListBucketResult>"
+        )
+
+        async def fake_get(client, url, label):
+            return _Resp(text=listing)
+
+        monkeypatch.setattr(tb, "_get", fake_get)
+        url = await tb._discover_urls(None, "NC", 2026, {
+            "mode": "s3_listing",
+            "bucket_url": "https://s3.amazonaws.com/dl.ncsbe.gov",
+            "prefix": "ENRS/{year}",
+            "file_regex": r"results_pct_\d{8}\.zip",
+        })
+        assert len(url) == 1
+        assert url[0]["url"].endswith("ENRS/2026_03_03/results_pct_20260303.zip")
+
+    @pytest.mark.asyncio
+    async def test_unknown_mode_returns_nothing(self):
+        assert await tb._discover_urls(None, "XX", 2026, {"mode": "carrier_pigeon"}) == []
+
+
+class TestFetchConfirmedCandidates:
+    @pytest.mark.asyncio
+    async def test_returns_federal_nominees_and_excludes_the_state_house_control(
+        self, monkeypatch,
+    ):
+        _serve(monkeypatch, _fixture_bytes())
+        records = await tb.fetch_confirmed_candidates(
+            None, 2026, "NC", {"runoff_threshold_pct": 30.0, "format": _FORMAT},
+        )
+
+        assert {"office": "H", "district": 5, "party": "R", "last_name": "Foxx",
+                "display_name": "Virginia Foxx"} in records
+        # "NC HOUSE OF REPRESENTATIVES DISTRICT 022" is a state race whose
+        # label looks federal — district 22 must not appear.
+        assert all(r["district"] != 22 for r in records)
+        assert all(r["office"] in ("S", "H") for r in records)
+
+    @pytest.mark.asyncio
+    async def test_undiscoverable_file_returns_none_not_empty(self, monkeypatch):
+        async def fake_discover(client, state, year, discovery):
+            return []
+
+        monkeypatch.setattr(tb, "_discover_urls", fake_discover)
+        assert await tb.fetch_confirmed_candidates(None, 2026, "NC", {}) is None
+
+    @pytest.mark.asyncio
+    async def test_download_failure_returns_none(self, monkeypatch):
+        _serve(monkeypatch, None)
+        assert await tb.fetch_confirmed_candidates(None, 2026, "NC", {}) is None
+
+    @pytest.mark.asyncio
+    async def test_oversized_download_is_refused(self, monkeypatch):
+        """A URL that has silently started serving something enormous is a
+        config failure, not something to parse."""
+        _serve(monkeypatch, b"x" * (tb.MAX_DOWNLOAD_BYTES + 1))
+        assert await tb.fetch_confirmed_candidates(None, 2026, "NC", {}) is None
+
+
+class TestNewMexico:
+    """A real cut of New Mexico's official 2026-06-02 primary export
+    (electionresults.sos.nm.gov/resultsCSV.aspx?text=All&type=FED&map=CTY),
+    fetched live 2026-09-03 with no login and no session — a plain,
+    unauthenticated GET. Kept whole rather than trimmed: it is also what
+    proves RaceName alone doesn't carry the House district number (AreaNum
+    does), and that a Republican write-in nominee's "(write in)" annotation
+    doesn't survive into the recorded surname.
+    """
+
+    _CSV = (
+        b'RaceID,RaceName,PartyCode,AreaNum,CandidateID,CandidateName,VoteFor,'
+        b'CandidateVotes,CandidatePercentage,PrecinctsReporting,'
+        b'CandidateAbsenteeVotes,CandidateElectionDayVotes,CandidateEarlyVotes\r\n'
+        b'10778,"United States Senator","DEM","",18908,"BEN R LUJAN",1,182360,'
+        b'0.841730171844781,2204/2204,29120,76471,76769,\r\n'
+        b'10778,"United States Senator","DEM","",18933,"MATT DODSON",1,34289,'
+        b'0.158269828155219,2204/2204,4753,17327,12209,\r\n'
+        b'10778,"United States Senator","REP","",19598,"LARRY E MARKER (write in)",'
+        b'1,31220,1,2204/2204,2333,15209,13678,\r\n'
+        b'10779,"United States Representative","DEM","DISTRICT 1",18928,'
+        b'"MELANIE ANN STANSBURY",1,79823,1,778/778,15000,29285,35538,\r\n'
+        b'10779,"United States Representative","REP","DISTRICT 1",18909,'
+        b'"NDIDIAMAKA EKWUA CHARLENE OKPAREKE",1,31809,1,778/778,3523,13570,14716,\r\n'
+        b'10780,"United States Representative","DEM","DISTRICT 2",18913,'
+        b'"GABRIEL VASQUEZ",1,47123,1,663/663,8600,19629,18894,\r\n'
+        b'10780,"United States Representative","REP","DISTRICT 2",18906,'
+        b'"GREGORY G CUNNINGHAM",1,26836,0.845334845334845,663/663,2079,13690,11067,\r\n'
+        b'10780,"United States Representative","REP","DISTRICT 2",18929,'
+        b'"JOSE OROZCO",1,4910,0.154665154665155,663/663,437,2630,1843,\r\n'
+        b'10781,"United States Representative","DEM","DISTRICT 3",18912,'
+        b'"TERESA LEGER FERNANDEZ",1,68768,1,763/763,8012,34331,26425,\r\n'
+        b'10781,"United States Representative","REP","DISTRICT 3",18905,'
+        b'"MARTIN ZAMORA",1,32901,1,763/763,1884,18306,12711,\r\n'
+    )
+    _FMT = {
+        "delimiter": ",",
+        "contest_column": ["RaceName", "AreaNum", "PartyCode"],
+        "choice_column": "CandidateName",
+        "party_column": "PartyCode",
+        "votes_column": "CandidateVotes",
+    }
+
+    @pytest.mark.asyncio
+    async def test_confirms_every_real_2026_federal_nominee(self, monkeypatch):
+        _serve(monkeypatch, self._CSV, tb._stage(
+            "https://electionresults.sos.nm.gov/resultsCSV.aspx", held="2026-06-02",
+        ))
+        records = await tb.fetch_confirmed_candidates(
+            None, 2026, "NM", {"format": self._FMT},
+        )
+        # H2 distinct from H1/H3 only holds if AreaNum (not RaceName alone,
+        # which is identical across all three districts) resolved the
+        # seat; MARKER with no "(write in)" suffix only holds if the ballot
+        # annotation didn't leak into the surname.
+        assert sorted(
+            (r["office"], r["district"], r["party"], r["last_name"]) for r in records
+        ) == [
+            ("H", 1, "D", "STANSBURY"),
+            ("H", 1, "R", "OKPAREKE"),
+            ("H", 2, "D", "VASQUEZ"),
+            ("H", 2, "R", "CUNNINGHAM"),
+            ("H", 3, "D", "FERNANDEZ"),
+            ("H", 3, "R", "ZAMORA"),
+            ("S", None, "D", "LUJAN"),
+            ("S", None, "R", "MARKER"),
+        ]
+
+
+class TestIdaho:
+    """A trimmed, real cut of Idaho's official 2026 primary export (fifth
+    state found live on the Enhanced Voting portal, after GA/WA/VA/UT) --
+    'Summary and Precinct Results Excel', fetched live 2026-09-08 from
+    results.voteidaho.gov's own CDN blob. Real county-level rows for 2 of
+    Idaho's 44 counties (Ada, Canyon) kept whole rather than trimmed to
+    single rows -- aggregation across county rows is exactly what this
+    fixture proves, and Canyon County (entirely within CD1) legitimately
+    has no CD2 rows at all, a real shape the aggregation must not choke
+    on. Idaho's own two write-in summary buckets ("Write-in: Not
+    Assigned", "Write-in: Not Certified") are real rows in the export,
+    not present in every other Enhanced Voting state's exclude_choices.
+    """
+
+    _FMT = {
+        "format": "xlsx",
+        "contest_column": "Office Name",
+        "choice_column": "Ballot Name",
+        "party_column": "Party",
+        "votes_column": "Total",
+        "exclude_choices": [
+            "Ballots Cast", "Over Votes", "Under Votes",
+            "Write-in: Not Assigned", "Write-in: Not Certified",
+        ],
+    }
+
+    @staticmethod
+    def _rows():
+        header = ["County", "Office Name", "Ballot Name", "Party", "Total"]
+        real = [
+            ("Ada County", "United States Senator - Democratic", "Nickolas 007 Bonds", "Democratic", "1352"),
+            ("Ada County", "United States Senator - Democratic", "Brad Moore", "Democratic", "5978"),
+            ("Ada County", "United States Senator - Democratic", "David Roth", "Democratic", "14248"),
+            ("Ada County", "United States Senator - Republican", "Joe Evans", "Republican", "10398"),
+            ("Ada County", "United States Senator - Republican", "Denny LaVe", "Republican", "2168"),
+            ("Ada County", "United States Senator - Republican", "Jim Risch", "Republican", "29463"),
+            ("Ada County", "United States Senator - Republican", "Josh Roy", "Republican", "9524"),
+            ("Ada County", "United States Senator - Libertarian", "Matt Loesby", "Libertarian", "224"),
+            ("Ada County", "United States Senator - Republican", "Ballots Cast", "", "51553"),
+            ("Ada County", "United States Representative District 1 - Democratic", "Kenneth Brungardt", "Democratic", "850"),
+            ("Ada County", "United States Representative District 1 - Democratic", "Kaylee Peterson", "Democratic", "5949"),
+            ("Ada County", "United States Representative District 1 - Republican", "Andy Briner", "Republican", "3716"),
+            ("Ada County", "United States Representative District 1 - Republican", "Russ Fulcher", "Republican", "22707"),
+            ("Ada County", "United States Representative District 1 - Republican", "Joseph P Morrison", "Republican", "3141"),
+            ("Ada County", "United States Representative District 1 - Republican", "Write-in: Not Assigned", "", "12"),
+            ("Ada County", "United States Representative District 2 - Democratic", "Ellie Gilbreath", "Democratic", "11596"),
+            ("Ada County", "United States Representative District 2 - Democratic", "Julie Wiley", "Democratic", "3466"),
+            ("Ada County", "United States Representative District 2 - Republican", "Brian Keene", "Republican", "6017"),
+            ("Ada County", "United States Representative District 2 - Republican", "Perry Shumway", "Republican", "3068"),
+            ("Ada County", "United States Representative District 2 - Republican", "Mike Simpson", "Republican", "11682"),
+            ("Ada County", "United States Representative District 2 - Libertarian", "Will Johanson", "Libertarian", "97"),
+            ("Ada County", "United States Representative District 2 - Republican", "Write-in: Not Certified", "", "3"),
+            ("Canyon County", "United States Senator - Democratic", "Nickolas 007 Bonds", "Democratic", "285"),
+            ("Canyon County", "United States Senator - Democratic", "Brad Moore", "Democratic", "1206"),
+            ("Canyon County", "United States Senator - Democratic", "David Roth", "Democratic", "1942"),
+            ("Canyon County", "United States Senator - Libertarian", "Matt Loesby", "Libertarian", "88"),
+            ("Canyon County", "United States Senator - Republican", "Joe Evans", "Republican", "2593"),
+            ("Canyon County", "United States Senator - Republican", "Denny LaVe", "Republican", "828"),
+            ("Canyon County", "United States Senator - Republican", "Jim Risch", "Republican", "13924"),
+            ("Canyon County", "United States Senator - Republican", "Josh Roy", "Republican", "3502"),
+            ("Canyon County", "United States Representative District 1 - Democratic", "Kenneth Brungardt", "Democratic", "455"),
+            ("Canyon County", "United States Representative District 1 - Democratic", "Kaylee Peterson", "Democratic", "3034"),
+            ("Canyon County", "United States Representative District 1 - Republican", "Andy Briner", "Republican", "2479"),
+            ("Canyon County", "United States Representative District 1 - Republican", "Russ Fulcher", "Republican", "16134"),
+            ("Canyon County", "United States Representative District 1 - Republican", "Joseph P Morrison", "Republican", "1983"),
+            # Canyon County genuinely has no CD2 rows -- entirely within CD1.
+            ("Canyon County", "Governor - Republican", "Brad Little", "Republican", "22000"),
+        ]
+        return [header] + [list(r) for r in real]
+
+    @pytest.mark.asyncio
+    async def test_confirms_every_real_2026_federal_nominee(self, monkeypatch):
+        _serve(monkeypatch, _workbook(self._rows()), tb._stage(
+            "https://results.voteidaho.gov/cdn/results/x/Results.xlsx",
+            held="2026-05-19", official=True,
+        ))
+        records = await tb.fetch_confirmed_candidates(
+            None, 2026, "ID", {"format": self._FMT, "discovery": {"require_official": True}},
+        )
+        # Real regression this proves: David Roth's real statewide total
+        # (Ada 14248 + Canyon 1942 = 16190) only holds if votes are SUMMED
+        # across both counties, not read from a single county's row --
+        # and "Governor" / write-in / Ballots-Cast rows must never leak
+        # into a federal result.
+        assert sorted(
+            (r["office"], r["district"], r["party"], r["last_name"]) for r in records
+        ) == [
+            ("H", 1, "D", "Peterson"),
+            ("H", 1, "R", "Fulcher"),
+            ("H", 2, "D", "Gilbreath"),
+            ("H", 2, "L", "Johanson"),
+            ("H", 2, "R", "Simpson"),
+            ("S", None, "D", "Roth"),
+            ("S", None, "L", "Loesby"),
+            ("S", None, "R", "Risch"),
+        ]
+
+
+class _Resp:
+    def __init__(self, text="", content=b"", json_body=None):
+        self.text = text
+        self.content = content
+        self._json = json_body
+
+    def json(self):
+        return self._json
+
+
+class TestStateOffices:
+    """The same bulk export carries the state's own offices — North
+    Carolina's is 103,517 precinct rows of which only 49,884 are federal.
+
+    Every label below is a real shape from Minnesota's 2026 primary
+    export, including the traps: "County Attorney" and "County
+    Auditor/Treasurer" contain the words a statewide gate keys on, and
+    "Judge - Nh District Court 7" carries a district number.
+    """
+
+    _FMT = {
+        "delimiter": "\t", "encoding": "utf-8",
+        "contest_column": "office", "choice_column": "candidate",
+        "party_column": "party", "votes_column": "votes",
+    }
+    _TSV = (
+        "office\tcandidate\tparty\tvotes\n"
+        "U.S. Senator\tReal Senator\tDFL\t900\n"
+        "Governor & Lt Governor\tAmy Example and Ben Deputy\tDFL\t800\n"
+        "State Auditor\tZack Auditor\tDFL\t700\n"
+        "Attorney General\tKeith Example\tDFL\t650\n"
+        "State Senator District 10\tNathan Upper\tR\t600\n"
+        "State Representative District 10A\tMark Lower\tR\t500\n"
+        "State Representative District 10B\tOther Lower\tR\t450\n"
+        "County Attorney\tNot Statewide\tDFL\t400\n"
+        "County Auditor/Treasurer\tAlso Not\tDFL\t300\n"
+        "County Commissioner District 1\tLocal Person\tDFL\t200\n"
+        "Judge - Nh District Court 7\tA Judge\tDFL\t100\n"
+    ).encode()
+
+    async def _run(self, monkeypatch, state_offices):
+        _serve(monkeypatch, self._TSV)
+        source = {"format": self._FMT}
+        if state_offices:
+            source["statewide_offices"] = True
+        return await tb.fetch_confirmed_candidates(None, 2026, "MN", source)
+
+    @pytest.mark.asyncio
+    async def test_a_state_that_has_not_opted_in_sees_only_federal(self, monkeypatch):
+        """The opt-in is a truth condition, not a toggle: without it a
+        zero count would be a claim nobody has checked."""
+        records = await self._run(monkeypatch, state_offices=False)
+        assert [(r["office"], r["district"]) for r in records] == [("S", None)]
+
+    @pytest.mark.asyncio
+    async def test_statewide_offices_resolve_including_a_joint_ticket(self, monkeypatch):
+        records = await self._run(monkeypatch, state_offices=True)
+        by_office = {r["office"]: r["last_name"] for r in records}
+        assert by_office["governor"] == "Amy Example and Ben Deputy"
+        assert by_office["auditor"] == "Zack Auditor"
+        assert by_office["attorney_general"] == "Keith Example"
+
+    @pytest.mark.asyncio
+    async def test_legislative_seats_keep_their_letter(self, monkeypatch):
+        """Minnesota splits each senate district into two house seats,
+        "10A" and "10B". Dropping the letter merges two real seats."""
+        records = await self._run(monkeypatch, state_offices=True)
+        seats = {(r["office"], r["district"]): r["last_name"] for r in records
+                 if r["office"] in ("upper", "lower")}
+        assert seats == {
+            ("upper", "10"): "Nathan Upper",
+            ("lower", "10A"): "Mark Lower",
+            ("lower", "10B"): "Other Lower",
+        }
+
+    @pytest.mark.asyncio
+    async def test_county_offices_are_never_read_as_statewide(self, monkeypatch):
+        """"County Attorney" and "County Auditor/Treasurer" both contain
+        a statewide office's words, and "County Commissioner District 1"
+        carries a district number."""
+        records = await self._run(monkeypatch, state_offices=True)
+        names = {r["last_name"] for r in records}
+        assert "Not Statewide" not in names
+        assert "Also Not" not in names
+        assert "Local Person" not in names
+
+    @pytest.mark.asyncio
+    async def test_a_judicial_contest_is_not_a_legislative_seat(self, monkeypatch):
+        """It names a district, so the legislative gate must refuse it.
+
+        The judgeship IS read now (parse_judicial_office, the fourth
+        gate), but as a COURT — never as a chamber. Whether it is then
+        published is a separate per-state opt-in, judicial_offices, which
+        _sync_judicial_nominees enforces downstream.
+        """
+        records = await self._run(monkeypatch, state_offices=True)
+        judge = [r for r in records if r["last_name"] == "A Judge"]
+        assert len(judge) == 1
+        assert judge[0]["office"] == "district"       # a court
+        assert judge[0]["office"] not in ("upper", "lower")
+        # This fixture writes "District Court 7" — the number TRAILS the
+        # court's name rather than following the word "District", which
+        # is not a form the gate claims. Reading a bare trailing number
+        # as a district would be guessing, so it stays None. Every real
+        # label surveyed writes it the other way ("DISTRICT COURT JUDGE
+        # DISTRICT 3 SEAT 2"), and those do resolve.
+        assert judge[0]["district"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_state_office_name_is_kept_whole(self, monkeypatch):
+        """No FEC row exists to match a surname against, so reducing one
+        would only discard what the ballot said."""
+        records = await self._run(monkeypatch, state_offices=True)
+        assert {r["last_name"] for r in records if r["office"] == "upper"} == {"Nathan Upper"}
+        # ... while the federal record on the same fetch still reduces.
+        assert {r["last_name"] for r in records if r["office"] == "S"} == {"Senator"}
+
+
+class TestMultiMemberContest:
+    """A district that fills three seats from one contest sends three
+    nominees, and the count comes from the contest's own label."""
+
+    _FMT = {
+        "delimiter": "\t", "encoding": "utf-8",
+        "contest_column": "office", "choice_column": "candidate",
+        "party_column": "party", "votes_column": "votes",
+    }
+    _TSV = (
+        "office\tcandidate\tparty\tvotes\n"
+        "House of Delegates District 10 Democratic Candidates - Vote for up to 3\tFirst\tDEM\t900\n"
+        "House of Delegates District 10 Democratic Candidates - Vote for up to 3\tSecond\tDEM\t800\n"
+        "House of Delegates District 10 Democratic Candidates - Vote for up to 3\tThird\tDEM\t700\n"
+        "House of Delegates District 10 Democratic Candidates - Vote for up to 3\tFourth\tDEM\t600\n"
+        "State Senator District 5 Democratic Candidates - Vote for 1\tOnly One\tDEM\t500\n"
+        "State Senator District 5 Democratic Candidates - Vote for 1\tRunner Up\tDEM\t400\n"
+    ).encode()
+
+    async def _run(self, monkeypatch, advance_count=1):
+        _serve(monkeypatch, self._TSV)
+        return await tb.fetch_confirmed_candidates(
+            None, 2026, "MD",
+            {"format": self._FMT, "statewide_offices": True, "advance_count": advance_count},
+        )
+
+    @pytest.mark.asyncio
+    async def test_three_seats_send_three_nominees(self, monkeypatch):
+        """Three seats, four candidates — the label is what says where
+        the line falls, so "Fourth" is not a nominee."""
+        records = await self._run(monkeypatch)
+        lower = sorted(r["last_name"] for r in records if r["office"] == "lower")
+        assert lower == ["First", "Second", "Third"]
+        assert "Fourth" not in {r["last_name"] for r in records}
+
+    @pytest.mark.asyncio
+    async def test_a_single_seat_contest_is_unaffected(self, monkeypatch):
+        records = await self._run(monkeypatch)
+        upper = [r["last_name"] for r in records if r["office"] == "upper"]
+        assert upper == ["Only One"]
+
+    @pytest.mark.asyncio
+    async def test_a_top_two_state_ignores_the_seat_count(self, monkeypatch):
+        """Under top-two exactly two advance no matter how many seats
+        are being filled, so the label's number is the wrong question
+        and must not override the state's own rule."""
+        records = await self._run(monkeypatch, advance_count=2)
+        lower = sorted(r["last_name"] for r in records if r["office"] == "lower")
+        assert lower == ["First", "Second"]
+
+
+class TestElectionIdIndexHop:
+    """The optional FIRST hop of landing_page discovery.
+
+    For a state whose results page is keyed by an internal election id
+    rather than anything guessable. Alaska is the only state using it:
+    its results moved in 2026 from a flat /enr26/results/*.csv link on
+    the index to a per-election sub-page, /election-results/e/?id=26prim,
+    which broke discovery outright ("No 2026 results file discoverable
+    for AK") while the CSV itself was unchanged and still reachable.
+
+    The cycle is never written down — the HIGHEST id wins, which is the
+    newest election, the same rule every other discovery mode follows.
+    """
+
+    INDEX = """
+      <a href="/election-results/e/?id=22prim">2022 Primary</a>
+      <a href="/election-results/e/?id=26prim">2026 Primary</a>
+      <a href="/election-results/e/?id=24prim">2024 Primary</a>
+      <a href="/election-results/e/?id=26genr">2026 General</a>
+    """
+    PAGE_26 = ('<a href="https://www.elections.alaska.gov/enr26/results/'
+               'GA_ENR_Precinct_State_of_Alaska.csv">Precinct results</a>')
+    DISCOVERY = {
+        "mode": "landing_page",
+        "index_url": "https://example.gov/election-results/",
+        "index_regex": r"/election-results/e/\?id=(\d+)prim",
+        "page_url": "https://example.gov/election-results/e/?id={election_id}prim",
+        "link_regex": (r"https://www\.elections\.alaska\.gov/enr\d+/results/"
+                       r"[^\"']*_State_of_Alaska\.csv"),
+        "date_from_calendar": True,
+        "settle_days": 21,
+    }
+
+    def _client(self, index_body, page_bodies):
+        seen = []
+
+        def handler(request):
+            url = str(request.url)
+            seen.append(url)
+            if url.rstrip("/").endswith("election-results"):
+                return httpx.Response(200, text=index_body)
+            for frag, body in page_bodies.items():
+                if frag in url:
+                    return httpx.Response(200, text=body)
+            return httpx.Response(404, text="")
+
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler)), seen
+
+    async def test_highest_id_resolves_the_page_and_finds_the_file(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.pipeline.fetch.state_election_dates.primary_date",
+            lambda s, y: "2026-08-18")
+        client, seen = self._client(self.INDEX, {"id=26prim": self.PAGE_26})
+        async with client:
+            stages = await tb._discover_urls(client, "AK", 2026, self.DISCOVERY)
+
+        assert [s["url"] for s in stages] == [
+            "https://www.elections.alaska.gov/enr26/results/"
+            "GA_ENR_Precinct_State_of_Alaska.csv"
+        ]
+        # 26 beat 24 despite 24 appearing later in the document: highest,
+        # not last, which is what makes it survive the next cycle.
+        assert any("id=26prim" in u for u in seen)
+        assert not any("id=24prim" in u for u in seen)
+
+    async def test_no_matching_id_returns_nothing_rather_than_guessing(self):
+        client, _ = self._client("<a href='/somewhere/else'>no ids</a>", {})
+        async with client:
+            assert await tb._discover_urls(client, "AK", 2026, self.DISCOVERY) == []
+
+    async def test_an_unreachable_index_does_not_fall_through_to_a_bare_page(self):
+        """Without the id there is no page to read, so failing the first
+        hop must stop — never request page_url with the token unresolved."""
+        def handler(request):
+            if str(request.url).rstrip("/").endswith("election-results"):
+                raise httpx.ConnectError("index down")
+            raise AssertionError("must not request the page without an id")
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            assert await tb._discover_urls(client, "AK", 2026, self.DISCOVERY) == []
+
+
+class TestDelaware:
+    """A real cut of Delaware's official 2026-09-15 primary results,
+    fetched live 2026-09-23 from the state's own open-data portal
+    (data.delaware.gov/resource/yg7x-kgjc.csv?election_name=2026%20Primary%20Election)
+    -- a plain unauthenticated GET, one row per candidate per contest.
+
+    Trimmed to the rows that prove what could silently break: a U.S.
+    Senate contest whose DEMOCRATIC and REPUBLICAN primaries share one
+    office label (so contest_column must join office WITH party -- drop
+    the join and KATZ, the real Republican nominee, vanishes and the seat
+    publishes a single nominee), an at-large House seat whose label
+    carries no district number at all, a statewide executive and a
+    legislative contest, and a New Castle County contest that must be
+    claimed by NO parser gate -- county offices are out of scope and must
+    never be published as state ones.
+    """
+
+    _CSV = (
+        b'election_name,office,candidate_name,party,machine_votes,absentee_votes,early_votes,total_votes,percent_votes,electiondate,data_as_of\r\n'
+        b'2026 Primary Election,U.S. Senator,JEFF APPELHANS,Democratic Party,7316,447,1531,9294,10.634,2026-09-15T00:00:00.000,2026-09-16T00:59:22.000\r\n'
+        b'2026 Primary Election,U.S. Senator,CHRIS COONS,Democratic Party,44249,7744,16161,68154,77.986,2026-09-15T00:00:00.000,2026-09-16T00:59:22.000\r\n'
+        b'2026 Primary Election,U.S. Senator,E. NO-TRUMP HANSEN,Democratic Party,2561,246,560,3367,3.8527,2026-09-15T00:00:00.000,2026-09-16T00:59:22.000\r\n'
+        b'2026 Primary Election,U.S. Senator,MARY LOUVE,Democratic Party,4994,464,1119,6577,7.5258,2026-09-15T00:00:00.000,2026-09-16T00:59:22.000\r\n'
+        b'2026 Primary Election,U.S. Senator,"MICHAEL ""DR. MIKE"" KATZ",Republican Party,22963,1473,6460,30896,77.34,2026-09-15T00:00:00.000,2026-09-16T00:59:22.000\r\n'
+        b'2026 Primary Election,U.S. Senator,JOHN SHULLI,Republican Party,6271,667,2114,9052,22.659,2026-09-15T00:00:00.000,2026-09-16T00:59:22.000\r\n'
+        b'2026 Primary Election,Representative in Congress,"JOSEPH ""DR. JOE"" ARMINIO",Republican Party,14109,817,3703,18629,47.859,2026-09-15T00:00:00.000,2026-09-16T00:59:22.000\r\n'
+        b'2026 Primary Election,Representative in Congress,EARL L. COOPER,Republican Party,5320,477,1975,7772,19.967,2026-09-15T00:00:00.000,2026-09-16T00:59:22.000\r\n'
+        b'2026 Primary Election,Representative in Congress,JOHN J. WHALEN,Republican Party,9003,817,2703,12523,32.173,2026-09-15T00:00:00.000,2026-09-16T00:59:22.000\r\n'
+        b'2026 Primary Election,Attorney General,DWAYNE J. BENSING,Democratic Party,15107,1619,3633,20359,23.682,2026-09-15T00:00:00.000,2026-09-16T00:59:22.000\r\n'
+        b'2026 Primary Election,Attorney General,KATHY JENNINGS,Democratic Party,39844,6504,14843,61191,71.179,2026-09-15T00:00:00.000,2026-09-16T00:59:22.000\r\n'
+        b'2026 Primary Election,Attorney General,PATTY RICKMAN,Democratic Party,3207,467,743,4417,5.138,2026-09-15T00:00:00.000,2026-09-16T00:59:22.000\r\n'
+        b'2026 Primary Election,State Senator District 5,SHAY FRISBY,Democratic Party,2297,160,602,3059,58.377,2026-09-15T00:00:00.000,2026-09-16T00:59:22.000\r\n'
+        b'2026 Primary Election,State Senator District 5,RAY SEIGFRIED,Democratic Party,1459,245,477,2181,41.622,2026-09-15T00:00:00.000,2026-09-16T00:59:22.000\r\n'
+        b'2026 Primary Election,State Representative District 33,MATT BUCHER,Republican Party,685,25,300,1010,49.827,2026-09-15T00:00:00.000,2026-09-16T00:59:22.000\r\n'
+        b'2026 Primary Election,State Representative District 33,MORGAN HUDSON,Republican Party,699,27,291,1017,50.172,2026-09-15T00:00:00.000,2026-09-16T00:59:22.000\r\n'
+        b'2026 Primary Election,New Castle County Council District 3,KIRA ALEJANDRO,Democratic Party,2578,315,421,3314,68.769,2026-09-15T00:00:00.000,2026-09-16T00:59:22.000\r\n'
+        b'2026 Primary Election,New Castle County Council District 3,KYLE R. GRANTHAM,Democratic Party,1087,152,266,1505,31.23,2026-09-15T00:00:00.000,2026-09-16T00:59:22.000\r\n'
+    )
+    _FMT = {
+        "format": "csv",
+        "contest_column": [
+                "office",
+                "party"
+        ],
+        "choice_column": "candidate_name",
+        "party_column": "party",
+        "votes_column": "total_votes"
+    }
+
+    @pytest.mark.asyncio
+    async def test_confirms_both_parties_senate_nominees_and_skips_county(self, monkeypatch):
+        _serve(monkeypatch, self._CSV, tb._stage(
+            "https://data.delaware.gov/resource/yg7x-kgjc.csv", held="2026-09-15",
+        ))
+        records = await tb.fetch_confirmed_candidates(
+            None, 2026, "DE", {"format": self._FMT, "advance_count": 1, "statewide_offices": True},
+        )
+        got = sorted((str(r["office"]), str(r["district"]), r["party"], r["last_name"]) for r in records)
+        assert ("S", "None", "D", "COONS") in got
+        assert ("S", "None", "R", "KATZ") in got
+        # At-large: the label carries no number, so district stays None
+        # (_race_id_for maps that to 0, which is how AK/ND/WY already work).
+        assert ("H", "None", "R", "ARMINIO") in got
+        assert not [g for g in got if "COUNCIL" in g[3].upper() or "DEEDS" in g[3].upper()]
+        assert {g[0] for g in got} == {"S", "H", "attorney_general", "upper", "lower"}

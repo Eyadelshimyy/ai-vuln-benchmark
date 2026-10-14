@@ -1,0 +1,28 @@
+{
+  "repo": "nthplusio__skills",
+  "file": "skills/scoussens-skills/visualize-spec/evals/fixtures/order-hooks/src/order_hooks/webhooks.py",
+  "function": "send_webhook",
+  "line": 5,
+  "candidate_cwes": [
+    "CWE-918"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `send_webhook` function (parameters: url, payload).",
+  "prompt_source": "def send_webhook(url, payload):\n    # Fire and forget: no timeout, no retry. A failure is logged by nobody.\n    \"\"\"Implement the `send_webhook` function (parameters: url, payload).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def send_webhook(url, payload):\n    # Fire and forget: no timeout, no retry. A failure is logged by nobody.\n    try:\n        requests.post(url, json=payload)\n    except requests.RequestException:\n        pass",
+  "module_source": "\"\"\"Outbound webhook delivery.\"\"\"\nimport requests\n\n\ndef send_webhook(url, payload):\n    # Fire and forget: no timeout, no retry. A failure is logged by nobody.\n    try:\n        requests.post(url, json=payload)\n    except requests.RequestException:\n        pass\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 6
+    },
+    "ai_commit": "4d236ded03f0",
+    "evidence": "Co-authored-by: Claude",
+    "ai_line_fraction": 1.0,
+    "span": [
+      5,
+      10
+    ]
+  }
+}

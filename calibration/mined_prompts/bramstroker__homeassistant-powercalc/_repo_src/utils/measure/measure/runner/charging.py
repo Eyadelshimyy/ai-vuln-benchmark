@@ -1,0 +1,164 @@
+import logging
+import time
+
+from measure.controller.charging.const import ChargingDeviceType
+from measure.controller.charging.controller import ChargingController
+from measure.controller.charging.errors import ChargingControllerError
+from measure.request import ChargingMeasurementRequest
+from measure.runner.errors import RunnerError
+from measure.runner.interaction import ChargingOperatingPoint, ImmediateInteraction, RunInteraction
+from measure.runner.runner import MeasurementRunner, RunnerResult
+from measure.tuning import MeasurementParameters
+from measure.utils.sampling import PowerSampler
+
+_LOGGER = logging.getLogger("measure")
+
+
+TRICKLE_CHARGING_TIME = 1800
+
+
+class ChargingRunner(MeasurementRunner[ChargingMeasurementRequest]):
+    def __init__(
+        self,
+        sampler: PowerSampler,
+        parameters: MeasurementParameters,
+        controller: ChargingController,
+        interaction: RunInteraction | None = None,
+    ) -> None:
+        self.config = parameters
+        self.sampler = sampler
+        self.controller = controller
+        self.interaction = interaction or ImmediateInteraction()
+
+    def run(
+        self,
+        request: ChargingMeasurementRequest,
+        export_directory: str,
+    ) -> RunnerResult:
+        self.interaction.phase("Starting charging measurement")
+
+        self.interaction.phase("Checking battery and charging state")
+        battery_level = self.controller.get_battery_level()
+        self.interaction.operating_point(
+            ChargingOperatingPoint(
+                type="charging",
+                battery_level=battery_level,
+                charging=self.controller.is_charging(),
+            ),
+        )
+        measurements: dict[int, list[float]] = {}
+        voltages: list[float] = []
+
+        if battery_level < 100:
+            self.wait_for_vacuum_to_start_charging()
+
+        error_count = 0
+        while battery_level < 100:
+            try:
+                battery_level = self.controller.get_battery_level()
+                self._measure_charging_step(battery_level, measurements, voltages)
+                error_count = 0
+            except ChargingControllerError as e:
+                _LOGGER.error("Error during measurement: %s", e)
+                error_count += 1
+                if error_count > 10:
+                    raise RunnerError("Too many errors occurred during measurements. aborting") from e
+                self._wait_between_measurements()
+
+        self.interaction.notify("Done charging, start measurements for trickle charging..")
+        self.interaction.phase("Measuring trickle charging power")
+
+        trickle_result = (
+            self.sampler.take_measurement(time.time())
+            if self.config.fast_test_mode
+            else self.sampler.take_average_measurement(
+                TRICKLE_CHARGING_TIME,
+                on_progress=self._report_trickle_progress,
+            )
+        )
+        measurements[100] = [trickle_result.power]
+        voltages.extend(trickle_result.voltages)
+
+        return RunnerResult(
+            model_json_data=self._build_model_json_data(measurements, request.charging_device_type), voltages=voltages
+        )
+
+    def _measure_charging_step(
+        self,
+        battery_level: int,
+        measurements: dict[int, list[float]],
+        voltages: list[float],
+    ) -> None:
+        """Take a single power measurement at the current battery level."""
+        is_charging = self.controller.is_charging()
+        self.interaction.operating_point(
+            ChargingOperatingPoint(
+                type="charging",
+                battery_level=battery_level,
+                charging=is_charging,
+            ),
+        )
+        if not is_charging:
+            raise RunnerError("Device is not charging anymore.")
+
+        self.interaction.progress(battery_level, 100, phase="Charging")
+        _LOGGER.info("Battery level: %d%%", battery_level)
+        self.interaction.phase(f"Measuring charging power at {battery_level}% battery")
+        result = self.sampler.take_measurement(time.time())
+        _LOGGER.info("Measured power: %.2f W", result.power)
+        measurements.setdefault(battery_level, []).append(result.power)
+        voltages.extend(result.voltages)
+        self._wait_between_measurements()
+
+    def _wait_between_measurements(self) -> None:
+        """Sleep between measurements, unless the fast test mode is enabled."""
+        if not self.config.fast_test_mode:
+            self.interaction.wait(self.config.sleep_time)
+
+    def _report_trickle_progress(self, elapsed: float, duration: float) -> None:
+        self.interaction.progress(
+            int(min(elapsed, duration)),
+            int(duration),
+            phase="Trickle charging",
+            remaining_seconds=max(0.0, duration - elapsed),
+        )
+
+    def wait_for_vacuum_to_start_charging(self) -> None:
+        is_charging = self.controller.is_charging()
+        wait_message_printed = False
+        while not is_charging:
+            if not self.controller.is_valid_state():
+                raise RunnerError("Device is not in a valid state.")
+
+            if not wait_message_printed:
+                self.interaction.notify("Waiting for charging device to start charging...")
+                self.interaction.phase("Waiting for the device to start charging")
+                wait_message_printed = True
+
+            self.interaction.wait(1)
+            is_charging = self.controller.is_charging()
+
+        if wait_message_printed:
+            self.interaction.notify("Charging device started charging, starting measurements")
+
+    def _build_model_json_data(
+        self, measurements: dict[int, list[float]], device_type: ChargingDeviceType
+    ) -> dict[str, object]:
+        """Build the model JSON data from the measurements"""
+        calibrate_list = []
+        for battery_level, powers in measurements.items():
+            average_power = round(sum(powers) / len(powers), 2)
+            calibrate_list.append(f"{battery_level} -> {average_power}")
+
+        calculation_enabled_condition = "{{ is_state('[[entity]]', 'docked') }}"
+
+        linear_config: dict[str, object] = {"calibrate": calibrate_list}
+        if self.controller.battery_level_attribute is not None:
+            linear_config["attribute"] = self.controller.battery_level_attribute
+
+        return {
+            "device_type": device_type.value,
+            "calculation_strategy": "linear",
+            "calculation_enabled_condition": calculation_enabled_condition,
+            "linear_config": linear_config,
+        }

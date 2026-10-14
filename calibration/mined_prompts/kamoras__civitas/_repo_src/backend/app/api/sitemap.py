@@ -1,0 +1,159 @@
+"""Sitemap index — every indexable detail page's id and last-modified date.
+
+Backs the frontend's `sitemap.ts`. Before this existed the sitemap listed
+only the ~65 static routes and state ballot pages, so search engines had no
+way to discover a single member profile, bill, or Action Center issue except
+by crawling a client-rendered directory. Those detail pages are most of the
+site's content and are what people actually search for ("<senator> voting
+record", "<bill number>").
+
+Read path only: plain column selects, no ORM hydration, no model inference.
+"""
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import JSONResponse
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from app.api.response_helpers import CACHE_TTL_REFERENCE_S, cached_json
+from app.database import get_db
+from app.issue_ids import to_public_id
+from app.config import settings
+from app.models import (
+    ActionIssue, ActionIssueStatus, CongressEvent, ExploreDocument, Justice, President, Representative, RollCall,
+    Senator,
+)
+from app.pipeline.fetch.congressional_record import congress_start
+from app.services.bill_service import _collect_bills
+from app.services.congress_service import session_days
+
+router = APIRouter()
+
+
+def _iso_date(value: datetime | str | None) -> str | None:
+    """YYYY-MM-DD, or None when the row carries no usable date.
+
+    Sitemap `lastmod` must be a W3C date; an empty or malformed value is
+    worse than omitting it (Google stops trusting a site's lastmod values
+    once they prove inaccurate)."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    text = str(value)[:10]
+    try:
+        datetime.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        return None
+    return text
+
+
+def _reported_bills(db: Session) -> list[tuple[str, str]]:
+    """(bill id, the last day it appears) for every current-congress bill a
+    Congress report links to: Digest entries and roll calls."""
+    congress = settings.CURRENT_CONGRESS
+    start = congress_start(congress).isoformat()
+    last: dict[str, str] = {}
+    for bill_id, day in (
+        db.query(CongressEvent.bill_id, func.max(CongressEvent.date))
+        .filter(CongressEvent.bill_id.isnot(None), CongressEvent.date >= start)
+        .group_by(CongressEvent.bill_id)
+        .all()
+    ) + (
+        db.query(RollCall.bill_id, func.max(RollCall.date))
+        .filter(RollCall.bill_id.isnot(None), RollCall.congress == congress)
+        .group_by(RollCall.bill_id)
+        .all()
+    ):
+        last[bill_id] = max(last.get(bill_id, ""), day or "")
+    return sorted(last.items())
+
+
+@router.get("/sitemap")
+def sitemap_entries(db: Session = Depends(get_db)) -> JSONResponse:
+    """Ids + lastmod for every politician profile, bill, and issue page.
+
+    Politicians: every row `/politicians/{id}` resolves (see
+    `politicians._detect_branch`) — including former presidents, which are
+    permanent site content, and departed members still inside their
+    retirement grace window, whose profiles still render.
+
+    Bills: the set `/bills` lists (`_collect_bills`, the current
+    congress's bills from sitting members), and the current congress's
+    bills the Congress reports link to (a Digest entry or a roll call),
+    which include bills no sitting member sponsors: 36 linked bill pages
+    were missing on 2026-10-11. Never a bill page the site doesn't link to.
+
+    Issues: every CONFIRMED issue, current or retired — the issue archive
+    is a permanent record, and each has its own stable public id. DEVELOPING
+    issues are left out, including ones that expired unconfirmed: they are
+    drafted from a primary source before any press coverage exists, and
+    their pages are noindex for the same reason (see issue/[id]/page.tsx).
+    """
+    politicians: list[dict] = []
+    for model in (Senator, Representative, President, Justice):
+        for pid, updated in db.query(model.id, model.updated_at).all():
+            politicians.append({"id": pid, "lastmod": _iso_date(updated)})
+
+    seen_bills: set[str] = set()
+    bills: list[dict] = []
+    for row in _collect_bills(db):
+        bill_id = row.bill.bill_id
+        if bill_id in seen_bills:
+            continue
+        seen_bills.add(bill_id)
+        bills.append({"id": bill_id, "lastmod": _iso_date(row.latest_action_date)})
+    for bill_id, day in _reported_bills(db):
+        if bill_id not in seen_bills:
+            seen_bills.add(bill_id)
+            bills.append({"id": bill_id, "lastmod": _iso_date(day)})
+
+    issues = [
+        {"id": to_public_id(iid), "lastmod": _iso_date(date)}
+        for iid, date in db.query(ActionIssue.id, ActionIssue.date)
+        .filter(ActionIssue.status != ActionIssueStatus.DEVELOPING)
+        .order_by(ActionIssue.date.desc())
+        .all()
+    ]
+
+    # The Congress reports: each day either chamber met, whose page is its
+    # own record (/congress/{date}); the week and month pages are built
+    # from the same days.
+    congress_days = session_days(db)
+
+    return cached_json(
+        {
+            "politicians": politicians, "bills": bills, "issues": issues,
+            "congressDays": congress_days,
+            # Explore documents are listed separately, a page at a time
+            # (/sitemap/explore): the corpus has no upper bound, and one
+            # sitemap file holds at most 50,000 URLs.
+            "exploreDocuments": db.query(ExploreDocument.id).count(),
+            "explorePageSize": EXPLORE_SITEMAP_PAGE,
+        },
+        max_age=CACHE_TTL_REFERENCE_S,
+    )
+
+
+# Explore documents per sitemap file: well under the protocol's
+# 50,000-URL cap, and small enough (~400 KB of JSON) for Next's fetch
+# cache, which skips anything over 2 MB.
+EXPLORE_SITEMAP_PAGE = 10_000
+
+
+@router.get("/sitemap/explore")
+def sitemap_explore(page: int = Query(0, ge=0, le=10_000), db: Session = Depends(get_db)) -> JSONResponse:
+    """One page of Explore document ids and dates, oldest id first, so a
+    page's contents only grow at the end and existing pages stay stable."""
+    rows = (
+        db.query(ExploreDocument.id, ExploreDocument.date)
+        .order_by(ExploreDocument.id)
+        .offset(page * EXPLORE_SITEMAP_PAGE)
+        .limit(EXPLORE_SITEMAP_PAGE)
+        .all()
+    )
+    return cached_json(
+        {"documents": [{"id": str(doc_id), "lastmod": _iso_date(day)} for doc_id, day in rows]},
+        max_age=CACHE_TTL_REFERENCE_S,
+    )

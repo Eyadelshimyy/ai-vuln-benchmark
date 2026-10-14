@@ -1,0 +1,55 @@
+from collections.abc import Mapping
+
+from measure.ha_app.session import SessionControl
+from measure.runner.interaction import OperatingPoint, RunInteraction
+
+
+class SessionInteraction(RunInteraction):
+    """Home Assistant session implementation with progress and cancellation."""
+
+    def __init__(self, control: SessionControl) -> None:
+        self.control = control
+
+    def confirm(self, message: str, *, action: str | None = None) -> None:
+        self.control.confirm(message, action=action)
+
+    def notify(self, message: str) -> None:
+        self.control.log(message)
+
+    def choose(self, message: str, *, default: bool) -> bool:
+        choice = "yes" if default else "no"
+        self.control.log(f"{message} Using the non-interactive default: {choice}.")
+        return default
+
+    def phase(self, message: str) -> None:
+        self.control.phase(message)
+
+    def progress(
+        self,
+        completed: int,
+        total: int,
+        *,
+        phase: str,
+        remaining_seconds: float | None = None,
+        skipped: int = 0,
+    ) -> None:
+        remaining = "" if remaining_seconds is None else f"{int(remaining_seconds)}s"
+        self.control.progress(
+            completed=completed,
+            total=total,
+            mode=phase,
+            estimated_remaining=remaining,
+            skipped=skipped,
+        )
+
+    def wait(self, seconds: float) -> None:
+        self.control.wait(seconds)
+
+    def checkpoint(self) -> None:
+        self.control.checkpoint()
+
+    def operating_point(self, point: OperatingPoint) -> None:
+        self.control.operating_point(point)
+
+    def entity_states(self, states: Mapping[str, str]) -> None:
+        self.control.entity_states(states)

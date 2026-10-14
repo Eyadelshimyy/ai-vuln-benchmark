@@ -1,0 +1,67 @@
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import ServiceValidationError
+import homeassistant.helpers.config_validation as cv
+
+from custom_components.powercalc.const import (
+    CONF_CREATE_COST_SENSOR,
+    CONF_CREATE_ENERGY_SENSOR,
+    CONF_CREATE_STANDBY_ENERGY_SENSOR,
+    CONF_CREATE_UTILITY_METERS,
+    CONF_ENERGY_INTEGRATION_METHOD,
+    CONF_IGNORE_UNAVAILABLE_STATE,
+    DOMAIN,
+    ENERGY_INTEGRATION_METHODS,
+)
+from custom_components.powercalc.validation import vol
+
+ALLOWED_CONFIG_KEYS = [
+    CONF_CREATE_ENERGY_SENSOR,
+    CONF_CREATE_STANDBY_ENERGY_SENSOR,
+    CONF_CREATE_COST_SENSOR,
+    CONF_CREATE_UTILITY_METERS,
+    CONF_IGNORE_UNAVAILABLE_STATE,
+    CONF_ENERGY_INTEGRATION_METHOD,
+]
+
+SERVICE_SCHEMA = vol.Schema(
+    {
+        vol.Required("field"): vol.In(ALLOWED_CONFIG_KEYS),
+        vol.Required("value"): cv.string,
+    },
+)
+
+
+async def change_gui_configuration(hass: HomeAssistant, call: ServiceCall) -> None:
+    field = call.data["field"]
+    value = call.data["value"]
+
+    if field in [
+        CONF_CREATE_ENERGY_SENSOR,
+        CONF_CREATE_STANDBY_ENERGY_SENSOR,
+        CONF_CREATE_COST_SENSOR,
+        CONF_CREATE_UTILITY_METERS,
+        CONF_IGNORE_UNAVAILABLE_STATE,
+    ]:
+        value = cv.boolean(value)
+
+    if field == CONF_ENERGY_INTEGRATION_METHOD and value not in ENERGY_INTEGRATION_METHODS:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="invalid_integration_method",
+            translation_placeholders={
+                "method": str(value),
+                "allowed_methods": ", ".join(ENERGY_INTEGRATION_METHODS),
+            },
+        )
+
+    apply_field_to_config_entries(hass, field, value)
+
+
+def apply_field_to_config_entries(hass: HomeAssistant, field: str, value: object) -> None:
+    """Apply a single config field/value to all existing powercalc config entries that use it."""
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        if field not in entry.data:
+            continue
+        new_data = entry.data.copy()
+        new_data[field] = value
+        hass.config_entries.async_update_entry(entry, data=new_data)

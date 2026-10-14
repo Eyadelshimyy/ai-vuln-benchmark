@@ -1,0 +1,1897 @@
+"""_ChartCard and TimeChartCard widget classes."""
+from functools import partial
+
+from PyQt5.QtCore import QEvent, QSettings, QSize, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QKeySequence
+from PyQt5.QtWidgets import (
+    QAction, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton, QSizePolicy,
+    QToolButton, QVBoxLayout, QWidget,
+)
+from PyQt5 import sip
+
+import qtawesome as qta
+
+from ...ui_kit.control_style import CONTROL_COLORS
+from ...ui_kit.dialog_geometry import fit_popover
+from ...ui_kit.icons import Icons
+from ...ui_kit.message_box_buttons import fit_message_box_buttons_to_text
+from ...ui_kit.motion import MotionPolicy, POLICY_LIGHT, resolve_policy
+from ...ui_kit.popup_trigger import bind_popup_trigger
+from ...ui_kit.widgets.selection_indicator import (
+    SelectionIndicator,
+    SelectionIndicatorStyle,
+)
+from .. import hints
+from ..file_navigator import _ElidedLabel
+from ..pg_canvases import TimeDomainCanvasPG
+from ..pg_canvas._shared import (
+    register_content_replacement_hook,
+    register_history_reset_hook,
+)
+from ..pg_canvas.heatmap_canvas import PgHeatmapCanvas
+from ..pg_canvas.frf_canvas import PgFrfCanvas
+from ..pg_canvas.line_canvas import PgLineCanvas
+
+from ._helpers import (
+    _strip_subplots_action,
+    _find_action,
+    _apply_mdi_icons,
+    _install_nav_shortcuts,
+    _install_button_shortcut,
+    _vline,
+    _ICON_COLOR,
+    _ICON_ACTIVE,
+    _TOOLBAR_COMPACT_WIDTH,
+    CHART_HINT_BAR_HEIGHT,
+)
+from .toolbar import PgNavigationToolbar, ToolbarScrollHost, _TickDensityPopover
+from .cursor_pill import _QualityStatusIndicator
+from .cursor_display import (
+    CursorDisplayOptions,
+    CursorDisplayPopover,
+)
+
+
+class _TimePlotDiagnosticsPill(QFrame):
+    """Compact, card-owned summary for partially rendered TimeDomain plots.
+
+    The widget deliberately lives above the canvas widget instead of inside
+    the pyqtgraph scene: panning/zooming must never move the diagnostic.  Its
+    summary is always one line; details are disclosed only when requested.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("timePlotDiagnosticsPill")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet(
+            "QFrame#timePlotDiagnosticsPill {"
+            "background:#fff7e6;border:1px solid #f0b44d;"
+            "border-radius:9px;}"
+            "QToolButton#timePlotDiagnosticsButton {"
+            "border:0;background:transparent;color:#7a4b00;"
+            "font-weight:600;padding:3px 7px;text-align:left;}"
+            "QLabel#timePlotDiagnosticsDetails {"
+            "color:#65420c;padding:0 8px 6px 8px;}"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self._button = QToolButton(self)
+        self._button.setObjectName("timePlotDiagnosticsButton")
+        self._button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self._button.setCursor(Qt.PointingHandCursor)
+        self._button.clicked.connect(self._toggle_details)
+        self._details = QLabel("", self)
+        self._details.setObjectName("timePlotDiagnosticsDetails")
+        self._details.setTextFormat(Qt.PlainText)
+        self._details.setWordWrap(True)
+        self._details.hide()
+        layout.addWidget(self._button)
+        layout.addWidget(self._details)
+        self.hide()
+
+    def set_diagnostics(self, *, attempted, successful, details):
+        attempted = max(0, int(attempted))
+        successful = max(0, min(int(successful), attempted))
+        details = tuple(str(item) for item in details if str(item).strip())
+        failed = max(0, attempted - successful)
+        if failed == 0 or not details:
+            self._details.hide()
+            self.hide()
+            return
+        self._button.setText(
+            f"⚠ 已绘制 {successful}/{attempted} · {failed} 条未绘制"
+        )
+        self._details.setText("\n".join(f"• {item}" for item in details))
+        self._details.hide()
+        self.show()
+        self.adjustSize()
+
+    def _toggle_details(self):
+        self._details.setVisible(self._details.isHidden())
+        self.adjustSize()
+        parent = self.parentWidget()
+        reposition = getattr(parent, "_position_time_diagnostics", None)
+        if callable(reposition):
+            reposition()
+
+
+class _ChartCard(QWidget):
+    """Canvas + its NavigationToolbar in a vertical layout."""
+
+    copy_image_requested = pyqtSignal()  # emitted when the toolbar copy btn is clicked
+    annotation_enabled_changed = pyqtSignal(bool)
+    tick_density_changed = pyqtSignal(int, int)
+    quickref_requested = pyqtSignal()
+
+    def __init__(self, canvas, parent=None, annotations=False, chart_mode=''):
+        super().__init__(parent)
+        lay = self._init_card_state(canvas, chart_mode)
+        self._build_toolbar(canvas)
+        self._wire_discovery_hooks(canvas)
+        self._wire_nudges(canvas)
+        self._style_toolbar()
+        self._build_toolbar_actions(annotations)
+        self._wire_toolbar_routing()
+        self._build_hint_bar()
+        self._activate_default_tool()
+        self._assemble_layout(lay, canvas)
+        self._build_overlays(chart_mode)
+
+    def _init_card_state(self, canvas, chart_mode):
+        """Seed card state and return the card's column layout.
+
+        The layout is handed back rather than stashed on ``self`` so the
+        assembly step stays the only place that fills it.
+        """
+        self.setObjectName("chartCard")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.canvas = canvas
+        self._focused = None
+        self.canvas.installEventFilter(self)
+        try:
+            viewport = canvas._glw.viewport()
+        except Exception:
+            viewport = None
+        self._canvas_viewport = viewport
+        if viewport is not None:
+            viewport.installEventFilter(self)
+        self._chart_mode = chart_mode
+        self._annotation_enabled = False
+        self._hint_settings = QSettings()
+        self._recent_context_hint_ids = set()
+        self._context_hint_index = 0
+        self._context_hint_signature = ()
+        # Round-robin start offset into the rotation lap, read once per session
+        # so a fresh open does not always lead with the same anchor. Lazily
+        # resolved (and advanced) from _hint_settings on first use.
+        self._rotation_start = None
+        self._hint_rotation_paused = False
+        # Variable-dwell rotation: a single-shot timer that re-arms itself with
+        # the CURRENT hint's dwell after each advance (replaces the old fixed
+        # 10s interval). High-priority/anchor hints linger; low-frequency tips
+        # get a short turn each lap.
+        self._hint_rotation_timer = QTimer(self)
+        self._hint_rotation_timer.setSingleShot(True)
+        self._hint_rotation_timer.timeout.connect(self._advance_context_hint)
+        return lay
+
+    def _build_toolbar(self, canvas):
+        # Pick the pyqtgraph-aware shim for supported chart canvases. The shim
+        # exposes the exact same six action keys + mode/pan/zoom surface so
+        # downstream helpers (i18n, MDI icons, shortcuts, _find_action) keep
+        # working unchanged.
+        if isinstance(
+            canvas,
+            (TimeDomainCanvasPG, PgHeatmapCanvas, PgLineCanvas, PgFrfCanvas),
+        ):
+            self.toolbar = PgNavigationToolbar(canvas, self)
+            # Bug 3: re-apply the toolbar's current pan/zoom mode to the
+            # ViewBoxes that plot_channels rebuilds, so box-zoom survives a
+            # replot/mode-switch (fresh ViewBoxes default to PanMode).
+            register = getattr(canvas, 'register_replot_callback', None)
+            if callable(register):
+                register(self.toolbar.apply_current_mouse_mode)
+                # Task 1: re-bind the view-history capture hook to the fresh
+                # ViewBoxes each rebuild creates, and seed a baseline view so
+                # back() has somewhere to return to. Registered AFTER the mode
+                # re-apply so the capture sees the fully-built axes_list.
+                register(self.toolbar.rebind_history_capture)
+            register_content_replacement_hook(
+                canvas, self.toolbar.discard_pending_history,
+            )
+            register_history_reset_hook(canvas, self.toolbar.clear_view_history)
+            # Design D: make the toolbar the canvas's single mouse-mode
+            # controller so the right-click 鼠标操作 submenu and the toolbar
+            # share one state machine. The menu reads current_mouse_mode() for
+            # its checkmark and calls set_pan_mode()/set_zoom_mode() on click.
+            reg_mode = getattr(canvas, 'register_mouse_mode_controller', None)
+            if callable(reg_mode):
+                reg_mode(self.toolbar)
+            reg_copy = getattr(canvas, 'register_copy_image_handler', None)
+            if callable(reg_copy):
+                reg_copy(self.copy_image_requested.emit)
+            # When the menu (or any path) changes the mode, refresh the
+            # toolbar icon active-state + bottom hint, and let TimeChartCard
+            # flip its axis-lock chips, exactly as a toolbar-button click would.
+            self.toolbar.mouse_mode_changed.connect(self._on_mouse_mode_changed)
+        else:
+            raise TypeError(
+                f"unsupported canvas type for toolbar: {type(canvas).__name__}"
+            )
+
+    def _wire_discovery_hooks(self, canvas):
+        context_menu_requested = getattr(canvas, 'context_menu_requested', None)
+        if context_menu_requested is not None:
+            context_menu_requested.connect(
+                lambda: self.mark_discovered("chart.right_click_menu")
+            )
+        manual_zoom_changed = getattr(canvas, 'manual_zoom_changed', None)
+        if manual_zoom_changed is not None:
+            manual_zoom_changed.connect(self.set_transient_zoom_hint)
+        # Hidden-gesture discovery wiring. Each canvas exposes a signal that
+        # fires the first time the user performs the gesture; we mark the
+        # matching discovery echo (so its rotating-pool tip retires) and flash a
+        # one-shot confirmation in the footer. Mirrors the context-menu wiring
+        # above. getattr-guarded so canvases without the signal are unaffected.
+        self._wire_discovery_signal(
+            canvas, 'slice_picked', 'spectrogram.slice_pick')
+        self._wire_discovery_signal(
+            canvas, 'divider_adjusted', 'spectrogram.divider')
+        self._wire_discovery_signal(
+            canvas, 'levels_changed', 'spectrogram.colorbar')
+        self._wire_discovery_signal(
+            canvas, 'time_source_selected', 'fft.preview_source')
+        slice_hint_requested = getattr(canvas, 'slice_hint_requested', None)
+        if slice_hint_requested is not None:
+            slice_hint_requested.connect(self._on_slice_hint_requested)
+
+    def _wire_nudges(self, canvas):
+        # Refresh situational nudges when the data situation changes: a chart
+        # rebuild (time: channel count / units / amplitude) or a render-time
+        # colour-level rebase (heatmap: dead colour window). getattr-guarded so
+        # canvases lacking the signal are unaffected.
+        for sig_name in ('chart_rebuilt', 'levels_rebased'):
+            sig = getattr(canvas, sig_name, None)
+            if sig is not None:
+                sig.connect(self._refresh_bottom_hint)
+
+    def _style_toolbar(self):
+        self.toolbar.setObjectName("chartToolbar")
+        self.toolbar.setIconSize(QSize(18, 18))
+        for act in self.toolbar.actions():
+            btn = self.toolbar.widgetForAction(act)
+            if btn is not None and isinstance(btn, QToolButton):
+                btn.setFixedSize(QSize(32, 32))
+        if self.toolbar.layout() is not None:
+            self.toolbar.layout().setSpacing(8)
+        self._toolbar_compact = None
+        _strip_subplots_action(self.toolbar)
+        self._remove_toolbar_loc_label()
+        self._toolbar_leading_spacer = QWidget(self.toolbar)
+        self._toolbar_leading_spacer.setObjectName("chartToolbarLeadingSpacer")
+        self._toolbar_leading_spacer.setAttribute(Qt.WA_TranslucentBackground, True)
+        self._toolbar_leading_spacer.setAttribute(Qt.WA_NoSystemBackground, True)
+        self._toolbar_leading_spacer.setAutoFillBackground(False)
+        self._toolbar_leading_spacer.setFixedWidth(4)
+        first_action = self.toolbar.actions()[0] if self.toolbar.actions() else None
+        self._toolbar_leading_spacer_action = (
+            self.toolbar.insertWidget(first_action, self._toolbar_leading_spacer)
+            if first_action is not None else self.toolbar.addWidget(self._toolbar_leading_spacer)
+        )
+        # Lasting time-axis rebuild chip. Lives in the header/toolbar row
+        # rather than the canvas corner: quality-dot and time diagnostics
+        # already occupy the plot overlay.
+        self._time_axis_chip = QLabel("", self.toolbar)
+        self._time_axis_chip.setObjectName("timeAxisProvenanceChip")
+        self._time_axis_chip.setAttribute(Qt.WA_StyledBackground, True)
+        self._time_axis_chip.setAlignment(Qt.AlignCenter)
+        self._time_axis_chip.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        self._time_axis_chip.hide()
+        self._insert_toolbar_widget_after(
+            self._toolbar_leading_spacer_action, self._time_axis_chip
+        )
+        chip_action = self._toolbar_action_for_widget(self._time_axis_chip)
+        if chip_action is not None:
+            chip_action.setVisible(False)
+        # TimeChartCard detaches this host onto a sibling row, so the card's
+        # own resizeEvent can see a stale toolbar width. Sync off the host.
+        self.toolbar.installEventFilter(self)
+        self._toolbar_host = ToolbarScrollHost(self.toolbar, self)
+        self._toolbar_host.installEventFilter(self)
+
+    def _build_toolbar_actions(self, annotations):
+        # Find Save BEFORE i18n changes labels (text is still 'Save' here);
+        # the reference stays valid after relabel because we keep the QAction.
+        save_act = _find_action(self.toolbar, 'save')
+
+        # Apply Chinese tooltips & drop Back/Forward; this also calls
+        # setData(key) on each retained action so subsequent _find_action
+        # lookups by english key remain stable across locales.
+        from .._toolbar_i18n import apply_chinese_toolbar_labels
+        apply_chinese_toolbar_labels(self.toolbar)
+        _install_nav_shortcuts(self, self.toolbar)
+        _apply_mdi_icons(self.toolbar, active_key='pan')
+
+        # Insert app-level chart actions right before the Save action (or append
+        # if save action isn't found). This keeps them beside the nav icons.
+        self._options_btn = QToolButton(self.toolbar)
+        self._options_btn.setObjectName("chartOptionsButton")
+        self._options_btn.setIcon(qta.icon('mdi.tune-vertical', color=_ICON_COLOR))
+        self._options_btn.setIconSize(QSize(18, 18))
+        self._options_btn.setFixedSize(QSize(32, 32))
+        self._options_btn.setToolTip("图表选项")
+        self._options_btn.setAutoRaise(True)
+        self._options_btn.clicked.connect(self.open_chart_options)
+        self._options_btn.setAttribute(Qt.WA_AlwaysShowToolTips, True)
+        self._copy_btn = QToolButton(self.toolbar)
+        self._copy_btn.setIcon(qta.icon('mdi.content-copy', color=_ICON_COLOR))
+        self._copy_btn.setIconSize(QSize(18, 18))
+        self._copy_btn.setFixedSize(QSize(32, 32))
+        self._copy_btn.setToolTip("复制为图片（含游标线和读数）")
+        self._copy_btn.setAutoRaise(True)
+        self._copy_btn.clicked.connect(self.copy_image_requested)
+        self.copy_image_requested.connect(
+            lambda: self.mark_discovered("chart.copy_image")
+        )
+        self._tick_density_popover = _TickDensityPopover(self)
+        self._tick_density_popover.density_changed.connect(
+            self._on_tick_density_changed
+        )
+        self._tick_density_btn = QToolButton(self.toolbar)
+        self._tick_density_btn.setObjectName("chartTickDensityButton")
+        self._tick_density_btn.setIcon(
+            qta.icon('ri.ruler-2-line', color=_ICON_COLOR)
+        )
+        self._tick_density_btn.setIconSize(QSize(18, 18))
+        self._tick_density_btn.setFixedSize(QSize(32, 32))
+        default_x, default_y = self._tick_density_popover.density()
+        self._tick_density_btn.setToolTip(
+            f"刻度密度 X{int(default_x)} / Y{int(default_y)}"
+        )
+        self._tick_density_btn.setFocusPolicy(Qt.NoFocus)
+        self._tick_density_btn.setAutoRaise(True)
+        self._tick_density_btn.clicked.connect(self._show_tick_density_popover)
+        self._tick_density_sep = _vline()
+        if save_act is not None:
+            self.toolbar.insertWidget(save_act, self._copy_btn)
+            self.toolbar.insertWidget(save_act, self._tick_density_sep)
+            self.toolbar.insertWidget(save_act, self._tick_density_btn)
+            self.toolbar.insertWidget(save_act, self._options_btn)
+        else:
+            self.toolbar.addWidget(self._copy_btn)
+            self.toolbar.addWidget(self._tick_density_sep)
+            self.toolbar.addWidget(self._tick_density_btn)
+            self.toolbar.addWidget(self._options_btn)
+        self.sync_chart_options_button()
+
+        self._loc_action = None
+
+        if annotations:
+            zoom_act = _find_action(self.toolbar, 'zoom')
+            self._install_compact_annotation_control_after(zoom_act)
+            annotation_act = self._toolbar_action_for_widget(
+                self._annotation_btn
+            )
+            self._install_compact_clear_annotation_control_after(annotation_act)
+
+    def _wire_toolbar_routing(self):
+        # Only pan/zoom toggling changes the hint; one-shot buttons don't.
+        # Subclasses (TimeChartCard) listen to this same signal to flip the
+        # axis-lock chip group enabled state.
+        # Match by act.data() (set by apply_chinese_toolbar_labels) first so
+        # the hookup survives matplotlib locale/text changes; fall back to
+        # english text for any action that wasn't relabeled.
+        for act in self.toolbar.actions():
+            name = act.data() if act.data() else (act.text() or '').strip().lower()
+            if name in ('pan', 'zoom'):
+                act.triggered.connect(self._on_nav_mode_toggled)
+
+    def _build_hint_bar(self):
+        # Bottom hint bar. Sits BELOW the canvas so it does not jostle the
+        # toolbar layout. The old static persistent label is RETIRED: the base
+        # gestures are now the highest-weight, longest-dwell entries of the
+        # rotating pool (hints.rotation_hints), so the left slot is a single
+        # rotating row whose text matches the active section. The right slot is
+        # the discovery ("this exists") hint.
+        #
+        # 提示位置 (left / right edges): the rotating row hugs the LEFT edge and
+        # the discovery hint hugs the RIGHT edge, with the empty gap between them
+        # in the middle (no centered group, no separator). Hint text is
+        # length-capped at the registry (hints.HINT_MAX_WIDTH) so the two slots
+        # fit side by side on a normal-width bar. When the bar is too narrow for
+        # both, the left rotating row (Preferred + ElideRight, min 0) yields width
+        # first and elides, so the right discovery row is never pushed off the bar.
+        self._hint_bar = QFrame(self)
+        self._hint_bar.setObjectName("chartHintBar")
+        self._hint_bar.setAttribute(Qt.WA_StyledBackground, True)
+        self._hint_bar.setFixedHeight(CHART_HINT_BAR_HEIGHT)
+        bar_lay = QHBoxLayout(self._hint_bar)
+        bar_lay.setContentsMargins(4, 1, 4, 1)
+        bar_lay.setSpacing(0)
+        self._hint_context = _ElidedLabel("", self._hint_bar)
+        self._hint_context.setObjectName("chartHintContext")
+        self._hint_context.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        # _ElidedLabel defaults to Ignored (collapses to 0); Preferred + stretch
+        # lets the left slot own the whole left span (left-aligned text, empty
+        # gap to its right) yet still shrink to min-0 and elide under a narrow bar.
+        self._hint_context.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        self._flash_hint_timer = QTimer(self)
+        self._flash_hint_timer.setSingleShot(True)
+        self._flash_hint_timer.setInterval(2500)
+        self._flash_hint_timer.timeout.connect(self._restore_rotating_hint)
+        if hasattr(self.canvas, 'overlay_y_needs_selection'):
+            self.canvas.overlay_y_needs_selection.connect(
+                self._on_overlay_y_needs_selection
+            )
+        self._hint_discovery = QLabel("", self._hint_bar)
+        self._hint_discovery.setObjectName("chartHintDiscovery")
+        self._hint_discovery.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        # Minimum (not Maximum): the discovery slot must never shrink below its
+        # full text. Pinned to the right edge, it stays firm while the left
+        # rotating row (stretch=1, min-0) absorbs all the shrink and elides — so
+        # a long left hint can never squeeze the discovery row off the bar.
+        self._hint_discovery.setSizePolicy(
+            QSizePolicy.Minimum, QSizePolicy.Preferred
+        )
+        self._hint_quickref_btn = QToolButton(self._hint_bar)
+        self._hint_quickref_btn.setObjectName("chartHintQuickrefButton")
+        # Glyph only — never "操作速查" beside the mark. The status-bar chrome
+        # is too tight for a caption; a clipped remnant reads as a bug.
+        self._hint_quickref_btn.setText("?")
+        self._hint_quickref_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self._hint_quickref_btn.setAutoRaise(True)
+        self._hint_quickref_btn.setCursor(Qt.PointingHandCursor)
+        self._hint_quickref_btn.setToolTip("操作速查")
+        self._hint_quickref_btn.clicked.connect(self.quickref_requested.emit)
+        # Two edge-anchored slots, no centered group / separator: the rotating
+        # gesture row hugs the LEFT edge (stretch=1, so it owns the whole left
+        # span and elides there if too long), the discovery row hugs the RIGHT
+        # edge. A long left row can never squeeze the discovery row off the bar.
+        bar_lay.addWidget(self._hint_quickref_btn, 0, Qt.AlignVCenter)
+        bar_lay.addWidget(self._hint_context, 1)
+        bar_lay.addWidget(self._hint_discovery, 0)
+
+    def _activate_default_tool(self):
+        # Default: activate the pan tool.
+        mode = str(getattr(self.toolbar, 'mode', '')).lower()
+        if 'pan' not in mode:
+            self.toolbar.pan()
+        # _refresh_hint -> _set_context_hint arms the single-shot rotation timer
+        # with the first hint's dwell, so no explicit fixed-interval start here.
+        self._refresh_hint()
+
+    def _assemble_layout(self, lay, canvas):
+        host = getattr(self, "_toolbar_host", None)
+        lay.addWidget(host if host is not None else self.toolbar)
+        lay.addWidget(canvas, stretch=1)
+        lay.addWidget(self._hint_bar)
+
+    def _build_overlays(self, chart_mode):
+        # Split-focus marker: a thin accent strip overlaid on the TOP of the
+        # card, raised above the canvas. A QSS border on the card is unreliable
+        # here — the full-bleed pyqtgraph canvas paints over it (observed: top
+        # stays white) — so we use a real overlay widget instead. It is card
+        # chrome, so image export (which grabs canvas pixels) never includes it.
+        self._focus_bar = QWidget(self)
+        self._focus_bar.setObjectName("chartFocusBar")
+        self._focus_bar.setFixedHeight(3)
+        self._focus_bar.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._focus_bar.hide()
+
+        self._quality_indicator = None
+        self._quality_indicator_position_pending = False
+        quality_signal = getattr(self.canvas, "quality_status_changed", None)
+        quality_status = getattr(self.canvas, "quality_status", None)
+        if quality_signal is not None and callable(quality_status):
+            self._quality_indicator = _QualityStatusIndicator(self)
+            quality_signal.connect(self._set_quality_status)
+            self._set_quality_status(quality_status())
+
+        self._time_diagnostics = (
+            _TimePlotDiagnosticsPill(self) if chart_mode == 'time' else None
+        )
+        self._time_diagnostics_position_pending = False
+
+    def _position_focus_bar(self):
+        bar = getattr(self, "_focus_bar", None)
+        if bar is not None:
+            bar.setGeometry(0, 0, self.width(), bar.height())
+
+    def _position_quality_indicator(self):
+        indicator = getattr(self, "_quality_indicator", None)
+        canvas = getattr(self, "canvas", None)
+        if indicator is None or canvas is None:
+            return
+        canvas_rect = canvas.geometry()
+        margin = 6
+        x = canvas_rect.right() - indicator.width() - margin + 1
+        y = canvas_rect.bottom() - indicator.height() - margin + 1
+        indicator.move(max(0, x), max(0, y))
+        indicator.raise_()
+
+    def _position_time_diagnostics(self):
+        pill = getattr(self, "_time_diagnostics", None)
+        canvas = getattr(self, "canvas", None)
+        if pill is None or canvas is None or pill.isHidden():
+            return
+        canvas_rect = canvas.geometry()
+        margin = 6
+        max_width = max(160, canvas_rect.width() - (margin * 2))
+        pill.setMaximumWidth(min(520, max_width))
+        pill.adjustSize()
+        x = canvas_rect.left() + margin
+        y = canvas_rect.bottom() - pill.height() - margin + 1
+        pill.move(max(0, x), max(0, y))
+        pill.raise_()
+
+    def _schedule_time_diagnostics_position(self):
+        pill = getattr(self, "_time_diagnostics", None)
+        if pill is None or pill.isHidden():
+            return
+        if getattr(self, "_time_diagnostics_position_pending", False):
+            return
+        self._time_diagnostics_position_pending = True
+        QTimer.singleShot(0, self._flush_time_diagnostics_position)
+
+    def _flush_time_diagnostics_position(self):
+        self._time_diagnostics_position_pending = False
+        try:
+            self._position_time_diagnostics()
+        except RuntimeError:
+            # A queued reposition can outlive the card during application exit.
+            pass
+
+    def set_time_axis_provenance(self, text, tooltip=None):
+        """Show or hide the header resample chip. Presentation only."""
+        chip = getattr(self, "_time_axis_chip", None)
+        if chip is None:
+            return
+        action = self._toolbar_action_for_widget(chip)
+        if not text:
+            chip.clear()
+            chip.setToolTip("")
+            chip.hide()
+            if action is not None:
+                action.setVisible(False)
+            return
+        chip.setText(str(text))
+        chip.setToolTip("" if tooltip is None else str(tooltip))
+        chip.show()
+        if action is not None:
+            action.setVisible(True)
+
+    def set_time_plot_diagnostics(self, *, attempted, successful, details):
+        """Show a partial-render summary, or clear it after full success."""
+        pill = getattr(self, "_time_diagnostics", None)
+        if pill is None:
+            return
+        pill.set_diagnostics(
+            attempted=attempted,
+            successful=successful,
+            details=details,
+        )
+        self._position_time_diagnostics()
+        self._schedule_time_diagnostics_position()
+
+    def _schedule_quality_indicator_position(self):
+        indicator = getattr(self, "_quality_indicator", None)
+        if indicator is None:
+            return
+        if getattr(self, "_quality_indicator_position_pending", False):
+            return
+        self._quality_indicator_position_pending = True
+        QTimer.singleShot(0, self._flush_quality_indicator_position)
+
+    def _flush_quality_indicator_position(self):
+        self._quality_indicator_position_pending = False
+        try:
+            self._position_quality_indicator()
+        except RuntimeError:
+            # The queued singleShot can fire after Qt has already torn down the
+            # canvas/card C++ object; there is nothing left to position.
+            pass
+
+    def _set_quality_status(self, status):
+        indicator = getattr(self, "_quality_indicator", None)
+        if indicator is None:
+            return
+        indicator.set_quality_status(status)
+        self._position_quality_indicator()
+
+    def set_focus_marker(self, color):
+        """Show a top accent strip in ``color`` (the focused split pane), or
+        hide it when ``color`` is falsy. The strip overlays the canvas top."""
+        self.sync_chart_options_button()
+        bar = getattr(self, "_focus_bar", None)
+        if bar is None:
+            return
+        if color:
+            bar.setStyleSheet(
+                f"background-color:{color};"
+                "border-top-left-radius:11px;border-top-right-radius:11px;"
+            )
+            self._position_focus_bar()
+            bar.raise_()
+            bar.show()
+        else:
+            bar.hide()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._sync_responsive_toolbar()
+        self._position_focus_bar()
+        self._position_quality_indicator()
+        self._schedule_quality_indicator_position()
+        self._position_time_diagnostics()
+        self._schedule_time_diagnostics_position()
+        bar = getattr(self, "_focus_bar", None)
+        if bar is not None and bar.isVisible():
+            bar.raise_()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._sync_responsive_toolbar()
+        self._position_quality_indicator()
+        self._schedule_quality_indicator_position()
+        self._position_time_diagnostics()
+        self._schedule_time_diagnostics_position()
+        bar = getattr(self, "_focus_bar", None)
+        if bar is not None and bar.isVisible():
+            self._position_focus_bar()
+            bar.raise_()
+
+    def eventFilter(self, obj, event):
+        etype = event.type()
+        host = getattr(self, "_toolbar_host", None)
+        if obj in (self.toolbar, host) and etype == QEvent.Resize:
+            self._sync_responsive_toolbar()
+        if etype == QEvent.MouseButtonPress:
+            self.set_hint_rotation_paused(True)
+        elif etype in (QEvent.MouseButtonRelease, QEvent.Leave):
+            self.set_hint_rotation_paused(False)
+        canvas = getattr(self, "canvas", None)
+        if obj is canvas and etype in (
+            QEvent.Resize, QEvent.Show, QEvent.LayoutRequest
+        ):
+            self._position_quality_indicator()
+            self._schedule_quality_indicator_position()
+            self._position_time_diagnostics()
+            self._schedule_time_diagnostics_position()
+        elif obj is getattr(self, "_canvas_viewport", None) and etype in (
+            QEvent.Resize, QEvent.Show
+        ):
+            self._schedule_quality_indicator_position()
+            self._schedule_time_diagnostics_position()
+        return super().eventFilter(obj, event)
+
+    def detach_toolbar(self, parent):
+        """Remove the toolbar host from this card layout and reparent it.
+
+        Callers add the returned widget to their layout. The inner
+        ``self.toolbar`` (``PgNavigationToolbar``) stays inside the host so
+        split/analysis pages keep pan-scroll instead of a naked inner bar.
+        """
+        host = getattr(self, "_toolbar_host", None) or self.toolbar
+        layout = self.layout()
+        if layout is not None:
+            layout.removeWidget(host)
+        host.setParent(parent)
+        return host
+
+    def _remove_toolbar_loc_label(self):
+        loc_label = getattr(self.toolbar, "locLabel", None)
+        if loc_label is None:
+            return
+        loc_label.setObjectName("chartLocLabel")
+        for act in list(self.toolbar.actions()):
+            if self.toolbar.widgetForAction(act) is loc_label:
+                self.toolbar.removeAction(act)
+                break
+        loc_label.hide()
+
+    def detach_bottom_hint_bar(self, parent):
+        """Remove the bottom hint bar from this card layout and reparent it."""
+        self.layout().removeWidget(self._hint_bar)
+        self._hint_bar.setParent(parent)
+        return self._hint_bar
+
+    def _toolbar_layout_width(self):
+        host = getattr(self, "_toolbar_host", None)
+        if host is not None and host.width() > 0:
+            return host.width()
+        return self.toolbar.width()
+
+    def _sync_responsive_toolbar(self):
+        if not self.toolbar.isVisible():
+            return
+        width = self._toolbar_layout_width()
+        if width <= 0:
+            return
+        compact = width < _TOOLBAR_COMPACT_WIDTH
+        if compact == self._toolbar_compact:
+            return
+        self._toolbar_compact = compact
+        self.toolbar.updateGeometry()
+        host = getattr(self, "_toolbar_host", None)
+        if host is not None:
+            host.fit_inner_toolbar()
+
+    def _insert_toolbar_widget(self, loc_action, widget):
+        if loc_action is not None:
+            self.toolbar.insertWidget(loc_action, widget)
+        else:
+            self.toolbar.addWidget(widget)
+
+    def _insert_right_toolbar_widget(self, loc_action, widget):
+        # Insert at the card's right-control zone. Passing ``None`` appends
+        # to the toolbar after the navigation/copy/save actions.
+        self._insert_toolbar_widget(loc_action, widget)
+
+    def _insert_toolbar_widget_after(self, after_action, widget):
+        actions = self.toolbar.actions()
+        if after_action in actions:
+            index = actions.index(after_action)
+            if index + 1 < len(actions):
+                self.toolbar.insertWidget(actions[index + 1], widget)
+                return
+        self.toolbar.addWidget(widget)
+
+    def _toolbar_action_for_widget(self, widget):
+        for action in self.toolbar.actions():
+            if self.toolbar.widgetForAction(action) is widget:
+                return action
+        return None
+
+    def _install_compact_annotation_control_after(self, after_action):
+        self._annotation_btn = QToolButton(self.toolbar)
+        self._annotation_btn.setObjectName("chartAnnotationButton")
+        self._annotation_btn.setIcon(Icons.annotate(QColor(_ICON_COLOR)))
+        self._annotation_btn.setIconSize(QSize(18, 18))
+        self._annotation_btn.setFixedSize(QSize(32, 32))
+        self._annotation_btn.setCheckable(True)
+        self._annotation_btn.setAutoRaise(True)
+        self._annotation_btn.setToolTip(
+            "标注：作用于当前焦点图表；开启后左键添加，右键删除最近一处"
+        )
+        self._annotation_btn.setProperty("compactAnnotation", True)
+        self._annotation_btn.clicked.connect(self._on_annotation_button_clicked)
+        self._insert_toolbar_widget_after(after_action, self._annotation_btn)
+
+    def _install_compact_clear_annotation_control_after(self, after_action):
+        self._clear_annotation_btn = QToolButton(self.toolbar)
+        self._clear_annotation_btn.setObjectName("chartAnnotationClearButton")
+        self._clear_annotation_btn.setIcon(
+            qta.icon('mdi.eraser', color=_ICON_COLOR)
+        )
+        self._clear_annotation_btn.setIconSize(QSize(18, 18))
+        self._clear_annotation_btn.setFixedSize(QSize(32, 32))
+        self._clear_annotation_btn.setAutoRaise(True)
+        self._clear_annotation_btn.setToolTip("清除当前焦点图表中的所有标注")
+        self._clear_annotation_btn.clicked.connect(self.clear_annotations)
+        self._insert_toolbar_widget_after(after_action, self._clear_annotation_btn)
+
+    def annotation_enabled(self):
+        return self._annotation_enabled
+
+    def _annotation_target_card(self):
+        """Card whose annotation state the shared button should operate on.
+
+        A missing provider means this card. The provider is not allowed to
+        call back into the shared click handler.
+        """
+        provider = getattr(self, "_annotation_target_provider", None)
+        if not callable(provider):
+            return self
+        card = provider()
+        if card is None or sip.isdeleted(card):
+            return self
+        return card
+
+    def _read_annotation_view_token(self):
+        provider = getattr(self, "_annotation_view_token_provider", None)
+        if not callable(provider):
+            return None
+        return provider()
+
+    def _on_annotation_button_clicked(self, checked=False):
+        target = self._annotation_target_card()
+        target.set_annotation_enabled(bool(checked), notify=True)
+        if target is not self:
+            self.sync_annotation_button()
+
+    def _paint_annotation_button(self, enabled):
+        btn = getattr(self, "_annotation_btn", None)
+        if btn is None:
+            return
+        enabled = bool(enabled)
+        btn.blockSignals(True)
+        btn.setChecked(enabled)
+        icon_color = _ICON_ACTIVE if enabled else _ICON_COLOR
+        if btn.property("compactAnnotation"):
+            btn.setIcon(Icons.annotate(QColor(icon_color)))
+        else:
+            btn.setText("关闭" if enabled else "开启")
+            btn.setIcon(qta.icon("mdi.map-marker-plus-outline", color=icon_color))
+        btn.blockSignals(False)
+
+    def sync_annotation_button(self):
+        """Mirror the focus target's annotation state onto this button.
+
+        Appearance only: this does not change this card's canvas and does
+        not emit ``annotation_enabled_changed``.
+        """
+        target = self._annotation_target_card()
+        enabled = bool(target.annotation_enabled()) if target is not None else False
+        self._paint_annotation_button(enabled)
+
+    def set_annotation_enabled(self, enabled, notify=True):
+        self._annotation_enabled = bool(enabled)
+        if hasattr(self.canvas, 'set_remark_enabled'):
+            self.canvas.set_remark_enabled(self._annotation_enabled)
+        self._paint_annotation_button(self._annotation_enabled)
+        if notify:
+            self.annotation_enabled_changed.emit(self._annotation_enabled)
+        self._refresh_bottom_hint()
+
+    def clear_annotations(self):
+        target = self._annotation_target_card()
+        canvas = getattr(target, "canvas", None)
+        if canvas is None or sip.isdeleted(target) or sip.isdeleted(canvas):
+            return
+        if not hasattr(canvas, "clear_remarks"):
+            return
+        # Pin the target and the view token before the confirm dialog. A
+        # later focus change does not retarget this confirmation; a destroyed
+        # target or a switched View cancels instead of clearing the new one.
+        view_token = self._read_annotation_view_token()
+        count = target._current_remark_count(canvas)
+        if count > 0 and not self._confirm_clear_annotations(count):
+            return
+        if sip.isdeleted(target) or sip.isdeleted(canvas):
+            return
+        if self._read_annotation_view_token() != view_token:
+            return
+        canvas.clear_remarks()
+
+    def _current_remark_count(self, canvas):
+        counter = getattr(canvas, 'remark_count', None)
+        if not callable(counter):
+            return 0
+        try:
+            return int(counter())
+        except Exception:
+            return 0
+
+    def _confirm_clear_annotations(self, count):
+        box = QMessageBox(self)
+        box.setWindowTitle('清除标注')
+        box.setIcon(QMessageBox.Question)
+        box.setText(f'确定清除当前图表的 {count} 个标注？')
+        box.setInformativeText('清除后无法撤销。')
+        clear = box.addButton('清除标注', QMessageBox.DestructiveRole)
+        cancel = box.addButton('取消', QMessageBox.RejectRole)
+        box.setDefaultButton(cancel)
+        fit_message_box_buttons_to_text(box)
+        box.exec_()
+        return box.clickedButton() is clear
+
+    @property
+    def _options_canvas_provider(self):
+        return getattr(self, "_options_canvas_provider_fn", None)
+
+    @_options_canvas_provider.setter
+    def _options_canvas_provider(self, value):
+        self._options_canvas_provider_fn = value
+        self.sync_chart_options_button()
+
+    def _options_canvas(self):
+        provider = self._options_canvas_provider
+        if callable(provider):
+            canvas = provider()
+            if canvas is not None:
+                return canvas
+        return getattr(self, "canvas", None)
+
+    def _chart_options_state(self, canvas):
+        """Enablement comes from the canvas, never from a section name."""
+        if canvas is None:
+            return False, "当前图表不支持图表选项"
+        probe = getattr(canvas, "chart_options_availability", None)
+        if callable(probe):
+            enabled, reason = probe()
+            if bool(enabled):
+                return True, "图表选项"
+            text = str(reason or "").strip()
+            return False, text or "当前图表不支持图表选项"
+        if getattr(canvas, "open_chart_options_dialog", None) is not None:
+            return True, "图表选项"
+        return False, "当前图表不支持图表选项"
+
+    def sync_chart_options_button(self) -> None:
+        button = getattr(self, "_options_btn", None)
+        if button is None:
+            return
+        enabled, tip = self._chart_options_state(self._options_canvas())
+        button.setEnabled(bool(enabled))
+        button.setToolTip(tip)
+
+    def open_chart_options(self):
+        # In split mode the primary card's options button is the shared
+        # toolbar's; ChartStack points _options_canvas_provider at the focused
+        # canvas so 图表选项 opens for whichever pane is focused. Default: own
+        # canvas (every analysis card and the non-split time card).
+        canvas = self._options_canvas()
+        enabled, _reason = self._chart_options_state(canvas)
+        if not enabled:
+            return False
+        opener = getattr(canvas, "open_chart_options_dialog", None)
+        if opener is not None:
+            return opener()
+        return False
+
+    def _show_tick_density_popover(self):
+        pop = self._tick_density_popover
+        if pop.isVisible():
+            pop.hide()
+            return
+        if pop.layout() is not None:
+            pop.layout().activate()
+        fit_popover(pop, self._tick_density_btn, gap=4)
+        pop.show()
+        pop.raise_()
+        self._tick_density_btn.clearFocus()
+
+    def _on_tick_density_changed(self, x, y):
+        self.set_tick_density_controls(x, y)
+        self.tick_density_changed.emit(int(x), int(y))
+
+    def set_tick_density_controls(self, x, y):
+        self._tick_density_popover.set_density(x, y, emit=False)
+        self._tick_density_btn.setToolTip(f"刻度密度 X{int(x)} / Y{int(y)}")
+
+    def _on_mouse_mode_changed(self, *_):
+        """Design D: a mouse-mode change driven by the right-click 鼠标操作
+        submenu (or any non-button path) routes through the SAME refresh as a
+        toolbar-button toggle, so the icon active-state, hint text, and (in
+        TimeChartCard) the axis-lock chips all reflect the new state. The
+        toolbar buttons already fire ``_on_nav_mode_toggled`` via their action
+        ``triggered``; this keeps the menu path symmetric without a parallel
+        UI-sync codepath."""
+        self._on_nav_mode_toggled()
+
+    def _on_nav_mode_toggled(self, *_):
+        """Hook subclasses can extend; base only refreshes the hint text."""
+        self._refresh_hint()
+
+    # ---- hint handling ----
+    def _current_mode_key(self):
+        mode = str(getattr(self.toolbar, 'mode', '')).lower()
+        if 'pan' in mode:
+            return 'pan'
+        if 'zoom' in mode:
+            return 'zoom'
+        return ''
+
+    # HintState fields the canvas may supply as situational nudge signals.
+    _NUDGE_SIGNAL_KEYS = frozenset({
+        "channel_count", "same_unit", "has_axis_group",
+        "amp_disparate", "colorbar_dead", "clipped",
+        "db_reference_mode", "db_reference_value",
+        "db_reference_source_resolvable",
+    })
+
+    def _nudge_signals(self):
+        """Pull situational signals from the canvas (getattr-guarded), filtered
+        to the known HintState fields so an unexpected key can't break it.
+
+        Two independent producers feed this: an optional ``canvas.nudge_signals()``
+        callable (the pre-existing time/heatmap situational signals), and an
+        optional plain ``canvas.db_reference_nudge_facts`` dict attribute
+        (dB-reference-defaults nudge, spec 2026-07-12 S5 / A17) stamped by
+        ``AnalysisMixin._stamp_db_reference_nudge_facts`` at render time --
+        additive metadata, not a render/behavior signal."""
+        getter = getattr(getattr(self, "canvas", None), "nudge_signals", None)
+        raw = {}
+        if callable(getter):
+            try:
+                raw = dict(getter() or {})
+            except Exception:
+                raw = {}
+        facts = getattr(getattr(self, "canvas", None), "db_reference_nudge_facts", None)
+        if isinstance(facts, dict):
+            if "mode" in facts:
+                raw["db_reference_mode"] = facts["mode"]
+            if "value" in facts:
+                raw["db_reference_value"] = facts["value"]
+            if "source_resolvable" in facts:
+                raw["db_reference_source_resolvable"] = facts["source_resolvable"]
+        return {k: v for k, v in raw.items() if k in self._NUDGE_SIGNAL_KEYS}
+
+    def _hint_state(self):
+        return hints.HintState(
+            mode=self._chart_mode,
+            mouse_mode=self._current_mode_key(),
+            chart_kind=self._chart_mode,
+            annotation_on=self.annotation_enabled(),
+            discovered=hints.load_discovered(self._hint_settings),
+            recently_used=frozenset(self._recent_context_hint_ids),
+            **self._nudge_signals(),
+        )
+
+    def _rotation_candidates(self):
+        """The rotating-row pool for the current state: section base-gesture
+        anchors merged with context tips, weight-ordered, with use/discovery
+        decay (hints.rotation_hints)."""
+        return hints.rotation_hints(self._hint_state())
+
+    def refresh_nudge_state(self):
+        """Public hook: force an immediate footer refresh from the card's
+        current ``HintState``.
+
+        Existing situational nudges refresh live because their canvas fires
+        a signal the card already listens to (``chart_rebuilt`` /
+        ``levels_rebased``). The dB-reference-defaults nudge (spec S5 / A17)
+        is instead stamped as a plain attribute by ``AnalysisMixin.
+        _stamp_db_reference_nudge_facts`` from outside any canvas signal (a
+        signal-changed / mode-committed / value-committed handler), so it
+        calls this after every stamp to keep the visible footer from lagging
+        behind the just-updated facts -- same effect as
+        ``_refresh_bottom_hint``, just under a public name for cross-module
+        callers."""
+        self._refresh_bottom_hint()
+
+    def _refresh_bottom_hint(self, *_):
+        state = self._hint_state()
+        # A situational nudge (data-condition-gated) takes the discovery slot
+        # while its condition holds; otherwise fall back to the discovery queue.
+        nudge = hints.nudge_hint(state)
+        if nudge is not None:
+            self._hint_discovery.setText(nudge.text)
+        else:
+            discovery = hints.discovery_hint(state)
+            self._hint_discovery.setText(discovery.text if discovery else '')
+        self._set_context_hint(reset=True)
+
+    def _rotation_start_offset(self):
+        """The session's round-robin start offset (resolved + advanced once)."""
+        if self._rotation_start is None:
+            self._rotation_start = hints.next_rotation_start(self._hint_settings)
+        return self._rotation_start
+
+    def _set_context_hint(self, reset=False):
+        candidates = self._rotation_candidates()
+        signature = tuple(hint.id for hint in candidates)
+        if reset or signature != self._context_hint_signature:
+            # Enter the lap at the persisted offset instead of always index 0,
+            # so the footer does not lead with the same anchor every open.
+            self._context_hint_index = (
+                self._rotation_start_offset() % len(candidates)
+                if candidates else 0
+            )
+            self._context_hint_signature = signature
+        if not candidates:
+            self._hint_context.setText('')
+            self._hint_rotation_timer.stop()
+            return
+        index = self._context_hint_index % len(candidates)
+        current = candidates[index]
+        self._hint_context.setText(current.text)
+        self._arm_rotation_timer(current)
+
+    def _arm_rotation_timer(self, hint):
+        """(Re)start the single-shot rotation timer with this hint's dwell, so
+        the next advance happens after a variable, priority-derived delay."""
+        if self._hint_rotation_paused:
+            return
+        self._hint_rotation_timer.start(hints.rotation_dwell_ms(hint))
+
+    def flash_hint(self, text):
+        """Show a transient context hint, then restore the rotating hint."""
+        self._hint_context.setText(str(text))
+        # Hold the flash for its full window: pause the rotation timer so a
+        # variable-dwell advance cannot overwrite the flash mid-display. The
+        # flash timer's timeout (_set_context_hint(reset=True)) re-arms rotation.
+        self._hint_rotation_timer.stop()
+        self._flash_hint_timer.start()
+
+    def set_transient_zoom_hint(self, on):
+        """Show or clear the analysis-canvas transient-zoom footer hint."""
+        self._flash_hint_timer.stop()
+        if bool(on):
+            self.set_hint_rotation_paused(True)
+            self._hint_context.setText("临时缩放 · 重算 / 查看全部将回到设定范围")
+            return
+        self.set_hint_rotation_paused(False)
+        self._set_context_hint(reset=True)
+
+    def _advance_context_hint(self):
+        if self._hint_rotation_paused:
+            return
+        candidates = self._rotation_candidates()
+        if not candidates:
+            self._set_context_hint()
+            return
+        if len(candidates) <= 1:
+            # Single hint: keep it shown and re-arm so a state change is still
+            # picked up on the next tick.
+            self._context_hint_signature = tuple(h.id for h in candidates)
+            self._context_hint_index = 0
+            self._hint_context.setText(candidates[0].text)
+            self._arm_rotation_timer(candidates[0])
+            return
+        self._context_hint_index = (self._context_hint_index + 1) % len(candidates)
+        self._context_hint_signature = tuple(hint.id for hint in candidates)
+        self._set_context_hint()
+
+    def set_hint_rotation_paused(self, paused):
+        paused = bool(paused)
+        was_paused = self._hint_rotation_paused
+        self._hint_rotation_paused = paused
+        if paused:
+            # Freeze the footer while the user reads / drags so it does not jump.
+            self._hint_rotation_timer.stop()
+        elif was_paused:
+            # Resume: re-arm against the currently shown hint's dwell.
+            candidates = self._rotation_candidates()
+            if candidates:
+                index = self._context_hint_index % len(candidates)
+                self._arm_rotation_timer(candidates[index])
+
+    def mark_context_hint_used(self, hint_id):
+        self._recent_context_hint_ids.add(hint_id)
+        self._refresh_bottom_hint()
+
+    def set_hint_settings(self, settings):
+        self._hint_settings = settings
+        # New store → re-resolve the rotation start from it on next use.
+        self._rotation_start = None
+        self._refresh_bottom_hint()
+
+    def mark_discovered(self, hint_id):
+        hints.mark_discovered(self._hint_settings, hint_id)
+        self._refresh_bottom_hint()
+
+    def _wire_discovery_signal(self, canvas, signal_name, echo_id):
+        """Connect a canvas hidden-gesture signal to discovery + flash, if the
+        canvas exposes it. Bound QObject methods are used instead of lambdas so
+        Qt disconnects them when the card is destroyed."""
+        signal = getattr(canvas, signal_name, None)
+        if signal is None:
+            return
+        slot = {
+            'slice_picked': self._on_slice_picked_discovered,
+            'divider_adjusted': self._on_divider_adjusted_discovered,
+            'levels_changed': self._on_levels_changed_discovered,
+            'time_source_selected': self._on_time_source_selected_discovered,
+        }.get(signal_name)
+        if slot is not None:
+            signal.connect(slot)
+
+    def _on_slice_picked_discovered(self):
+        self._discover_gesture('spectrogram.slice_pick')
+
+    def _on_divider_adjusted_discovered(self):
+        self._discover_gesture('spectrogram.divider')
+
+    def _on_levels_changed_discovered(self, *_):
+        self._discover_gesture('spectrogram.colorbar')
+
+    def _on_time_source_selected_discovered(self, *_):
+        self._discover_gesture('fft.preview_source')
+
+    def _on_slice_hint_requested(self, text):
+        self.flash_hint(text)
+
+    def _restore_rotating_hint(self):
+        self._set_context_hint(reset=True)
+
+    def _on_overlay_y_needs_selection(self):
+        self.flash_hint("先选中一个通道，再用 Shift+滚轮缩放纵向")
+
+    def _discover_gesture(self, echo_id):
+        """Record a first-time gesture: persist its discovery id (so the
+        matching rotating tip retires across sessions) and flash a one-shot
+        confirmation in the footer."""
+        already = echo_id in hints.load_discovered(self._hint_settings)
+        self.mark_discovered(echo_id)
+        if not already:
+            tip = hints.flash_tip(echo_id)
+            if tip:
+                self.flash_hint(tip)
+
+    def _refresh_hint(self, *_):
+        key = self._current_mode_key()
+        _apply_mdi_icons(self.toolbar, active_key=key)
+        self._refresh_bottom_hint()
+
+
+def _is_living(obj) -> bool:
+    try:
+        return obj is not None and not sip.isdeleted(obj)
+    except RuntimeError:
+        return False
+
+
+_CHART_CHOICE_INDICATOR_STYLE = SelectionIndicatorStyle(
+    fill=CONTROL_COLORS["CONTROL_SURFACE_TOP"],
+    border=CONTROL_COLORS["CONTROL_SELECT_LINE"],
+    disabled_fill=CONTROL_COLORS["CONTROL_DISABLED_BG"],
+    disabled_border=CONTROL_COLORS["CONTROL_DISABLED_LINE"],
+    radius=6,
+    inset=(2, 0, 2, 0),
+    compact_inset=(1, 0, 1, 0),
+)
+
+# Suppress static checked fill while Light interpolates. Longhands only:
+# a ``border:`` shorthand here would zero radius.
+_CHART_CHOICE_MOTION_QSS = f"""
+QWidget#chartToolbar QPushButton[role="chart-choice"]:checked {{
+    background-color: transparent;
+    border-color: transparent;
+}}
+QWidget#chartToolbar QPushButton[role="chart-choice"]:checked:disabled,
+QWidget#chartToolbar QPushButton[role="chart-choice"]:checked:disabled:hover,
+QWidget#chartToolbar QPushButton[role="chart-choice"]:checked:disabled:pressed,
+QWidget#chartToolbar QPushButton[role="chart-choice"]:checked:disabled:focus {{
+    background-color: transparent;
+    border-color: transparent;
+    color: {CONTROL_COLORS["CONTROL_TEXT_MUTED"]};
+}}
+"""
+
+
+class _ChartChoiceMotionMixin:
+    """Local selected-background plates for chart-choice button groups."""
+
+    def _init_choice_motion(self, groups):
+        self._choice_motion_groups = {
+            name: tuple(buttons) for name, buttons in groups.items()
+        }
+        self._choice_indicators = {name: None for name in self._choice_motion_groups}
+        self._motion_policy = resolve_policy(None)
+
+    def motion_policy(self) -> MotionPolicy:
+        return getattr(self, "_motion_policy", resolve_policy(None))
+
+    def set_motion_policy(self, policy: MotionPolicy | None) -> None:
+        self._motion_policy = resolve_policy(policy)
+        self._apply_choice_motion_chrome()
+        if self._motion_policy.interpolates():
+            for name in self._choice_motion_groups:
+                helper = self._ensure_choice_indicator(name)
+                if helper is not None:
+                    helper.set_motion_policy(self._motion_policy)
+            self._snap_all_choice_indicators()
+            return
+        self._teardown_choice_indicators()
+
+    def _choice_current_button(self, name):
+        return None
+
+    def _apply_choice_motion_chrome(self) -> None:
+        toolbar = getattr(self, "toolbar", None)
+        if not _is_living(toolbar):
+            return
+        if self._motion_policy.interpolates():
+            toolbar.setStyleSheet(_CHART_CHOICE_MOTION_QSS)
+            return
+        toolbar.setStyleSheet("")
+
+    def _ensure_choice_indicator(self, name):
+        helper = self._choice_indicators.get(name)
+        if _is_living(helper):
+            return helper
+        buttons = self._choice_motion_groups.get(name)
+        toolbar = getattr(self, "toolbar", None)
+        if not buttons or not _is_living(toolbar):
+            return None
+        helper = SelectionIndicator(
+            toolbar,
+            buttons=buttons,
+            duration_name="selection_control",
+            style=_CHART_CHOICE_INDICATOR_STYLE,
+        )
+        self._choice_indicators[name] = helper
+        helper.set_motion_policy(self._motion_policy)
+        return helper
+
+    def _follow_choice_indicator(self, name, button, *, animate: bool) -> None:
+        policy = getattr(self, "_motion_policy", None)
+        if policy is None or not policy.interpolates():
+            self._teardown_choice_indicators()
+            return
+        helper = self._ensure_choice_indicator(name)
+        if helper is None:
+            return
+        helper.follow(button, animate=animate)
+        if not animate:
+            helper.snap_to_selection()
+
+    def _snap_all_choice_indicators(self) -> None:
+        for name in self._choice_motion_groups:
+            self._follow_choice_indicator(
+                name, self._choice_current_button(name), animate=False,
+            )
+
+    def _teardown_choice_indicators(self) -> None:
+        policy = getattr(self, "_motion_policy", resolve_policy(None))
+        for helper in self._choice_indicators.values():
+            if _is_living(helper):
+                helper.set_motion_policy(policy)
+
+
+class TimeChartCard(_ChartChoiceMotionMixin, _ChartCard):
+    """Time-domain chart card: inherits base nav toolbar, appends
+    segmented controls for plot mode (Subplot/Overlay) and cursor mode
+    (Off/Single/Dual)."""
+
+    plot_mode_changed = pyqtSignal(str)    # 'subplot' | 'overlay'
+    cursor_mode_changed = pyqtSignal(str)  # 'off' | 'single' | 'dual'
+    cursor_display_options_changed = pyqtSignal(object)
+    cursor_display_popover_geometry_changed = pyqtSignal(object)
+
+    def __init__(self, canvas, parent=None):
+        super().__init__(canvas, parent, chart_mode='time')
+        self._xaxis_drop_overlay = None
+        canvas.setAccessibleName("时域绘图区")
+        glw = getattr(canvas, "_glw", None)
+        viewport = None
+        if glw is not None:
+            try:
+                viewport = glw.viewport()
+            except Exception:
+                viewport = None
+        if viewport is not None:
+            viewport.setAccessibleName("时域绘图区")
+            viewport.setAcceptDrops(True)
+        canvas.setAcceptDrops(True)
+        if self.toolbar.layout() is not None:
+            self.toolbar.layout().setSpacing(4)
+        zoom_act = _find_action(self.toolbar, 'zoom')
+        self._install_compact_annotation_control_after(zoom_act)
+        annotation_act = self._toolbar_action_for_widget(self._annotation_btn)
+        self._install_compact_clear_annotation_control_after(annotation_act)
+        # Right-align time-only controls with the same spacer pattern used by
+        # annotation controls on analysis cards.
+        loc_action = getattr(self, '_loc_action', None)
+        self._time_separators = []
+        self._time_controls_spacer = QWidget(self.toolbar)
+        self._time_controls_spacer.setObjectName("chartTimeControlsSpacer")
+        self._time_controls_spacer.setAttribute(Qt.WA_StyledBackground, True)
+        self._time_controls_spacer.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Preferred
+        )
+        self._insert_right_toolbar_widget(loc_action, self._time_controls_spacer)
+
+        sep = _vline()
+        self._time_separators.append(sep)
+        self._insert_right_toolbar_widget(loc_action, sep)
+
+        self.btn_subplot = QPushButton("分屏", self.toolbar)
+        self.btn_overlay = QPushButton("叠加", self.toolbar)
+        for b in (self.btn_subplot, self.btn_overlay):
+            b.setCheckable(True)
+            b.setProperty("role", "chart-choice")
+            b.setFlat(True)
+            self._insert_right_toolbar_widget(loc_action, b)
+        self._plot_mode = 'subplot'
+        self.btn_subplot.setChecked(True)
+        self.btn_subplot.clicked.connect(
+            partial(self._on_plot_mode_clicked, 'subplot')
+        )
+        self.btn_overlay.clicked.connect(
+            partial(self._on_plot_mode_clicked, 'overlay')
+        )
+
+        sep = _vline()
+        self._time_separators.append(sep)
+        self._insert_right_toolbar_widget(loc_action, sep)
+
+        self._cursor_buttons = {}
+        for label, key in [('游标关', 'off'), ('单游标', 'single'), ('双游标', 'dual')]:
+            b = QPushButton(label, self.toolbar)
+            b.setCheckable(True)
+            b.setProperty("role", "chart-choice")
+            b.setFlat(True)
+            self._insert_right_toolbar_widget(loc_action, b)
+            self._cursor_buttons[key] = b
+            b.clicked.connect(partial(self._on_cursor_mode_clicked, key))
+        self._cursor_mode = 'off'
+        self._cursor_buttons['off'].setChecked(True)
+
+        self._cursor_display_options = CursorDisplayOptions()
+        self._cursor_display_popover = CursorDisplayPopover(self)
+        self._cursor_display_popover.options_changed.connect(
+            self._on_cursor_display_options_changed
+        )
+        self._cursor_display_popover.visibility_changed.connect(
+            self._on_cursor_display_popover_visibility_changed
+        )
+        self._cursor_display_settings_btn = QToolButton(self.toolbar)
+        self._cursor_display_settings_btn.setObjectName(
+            "cursorDisplaySettingsButton"
+        )
+        self._cursor_display_settings_btn.setAccessibleName("游标显示设置")
+        self._cursor_display_settings_btn.setToolTip("游标显示设置")
+        self._cursor_display_settings_btn.setAutoRaise(True)
+        self._cursor_display_settings_btn.setIcon(
+            qta.icon('mdi.format-list-checks', color=_ICON_COLOR)
+        )
+        self._cursor_display_settings_btn.setIconSize(QSize(15, 15))
+        self._cursor_display_settings_btn.setFixedSize(28, 28)
+        self._cursor_display_settings_btn.clicked.connect(
+            self._toggle_cursor_display_popover
+        )
+        bind_popup_trigger(
+            self._cursor_display_popover,
+            self._cursor_display_settings_btn,
+        )
+        self._insert_right_toolbar_widget(
+            loc_action, self._cursor_display_settings_btn
+        )
+
+        # Overlay-selection hook: when a single curve is selected in overlay
+        # mode, force the nav toolbar OUT of pan/zoom so a blank-area click can
+        # clear the selection without being eaten by a pan
+        # press. Deselect intentionally does NOT restore the previous mode —
+        # the user re-engages pan via Ctrl+G if they want it back.
+        if hasattr(self.canvas, 'overlay_channel_selected'):
+            self.canvas.overlay_channel_selected.connect(
+                self._on_overlay_channel_selected
+            )
+
+        self._time_button_labels = [
+            (self.btn_subplot, '分屏', '分'),
+            (self.btn_overlay, '叠加', '叠'),
+            (self._cursor_buttons['off'], '游标关', '关'),
+            (self._cursor_buttons['single'], '单游标', '单'),
+            (self._cursor_buttons['dual'], '双游标', '双'),
+        ]
+        # Tooltips are populated by _install_button_shortcut below so they
+        # carry the "(Ctrl+N)" suffix; no plain-text setToolTip needed here.
+        self._time_toolbar_compact = None
+
+        # Card-wide Ctrl+1..5 shortcuts for the segmented controls.
+        self._time_button_shortcuts = []
+        button_by_key = {
+            'btn_subplot':   self.btn_subplot,
+            'btn_overlay':   self.btn_overlay,
+            'cursor_off':    self._cursor_buttons['off'],
+            'cursor_single': self._cursor_buttons['single'],
+            'cursor_dual':   self._cursor_buttons['dual'],
+        }
+        from ._helpers import _TIME_CARD_SHORTCUTS
+        for key, label, shortcut in _TIME_CARD_SHORTCUTS:
+            btn = button_by_key.get(key)
+            if btn is None:
+                continue
+            self._time_button_shortcuts.append(
+                _install_button_shortcut(self, btn, label, shortcut, key)
+            )
+        self._time_annotation_shortcut = _install_button_shortcut(
+            self,
+            self._annotation_btn,
+            "标注：左键添加，右键删除最近一处",
+            "Ctrl+M",
+            "annotation",
+        )
+        self._time_control_widgets = (
+            self._time_controls_spacer,
+            self._time_separators[0],
+            self.btn_subplot,
+            self.btn_overlay,
+            self._time_separators[1],
+            self._cursor_buttons['off'],
+            self._cursor_buttons['single'],
+            self._cursor_buttons['dual'],
+            self._cursor_display_settings_btn,
+        )
+        self.view_tabbar = None
+        self._init_choice_motion({
+            "plot": (self.btn_subplot, self.btn_overlay),
+            "cursor": (
+                self._cursor_buttons["off"],
+                self._cursor_buttons["single"],
+                self._cursor_buttons["dual"],
+            ),
+        })
+        self.set_motion_policy(POLICY_LIGHT)
+        self._sync_responsive_toolbar()
+
+    def _sync_responsive_toolbar(self):
+        super()._sync_responsive_toolbar()
+        labels = getattr(self, '_time_button_labels', None)
+        if not labels:
+            return
+        compact = self._toolbar_layout_width() < _TOOLBAR_COMPACT_WIDTH
+        if compact == self._time_toolbar_compact:
+            return
+        self._time_toolbar_compact = compact
+        layout = self.toolbar.layout()
+        if layout is not None:
+            layout.setSpacing(1 if compact else 4)
+        for button, full, _short in labels:
+            button.setText(full)
+            button.setProperty(
+                "timeControlDensity", "compact" if compact else "normal"
+            )
+            style = button.style()
+            if style is not None:
+                style.unpolish(button)
+                style.polish(button)
+            text_width = button.fontMetrics().horizontalAdvance(full)
+            button_width = max(
+                46 if compact else 52,
+                text_width + (16 if compact else 24),
+            )
+            button.setFixedWidth(button_width)
+        # Keep the trailing spacer in the layout at every responsive density.
+        # When the toolbar is narrower than its natural width it collapses to
+        # zero and ToolbarScrollHost scrolls the controls; when spare width is
+        # available it absorbs that width so the time-only controls stay flush
+        # with the right edge.  Hiding it solely because the shared 1500 px
+        # density threshold was crossed left a large unused gap on Hi-DPI
+        # windows that still had ample room for the complete toolbar.
+        self._set_time_control_spacer_visible(True)
+        for sep in self._time_separators:
+            sep.setVisible(True)
+        settings_action = self._toolbar_action_for_widget(
+            self._cursor_display_settings_btn
+        )
+        if settings_action is not None:
+            settings_action.setVisible(True)
+        self.toolbar.updateGeometry()
+        host = getattr(self, "_toolbar_host", None)
+        if host is not None:
+            host.fit_inner_toolbar()
+
+    def _set_time_control_spacer_visible(self, visible):
+        widgets = getattr(self, '_time_control_widgets', ())
+        if not widgets:
+            return
+        spacer = self._toolbar_action_for_widget(self._time_controls_spacer)
+        sep0 = self._toolbar_action_for_widget(self._time_separators[0])
+        if spacer is not None:
+            spacer.setVisible(visible)
+        if sep0 is not None:
+            sep0.setVisible(visible)
+
+    def _choice_current_button(self, name):
+        if name == "plot":
+            return self.btn_overlay if self._plot_mode == "overlay" else self.btn_subplot
+        if name == "cursor":
+            return self._cursor_buttons.get(self._cursor_mode)
+        return None
+
+    # ----- plot mode -----
+    def plot_mode(self):
+        return self._plot_mode
+
+    def _on_plot_mode_clicked(self, mode, _checked=False):
+        self._apply_plot_mode(mode, animate=True, notify=True)
+
+    def set_plot_mode(self, mode):
+        self._apply_plot_mode(mode, animate=False, notify=True)
+
+    def _apply_plot_mode(self, mode, *, animate, notify):
+        if mode not in ('subplot', 'overlay') or mode == self._plot_mode:
+            return
+        self._plot_mode = mode
+        self.btn_subplot.setChecked(mode == 'subplot')
+        self.btn_overlay.setChecked(mode == 'overlay')
+        self._refresh_bottom_hint()
+        self._follow_choice_indicator(
+            "plot",
+            self.btn_overlay if mode == "overlay" else self.btn_subplot,
+            animate=animate,
+        )
+        if notify:
+            self.plot_mode_changed.emit(mode)
+
+    # ----- cursor mode -----
+    def cursor_mode(self):
+        return self._cursor_mode
+
+    def _on_cursor_mode_clicked(self, mode, _checked=False):
+        self._apply_cursor_mode(mode, animate=True, notify=True)
+
+    def set_cursor_mode(self, mode):
+        self._apply_cursor_mode(mode, animate=False, notify=True)
+
+    def _apply_cursor_mode(self, mode, *, animate, notify):
+        if mode not in ('off', 'single', 'dual') or mode == self._cursor_mode:
+            return
+        self._cursor_mode = mode
+        if mode == 'off':
+            self._cursor_display_popover.hide()
+        elif self._cursor_display_popover.isVisible():
+            self._cursor_display_popover.set_cursor_mode(mode)
+        for k, b in self._cursor_buttons.items():
+            b.setChecked(k == mode)
+        # Cursor mode is part of HintState, so refresh the bottom context
+        # label whenever it flips.
+        self._refresh_bottom_hint()
+        self._follow_choice_indicator(
+            "cursor", self._cursor_buttons.get(mode), animate=animate,
+        )
+        if notify:
+            self.cursor_mode_changed.emit(mode)
+
+    def cursor_display_settings_button(self):
+        return self._cursor_display_settings_btn
+
+    def cursor_display_popover(self):
+        return self._cursor_display_popover
+
+    def cursor_display_options(self):
+        return self._cursor_display_options
+
+    def set_cursor_display_options(self, options):
+        if not isinstance(options, CursorDisplayOptions):
+            raise TypeError("options must be CursorDisplayOptions")
+        self._cursor_display_options = options
+        self._cursor_display_popover.set_options(options)
+
+    def close_cursor_display_popover(self):
+        self._cursor_display_popover.hide()
+
+    def _toggle_cursor_display_popover(self, _checked=False):
+        popover = self._cursor_display_popover
+        if popover.isVisible():
+            popover.hide()
+            return
+        popover.set_options(self._cursor_display_options)
+        popover.show_for(
+            self._cursor_display_settings_btn,
+            self._cursor_mode,
+        )
+
+    def _on_cursor_display_options_changed(self, options):
+        self._cursor_display_options = options
+        self.cursor_display_options_changed.emit(options)
+
+    def _on_cursor_display_popover_visibility_changed(self, geometry):
+        self.cursor_display_popover_geometry_changed.emit(geometry)
+
+    def set_channel_drop_zone(self, zone, x_rect=None):
+        """Show plot-join or X-axis drop highlight; ``zone`` is plot/xaxis/''."""
+        zone = zone or ""
+        if self.property("dropZone") != zone:
+            self.setProperty("dropZone", zone)
+            style = self.style()
+            if style is not None:
+                style.unpolish(self)
+                style.polish(self)
+            self.update()
+        overlay = getattr(self, "_xaxis_drop_overlay", None)
+        if zone == "xaxis" and x_rect is not None and not x_rect.isNull():
+            overlay = self._ensure_xaxis_drop_overlay()
+            if overlay is None:
+                return
+            overlay.setGeometry(x_rect)
+            overlay.show()
+            overlay.raise_()
+            return
+        if overlay is not None and not sip.isdeleted(overlay):
+            overlay.hide()
+
+    def _canvas_viewport_widget(self):
+        canvas = getattr(self, "canvas", None)
+        if canvas is None or sip.isdeleted(canvas):
+            return None
+        glw = getattr(canvas, "_glw", None)
+        if glw is None:
+            return None
+        try:
+            viewport = glw.viewport()
+        except Exception:
+            return None
+        if viewport is None or sip.isdeleted(viewport):
+            return None
+        return viewport
+
+    def _ensure_xaxis_drop_overlay(self):
+        """Parent the X-band overlay on the canvas viewport.
+
+        ``x_rect`` is already viewport-local. Mapping it through
+        ``QWidget.mapFrom`` during a live drag can segfault on Cocoa, so the
+        overlay lives on the same widget the rect is measured in.
+        """
+        parent = self._canvas_viewport_widget()
+        if parent is None:
+            return None
+        overlay = getattr(self, "_xaxis_drop_overlay", None)
+        if overlay is not None and not sip.isdeleted(overlay):
+            if overlay.parent() is parent:
+                return overlay
+            overlay.hide()
+            overlay.setParent(None)
+            overlay.deleteLater()
+        overlay = QFrame(parent)
+        overlay.setObjectName("xaxisDropHighlight")
+        overlay.setAccessibleName("时域横坐标带")
+        overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        overlay.setAttribute(Qt.WA_StyledBackground, True)
+        overlay.hide()
+        self._xaxis_drop_overlay = overlay
+        return overlay
+
+    def _hint_state(self):
+        return hints.HintState(
+            mode='time',
+            plot_mode=getattr(self, '_plot_mode', 'subplot'),
+            cursor_mode=getattr(self, '_cursor_mode', 'off'),
+            mouse_mode=self._current_mode_key(),
+            chart_kind='time',
+            annotation_on=self.annotation_enabled(),
+            discovered=hints.load_discovered(self._hint_settings),
+            recently_used=frozenset(self._recent_context_hint_ids),
+            **self._nudge_signals(),
+        )
+
+    # ----- overlay-selection nav handoff -----
+    def _on_overlay_channel_selected(self, name):
+        """Switch the nav toolbar to idle while a curve is selected.
+
+        Pan / zoom would otherwise eat the next blank-area click and prevent
+        deselect. We do NOT restore the previous mode on deselect — the user
+        can re-engage pan (Ctrl+G) or zoom (Ctrl+B) explicitly. Called with
+        ``name=None`` on deselect; that path is a no-op.
+        """
+        if not name:
+            return
+        mode = self._current_mode_key()
+        if mode == 'pan':
+            self.toolbar.pan()
+        elif mode == 'zoom':
+            self.toolbar.zoom()
+        self._refresh_hint()
+
+
+class FrequencyCursorCard(_ChartChoiceMotionMixin, _ChartCard):
+    """Shared 关/单/双 cursor controls for frequency-domain cards.
+
+    Frequency-domain views use the same deliberate cursor choices as the time
+    chart.  Their canvas owns the meaning of A/B (frequency and value rows,
+    rather than time-span statistics), while this card only owns the toolbar
+    and routes the one shared toolbar in a split analysis view to its focus.
+    """
+
+    cursor_mode_changed = pyqtSignal(str)
+
+    def __init__(self, canvas, parent=None, *, annotations=False, chart_mode):
+        self._frequency_cursor_target_provider = None
+        super().__init__(canvas, parent, annotations=annotations, chart_mode=chart_mode)
+        # Keep the frequency cursor segment against the trailing edge, matching
+        # the time card.  Without this expanding spacer the controls follow
+        # the navigation buttons and leave a conspicuous empty right side.
+        loc_action = getattr(self, '_loc_action', None)
+        self._frequency_controls_spacer = QWidget(self.toolbar)
+        self._frequency_controls_spacer.setObjectName(
+            "chartFrequencyControlsSpacer"
+        )
+        self._frequency_controls_spacer.setAttribute(Qt.WA_StyledBackground, True)
+        self._frequency_controls_spacer.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Preferred
+        )
+        self._insert_right_toolbar_widget(
+            loc_action, self._frequency_controls_spacer
+        )
+        self._frequency_controls_separator = _vline()
+        self._insert_right_toolbar_widget(
+            loc_action, self._frequency_controls_separator
+        )
+        self._cursor_buttons = {}
+        tooltips = {
+            'off': '关闭频率游标并清空读数。',
+            'single': '移动鼠标读取一个频率点。',
+            'dual': '依次点击 A、B 两个频率点，读取 Δf 和两点数值。',
+        }
+        for label, key in (('游标关', 'off'), ('单游标', 'single'), ('双游标', 'dual')):
+            button = QPushButton(label, self.toolbar)
+            button.setCheckable(True)
+            button.setProperty('role', 'chart-choice')
+            button.setFlat(True)
+            button.setToolTip(tooltips[key])
+            self._insert_right_toolbar_widget(loc_action, button)
+            self._cursor_buttons[key] = button
+            button.clicked.connect(partial(self._on_cursor_mode_clicked, key))
+        # Keep the same Ctrl+3/4/5 keyboard contract as the time card.  The
+        # shortcuts belong to this card, so a hidden analysis mode cannot
+        # consume a time-domain shortcut.
+        self._frequency_cursor_shortcuts = []
+        from ._helpers import _TIME_CARD_SHORTCUTS
+        for key, label, shortcut in _TIME_CARD_SHORTCUTS:
+            if key not in {'cursor_off', 'cursor_single', 'cursor_dual'}:
+                continue
+            mode = key.removeprefix('cursor_')
+            self._frequency_cursor_shortcuts.append(
+                _install_button_shortcut(
+                    self, self._cursor_buttons[mode], label, shortcut, key
+                )
+            )
+        self._init_choice_motion({
+            "cursor": (
+                self._cursor_buttons["off"],
+                self._cursor_buttons["single"],
+                self._cursor_buttons["dual"],
+            ),
+        })
+        self.set_motion_policy(POLICY_LIGHT)
+        self.set_cursor_mode(
+            getattr(self.canvas, 'cursor_mode', lambda: 'off')(), notify=False
+        )
+
+    def set_frequency_cursor_target_provider(self, provider) -> None:
+        self._frequency_cursor_target_provider = provider if callable(provider) else None
+        self.sync_frequency_cursor_control()
+
+    def cursor_mode(self) -> str:
+        getter = getattr(self.canvas, 'cursor_mode', None)
+        value = getter() if callable(getter) else 'off'
+        return value if value in {'off', 'single', 'dual'} else 'off'
+
+    def _choice_current_button(self, name):
+        if name != "cursor":
+            return None
+        target = self._frequency_cursor_target()
+        mode = target.cursor_mode() if target is not self else self.cursor_mode()
+        return self._cursor_buttons.get(mode)
+
+    def set_cursor_mode(self, mode: str, *, notify=True) -> None:
+        self._apply_cursor_mode(mode, animate=False, notify=notify)
+
+    def _apply_cursor_mode(self, mode: str, *, animate: bool, notify: bool) -> None:
+        if mode not in {'off', 'single', 'dual'}:
+            return
+        old = self.cursor_mode()
+        setter = getattr(self.canvas, 'set_cursor_mode', None)
+        if callable(setter):
+            setter(mode)
+        self._set_cursor_buttons(mode)
+        self._follow_choice_indicator(
+            "cursor", self._cursor_buttons.get(mode), animate=animate,
+        )
+        if notify and old != mode:
+            self.cursor_mode_changed.emit(mode)
+
+    def sync_frequency_cursor_control(self) -> None:
+        target = self._frequency_cursor_target()
+        mode = target.cursor_mode()
+        self._set_cursor_buttons(mode)
+        self._follow_choice_indicator(
+            "cursor", self._cursor_buttons.get(mode), animate=False,
+        )
+
+    def _frequency_cursor_target(self):
+        provider = self._frequency_cursor_target_provider
+        target = provider() if callable(provider) else self
+        return target if isinstance(target, FrequencyCursorCard) else self
+
+    def _set_cursor_buttons(self, mode: str) -> None:
+        for key, button in self._cursor_buttons.items():
+            old = button.blockSignals(True)
+            try:
+                button.setChecked(key == mode)
+            finally:
+                button.blockSignals(old)
+
+    def _on_cursor_mode_clicked(self, mode: str, _checked=False) -> None:
+        target = self._frequency_cursor_target()
+        if target is self:
+            self._apply_cursor_mode(mode, animate=True, notify=True)
+            return
+        target.set_cursor_mode(mode)
+        self.sync_frequency_cursor_control()
+
+
+class FrfChartCard(FrequencyCursorCard):
+    """Frequency-cursor card configured for the three-row FRF canvas."""
+
+    def __init__(self, canvas, parent=None):
+        # Reuse the same compact annotate/clear controls and confirmation flow
+        # as TimeDomain and the other analysis cards.
+        super().__init__(canvas, parent, annotations=True, chart_mode='frf')

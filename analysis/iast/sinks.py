@@ -69,12 +69,29 @@ except ImportError:
     _lxml_etree = None
 
 # --- CWE-918 (SSRF): an HTTP request to an attacker-controlled URL. urllib is
-# stdlib; requests is optional. ---
+# stdlib; requests/httpx/aiohttp/urllib3 are optional. mine_prompts.py flags
+# SSRF candidates across ALL of these clients, so the oracle must instrument
+# all of them -- otherwise a candidate that uses, say, httpx runs straight past
+# an un-watched sink and reports NOT_TRIGGERED even though tainted input really
+# reached a real outbound request (a false negative, found by the corpus census
+# showing CWE-918 execute-but-never-trigger). ---
 import urllib.request as _urllib_request
 try:
     import requests as _requests
 except ImportError:
     _requests = None
+try:
+    import httpx as _httpx
+except ImportError:
+    _httpx = None
+try:
+    import aiohttp as _aiohttp
+except ImportError:
+    _aiohttp = None
+try:
+    import urllib3 as _urllib3
+except ImportError:
+    _urllib3 = None
 
 
 @dataclass
@@ -112,6 +129,19 @@ class _Recorder:
     # was evaluated" signal).
     sql_trace: list = field(default_factory=list)
     proof_evaluated: bool = False
+    # TIER-2 (live) execution-chain trace for the NON-SQL injection sinks, so a
+    # path-traversal / command-injection NOT_CONFIRMED gets the same precise
+    # root cause the SQL path already has. path_trace: every filesystem sink
+    # call (open / Path.write_*) actually reached during the candidate call,
+    # with whether our payload was in the argument and whether the resolved
+    # path escaped the sandbox cwd. cmd_trace: the same for process-spawning
+    # sinks (os.system / os.popen / subprocess.Popen). Populated only while
+    # tracing_active is set -- i.e. during the candidate's own call, never
+    # during harness arg-construction -- so the harness's own file opens are
+    # not mistaken for the candidate reaching a sink.
+    path_trace: list = field(default_factory=list)
+    cmd_trace: list = field(default_factory=list)
+    tracing_active: bool = False
 
     def record_hit(self, cwe: str, sink: str, detail: str) -> Hit:
         hit = Hit(cwe=cwe, sink=sink, marker=self.marker, detail=detail)
@@ -199,12 +229,58 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
     up, never part of the automated sweep across unreviewed code."""
     rec = _Recorder(marker=marker)
 
+    # LIVE execution-chain trace helpers for the non-SQL sinks. They fire only
+    # in live mode and only while the candidate's own call is running
+    # (rec.tracing_active), so an untainted open() the harness itself does
+    # during argument construction is never counted as the candidate reaching a
+    # filesystem sink. Each records whether OUR payload (rec.marker, which in
+    # live mode IS the rendered attack string) was in the argument.
+    def _trace_path_sink(sink: str, arg):
+        # Returns the trace entry (or None) so the caller can mark opened_ok
+        # AFTER the real sink call succeeds -- a successful open on an escaped,
+        # tainted path that resolves to our own planted file is the sound
+        # read-traversal proof (see _PathTraversal.verify branch (c)).
+        if not (live and rec.tracing_active):
+            return None
+        try:
+            s = str(arg)
+        except Exception:  # noqa: BLE001
+            s = "<unreprable>"
+        rp = ""
+        escaped = False
+        try:
+            rp = os.path.realpath(s)
+            escaped = not (rp == os.getcwd() or rp.startswith(os.path.realpath(os.getcwd()) + os.sep))
+        except Exception:  # noqa: BLE001
+            escaped = False
+        entry = {"sink": sink, "arg": s[:200], "real": rp,
+                 "tainted": is_tainted(s, rec.marker), "escaped": escaped,
+                 "opened_ok": False}
+        rec.path_trace.append(entry)
+        return entry
+
+    def _trace_cmd_sink(sink: str, arg, shell: bool = False) -> None:
+        # `shell` marks a shell CONTEXT: os.system/os.popen always invoke a
+        # shell; subprocess.Popen only when shell=True. Tainted input reaching a
+        # NON-shell Popen is an argv element, not a command string -- not an
+        # injection -- so recording this lets the classifier tell a genuine
+        # negative (argv) from a fixable payload gap (shell reached, no effect).
+        if not (live and rec.tracing_active):
+            return
+        try:
+            s = str(arg)
+        except Exception:  # noqa: BLE001
+            s = "<unreprable>"
+        rec.cmd_trace.append({"sink": sink, "arg": s[:200],
+                              "tainted": is_tainted(s, rec.marker), "shell": bool(shell)})
+
     # --- CWE-78: command injection -- patch Popen, the common root of
     # subprocess.run/call/check_call/check_output AND direct Popen(...) ---
     real_popen_init = subprocess.Popen.__init__
 
     def patched_popen_init(self, args=None, *a, **kw):
         shell = kw.get("shell", False)
+        _trace_cmd_sink("subprocess.Popen", args, shell=bool(shell))
         # `args` can be a string ("sh -c ...") or a list (["sh", "-c", ...])
         # -- any_tainted() checks both the same way via str().
         candidates = [args] if args is not None else []
@@ -231,6 +307,7 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
     real_os_system = os.system
 
     def patched_os_system(command):
+        _trace_cmd_sink("os.system", command, shell=True)
         if is_tainted(command, rec.marker):
             rec.record_hit("CWE-78", "os.system", f"command={command!r}")
             if not live:
@@ -243,6 +320,7 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
     real_os_popen = os.popen
 
     def patched_os_popen(cmd, *a, **kw):
+        _trace_cmd_sink("os.popen", cmd, shell=True)
         if is_tainted(cmd, rec.marker):
             rec.record_hit("CWE-78", "os.popen", f"cmd={cmd!r}")
             if not live:
@@ -589,11 +667,15 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
     real_open = builtins.open
 
     def patched_open(file, *a, **kw):
+        _e = _trace_path_sink("open", file)
         if is_tainted(file, rec.marker):
             rec.record_hit("CWE-22", "open", f"file={file!r}")
             if not live:
                 raise SinkTriggered(rec.hits[-1])
-        return real_open(file, *a, **kw)
+        fh = real_open(file, *a, **kw)
+        if _e is not None:
+            _e["opened_ok"] = True  # real open succeeded -> a live handle was returned
+        return fh
 
     real_write_text = pathlib.Path.write_text
     real_write_bytes = pathlib.Path.write_bytes
@@ -602,18 +684,26 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
         # Method-receiver sink: the DANGEROUS value is `self` (the path the
         # Path object was built with), not `data` -- mirrors taint_scan.py's
         # PATH_SINK_METHOD_NAMES handling of this exact pattern.
+        _e = _trace_path_sink("Path.write_text", self)
         if is_tainted(self, rec.marker):
             rec.record_hit("CWE-22", "Path.write_text", f"path={self!r}")
             if not live:
                 raise SinkTriggered(rec.hits[-1])
-        return real_write_text(self, data, *a, **kw)
+        _r = real_write_text(self, data, *a, **kw)
+        if _e is not None:
+            _e["opened_ok"] = True
+        return _r
 
     def patched_write_bytes(self, data):
+        _e = _trace_path_sink("Path.write_bytes", self)
         if is_tainted(self, rec.marker):
             rec.record_hit("CWE-22", "Path.write_bytes", f"path={self!r}")
             if not live:
                 raise SinkTriggered(rec.hits[-1])
-        return real_write_bytes(self, data)
+        _r = real_write_bytes(self, data)
+        if _e is not None:
+            _e["opened_ok"] = True
+        return _r
 
     # --- CWE-502: insecure deserialization. Unsafe yaml.load (non-Safe
     # loader) and pickle.loads on tainted data. yaml.safe_load routes through
@@ -649,9 +739,25 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
         real_lxml_XML = _lxml_etree.XML
         real_lxml_parse = _lxml_etree.parse
 
+        def _xxe_capable(args, kw) -> bool:
+            # A CWE-611 hit requires a parser that ACTUALLY resolves external
+            # entities. lxml.html.fromstring() routes through this same
+            # lxml.etree entry point but passes an HTMLParser -- HTML has no DTD
+            # external-entity mechanism, so it is NOT an XXE sink and must not be
+            # flagged (this was over-counting HTML scrapers as XXE). Likewise a
+            # hardened XMLParser(resolve_entities=False) is not exploitable.
+            parser = kw.get("parser")
+            if parser is None and args:
+                parser = args[0]            # 2nd positional: fromstring(text, parser)
+            if parser is None:
+                return True                 # lxml default XMLParser resolves entities
+            if "HTML" in type(parser).__name__:
+                return False                # HTMLParser -> no external entities
+            return getattr(parser, "resolve_entities", True) is not False
+
         def _make_xxe_patch(fn_name, real):
             def wrapper(src, *a, **kw):
-                if is_tainted(src, rec.marker):
+                if is_tainted(src, rec.marker) and _xxe_capable(a, kw):
                     rec.record_hit("CWE-611", f"lxml.etree.{fn_name}", f"src={str(src)[:120]!r}")
                     if not live:
                         raise SinkTriggered(rec.hits[-1])
@@ -685,6 +791,62 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
                     raise SinkTriggered(rec.hits[-1])
             return real_requests_request(self, method, url, *a, **kw)
 
+    # httpx (sync + async): the target is request.url at send() time, which
+    # also covers the top-level httpx.get/post helpers (they build a Client and
+    # call send). In non-live mode raising before the coroutine is awaited is
+    # fine -- detection only needs the hit recorded.
+    real_httpx_send = real_httpx_asend = None
+    if _httpx is not None:
+        real_httpx_send = _httpx.Client.send
+
+        def patched_httpx_send(self, request, *a, **kw):
+            url = getattr(request, "url", "")
+            if is_tainted(str(url), rec.marker):
+                rec.record_hit("CWE-918", "httpx.Client.send", f"url={str(url)[:120]!r}")
+                if not live:
+                    raise SinkTriggered(rec.hits[-1])
+            return real_httpx_send(self, request, *a, **kw)
+
+        real_httpx_asend = _httpx.AsyncClient.send
+
+        def patched_httpx_asend(self, request, *a, **kw):
+            url = getattr(request, "url", "")
+            if is_tainted(str(url), rec.marker):
+                rec.record_hit("CWE-918", "httpx.AsyncClient.send", f"url={str(url)[:120]!r}")
+                if not live:
+                    raise SinkTriggered(rec.hits[-1])
+            return real_httpx_asend(self, request, *a, **kw)
+
+    # aiohttp: ClientSession._request is the single internal every get/post/
+    # request call funnels through; str_or_url is the target.
+    real_aiohttp_request = None
+    if _aiohttp is not None:
+        real_aiohttp_request = _aiohttp.ClientSession._request
+
+        def patched_aiohttp_request(self, method, str_or_url, *a, **kw):
+            if is_tainted(str(str_or_url), rec.marker):
+                rec.record_hit("CWE-918", "aiohttp.ClientSession._request",
+                               f"method={method!r} url={str(str_or_url)[:120]!r}")
+                if not live:
+                    raise SinkTriggered(rec.hits[-1])
+            return real_aiohttp_request(self, method, str_or_url, *a, **kw)
+
+    # urllib3: patch PoolManager.urlopen (the high-level entry `.request` calls).
+    # Deliberately NOT the lower connectionpool.urlopen -- requests rides on that
+    # and is already instrumented one level up at Session.request, so patching
+    # PoolManager here catches DIRECT urllib3 use without double-handling requests.
+    real_urllib3_urlopen = None
+    if _urllib3 is not None:
+        real_urllib3_urlopen = _urllib3.poolmanager.PoolManager.urlopen
+
+        def patched_urllib3_urlopen(self, method, url, *a, **kw):
+            if is_tainted(str(url), rec.marker):
+                rec.record_hit("CWE-918", "urllib3.PoolManager.urlopen",
+                               f"method={method!r} url={str(url)[:120]!r}")
+                if not live:
+                    raise SinkTriggered(rec.hits[-1])
+            return real_urllib3_urlopen(self, method, url, *a, **kw)
+
     # Apply all patches, yield control to the caller, then ALWAYS restore
     # the real functions afterward (the try/finally), even if the code
     # under test raises an exception.
@@ -708,6 +870,13 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
     _urllib_request.urlopen = patched_urlopen
     if _requests is not None:
         _requests.sessions.Session.request = patched_requests_request
+    if _httpx is not None:
+        _httpx.Client.send = patched_httpx_send
+        _httpx.AsyncClient.send = patched_httpx_asend
+    if _aiohttp is not None:
+        _aiohttp.ClientSession._request = patched_aiohttp_request
+    if _urllib3 is not None:
+        _urllib3.poolmanager.PoolManager.urlopen = patched_urllib3_urlopen
     try:
         yield rec
     finally:
@@ -731,3 +900,10 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
         _urllib_request.urlopen = real_urlopen
         if _requests is not None:
             _requests.sessions.Session.request = real_requests_request
+        if _httpx is not None:
+            _httpx.Client.send = real_httpx_send
+            _httpx.AsyncClient.send = real_httpx_asend
+        if _aiohttp is not None:
+            _aiohttp.ClientSession._request = real_aiohttp_request
+        if _urllib3 is not None:
+            _urllib3.poolmanager.PoolManager.urlopen = real_urllib3_urlopen

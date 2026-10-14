@@ -1,0 +1,37 @@
+from homeassistant.const import CONF_ENTITY_ID, STATE_IDLE, STATE_PLAYING
+from homeassistant.core import HomeAssistant
+
+from custom_components.powercalc.const import (
+    CONF_CALCULATION_ENABLED_CONDITION,
+    CONF_LINEAR,
+    CONF_MAX_POWER,
+    CONF_MODE,
+    CalculationStrategy,
+)
+from tests.common import assert_entity_state, run_powercalc_setup, set_states
+
+
+async def test_media_player_idle(
+    hass: HomeAssistant,
+) -> None:
+    """
+    See https://github.com/bramstroker/homeassistant-powercalc/issues/3492
+    """
+
+    await run_powercalc_setup(
+        hass,
+        {
+            CONF_ENTITY_ID: "media_player.test",
+            CONF_MODE: CalculationStrategy.LINEAR,
+            CONF_CALCULATION_ENABLED_CONDITION: "{{ true }}",
+            CONF_LINEAR: {
+                CONF_MAX_POWER: 5,
+            },
+        },
+    )
+
+    await set_states(hass, [("media_player.test", STATE_PLAYING, {"volume_level": 0.16})])
+    assert_entity_state(hass, "sensor.test_power", "0.80")
+
+    await set_states(hass, [("media_player.test", STATE_IDLE, {"volume_level": 0.16})])
+    assert_entity_state(hass, "sensor.test_power", "0.80")

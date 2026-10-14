@@ -1,0 +1,177 @@
+"""
+KPIs de candidatos Drive alineados al guardado masivo (`_motivos_no_100`).
+
+Cuenta cuántas filas el botón «Guardar (100%)» intentaría crear (misma validación de servidor que al persistir),
+no solo el color verde de la grilla (la grilla puede verse verde y aún faltar cliente, N, R, S, J, etc.).
+"""
+from __future__ import annotations
+
+from datetime import date
+from typing import Any, Dict, List, Tuple
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.models.prestamo_candidato_drive import PrestamoCandidatoDrive
+from app.services.prestamo_candidatos_drive_guardar import (
+    MAX_DIAS_APROBACION_DRIVE,
+    _fechas_desde_col_q,
+    _motivos_no_100,
+)
+from app.services.prestamo_candidatos_drive_validadores import (
+    cedula_bloqueada_por_desistimiento_drive,
+    cedula_cmp_es_tipo_venezolano_v,
+    cedula_v_bloqueada_por_no_liquidado_terminado,
+    conteo_prestamos_aprobados_por_cedula_norm,
+    conteo_prestamos_desistimiento_por_cedula_norm,
+    conteo_prestamos_no_liquidado_terminado_por_cedula_norm,
+    cupo_ve_permite_nuevo_prestamo,
+    n_aprobados_en_payload,
+    n_desistimiento_en_payload,
+    n_no_liquidado_terminado_en_payload,
+)
+
+
+def _cell(v: Any) -> str:
+    if v is None:
+        return ""
+    return str(v).strip()
+
+
+def _letra_documento(payload: Dict[str, Any], cedula_cmp_fila: str) -> str:
+    """Primera letra V/E/J/G desde cmp, columna E o fila; manda sobre flags stale."""
+    for raw in (
+        payload.get("cedula_cmp"),
+        cedula_cmp_fila,
+        payload.get("col_e_cedula"),
+    ):
+        u = "".join(ch for ch in _cell(raw).upper() if ch.isalnum())
+        if u and u[0] in ("V", "E", "J", "G"):
+            return u[0]
+    return ""
+
+
+def _cedula_es_j(payload: Dict[str, Any], cedula_cmp_fila: str) -> bool:
+    if _letra_documento(payload, cedula_cmp_fila) == "J":
+        return True
+    return payload.get("cedula_es_tipo_j") is True
+
+
+def _cedula_es_ve(payload: Dict[str, Any], cedula_cmp_fila: str) -> bool:
+    letra = _letra_documento(payload, cedula_cmp_fila)
+    if letra == "J":
+        return False
+    if letra in ("V", "E"):
+        return True
+    if payload.get("cedula_es_tipo_j") is True:
+        return False
+    if payload.get("cedula_es_tipo_ve") is True:
+        return True
+    return payload.get("cedula_es_tipo_v_venezolano") is True or payload.get("cedula_es_tipo_e") is True
+
+
+def _formato_ok(payload: Dict[str, Any]) -> bool:
+    a = payload.get("validador_formato_cedula_ok")
+    if a is not None:
+        return a is True
+    return payload.get("cedula_valida") is True
+
+
+def _hoja_ok(payload: Dict[str, Any]) -> bool:
+    v = payload.get("validador_sin_duplicado_en_hoja_ok")
+    if v is not None:
+        return v is True
+    return payload.get("duplicada_en_hoja") is not True
+
+
+def _tabla_ve_ok(payload: Dict[str, Any], cedula_cmp_fila: str, es_ve: bool, es_j: bool) -> bool:
+    if es_j:
+        return True
+    for k in ("validador_ve_max_un_prestamo_ok", "validador_v_max_un_prestamo_ok"):
+        t = payload.get(k)
+        if t is True:
+            return True
+        if t is False:
+            return False
+    n_aprob = n_aprobados_en_payload(payload)
+    return cupo_ve_permite_nuevo_prestamo(es_ve=es_ve, es_j=es_j, n_aprob=n_aprob)
+
+
+def fila_payload_grilla_verde(payload: Dict[str, Any], cedula_cmp_fila: str) -> bool:
+    """True si la fila se mostraría en verde (listas para guardar según validadores de pantalla)."""
+    formato_ok = _formato_ok(payload)
+    es_ve = _cedula_es_ve(payload, cedula_cmp_fila)
+    es_j = _cedula_es_j(payload, cedula_cmp_fila)
+    tabla_ok = _tabla_ve_ok(payload, cedula_cmp_fila, es_ve, es_j)
+
+    q_raw = _cell(payload.get("col_q_fecha"))
+    red_fecha = False
+    fechas = _fechas_desde_col_q(q_raw)
+    if fechas:
+        _, ap_d = fechas
+        red_fecha = (date.today() - ap_d).days > MAX_DIAS_APROBACION_DRIVE
+
+    n_aprob = n_aprobados_en_payload(payload)
+    red_ve = es_ve and not cupo_ve_permite_nuevo_prestamo(es_ve=es_ve, es_j=es_j, n_aprob=n_aprob)
+    red_desist = cedula_bloqueada_por_desistimiento_drive(n_desistimiento_en_payload(payload))
+    red_v_liq_term = cedula_v_bloqueada_por_no_liquidado_terminado(
+        es_v=cedula_cmp_es_tipo_venezolano_v(
+            _cell(payload.get("cedula_cmp")) or _cell(cedula_cmp_fila)
+        ),
+        n_no_liquidado_terminado=n_no_liquidado_terminado_en_payload(payload),
+    )
+    red_reimporte_liq = payload.get("reimporte_liquidado_huella") is True
+    if payload.get("validador_sin_desistimiento_ok") is False:
+        red_desist = True
+    if payload.get("validador_v_liquidado_terminado_ok") is False:
+        red_v_liq_term = True
+    if (
+        not formato_ok
+        or red_ve
+        or red_fecha
+        or red_reimporte_liq
+        or red_desist
+        or red_v_liq_term
+    ):
+        return False
+    return bool(formato_ok and tabla_ok)
+
+
+def conteos_listo_guardar_y_map_por_id(
+    db: Session,
+    *,
+    cedula_cmp_contains: str | None,
+) -> Tuple[int, int, Dict[int, bool], Dict[int, List[str]]]:
+    """
+    Una sola pasada sobre el snapshot filtrado:
+    - cuenta guardables / no guardables (`_motivos_no_100`, igual que «Guardar (100%)»);
+    - devuelve mapa `id` → cumple validación previa al crear préstamo (para la UI por fila);
+    - devuelve mapa `id` → motivos de no-guardable (lista vacía si guardable), para mostrar en UI.
+    """
+    prestamo_counts_aprob = conteo_prestamos_aprobados_por_cedula_norm(db)
+    prestamo_counts_desist = conteo_prestamos_desistimiento_por_cedula_norm(db)
+    prestamo_counts_no_liq_term = conteo_prestamos_no_liquidado_terminado_por_cedula_norm(db)
+    stmt = select(PrestamoCandidatoDrive.id, PrestamoCandidatoDrive.payload, PrestamoCandidatoDrive.cedula_cmp)
+    q = (cedula_cmp_contains or "").strip()
+    if q:
+        stmt = stmt.where(PrestamoCandidatoDrive.cedula_cmp.contains(q))
+    rows = list(db.execute(stmt).all() or [])
+    listo_map: Dict[int, bool] = {}
+    motivos_map: Dict[int, List[str]] = {}
+    apr = 0
+    for rid, payload, cmp in rows:
+        pl = payload if isinstance(payload, dict) else {}
+        ok, motivos, pc = _motivos_no_100(
+            pl,
+            db,
+            prestamo_counts_aprob,
+            prestamo_counts_desist,
+            prestamo_counts_no_liq_term,
+        )
+        v = bool(ok and pc is not None)
+        listo_map[int(rid)] = v
+        motivos_map[int(rid)] = [] if v else list(motivos)
+        if v:
+            apr += 1
+    total = len(rows)
+    return apr, total - apr, listo_map, motivos_map

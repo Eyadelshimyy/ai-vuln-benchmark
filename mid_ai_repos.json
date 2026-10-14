@@ -1,0 +1,30 @@
+[
+  {
+    "full_name": "airbytehq/airbyte",
+    "clone_url": "https://github.com/airbytehq/airbyte.git",
+    "tools": [
+      "devin"
+    ],
+    "ai_commit_hits": 3,
+    "stars": 22219,
+    "language": "Python",
+    "pushed_at": "2026-10-14T00:38:39Z",
+    "archived": false,
+    "fork": false,
+    "size_kb": 939763
+  },
+  {
+    "full_name": "BerriAI/litellm",
+    "clone_url": "https://github.com/BerriAI/litellm.git",
+    "tools": [
+      "devin"
+    ],
+    "ai_commit_hits": 1,
+    "stars": 61175,
+    "language": "Python",
+    "pushed_at": "2026-10-14T01:06:51Z",
+    "archived": false,
+    "fork": false,
+    "size_kb": 2320763
+  }
+]

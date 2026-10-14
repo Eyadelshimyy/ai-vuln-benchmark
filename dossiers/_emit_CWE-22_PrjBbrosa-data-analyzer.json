@@ -1,0 +1,22 @@
+{
+  "repo_url": "https://github.com/PrjBbrosa/data-analyzer.git",
+  "commit": "",
+  "file": "scripts/probe_switch_smoothness.py",
+  "function": "_emit",
+  "cwe": "CWE-22",
+  "param": "out",
+  "payload": "/tmp/tier2_proof_gsvbjm5y/pwned_f868876ae420",
+  "verdict": "NEEDS_MANUAL",
+  "detail": "target '_emit' is internal (underscore-prefixed or under a private module). An external attacker reaches it only via a public caller / CLI / HTTP entry -- trace that path by hand before disclosing.",
+  "tier2_proof": "traversal write escaped to /tmp/tier2_proof_gsvbjm5y/pwned_f868876ae420",
+  "tier2_sink": "Path.write_text",
+  "reachable": true,
+  "entry_kind": "api",
+  "call_path": [
+    "log",
+    "_emit"
+  ],
+  "reproduce_verdict": "NEEDS_MANUAL",
+  "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
+  "repo_full": "PrjBbrosa/data-analyzer"
+}

@@ -1,0 +1,187 @@
+# -*- coding: utf-8 -*-
+"""Tests de exclusion LIQUIDADO/DESISTIMIENTO en envios de notificaciones."""
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
+from app.services.notificaciones_exclusion_desistimiento import (
+    cliente_bloqueado_portal_por_desistimiento,
+    cliente_bloqueado_por_desistimiento,
+    cliente_ids_bloqueados_para_notificacion,
+    cliente_sin_cartera_activa_notif,
+    item_bloqueado_para_envio_notificacion,
+    motivo_bloqueo_prestamo_notificacion,
+)
+
+
+def test_motivo_bloqueo_prestamo_liquidado():
+    db = MagicMock()
+    db.scalar.return_value = "liquidado"
+    assert motivo_bloqueo_prestamo_notificacion(db, 10) == "LIQUIDADO"
+
+
+def test_motivo_bloqueo_prestamo_desistimiento():
+    db = MagicMock()
+    db.scalar.return_value = " Desistimiento "
+    assert motivo_bloqueo_prestamo_notificacion(db, 11) == "DESISTIMIENTO"
+
+
+def test_motivo_bloqueo_prestamo_aprobado_no_bloquea():
+    db = MagicMock()
+    db.scalar.return_value = "APROBADO"
+    assert motivo_bloqueo_prestamo_notificacion(db, 12) is None
+
+
+def test_item_bloqueado_por_prestamo_liquidado():
+    db = MagicMock()
+    db.scalar.return_value = "LIQUIDADO"
+    bloqueado, motivo = item_bloqueado_para_envio_notificacion(
+        db, {"prestamo_id": 99, "cliente_id": 1}
+    )
+    assert bloqueado is True
+    assert motivo == "LIQUIDADO"
+
+
+def test_item_bloqueado_por_cliente_desistimiento():
+    calls = {"n": 0}
+
+    def _scalar(stmt):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "APROBADO"  # estado prestamo
+        if calls["n"] == 2:
+            return 1  # count desistimiento
+        return 0
+
+    db = MagicMock()
+    db.scalar.side_effect = _scalar
+    bloqueado, motivo = item_bloqueado_para_envio_notificacion(
+        db, {"prestamo_id": 5, "cliente_id": 7}
+    )
+    assert bloqueado is True
+    assert motivo == "DESISTIMIENTO"
+
+
+def test_item_bloqueado_cliente_solo_liquidado():
+    calls = {"n": 0}
+
+    def _scalar(stmt):
+        calls["n"] += 1
+        # Sin prestamo_id: 1) count desistimiento 2) total prestamos 3) activos
+        return {1: 0, 2: 2, 3: 0}.get(calls["n"], 0)
+
+    db = MagicMock()
+    db.scalar.side_effect = _scalar
+    bloqueado, motivo = item_bloqueado_para_envio_notificacion(
+        db, {"cliente_id": 3, "prestamo_id": None}
+    )
+    assert bloqueado is True
+    assert motivo == "LIQUIDADO"
+
+
+def test_cliente_sin_cartera_activa_true():
+    calls = {"n": 0}
+
+    def _scalar(stmt):
+        calls["n"] += 1
+        return 2 if calls["n"] == 1 else 0
+
+    db = MagicMock()
+    db.scalar.side_effect = _scalar
+    assert cliente_sin_cartera_activa_notif(db, 42) is True
+
+
+def test_cliente_sin_cartera_activa_false_con_aprobado():
+    calls = {"n": 0}
+
+    def _scalar(stmt):
+        calls["n"] += 1
+        return 2 if calls["n"] == 1 else 1
+
+    db = MagicMock()
+    db.scalar.side_effect = _scalar
+    assert cliente_sin_cartera_activa_notif(db, 42) is False
+
+
+def test_tupla_bloqueo_no_evaluar_como_bool_directo():
+    """
+    Regresion ESTADO_CUENTA: `if item_bloqueado_para_envio_notificacion(...):`
+    omitia todos los envios porque (False, '') es truthy en Python.
+    """
+    bloqueado, motivo = item_bloqueado_para_envio_notificacion(
+        MagicMock(), {"prestamo_id": None}
+    )
+    assert bloqueado is False
+    assert motivo == ""
+    assert bool((bloqueado, motivo)) is True
+
+
+def test_item_no_bloqueado_aprobado():
+    calls = {"n": 0}
+
+    def _scalar(stmt):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "APROBADO"
+        if calls["n"] == 2:
+            return 0  # desistimiento
+        if calls["n"] == 3:
+            return 1  # total
+        return 1  # activos
+
+    db = MagicMock()
+    db.scalar.side_effect = _scalar
+    bloqueado, motivo = item_bloqueado_para_envio_notificacion(
+        db, {"prestamo_id": 1, "cliente_id": 2}
+    )
+    assert bloqueado is False
+    assert motivo == ""
+
+
+def test_cliente_ids_bloqueados_batch():
+    """Batch: DESISTIMIENTO + solo-LIQUIDADO; deja pasar con cartera activa."""
+    db = MagicMock()
+    results = [
+        [(1,)],
+        [(2,)],
+        [(1,), (2,), (3,)],
+    ]
+    calls = {"i": 0}
+
+    def _exec(stmt):
+        i = calls["i"]
+        calls["i"] += 1
+        m = MagicMock()
+        m.all.return_value = results[i]
+        return m
+
+    db.execute.side_effect = _exec
+    bloq = cliente_ids_bloqueados_para_notificacion(db, {1, 2, 3, 4})
+    assert bloq == {1, 3}
+
+
+def test_cliente_bloqueado_portal_no_bloquea_solo_liquidado():
+    """Portal: cartera solo LIQUIDADO puede usar estado de cuenta (no es desistimiento)."""
+    calls = {"n": 0}
+
+    def _scalar(stmt):
+        calls["n"] += 1
+        return 0  # sin prestamo desistimiento
+
+    db = MagicMock()
+    db.scalar.side_effect = _scalar
+    assert cliente_bloqueado_portal_por_desistimiento(db, cliente_id=9) is False
+
+
+def test_cliente_bloqueado_por_desistimiento_incluye_solo_liquidado():
+    """Compat: helper historico tambien bloquea cartera solo LIQUIDADO."""
+    calls = {"n": 0}
+
+    def _scalar(stmt):
+        calls["n"] += 1
+        # 1 desistimiento count, 2 total prestamos, 3 activos
+        return {1: 0, 2: 1, 3: 0}.get(calls["n"], 0)
+
+    db = MagicMock()
+    db.scalar.side_effect = _scalar
+    assert cliente_bloqueado_por_desistimiento(db, cliente_id=9) is True

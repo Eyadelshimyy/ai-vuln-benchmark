@@ -1,0 +1,21 @@
+{
+  "repo_url": "https://github.com/loveRhythm1990/mini-pi.git",
+  "commit": "",
+  "file": "02-providers/src/main.py",
+  "function": "execute_bash",
+  "cwe": "CWE-78",
+  "param": "command",
+  "payload": "$(touch /tmp/tier2_proof_65zjmb2t/pwned_43c1e53fb8f2)",
+  "verdict": "SETUP_FAILED",
+  "detail": "clone/checkout failed",
+  "tier2_proof": "injected shell command created /tmp/tier2_proof_65zjmb2t/pwned_43c1e53fb8f2",
+  "tier2_sink": "subprocess.Popen",
+  "reachable": true,
+  "entry_kind": "api",
+  "call_path": [
+    "execute_bash"
+  ],
+  "reproduce_verdict": "SETUP_FAILED",
+  "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
+  "repo_full": "loveRhythm1990/mini-pi"
+}

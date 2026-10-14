@@ -1,0 +1,21 @@
+{
+  "repo_url": "https://github.com/kamoras/civitas.git",
+  "commit": "",
+  "file": "backend/scripts/fetch_state_leg_crosswalk.py",
+  "function": "download",
+  "cwe": "CWE-918",
+  "param": "url",
+  "payload": "http://127.0.0.1:36295/0296c2214739",
+  "verdict": "SETUP_FAILED",
+  "detail": "clone/checkout failed",
+  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:36295/0296c2214739",
+  "tier2_sink": "urllib.request.urlopen",
+  "reachable": true,
+  "entry_kind": "api",
+  "call_path": [
+    "download"
+  ],
+  "reproduce_verdict": "SETUP_FAILED",
+  "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
+  "repo_full": "kamoras/civitas"
+}

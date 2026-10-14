@@ -1,0 +1,703 @@
+"""The Congress reports: a day, a week or a month of what each chamber did.
+
+Built only from what congress_activity.py stored: the Daily Digest's
+entries (quoted as published), the chambers' floor logs and the roll
+calls. Every count and every summary sentence is computed here, from those
+rows, by rule; nothing is generated. A sentence is a template filled with
+counts, so it can say "passed 3 bills" and never characterise them.
+"""
+
+import calendar
+import re
+from collections import defaultdict
+from datetime import date, timedelta
+
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from app.models import CongressDay, CongressEvent, RepSponsoredBill, RollCall, SponsoredBill
+from app.pipeline.congress_activity import digest_cursor, eastern_today, last_run
+from app.pipeline.fetch.daily_digest import words_to_int
+from app.pipeline.analyze.bill_stage import became_law_action
+from app.pipeline.bill_refresh import stored_laws
+from app.pipeline.fetch.congress import congress_of_date
+
+CHAMBERS = ("senate", "house")
+_CHAMBER_NAME = {"senate": "Senate", "house": "House"}
+
+_BILL_LABELS = {
+    "HR": "H.R.", "S": "S.", "HRES": "H. Res.", "SRES": "S. Res.", "HJRES": "H.J. Res.",
+    "SJRES": "S.J. Res.", "HCONRES": "H. Con. Res.", "SCONRES": "S. Con. Res.",
+}
+# Simple and concurrent resolutions never become law; bills and joint
+# resolutions do. The reports count them apart ("3 bills, 4 resolutions").
+_RESOLUTIONS = {"HRES", "SRES", "HCONRES", "SCONRES"}
+# A simple resolution is one chamber's own business: it never goes to the other.
+_SIMPLE_RESOLUTIONS = {"HRES", "SRES"}
+
+
+def bill_label(bill_id: str | None) -> str | None:
+    """"HCONRES.89" -> "H. Con. Res. 89", as the Record prints it."""
+    if not bill_id or "." not in bill_id:
+        return None
+    prefix, number = bill_id.split(".", 1)
+    label = _BILL_LABELS.get(prefix)
+    return f"{label} {number}" if label else None
+
+
+def _prefix(bill_id: str | None) -> str:
+    return (bill_id or "").split(".", 1)[0]
+
+
+def is_resolution(bill_id: str | None) -> bool:
+    return _prefix(bill_id) in _RESOLUTIONS
+
+
+# The chamber a measure started in agreeing, without a further amendment,
+# to the other chamber's amendment: the Record's "concurred in the Senate
+# amendment to H.R. 5371", "agreed to the motion to concur in the Senate
+# amendment to H.R. 1", "Concurred in the Senate amendments to H.R. 6500",
+# "Senate concurred in the amendment of the House of Representatives to S.
+# 1071". Each cleared the measure for the President, and read as a first
+# passage each said "Goes to the Senate" (2025-07-02, 2025-11-12).
+_CONCURRENCE_RE = re.compile(
+    r"\bconcur(?:red)? in the (?:(?:Senate|House) amendments?|amendments? of the (?:Senate|House))"
+    r"(?![^;]{0,200}?\bwith (?:an|a further) amendment)",
+    re.IGNORECASE,
+)
+
+
+def passed_both_chambers(bill_id: str | None, passing_chamber: str, text: str = "") -> bool:
+    """A measure passed by the chamber it did not start in has passed both:
+    it reached the second chamber only by passing the first. So has one its
+    own chamber passed by concurring in the other's amendment (`text`, the
+    Record's entry). Says nothing about amendments still to be reconciled."""
+    prefix = _prefix(bill_id)
+    if not prefix or prefix in _SIMPLE_RESOLUTIONS:
+        return False
+    origin = "house" if prefix.startswith("H") else "senate"
+    return origin != passing_chamber or bool(_CONCURRENCE_RE.search(text or ""))
+
+
+_NOMINATIONS_RE = re.compile(r"^([\w-]+(?: hundred(?: and)?(?: [\w-]+)?)?) (?:[^.]*? )?nominations\b", re.IGNORECASE)
+
+
+# "Routine lists in the Air Force, Army, Marine Corps, Navy, and Space
+# Force." confirms promotion lists whose size the Digest doesn't give.
+_ROUTINE_LIST_RE = re.compile(r"^(?:A )?routine lists? in\b", re.IGNORECASE)
+
+
+def is_routine_list(text: str) -> bool:
+    return bool(_ROUTINE_LIST_RE.match(text or ""))
+
+
+def nominations_in(text: str) -> int:
+    """How many nominations one confirmation entry covers: "3 Coast Guard
+    nominations in the rank of admiral." is 3; an entry naming one nominee
+    is 1; a routine list, whose size the Digest doesn't state, none (it is
+    counted apart, as a list)."""
+    if is_routine_list(text):
+        return 0
+    m = _NOMINATIONS_RE.match(text or "")
+    if m:
+        n = words_to_int(m.group(1))
+        if n:
+            return n
+    return 1
+
+
+_FRACTION_RE = re.compile(r"^\s*(\d+)\s*/\s*(\d+)")
+# Senate Rule XXII: cloture takes three-fifths of the senators duly chosen
+# and sworn, not of those voting — 60 with no vacancy, fewer with one. A
+# Senate roll call lists every sitting senator (yea, nay, present or not
+# voting), so its own totals are that count on the day of the vote, with no
+# seat count typed here.
+
+
+def _sworn(rc: RollCall) -> int:
+    return sum(n or 0 for n in (rc.yeas, rc.nays, rc.present, rc.not_voting))
+
+
+def votes_from_threshold(rc: RollCall) -> float:
+    """How far the yeas were from what the vote needed, in votes.
+
+    The margin between yeas and nays is only that for a simple majority.
+    Cloture that fails 59-41 is a single vote short of 60, and a
+    suspension carried 290-140 two-thirds votes clear by 3; ranked by
+    yeas minus nays those read as lopsided (18 and 150) and never make a
+    "closest votes" list they belong at the top of."""
+    m = _FRACTION_RE.match(rc.majority_requirement or "")
+    num, den = (int(m.group(1)), int(m.group(2))) if m and int(m.group(2)) else (1, 2)
+    if rc.chamber == "senate" and (num, den) == (3, 5):
+        needed = _sworn(rc) * num / den
+    else:
+        needed = (rc.yeas + rc.nays) * num / den
+    return abs(rc.yeas - needed)
+
+
+def _plural(n: int, one: str, many: str | None = None) -> str:
+    return f"{n} {one if n == 1 else (many or one + 's')}"
+
+
+def _confirmed_phrase(counts: dict) -> str | None:
+    """"confirmed 9 nominations", "... and routine lists" when the Senate
+    also confirmed lists it doesn't count, or None."""
+    n, lists = counts["confirmed"], counts.get("confirmedLists", 0)
+    if n and lists:
+        return f"confirmed {_plural(n, 'nomination')} and routine lists"
+    if n:
+        return "confirmed " + _plural(n, "nomination")
+    if lists:
+        return "confirmed routine lists of nominations"
+    return None
+
+
+def _list_phrase(parts: list[str]) -> str:
+    if len(parts) <= 1:
+        return "".join(parts)
+    return ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+# ── Rows to wire shapes ───────────────────────────────────────────
+
+def _next_step(e: CongressEvent) -> str | None:
+    """For a passed measure: "both" (it has now passed both chambers),
+    "senate"/"house" (it goes there next), or None (a resolution, or not a
+    passage)."""
+    if e.kind != "passed" or not e.bill_id or is_resolution(e.bill_id):
+        return None
+    if passed_both_chambers(e.bill_id, e.chamber, e.text):
+        return "both"
+    return "house" if e.chamber == "senate" else "senate"
+
+
+def _event(e: CongressEvent) -> dict:
+    return {
+        # The Congress the day fell in: a bill number names a different
+        # bill in each, so a link to the bill needs it.
+        "congress": congress_of_date(e.date),
+        "kind": e.kind, "name": e.name, "text": e.text, "billId": e.bill_id,
+        "billLabel": bill_label(e.bill_id), "isResolution": is_resolution(e.bill_id),
+        "nextStep": _next_step(e),
+        "time": e.time, "pages": e.pages, "date": e.date, "chamber": e.chamber,
+    }
+
+
+def _vote(rc: RollCall) -> dict:
+    return {
+        "chamber": rc.chamber, "congress": rc.congress, "session": rc.session, "number": rc.number,
+        "date": rc.date, "question": rc.question, "title": rc.title, "result": rc.result,
+        "rejected": rc.rejected, "majorityRequirement": rc.majority_requirement,
+        "yeas": rc.yeas, "nays": rc.nays, "present": rc.present, "notVoting": rc.not_voting,
+        "billId": rc.bill_id, "billLabel": bill_label(rc.bill_id), "sourceUrl": rc.source_url,
+    }
+
+
+def _counts(events: list[CongressEvent], votes: list[RollCall]) -> dict:
+    passed = [e for e in events if e.kind == "passed"]
+    return {
+        "recordVotes": len(votes),
+        "billsPassed": sum(1 for e in passed if not is_resolution(e.bill_id)),
+        "resolutionsPassed": sum(1 for e in passed if is_resolution(e.bill_id)),
+        "failed": sum(1 for e in events if e.kind == "failed"),
+        "reported": sum(1 for e in events if e.kind == "reported"),
+        "confirmed": sum(nominations_in(e.text) for e in events if e.kind == "confirmed"),
+        "confirmedLists": sum(1 for e in events if e.kind == "confirmed" and is_routine_list(e.text)),
+        "committeeMeetings": sum(1 for e in events if e.kind == "committee"),
+    }
+
+
+# ── A day ─────────────────────────────────────────────────────────
+
+def _minutes(convened: str | None, adjourned: str | None) -> int | None:
+    """Minutes between two of the record's clock times ("2:30 p.m.",
+    "2:33:35 P.M.", "12 noon"), or None when either is missing or the
+    day ran past midnight."""
+    def parse(t: str | None) -> int | None:
+        if not t:
+            return None
+        t = t.lower().replace(" ", "")
+        if "noon" in t:
+            return 12 * 60
+        m = re.match(r"(\d{1,2})(?::(\d{2}))?(?::\d{2})?([ap])\.?m\.?", t)
+        if not m:
+            return None
+        hour = int(m.group(1)) % 12 + (12 if m.group(3) == "p" else 0)
+        return hour * 60 + int(m.group(2) or 0)
+    a, b = parse(convened), parse(adjourned)
+    return b - a if a is not None and b is not None and b >= a else None
+
+
+def _session_length(minutes: int) -> str:
+    """ "under a minute" for a sitting that opened and closed inside one
+    minute (a pro forma session often does), not "0 minutes"."""
+    return "under a minute" if minutes < 1 else _plural(minutes, "minute")
+
+
+def _chamber_sentence(chamber: str, day: dict) -> str:
+    name = _CHAMBER_NAME[chamber]
+    status = day["status"]
+    if status == "not_in_session":
+        return f"The {name} did not meet."
+    if status == "no_record":
+        return f"No record of the {name} for this day yet."
+    if status == "no_record_published":
+        return f"The {name} has no Congressional Record for this day."
+    c = day["counts"]
+    parts = []
+    if c["billsPassed"]:
+        parts.append("passed " + _plural(c["billsPassed"], "bill"))
+    if c["resolutionsPassed"]:
+        parts.append("agreed to " + _plural(c["resolutionsPassed"], "resolution"))
+    if confirmed := _confirmed_phrase(c):
+        parts.append(confirmed)
+    if c["recordVotes"]:
+        parts.append("took " + _plural(c["recordVotes"], "record vote"))
+    if parts:
+        return f"The {name} {_list_phrase(parts)}."
+    minutes = day["minutesInSession"]
+    if "pro forma session" in (day.get("adjournmentText") or "").lower():
+        length = f" for {_session_length(minutes)}" if minutes is not None else ""
+        return f"The {name} met in pro forma session{length}."
+    if minutes is not None and minutes < 60:
+        return f"The {name} met for {_session_length(minutes)} and took no record votes."
+    return f"The {name} met and took no record votes."
+
+
+def _source_outcome(run: dict | None, day_iso: str, chamber: str) -> str | None:
+    if not run:
+        return None
+    return ((run.get("floorLogs") or {}).get(day_iso) or {}).get(chamber)
+
+
+# GPO posts a day's Record by the next evening; a Record still missing
+# three days on was not published.
+_RECORD_SETTLED_DAYS = 3
+
+
+def record_not_published(db: Session, day: date, run: dict | None) -> bool:
+    """Whether the Congressional Record for `day` is known not to exist.
+    GPO publishes it for every day either chamber is in session, so this
+    is how a day with no session looks; the page says what is known — no
+    Record — rather than asserting who met (GPO very rarely prints two
+    small consecutive days as one issue). Known two ways: the back-fill
+    cursor is past the day (it stops before any day it could not read),
+    or the last run found no Record for a day at least three days old."""
+    if day <= digest_cursor(db):
+        return True
+    iso = day.isoformat()
+    settled = day <= eastern_today() - timedelta(days=_RECORD_SETTLED_DAYS)
+    return settled and ((run or {}).get("digests") or {}).get(iso) == "absent"
+
+
+def chamber_day(row: CongressDay | None, events: list[CongressEvent], votes: list[RollCall],
+                run: dict | None, day_iso: str, chamber: str, no_record_published: bool = False) -> dict:
+    if row is None:
+        status = "live" if votes else ("no_record_published" if no_record_published else "no_record")
+    elif not row.in_session:
+        status = "not_in_session"
+    else:
+        status = "final" if row.is_final else "live"
+    digest = [e for e in events if e.source == "digest"]
+    floor = sorted((e for e in events if e.source == "floor_log"), key=lambda e: e.seq)
+    by_kind = defaultdict(list)
+    for e in sorted(digest, key=lambda e: e.seq):
+        by_kind[e.kind].append(_event(e))
+    out = {
+        "chamber": chamber,
+        "status": status,
+        "convenedAt": row.convened_at if row else None,
+        "adjournedAt": row.adjourned_at if row else None,
+        "minutesInSession": _minutes(row.convened_at, row.adjourned_at) if row else None,
+        "adjournmentText": row.adjournment_text if row else "",
+        "nextMeeting": row.next_meeting if row else None,
+        "nextProgram": row.next_program if row else "",
+        "billsIntroduced": row.bills_introduced if row else None,
+        "resolutionsIntroduced": row.resolutions_introduced if row else None,
+        "introducedText": row.introduced_text if row else "",
+        "source": row.source if row else None,
+        "sourceUrl": row.source_url if row else None,
+        "fetchedAt": row.fetched_at.isoformat() if row and row.fetched_at else None,
+        # The last run's outcome for this day's floor log: "failed" lets the
+        # page say the log is unavailable instead of showing nothing.
+        "floorLogStatus": _source_outcome(run, day_iso, chamber),
+        "counts": _counts(digest, votes),
+        "votes": [_vote(v) for v in sorted(votes, key=lambda v: v.number)],
+        "passed": by_kind["passed"],
+        "failed": by_kind["failed"],
+        "reported": by_kind["reported"],
+        "confirmed": by_kind["confirmed"],
+        "committees": by_kind["committee"],
+        "floorLog": [_event(e) for e in floor],
+    }
+    out["sentence"] = _chamber_sentence(chamber, out)
+    return out
+
+
+def session_days(db: Session) -> list[str]:
+    """Every day either chamber met (in session, or held a roll call), oldest first."""
+    days = {d for (d,) in db.query(CongressDay.date).filter(CongressDay.in_session.is_(True))}
+    days |= {d for (d,) in db.query(RollCall.date).distinct()}
+    return sorted(d for d in days if d)
+
+
+def record_span(db: Session) -> tuple[date, date] | None:
+    """(the first day either chamber is on record as meeting, today): the
+    dates a report can say anything about. Outside it a report is only
+    placeholders ("no record of the Senate for this day yet"), and a page
+    for every such date is an unbounded set of pages a crawler can walk
+    (2026-10: one walked dates into 2027 from rotating addresses, each
+    counted as a new visitor). None before anything is recorded."""
+    days = session_days(db)
+    return (date.fromisoformat(days[0]), eastern_today()) if days else None
+
+
+def latest_day(db: Session) -> date | None:
+    today = eastern_today().isoformat()
+    past = [d for d in session_days(db) if d <= today]
+    return date.fromisoformat(past[-1]) if past else None
+
+
+# ── The next meeting ──────────────────────────────────────────────
+
+_MONTHS = {name: i for i, name in enumerate(calendar.month_name) if name}
+# The Record's own wording for a next meeting: the Digest's "3:30 p.m.,
+# Tuesday, October 13" or the floor log's "...reconvene at 3:30 p.m.
+# Tuesday, October 13, 2026." Month names are the format, not a guess.
+_MEETING_DATE_RE = re.compile(r"\b(" + "|".join(_MONTHS) + r")\s+(\d{1,2})(?:,\s*(\d{4}))?")
+
+
+def meeting_date(text: str | None, written_on: date) -> date | None:
+    """The date in a next-meeting notice. A notice without a year names the
+    first such date after the day it was written (December's notice can
+    name a day in January)."""
+    m = _MEETING_DATE_RE.search(text or "")
+    if not m:
+        return None
+    month, day = _MONTHS[m.group(1)], int(m.group(2))
+    year = int(m.group(3)) if m.group(3) else written_on.year + (month < written_on.month)
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def next_meeting(db: Session, chamber: str, today: date) -> tuple[date | None, str]:
+    """When `chamber` next meets, from the newest notice written on or
+    before `today` (each day's Record, or the floor log until the Digest
+    arrives, names it), and that meeting's program as the Digest prints it
+    ("Program for Tuesday: Senate will meet in a pro forma session."), ""
+    when no notice of that meeting gives one. (None, "") when no notice
+    names a day from `today` on: a notice that has passed says nothing
+    about what comes next."""
+    notices = (
+        db.query(CongressDay)
+        .filter(CongressDay.chamber == chamber, CongressDay.next_meeting.isnot(None),
+                CongressDay.date <= today.isoformat())
+        .order_by(CongressDay.date.desc())
+        .limit(5)
+        .all()
+    )
+    if not notices:
+        return None, ""
+    when = meeting_date(notices[0].next_meeting, date.fromisoformat(notices[0].date))
+    if when is None or when < today:
+        return None, ""
+    # The floor log names the meeting without its program; the Digest of
+    # the same or an earlier day may give it.
+    program = next(
+        (n.next_program for n in notices
+         if n.next_program and meeting_date(n.next_meeting, date.fromisoformat(n.date)) == when),
+        "",
+    )
+    return when, program
+
+
+# What counts as business, for "Congress is out": floor action — a record
+# vote, or a measure or nomination the Digest records as passed, failed or
+# confirmed. A pro forma sitting is not, and neither is a committee report
+# filed during one: the House files them through a recess (three in the
+# week of 2026-10-05, when neither chamber voted or passed anything), and
+# counting them opened that week of zeros as "the last week of business".
+_BUSINESS_KINDS = ("passed", "failed", "confirmed")
+
+
+def last_business_day(db: Session, on_or_before: date) -> date | None:
+    """The latest day, up to `on_or_before`, either chamber took a record
+    vote or passed, failed or confirmed anything on the floor."""
+    iso = on_or_before.isoformat()
+    voted = db.query(func.max(RollCall.date)).filter(RollCall.date <= iso).scalar()
+    acted = db.query(func.max(CongressEvent.date)).filter(
+        CongressEvent.date <= iso, CongressEvent.kind.in_(_BUSINESS_KINDS),
+    ).scalar()
+    best = max((d for d in (voted, acted) if d), default=None)
+    return date.fromisoformat(best) if best else None
+
+
+def _long_date(d: date) -> str:
+    return f"{d:%A, %B} {d.day}"
+
+
+def recess(db: Session, report: dict) -> dict | None:
+    """For the latest day's report: when neither chamber did business that
+    day (a pro forma sitting, a two-minute House session), what /congress
+    leads with instead of a day of zeros — that Congress is out, since
+    when, when each chamber next sits as the record gives it, and the week
+    of the last business to show. None when the day had business, or a
+    chamber's day is still on the live floor log (it may yet have some)."""
+    day = date.fromisoformat(report["date"])
+    chambers = report["chambers"]
+    if any(chambers[c]["status"] == "live" for c in CHAMBERS):
+        return None
+    last = last_business_day(db, day)
+    if last == day:
+        return None
+    sentences = [
+        "Neither chamber has taken a record vote or passed or confirmed anything since "
+        f"{_long_date(last)}." if last else "Neither chamber has taken a record vote or passed anything on record."
+    ]
+    nxt = []
+    for c in CHAMBERS:
+        when = chambers[c]["nextMeeting"]
+        if not when:
+            continue
+        pro_forma = "pro forma" in (chambers[c]["nextProgram"] or "").lower()
+        nxt.append(f"the {_CHAMBER_NAME[c]} at {when}" + (", in a pro forma session" if pro_forma else ""))
+    if nxt:
+        sentences.append(f"Next sittings on the record: {'; '.join(nxt)}.")
+    return {
+        "headline": "Congress is out",
+        "sentence": " ".join(sentences),
+        "lastBusinessDay": last.isoformat() if last else None,
+        # The week to open: the last one with business, else the latest day's.
+        "week": week_bounds(last or day)[0].isoformat(),
+    }
+
+
+def day_report(db: Session, day: date) -> dict:
+    iso = day.isoformat()
+    rows = {r.chamber: r for r in db.query(CongressDay).filter(CongressDay.date == iso)}
+    events = db.query(CongressEvent).filter(CongressEvent.date == iso).all()
+    votes = db.query(RollCall).filter(RollCall.date == iso).all()
+    run = last_run(db)
+    unpublished = not rows and not votes and record_not_published(db, day, run)
+    chambers = {
+        c: chamber_day(rows.get(c), [e for e in events if e.chamber == c],
+                       [v for v in votes if v.chamber == c], run, iso, c, no_record_published=unpublished)
+        for c in CHAMBERS
+    }
+    met = session_days(db)
+    earlier = [d for d in met if d < iso]
+    later = [d for d in met if d > iso]
+    return {
+        "date": iso,
+        "sentence": (
+            "No Congressional Record was published for this day. It is published for every day either chamber is in session."
+            if unpublished else " ".join(chambers[c]["sentence"] for c in CHAMBERS)
+        ),
+        "chambers": chambers,
+        "previousDay": earlier[-1] if earlier else None,
+        "nextDay": later[0] if later else None,
+        "syncedAt": (run or {}).get("finishedAt"),
+    }
+
+
+# ── A week or a month ─────────────────────────────────────────────
+
+def _period(db: Session, start: date, end: date) -> dict:
+    """Everything recorded from start through end, inclusive."""
+    s, e = start.isoformat(), end.isoformat()
+    rows = db.query(CongressDay).filter(CongressDay.date >= s, CongressDay.date <= e).all()
+    events = db.query(CongressEvent).filter(
+        CongressEvent.date >= s, CongressEvent.date <= e, CongressEvent.source == "digest",
+    ).all()
+    votes = db.query(RollCall).filter(RollCall.date >= s, RollCall.date <= e).all()
+    return {"rows": rows, "events": events, "votes": votes}
+
+
+def _totals(p: dict, chamber: str) -> dict:
+    rows = [r for r in p["rows"] if r.chamber == chamber]
+    events = [e for e in p["events"] if e.chamber == chamber]
+    votes = [v for v in p["votes"] if v.chamber == chamber]
+    days_in_session = {r.date for r in rows if r.in_session} | {v.date for v in votes}
+    counts = _counts(events, votes)
+    counts["daysInSession"] = len(days_in_session)
+    counts["billsIntroduced"] = sum(r.bills_introduced or 0 for r in rows)
+    counts["resolutionsIntroduced"] = sum(r.resolutions_introduced or 0 for r in rows)
+    # Days whose record is still the live floor log: their passed/reported
+    # entries arrive with the Digest, so these totals can still grow.
+    counts["daysPending"] = sum(1 for r in rows if r.in_session and not r.is_final)
+    return counts
+
+
+def _period_sentence(totals: dict) -> str:
+    sentences = []
+    for chamber in CHAMBERS:
+        t = totals[chamber]
+        name = _CHAMBER_NAME[chamber]
+        if not t["daysInSession"]:
+            sentences.append(f"The {name} did not meet.")
+            continue
+        parts = ["met " + _plural(t["daysInSession"], "day")]
+        if t["recordVotes"]:
+            parts.append("took " + _plural(t["recordVotes"], "record vote"))
+        if t["billsPassed"]:
+            parts.append("passed " + _plural(t["billsPassed"], "bill"))
+        if confirmed := _confirmed_phrase(t):
+            parts.append(confirmed)
+        if len(parts) == 1:
+            parts.append("took no record votes")
+        sentences.append(f"The {name} {_list_phrase(parts)}.")
+    return " ".join(sentences)
+
+
+# Congress.gov's own words for the President signing a bill, the day it
+# becomes law, before the law number is assigned.
+_SIGNED_RE = re.compile(r"^signed by (?:the )?president\b", re.IGNORECASE)
+
+
+def _became_law(db: Session, start: date, end: date) -> list[dict]:
+    """Bills that became law in the period: Congress.gov's list of the
+    Congress's laws, each on the day it became law (bill_refresh.sync_laws),
+    and a bill signed in the period whose law number isn't on that list yet,
+    from the sponsored-bill rows (its latest action is the signing)."""
+    s, e = start.isoformat(), end.isoformat()
+    seen: dict[tuple[str, int | None], dict] = {}
+    for congress in sorted({congress_of_date(s), congress_of_date(e)} - {None}):
+        for bill_id, law in stored_laws(db, congress).items():
+            if s <= law["date"] <= e:
+                seen[(bill_id, congress)] = {
+                    "billId": bill_id, "billLabel": bill_label(bill_id), "name": law["title"], "congress": congress,
+                    "date": law["date"], "text": f"Became {law['kind']} Law No: {law['law']}.",
+                }
+    for model in (SponsoredBill, RepSponsoredBill):
+        for b in db.query(model).filter(
+            model.is_law.is_(True), model.latest_action_date >= s, model.latest_action_date <= e,
+        ):
+            if (b.bill_id, b.congress) in seen or b.bill_id in stored_laws(db, b.congress):
+                continue  # on the list, under the day it became law
+            if became_law_action(b.latest_action) or _SIGNED_RE.match(b.latest_action or ""):
+                seen[(b.bill_id, b.congress)] = {
+                    "billId": b.bill_id, "billLabel": bill_label(b.bill_id), "name": b.title,
+                    "congress": b.congress, "date": b.latest_action_date, "text": b.latest_action,
+                }
+    return sorted(seen.values(), key=lambda b: (b["date"], b["billId"]))
+
+
+def period_report(db: Session, start: date, end: date) -> dict:
+    p = _period(db, start, end)
+    totals = {c: _totals(p, c) for c in CHAMBERS}
+    passed = sorted((e for e in p["events"] if e.kind == "passed"), key=lambda e: (e.date, e.seq))
+    both = [_event(e) for e in passed if passed_both_chambers(e.bill_id, e.chamber, e.text)]
+    # A bill that passed its first chamber and then its second in the same
+    # period is listed once, as through both.
+    cleared = {b["billId"] for b in both}
+    one = [_event(e) for e in passed
+           if not is_resolution(e.bill_id) and e.bill_id and e.bill_id not in cleared
+           and not passed_both_chambers(e.bill_id, e.chamber, e.text)]
+    decided = [v for v in p["votes"] if v.yeas + v.nays > 0]
+    closest = sorted(decided, key=lambda v: (votes_from_threshold(v), v.date, v.number))[:3]
+
+    days = []
+    run = last_run(db)
+    d = start
+    while d <= end:
+        iso = d.isoformat()
+        entry = {"date": iso}
+        nothing = not any(r.date == iso for r in p["rows"]) and not any(v.date == iso for v in p["votes"])
+        entry["noRecordPublished"] = nothing and record_not_published(db, d, run)
+        for c in CHAMBERS:
+            row = next((r for r in p["rows"] if r.chamber == c and r.date == iso), None)
+            votes = [v for v in p["votes"] if v.chamber == c and v.date == iso]
+            events = [e for e in p["events"] if e.chamber == c and e.date == iso]
+            in_session = bool(votes) or bool(row and row.in_session)
+            entry[c] = {
+                "inSession": in_session,
+                "recorded": row is not None or bool(votes),
+                "convenedAt": row.convened_at if row else None,
+                "adjournedAt": row.adjourned_at if row else None,
+                "minutesInSession": _minutes(row.convened_at, row.adjourned_at) if row else None,
+                "counts": _counts(events, votes),
+            }
+        days.append(entry)
+        d += timedelta(days=1)
+
+    return {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "sentence": _period_sentence(totals),
+        "totals": totals,
+        "days": days,
+        "passedBothChambers": both,
+        "passedOneChamber": one,
+        "closestVotes": [_vote(v) for v in closest],
+        "votes": [_vote(v) for v in sorted(p["votes"], key=lambda v: (v.date, v.chamber, v.number))],
+        "becameLaw": _became_law(db, start, end),
+        "syncedAt": (last_run(db) or {}).get("finishedAt"),
+    }
+
+
+def week_bounds(day: date) -> tuple[date, date]:
+    monday = day - timedelta(days=day.weekday())
+    return monday, monday + timedelta(days=6)
+
+
+def month_bounds(year: int, month: int) -> tuple[date, date]:
+    start = date(year, month, 1)
+    nxt = date(year + (month == 12), month % 12 + 1, 1)
+    return start, nxt - timedelta(days=1)
+
+
+def _on_record(span: tuple[date, date] | None, first: date, last: date) -> bool:
+    """Whether a period overlaps the days on record (record_span)."""
+    return span is not None and last >= span[0] and first <= span[1]
+
+
+def week_report(db: Session, day: date) -> dict:
+    start, end = week_bounds(day)
+    out = period_report(db, start, end)
+    # Only a neighbour with a record to show: an always-present link let a
+    # crawler walk weeks without end in both directions.
+    span = record_span(db)
+    before, after = start - timedelta(days=7), start + timedelta(days=7)
+    out["previous"] = before.isoformat() if _on_record(span, before, before + timedelta(days=6)) else None
+    out["next"] = after.isoformat() if _on_record(span, after, after + timedelta(days=6)) else None
+    return out
+
+
+def month_report(db: Session, year: int, month: int) -> dict:
+    start, end = month_bounds(year, month)
+    out = period_report(db, start, end)
+    weeks = []
+    monday, _ = week_bounds(start)
+    while monday <= end:
+        w_start, w_end = max(monday, start), min(monday + timedelta(days=6), end)
+        p = _period(db, w_start, w_end)
+        totals = {c: _totals(p, c) for c in CHAMBERS}
+        weeks.append({"week": monday.isoformat(), "start": w_start.isoformat(), "end": w_end.isoformat(),
+                      "sentence": _period_sentence(totals), "totals": totals})
+        monday += timedelta(days=7)
+    out["weeks"] = weeks
+    span = record_span(db)
+    before = month_bounds((start - timedelta(days=1)).year, (start - timedelta(days=1)).month)
+    after = month_bounds((end + timedelta(days=1)).year, (end + timedelta(days=1)).month)
+    out["previous"] = before[0].strftime("%Y-%m") if _on_record(span, *before) else None
+    out["next"] = after[0].strftime("%Y-%m") if _on_record(span, *after) else None
+    return out
+
+
+def bill_days(db: Session, bill_id: str, congress: int) -> list[dict]:
+    """The days a bill appears in the Congress record (for its detail
+    page's "in the daily reports" list): Digest entries and roll calls, of
+    `congress` only — H.R. 1 of one Congress is another bill from H.R. 1 of
+    the next."""
+    rows = [e for e in db.query(CongressEvent).filter(CongressEvent.bill_id == bill_id)
+            if congress_of_date(e.date) == congress]
+    out: dict[tuple[str, str], dict] = {}
+    for e in rows:
+        out.setdefault((e.date, e.chamber), {"date": e.date, "chamber": e.chamber, "entries": []})["entries"].append(
+            {"kind": e.kind, "text": e.text, "source": e.source})
+    for v in db.query(RollCall).filter(RollCall.bill_id == bill_id, RollCall.congress == congress):
+        out.setdefault((v.date, v.chamber), {"date": v.date, "chamber": v.chamber, "entries": []})["entries"].append(
+            {"kind": "vote", "text": f"{v.question}: {v.result}, {v.yeas}-{v.nays}", "source": "roll_call"})
+    return sorted(out.values(), key=lambda d: d["date"], reverse=True)

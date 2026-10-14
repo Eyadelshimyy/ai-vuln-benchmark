@@ -1,0 +1,169 @@
+from dataclasses import dataclass
+import logging
+
+from homeassistant.components import sensor
+from homeassistant.components.sensor import SensorDeviceClass
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity import Entity
+from homeassistant.helpers.entity_registry import RegistryEntry
+
+from custom_components.powercalc.common import create_source_entity
+from custom_components.powercalc.const import (
+    CONF_SENSOR_TYPE,
+    DATA_CONFIGURED_ENTITIES,
+    DATA_ENTITIES,
+    DOMAIN,
+    ENTRY_DATA_ENERGY_ENTITY,
+    ENTRY_DATA_POWER_ENTITY,
+    SensorType,
+)
+from custom_components.powercalc.discovery import get_power_profile_by_source_entity
+from custom_components.powercalc.power_profile.power_profile import SUPPORTED_DOMAINS
+from custom_components.powercalc.sensors.energy import RealEnergySensor
+from custom_components.powercalc.sensors.power import RealPowerSensor
+from custom_components.powercalc.sensors.utility_meter import VirtualUtilityMeter
+
+from .filter import CompositeFilter, DomainFilter, EntityFilter, LambdaFilter, get_filtered_entity_list
+
+_LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class FindEntitiesResult:
+    resolved: list[Entity]
+    discoverable: list[str]
+
+
+async def find_entities(
+    hass: HomeAssistant,
+    entity_filter: EntityFilter | None = None,
+    include_non_powercalc: bool = True,
+    exclude_utility_meters: bool = True,
+) -> FindEntitiesResult:
+    """
+    Based on the given entity filter, fetch all power and energy sensors from the HA instance.
+    """
+    domain_data = hass.data.get(DOMAIN, {})
+
+    source_entity_powercalc_entity_map: dict[str, list[tuple[Entity, bool]]] = domain_data.get(
+        DATA_CONFIGURED_ENTITIES,
+        {},
+    )
+    powercalc_entities: dict[str, Entity] = domain_data.get(
+        DATA_ENTITIES,
+        {},
+    )
+
+    resolved_entities: list[Entity] = []
+    discoverable_entities: list[str] = []
+
+    source_entities = get_filtered_entity_list(hass, _build_filter(hass, entity_filter, include_non_powercalc))
+
+    if _LOGGER.isEnabledFor(logging.DEBUG):  # pragma: no cover
+        _LOGGER.debug("Source entities: %s", [entity.entity_id for entity in source_entities])
+
+    for entity_entry in source_entities:
+        entity_id = entity_entry.entity_id
+
+        mapped = source_entity_powercalc_entity_map.get(entity_id)
+        if mapped:
+            resolved_entities.extend(entity for entity, _ in mapped)
+            continue
+
+        existing = powercalc_entities.get(entity_id)
+        if existing:
+            resolved_entities.append(existing)
+            continue
+
+        real_sensor = _create_real_sensor(entity_entry)
+        if real_sensor:
+            resolved_entities.append(real_sensor)
+            continue
+
+        if await _is_discoverable_source_entity(hass, entity_entry):
+            discoverable_entities.append(entity_id)
+
+    if exclude_utility_meters:
+        resolved_entities = [entity for entity in resolved_entities if not isinstance(entity, VirtualUtilityMeter)]
+
+    if _LOGGER.isEnabledFor(logging.DEBUG):  # pragma: no cover
+        _LOGGER.debug("Resolved entities: %s", [entity.entity_id for entity in resolved_entities])
+        _LOGGER.debug("Discoverable entities: %s", discoverable_entities)
+
+    return FindEntitiesResult(resolved_entities, discoverable_entities)
+
+
+def _is_source_entity_eligible(
+    hass: HomeAssistant,
+    entity_entry: RegistryEntry,
+    include_non_powercalc: bool,
+) -> bool:
+    """Return whether a registry entity is eligible for Powercalc discovery."""
+    if entity_entry.platform != DOMAIN:
+        return include_non_powercalc or entity_entry.domain != sensor.DOMAIN
+
+    # YAML-created Powercalc entities have no config entry and are classified by their runtime type later.
+    if entity_entry.config_entry_id is None:
+        return True
+
+    config_entry = hass.config_entries.async_get_entry(entity_entry.config_entry_id)
+    if config_entry is None:
+        return False
+
+    if config_entry.data.get(CONF_SENSOR_TYPE) == SensorType.GROUP:
+        return False
+
+    main_entity_ids = {
+        config_entry.data.get(ENTRY_DATA_POWER_ENTITY),
+        config_entry.data.get(ENTRY_DATA_ENERGY_ENTITY),
+    }
+    return entity_entry.entity_id in main_entity_ids
+
+
+def _create_real_sensor(entity_entry: RegistryEntry) -> Entity | None:
+    if entity_entry.domain != sensor.DOMAIN:
+        return None
+
+    device_class = entity_entry.device_class or entity_entry.original_device_class
+    if device_class == SensorDeviceClass.POWER:
+        return RealPowerSensor(entity_entry.entity_id, entity_entry.unit_of_measurement)
+    if device_class == SensorDeviceClass.ENERGY:
+        return RealEnergySensor(entity_entry.entity_id)
+    return None  # pragma: no cover
+
+
+async def _is_discoverable_source_entity(hass: HomeAssistant, entity_entry: RegistryEntry) -> bool:
+    power_profile = await get_power_profile_by_source_entity(
+        hass,
+        create_source_entity(entity_entry.entity_id, hass),
+    )
+    return bool(
+        power_profile
+        and not await power_profile.needs_user_configuration
+        and power_profile.is_entity_domain_supported(entity_entry),
+    )
+
+
+def _build_filter(
+    hass: HomeAssistant,
+    entity_filter: EntityFilter | None,
+    include_non_powercalc: bool,
+) -> EntityFilter:
+    base_filter = CompositeFilter(
+        [
+            DomainFilter(SUPPORTED_DOMAINS),
+            LambdaFilter(lambda entity: _is_source_entity_eligible(hass, entity, include_non_powercalc)),
+            LambdaFilter(lambda entity: entity.platform != "utility_meter"),
+            LambdaFilter(lambda entity: not str(entity.unique_id).startswith("powercalc_standby_group")),
+            LambdaFilter(lambda entity: "tracked_" not in str(entity.unique_id)),
+            LambdaFilter(
+                lambda entity: (
+                    entity.platform != "tasmota" or not str(entity.entity_id).endswith(("_yesterday", "_today"))
+                ),
+            ),
+        ],
+    )
+    if not entity_filter:
+        return base_filter
+
+    return CompositeFilter([base_filter, entity_filter])

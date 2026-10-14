@@ -1,0 +1,183 @@
+{
+  "repos": {
+    "anyconfig": {
+      "flagged": 1,
+      "labels": {
+        "SINK_REACHED_INPUT_ABSENT": 1
+      },
+      "categories": {
+        "REFUTED": 1
+      }
+    },
+    "fabric": {
+      "flagged": 1,
+      "labels": {
+        "NO_INPUT_CHANNEL": 1
+      },
+      "categories": {
+        "REFUTED": 1
+      }
+    },
+    "feedparser": {
+      "flagged": 0,
+      "labels": {},
+      "categories": {}
+    },
+    "invoke": {
+      "flagged": 6,
+      "labels": {
+        "CONFIRMED_EXPLOIT": 1,
+        "EXECUTED_NO_SINK": 3,
+        "SINK_REACHED_INPUT_ABSENT": 1,
+        "CONSTRUCTION_FAILED": 1
+      },
+      "categories": {
+        "CONFIRMED": 1,
+        "REFUTED": 4,
+        "COVERAGE_GAP": 1
+      }
+    },
+    "joblib": {
+      "flagged": 8,
+      "labels": {
+        "NO_INPUT_CHANNEL": 2,
+        "EXECUTED_NO_SINK": 3,
+        "CMD_ARGV_NOT_SHELL": 1,
+        "CONFIRMED_EXPLOIT": 1,
+        "SINK_REACHED_INPUT_ABSENT": 1
+      },
+      "categories": {
+        "REFUTED": 7,
+        "CONFIRMED": 1
+      }
+    },
+    "micawber": {
+      "flagged": 5,
+      "labels": {
+        "NO_INPUT_CHANNEL": 3,
+        "LIVE_RUN_FAILED": 2
+      },
+      "categories": {
+        "REFUTED": 3,
+        "COVERAGE_GAP": 2
+      }
+    },
+    "paramiko": {
+      "flagged": 8,
+      "labels": {
+        "CONFIRMED_EXPLOIT": 6,
+        "EXECUTED_NO_SINK": 1,
+        "NO_INPUT_CHANNEL": 1
+      },
+      "categories": {
+        "CONFIRMED": 6,
+        "REFUTED": 2
+      }
+    },
+    "peewee": {
+      "flagged": 6,
+      "labels": {
+        "CONSTRUCTION_FAILED": 2,
+        "EXECUTED_NO_SINK": 3,
+        "CONFIRMED_EXPLOIT": 1
+      },
+      "categories": {
+        "COVERAGE_GAP": 2,
+        "REFUTED": 3,
+        "CONFIRMED": 1
+      }
+    },
+    "plumbum": {
+      "flagged": 7,
+      "labels": {
+        "NO_INPUT_CHANNEL": 3,
+        "EXECUTED_NO_SINK": 3,
+        "CONSTRUCTION_FAILED": 1
+      },
+      "categories": {
+        "REFUTED": 6,
+        "COVERAGE_GAP": 1
+      }
+    },
+    "pyshorteners": {
+      "flagged": 0,
+      "labels": {},
+      "categories": {}
+    },
+    "sqlite-utils": {
+      "flagged": 15,
+      "labels": {
+        "EXECUTED_NO_SINK": 2,
+        "CONFIRMED_EXPLOIT": 2,
+        "INPUT_IN_SQL_PAYLOAD_MISMATCH": 3,
+        "INPUT_IN_SQL_RAN_SAFE": 1,
+        "INPUT_NOT_IN_SQL": 1,
+        "NO_INPUT_CHANNEL": 5,
+        "SKIPPED_NO_STRATEGY": 1
+      },
+      "categories": {
+        "REFUTED": 9,
+        "CONFIRMED": 2,
+        "ORACLE_GAP": 3,
+        "SKIPPED": 1
+      }
+    },
+    "tinydb": {
+      "flagged": 2,
+      "labels": {
+        "CONFIRMED_EXPLOIT": 2
+      },
+      "categories": {
+        "CONFIRMED": 2
+      }
+    },
+    "vela_slides_ai": {
+      "flagged": 24,
+      "labels": {
+        "EXECUTED_NO_SINK": 6,
+        "INPUT_NOT_IN_SQL": 1,
+        "CONFIRMED_EXPLOIT": 3,
+        "RECOVERED": 1,
+        "NO_INPUT_CHANNEL": 4,
+        "CMD_ARGV_NOT_SHELL": 2,
+        "LIVE_RUN_FAILED": 4,
+        "SINK_REACHED_INPUT_ABSENT": 2,
+        "PATH_TRAVERSAL_NO_OBSERVABLE": 1
+      },
+      "categories": {
+        "REFUTED": 15,
+        "CONFIRMED": 4,
+        "COVERAGE_GAP": 4,
+        "ORACLE_GAP": 1
+      }
+    }
+  },
+  "skipped_repos": [],
+  "failed_repos": {},
+  "total_flagged": 83,
+  "overall_categories": {
+    "REFUTED": 51,
+    "CONFIRMED": 17,
+    "COVERAGE_GAP": 10,
+    "ORACLE_GAP": 4,
+    "SKIPPED": 1
+  },
+  "overall_labels": {
+    "SINK_REACHED_INPUT_ABSENT": 5,
+    "NO_INPUT_CHANNEL": 19,
+    "CONFIRMED_EXPLOIT": 16,
+    "EXECUTED_NO_SINK": 21,
+    "CONSTRUCTION_FAILED": 4,
+    "CMD_ARGV_NOT_SHELL": 3,
+    "LIVE_RUN_FAILED": 6,
+    "INPUT_IN_SQL_PAYLOAD_MISMATCH": 3,
+    "INPUT_IN_SQL_RAN_SAFE": 1,
+    "INPUT_NOT_IN_SQL": 2,
+    "SKIPPED_NO_STRATEGY": 1,
+    "RECOVERED": 1,
+    "PATH_TRAVERSAL_NO_OBSERVABLE": 1
+  },
+  "crafter": "qwen2.5-coder:7b",
+  "use": "ground_truth",
+  "max_agent": 4
+}

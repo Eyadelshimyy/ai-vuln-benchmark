@@ -1,0 +1,28 @@
+{
+  "repo": "markus-michalski__project-hub",
+  "file": "servers/project-hub-server/tools/docs_writer.py",
+  "function": "write_note_to_disk",
+  "line": 19,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Write a note to the appropriate subfolder under docs_path.\n\nReturns the absolute path of the written file.",
+  "prompt_source": "def write_note_to_disk(docs_path: str, title: str, content: str, note_type: str) -> str:\n    \"\"\"Write a note to the appropriate subfolder under docs_path.\n\n    Returns the absolute path of the written file.\n    \"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def write_note_to_disk(docs_path: str, title: str, content: str, note_type: str) -> str:\n    \"\"\"Write a note to the appropriate subfolder under docs_path.\n\n    Returns the absolute path of the written file.\n    \"\"\"\n    base = Path(docs_path)\n    subfolder = _TYPE_TO_SUBFOLDER.get(note_type, \"misc\")\n    folder = base / subfolder\n    folder.mkdir(parents=True, exist_ok=True)\n\n    if note_type == \"action-item\":\n        file_path = folder / _TODO_FILENAME\n        _append_action_item(file_path, title)\n    else:\n        today = date.today().isoformat()\n        slug = _slugify(title)\n        filename = f\"{today}-{slug}.md\"\n        file_path = folder / filename\n        file_path.write_text(_render_note(title, content, note_type), encoding=\"utf-8\")\n\n    return str(file_path)",
+  "module_source": "\"\"\"Write note content as markdown files to docs_path subfolders.\"\"\"\nfrom __future__ import annotations\n\nimport re\nfrom datetime import date\nfrom pathlib import Path\n\n_TYPE_TO_SUBFOLDER: dict[str, str] = {\n    \"meeting-notes\": \"meeting-notes\",\n    \"email\": \"emails\",\n    \"action-item\": \"misc\",\n    \"decision\": \"misc\",\n    \"note\": \"misc\",\n}\n\n_TODO_FILENAME = \"todo.md\"\n\n\ndef write_note_to_disk(docs_path: str, title: str, content: str, note_type: str) -> str:\n    \"\"\"Write a note to the appropriate subfolder under docs_path.\n\n    Returns the absolute path of the written file.\n    \"\"\"\n    base = Path(docs_path)\n    subfolder = _TYPE_TO_SUBFOLDER.get(note_type, \"misc\")\n    folder = base / subfolder\n    folder.mkdir(parents=True, exist_ok=True)\n\n    if note_type == \"action-item\":\n        file_path = folder / _TODO_FILENAME\n        _append_action_item(file_path, title)\n    else:\n        today = date.today().isoformat()\n        slug = _slugify(title)\n        filename = f\"{today}-{slug}.md\"\n        file_path = folder / filename\n        file_path.write_text(_render_note(title, content, note_type), encoding=\"utf-8\")\n\n    return str(file_path)\n\n\ndef _append_action_item(todo_path: Path, title: str) -> None:\n    today = date.today().isoformat()\n    item_line = f\"- [ ] {title} ({today})\"\n\n    if not todo_path.exists():\n        lines = [\"# Action Items\", \"\", \"## Open\", \"\", item_line, \"\", \"## Done\", \"\"]\n        todo_path.write_text(\"\\n\".join(lines), encoding=\"utf-8\")\n        return\n\n    lines = todo_path.read_text(encoding=\"utf-8\").splitlines()\n\n    insert_pos: int | None = None\n    for i, line in enumerate(lines):\n        if line.strip() == \"## Open\":\n            insert_pos = i + 1\n            while insert_pos < len(lines) and lines[insert_pos].strip() == \"\":\n                insert_pos += 1\n            break\n\n    if insert_pos is not None:\n        lines.insert(insert_pos, item_line)\n    else:\n        lines.append(item_line)\n\n    todo_path.write_text(\"\\n\".join(lines), encoding=\"utf-8\")\n\n\ndef _render_note(title: str, content: str, note_type: str) -> str:\n    today = date.today().isoformat()\n    return f\"# {title}\\n\\n**Date:** {today}\\n**Type:** {note_type}\\n\\n{content}\\n\"\n\n\ndef _slugify(text: str) -> str:\n    slug = text.lower().strip()\n    slug = re.sub(r\"[^\\w\\s-]\", \"\", slug)\n    slug = re.sub(r\"[\\s_-]+\", \"-\", slug)\n    return slug.strip(\"-\")[:50]\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 21
+    },
+    "ai_commit": "7ab451effc3f",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 1.0,
+    "span": [
+      19,
+      39
+    ]
+  }
+}

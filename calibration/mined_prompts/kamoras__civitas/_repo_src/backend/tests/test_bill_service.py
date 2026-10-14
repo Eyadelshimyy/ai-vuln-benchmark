@@ -1,0 +1,710 @@
+"""Tests for the unified "bills currently moving through Congress" feed
+(app.services.bill_service.get_bills_in_flight).
+
+Uses the shared in-memory-SQLite `db_session` fixture from conftest.py.
+"""
+
+import json
+from datetime import datetime
+
+import pytest
+
+from app.config import settings
+from app.models import ActionIssue, Representative, RepSponsoredBill, Senator, SponsoredBill
+from app.services.bill_service import (
+    clear_bill_collection_cache, get_bill_detail, get_bills_in_flight, short_title_index, stage_base_rate,
+)
+from tests.conftest import TEST_CONGRESS
+
+# The Congress conftest pins every test to — never settings.CURRENT_CONGRESS
+# read here, at import, which is the real clock's.
+CURRENT = TEST_CONGRESS
+
+
+@pytest.fixture(autouse=True)
+def _reset_bill_collection_cache():
+    # _collect_bills caches its result at module scope for 120s in
+    # production (see bill_service.py) — without this, a cache populated
+    # by an earlier test's in-memory SQLite db would leak into a later
+    # test's assertions, since the cache doesn't know db_session gives
+    # every test a fresh database.
+    clear_bill_collection_cache()
+    yield
+    clear_bill_collection_cache()
+
+
+def _make_senator(db, id="s1", name="Sen. Alpha", state="CA", party="D", is_current=True):
+    senator = Senator(id=id, name=name, state=state, party=party, is_current=is_current)
+    db.add(senator)
+    db.flush()
+    return senator
+
+
+def _make_rep(db, id="r1", name="Rep. Beta", state="TX", party="R", is_current=True):
+    rep = Representative(id=id, name=name, state=state, party=party, is_current=is_current)
+    db.add(rep)
+    db.flush()
+    return rep
+
+
+def _make_sponsored_bill(db, senator_id, bill_id, stage, congress=CURRENT, title="A bill", latest_action_date="2026-01-01"):
+    bill = SponsoredBill(
+        senator_id=senator_id,
+        bill_id=bill_id,
+        title=title,
+        stage=stage,
+        congress=congress,
+        latest_action_date=latest_action_date,
+    )
+    db.add(bill)
+    db.flush()
+    return bill
+
+
+def _make_rep_sponsored_bill(db, representative_id, bill_id, stage, congress=CURRENT, title="A bill", latest_action_date="2026-01-01"):
+    bill = RepSponsoredBill(
+        representative_id=representative_id,
+        bill_id=bill_id,
+        title=title,
+        stage=stage,
+        congress=congress,
+        latest_action_date=latest_action_date,
+    )
+    db.add(bill)
+    db.flush()
+    return bill
+
+
+def _make_action_issue(db, bill_ids, is_current=True, date="2026-07-01", rank=1):
+    issue = ActionIssue(
+        date=date,
+        rank=rank,
+        title="Some trending issue",
+        related_bill_ids=json.dumps([{"name": b, "id": b, "url": ""} for b in bill_ids]),
+        is_current=is_current,
+    )
+    db.add(issue)
+    db.flush()
+    return issue
+
+
+class TestUnionAcrossChambers:
+    def test_unions_senate_and_house_bills(self, db_session):
+        senator = _make_senator(db_session)
+        rep = _make_rep(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.1", "INTRODUCED")
+        _make_rep_sponsored_bill(db_session, rep.id, "HR.1", "IN_COMMITTEE")
+
+        result = get_bills_in_flight(db_session)
+
+        assert result.total == 2
+        chambers = {b.chamber for b in result.bills}
+        assert chambers == {"senate", "house"}
+
+    def test_excludes_non_current_members(self, db_session):
+        senator = _make_senator(db_session, is_current=False)
+        _make_sponsored_bill(db_session, senator.id, "S.1", "INTRODUCED")
+
+        result = get_bills_in_flight(db_session)
+
+        assert result.total == 0
+
+    def test_excludes_bills_from_a_prior_congress(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.1", "INTRODUCED", congress=CURRENT - 1)
+
+        result = get_bills_in_flight(db_session)
+
+        assert result.total == 0
+
+    def test_blank_stage_defaults_to_introduced(self, db_session):
+        # Rows written before the stage classifier existed (or not yet
+        # backfilled) have stage="" — the feed should still place them
+        # somewhere sane rather than drop or mis-bucket them.
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.1", stage="")
+
+        result = get_bills_in_flight(db_session)
+
+        assert result.bills[0].stage == "INTRODUCED"
+
+
+class TestFiltering:
+    def test_filters_by_stage(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.1", "INTRODUCED")
+        _make_sponsored_bill(db_session, senator.id, "S.2", "ENACTED")
+
+        result = get_bills_in_flight(db_session, stage="ENACTED")
+
+        assert result.total == 1
+        assert result.bills[0].bill_id == "S.2"
+
+    def test_filters_by_chamber(self, db_session):
+        senator = _make_senator(db_session)
+        rep = _make_rep(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.1", "INTRODUCED")
+        _make_rep_sponsored_bill(db_session, rep.id, "HR.1", "INTRODUCED")
+
+        result = get_bills_in_flight(db_session, chamber="house")
+
+        assert result.total == 1
+        assert result.bills[0].chamber == "house"
+
+    def test_filters_by_party(self, db_session):
+        dem = _make_senator(db_session, id="s1", party="D")
+        rep_member = _make_senator(db_session, id="s2", party="R")
+        _make_sponsored_bill(db_session, dem.id, "S.1", "INTRODUCED")
+        _make_sponsored_bill(db_session, rep_member.id, "S.2", "INTRODUCED")
+
+        result = get_bills_in_flight(db_session, party="R")
+
+        assert result.total == 1
+        assert result.bills[0].sponsor_party == "R"
+
+    def test_filters_by_search_query_case_insensitive(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.1", "INTRODUCED", title="Clean Water Act")
+        _make_sponsored_bill(db_session, senator.id, "S.2", "INTRODUCED", title="Tax Reform Act")
+
+        result = get_bills_in_flight(db_session, q="clean water")
+
+        assert result.total == 1
+        assert result.bills[0].bill_id == "S.1"
+
+    def test_search_matches_sponsor_name(self, db_session):
+        fairley = _make_senator(db_session, id="s1", name="Sen. Joan Fairley")
+        other = _make_senator(db_session, id="s2", name="Sen. Someone Else")
+        _make_sponsored_bill(db_session, fairley.id, "S.1", "INTRODUCED", title="A bill")
+        _make_sponsored_bill(db_session, other.id, "S.2", "INTRODUCED", title="Another bill")
+
+        result = get_bills_in_flight(db_session, q="fairley")
+
+        assert result.total == 1
+        assert result.bills[0].bill_id == "S.1"
+
+    def test_search_matches_bill_id(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.4521", "INTRODUCED", title="A bill")
+        _make_sponsored_bill(db_session, senator.id, "S.99", "INTRODUCED", title="Another bill")
+
+        result = get_bills_in_flight(db_session, q="4521")
+
+        assert result.total == 1
+        assert result.bills[0].bill_id == "S.4521"
+
+    def test_stage_counts_ignore_the_stage_filter(self, db_session):
+        # Selecting a stage narrows the list, but the funnel/group headers
+        # still need to describe every stage.
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.1", "INTRODUCED")
+        _make_sponsored_bill(db_session, senator.id, "S.2", "ENACTED")
+
+        result = get_bills_in_flight(db_session, stage="ENACTED")
+
+        assert result.stage_counts == {"INTRODUCED": 1, "ENACTED": 1}
+
+    def test_stage_counts_respect_the_non_stage_filters(self, db_session):
+        # chamber/party/q DO narrow stage_counts — that's what lets the
+        # grouped view fill every stage group's header from one response.
+        senator = _make_senator(db_session)  # D / senate
+        rep = _make_rep(db_session)  # R / house
+        _make_sponsored_bill(db_session, senator.id, "S.1", "INTRODUCED")
+        _make_rep_sponsored_bill(db_session, rep.id, "HR.1", "ENACTED")
+
+        result = get_bills_in_flight(db_session, chamber="house")
+
+        assert result.stage_counts == {"ENACTED": 1}
+
+
+class TestPagination:
+    def test_paginates_results(self, db_session):
+        senator = _make_senator(db_session)
+        for i in range(5):
+            _make_sponsored_bill(db_session, senator.id, f"S.{i}", "INTRODUCED")
+
+        page1 = get_bills_in_flight(db_session, page=1, per_page=2)
+        page2 = get_bills_in_flight(db_session, page=2, per_page=2)
+        page3 = get_bills_in_flight(db_session, page=3, per_page=2)
+
+        assert page1.total == 5
+        assert page1.total_pages == 3
+        assert len(page1.bills) == 2
+        assert len(page2.bills) == 2
+        assert len(page3.bills) == 1
+
+    def test_sorts_by_latest_action_date_descending(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.1", "INTRODUCED", latest_action_date="2026-01-01")
+        _make_sponsored_bill(db_session, senator.id, "S.2", "INTRODUCED", latest_action_date="2026-06-01")
+
+        result = get_bills_in_flight(db_session)
+
+        assert [b.bill_id for b in result.bills] == ["S.2", "S.1"]
+
+
+class TestHotSort:
+    def test_hot_sort_excludes_bills_with_no_action_center_mentions(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.1", "INTRODUCED")
+        _make_action_issue(db_session, ["S.1"])
+
+        _make_sponsored_bill(db_session, senator.id, "S.2", "INTRODUCED")
+
+        result = get_bills_in_flight(db_session, sort="hot")
+
+        assert result.total == 1
+        assert result.bills[0].bill_id == "S.1"
+
+    def test_hot_sort_ranks_by_mention_count(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.1", "INTRODUCED")
+        _make_sponsored_bill(db_session, senator.id, "S.2", "INTRODUCED")
+        _make_action_issue(db_session, ["S.1"])
+        _make_action_issue(db_session, ["S.1", "S.2"])
+        _make_action_issue(db_session, ["S.2"])
+        # S.2 is mentioned by 2 issues, S.1 by 2 issues as well — bump S.2
+        # with one more so ranking is unambiguous.
+        _make_action_issue(db_session, ["S.2"])
+
+        result = get_bills_in_flight(db_session, sort="hot")
+
+        assert [b.bill_id for b in result.bills] == ["S.2", "S.1"]
+        assert result.bills[0].mention_count == 3
+        assert result.bills[1].mention_count == 2
+
+    def test_hot_sort_ignores_non_current_issues(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.1", "INTRODUCED")
+        _make_action_issue(db_session, ["S.1"], is_current=False)
+
+        result = get_bills_in_flight(db_session, sort="hot")
+
+        assert result.total == 0
+
+    def test_mention_count_is_populated_regardless_of_sort_mode(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.1", "INTRODUCED")
+        _make_action_issue(db_session, ["S.1"])
+
+        result = get_bills_in_flight(db_session, sort="recent")
+
+        assert result.bills[0].mention_count == 1
+
+
+class TestHotFallsBackToMovedThisWeek:
+    """Most days no live issue names a bill and "Active now" was empty. It
+    then lists bills that moved this week, and says that is what it shows."""
+
+    @pytest.fixture(autouse=True)
+    def today(self, freeze_utcnow):
+        freeze_utcnow(datetime(2026, 10, 9, 16))  # noon Eastern, Friday
+
+    def test_moved_this_week_past_referral(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.1", "REPORTED", latest_action_date="2026-10-03")  # first day
+        _make_sponsored_bill(db_session, senator.id, "S.2", "PASSED_CHAMBER", latest_action_date="2026-10-08")
+        _make_sponsored_bill(db_session, senator.id, "S.3", "REFERRED", latest_action_date="2026-10-08")  # automatic
+        _make_sponsored_bill(db_session, senator.id, "S.4", "REPORTED", latest_action_date="2026-10-02")  # 8 days ago
+
+        result = get_bills_in_flight(db_session, sort="hot")
+
+        assert (result.shown, result.moved_since) == ("moved", "2026-10-03")
+        assert [b.bill_id for b in result.bills] == ["S.2", "S.1"]
+
+    def test_a_named_bill_keeps_the_mentioned_list(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.1", "INTRODUCED")
+        _make_sponsored_bill(db_session, senator.id, "S.2", "REPORTED", latest_action_date="2026-10-08")
+        _make_action_issue(db_session, ["S.1"])
+
+        result = get_bills_in_flight(db_session, sort="hot")
+
+        assert (result.shown, result.moved_since) == ("mentioned", None)
+        assert [b.bill_id for b in result.bills] == ["S.1"]
+
+    def test_other_sorts_say_nothing_about_it(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.1", "REPORTED")
+        assert get_bills_in_flight(db_session).shown is None
+
+
+def test_in_motion_counts_bills_past_referral(db_session):
+    senator = _make_senator(db_session)
+    for n, stage in enumerate(("INTRODUCED", "REFERRED", "REFERRED", "IN_COMMITTEE", "ENACTED")):
+        _make_sponsored_bill(db_session, senator.id, f"S.{n}", stage)
+    assert get_bills_in_flight(db_session, per_page=1).in_motion == 2
+
+
+class TestStageBaseRate:
+    """A bill page states what happens to this Congress's bills at its
+    stage, computed from the stored stages; never a forecast for the bill."""
+
+    @pytest.fixture
+    def congress(self, db_session):
+        senator = _make_senator(db_session)
+        stages = ["REFERRED"] * 80 + ["IN_COMMITTEE"] * 8 + ["REPORTED"] * 6 + ["PASSED_CHAMBER"] * 3 \
+            + ["TO_PRESIDENT", "VETOED", "ENACTED"]
+        for n, stage in enumerate(stages):
+            _make_sponsored_bill(db_session, senator.id, f"S.{n}", stage)
+        _make_sponsored_bill(db_session, senator.id, "S.999", "ENACTED", congress=CURRENT - 1)  # another Congress
+        db_session.commit()
+        return db_session
+
+    def test_at_a_stage_and_beyond_it(self, congress):
+        rate = stage_base_rate(congress, "REPORTED", CURRENT)
+        # Reported or further: 6 + 3 + to president + vetoed + enacted.
+        assert (rate["total"], rate["atStage"], rate["reachedStage"], rate["becameLaw"]) == (100, 6, 12, 1)
+        assert rate["sentence"] == (
+            "Of the 100 bills sitting members have sponsored this Congress, 6% are at this stage and 1% have "
+            "become law. Of the 12 that got at least this far, 8% have become law so far. "
+            "That describes bills at this stage, not where this one will go."
+        )
+
+    def test_the_first_stage_has_no_further_comparison(self, congress):
+        rate = stage_base_rate(congress, "INTRODUCED", CURRENT)
+        assert rate["reachedStage"] == 100 and "got at least this far" not in rate["sentence"]
+
+    def test_none_once_the_outcome_is_known_or_for_another_congress(self, congress):
+        assert stage_base_rate(congress, "ENACTED", CURRENT) is None
+        assert stage_base_rate(congress, "VETOED", CURRENT) is None
+        assert stage_base_rate(congress, "REPORTED", CURRENT - 1) is None
+
+    def test_on_the_bill_detail(self, congress):
+        detail = get_bill_detail(congress, "S.90")  # a reported bill
+        assert detail.stage_base_rate.at_stage == 6
+
+
+class TestStaleSort:
+    def test_stale_sort_orders_oldest_action_first(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.1", "IN_COMMITTEE", latest_action_date="2026-06-01")
+        _make_sponsored_bill(db_session, senator.id, "S.2", "IN_COMMITTEE", latest_action_date="2025-01-01")
+        _make_sponsored_bill(db_session, senator.id, "S.3", "IN_COMMITTEE", latest_action_date="2026-01-01")
+
+        result = get_bills_in_flight(db_session, sort="stale")
+
+        assert [b.bill_id for b in result.bills] == ["S.2", "S.3", "S.1"]
+
+    def test_stale_sort_combines_with_stage_filter(self, db_session):
+        # The intended usage: staleness is only meaningful within one
+        # stage, since normal dwell time varies wildly by stage.
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.1", "IN_COMMITTEE", latest_action_date="2025-01-01")
+        _make_sponsored_bill(db_session, senator.id, "S.2", "ENACTED", latest_action_date="2024-01-01")
+
+        result = get_bills_in_flight(db_session, sort="stale", stage="IN_COMMITTEE")
+
+        assert result.total == 1
+        assert result.bills[0].bill_id == "S.1"
+
+
+class TestCollectionCache:
+    def test_cached_result_reflects_data_at_first_call(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.1", "INTRODUCED")
+
+        first = get_bills_in_flight(db_session)
+        assert first.total == 1
+
+        # Written after the cache was populated — within the TTL window a
+        # second call should still see the cached (pre-S.2) snapshot, not
+        # requery the database.
+        _make_sponsored_bill(db_session, senator.id, "S.2", "INTRODUCED")
+        second = get_bills_in_flight(db_session)
+
+        assert second.total == 1
+
+    def test_clearing_cache_picks_up_new_data(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.1", "INTRODUCED")
+        get_bills_in_flight(db_session)
+
+        _make_sponsored_bill(db_session, senator.id, "S.2", "INTRODUCED")
+        clear_bill_collection_cache()
+        result = get_bills_in_flight(db_session)
+
+        assert result.total == 2
+
+    def test_unfiltered_call_does_not_mutate_the_cached_list_order(self, db_session):
+        # get_bills_in_flight sorts `filtered` in place; when no filter is
+        # active `filtered is all_rows`, the exact list _collect_bills
+        # returned. If that were the cached list itself (not a copy), the
+        # first call's sort would permanently reorder every later cache hit.
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.1", "INTRODUCED", latest_action_date="2026-01-01")
+        _make_sponsored_bill(db_session, senator.id, "S.2", "INTRODUCED", latest_action_date="2026-06-01")
+
+        recent = get_bills_in_flight(db_session, sort="recent")
+        stale = get_bills_in_flight(db_session, sort="stale")
+
+        assert [b.bill_id for b in recent.bills] == ["S.2", "S.1"]
+        assert [b.bill_id for b in stale.bills] == ["S.1", "S.2"]
+
+
+class TestGetBillDetail:
+    def test_a_bill_number_is_read_in_the_congress_asked_for(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.1", "ENACTED", congress=CURRENT - 1, title="Last Congress's S. 1")
+        _make_sponsored_bill(db_session, senator.id, "S.1", "INTRODUCED", congress=CURRENT, title="This Congress's S. 1")
+
+        assert get_bill_detail(db_session, "S.1").title == "This Congress's S. 1"
+        assert get_bill_detail(db_session, "S.1", CURRENT - 1).title == "Last Congress's S. 1"
+        assert get_bill_detail(db_session, "S.1", CURRENT - 2) is None
+
+    def test_finds_senate_bill(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.4967", "IN_COMMITTEE", title="A bill")
+
+        detail = get_bill_detail(db_session, "S.4967")
+
+        assert detail is not None
+        assert detail.chamber == "senate"
+        assert detail.sponsor_id == senator.id
+        assert detail.title == "A bill"
+
+    def test_finds_house_bill(self, db_session):
+        rep = _make_rep(db_session)
+        _make_rep_sponsored_bill(db_session, rep.id, "HR.22", "ENACTED")
+
+        detail = get_bill_detail(db_session, "HR.22")
+
+        assert detail is not None
+        assert detail.chamber == "house"
+        assert detail.sponsor_id == rep.id
+
+    def test_lookup_is_case_insensitive(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.4967", "IN_COMMITTEE")
+
+        detail = get_bill_detail(db_session, "s.4967")
+
+        assert detail is not None
+        assert detail.bill_id == "S.4967"
+
+    def test_returns_none_for_unknown_bill(self, db_session):
+        assert get_bill_detail(db_session, "S.99999") is None
+
+    def test_excludes_non_current_sponsor(self, db_session):
+        senator = _make_senator(db_session, is_current=False)
+        _make_sponsored_bill(db_session, senator.id, "S.4967", "IN_COMMITTEE")
+
+        assert get_bill_detail(db_session, "S.4967") is None
+
+    def test_parses_policy_areas(self, db_session):
+        senator = _make_senator(db_session)
+        bill = _make_sponsored_bill(db_session, senator.id, "S.4967", "IN_COMMITTEE")
+        bill.policy_areas = json.dumps([{"area": "JUSTICE", "confidence": 0.9, "party": "D"}])
+        db_session.flush()
+
+        detail = get_bill_detail(db_session, "S.4967")
+
+        assert len(detail.policy_areas) == 1
+        assert detail.policy_areas[0].area == "JUSTICE"
+
+    def test_includes_related_current_issues(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.4967", "IN_COMMITTEE")
+        _make_action_issue(db_session, ["S.4967"], date="2026-07-01")
+        _make_action_issue(db_session, ["S.9999"])  # different bill, should not show up
+
+        detail = get_bill_detail(db_session, "S.4967")
+
+        assert detail.mention_count == 1
+        assert len(detail.related_issues) == 1
+        assert detail.related_issues[0].date == "2026-07-01"
+        # first_surfaced is the label shown next to the title; date drives
+        # the /action?date= link only — see RelatedIssueSchema's docstring.
+        assert detail.related_issues[0].first_surfaced != ""
+        # The bill page links each title to that issue's own page.
+        from app.issue_ids import to_public_id
+        assert detail.related_issues[0].public_id == to_public_id(detail.related_issues[0].id)
+
+    def test_excludes_non_current_issues_from_related(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.4967", "IN_COMMITTEE")
+        _make_action_issue(db_session, ["S.4967"], is_current=False)
+
+        detail = get_bill_detail(db_session, "S.4967")
+
+        assert detail.mention_count == 0
+        assert detail.related_issues == []
+
+
+class TestMalformedRelatedBillIds:
+    """`ActionIssue.related_bill_ids` is a JSON TEXT column with nothing
+    enforcing the shape of its elements — no `response_model`, no schema, no
+    constraint. Three of the four places that read these columns indexed the
+    elements as dicts unguarded, so a bare string in one row raised
+    AttributeError inside the query and returned a 500 for the whole route.
+
+    That is not a degraded mention count: /api/bills is what both the Bills
+    page and the homepage record index read, so both go blank together.
+    api/politicians.py already guarded its copy with `isinstance(entry, dict)`;
+    these tests hold the other three to the same bar.
+    """
+
+    def _issue_with_raw(self, db, raw, date="2026-07-01"):
+        issue = ActionIssue(date=date, rank=1, title="Trending", related_bill_ids=raw, is_current=True)
+        db.add(issue)
+        db.flush()
+        return issue
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            '["S.4967"]',                       # bare strings, not objects
+            '[null]',
+            '[123]',
+            '[{"id": "S.4967"}, "S.4967"]',     # one good element, one bad
+        ],
+        ids=["bare-strings", "nulls", "numbers", "mixed"],
+    )
+    def test_a_malformed_element_does_not_break_the_feed(self, db_session, raw):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.4967", "IN_COMMITTEE")
+        self._issue_with_raw(db_session, raw)
+
+        result = get_bills_in_flight(db_session)
+
+        assert [b.bill_id for b in result.bills] == ["S.4967"]
+
+    def test_a_malformed_element_does_not_break_bill_detail(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.4967", "IN_COMMITTEE")
+        self._issue_with_raw(db_session, '["S.4967"]')
+
+        detail = get_bill_detail(db_session, "S.4967")
+
+        assert detail.bill_id == "S.4967"
+        assert detail.related_issues == []
+
+    def test_well_formed_entries_beside_a_malformed_one_still_count(self, db_session):
+        senator = _make_senator(db_session)
+        _make_sponsored_bill(db_session, senator.id, "S.4967", "IN_COMMITTEE")
+        self._issue_with_raw(db_session, '["junk", {"id": "S.4967"}]')
+
+        result = get_bills_in_flight(db_session, sort="hot")
+
+        assert [b.bill_id for b in result.bills] == ["S.4967"]
+        assert get_bill_detail(db_session, "S.4967").mention_count == 1
+
+
+class TestChangesFromThePipelineProcess:
+    """Writers run in the pipeline process; the cache lives in each API
+    worker. A writer's warm records the change, and the API processes
+    rebuild once they see it."""
+
+    @pytest.fixture()
+    def shared_db(self, db_session, monkeypatch):
+        from contextlib import contextmanager
+
+        from sqlalchemy.orm import Session
+
+        @contextmanager
+        def _scope():
+            # A session of its own, closed after, like the real one: a
+            # write it doesn't commit is rolled back and lost.
+            session = Session(bind=db_session.get_bind())
+            try:
+                yield session
+            finally:
+                session.close()
+
+        monkeypatch.setattr("app.database.session_scope", _scope)
+        return db_session
+
+    def test_a_change_recorded_by_the_pipeline_process_is_picked_up(self, shared_db, monkeypatch):
+        import threading
+
+        from app.services import bill_service
+
+        senator = _make_senator(shared_db)
+        _make_sponsored_bill(shared_db, senator.id, "S.1", "INTRODUCED")
+        shared_db.commit()
+        assert get_bills_in_flight(shared_db).total == 1
+
+        # The pipeline process writes a bill and warms.
+        _make_sponsored_bill(shared_db, senator.id, "S.2", "INTRODUCED")
+        shared_db.commit()
+        monkeypatch.setattr(settings, "PROCESS_ROLE", "worker")
+        bill_service.warm_bill_collection_cache()
+        monkeypatch.setattr(settings, "PROCESS_ROLE", "api")
+
+        # Back in an API process: the rebuild runs on a thread of its own.
+        rebuilt = []
+        monkeypatch.setattr(threading, "Thread", lambda target, **_kw: type(
+            "T", (), {"start": lambda self: (target(), rebuilt.append(True))})())
+        bill_service._changes.expire()
+        assert get_bills_in_flight(shared_db).total == 1  # served stale, rebuild kicked off
+        assert rebuilt == [True]
+        assert get_bills_in_flight(shared_db).total == 2
+
+    def test_no_rebuild_without_a_change(self, shared_db, monkeypatch):
+        import threading
+
+        from app.services import bill_service
+
+        senator = _make_senator(shared_db)
+        _make_sponsored_bill(shared_db, senator.id, "S.1", "INTRODUCED")
+        shared_db.commit()
+        get_bills_in_flight(shared_db)
+        started = []
+        monkeypatch.setattr(threading, "Thread", lambda **_kw: started.append(True))
+        bill_service._changes.expire()
+        get_bills_in_flight(shared_db)
+        assert started == []
+
+    def test_the_marker_is_checked_at_most_every_few_seconds(self, shared_db, monkeypatch):
+        from app.services import bill_service
+
+        queries = []
+        real = shared_db.query
+        monkeypatch.setattr(shared_db, "query", lambda *a, **k: (queries.append(a), real(*a, **k))[1])
+        monkeypatch.setattr(settings, "PROCESS_ROLE", "api")
+        bill_service._changes.expire()
+        bill_service._changed_since(shared_db, bill_service.utcnow())
+        bill_service._changed_since(shared_db, bill_service.utcnow())
+        assert len(queries) == 1
+
+    @pytest.mark.parametrize("role", ["all", "worker"])
+    def test_only_the_api_role_polls_for_changes(self, shared_db, monkeypatch, role):
+        # Elsewhere nothing writes the marker for it to find.
+        from app.services import bill_service
+
+        queries = []
+        real = shared_db.query
+        monkeypatch.setattr(shared_db, "query", lambda *a, **k: (queries.append(a), real(*a, **k))[1])
+        monkeypatch.setattr(settings, "PROCESS_ROLE", role)
+        bill_service._changes.expire()
+        assert bill_service._changed_since(shared_db, bill_service.utcnow()) is False
+        assert queries == []
+
+
+def test_a_failed_rebuild_is_not_retried_on_every_request(monkeypatch):
+    import threading
+
+    from app.services import bill_service
+
+    starts = []
+    monkeypatch.setattr(bill_service, "_build_rows", lambda db: (starts.append(1), (_ for _ in ()).throw(RuntimeError("locked")))[1])
+    monkeypatch.setattr(threading, "Thread", lambda target, **_kw: type("T", (), {"start": lambda self: target()})())
+    monkeypatch.setattr("app.database.session_scope", __import__("contextlib").nullcontext)
+    monkeypatch.setattr(bill_service, "_refresh_failed_at", float("-inf"))
+    for _ in range(5):
+        bill_service._refresh_cache_in_background()
+    assert starts == [1]
+
+
+def test_short_title_index_keeps_names_news_uses(db_session):
+    db_session.add(Senator(id="S1", name="A", state="TX", party="R", is_current=True))
+    db_session.add(Representative(id="R1", name="B", state="TX", district=1, party="R", is_current=True))
+    for model, owner, bill_id, title in (
+        (SponsoredBill, {"senator_id": "S1"}, "S.4668", "Protect College Sports Act of 2026"),
+        (SponsoredBill, {"senator_id": "S1"}, "S.10", "Energy Act"),  # too short to name one bill
+        (SponsoredBill, {"senator_id": "S1"}, "S.11", "A bill to amend title 38, United States Code"),
+        (RepSponsoredBill, {"representative_id": "R1"}, "HR.20", "Protect College Sports Act"),  # companion
+    ):
+        db_session.add(model(bill_id=bill_id, title=title, congress=settings.CURRENT_CONGRESS, **owner))
+    db_session.commit()
+    assert short_title_index(db_session) == {"protect college sports act": {"S.4668", "HR.20"}}

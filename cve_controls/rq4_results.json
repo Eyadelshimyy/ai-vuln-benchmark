@@ -1,0 +1,34 @@
+[
+  {
+    "cve_id": "SYNTHETIC-SELFTEST-SQLI",
+    "cwe": "CWE-89",
+    "function": "get_user",
+    "in_scope": true,
+    "scope_reason": "SELF-TEST ONLY, not a real CVE: function-local SQLi whose fix is parameterization -> Tier-1 should distinguish",
+    "t1_vuln": "TRIGGERED",
+    "t1_patched": "NOT_TRIGGERED",
+    "t2_vuln": true,
+    "t2_patched": false,
+    "tier1_detects_vuln": true,
+    "tier1_distinguishes": true,
+    "tier2_distinguishes": true,
+    "distinguished": true,
+    "by_tier": "tier1"
+  },
+  {
+    "cve_id": "SYNTHETIC-SELFTEST-TRAVERSAL",
+    "cwe": "CWE-22",
+    "function": "read",
+    "in_scope": true,
+    "scope_reason": "SELF-TEST ONLY, not a real CVE: function-local path traversal whose fix is input validation -> only Tier-2 should distinguish",
+    "t1_vuln": "TRIGGERED",
+    "t1_patched": "TRIGGERED",
+    "t2_vuln": true,
+    "t2_patched": false,
+    "tier1_detects_vuln": true,
+    "tier1_distinguishes": false,
+    "tier2_distinguishes": true,
+    "distinguished": true,
+    "by_tier": "tier2"
+  }
+]

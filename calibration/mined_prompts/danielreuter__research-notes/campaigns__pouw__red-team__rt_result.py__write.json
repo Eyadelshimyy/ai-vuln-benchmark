@@ -1,0 +1,28 @@
+{
+  "repo": "danielreuter__research-notes",
+  "file": "campaigns/pouw/red-team/rt_result.py",
+  "function": "write",
+  "line": 5,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `write` function (parameters: name, measurements, details).",
+  "prompt_source": "def write(name, measurements, details, *, status=\"passed\", checker=\"red-team-pouw\", detail=\"\"):\n    \"\"\"Implement the `write` function (parameters: name, measurements, details).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def write(name, measurements, details, *, status=\"passed\", checker=\"red-team-pouw\", detail=\"\"):\n    run_dir = os.environ.get(\"RESEARCH_RUN_DIR\")\n    run_id = os.environ.get(\"RESEARCH_RUN_ID\")\n    if not run_dir or not run_id:\n        return None\n    with open(os.path.join(run_dir, \"details.json\"), \"w\") as f:\n        json.dump(details, f, indent=2)\n    doc = {\n        \"schema\": \"research/result/v0.1\",\n        \"run_id\": run_id,\n        \"workload_fingerprint\": {\"attack\": name, \"by\": \"red-team-pouw\"},\n        \"validation\": {\"status\": status, \"checker\": checker, \"detail\": detail, \"evidence\": [\"details.json\"]},\n        \"measurements\": [{\"name\": k, \"value\": v, \"unit\": u} for k, v, u in measurements],\n        \"measurement_files\": [\"details.json\"],\n        \"artifacts\": [\"details.json\"],\n    }\n    tmp = os.path.join(run_dir, \"result.json.tmp\")\n    with open(tmp, \"w\") as f:\n        json.dump(doc, f, indent=2)\n    os.replace(tmp, os.path.join(run_dir, \"result.json\"))\n    return os.path.join(run_dir, \"result.json\")",
+  "module_source": "\"\"\"Write a research/result/v0.1 result.json for a red-team CPU attack run (no import of `research`).\"\"\"\nimport json, os\n\n\ndef write(name, measurements, details, *, status=\"passed\", checker=\"red-team-pouw\", detail=\"\"):\n    run_dir = os.environ.get(\"RESEARCH_RUN_DIR\")\n    run_id = os.environ.get(\"RESEARCH_RUN_ID\")\n    if not run_dir or not run_id:\n        return None\n    with open(os.path.join(run_dir, \"details.json\"), \"w\") as f:\n        json.dump(details, f, indent=2)\n    doc = {\n        \"schema\": \"research/result/v0.1\",\n        \"run_id\": run_id,\n        \"workload_fingerprint\": {\"attack\": name, \"by\": \"red-team-pouw\"},\n        \"validation\": {\"status\": status, \"checker\": checker, \"detail\": detail, \"evidence\": [\"details.json\"]},\n        \"measurements\": [{\"name\": k, \"value\": v, \"unit\": u} for k, v, u in measurements],\n        \"measurement_files\": [\"details.json\"],\n        \"artifacts\": [\"details.json\"],\n    }\n    tmp = os.path.join(run_dir, \"result.json.tmp\")\n    with open(tmp, \"w\") as f:\n        json.dump(doc, f, indent=2)\n    os.replace(tmp, os.path.join(run_dir, \"result.json\"))\n    return os.path.join(run_dir, \"result.json\")\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 21
+    },
+    "ai_commit": "ebba7c7ae1a7",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      5,
+      25
+    ]
+  }
+}

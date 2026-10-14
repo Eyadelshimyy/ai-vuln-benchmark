@@ -1,0 +1,6 @@
+.
+plugins/fpga/hooks/scripts
+plugins/fpga/scripts
+scripts
+src
+src/fpga

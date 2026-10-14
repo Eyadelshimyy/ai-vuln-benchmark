@@ -1,0 +1,695 @@
+from datetime import timedelta
+import logging
+from unittest.mock import MagicMock, patch
+
+from homeassistant.components import light, sensor
+from homeassistant.components.integration.sensor import ATTR_SOURCE_ID
+from homeassistant.components.light import (
+    ATTR_BRIGHTNESS,
+    ATTR_COLOR_MODE,
+    ATTR_SUPPORTED_COLOR_MODES,
+    ColorMode,
+)
+from homeassistant.components.sensor import SensorDeviceClass
+from homeassistant.components.utility_meter.sensor import DAILY, HOURLY
+from homeassistant.const import (
+    ATTR_DEVICE_CLASS,
+    ATTR_FRIENDLY_NAME,
+    ATTR_UNIT_OF_MEASUREMENT,
+    CONF_ENTITIES,
+    CONF_ENTITY_ID,
+    CONF_NAME,
+    CONF_PLATFORM,
+    CONF_UNIQUE_ID,
+    STATE_OFF,
+    STATE_ON,
+    UnitOfEnergy,
+)
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import issue_registry as ir
+import homeassistant.helpers.entity_registry as er
+from homeassistant.setup import async_setup_component
+from homeassistant.util import dt
+import pytest
+
+from custom_components.powercalc.config_flow import Step
+from custom_components.powercalc.const import (
+    ATTR_CALCULATION_MODE,
+    ATTR_ENTITIES,
+    ATTR_SOURCE_ENTITY,
+    CONF_CREATE_ENERGY_SENSOR,
+    CONF_CREATE_GROUP,
+    CONF_CREATE_UTILITY_METERS,
+    CONF_ENERGY_INTEGRATION_METHOD,
+    CONF_ENERGY_SENSOR_FRIENDLY_NAMING,
+    CONF_ENERGY_SENSOR_NAMING,
+    CONF_FIXED,
+    CONF_MODE,
+    CONF_POWER,
+    CONF_POWER_SENSOR_FRIENDLY_NAMING,
+    CONF_POWER_SENSOR_NAMING,
+    CONF_SENSOR_TYPE,
+    CONF_UTILITY_METER_TYPES,
+    DOMAIN,
+    ENERGY_INTEGRATION_METHOD_LEFT,
+    SERVICE_ACTIVATE_PLAYBOOK,
+    SERVICE_CALIBRATE_COST,
+    SERVICE_CALIBRATE_ENERGY,
+    SERVICE_CALIBRATE_UTILITY_METER,
+    SERVICE_CHANGE_GUI_CONFIGURATION,
+    SERVICE_DEBUG_GROUP,
+    SERVICE_GET_ACTIVE_PLAYBOOK,
+    SERVICE_GET_GROUP_ENTITIES,
+    SERVICE_INCREASE_DAILY_ENERGY,
+    SERVICE_RELOAD,
+    SERVICE_RESET_COST,
+    SERVICE_RESET_ENERGY,
+    SERVICE_STOP_PLAYBOOK,
+    SERVICE_SWITCH_SUB_PROFILE,
+    SERVICE_UPDATE_LIBRARY,
+    CalculationStrategy,
+    SensorType,
+)
+from custom_components.powercalc.errors import SensorConfigurationError
+from tests.common import mock_device_with_entities, mock_entities_in_registry, set_states
+
+from .common import (
+    assert_entity_state,
+    create_mock_config_entry,
+    get_simple_fixed_config,
+    run_powercalc_setup,
+)
+from .config_flow.common import fixed_value_choice, handle_options_flow_update
+
+
+async def test_fixed_power_sensor_from_yaml(hass: HomeAssistant) -> None:
+    await set_states(hass, [("input_boolean.test", STATE_OFF)])
+
+    await run_powercalc_setup(
+        hass,
+        get_simple_fixed_config("input_boolean.test"),
+    )
+
+    assert_entity_state(hass, "sensor.test_power", "0.00")
+
+    await set_states(hass, [("input_boolean.test", STATE_ON)])
+    assert_entity_state(
+        hass,
+        "sensor.test_power",
+        "50.00",
+        attributes={
+            ATTR_CALCULATION_MODE: CalculationStrategy.FIXED,
+            ATTR_DEVICE_CLASS: SensorDeviceClass.POWER,
+        },
+    )
+
+    assert_entity_state(
+        hass,
+        "sensor.test_energy",
+        attributes={
+            ATTR_DEVICE_CLASS: SensorDeviceClass.ENERGY,
+            ATTR_UNIT_OF_MEASUREMENT: UnitOfEnergy.KILO_WATT_HOUR,
+            ATTR_SOURCE_ID: "sensor.test_power",
+            ATTR_SOURCE_ENTITY: "input_boolean.test",
+        },
+    )
+
+
+async def test_legacy_yaml_platform_configuration(
+    hass: HomeAssistant,
+    issue_registry: ir.IssueRegistry,
+) -> None:
+    assert await async_setup_component(
+        hass,
+        sensor.DOMAIN,
+        {
+            sensor.DOMAIN: {
+                CONF_PLATFORM: DOMAIN,
+                CONF_ENTITY_ID: "input_boolean.test",
+                CONF_FIXED: {CONF_POWER: 50},
+            },
+        },
+    )
+    await hass.async_block_till_done()
+
+    assert hass.states.get("sensor.test_power")
+    assert issue_registry.async_get_issue(DOMAIN, "powercalc_deprecated_yaml")
+
+
+async def test_utility_meter_is_created(hass: HomeAssistant) -> None:
+    """Test that utility meters are successfully created when `create_utility_meter: true`"""
+    await run_powercalc_setup(
+        hass,
+        {
+            CONF_ENTITY_ID: "input_boolean.test",
+            CONF_MODE: CalculationStrategy.FIXED,
+            CONF_CREATE_UTILITY_METERS: True,
+            CONF_UTILITY_METER_TYPES: [DAILY, HOURLY],
+            CONF_FIXED: {CONF_POWER: 50},
+        },
+    )
+
+    daily_state = hass.states.get("sensor.test_energy_daily")
+    assert daily_state
+
+    hourly_state = hass.states.get("sensor.test_energy_hourly")
+    assert hourly_state
+
+    monthly_state = hass.states.get("sensor.test_energy_monthly")
+    assert not monthly_state
+
+
+async def test_create_nested_group_sensor(hass: HomeAssistant) -> None:
+    await run_powercalc_setup(
+        hass,
+        {
+            CONF_CREATE_GROUP: "TestGroup1",
+            CONF_ENTITIES: [
+                get_simple_fixed_config("input_boolean.test", 50),
+                get_simple_fixed_config("input_boolean.test1", 50),
+                {
+                    CONF_CREATE_GROUP: "TestGroup2",
+                    CONF_ENTITIES: [
+                        get_simple_fixed_config("input_boolean.test2", 50),
+                    ],
+                },
+            ],
+        },
+    )
+
+    await set_states(
+        hass,
+        [("input_boolean.test", STATE_ON), ("input_boolean.test1", STATE_ON), ("input_boolean.test2", STATE_ON)],
+        block_count=3,
+    )
+
+    assert_entity_state(
+        hass,
+        "sensor.testgroup1_power",
+        "150.00",
+        attributes={
+            ATTR_ENTITIES: {
+                "sensor.test_power",
+                "sensor.test1_power",
+                "sensor.test2_power",
+            },
+        },
+    )
+
+    assert_entity_state(
+        hass,
+        "sensor.testgroup2_power",
+        "50.00",
+        attributes={
+            ATTR_ENTITIES: {
+                "sensor.test2_power",
+            },
+        },
+    )
+
+    with patch(
+        "homeassistant.util.utcnow",
+        return_value=dt.utcnow() + timedelta(seconds=60),
+    ):
+        await set_states(hass, [("input_boolean.test2", STATE_OFF)], block_count=3)
+    assert_entity_state(hass, "sensor.testgroup1_power", "100.00")
+
+    assert_entity_state(hass, "sensor.testgroup2_power", "0.00")
+
+
+async def test_create_nested_without_group(hass: HomeAssistant) -> None:
+    await run_powercalc_setup(
+        hass,
+        {
+            CONF_ENTITIES: [
+                get_simple_fixed_config("switch.test1", 50),
+                {
+                    CONF_ENTITIES: [
+                        get_simple_fixed_config("switch.test2", 50),
+                    ],
+                },
+            ],
+        },
+    )
+    assert hass.states.get("sensor.test1_power")
+    assert hass.states.get("sensor.test2_power")
+
+
+async def test_create_nested_handles_exception(hass: HomeAssistant, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.ERROR)
+
+    with patch(
+        "custom_components.powercalc.sensor.assign_device_to_entities",
+        new=MagicMock(side_effect=SensorConfigurationError("My custom error message")),
+    ):
+        await run_powercalc_setup(
+            hass,
+            {
+                CONF_ENTITIES: [
+                    get_simple_fixed_config("switch.test1", 50),
+                    get_simple_fixed_config("switch.test2", 50),
+                ],
+            },
+        )
+    assert not hass.states.get("sensor.test1_power")
+    assert not hass.states.get("sensor.test2_power")
+
+    assert "My custom error message" in caplog.text
+
+
+async def test_light_lut_strategy(
+    hass: HomeAssistant,
+) -> None:
+    light_entity_id = "light.test1"
+    mock_device_with_entities(
+        hass,
+        light_entity_id,
+        "signify",
+        "LWB010",
+        capabilities={ATTR_SUPPORTED_COLOR_MODES: [light.ColorMode.BRIGHTNESS]},
+    )
+    await set_states(
+        hass,
+        [
+            (
+                light_entity_id,
+                STATE_ON,
+                {ATTR_BRIGHTNESS: 125, ATTR_COLOR_MODE: light.ColorMode.BRIGHTNESS},
+            ),
+        ],
+    )
+    await run_powercalc_setup(
+        hass,
+        {CONF_ENTITY_ID: light_entity_id},
+    )
+
+    assert_entity_state(
+        hass,
+        "sensor.test1_power",
+        "2.67",
+        attributes={
+            ATTR_DEVICE_CLASS: SensorDeviceClass.POWER,
+            ATTR_CALCULATION_MODE: CalculationStrategy.LUT,
+            ATTR_SOURCE_ENTITY: light_entity_id,
+        },
+    )
+
+
+async def test_error_when_configuring_same_entity_twice(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.ERROR)
+
+    await run_powercalc_setup(
+        hass,
+        [
+            get_simple_fixed_config("input_boolean.test", 50),
+            get_simple_fixed_config("input_boolean.test", 100),
+        ],
+    )
+
+    assert "This entity has already configured a power sensor" in caplog.text
+    assert hass.states.get("sensor.test_power")
+    assert hass.states.get("sensor.test_energy")
+
+
+async def test_alternate_naming_strategy(hass: HomeAssistant) -> None:
+    await run_powercalc_setup(
+        hass,
+        {
+            CONF_ENTITY_ID: "input_boolean.test",
+            CONF_FIXED: {CONF_POWER: 25},
+        },
+        {
+            CONF_POWER_SENSOR_NAMING: "{} Power consumption",
+            CONF_POWER_SENSOR_FRIENDLY_NAMING: "{} Power friendly",
+            CONF_ENERGY_SENSOR_NAMING: "{} Energy kwh",
+            CONF_ENERGY_SENSOR_FRIENDLY_NAMING: "{} Energy friendly",
+        },
+    )
+
+    assert_entity_state(hass, "sensor.test_power_consumption", attributes={ATTR_FRIENDLY_NAME: "test Power friendly"})
+    assert_entity_state(hass, "sensor.test_energy_kwh", attributes={ATTR_FRIENDLY_NAME: "test Energy friendly"})
+
+
+async def test_can_create_same_entity_twice_with_unique_id(hass: HomeAssistant) -> None:
+    await run_powercalc_setup(
+        hass,
+        [
+            {
+                CONF_ENTITY_ID: "input_boolean.test",
+                CONF_UNIQUE_ID: "111",
+                CONF_MODE: CalculationStrategy.FIXED,
+                CONF_FIXED: {CONF_POWER: 50},
+            },
+            {
+                CONF_ENTITY_ID: "input_boolean.test",
+                CONF_UNIQUE_ID: "222",
+                CONF_MODE: CalculationStrategy.FIXED,
+                CONF_FIXED: {CONF_POWER: 100},
+            },
+        ],
+    )
+
+    assert hass.states.get("sensor.test_power")
+    assert hass.states.get("sensor.test_energy")
+    assert hass.states.get("sensor.test_power_2")
+    assert hass.states.get("sensor.test_energy_2")
+
+
+async def test_unsupported_model_is_skipped_from_autodiscovery(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    mock_device_with_entities(hass, "light.test", "lidl", "non_existing_model")
+
+    # Run powercalc setup with autodiscovery
+    await run_powercalc_setup(hass)
+
+    assert "Model not found in library, skipping discovery" in caplog.text
+
+
+async def test_can_include_autodiscovered_entity_in_group(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test that models are automatically discovered and power sensors created"""
+
+    caplog.set_level(logging.ERROR)
+
+    mock_device_with_entities(hass, "light.testa", "lidl", "HG06462A")
+
+    await set_states(
+        hass,
+        [
+            (
+                "light.testa",
+                STATE_ON,
+                {"brightness": 125, "color_mode": ColorMode.BRIGHTNESS},
+            ),
+        ],
+    )
+    await run_powercalc_setup(
+        hass,
+        [
+            {
+                CONF_CREATE_GROUP: "GroupA",
+                CONF_ENTITIES: [{CONF_ENTITY_ID: "light.testa"}],
+            },
+        ],
+    )
+
+    assert len(caplog.records) == 0
+
+    assert hass.states.get("sensor.testa_power")
+    assert_entity_state(hass, "sensor.groupa_power", attributes={ATTR_ENTITIES: {"sensor.testa_power"}})
+
+
+async def test_user_can_rename_entity_id(hass: HomeAssistant) -> None:
+    """
+    When the power/energy sensors exist already with an unique ID, don't change the entity ID
+    This allows the users to change the entity ID's from the GUI
+    """
+    mock_entities_in_registry(
+        hass,
+        {
+            "sensor.my_renamed_power": {"unique_id": "abcdef", "platform": DOMAIN},
+            "sensor.my_renamed_energy": {"unique_id": "abcdef_energy", "platform": DOMAIN},
+        },
+    )
+
+    await set_states(hass, [("input_boolean.test", STATE_OFF)])
+
+    await run_powercalc_setup(
+        hass,
+        {
+            CONF_ENTITY_ID: "input_boolean.test",
+            CONF_MODE: CalculationStrategy.FIXED,
+            CONF_UNIQUE_ID: "abcdef",
+            CONF_FIXED: {CONF_POWER: 40},
+        },
+    )
+
+    assert hass.states.get("sensor.my_renamed_power")
+    assert not hass.states.get("sensor.test_power")
+
+    assert_entity_state(hass, "sensor.my_renamed_energy", attributes={"source": "sensor.my_renamed_power"})
+    assert not hass.states.get("sensor.test_energy")
+
+
+async def test_setup_multiple_entities_in_single_platform_config(
+    hass: HomeAssistant,
+) -> None:
+    await run_powercalc_setup(
+        hass,
+        [
+            get_simple_fixed_config("input_boolean.test1"),
+            get_simple_fixed_config("input_boolean.test2"),
+            # Omitting the entity_id should log an error, but still successfully create the other entities
+            {CONF_NAME: "test3", CONF_FIXED: {CONF_POWER: 20}},
+        ],
+    )
+
+    await hass.async_start()
+
+    assert hass.states.get("sensor.test1_power")
+    assert hass.states.get("sensor.test2_power")
+    assert not hass.states.get("sensor.test3_power")
+
+
+async def test_change_options_of_renamed_sensor(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    entry = await create_mock_config_entry(
+        hass,
+        {
+            CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
+            CONF_MODE: CalculationStrategy.FIXED,
+            CONF_ENTITY_ID: "input_boolean.test",
+            CONF_CREATE_ENERGY_SENSOR: True,
+            CONF_CREATE_UTILITY_METERS: True,
+            CONF_FIXED: {CONF_POWER: 50},
+        },
+    )
+
+    assert hass.states.get("sensor.test_energy_daily").name == "test energy daily"
+
+    entity_registry.async_update_entity(
+        entity_id="sensor.test_energy_daily",
+        name="Renamed daily utility meter",
+    )
+    await hass.async_block_till_done()
+    assert hass.states.get("sensor.test_energy_daily").name == "Renamed daily utility meter"
+
+    await handle_options_flow_update(hass, entry, Step.FIXED, fixed_value_choice(CONF_POWER, 100))
+
+    assert hass.states.get("sensor.test_energy_daily").name == "Renamed daily utility meter"
+
+
+async def test_renaming_sensor_is_retained_after_startup(hass: HomeAssistant) -> None:
+    mock_entities_in_registry(
+        hass,
+        {"sensor.test_power": {"unique_id": "abcdef", "platform": DOMAIN, "name": "Renamed power"}},
+    )
+    await create_mock_config_entry(
+        hass,
+        {
+            CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
+            CONF_MODE: CalculationStrategy.FIXED,
+            CONF_ENTITY_ID: "input_boolean.test",
+            CONF_CREATE_ENERGY_SENSOR: True,
+            CONF_CREATE_UTILITY_METERS: True,
+            CONF_FIXED: {CONF_POWER: 50},
+        },
+        unique_id="abcdef",
+    )
+
+    assert hass.states.get("sensor.test_power").name == "Renamed power"
+
+
+async def test_sensors_with_errors_are_skipped_for_multiple_entity_setup(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    When creating a group or setting up multiple entities in one platform entry,
+    a sensor with an error should be skipped and not prevent the whole group from being setup.
+    This should be logged as an error.
+    """
+    caplog.set_level(logging.ERROR)
+
+    await run_powercalc_setup(
+        hass,
+        [
+            {
+                CONF_ENTITY_ID: "input_boolean.test",
+                CONF_MODE: CalculationStrategy.FIXED,
+                CONF_FIXED: {CONF_POWER: 40},
+            },
+            {
+                CONF_ENTITY_ID: "input_boolean.test2",
+                CONF_MODE: CalculationStrategy.FIXED,
+                CONF_FIXED: {},
+            },
+            {
+                CONF_ENTITIES: [
+                    {
+                        CONF_ENTITY_ID: "input_boolean.test3",
+                        CONF_MODE: CalculationStrategy.FIXED,
+                        CONF_FIXED: {},
+                    },
+                ],
+            },
+        ],
+    )
+
+    assert len(caplog.records) == 2
+    assert "Skipping sensor setup" in caplog.text
+
+
+async def test_create_config_entry_without_energy_sensor(
+    hass: HomeAssistant,
+) -> None:
+    await create_mock_config_entry(
+        hass,
+        {
+            CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
+            CONF_CREATE_ENERGY_SENSOR: False,
+            CONF_NAME: "testentry",
+            CONF_ENTITY_ID: "light.test",
+            CONF_FIXED: {CONF_POWER: 50},
+        },
+    )
+
+    assert hass.states.get("sensor.testentry_power")
+    assert not hass.states.get("sensor.testentry_energy")
+
+
+async def test_rename_source_entity_id(hass: HomeAssistant) -> None:
+    light_id = "sensor.my_light"
+    entity_reg = mock_entities_in_registry(
+        hass,
+        {
+            light_id: {"disabled_by": er.RegistryEntryDisabler.DEVICE, "platform": "light"},
+        },
+    )
+
+    entry = await create_mock_config_entry(
+        hass,
+        {
+            CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
+            CONF_CREATE_ENERGY_SENSOR: False,
+            CONF_NAME: "testentry",
+            CONF_ENTITY_ID: light_id,
+            CONF_FIXED: {CONF_POWER: 50},
+        },
+    )
+
+    await run_powercalc_setup(hass)
+
+    new_light_id = "sensor.my_light_new"
+    entity_reg.async_update_entity(entity_id=light_id, new_entity_id=new_light_id)
+    await hass.async_block_till_done()
+
+    changed_entry = hass.config_entries.async_get_entry(entry.entry_id)
+    assert changed_entry.data.get(CONF_ENTITY_ID) == new_light_id
+    await set_states(hass, [(new_light_id, STATE_ON)])
+    assert_entity_state(hass, "sensor.testentry_power", "50.00", attributes={ATTR_SOURCE_ENTITY: new_light_id})
+
+
+async def test_change_config_entry_entity_id(hass: HomeAssistant) -> None:
+    """Test that changing the source entity of an existing config entry works correctly"""
+
+    original_light_id = "light.original"
+    original_unique_id = "aaaa"
+    new_light_id = "light.new"
+    new_unique_id = "bbbb"
+    mock_entities_in_registry(
+        hass,
+        {
+            original_light_id: {"unique_id": original_unique_id, "platform": "light"},
+            new_light_id: {"unique_id": new_unique_id, "platform": "light"},
+        },
+    )
+
+    # Create an existing config entry referencing the original source entity
+    entry = await create_mock_config_entry(
+        hass,
+        {
+            CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
+            CONF_CREATE_ENERGY_SENSOR: True,
+            CONF_CREATE_UTILITY_METERS: True,
+            CONF_MODE: CalculationStrategy.FIXED,
+            CONF_NAME: "testentry",
+            CONF_ENTITY_ID: original_light_id,
+            CONF_FIXED: {CONF_POWER: 50},
+            CONF_UNIQUE_ID: original_unique_id,
+        },
+        unique_id=original_unique_id,
+    )
+
+    await run_powercalc_setup(hass)
+
+    await set_states(hass, [(original_light_id, STATE_ON), (new_light_id, STATE_ON)])
+    assert_entity_state(hass, "sensor.testentry_power", "50.00", attributes={ATTR_SOURCE_ENTITY: original_light_id})
+
+    # Change the entity_id and power using the options flow
+    await handle_options_flow_update(hass, entry, Step.BASIC_OPTIONS, {CONF_ENTITY_ID: new_light_id})
+    await handle_options_flow_update(hass, entry, Step.FIXED, fixed_value_choice(CONF_POWER, 100))
+
+    changed_entry = hass.config_entries.async_get_entry(entry.entry_id)
+    assert changed_entry.data.get(CONF_ENTITY_ID) == new_light_id
+    assert changed_entry.unique_id == original_unique_id
+    assert_entity_state(hass, "sensor.testentry_power", "100.00", attributes={ATTR_SOURCE_ENTITY: new_light_id})
+
+
+async def test_regression(hass: HomeAssistant) -> None:
+    await create_mock_config_entry(
+        hass,
+        {
+            CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
+            CONF_CREATE_ENERGY_SENSOR: True,
+            CONF_CREATE_UTILITY_METERS: False,
+            CONF_MODE: CalculationStrategy.FIXED,
+            CONF_NAME: "Standing lamp",
+            CONF_ENTITY_ID: "light.standing_lamp",
+            CONF_ENERGY_INTEGRATION_METHOD: ENERGY_INTEGRATION_METHOD_LEFT,
+            CONF_FIXED: {CONF_POWER: 11},
+            CONF_UNIQUE_ID: "pc_91b5b2b04e889549cb19effa3dea97e1",
+        },
+    )
+
+    await run_powercalc_setup(hass)
+
+    assert hass.states.get("sensor.standing_lamp_power")
+    assert hass.states.get("sensor.standing_lamp_energy")
+
+
+async def test_entity_services_registered(hass: HomeAssistant) -> None:
+    """Test that the entity services are registered."""
+
+    await create_mock_config_entry(hass, {CONF_ENTITY_ID: "light.test", CONF_FIXED: {CONF_POWER: 50}})
+
+    services = hass.services.async_services()
+    powercalc_services = services.get(DOMAIN)
+    assert powercalc_services is not None
+    expected_services = [
+        SERVICE_RESET_ENERGY,
+        SERVICE_RESET_COST,
+        SERVICE_CALIBRATE_UTILITY_METER,
+        SERVICE_CALIBRATE_ENERGY,
+        SERVICE_CALIBRATE_COST,
+        SERVICE_INCREASE_DAILY_ENERGY,
+        SERVICE_ACTIVATE_PLAYBOOK,
+        SERVICE_SWITCH_SUB_PROFILE,
+        SERVICE_GET_ACTIVE_PLAYBOOK,
+        SERVICE_STOP_PLAYBOOK,
+        SERVICE_GET_GROUP_ENTITIES,
+        SERVICE_DEBUG_GROUP,
+        SERVICE_RELOAD,
+        SERVICE_UPDATE_LIBRARY,
+        SERVICE_CHANGE_GUI_CONFIGURATION,
+    ]
+    assert sorted(powercalc_services.keys()) == sorted(expected_services)

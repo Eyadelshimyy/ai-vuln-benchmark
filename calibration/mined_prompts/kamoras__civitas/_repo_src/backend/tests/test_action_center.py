@@ -1,0 +1,3939 @@
+"""Tests for Action Center deduplication and national monitor creation logic."""
+
+import json
+import sqlite3
+from datetime import datetime, timedelta
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+
+from app.models import (
+    ActionIssue,
+    ActionIssueStatus,
+    ExploreDocument,
+    Justice,
+    LlmGenerationSample,
+    MonitorStatus,
+    MonitorUpdate,
+    NationalMonitor,
+    Representative,
+    Senator,
+)
+from app.pipeline.analyze.grounding import validate_facts as _validate_facts
+from app.database import Base
+from app.time_utils import utcnow
+from app.pipeline.fetch.news_feeds import NewsArticle
+from app.pipeline.analyze.action_center import (
+    _rank_clusters,
+    _deduplicate_top_clusters,
+    _update_national_monitors,
+    _cleanup_monitor_lifecycle,
+    _generate_monitor_metadata,
+    _full_story_should_invalidate,
+    _find_related_explore_docs,
+    _find_related_senators,
+    _find_related_officials,
+    _find_matching_issue,
+    dedupe_near_identical_issues,
+    _apply_matched_issue_update,
+    _promote_developing_issue,
+    _bluesky_eligible_issues,
+    _rank_ordered_issues,
+    _retire_untouched_issues,
+    _record_generation_sample,
+    _bsky_repost_has_new_information,
+    _is_exact_content_duplicate,
+    _issue_signature,
+    _center_titles,
+    _mentions_full_name,
+    _signatures_match,
+    _surname_owned_by_other_name,
+    _log_summary_source_consistency,
+)
+
+
+def _make_article(title: str, source: str = "AP News", url: str = "") -> NewsArticle:
+    return NewsArticle(
+        title=title,
+        url=url or f"https://example.com/{title.replace(' ', '-').lower()}",
+        source_name=source,
+        summary=f"Summary for {title}",
+    )
+
+
+def _make_issue(date: str, title: str, sources: list[str]) -> ActionIssue:
+    return ActionIssue(
+        date=date,
+        rank=1,
+        title=title,
+        summary=f"Summary for {title}",
+        source_names=json.dumps(sources),
+        source_urls=json.dumps([f"https://example.com/{s.lower()}" for s in sources]),
+    )
+
+
+class TestCenterTitles:
+    """Per-cluster checks must center on the day's mean, as pass 1 does.
+    Centering a coherent cluster on its own mean subtracted the topic its
+    articles shared, and live runs kept 1 of 5 same-story articles."""
+
+    def _day(self):
+        rng = np.random.default_rng(0)
+        generic = rng.normal(size=32) * 3          # every headline shares this
+        topics = rng.normal(size=(4, 32))
+        embs = np.array([generic + topics[t] + rng.normal(size=32) * 0.3
+                         for t in range(4) for _ in range(5)])
+        return embs, embs[:5]                       # the day; one topic's cluster
+
+    def test_a_coherent_cluster_keeps_every_article_on_the_days_mean(self):
+        day, cluster = self._day()
+        vecs = _center_titles(cluster, day.mean(axis=0))
+        centroid = vecs.mean(axis=0) / np.linalg.norm(vecs.mean(axis=0))
+        assert (vecs @ centroid).min() > 0.25
+
+    def test_its_own_mean_is_what_broke_it(self):
+        day, cluster = self._day()
+        vecs = _center_titles(cluster, cluster.mean(axis=0))
+        centroid = vecs.mean(axis=0) / np.linalg.norm(vecs.mean(axis=0))
+        assert (vecs @ centroid).min() < 0.25
+
+
+class TestClusterArticles:
+    """Complete linkage: a cluster is a set of articles that are ALL alike,
+    never a chain of pairwise resemblances (issue 759, 2026-09-27)."""
+
+    def _cluster(self, monkeypatch, vectors):
+        from app.pipeline.analyze import action_center as ac
+
+        arts = [NewsArticle(title=f"t{i}", summary="", url=f"u{i}", source_name="s", published=None)
+                for i in range(len(vectors))]
+        monkeypatch.setattr(ac, "_embed_texts", lambda texts: np.array(vectors, dtype=float))
+        return sorted(sorted(a.title for a in c) for c in ac._cluster_articles([(a, None) for a in arts]))
+
+    def test_a_chain_of_resemblances_is_not_one_cluster(self, monkeypatch):
+        # Symmetric so centering on the day's mean leaves them as written:
+        # a~b and b~c at 0.71, a~c at 0 (floods ~ storm ~ epidemic). Single
+        # linkage made {a, b, c}; complete linkage keeps a and c apart.
+        a, b, c = [1, 0, 0, 0], [0.7, 0.7, 0, 0], [0, 1, 0, 0]
+        vectors = [a, b, c, [-x for x in a], [-x for x in b], [-x for x in c], [0, 0, 1, 0], [0, 0, -1, 0]]
+        clusters = self._cluster(monkeypatch, vectors)
+        assert not any({"t0", "t2"} <= set(c) for c in clusters)
+
+    def test_same_story_coverage_is_one_cluster(self, monkeypatch):
+        vectors = [[1, 0.05, 0], [1, -0.05, 0], [0.98, 0, 0.05], [0, 1, 0], [0, 0, 1], [-1, -1, -1]]
+        clusters = self._cluster(monkeypatch, vectors)
+        assert ["t0", "t1", "t2"] in clusters
+
+    def test_one_article(self, monkeypatch):
+        assert self._cluster(monkeypatch, [[1, 0]]) == [["t0"]]
+
+
+class TestRankClusters:
+    """2026-08 quality audit: MAX_ISSUES was lowered as a capacity choice,
+    not a calibrated one — the combined score has no absolute floor to
+    check against since it's normalized per-run. The score-distribution
+    metric that would let a real floor be derived later lives in
+    _deduplicate_top_clusters, not here (see TestDeduplicateTopClusters) —
+    that function is what actually decides final selection, since it can
+    merge away a higher-ranked cluster and promote a lower-ranked one.
+    _rank_clusters' own job is just producing the ranking those decisions
+    are based on."""
+
+    @patch("app.pipeline.analyze.action_center._compute_action_link_boost")
+    @patch("app.pipeline.analyze.action_center._compute_trending_boost")
+    def test_returns_clusters_and_scores_in_matching_ranked_order(
+        self, mock_trending, mock_civic,
+    ):
+        clusters = [[_make_article(f"Story {i}")] for i in range(4)]
+        mock_trending.return_value = [0.0, 0.0, 0.0, 0.0]
+        # Deliberately out of input order — civic is the only nonzero
+        # component, so it alone determines rank.
+        mock_civic.return_value = [0.2, 0.8, 0.4, 0.6]
+
+        ranked_clusters, ranked_scores = _rank_clusters(clusters, trending=[], db=MagicMock())
+
+        assert [c[0].title for c in ranked_clusters] == ["Story 1", "Story 3", "Story 2", "Story 0"]
+        assert ranked_scores == sorted(ranked_scores, reverse=True)
+        assert len(ranked_scores) == len(ranked_clusters)
+
+
+def _tried(clusters, scores, n, publishes=lambda i: True):
+    """Drive _deduplicate_top_clusters as the refresh loop does: every
+    candidate it yields is tried, and those that `publishes` are reported
+    back through the shared list."""
+    published: list[int] = []
+    tried = []
+    for i, cluster in _deduplicate_top_clusters(clusters, scores, n, published):
+        tried.append(cluster)
+        if publishes(i):
+            published.append(i)
+    return tried
+
+
+class TestDeduplicateTopClusters:
+    """Cross-cluster deduplication prevents two angles on the same story."""
+
+    @pytest.mark.slow
+    def test_identical_clusters_deduplicated(self):
+        c1 = [_make_article("Trade war tariffs increase on Chinese goods")]
+        c2 = [_make_article("Trade war tariffs rise for Chinese imports")]
+        c3 = [_make_article("Healthcare bill passes Senate committee")]
+
+        result = _tried([c1, c2, c3], [0.9, 0.8, 0.5], 4)
+        assert len(result) == 2
+        titles = [r[0].title for r in result]
+        assert "Trade war tariffs increase on Chinese goods" in titles
+        assert "Healthcare bill passes Senate committee" in titles
+
+    @pytest.mark.slow
+    def test_merge_decisions_are_logged_for_future_threshold_calibration(self):
+        # 2026-08 audit: DEDUP_THRESHOLD has never been measured against a
+        # real same-story/different-story sample (unlike this file's other
+        # similarity gates) — every merge/keep decision must record a
+        # bucketed action_metrics counter so that data accumulates
+        # automatically instead of needing a one-off manual production pull.
+        from app.pipeline.analyze import action_metrics
+
+        action_metrics.reset()
+        c1 = [_make_article("Trade war tariffs increase on Chinese goods")]
+        c2 = [_make_article("Trade war tariffs rise for Chinese imports")]
+        c3 = [_make_article("Healthcare bill passes Senate committee")]
+
+        _tried([c1, c2, c3], [0.9, 0.8, 0.5], 4)
+
+        counts = action_metrics.snapshot()
+        merged = sum(v for k, v in counts.items() if k.startswith("cluster_dedup_merged_sim_bucket_"))
+        kept = sum(v for k, v in counts.items() if k.startswith("cluster_dedup_kept_sim_bucket_"))
+        # 3 candidates, first has nothing to compare against yet (no counter),
+        # so exactly 2 decisions get logged: one merge, one keep.
+        assert merged == 1
+        assert kept == 1
+
+    @patch("app.pipeline.analyze.action_center._embed_texts")
+    def test_promoted_lower_ranked_cluster_is_logged_selected_not_the_merged_one(self, mock_embed):
+        # 2026-08 quality audit (independent review of #443): logging
+        # selected/rejected by raw rank position — as an earlier version
+        # of this feature did in _rank_clusters — mislabels this exact
+        # case. c1/c2 are near-duplicates (c2 gets merged into c1 despite
+        # outranking c3); with max_issues=2, c3 is then promoted into the
+        # 2nd slot even though it ranks below c2. The metric must reflect
+        # what ACTUALLY got selected (c1, c3), not raw rank (c1, c2).
+        # Mocked embeddings (not @pytest.mark.slow, unlike this class's
+        # other tests) so this exercises the fast test suite CI's
+        # diff-coverage gate actually measures — c1/c2 identical raw
+        # vectors guarantee post-centering cosine ~1.0 (merge), c3
+        # orthogonal-ish guarantees a clear miss, deterministically.
+        from app.pipeline.analyze import action_metrics
+
+        action_metrics.reset()
+        mock_embed.return_value = np.array([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+        c1 = [_make_article("Trade war tariffs increase on Chinese goods")]
+        c2 = [_make_article("Trade war tariffs rise for Chinese imports")]
+        c3 = [_make_article("Healthcare bill passes Senate committee")]
+
+        result = _tried([c1, c2, c3], [0.9, 0.8, 0.5], 2)
+
+        result_titles = {a.title for cluster in result for a in cluster}
+        assert "Healthcare bill passes Senate committee" in result_titles
+        # The duplicate is dropped, not folded into c1: appending it was
+        # single linkage one step later and built 2026-09-27's chimeras.
+        assert result[0] == [c1[0]]
+        assert "Trade war tariffs rise for Chinese imports" not in result_titles
+
+        # Bucket-level check, not just aggregate counts: counting selected
+        # vs rejected alone can't tell "c1, c3 selected" apart from the
+        # raw-rank-position bug's "c1, c2 selected" when both mislabelings
+        # happen to produce the same totals (2 selected, 1 rejected) for
+        # this cluster count and max_issues — this caught a test that
+        # passed under the bug on first write. Checking WHICH score
+        # (c3's 0.5, not c2's 0.8) lands in "selected" is what actually
+        # proves the real outcome was logged.
+        counts = action_metrics.snapshot()
+        assert counts.get(f"cluster_rank_score_selected_{action_metrics.decile_bucket(0.5)}") == 1
+        assert counts.get(f"cluster_rank_score_rejected_{action_metrics.decile_bucket(0.8)}") == 1
+        assert f"cluster_rank_score_selected_{action_metrics.decile_bucket(0.8)}" not in counts
+        assert f"cluster_rank_score_rejected_{action_metrics.decile_bucket(0.5)}" not in counts
+
+    @patch("app.pipeline.analyze.action_center._embed_texts")
+    def test_a_duplicate_of_a_cluster_that_did_not_publish_is_still_tried(self, mock_embed):
+        # 2026-10-08: a live blog naming two stories ranked first, both
+        # stories were dropped as its duplicates, and the live blog then
+        # published nothing — in two consecutive runs. Only a published
+        # cluster carries its story; one that failed carries none.
+        mock_embed.return_value = np.array([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+        live_blog = [_make_article("Live updates: work visa penalties; judge extends media ban block")]
+        story = [_make_article("Judge extends temporary block on media ban")]
+        other = [_make_article("Healthcare bill passes Senate committee")]
+
+        tried = _tried([live_blog, story, other], [0.9, 0.8, 0.5], 3, publishes=lambda i: i != 0)
+        assert tried == [live_blog, story, other]
+
+        # Once the story does publish, its duplicate is not tried after it.
+        tried = _tried([story, live_blog, other], [0.9, 0.8, 0.5], 3)
+        assert tried == [story, other]
+
+
+class TestNationalMonitorCreation:
+    """Tests for importance and breadth requirements in monitor creation."""
+
+    @staticmethod
+    def _db(today_issue, past_issues):
+        """A mock session answering _update_national_monitors' queries:
+        today's issues, the past issues, and no existing monitors."""
+        def query(model):
+            q = MagicMock()
+            if model == ActionIssue:
+                q.filter.return_value.order_by.return_value.all.return_value = [today_issue]
+                q.filter.return_value.all.return_value = past_issues
+            elif model == NationalMonitor:
+                q.all.return_value = []
+            return q
+
+        db = MagicMock()
+        db.query.side_effect = query
+        return db
+
+    # call_llm answers nothing, so only the gate under test can stop the
+    # monitor: an unanswered model call no longer drops one (it falls back
+    # to the issue's own text), and these tests used to pass on that alone.
+    @patch("app.pipeline.analyze.action_center.call_llm", return_value=None)
+    @patch("app.pipeline.analyze.action_center.get_embedding_model")
+    def test_insufficient_breadth_skips_monitor(self, mock_get_model, _llm):
+        """Monitor should NOT be created if only one source covers the topic over multiple days."""
+        mock_model = MagicMock()
+        mock_get_model.return_value = mock_model
+        
+        # All embeddings are highly similar (0.95+)
+        mock_model.encode.return_value = np.array([[1.0] * 384 for _ in range(5)], dtype=np.float32)
+
+        today = "2026-03-13"
+        topic = "Niche local zoning issue"
+        
+        # Today's issue - only 1 source
+        today_issue = _make_issue(today, topic, ["Local News Source"])
+        # Past issues - all from same source
+        past_issues = [
+            _make_issue((datetime(2026, 3, 13) - timedelta(days=i)).strftime("%Y-%m-%d"), topic, ["Local News Source"])
+            for i in range(1, 5)
+        ]
+        mock_db = self._db(today_issue, past_issues)
+
+        _update_national_monitors(today, mock_db)
+
+        # Ensure NationalMonitor was not added because it only has 1 source
+        # (Even though it has 5 days of history, which is >= _MONITOR_MIN_DAYS)
+        added_objects = [call.args[0] for call in mock_db.add.call_args_list]
+        assert not any(isinstance(obj, NationalMonitor) for obj in added_objects)
+
+    @patch("app.pipeline.analyze.action_center._generate_monitor_metadata")
+    @patch("app.pipeline.analyze.action_center.get_embedding_model")
+    def test_sufficient_breadth_creates_monitor(self, mock_get_model, mock_gen_meta):
+        """Monitor SHOULD be created if multiple sources cover the topic over 5+ days."""
+        mock_model = MagicMock()
+        mock_get_model.return_value = mock_model
+        
+        # Mock LLM metadata generation
+        mock_gen_meta.return_value = {
+            "title": "Major Federal Tax Reform",
+            "description": "A big tax bill.",
+            "category": "taxes"
+        }
+        
+        # Mock embeddings to ensure matches
+        mock_model.encode.return_value = np.array([[1.0] * 384 for _ in range(6)], dtype=np.float32)
+
+        today = "2026-03-13"
+        topic = "Major Federal Tax Reform"
+        
+        # Today's issue - Source A
+        today_issue = _make_issue(today, topic, ["AP News"])
+        
+        # Past issues - 4 past days needed for 5 total
+        past_issues = [
+            _make_issue((datetime(2026, 3, 13) - timedelta(days=1)).strftime("%Y-%m-%d"), topic, ["Reuters"]),
+            _make_issue((datetime(2026, 3, 13) - timedelta(days=2)).strftime("%Y-%m-%d"), topic, ["AP News"]),
+            _make_issue((datetime(2026, 3, 13) - timedelta(days=3)).strftime("%Y-%m-%d"), topic, ["NPR Politics"]),
+            _make_issue((datetime(2026, 3, 13) - timedelta(days=4)).strftime("%Y-%m-%d"), topic, ["Reuters"]),
+        ]
+        mock_db = self._db(today_issue, past_issues)
+
+        _update_national_monitors(today, mock_db)
+
+        # Should be created: 4 days of history (today + 3 past) and 3 unique sources
+        added_objects = [call.args[0] for call in mock_db.add.call_args_list]
+        monitors = [obj for obj in added_objects if isinstance(obj, NationalMonitor)]
+        assert len(monitors) == 1
+        assert monitors[0].title == topic
+
+    @patch("app.pipeline.analyze.action_center.call_llm", return_value=None)
+    @patch("app.pipeline.analyze.action_center.get_embedding_model")
+    def test_insufficient_days_skips_monitor(self, mock_get_model, _llm):
+        """Monitor should NOT be created if it has only appeared for 4 days (min is now 5)."""
+        mock_model = MagicMock()
+        mock_get_model.return_value = mock_model
+        mock_model.encode.return_value = np.array([[1.0] * 384 for _ in range(4)], dtype=np.float32)
+
+        today = "2026-03-13"
+        topic = "New Short-lived Policy"
+        
+        today_issue = _make_issue(today, topic, ["AP News", "Reuters"])
+        past_issues = [
+            _make_issue((datetime(2026, 3, 13) - timedelta(days=1)).strftime("%Y-%m-%d"), topic, ["AP News"]),
+            _make_issue((datetime(2026, 3, 13) - timedelta(days=2)).strftime("%Y-%m-%d"), topic, ["Reuters"]),
+            _make_issue((datetime(2026, 3, 13) - timedelta(days=3)).strftime("%Y-%m-%d"), topic, ["NPR Politics"]),
+        ]
+        mock_db = self._db(today_issue, past_issues)
+
+        _update_national_monitors(today, mock_db)
+
+        # 3 days total (today, yesterday, day before). Min is 4.
+        added_objects = [call.args[0] for call in mock_db.add.call_args_list]
+        assert not any(isinstance(obj, NationalMonitor) for obj in added_objects)
+
+    @patch("app.pipeline.analyze.action_center.call_llm", return_value=None)
+    @patch("app.pipeline.analyze.action_center.get_embedding_model")
+    def test_developing_issue_is_never_written_as_a_monitor_update(
+        self, mock_get_model, mock_call_llm, db_session,
+    ):
+        """A hedged, unconfirmed, single-source DEVELOPING draft must not
+        surface publicly via a MonitorUpdate before press corroborates it
+        — same reasoning as excluding it from Bluesky/full-story. Uses a
+        real DB session and an EXISTING monitor the issue would otherwise
+        match (identical embeddings, well above _MONITOR_ISSUE_SIM) —
+        a single unmatched issue alone can't create/update
+        anything regardless of status, so that alone wouldn't have caught
+        a missing status filter here."""
+        mock_model = MagicMock()
+        mock_model.encode.return_value = np.array([[1.0] * 4], dtype=np.float32)
+        mock_get_model.return_value = mock_model
+
+        today = "2026-03-13"
+        monitor = NationalMonitor(
+            slug="ongoing-story", title="An ongoing story",
+            description="Long-running coverage.", status=MonitorStatus.ACTIVE,
+            last_article_date="2026-03-12",
+        )
+        db_session.add(monitor)
+        db_session.add(ActionIssue(
+            date=today, rank=1, title="An ongoing story", summary="s",
+            is_current=True, status=ActionIssueStatus.DEVELOPING,
+            source_urls=json.dumps(["https://www.senate.gov/vote.xml"]),
+            source_names=json.dumps(["Senate.gov roll call record"]),
+        ))
+        db_session.flush()
+
+        _update_national_monitors(today, db_session)
+
+        assert db_session.query(MonitorUpdate).count() == 0
+
+    @patch("app.pipeline.analyze.action_center.call_llm", return_value=None)
+    @patch("app.pipeline.analyze.action_center.get_embedding_model")
+    def test_issue_monitor_gate_is_the_similarity_floor_alone(
+        self, mock_get_model, mock_call_llm, db_session,
+    ):
+        """An issue at or above _MONITOR_ISSUE_SIM joins the monitor and one
+        below it does not, with no model call deciding either: the LLM
+        verdict that used to decide the band up to 0.80 approved 17 of 18
+        off-topic updates when replayed, so it was removed."""
+        from app.pipeline.analyze.action_center import _MONITOR_ISSUE_SIM
+
+        def unit(sim):
+            return [sim, float(np.sqrt(1 - sim * sim))]
+
+        vectors = {
+            "Ongoing standoff Long-running coverage.": [1.0, 0.0],
+            "In the band": unit(_MONITOR_ISSUE_SIM + 0.04),
+            "Below the floor": unit(_MONITOR_ISSUE_SIM - 0.01),
+        }
+        mock_model = MagicMock()
+        mock_model.encode.side_effect = lambda texts, **_: np.array(
+            [vectors[t] for t in texts], dtype=np.float32,
+        )
+        mock_get_model.return_value = mock_model
+
+        today = "2026-03-13"
+        db_session.add(NationalMonitor(
+            slug="ongoing-standoff", title="Ongoing standoff",
+            description="Long-running coverage.", status=MonitorStatus.ACTIVE,
+            last_article_date="2026-03-12",
+        ))
+        for rank, title in enumerate(("In the band", "Below the floor"), start=1):
+            db_session.add(ActionIssue(
+                date=today, rank=rank, title=title, summary="s", is_current=True,
+                status=ActionIssueStatus.CONFIRMED,
+                source_urls=json.dumps([f"https://example.org/{rank}"]),
+                source_names=json.dumps(["Example"]),
+            ))
+        db_session.flush()
+
+        _update_national_monitors(today, db_session)
+
+        assert [u.article_title for u in db_session.query(MonitorUpdate)] == ["In the band"]
+        # No model call in the stage unless a monitor is being named: the
+        # category check went too (the issues' own policy areas name it).
+        assert not mock_call_llm.called
+
+    def test_lifecycle_closing_and_deletion(self):
+        """Monitors should close after 30 days, and delete if they had few updates."""
+        mock_db = MagicMock()
+        today = "2026-03-13"
+        old_date = "2026-01-01" # > 30 days ago
+        
+        # 1. Significant old monitor (should close)
+        m1 = NationalMonitor(title="Big Event", status="active", last_article_date=old_date)
+        m1.updates = [MagicMock()] * 5 # 5 updates
+        
+        # 2. Insignificant old monitor (should be deleted)
+        m2 = NationalMonitor(title="Tiny blip", status="active", last_article_date=old_date)
+        m2.updates = [MagicMock()] * 2 # only 2 updates
+        
+        # 3. Recent monitor (should stay active)
+        m3 = NationalMonitor(title="Current war", status="active", last_article_date="2026-03-12")
+        m3.updates = [MagicMock()] * 10
+
+        # 4. A week and a day without an update (should be watching)
+        m4 = NationalMonitor(title="Quiet standoff", status="active", last_article_date="2026-03-05")
+        m4.updates = [MagicMock()] * 10
+
+        mock_db.query.return_value.filter.return_value.all.return_value = [m1, m2, m3, m4]
+
+        _cleanup_monitor_lifecycle(today, mock_db)
+
+        assert m1.status == "closed"
+        mock_db.delete.assert_any_call(m2)
+        assert m3.status == "active"
+        assert m4.status == "watching"
+
+    @patch("app.pipeline.analyze.action_center.call_llm")
+    def test_generate_monitor_metadata_success(self, mock_call_llm):
+        """The model writes the title and description; the category is the
+        issues' own commonest policy area, not the model's."""
+        issue = _make_issue("2026-03-13", "Strikes on Iran continue", ["AP News"])
+        issue.policy_areas = json.dumps(["DEFENSE"])
+        past = [_make_issue("2026-03-12", "Iran talks stall", ["Reuters"])]
+        past[0].policy_areas = json.dumps(["DEFENSE", "FOREIGN_POLICY"])
+
+        mock_call_llm.return_value = json.dumps({
+            "title": "Iran Strikes and Talks",
+            "description": "Strikes on Iran continue while talks stall.",
+            "category": "TRADE",
+        })
+
+        result = _generate_monitor_metadata(issue, past, MagicMock())
+
+        assert result["title"] == "Iran Strikes and Talks"
+        assert result["category"] == "defense"
+        assert result["description"].startswith("Strikes")
+
+    @patch("app.pipeline.analyze.action_center.call_llm")
+    def test_monitor_title_naming_what_the_articles_dont_falls_back(self, mock_call_llm):
+        """The model copied the example title from its prompt ("U.S.-Iran
+        Conflict") for 18 of 23 unrelated topics; each was then merged into
+        the existing monitor of that name. A title word the articles never
+        use sends the monitor to the issue's own title instead."""
+        issue = _make_issue("2026-03-13", "Beef import plan draws criticism", ["AP News"])
+        mock_call_llm.return_value = json.dumps({
+            "title": "U.S.-Iran Conflict",
+            "description": "Beef import plan draws criticism.",
+        })
+
+        result = _generate_monitor_metadata(issue, [], MagicMock())
+
+        assert result["title"] == "Beef import plan draws criticism"
+        assert result["description"] == "Summary for Beef import plan draws criticism"
+
+    @patch("app.pipeline.analyze.action_center.call_llm", return_value=None)
+    def test_unanswered_model_call_keeps_the_monitor(self, _llm):
+        """Whether a monitor opens is decided before the model is asked; no
+        answer means the issue's own (already checked) text, not no monitor."""
+        issue = _make_issue("2026-03-13", "Tariff talks stall", ["AP News"])
+
+        result = _generate_monitor_metadata(issue, [], MagicMock())
+
+        assert result["title"] == "Tariff talks stall"
+        assert result["category"] == "general"
+
+    @patch("app.pipeline.analyze.action_center.get_embedding_model")
+    def test_new_topic_gets_its_own_monitor_once(self, mock_get_model, db_session, monkeypatch):
+        """End to end on a real session: a recurring topic beside an existing
+        monitor opens one monitor of its own, even when the model names it
+        after the existing one, and a second issue on it the same run does
+        not open another."""
+        import app.pipeline.analyze.action_center as ac
+
+        topic = [1.0, 0.0, 0.0]
+        vectors = {
+            "Ongoing standoff Long-running coverage.": [0.0, 1.0, 0.0],
+            "Tariff talks stall": topic,
+            "Tariff dispute widens": topic,
+        }
+
+        def encode(texts, **_):
+            return np.array([vectors.get(t, topic) for t in texts], dtype=np.float32)
+
+        mock_model = MagicMock()
+        mock_model.encode.side_effect = encode
+        mock_get_model.return_value = mock_model
+        # Title similarity for the merge step: equal titles merge, others don't.
+        title_ids: dict[str, int] = {}
+        monkeypatch.setattr(ac, "_embed_texts_sim", lambda texts: [
+            np.eye(16)[title_ids.setdefault(t, len(title_ids))] for t in texts
+        ])
+        monkeypatch.setattr(ac, "call_llm", lambda **_: json.dumps({
+            "title": "Ongoing standoff", "description": "Tariff talks stall.",
+        }))
+
+        today = "2026-03-13"
+        db_session.add(NationalMonitor(
+            slug="ongoing-standoff", title="Ongoing standoff",
+            description="Long-running coverage.", status=MonitorStatus.ACTIVE,
+            last_article_date=today,
+        ))
+        for rank, title in enumerate(("Tariff talks stall", "Tariff dispute widens"), start=1):
+            row = _make_issue(today, title, ["AP News", "Reuters"])
+            row.rank, row.status = rank, ActionIssueStatus.CONFIRMED
+            row.source_urls = json.dumps([f"https://example.org/today-{rank}"])
+            db_session.add(row)
+        for back, source in zip(range(1, 5), ("NPR", "PBS", "AP News", "Reuters")):
+            day = (datetime(2026, 3, 13) - timedelta(days=back)).strftime("%Y-%m-%d")
+            row = _make_issue(day, "Tariff talks stall", [source])
+            row.status = ActionIssueStatus.CONFIRMED
+            row.source_urls = json.dumps([f"https://example.org/past-{back}"])
+            db_session.add(row)
+        db_session.commit()
+
+        _update_national_monitors(today, db_session)
+
+        monitors = {m.slug: m for m in db_session.query(NationalMonitor)}
+        assert len(monitors) == 2
+        new = next(m for slug, m in monitors.items() if slug != "ongoing-standoff")
+        assert new.title == "Tariff talks stall"
+        assert not monitors["ongoing-standoff"].updates
+        assert len(new.updates) == 5
+
+
+class TestFullStoryShouldInvalidate:
+    """A topic-similarity match can land two substantively different stories
+    on the same row (e.g. two senators' health events). full_story must be
+    regenerated when that happens, not left describing the old event."""
+
+    @pytest.mark.parametrize("old_title, old_facts, new_title, new_facts, expected", [
+        # Rank/date churn alone (no title/facts change) must not invalidate —
+        # this function only ever sees title/facts, so callers don't need to
+        # regenerate on every hourly refresh of an unchanged story.
+        pytest.param("Senator X hospitalized", '["fact a"]', "Senator X hospitalized", '["fact a"]', False,
+                     id="unchanged_title_and_facts_does_not_invalidate"),
+        # The real 2026-07 bug: a McAllister hospitalization story's row got
+        # re-matched onto a later, different senator's death.
+        pytest.param("Hal McAllister hospitalized", '["fact a"]', "Lowell Whitfield dies at 71", '["fact a"]', True,
+                     id="changed_title_invalidates"),
+        # Same headline, but the underlying facts were updated (story
+        # evolved) — the old full_story may cite facts no longer true.
+        pytest.param("Senator X hospitalized", '["fact a"]', "Senator X hospitalized", '["fact a", "fact b"]', True,
+                     id="changed_facts_alone_invalidates"),
+    ])
+    def test_invalidation(self, old_title, old_facts, new_title, new_facts, expected):
+        assert _full_story_should_invalidate(old_title, old_facts, new_title, new_facts) is expected
+
+
+
+class TestLogSummarySourceConsistency:
+    """Automated, non-blocking semantic-consistency signal (2026-08 AI/ML
+    audit): grounding.py's checks are all regex-based and only catch a
+    failure class after a human has already seen it live. This starts
+    collecting a real distribution instead — bucketed decile counters via
+    the same action_metrics pattern every other validator uses — so a
+    threshold can eventually be derived the way every other one in this
+    codebase was. Never rejects or retries."""
+
+    @patch("app.pipeline.analyze.action_center._embed_texts_sim")
+    def test_records_the_correct_similarity_decile_bucket(self, mock_embed):
+        from app.pipeline.analyze import action_metrics
+
+        action_metrics.reset()
+        # cosine 0.7 between the two (already-normalized) mock vectors.
+        mock_embed.return_value = np.array([[1.0, 0.0], [0.7, (1 - 0.7 ** 2) ** 0.5]])
+
+        _log_summary_source_consistency("a generated summary", "the source article text")
+
+        assert action_metrics.snapshot() == {"summary_source_similarity_bucket_70": 1}
+
+    @patch("app.pipeline.analyze.action_center._embed_texts_sim")
+    def test_never_blocks_on_embedding_failure(self, mock_embed):
+        from app.pipeline.analyze import action_metrics
+
+        action_metrics.reset()
+        mock_embed.side_effect = RuntimeError("model not loaded")
+
+        _log_summary_source_consistency("a generated summary", "the source article text")
+
+        assert action_metrics.snapshot() == {}
+
+
+class TestFindRelatedExploreDocsGenericTitleFilter:
+    """Confirmed live 2026-07: 'LEGISLATIVE SESSION' — a boilerplate title
+    shared by hundreds of Senate floor-speech records covering completely
+    different bills, whose real content ('Mr. President, I move to
+    proceed to Calendar No. X') carries no topic-specific signal — got
+    linked to both a Ukraine-aid story and an unrelated budget-resolution
+    story on the same day, because the title-only re-ranking this
+    function uses can't discriminate a title that doesn't actually
+    describe its own content."""
+
+    def _seed_docs(self, db_session, generic_count: int = 6):
+        db_session.add(ExploreDocument(
+            id=1, doc_type="Final Rule", source="Federal Register",
+            title="Bank Secrecy Act and Stablecoin Issuer Standards",
+            summary="", body="", date="2026-01-01",
+        ))
+        for i in range(2, 2 + generic_count):
+            db_session.add(ExploreDocument(
+                id=i, doc_type="Senate Floor Speech", source="Congressional Record",
+                title="LEGISLATIVE SESSION", summary="", body="", date="2026-01-01",
+            ))
+        db_session.commit()
+
+    @patch("app.pipeline.analyze.action_center._embed_texts_sim")
+    @patch("app.pipeline.analyze.action_center.search_explore_documents")
+    def test_boilerplate_title_excluded_even_with_higher_raw_similarity(
+        self, mock_search, mock_embed, db_session,
+    ):
+        self._seed_docs(db_session, generic_count=6)
+        mock_search.return_value = [
+            {"id": 1, "title": "Bank Secrecy Act and Stablecoin Issuer Standards", "distance": 0.5},
+            {"id": 2, "title": "LEGISLATIVE SESSION", "distance": 0.5},
+        ]
+        # Embeddings crafted so the generic doc (id=2) scores a HIGHER raw
+        # cosine similarity than the genuinely relevant doc (id=1) — proving
+        # the genericness filter, not just similarity ranking, is what
+        # excludes it.
+        mock_embed.return_value = np.array([
+            [1.0, 0.0],    # issue title embedding
+            [0.90, 0.10],  # doc 1 (relevant, real signal)
+            [0.99, 0.01],  # doc 2 (generic title, spuriously higher similarity)
+        ])
+
+        result = _find_related_explore_docs(
+            "Crypto stablecoin legislation", "summary", ["FINANCIAL"], db_session,
+        )
+
+        ids = [d["id"] for d in result]
+        assert 1 in ids
+        assert 2 not in ids
+
+    @patch("app.pipeline.analyze.action_center._embed_texts_sim")
+    @patch("app.pipeline.analyze.action_center.search_explore_documents")
+    def test_title_below_repeat_threshold_is_not_filtered(
+        self, mock_search, mock_embed, db_session,
+    ):
+        # Same shape, but the "generic" title only appears twice — below
+        # GENERIC_TITLE_REPEAT_THRESHOLD (5) — so it's a real match, not
+        # boilerplate, and should be kept.
+        self._seed_docs(db_session, generic_count=2)
+        mock_search.return_value = [
+            {"id": 2, "title": "LEGISLATIVE SESSION", "distance": 0.5},
+        ]
+        mock_embed.return_value = np.array([
+            [1.0, 0.0],
+            [0.95, 0.05],
+        ])
+
+        result = _find_related_explore_docs(
+            "Some issue title", "summary", [], db_session,
+        )
+
+        assert [d["id"] for d in result] == [2]
+
+
+class TestExploreDocThresholds:
+    """Confirmed live 2026-07: at the prior distance/similarity thresholds
+    (1.10 / 0.40), nearly every Action Center issue linked 2-3 unrelated
+    explore docs — e.g. a World Cup soccer story matched to Chinese steel
+    anti-dumping notices at distance 0.87 and title-similarity 0.74, both
+    comfortably inside the old bounds. Tightened based on real production
+    score distributions (see _EXPLORE_DOC_MAX_DISTANCE's comment)."""
+
+    def _seed_doc(self, db_session, doc_id: int, title: str):
+        db_session.add(ExploreDocument(
+            id=doc_id, doc_type="Notice", source="Federal Register",
+            title=title, summary="", body="", date="2026-01-01",
+        ))
+        db_session.commit()
+
+    @patch("app.pipeline.analyze.action_center._embed_texts_sim")
+    @patch("app.pipeline.analyze.action_center.search_explore_documents")
+    def test_distance_at_old_threshold_now_rejected(self, mock_search, mock_embed, db_session):
+        self._seed_doc(db_session, 1, "Certain Steel Products From China: Preliminary Results")
+        mock_search.return_value = [
+            {"id": 1, "title": "Certain Steel Products From China: Preliminary Results", "distance": 0.95},
+        ]
+        mock_embed.return_value = np.array([[1.0, 0.0], [0.95, 0.05]])
+
+        result = _find_related_explore_docs("Sports story", "summary", [], db_session)
+        assert result == []
+
+    @patch("app.pipeline.analyze.action_center._embed_texts_sim")
+    @patch("app.pipeline.analyze.action_center.search_explore_documents")
+    def test_similarity_at_old_threshold_now_rejected(self, mock_search, mock_embed, db_session):
+        self._seed_doc(db_session, 1, "Certain Steel Products From China: Preliminary Results")
+        mock_search.return_value = [
+            {"id": 1, "title": "Certain Steel Products From China: Preliminary Results", "distance": 0.5},
+        ]
+        # cos_sim ~= 0.25 — above zero, below the similarity-model bar.
+        mock_embed.return_value = np.array([[1.0, 0.0], [0.25, 0.968]])
+
+        result = _find_related_explore_docs("Sports story", "summary", [], db_session)
+        assert result == []
+
+    @patch("app.pipeline.analyze.action_center._embed_texts_sim")
+    @patch("app.pipeline.analyze.action_center.search_explore_documents")
+    def test_a_same_place_notice_below_the_measured_bar_is_rejected(self, mock_search, mock_embed, db_session):
+        # Linked 2026-10-08 at title similarity 0.381, under the old 0.33
+        # bar: 189 of 299 stored links were unrelated like this one.
+        title = "Safety Zone; Bayfront Park 4th of July Fireworks Display, Intercoastal Waterway, Biscayne Bay, Miami, FL"
+        self._seed_doc(db_session, 1, title)
+        mock_search.return_value = [{"id": 1, "title": title, "distance": 0.80}]
+        mock_embed.return_value = np.array([[1.0, 0.0], [0.381, 0.925]])
+
+        result = _find_related_explore_docs(
+            "President proposes a presidential retreat at a private Florida golf club",
+            "summary", [], db_session,
+        )
+        assert result == []
+
+    @patch("app.pipeline.analyze.action_center._embed_texts_sim")
+    @patch("app.pipeline.analyze.action_center.search_explore_documents")
+    def test_genuine_close_match_survives_tightened_thresholds(self, mock_search, mock_embed, db_session):
+        self._seed_doc(db_session, 1, "EO 14318: Accelerating Federal Permitting of Data Center Infrastructure")
+        mock_search.return_value = [
+            {"id": 1, "title": "EO 14318: Accelerating Federal Permitting of Data Center Infrastructure", "distance": 0.80},
+        ]
+        mock_embed.return_value = np.array([[1.0, 0.0], [0.80, 0.20]])
+
+        result = _find_related_explore_docs("China data center buildout", "summary", [], db_session)
+        assert [d["id"] for d in result] == [1]
+
+
+class TestAdministrativeNoticeTitleFilter:
+    """Confirmed live 2026-07: Paperwork Reduction Act information-collection
+    notices and FACA advisory-committee meeting notices — legally-templated
+    titles that are never substantively about any particular news story —
+    scored well inside the "genuine match" distance/similarity bands for
+    completely unrelated issues (e.g. an Attorney General story matched to
+    a "Notice of Public Meeting of the Montana Advisory Committee"). Unlike
+    LEGISLATIVE SESSION, each of these notices is uniquely titled, so
+    GENERIC_TITLE_REPEAT_THRESHOLD's repeat-count check can't catch them —
+    this matches the fixed legal template phrasing instead."""
+
+    def _seed_doc(self, db_session, doc_id: int, title: str):
+        db_session.add(ExploreDocument(
+            id=doc_id, doc_type="Notice", source="Federal Register",
+            title=title, summary="", body="", date="2026-01-01",
+        ))
+        db_session.commit()
+
+    @pytest.mark.parametrize(
+        "issue_title, doc_title",
+        [
+            pytest.param(
+                "Some unrelated issue",
+                "Agency Information Collection Activities; Proposed eCollection",
+                id="information_collection_notice_rejected_despite_high_similarity",
+            ),
+            pytest.param(
+                "Attorney General independence",
+                "Notice of Public Meeting of the Montana Advisory Committee",
+                id="advisory_committee_meeting_notice_rejected_despite_high_similarity",
+            ),
+            pytest.param(
+                "Some unrelated issue",
+                "Proposed Collection; 60-day Comment Request; Generic Clearance for NIH",
+                id="proposed_collection_comment_request_variant_rejected",
+            ),
+            pytest.param(
+                "Some unrelated issue",
+                "Solicitation of Nominations for Membership on the Ocean Exploration Advisory Board",
+                id="solicitation_of_nominations_variant_rejected",
+            ),
+        ],
+    )
+    @patch("app.pipeline.analyze.action_center._embed_texts_sim")
+    @patch("app.pipeline.analyze.action_center.search_explore_documents")
+    def test_administrative_notice_rejected_despite_high_similarity(
+        self, mock_search, mock_embed, issue_title, doc_title, db_session,
+    ):
+        self._seed_doc(db_session, 1, doc_title)
+        mock_search.return_value = [{"id": 1, "title": doc_title, "distance": 0.70}]
+        mock_embed.return_value = np.array([[1.0, 0.0], [0.95, 0.05]])
+
+        result = _find_related_explore_docs(issue_title, "summary", [], db_session)
+        assert result == []
+
+    @patch("app.pipeline.analyze.action_center._embed_texts_sim")
+    @patch("app.pipeline.analyze.action_center.search_explore_documents")
+    def test_notice_without_administrative_template_phrasing_is_kept(
+        self, mock_search, mock_embed, db_session,
+    ):
+        self._seed_doc(db_session, 1, "Notice of OFAC Sanctions Actions")
+        mock_search.return_value = [
+            {"id": 1, "title": "Notice of OFAC Sanctions Actions", "distance": 0.70},
+        ]
+        mock_embed.return_value = np.array([[1.0, 0.0], [0.95, 0.05]])
+
+        result = _find_related_explore_docs("Sanctions on foreign officials", "summary", [], db_session)
+        assert [d["id"] for d in result] == [1]
+
+
+class TestFindRelatedSenatorsCommonWordSurnames:
+    """Rep. Darnell Figures (surname "Figures", seated Jan 2025) was
+    getting tagged on any article using the common word "figures" ("the
+    data figures show...") — a bare last-name substring/word-boundary
+    match with no context requirement strong enough to filter it out
+    reliably. _COMMON_WORD_SURNAMES already existed for exactly this
+    failure mode (it already had "justice", "banks", "young", etc.) but
+    "figures" wasn't on it, and there was no test coverage to catch a
+    regression either way."""
+
+    def test_common_word_surname_not_matched_by_bare_word(self, db_session):
+        db_session.add(Representative(
+            id="s-figures", name="Darnell Figures", state="AL", party="D",
+        ))
+        db_session.commit()
+
+        result = _find_related_senators(
+            "Economic outlook", "The latest data figures show inflation cooling.", [], db_session,
+        )
+        assert result == []
+
+    def test_common_word_surname_still_matched_by_full_name(self, db_session):
+        """The stoplist only blocks bare last-name matching — a full-name
+        hit is always high-confidence and must still work."""
+        db_session.add(Representative(
+            id="s-figures", name="Darnell Figures", state="AL", party="D",
+        ))
+        db_session.commit()
+
+        result = _find_related_senators(
+            "Alabama delegation", "Rep. Darnell Figures announced a new bill today.", [], db_session,
+        )
+        assert [r["id"] for r in result] == ["s-figures"]
+
+    def test_a_surname_several_members_share_names_none_of_them(self, db_session):
+        """2026-10-08: one story about the Speaker linked five members
+        sharing his surname."""
+        db_session.add_all([
+            Representative(id="r-1", name="Amara Delacroix", state="TX", party="R"),
+            Representative(id="r-2", name="Bryce Delacroix", state="OH", party="D"),
+            Representative(id="r-3", name="Celia Ostrander", state="NV", party="D"),
+        ])
+        db_session.commit()
+
+        result = _find_related_senators(
+            "Texas news", "Rep. Delacroix and Rep. Ostrander spoke at the event.", [], db_session,
+        )
+        assert [m["id"] for m in result] == ["r-3"]
+        assert result[0]["match_reason"] == "referenced in coverage"
+
+    def test_a_two_letter_given_name_is_another_person(self, db_session):
+        db_session.add(Representative(id="r-1", name="Celia Ostrander", state="NV", party="D"))
+        db_session.commit()
+
+        assert _find_related_senators("Sports", "Former player Ed Ostrander was charged.", [], db_session) == []
+
+
+class TestFindRelatedSenatorsSameSurnameCollision:
+    """2026-07: live production bug — the Action Center's #2-ranked issue
+    ("Endorsements for South Carolina race", about SC candidate Delia
+    Whitfield) also tagged Sen. Lowell Whitfield as "referenced in coverage",
+    even though he is never mentioned anywhere in the title, summary,
+    facts, or full story. 30+ surnames are shared by 2+ current members
+    (Smith x5, Carver x5, Moore x5, Whitfield x2, etc.), so this wasn't a
+    one-off: any story that fully-names one member also puts every OTHER
+    member with the same surname through last-name-only disambiguation,
+    and a same-state, same-general-topic collision (candidate Whitfield,
+    Senator Whitfield, both South Carolina, both "politician" context) can
+    read as similar enough to a generic "Senator {name} from {state}"
+    prototype phrase to cross the similarity threshold — despite the
+    surname's every appearance in the text being fully explained by the
+    OTHER person's own confirmed full-name match already.
+    """
+
+    def test_unrelated_same_surname_member_is_not_matched(self, db_session):
+        db_session.add(Senator(id="delia-whitfield", name="Delia Whitfield", state="SC", party="R"))
+        db_session.add(Senator(id="lowell-whitfield", name="Lowell Whitfield", state="SC", party="R"))
+        db_session.commit()
+
+        result = _find_related_senators(
+            "Endorsements for South Carolina race",
+            "Several officials have publicly backed Delia Whitfield as a candidate "
+            "for the South Carolina congressional seat.",
+            [
+                "Whitfield collected endorsements from political figures following her announcement.",
+                "The race is scheduled for a full six-year term as outlined in her campaign plans.",
+            ],
+            db_session,
+        )
+
+        assert [r["id"] for r in result] == ["delia-whitfield"]
+
+    def test_same_surname_member_still_matched_when_also_named_in_full(self, db_session):
+        """The fix must only suppress the OTHER person sharing a surname —
+        if both are genuinely named in full, both should still match."""
+        db_session.add(Senator(id="delia-whitfield", name="Delia Whitfield", state="SC", party="R"))
+        db_session.add(Senator(id="lowell-whitfield", name="Lowell Whitfield", state="SC", party="R"))
+        db_session.commit()
+
+        result = _find_related_senators(
+            "South Carolina endorsement",
+            "Delia Whitfield received an endorsement from Lowell Whitfield today.",
+            [],
+            db_session,
+        )
+
+        assert {r["id"] for r in result} == {"delia-whitfield", "lowell-whitfield"}
+
+    @patch("app.pipeline.analyze.action_center._embed_texts")
+    def test_last_name_only_reference_still_works_without_a_collision(self, mock_embed, db_session):
+        """The fix must not break ordinary last-name-only disambiguation
+        for a member with no same-surname collision in play at all."""
+        db_session.add(Senator(id="lowell-whitfield", name="Lowell Whitfield", state="SC", party="R"))
+        db_session.commit()
+        mock_embed.return_value = np.array([[1.0, 0.0], [1.0, 0.0]])
+
+        result = _find_related_senators(
+            "South Carolina news", "Whitfield criticized the bill in a floor speech.", [], db_session,
+        )
+
+        assert [r["id"] for r in result] == ["lowell-whitfield"]
+
+
+class TestFindRelatedOfficialsJusticeCommonWordSurnames:
+    """Same failure mode as senators/reps, applied to justice matching:
+    Justice Mara Lynn Jackson's surname is both a common place name
+    ("Jackson, Mississippi") and an everyday word."""
+
+    def test_justice_common_word_surname_not_matched_by_bare_word(self, db_session):
+        db_session.add(Senator(id="dummy", name="Dummy Senator", state="CA", party="D"))
+        db_session.add(Justice(id="jackson", name="Mara Lynn Jackson", last_name="Jackson"))
+        db_session.commit()
+
+        result = _find_related_officials(
+            "Travel feature", "Visitors flocked to Jackson, Mississippi this summer.", [], db_session,
+        )
+        assert result == []
+
+
+class TestSurnameOwnedByOtherName:
+    """2026-07 audit H3: a World Cup story tagged both Reps. Torres
+    ("referenced in coverage") off soccer player Ferran Torres' surname —
+    and that false tag was itself the action surface that let a sports
+    story publish as a civic issue. The embedding disambiguation is
+    provably unable to catch this (measured on the live case: 0.78-0.80
+    vs. genuine civic references at 0.77-0.85 — fully overlapping), so
+    the guard is deterministic: a surname occurrence immediately preceded
+    by a different person's given name is not the member."""
+
+    @pytest.mark.parametrize("text, expected", [
+        pytest.param("Spain defeated Argentina 1-0 in a match featuring Ferran Torres' late goal.", True,
+                     id="live_ferran_torres_case"),
+        pytest.param("The bill from Marco Torres advanced on Tuesday.", False,
+                     id="own_first_name_is_not_another_owner"),
+        pytest.param("On the floor, Rep. Torres criticized the amendment.", False,
+                     id="title_prefix_is_not_another_owner"),
+        # "Georgia." ends the previous sentence — it does not own "Torres".
+        pytest.param("The delegation visited Georgia. Torres said the trip was productive.", False,
+                     id="sentence_boundary_capitalized_word_is_not_an_owner"),
+        pytest.param("A spokesman for Torres confirmed the schedule.", False,
+                     id="lowercase_preceding_word_is_not_an_owner"),
+        pytest.param("Torres said the housing bill would advance this week.", False,
+                     id="surname_at_text_start_has_no_owner"),
+    ])
+    def test_owner(self, text, expected):
+        import re
+
+        m = re.search(r"\bTorres\b", text)
+        assert _surname_owned_by_other_name(text, m, "Marco Torres") is expected
+
+
+class TestFindRelatedSenatorsSurnameOwnedByOtherPerson:
+    def test_world_cup_ferran_torres_does_not_tag_reps_torres(self, db_session):
+        db_session.add(Representative(id="r-torres", name="Marco Torres", state="NY", party="D"))
+        db_session.add(Representative(id="n-torres", name="Inez J. Torres", state="CA", party="D"))
+        db_session.commit()
+
+        result = _find_related_senators(
+            "Spanish and Argentine reactions to World Cup final",
+            "Spain defeated Argentina 1-0 in a match featuring Ferran Torres' late goal.",
+            ["Spanish spectators celebrated in Madrid following Spain's World Cup win."],
+            db_session,
+        )
+        assert result == []
+
+    def test_member_still_matched_when_some_occurrence_is_unowned(self, db_session):
+        # One occurrence owned by another name, one genuinely bare — the
+        # member stays a live candidate (the guard requires EVERY
+        # occurrence to be someone else's).
+        db_session.add(Representative(id="r-torres", name="Marco Torres", state="NY", party="D"))
+        db_session.commit()
+        with patch("app.pipeline.analyze.action_center._embed_texts") as mock_embed:
+            mock_embed.return_value = np.array([[1.0, 0.0], [1.0, 0.0]])
+            result = _find_related_senators(
+                "Housing bill advances",
+                "Rep. Torres introduced the measure. Ferran Torres played no role.",
+                [],
+                db_session,
+            )
+        assert [r["id"] for r in result] == ["r-torres"]
+
+
+class TestIssueSignatureMatching:
+    """2026-07 audit H1/H2: topic identity by raw title cosine at 0.82
+    failed in both directions on real production rows — two same-story
+    rows measured 0.80/0.85 (duplicate rows, duplicate Bluesky posts)
+    while a different-story pair measured 0.88 (row content overwritten
+    in place; the published post described a different story than its
+    permalink). Every case below uses the real production rows' text."""
+
+    def test_same_defense_bill_rows_match(self):
+        # ids 394/405: same $95B bill, same 216-212 vote, two rows.
+        sig_a = _issue_signature(
+            "Defense policy bill passage and budget debates",
+            ["A defense policy bill was passed with a narrow 216-212 vote.",
+             "Six Democrats supported the bill, and seven Republicans opposed it.",
+             "House Republicans approved a $95 billion framework for a third budget reconciliation package."],
+        )
+        sig_b = _issue_signature(
+            "House approves Pentagon funding framework",
+            ["A $95 billion framework was approved for defense spending.",
+             "The vote resulted in a narrow 216-212 outcome.",
+             "Six Democrats supported the measure while seven Republicans opposed it."],
+        )
+        assert _signatures_match(sig_a, sig_b) is True
+
+    def test_same_outbreak_rows_match(self):
+        # ids 396/401: same cyclospora outbreak on adjacent days.
+        sig_a = _issue_signature(
+            "FDA investigation continues over Taylor Farms lettuce",
+            ["A lettuce sample from Taylor Farms was initially flagged as positive for cyclospora.",
+             "Multiple states are reporting over 7,000 confirmed cases of cyclosporiasis nationwide."],
+        )
+        sig_b = _issue_signature(
+            "Cyclosporiasis outbreak investigation updates",
+            ["Over 7,000 cases have been reported across several states.",
+             "The FDA has stated that a sample from Taylor Farms was later identified as a false positive."],
+        )
+        assert _signatures_match(sig_a, sig_b) is True
+
+    def test_different_stories_with_similar_titles_do_not_match(self):
+        # The drift shape: a shutdown stopgap story vs. the $95B package —
+        # titles alike enough that raw cosine matched them (0.88 measured),
+        # overwriting a posted row with a different story's content.
+        sig_a = _issue_signature(
+            "House advances funding bill to avoid government shutdown",
+            ["The House passed a temporary funding measure to avoid a shutdown.",
+             "Senators plan a response next week."],
+        )
+        sig_b = _issue_signature(
+            "House approves Pentagon funding framework",
+            ["A $95 billion framework was approved for defense spending.",
+             "The vote resulted in a narrow 216-212 outcome."],
+        )
+        assert _signatures_match(sig_a, sig_b) is False
+
+    def test_generic_civic_vocabulary_carries_no_identity(self):
+        sig = _issue_signature(
+            "House Republicans debate the bill",
+            ["Lawmakers in Congress discussed the legislation."],
+        )
+        # Everything here is generic — the signature must be (nearly)
+        # empty rather than full of House/Republicans/Congress tokens
+        # that would match every other political story.
+        assert "house" not in sig
+        assert "republicans" not in sig
+        assert "congress" not in sig
+
+    def test_empty_signature_never_matches(self):
+        assert _signatures_match(set(), {"taylor", "farms"}) is False
+
+    def test_sparse_single_token_signature_cannot_match_even_itself(self):
+        # Live 2026-07-23 bug: a story whose only extractable entity is one
+        # name ("Varga") produces a 1-token signature. _SIGNATURE_MATCH_MIN_SHARED
+        # (2) means it can never clear the floor, even compared to an
+        # exact copy of itself — this is exactly why _run_refresh's loop
+        # needs the exact-content check ahead of signature matching (see
+        # test_byte_identical_issues_are_duplicates below), not a reason
+        # to lower the shared-token floor (that would risk merging
+        # different stories that happen to mention the same one person).
+        facts = [
+            "A new bill text was released by Republican representatives.",
+            "The legislation includes a provision endorsed by former President Varga.",
+        ]
+        sig = _issue_signature("Republicans introduce crypto legislation with ethical clause", facts)
+        assert sig == {"varga"}
+        assert _signatures_match(sig, sig) is False
+
+    def test_byte_identical_issues_are_duplicates(self):
+        title = "Republicans introduce crypto legislation with ethical clause"
+        facts = [
+            "A new bill text was released by Republican representatives.",
+            "The legislation includes a provision endorsed by former President Varga.",
+        ]
+        assert _is_exact_content_duplicate(title, facts, title, list(facts)) is True
+
+    def test_different_content_is_not_a_duplicate(self):
+        assert _is_exact_content_duplicate(
+            "Title A", ["fact 1"], "Title B", ["fact 1"],
+        ) is False
+        assert _is_exact_content_duplicate(
+            "Same title", ["fact 1"], "Same title", ["fact 2"],
+        ) is False
+
+    def test_find_matching_issue_catches_sparse_signature_exact_duplicate(self):
+        # End-to-end reproduction of the live 2026-07-23 bug via the actual
+        # matching function _run_refresh calls, not just the helper in
+        # isolation: a byte-identical reprocessing of the same source
+        # article must resolve to the existing row, never a new one.
+        title = "Republicans introduce crypto legislation with ethical clause"
+        facts = [
+            "A new bill text was released by Republican representatives.",
+            "The legislation includes a provision endorsed by former President Varga.",
+        ]
+        existing = ActionIssue(
+            id=420, date="2026-07-23", rank=2, title=title, facts=json.dumps(facts),
+        )
+        # Identical title -> cosine similarity 1.0 against itself.
+        recent_embs = np.array([[1.0, 0.0]])
+        title_emb = np.array([1.0, 0.0])
+
+        match = _find_matching_issue(title, facts, [existing], recent_embs, title_emb, set())
+        assert match is existing
+
+    def test_find_matching_issue_catches_identical_title_with_reworded_facts(self):
+        # Live 2026-08-22 bug: "Varga defends beef import plan amid GOP
+        # criticism" was regenerated an hour apart with the same title but
+        # "cattle producers"/"ranchers" swapped between generations — enough
+        # to sink _issue_signature's sparse entity overlap below
+        # _signatures_match's floor, and _is_exact_content_duplicate
+        # requires facts to match too so it didn't catch this either. Two
+        # rows created, two Bluesky posts for the same story.
+        title = "Varga defends beef import plan amid GOP criticism"
+        old_facts = [
+            "Varga said the decision was driven by public pressure to lower beef prices.",
+            "GOP lawmakers voiced alarm over the policy's effect on U.S. beef producers.",
+        ]
+        new_facts = [
+            "Varga said the decision was driven by public pressure to lower beef prices.",
+            "GOP lawmakers voiced alarm over the policy's effect on U.S. cattle producers.",
+        ]
+        existing = ActionIssue(
+            id=603, date="2026-08-21", rank=3, title=title, facts=json.dumps(old_facts),
+        )
+        recent_embs = np.array([[1.0, 0.0]])
+        title_emb = np.array([1.0, 0.0])
+
+        match = _find_matching_issue(title, new_facts, [existing], recent_embs, title_emb, set())
+        assert match is existing
+
+    def test_find_matching_issue_catches_near_identical_but_not_byte_identical_title(self):
+        # Real production pair (2026-08-22 audit): "Senate funding patch
+        # delays grant changes" vs "...grant overhaul" scored 0.957 title
+        # cosine — clearly the same specific development, but not a byte-
+        # identical title, so the exact-title check added for the beef
+        # bug wouldn't catch it. Facts are written to share no signature
+        # tokens, isolating that this match comes from the near-identical-
+        # title path, not signature overlap.
+        title = "Senate funding patch delays grant changes"
+        cand_title = "Senate funding patch delays grant overhaul"
+        facts = ["A provision affecting research grants was altered in the latest text."]
+        cand_facts = ["A separate clause affecting award programs was modified in committee."]
+        existing = ActionIssue(
+            id=490, date="2026-08-20", rank=5, title=cand_title, facts=json.dumps(cand_facts),
+        )
+        cosine = 0.957
+        recent_embs = np.array([[cosine, (1 - cosine**2) ** 0.5]])
+        title_emb = np.array([1.0, 0.0])
+
+        match = _find_matching_issue(title, facts, [existing], recent_embs, title_emb, set())
+        assert match is existing
+
+    def test_find_matching_issue_does_not_merge_distinct_developments_in_the_same_saga(self):
+        # Real production title-cosine (0.795) between two genuinely
+        # separate steps of the same funding-bill saga — related, but not
+        # the same specific development. Facts are written to give both
+        # sides a non-empty, non-overlapping signature (1 shared token,
+        # below _SIGNATURE_MATCH_MIN_SHARED) so this isolates the new
+        # near-identical-title path rather than tripping the pre-existing
+        # empty-signature fallback. Below _NEAR_IDENTICAL_TITLE_THRESHOLD
+        # (0.92), this must NOT auto-merge — collapsing every step of an
+        # ongoing saga into one row would hide real distinct developments.
+        title = "Senate passes funding bill to avert October shutdown"
+        cand_title = "Senate approves funding bill to avoid shutdown"
+        facts = ["Senator Grantham led the floor vote ahead of the October deadline."]
+        cand_facts = ["Senator Pryor negotiated the final procedural agreement with House leaders."]
+        existing = ActionIssue(
+            id=535, date="2026-08-18", rank=5, title=cand_title, facts=json.dumps(cand_facts),
+        )
+        cosine = 0.795
+        recent_embs = np.array([[cosine, (1 - cosine**2) ** 0.5]])
+        title_emb = np.array([1.0, 0.0])
+
+        match = _find_matching_issue(title, facts, [existing], recent_embs, title_emb, set())
+        assert match is None
+
+    def test_find_matching_issue_returns_none_when_already_claimed_this_run(self):
+        title = "Republicans introduce crypto legislation with ethical clause"
+        facts = ["A new bill text was released by Republican representatives."]
+        existing = ActionIssue(id=420, date="2026-07-23", rank=2, title=title, facts=json.dumps(facts))
+        recent_embs = np.array([[1.0, 0.0]])
+        title_emb = np.array([1.0, 0.0])
+
+        match = _find_matching_issue(title, facts, [existing], recent_embs, title_emb, {420})
+        assert match is None
+
+    def test_a_shared_source_matches_only_with_titles_that_agree(self):
+        """One roundup article is cited by unrelated stories (2026-10-08:
+        a shared source alone merged 45 different-story pairs)."""
+        existing = ActionIssue(
+            id=621, date="2026-08-25", rank=3,
+            title="DHS data claims and think tank connections",
+            facts=json.dumps(["DHS cited a report from a conservative think tank."]),
+            source_urls=json.dumps(["https://npr.org/nx-s1-5940807"]),
+        )
+        recent_embs = np.array([[1.0, 0.0]])
+        args = ("DHS data claims and state ballot measures", ["DHS data was cited in a state ballot measure debate."],
+                [existing], recent_embs)
+        orthogonal, agreeing = np.array([0.0, 1.0]), np.array([0.7, (1 - 0.7 ** 2) ** 0.5])
+        url = ["https://npr.org/nx-s1-5940807"]
+        assert _find_matching_issue(*args, orthogonal, set(), source_urls=url) is None
+        assert _find_matching_issue(*args, agreeing, set(), source_urls=url) is existing
+
+    def test_find_matching_issue_does_not_match_on_url_when_none_are_shared(self):
+        existing = ActionIssue(
+            id=622, date="2026-08-25", rank=3, title="Unrelated story",
+            facts=json.dumps(["Some other fact."]),
+            source_urls=json.dumps(["https://apnews.com/other-story"]),
+        )
+        recent_embs = np.array([[1.0, 0.0]])
+        title_emb = np.array([0.0, 1.0])
+
+        match = _find_matching_issue(
+            "A totally different headline", ["A totally different fact."],
+            [existing], recent_embs, title_emb, set(),
+            source_urls=["https://npr.org/nx-s1-5940807"],
+        )
+        assert match is None
+
+    def test_find_matching_issue_skips_a_shared_url_already_claimed_this_run(self):
+        existing = ActionIssue(
+            id=623, date="2026-08-25", rank=3, title="Some story",
+            facts=json.dumps(["Some fact."]),
+            source_urls=json.dumps(["https://npr.org/nx-s1-5940807"]),
+        )
+        recent_embs = np.array([[1.0, 0.0]])
+        title_emb = np.array([0.0, 1.0])
+
+        match = _find_matching_issue(
+            "Some story", ["Some fact."],
+            [existing], recent_embs, title_emb, {623},
+            source_urls=["https://npr.org/nx-s1-5940807"],
+        )
+        assert match is None
+
+
+class TestDedupeNearIdenticalIssues:
+    """The homepage's recent-issues endpoint deliberately shows issues
+    regardless of is_current (see get_recent_action_issues) — so a row
+    retired specifically for BEING a duplicate resurfaced there anyway
+    (2026-08-22 report: "I see 3 copies of the beef import issue on the
+    homepage"). This is the read-time dedup that fixes that without a
+    second is_current flip."""
+
+    def _issue(self, id, title, created_at):
+        row = ActionIssue(date="2026-08-21", rank=1, title=title, facts="[]")
+        row.id = id
+        row.created_at = created_at
+        return row
+
+    @patch("app.pipeline.analyze.action_center._embed_texts_sim")
+    def test_collapses_a_cluster_to_its_freshest_member(self, mock_embed):
+        # Identical vectors -> cosine 1.0 (over threshold); orthogonal ->
+        # cosine 0.0 (nowhere close). The threshold's own calibration is
+        # tested in TestIssueSignatureMatching — this exercises clustering.
+        a = self._issue(603, "Varga defends beef import plan amid GOP criticism", datetime(2026, 8, 21, 23))
+        b = self._issue(604, "Varga defends beef import plan amid GOP criticism", datetime(2026, 8, 22, 0))
+        c = self._issue(605, "Varga defends beef import plan after GOP criticism", datetime(2026, 8, 22, 2))
+        d = self._issue(999, "Senate confirms new EPA administrator", datetime(2026, 8, 21, 10))
+        mock_embed.return_value = np.array([
+            [1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+        ])
+
+        result = dedupe_near_identical_issues([a, b, c, d])
+
+        assert result == [c, d]
+
+    @patch("app.pipeline.analyze.action_center._embed_texts_sim")
+    def test_no_clusters_returns_everything_in_original_order(self, mock_embed):
+        a = self._issue(1, "Senate confirms new EPA administrator", datetime(2026, 8, 20))
+        b = self._issue(2, "House passes defense funding bill", datetime(2026, 8, 21))
+        mock_embed.return_value = np.array([[1.0, 0.0], [0.0, 1.0]])
+
+        result = dedupe_near_identical_issues([a, b])
+
+        assert result == [a, b]
+
+    def test_fewer_than_two_issues_is_a_no_op(self):
+        a = self._issue(1, "Solo issue", datetime(2026, 8, 20))
+        assert dedupe_near_identical_issues([a]) == [a]
+        assert dedupe_near_identical_issues([]) == []
+
+    @patch("app.pipeline.analyze.action_center._embed_texts_sim")
+    def test_the_refresh_records_each_duplicate_for_the_feed(self, mock_embed, db_session):
+        from app.pipeline.analyze.action_center import mark_recent_duplicates
+
+        rows = [
+            ActionIssue(date="2026-08-22", rank=1, title="Varga defends beef import plan", facts="[]",
+                        created_at=datetime(2026, 8, 22, 2)),
+            ActionIssue(date="2026-08-22", rank=2, title="Varga defends beef import plan", facts="[]",
+                        created_at=datetime(2026, 8, 21, 23)),
+            ActionIssue(date="2026-08-21", rank=1, title="Senate confirms new EPA administrator", facts="[]",
+                        created_at=datetime(2026, 8, 21, 10)),
+        ]
+        db_session.add_all(rows)
+        db_session.commit()
+        mock_embed.return_value = np.array([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+
+        assert mark_recent_duplicates(db_session) == 1
+        fresh, older, other = rows
+        assert (fresh.duplicate_of_id, older.duplicate_of_id, other.duplicate_of_id) == (None, fresh.id, None)
+
+        # A later run that no longer finds the pair clears the mark.
+        older.title = "House passes a defense funding bill"
+        db_session.commit()
+        mock_embed.return_value = np.array([[1.0, 0.0], [0.0, 1.0], [0.6, 0.8]])
+        mark_recent_duplicates(db_session)
+        assert older.duplicate_of_id is None
+
+    @patch("app.pipeline.analyze.action_center._embed_texts_sim")
+    def test_kept_issues_preserve_their_original_relative_order(self, mock_embed):
+        # Freshest-of-cluster is issue b (middle position) — it must stay
+        # in b's original slot relative to c, not jump to wherever a was.
+        a = self._issue(1, "Varga defends beef import plan amid GOP criticism", datetime(2026, 8, 21))
+        b = self._issue(2, "Senate confirms new EPA administrator", datetime(2026, 8, 20))
+        c = self._issue(3, "Varga defends beef import plan amid GOP criticism", datetime(2026, 8, 20))
+        mock_embed.return_value = np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]])
+
+        result = dedupe_near_identical_issues([a, b, c])
+
+        assert result == [a, b]
+
+    @patch("app.pipeline.analyze.action_center._embed_texts_sim")
+    def test_a_shared_source_collapses_only_with_titles_that_agree(self, mock_embed):
+        a = self._issue(1, "DHS data claims and think tank connections", datetime(2026, 8, 21))
+        b = self._issue(2, "DHS data claims and state ballot measures", datetime(2026, 8, 22))
+        a.source_urls = json.dumps(["https://npr.org/dhs-story"])
+        b.source_urls = json.dumps(["https://npr.org/dhs-story"])
+        mock_embed.return_value = np.array([[1.0, 0.0], [0.0, 1.0]])
+        assert dedupe_near_identical_issues([a, b]) == [a, b]
+        mock_embed.return_value = np.array([[1.0, 0.0], [0.7, (1 - 0.7 ** 2) ** 0.5]])
+        assert dedupe_near_identical_issues([a, b]) == [b]
+
+    @patch("app.pipeline.analyze.action_center._embed_texts_sim")
+    def test_shared_names_below_a_near_identical_title_stay_separate(self, mock_embed):
+        """Shared names and numbers no longer decide: on 2026-10-08, 16 of
+        65 pairs the signature test called one story were (two stories
+        about one senator share two names)."""
+        a = self._issue(1, "Varga attorney general nominee advances 54-45", datetime(2026, 8, 21))
+        b = self._issue(2, "Varga campaign raises record sum 54-45", datetime(2026, 8, 22))
+        mock_embed.return_value = np.array([[1.0, 0.0], [0.7, (1 - 0.7 ** 2) ** 0.5]])
+
+        assert dedupe_near_identical_issues([a, b]) == [a, b]
+
+    @patch("app.pipeline.analyze.action_center._embed_texts_sim")
+    def test_two_vote_drafts_are_only_the_same_item_with_the_same_content(self, mock_embed):
+        """Two House votes the same day matched on their template's words
+        ("Passed", "Representatives"); a draft is its record."""
+        a = self._issue(1, "House vote on S 2403: Passed, 401-14", datetime(2026, 9, 30, 10))
+        b = self._issue(2, "House vote on H R 9497: Passed, 415-9", datetime(2026, 9, 30, 11))
+        a.source_type = b.source_type = "house_roll_call_vote"
+        mock_embed.return_value = np.array([[1.0, 0.0], [1.0, 0.0]])
+
+        assert dedupe_near_identical_issues([a, b]) == [a, b]
+
+    @patch("app.pipeline.analyze.action_center._embed_texts_sim")
+    def test_rows_further_apart_than_the_rematch_window_stay_separate(self, mock_embed):
+        a = self._issue(1, "Varga attorney general nominee advances", datetime(2026, 8, 1))
+        b = self._issue(2, "Varga attorney general nominee advances", datetime(2026, 8, 21))
+        a.date = "2026-08-01"
+        mock_embed.return_value = np.array([[1.0, 0.0], [1.0, 0.0]])
+
+        assert dedupe_near_identical_issues([a, b]) == [a, b]
+
+    @patch("app.pipeline.analyze.action_center._embed_texts_sim")
+    def test_different_signatures_below_near_identical_stay_separate(self, mock_embed):
+        # Sanity check for the new branches: a shared-vocabulary pair with
+        # NO shared entities/numbers and no shared source URL must not
+        # collapse just because title cosine clears TOPIC_CHANGE_THRESHOLD.
+        a = self._issue(1, "Varga attorney general nominee advances 54-45", datetime(2026, 8, 21))
+        b = self._issue(2, "Dunmore EPA administrator confirmed 60-38", datetime(2026, 8, 22))
+        mock_embed.return_value = np.array([[1.0, 0.0], [0.7, (1 - 0.7 ** 2) ** 0.5]])
+
+        result = dedupe_near_identical_issues([a, b])
+
+        assert result == [a, b]
+
+    @patch("app.pipeline.analyze.action_center._embed_texts_sim")
+    def test_a_weak_link_cannot_transitively_merge_an_unrelated_third_issue(self, mock_embed):
+        # 2026-08 audit (independent review): single-linkage union-find let
+        # a strong match (A-B, shared source URL) and an unrelated weak
+        # match (B-C, signature overlap only) transitively merge A and C
+        # even though A and C never matched anything directly — silently
+        # dropping a legitimately separate issue. Clustering must be
+        # complete-linkage: A-B merge (shared URL), but C stays on its own
+        # since A-C shares neither a URL, a signature, nor meaningful
+        # title similarity, regardless of C's link to B.
+        a = self._issue(1, "DHS data claims and think tank connections", datetime(2026, 8, 21, 21))
+        b = self._issue(2, "Varga attorney general nominee advances 54-45", datetime(2026, 8, 21, 22))
+        c = self._issue(3, "Senate advances Varga attorney general pick 54-45", datetime(2026, 8, 22, 2))
+        a.source_urls = json.dumps(["https://npr.org/dhs-story"])
+        b.source_urls = json.dumps(["https://npr.org/dhs-story"])
+        # A-B: shared URL and titles agreeing (0.7). B-C: 0.5, no link.
+        # A-C: orthogonal.
+        mock_embed.return_value = np.array([
+            [1.0, 0.0, 0.0],
+            [0.7, (1 - 0.7 ** 2) ** 0.5, 0.0],
+            [0.0, 0.7, (1 - 0.7 ** 2) ** 0.5],
+        ])
+
+        result = dedupe_near_identical_issues([a, b, c])
+
+        # {a, b} collapse to the fresher of the two (b); c stays separate.
+        # A buggy single-linkage pass would chain a-b-c into one cluster
+        # and keep only c (the overall freshest), losing b's URL-verified
+        # story entirely.
+        assert result == [b, c]
+
+
+def _new_values_for(
+    title: str, facts: list[str], primary_article_date: str, image_url: str | None = None,
+    image_alt: str = "", image_credit: str = "",
+) -> dict:
+    return {
+        "title": title, "summary": "summary", "facts": json.dumps(facts),
+        "actions": "[]", "source_urls": "[]", "source_names": "[]",
+        "policy_areas": "[]", "related_bill_ids": "[]", "related_explore_ids": "[]",
+        "related_senators": "[]", "related_officials": "[]",
+        "primary_article_date": primary_article_date,
+        "image_url": image_url,
+        "image_alt": image_alt,
+        "image_credit": image_credit,
+    }
+
+
+class TestRetireUntouchedIssues:
+    """_retire_untouched_issues, extracted from _run_refresh (2026-08) for
+    direct testability — pins what _RETIREMENT_GRACE_HOURS (90min -> 24h,
+    2026-08 audit) actually controls, not just what the comment claims."""
+
+    def _issue(self, id: int, created_at: datetime | None) -> ActionIssue:
+        row = ActionIssue(date="2026-08-20", rank=1, title=f"Issue {id}", summary="s")
+        row.id = id
+        row.created_at = created_at
+        row.is_current = True
+        return row
+
+    @pytest.mark.parametrize("age, matched, counts, still_current", [
+        pytest.param(timedelta(days=5), True, (0, 0), True,
+                     id="a_matched_issue_is_never_retired_regardless_of_age"),
+        pytest.param(timedelta(hours=25), False, (1, 0), False,
+                     id="unmatched_issue_past_the_grace_cutoff_is_retired"),
+        pytest.param(timedelta(hours=1), False, (0, 1), True,
+                     id="unmatched_issue_within_the_grace_cutoff_is_spared"),
+        # Can't prove it's young without a timestamp — fails closed rather
+        # than sparing indefinitely.
+        pytest.param(None, False, (1, 0), False,
+                     id="missing_created_at_is_treated_as_eligible_for_retirement"),
+    ])
+    def test_a_single_issue(self, age, matched, counts, still_current):
+        now = utcnow()
+        issue = self._issue(1, None if age is None else now - age)
+
+        result = _retire_untouched_issues([issue], {1} if matched else set(), now - timedelta(hours=24))
+
+        assert result == counts
+        assert issue.is_current is still_current
+
+    def test_mixed_batch_counts_each_correctly(self):
+        now = utcnow()
+        matched = self._issue(1, now - timedelta(hours=48))
+        old_unmatched = self._issue(2, now - timedelta(hours=25))
+        recent_unmatched = self._issue(3, now - timedelta(hours=1))
+
+        n_retired, n_graced = _retire_untouched_issues(
+            [matched, old_unmatched, recent_unmatched], {1}, now - timedelta(hours=24),
+        )
+
+        assert (n_retired, n_graced) == (1, 1)
+        assert matched.is_current is True
+        assert old_unmatched.is_current is False
+        assert recent_unmatched.is_current is True
+
+    def test_records_retired_and_graced_counts_on_action_metrics(self):
+        # admin_action_metrics is the only way to check _RETIREMENT_GRACE_HOURS
+        # against real history — before this, retirement/grace were logged as
+        # free text only, so the 24h value had nothing to be validated against.
+        from app.pipeline.analyze import action_metrics
+
+        action_metrics.reset()
+        now = utcnow()
+        old_unmatched = self._issue(2, now - timedelta(hours=25))
+        recent_unmatched = self._issue(3, now - timedelta(hours=1))
+
+        _retire_untouched_issues([old_unmatched, recent_unmatched], set(), now - timedelta(hours=24))
+
+        counts = action_metrics.snapshot()
+        assert counts["issues_retired"] == 1
+        assert counts["issues_graced"] == 1
+
+
+
+
+class TestRecordGenerationSample:
+    """_record_generation_sample: the fine-tuning data-capture helper. It
+    must never let a persistence failure break issue generation, since the
+    table only feeds a future training run, not anything the site serves."""
+
+    def test_passed_attempt_is_recorded_with_no_violations(self, db_session):
+        _record_generation_sample(
+            db_session, "action_center_issue", rank=1, attempt=1,
+            input_text="generate the issue",
+            output={"title": "T", "summary": "S", "facts": ["F"]},
+            passed=True,
+        )
+        db_session.commit()
+
+        rows = db_session.query(LlmGenerationSample).all()
+        assert len(rows) == 1
+        assert rows[0].task == "action_center_issue"
+        assert rows[0].passed is True
+        assert rows[0].violations is None
+        assert json.loads(rows[0].output_json) == {"title": "T", "summary": "S", "facts": ["F"]}
+
+    def test_failed_attempt_records_violations(self, db_session):
+        _record_generation_sample(
+            db_session, "action_center_issue", rank=2, attempt=1,
+            input_text="generate the issue",
+            output={"title": "T", "summary": "Reports say X", "facts": []},
+            passed=False, violations=["hedging attribution phrases (reports say)"],
+        )
+        db_session.commit()
+
+        row = db_session.query(LlmGenerationSample).one()
+        assert row.passed is False
+        assert json.loads(row.violations) == ["hedging attribution phrases (reports say)"]
+
+    def test_db_error_is_swallowed_not_raised(self, db_session):
+        broken_db = MagicMock()
+        broken_db.add.side_effect = RuntimeError("db is down")
+
+        _record_generation_sample(
+            broken_db, "action_center_issue", rank=1, attempt=1,
+            input_text="x", output={"summary": "y"}, passed=True,
+        )  # must not raise
+
+    def test_once_per_day_skips_a_repeat_of_todays_input(self, db_session):
+        """call_llm caches a day's answer per input, so a later hourly run
+        asking the same thing is not a new generation."""
+        for _ in range(2):
+            _record_generation_sample(
+                db_session, "action_center_claim", rank=1, attempt=1,
+                input_text="same prompt", output={}, passed=False, once_per_day=True,
+            )
+        _record_generation_sample(
+            db_session, "action_center_claim", rank=1, attempt=1,
+            input_text="another prompt", output={}, passed=False, once_per_day=True,
+        )
+        assert db_session.query(LlmGenerationSample).count() == 2
+
+    def test_a_claim_call_is_recorded_as_sent(self, db_session):
+        """The row is the prompt the model got, with the article in it —
+        not the template with a literal {source} (every row from 2026-09-24
+        to 2026-10-10) — and whether its spans verified."""
+        from app.pipeline.analyze import action_center as ac
+
+        source = "Senate passes the budget. The Senate passed the budget 51-49 on Tuesday."
+        spans = {"actor": "The Senate", "predicate": "passed the budget 51-49 on Tuesday"}
+        with patch.object(ac, "call_llm", return_value=spans):
+            assert ac.locate_claim(source, db=db_session, today="2026-10-10", rank=1) == spans
+        with patch.object(ac, "call_llm", return_value={"actor": "The House", "predicate": "voted no"}):
+            ac.locate_claim("Other story. Nothing here.", db=db_session, today="2026-10-10", rank=2)
+
+        rows = db_session.query(LlmGenerationSample).order_by(LlmGenerationSample.rank).all()
+        assert [r.task for r in rows] == ["action_center_claim", "action_center_claim"]
+        assert "{source}" not in rows[0].input_text
+        assert source in rows[0].input_text
+        assert json.loads(rows[0].output_json) == spans
+        assert [r.passed for r in rows] == [True, False]
+
+    def test_no_sample_is_recorded_against_the_unfilled_template(self):
+        import ast
+        import inspect
+
+        from app.pipeline.analyze import action_center as ac
+
+        tree = ast.parse(inspect.getsource(ac))
+        calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_record_generation_sample"
+        ]
+        assert calls
+        for call in calls:
+            assert not any(
+                isinstance(arg, ast.Name) and arg.id == "_CLAIM_PROMPT_TEMPLATE"
+                for arg in [*call.args, *(k.value for k in call.keywords)]
+            )
+
+    def test_does_not_hold_the_callers_write_transaction(self, tmp_path):
+        """The refresh loop's session commits only after every cluster's
+        LLM work. A sample flushed into it held SQLite's write lock for the
+        rest of the run and starved every other writer, the refresh lock's
+        heartbeat first (2026-09-27)."""
+        path = tmp_path / "samples.db"
+        engine = create_engine(f"sqlite:///{path}")
+        Base.metadata.create_all(engine, tables=[LlmGenerationSample.__table__])
+        refresh_db = Session(bind=engine)
+        try:
+            _record_generation_sample(
+                refresh_db, "action_center_issue", rank=1, attempt=1,
+                input_text="x", output={"summary": "y"}, passed=True,
+            )
+            other = sqlite3.connect(path, timeout=0)
+            other.execute(
+                "INSERT INTO llm_generation_samples "
+                "(task, rank, attempt, input_text, output_json, passed, created_at) "
+                "VALUES ('t', 1, 1, 'x', '{}', 1, '2026-09-27')"
+            )
+            other.commit()
+            assert other.execute("SELECT COUNT(*) FROM llm_generation_samples").fetchone()[0] == 2
+            other.close()
+        finally:
+            refresh_db.close()
+            engine.dispose()
+
+
+
+class TestApplyMatchedIssueUpdate:
+    """_apply_matched_issue_update, extracted from _run_refresh (2026-07)
+    for direct testability — _run_refresh as a whole fetches real
+    articles, runs an embedding model, and calls an LLM, so it can't
+    reasonably be driven end-to-end in a unit test."""
+
+    def test_updates_row_attributes_from_new_values(self):
+        match = ActionIssue(
+            id=1, date="2026-07-20", rank=3, title="Old title",
+            facts=json.dumps(["An old fact."]), primary_article_date="2026-07-19",
+        )
+        new_values = _new_values_for("New title", ["An old fact.", "A new fact with Senator Ruth Pryor."], "2026-07-20")
+
+        _apply_matched_issue_update(match, new_values, 1, "2026-07-20", "2026-07-20", json.loads(new_values["facts"]), "New title")
+
+        assert match.title == "New title"
+        assert match.rank == 1
+        assert match.date == "2026-07-20"
+        assert match.is_current is True
+
+    def test_previous_facts_snapshots_the_outgoing_facts_when_they_change(self):
+        match = ActionIssue(
+            id=1, date="2026-07-19", rank=1, title="Story",
+            facts=json.dumps(["An old fact."]), primary_article_date="2026-07-19",
+        )
+        facts = ["An old fact.", "A brand new fact."]
+        new_values = _new_values_for("Story", facts, "2026-07-20")
+
+        _apply_matched_issue_update(match, new_values, 1, "2026-07-20", "2026-07-20", facts, "Story")
+
+        assert json.loads(match.previous_facts) == ["An old fact."]
+        assert json.loads(match.facts) == facts
+
+    def test_image_url_is_applied_from_new_values(self):
+        match = ActionIssue(
+            id=1, date="2026-07-19", rank=1, title="Story",
+            facts=json.dumps(["A fact."]), primary_article_date="2026-07-19",
+            image_url="https://rollcall.com/app/uploads/old.jpg",
+        )
+        facts = ["A fact."]
+        new_values = _new_values_for(
+            "Story", facts, "2026-07-20", image_url="https://rollcall.com/app/uploads/new.jpg",
+            image_alt="A member of Congress speaks.", image_credit="Tom Williams/CQ Roll Call",
+        )
+
+        _apply_matched_issue_update(match, new_values, 1, "2026-07-20", "2026-07-20", facts, "Story")
+
+        assert match.image_url == "https://rollcall.com/app/uploads/new.jpg"
+        assert match.image_alt == "A member of Congress speaks."
+        assert match.image_credit == "Tom Williams/CQ Roll Call"
+
+    def test_image_url_cleared_when_fresh_cluster_has_none(self):
+        """Same full-content-swap semantics as source_urls/source_names —
+        a story that stops carrying a rights-cleared image this run loses
+        its OG image too, it isn't preserved from a stale prior run."""
+        match = ActionIssue(
+            id=1, date="2026-07-19", rank=1, title="Story",
+            facts=json.dumps(["A fact."]), primary_article_date="2026-07-19",
+            image_url="https://rollcall.com/app/uploads/old.jpg",
+        )
+        facts = ["A fact."]
+        new_values = _new_values_for("Story", facts, "2026-07-20")
+
+        _apply_matched_issue_update(match, new_values, 1, "2026-07-20", "2026-07-20", facts, "Story")
+
+        assert match.image_url is None
+
+    def test_previous_facts_untouched_when_nothing_actually_changed(self):
+        # An hourly touch that reconfirms the same facts (LLM regenerates
+        # the whole list every run) must not overwrite the baseline the
+        # "new" marker diffs against with a copy of itself.
+        match = ActionIssue(
+            id=1, date="2026-07-19", rank=1, title="Story",
+            facts=json.dumps(["An old fact."]),
+            previous_facts=json.dumps(["Something from two versions ago."]),
+            primary_article_date="2026-07-19",
+        )
+        new_values = _new_values_for("Story", ["An old fact."], "2026-07-19")
+
+        _apply_matched_issue_update(match, new_values, 1, "2026-07-19", "2026-07-19", ["An old fact."], "Story")
+
+        assert json.loads(match.previous_facts) == ["Something from two versions ago."]
+
+    def test_previous_facts_ignores_pure_reordering(self):
+        # Set comparison, not string equality — the LLM makes no promise
+        # about a stable order between runs, and a reshuffled list with
+        # the same content isn't a content change.
+        match = ActionIssue(
+            id=1, date="2026-07-19", rank=1, title="Story",
+            facts=json.dumps(["fact a", "fact b"]),
+            previous_facts=json.dumps(["baseline"]),
+            primary_article_date="2026-07-19",
+        )
+        new_values = _new_values_for("Story", ["fact b", "fact a"], "2026-07-19")
+
+        _apply_matched_issue_update(match, new_values, 1, "2026-07-19", "2026-07-19", ["fact b", "fact a"], "Story")
+
+        assert json.loads(match.previous_facts) == ["baseline"]
+
+    def test_new_date_with_new_information_allows_repost(self):
+        match = ActionIssue(
+            id=1, date="2026-07-19", rank=1, title="Story",
+            facts=json.dumps(["An old fact."]), primary_article_date="2026-07-19",
+            bsky_posted_at=utcnow(), bsky_posted_rank=1,
+        )
+        facts = ["An old fact.", "A new fact naming Senator Ruth Pryor."]
+        new_values = _new_values_for("Story", facts, "2026-07-20")
+
+        result = _apply_matched_issue_update(match, new_values, 1, "2026-07-20", "2026-07-20", facts, "Story")
+
+        assert result is True
+        assert match.bsky_posted_at is None
+        assert match.bsky_posted_rank is None
+
+    def test_new_date_but_no_new_information_does_not_allow_repost(self):
+        match = ActionIssue(
+            id=1, date="2026-07-19", rank=1, title="Story",
+            facts=json.dumps(["An old fact about the vote."]), primary_article_date="2026-07-19",
+            bsky_posted_at=utcnow(), bsky_posted_rank=1,
+        )
+        # Same facts, reworded — no new named entity or figure.
+        facts = ["An old fact about the vote, restated."]
+        new_values = _new_values_for("Story", facts, "2026-07-20")
+        prior_posted_at = match.bsky_posted_at
+
+        result = _apply_matched_issue_update(match, new_values, 1, "2026-07-20", "2026-07-20", facts, "Story")
+
+        assert result is False
+        assert match.bsky_posted_at == prior_posted_at
+        assert match.bsky_posted_rank == 1
+
+    def test_no_new_date_does_not_allow_repost(self):
+        match = ActionIssue(
+            id=1, date="2026-07-19", rank=1, title="Story",
+            facts=json.dumps(["An old fact naming Senator Ruth Pryor."]),
+            primary_article_date="2026-07-19",
+            bsky_posted_at=utcnow(), bsky_posted_rank=1,
+        )
+        facts = ["An old fact naming Senator Ruth Pryor.", "Brand new fact naming Senator Dev Kapoor."]
+        # primary_article_date NOT advanced past match's own — new facts
+        # don't matter if the date itself never moved forward.
+        new_values = _new_values_for("Story", facts, "2026-07-19")
+        prior_posted_at = match.bsky_posted_at
+
+        result = _apply_matched_issue_update(match, new_values, 1, "2026-07-19", "2026-07-19", facts, "Story")
+
+        assert result is False
+        assert match.bsky_posted_at == prior_posted_at
+
+    def test_repost_baseline_is_the_last_post_not_the_last_run(self):
+        """Regression: a development that surfaced on a non-posting run was
+        absorbed into `facts` and then read as already-known on the one run
+        that could have reposted it, so the update was lost for good.
+
+        primary_article_date is day-granular, so the date edge fires on one
+        of the ~24 hourly runs per day while `facts` is rewritten on all 24
+        — which run the LLM happens to surface a given fact on is luck, and
+        it decided whether the story could ever be followed up.
+        """
+        from app.pipeline.analyze import action_metrics
+
+        posted_facts = ["A defense policy bill was passed with a narrow 216-212 vote."]
+        match = ActionIssue(
+            id=1, date="2026-07-19", rank=1, title="Story",
+            facts=json.dumps(posted_facts),
+            bsky_posted_facts=json.dumps(posted_facts),
+            primary_article_date="2026-07-19",
+            bsky_posted_at=utcnow(), bsky_posted_rank=1,
+        )
+
+        # Run A — same article date, so no repost is possible here, but the
+        # LLM's re-extraction surfaces a genuinely new named entity.
+        developed = posted_facts + ["Senator Ruth Pryor announced opposition."]
+        action_metrics.reset()
+        assert _apply_matched_issue_update(
+            match, _new_values_for("Story", developed, "2026-07-19"),
+            1, "2026-07-19", "2026-07-19", developed, "Story",
+        ) is False
+        assert match.facts == json.dumps(developed)  # baseline for display moved
+        assert match.bsky_posted_facts == json.dumps(posted_facts)  # repost baseline did not
+
+        # Run B — the article date finally advances, facts unchanged since
+        # run A. Pryor is still new relative to what was actually posted.
+        assert _apply_matched_issue_update(
+            match, _new_values_for("Story", developed, "2026-07-20"),
+            1, "2026-07-20", "2026-07-20", developed, "Story",
+        ) is True
+        assert match.bsky_posted_at is None
+        assert action_metrics.snapshot().get("bsky_reposts_allowed") == 1
+
+    def test_suppressed_repost_is_counted_separately_from_no_new_article(self):
+        """Both cases logged the same "no new articles" line, so the share
+        of reposts this gate suppressed was unmeasurable in production."""
+        from app.pipeline.analyze import action_metrics
+
+        facts = ["An old fact about the vote."]
+        match = ActionIssue(
+            id=1, date="2026-07-19", rank=1, title="Story",
+            facts=json.dumps(facts), bsky_posted_facts=json.dumps(facts),
+            primary_article_date="2026-07-19",
+            bsky_posted_at=utcnow(), bsky_posted_rank=1,
+        )
+        reworded = ["An old fact about the vote, restated."]
+
+        action_metrics.reset()
+        # Newer article date, nothing new to say -> suppressed by this gate.
+        _apply_matched_issue_update(
+            match, _new_values_for("Story", reworded, "2026-07-20"),
+            1, "2026-07-20", "2026-07-20", reworded, "Story",
+        )
+        # No newer article at all -> not this gate's doing, not counted.
+        _apply_matched_issue_update(
+            match, _new_values_for("Story", reworded, "2026-07-20"),
+            1, "2026-07-20", "2026-07-20", reworded, "Story",
+        )
+
+        counts = action_metrics.snapshot()
+        assert counts.get("bsky_reposts_suppressed_no_new_information") == 1
+        assert counts.get("bsky_reposts_allowed") is None
+
+    def test_row_last_posted_before_the_baseline_column_falls_back_to_facts(self):
+        # Rows posted before bsky_posted_facts existed have it NULL; they
+        # keep the old behavior until their next post rather than treating
+        # an empty baseline as "everything is new" and reposting all of them.
+        # The facts here carry a named entity precisely so that an empty
+        # baseline WOULD return True — this fails if the fallback is dropped.
+        facts = ["Senator Ruth Pryor opposed the temporary funding measure."]
+        match = ActionIssue(
+            id=1, date="2026-07-19", rank=1, title="Story",
+            facts=json.dumps(facts), bsky_posted_facts=None,
+            primary_article_date="2026-07-19",
+            bsky_posted_at=utcnow(), bsky_posted_rank=1,
+        )
+        reworded = ["Senator Ruth Pryor opposed the funding measure."]
+        assert _bsky_repost_has_new_information("", reworded) is True  # empty baseline
+
+        assert _apply_matched_issue_update(
+            match, _new_values_for("Story", reworded, "2026-07-20"),
+            1, "2026-07-20", "2026-07-20", reworded, "Story",
+        ) is False
+
+    def test_invalidated_story_clears_cached_full_story(self):
+        match = ActionIssue(
+            id=1, date="2026-07-19", rank=1, title="Old story",
+            facts=json.dumps(["An old fact."]), primary_article_date="2026-07-19",
+            full_story="Cached long-form text about the old story.",
+        )
+        facts = ["A completely different fact."]
+        new_values = _new_values_for("A different story entirely", facts, "2026-07-19")
+
+        _apply_matched_issue_update(match, new_values, 1, "2026-07-19", "2026-07-19", facts, "A different story entirely")
+
+        assert match.full_story is None
+
+
+class TestFindMatchingIssueAgainstDevelopingRows:
+    """_find_matching_issue is content-agnostic — it never inspects
+    status — but a DEVELOPING row must be a valid match candidate for a
+    fresh news cluster, since that IS the corroboration mechanism (see
+    the approved early-signal plan). Pins that nothing about the
+    signature/embedding matching path silently excludes it."""
+
+    def test_a_developing_row_matches_a_near_identical_title(self):
+        existing = ActionIssue(
+            id=900, title="Senate passes the Foreign Military Sales Act",
+            facts=json.dumps(["The Senate voted 60-40 Tuesday."]),
+            status=ActionIssueStatus.DEVELOPING,
+        )
+        title = "Senate passes the Foreign Military Sales Act"
+        title_emb = np.array([1.0, 0.0])
+        recent_embs = np.array([[1.0, 0.0]])  # sim = 1.0, well above 0.92
+
+        match = _find_matching_issue(
+            title, ["A new fact from press coverage."], [existing], recent_embs, title_emb, set(),
+        )
+        assert match is existing
+
+    def test_a_developing_row_matches_on_shared_source_url(self):
+        # The draft's source is its vote record: a story citing it is the
+        # draft's story whatever its headline (SHARED_SOURCE_TITLE_SIM is
+        # for news rows).
+        existing = ActionIssue(
+            id=901, title="Senate action on arms sale", source_type="senate_roll_call_vote",
+            facts=json.dumps(["A fact."]),
+            source_urls=json.dumps(["https://www.senate.gov/legislative/vote.xml"]),
+            status=ActionIssueStatus.DEVELOPING,
+        )
+        match = _find_matching_issue(
+            "A completely differently worded headline", ["fact"], [existing], None,
+            np.array([1.0, 0.0]), set(),
+            source_urls=["https://www.senate.gov/legislative/vote.xml"],
+        )
+        assert match is existing
+
+
+class TestPromoteDevelopingIssue:
+    """_promote_developing_issue: a full content swap (press coverage
+    supersedes the hedged primary-source draft) plus a status flip,
+    delegating rank/date/is_current/previous_facts/full-story bookkeeping
+    to the existing _apply_matched_issue_update rather than re-deriving
+    any of it."""
+
+    def test_flips_status_and_stamps_confirmed_at(self):
+        match = ActionIssue(
+            id=1, date="2026-08-29", rank=999, title="A floor vote occurred",
+            facts=json.dumps(["The Senate voted 60-40 Tuesday."]),
+            status=ActionIssueStatus.DEVELOPING, source_type="senate_roll_call_vote",
+            primary_source_url="https://www.senate.gov/vote.xml",
+            confirmation_deadline=utcnow() + timedelta(hours=40),
+            created_at=utcnow() - timedelta(hours=8),
+            primary_article_date="2026-08-29",
+        )
+        facts = ["The Senate passed the bill 60-40, according to AP and Reuters."]
+        new_values = _new_values_for("Senate passes the bill", facts, "2026-08-30")
+
+        _promote_developing_issue(
+            match, new_values, 1, "2026-08-30", "2026-08-30", facts, "Senate passes the bill",
+        )
+
+        assert match.status == ActionIssueStatus.CONFIRMED
+        assert match.confirmed_at is not None
+        assert match.confirmation_deadline is None
+
+    def test_swaps_content_from_the_press_cluster_not_a_merge(self):
+        match = ActionIssue(
+            id=1, date="2026-08-29", rank=999, title="A floor vote occurred",
+            facts=json.dumps(["The Senate voted 60-40 Tuesday."]),
+            status=ActionIssueStatus.DEVELOPING, source_type="senate_roll_call_vote",
+            primary_source_url="https://www.senate.gov/vote.xml",
+            confirmation_deadline=utcnow() + timedelta(hours=40),
+            primary_article_date="2026-08-29",
+        )
+        facts = ["The Senate passed the bill 60-40, according to AP and Reuters."]
+        new_values = _new_values_for("Senate passes the bill after floor debate", facts, "2026-08-30")
+
+        _promote_developing_issue(
+            match, new_values, 2, "2026-08-30", "2026-08-30", facts, "Senate passes the bill after floor debate",
+        )
+
+        assert match.title == "Senate passes the bill after floor debate"
+        assert json.loads(match.facts) == facts
+        assert match.rank == 2
+        assert match.date == "2026-08-30"
+        assert match.is_current is True
+
+
+class TestRankOrderedIssues:
+    """A hedged, unconfirmed DEVELOPING draft must never crowd out a real
+    top story — spared developing issues always sort after every spared
+    confirmed issue, regardless of their placeholder rank value."""
+
+    def test_touched_issues_keep_relative_order_first(self):
+        a = ActionIssue(id=1, rank=5, status=ActionIssueStatus.CONFIRMED)
+        b = ActionIssue(id=2, rank=1, status=ActionIssueStatus.CONFIRMED)
+        ordered = _rank_ordered_issues([a, b], matched_issue_ids={1, 2})
+        assert [r.id for r in ordered] == [2, 1]
+
+    def test_spared_developing_sorts_after_spared_confirmed_despite_a_lower_rank_value(self):
+        developing = ActionIssue(id=1, rank=1, status=ActionIssueStatus.DEVELOPING)
+        confirmed = ActionIssue(id=2, rank=999, status=ActionIssueStatus.CONFIRMED)
+        ordered = _rank_ordered_issues(
+            [developing, confirmed], matched_issue_ids=set(),
+        )
+        assert [r.id for r in ordered] == [2, 1]
+
+    def test_touched_then_spared_confirmed_then_spared_developing(self):
+        touched = ActionIssue(id=1, rank=3, status=ActionIssueStatus.CONFIRMED)
+        spared_confirmed = ActionIssue(id=2, rank=1, status=ActionIssueStatus.CONFIRMED)
+        spared_developing = ActionIssue(id=3, rank=1, status=ActionIssueStatus.DEVELOPING)
+        ordered = _rank_ordered_issues(
+            [spared_developing, spared_confirmed, touched], matched_issue_ids={1},
+        )
+        assert [r.id for r in ordered] == [1, 2, 3]
+
+
+class TestBlueskyEligibleIssues:
+    """DEVELOPING issues must never reach the Bluesky poster — there is no
+    correction mechanism for a wrong post, and Bluesky doesn't support
+    editing a published one."""
+
+    def test_excludes_developing_issues(self, db_session):
+        confirmed = ActionIssue(
+            date="2026-08-30", rank=1, title="A confirmed story", summary="s",
+            is_current=True, status=ActionIssueStatus.CONFIRMED,
+        )
+        developing = ActionIssue(
+            date="2026-08-30", rank=2, title="A developing story", summary="s",
+            is_current=True, status=ActionIssueStatus.DEVELOPING,
+        )
+        db_session.add_all([confirmed, developing])
+        db_session.flush()
+
+        eligible = _bluesky_eligible_issues(db_session, "2026-08-30")
+
+        assert [i.title for i in eligible] == ["A confirmed story"]
+
+    def test_excludes_retired_and_other_day_issues(self, db_session):
+        retired = ActionIssue(
+            date="2026-08-30", rank=1, title="Retired today", summary="s",
+            is_current=False, status=ActionIssueStatus.CONFIRMED,
+        )
+        yesterday = ActionIssue(
+            date="2026-08-29", rank=1, title="From yesterday", summary="s",
+            is_current=True, status=ActionIssueStatus.CONFIRMED,
+        )
+        db_session.add_all([retired, yesterday])
+        db_session.flush()
+
+        eligible = _bluesky_eligible_issues(db_session, "2026-08-30")
+
+        assert eligible == []
+
+
+class TestBskyRepostHasNewInformation:
+    """A matched issue's primary_article_date advancing used to be the only
+    gate on allowing a Bluesky repost — but recap/ongoing coverage of the
+    same story often just rewords the same names and numbers under a
+    fresher timestamp, which let a story repost with nothing new to say
+    (reported live 2026-07: Bluesky repeatedly posting about the same
+    thing). This checks the actual new-information gate, not just the
+    date comparison _run_refresh does before calling it.
+
+    An empty baseline ("" — a row with no stored facts) counts everything
+    as new; that case is pinned in TestApplyMatchedIssueUpdate's
+    test_row_last_posted_before_the_baseline_column_falls_back_to_facts."""
+
+    @pytest.mark.parametrize("old_facts, new_facts, expected", [
+        # Same pair as test_same_defense_bill_rows_match above (ids
+        # 394/405) — same $95B framework, same 216-212 vote, purely
+        # reworded with no new name or figure.
+        pytest.param(
+            ["A defense policy bill was passed with a narrow 216-212 vote.",
+             "House Republicans approved a $95 billion framework for a third budget reconciliation package."],
+            ["A $95 billion framework was approved for defense spending.",
+             "The vote resulted in a narrow 216-212 outcome."],
+            False, id="reworded_recap_of_the_same_facts_has_no_new_information",
+        ),
+        # A sample initially flagged positive later confirmed a false
+        # positive is a real narrative development (outbreak scare
+        # downgraded), not just a reword — "FDA" as the named source of
+        # that correction is new even though this reads as "the same
+        # story" for matching purposes.
+        pytest.param(
+            ["A lettuce sample from Taylor Farms was initially flagged as positive for cyclospora.",
+             "Multiple states are reporting over 7,000 confirmed cases of cyclosporiasis nationwide."],
+            ["Over 7,000 cases have been reported across several states.",
+             "The FDA has stated that a sample from Taylor Farms was later identified as a false positive."],
+            True, id="a_genuine_update_within_the_same_story_counts_as_new_information",
+        ),
+        pytest.param(
+            ["The House passed a temporary funding measure to avoid a shutdown."],
+            ["The House passed a temporary funding measure to avoid a shutdown.",
+             "Senator Ruth Pryor said she would support the measure in the Senate."],
+            True, id="a_new_named_entity_counts_as_new_information",
+        ),
+        pytest.param(
+            ["A defense policy bill was passed with a narrow 216-212 vote."],
+            ["A defense policy bill was passed with a narrow 216-212 vote, costing $95 billion."],
+            True, id="a_new_figure_counts_as_new_information",
+        ),
+        # Live 2026-08-27 case (issue 624): old facts named "Saudi" (from
+        # "The Saudi delegation referenced the agreement"); new facts
+        # spelled the same country out as "Saudi Arabia". The signature
+        # diff was the lone token "arabia" — read as a brand-new entity
+        # when it's the same country already known.
+        pytest.param(
+            ["A nuclear cooperation agreement was presented to Congress this week.",
+             "The agreement includes provisions for uranium enrichment activities.",
+             "The Saudi delegation referenced the agreement in a recent briefing."],
+            ["A nuclear cooperation agreement was presented to Congress this week.",
+             "The agreement allows Saudi Arabia to enrich uranium under specific conditions."],
+            False, id="expanding_a_known_entity_to_its_full_name_is_not_new_information",
+        ),
+        # The entity-expansion filter must not swallow an unrelated new
+        # entity just because it also appears in a two-word capitalized
+        # phrase alongside an already-known word.
+        pytest.param(
+            ["The Saudi delegation attended the summit."],
+            ["The Saudi delegation attended the summit.",
+             "Qatar Airways provided the delegation's transportation."],
+            True, id="a_genuinely_new_entity_still_counts_even_beside_a_known_one",
+        ),
+        # The marker check is differential: a recap that says "vetoed"
+        # again, having already said it, has still added nothing.
+        pytest.param(
+            ["The president vetoed the defense measure.",
+             "The bill had passed with a 216-212 vote."],
+            ["The defense measure was vetoed by the president.",
+             "It had passed 216-212."],
+            False, id="repeating_the_same_development_is_not_new_information",
+        ),
+        # "announced"/"reported"/"said" appear in every recap, so treating
+        # them as developments would re-open the bug this gate exists for.
+        pytest.param(
+            ["The committee will review the funding measure."],
+            ["The committee will review the funding measure.",
+             "The chair announced that the review is ongoing and reported no timetable."],
+            False, id="weak_reporting_verbs_are_not_developments",
+        ),
+    ])
+    def test_new_information_gate(self, old_facts, new_facts, expected):
+        assert _bsky_repost_has_new_information(json.dumps(old_facts), new_facts) is expected
+
+    # The signature answers "is a new PARTICIPANT involved?", which is not
+    # the same question as "did anything HAPPEN?" — a story can move
+    # decisively without naming anyone or anything new, and those updates
+    # were being suppressed as rewords (reported live 2026-07: the poster
+    # stopped following stories through to their outcome). Each case below
+    # deliberately introduces NO new capitalized entity and NO new figure
+    # (asserted), so only the development-marker path can carry it.
+    @pytest.mark.parametrize("old_facts, added_fact", [
+        pytest.param(
+            ["A defense policy bill was passed with a narrow 216-212 vote.",
+             "The measure includes a $95 billion framework."],
+            "The president vetoed the measure.",
+            id="a_veto",
+        ),
+        pytest.param(
+            ["A temporary funding measure took effect this week."],
+            "A federal judge blocked the order.",
+            id="a_court_blocking_the_measure",
+        ),
+        pytest.param(
+            ["The president vetoed the defense measure."],
+            "The override attempt failed.",
+            id="a_failed_override",
+        ),
+        # Prompted by a live 2026-08-26 issue (id 615) whose real facts
+        # included "Democratic-controlled states filed a new lawsuit
+        # challenging the executive order" as a genuinely new
+        # development — "filed" wasn't a tracked marker at all. That
+        # exact sentence happens to ALSO add a new signature token via a
+        # hyphenated-compound quirk ("Democratic-controlled" isn't
+        # stripped the way bare "Democratic" is), so this uses a
+        # deliberately cleaner example ("State officials", both stripped
+        # as generic civic vocabulary) to isolate the marker path itself.
+        pytest.param(
+            ["A court order had blocked the agency's new rule."],
+            "State officials filed a new lawsuit against the rule.",
+            id="a_new_lawsuit_being_filed",
+        ),
+        # "lifted" added the same day, same real issue, alongside "filed" —
+        # both real judicial-outcome verbs missing from the tracked list.
+        pytest.param(
+            ["A court order had blocked the agency's new rule."],
+            "A judge lifted the order blocking the rule.",
+            id="a_court_lifting_an_order",
+        ),
+    ])
+    def test_a_development_counts_as_new_information_without_a_new_name_or_figure(self, old_facts, added_fact):
+        new_facts = old_facts + [added_fact]
+        assert _issue_signature("", new_facts) - _issue_signature("", old_facts) == set()
+        assert _bsky_repost_has_new_information(json.dumps(old_facts), new_facts) is True
+
+
+class TestValidateFactsAuditAdditions:
+    """2026-07 audit: placeholder tokens, subject-form meta-facts, and
+    ungrounded family relationships all published — each case below is
+    the live text."""
+
+    def test_placeholder_fact_dropped(self):
+        facts = ["Holloway announced the tribute details on [date].",
+                 "The Senate held a vote on Thursday."]
+        clean = _validate_facts(facts, source_text="Holloway announced details. The Senate held a vote on Thursday.")
+        assert clean == ["The Senate held a vote on Thursday."]
+
+    @pytest.mark.parametrize("fact, source, kept", [
+        pytest.param("The articles focused on internal party dynamics rather than public policy outcomes.",
+                     None, False, id="articles_as_subject_meta_fact_dropped"),
+        pytest.param("The articles referenced specific names and dates related to the discussion.",
+                     None, False, id="articles_referenced_meta_fact_dropped"),
+        pytest.param("Senator Whitfield announced her candidacy for the seat left by her brother.",
+                     "Delia Whitfield announced her candidacy for the vacant seat.",
+                     False, id="ungrounded_family_relationship_fact_dropped"),
+        pytest.param("Senator Whitfield announced her candidacy for the seat left by her brother.",
+                     "Delia Whitfield, whose brother held the seat, announced her candidacy.",
+                     True, id="grounded_family_relationship_fact_kept"),
+        # 2026-07 live case: "former President Victor Varga" published while
+        # the source material said "President Varga".
+        pytest.param("Former President Victor Varga announced new tariffs on steel imports.",
+                     "President Varga announced tariffs on steel imports.",
+                     False, id="ungrounded_former_status_fact_dropped"),
+        pytest.param("Former President Ferrante criticized the ruling on Tuesday.",
+                     "Former President Luca Ferrante criticized the court's ruling Tuesday.",
+                     True, id="grounded_former_status_fact_kept"),
+    ])
+    def test_single_fact(self, fact, source, kept):
+        assert _validate_facts([fact], source_text=source) == ([fact] if kept else [])
+
+
+class TestValidateFactsAbsenceOfInformation:
+    """2026-08-26 audit: ~30% of a sampled window of issues had a "key
+    fact" that reports what the coverage DIDN'T say, rather than a real
+    event — a second meta-fact shape _META_PHRASES (which only catches
+    "the article(s)" as subject) didn't cover. Live examples below."""
+
+    @pytest.mark.parametrize("fact, kept", [
+        pytest.param("No specific date was provided for when the new block may take effect.", False,
+                     id="no_specific_x_was_provided_is_dropped"),
+        pytest.param("Specific names of officials were not disclosed in the provided articles.", False,
+                     id="specific_x_were_not_disclosed_is_dropped"),
+        pytest.param("No official timeline was provided regarding when renovations would proceed.", False,
+                     id="no_official_x_was_provided_is_dropped"),
+        # Must not catch the ordinary positive form just because it shares
+        # a qualifying word and a verb with the absence pattern.
+        pytest.param("The official statement was provided to reporters on Tuesday.", True,
+                     id="a_genuine_positive_fact_with_the_same_verb_is_kept"),
+        # "No injuries were reported" is a real, substantive fact, not
+        # padding — the qualifier requirement (specific/official/further/
+        # additional) is what keeps facts like this one out of scope.
+        pytest.param("No injuries were reported at the scene.", True,
+                     id="a_real_absence_fact_without_a_qualifier_is_kept"),
+    ])
+    def test_single_fact(self, fact, kept):
+        assert _validate_facts([fact]) == ([fact] if kept else [])
+
+
+class TestValidateFactsMetricPaths:
+    def test_stale_future_dated_fact_dropped(self):
+        facts = ["The ban will remain in effect until December 2025."]
+        assert _validate_facts(facts) == []
+
+    def test_fact_with_ungrounded_number_dropped(self):
+        facts = ["The program cost $450 million last year."]
+        clean = _validate_facts(facts, source_text="The program's cost rose sharply last year.")
+        assert clean == []
+
+
+class TestDigestFiltering:
+    """An outlet's recurring briefing ("Up First", "Morning news brief") is
+    ONE feed item covering several unrelated stories. Left in, it becomes an
+    issue whose summary presents separate events as one narrative — live
+    2026-07 case (issue 483): a Hamas-Israel agreement, a Varga quote, and a
+    slowing US economy joined by a causal "following the announcement" no
+    source stated. These have to be dropped at ingest: once the items are in
+    one article the topic boundary between them is not recoverable
+    downstream (see ACTION_CENTER_PROMPT_VERSION's note on why the
+    per-fact mechanical check does not separate them)."""
+
+    @pytest.mark.parametrize("title", [
+        "Up First briefing: Israel-Hamas deal, a slowing economy and the Court",
+        "Morning news brief",
+        "News Brief: Senate vote, border talks, Fed decision",
+        "Politics chat: Congress returns from recess",
+        "5 things to know about the tariff ruling",
+        "Daily rundown for July 30",
+        "First up: the Senate vote",
+        "NPR News Now newscast",
+        "The week in politics: shutdown standoff",
+        "Weekly wrap-up of the appropriations fight",
+        "Tariffs, the Fed and more:",
+        "Congress this week, in brief",
+        # A source tag ahead of the product name is still the product name.
+        "NPR: Morning briefing",
+        # Feeds emit the typographic apostrophe far more often than the
+        # ASCII one; matching only the ASCII spelling missed this entirely.
+        "Today\u2019s headlines from the Capitol",
+        # Live-missed case (issue 492, 2026-08): NPR's real title format for
+        # this product leads with "The", which is too long to be absorbed by
+        # the source-tag group (no colon of its own within 20 chars) and was
+        # not otherwise skipped, so the whole prefix pattern silently failed.
+        "The Up First newsletter: Varga weighs birthright citizenship order",
+        "An evening briefing on troop levels",
+    ])
+    def test_recurring_digest_titles_are_dropped(self, title):
+        from app.pipeline.analyze.action_center import _digest_reason
+
+        assert _digest_reason(_make_article(title)) == "recurring digest title"
+
+    def test_an_outlets_newsletter_section_is_a_digest(self):
+        from app.pipeline.analyze.action_center import _digest_reason
+
+        url = "https://example.com/newsletters/healthcare/123-drugmakers-challenge-pilot/"
+        assert _digest_reason(_make_article("Drugmakers challenge pilot program", url=url)) == "newsletter section"
+        # A slug that only mentions a newsletter is not the section.
+        url = "https://example.com/2026/10/08/123/up-first-newsletter-story"
+        assert _digest_reason(_make_article("Senate passes the budget", url=url)) is None
+
+    @pytest.mark.parametrize("title", [
+        "House approves Pentagon funding framework in narrow vote",
+        "Israel and Hamas reach agreement on hostage release",
+        # Product names collide with real reporting mid-headline, so they
+        # only count title-initial. All three published as ordinary
+        # single-story headlines and were dropped before this was split out.
+        "White House news briefing on the Gaza strikes",
+        "Varga skipped the President's Daily Brief for a week, officials say",
+        "Pentagon holds evening briefing on troop levels",
+        "The building blew up first, then the roof collapsed",
+        # A hyphenated word is not a source tag, so what follows it is not
+        # title-initial either.
+        "Wrap-up first look at the budget request",
+        # "in brief" / "and more" are digest markers only as a trailing tag;
+        # mid-sentence they are ordinary prose, and an unspaced dash is a
+        # compound adjective rather than the tag boundary.
+        "Senator Pryor spoke in brief remarks after the vote",
+        "Flooding kills 20 and more than 100 are missing in Texas",
+        "Senate passes trade bill and more-restrictive tariff rules",
+        # Single-topic forms deliberately left out of the pattern: an
+        # explainer and a live blog each cover ONE event.
+        "What to know about the new tariff rules",
+        "Israel-Hamas war live updates: talks resume in Cairo",
+        "The latest: FEMA administrator resigns",
+    ])
+    def test_single_story_titles_are_kept(self, title):
+        from app.pipeline.analyze.action_center import _digest_reason
+
+        assert _digest_reason(_make_article(title)) is None
+
+    @pytest.mark.parametrize("title,body", [
+        # Sentence-delimited: the shape of an NPR "Up First" body.
+        ("Your Wednesday roundup",
+         "Israel and Hamas agreed to a ceasefire framework. The Federal "
+         "Reserve held interest rates steady. Wildfires forced evacuations "
+         "across Oregon."),
+        # Semicolons and bullets: after these, a capitalized first word is a
+        # real name rather than grammar, and must not be stripped. Both
+        # cases read as a single two-item blurb if it is.
+        ("Wednesday",
+         "Okonkwo addressed the Knesset; Brandt defended the rate "
+         "decision; Quillen declared a state of emergency."),
+        ("The day ahead",
+         "Ukraine aid clears the Senate • Brandt signals a pause • Texas "
+         "sues over the new map"),
+    ])
+    def test_bodies_listing_unrelated_stories_are_dropped(self, title, body):
+        from app.pipeline.analyze.action_center import _digest_reason
+
+        article = _make_article(title)
+        article.summary = body
+        assert _digest_reason(article) == "body lists unrelated stories"
+
+    @pytest.mark.parametrize("title,body", [
+        # A single story keeps returning to its own subject.
+        ("Israel and Hamas reach ceasefire deal",
+         "Israel and Hamas reached a deal on Tuesday. The agreement calls "
+         "for a phased withdrawal. Hamas said it would release hostages."),
+        ("Senate confirms Jane Doe to lead FDA",
+         "The Senate voted 51-49 to confirm Jane Doe. Doe will lead the "
+         "FDA. Varga praised the outcome."),
+        # Sentence-initial capitals are grammar, not names — without the
+        # forced-capital strip each of these sentences would look like it
+        # introduced a different entity and the blurb would read as a list.
+        ("Judge sets October sentencing in fraud case",
+         "Prosecutors filed the charges Monday. Defense attorneys called "
+         "the case weak. Sentencing is set for October."),
+        # Three sentences, three disjoint entity sets, ONE story — caught
+        # only by the title-coverage condition, since the headline accounts
+        # for all three items.
+        ("Grantham releases FBI transcript in Judiciary probe",
+         "Sen. Chuck Grantham released the transcript Thursday. The FBI "
+         "declined to comment. House Judiciary Democrats called for "
+         "hearings."),
+        # Bare numbers are not topics.
+        ("House clears the funding bill",
+         "The vote was 216-212. It came after 3 hours. Final passage is "
+         "expected by 5 p.m."),
+        ("House sends the bill to the Senate",
+         "The House passed the bill. It now goes to the Senate."),
+        ("Nothing here", ""),
+        # An abbreviation's period is not a sentence break: split after
+        # "Rep." the name lands in an item of its own, a third disjoint one.
+        ("Dana Varga refuses to drop reelection bid",
+         "Voters in Ohio's 7th district react to calls for Rep. Dana Varga "
+         "to drop out. He ran uncontested in the primary. The Democratic "
+         "nominee is Lee Okafor."),
+        # A photo credit names someone who is not in the story.
+        ("Varga denied bail in extradition fight",
+         "Prosecutors told the court that Dana Varga boasted about multiple "
+         "passports. Defense lawyers for Quillen argued it was a role. "
+         "(Image credit: Lee Okafor)"),
+        # Nor does a broadcast segment's sign-off.
+        ("The debate over money in politics",
+         "Voters in Alaska are weighing a ballot measure on donations. It "
+         "follows a Supreme Court decision on party spending. Dana Varga "
+         "discussed it with Lee Okafor."),
+    ])
+    def test_single_story_bodies_are_kept(self, title, body):
+        from app.pipeline.analyze.action_center import _digest_reason
+
+        article = _make_article(title)
+        article.summary = body
+        assert _digest_reason(article) is None
+
+    @pytest.mark.parametrize("title", [
+        # A possessive-led headline is the most common shape there is, and
+        # _issue_signature keeps "'s" inside the token — so "Varga's" shared
+        # nothing with a body saying "Varga" and the headline read as
+        # failing to describe its own story. Both apostrophe characters,
+        # since the typographic one tokenizes differently again.
+        "Varga's tariff order and the Lindqvist schedule fight",
+        "Varga\u2019s tariff order and the Lindqvist schedule fight",
+    ])
+    def test_possessive_headline_still_covers_its_own_body(self, title):
+        from app.pipeline.analyze.action_center import _multi_topic_body
+
+        body = (
+            "The order signed by Varga takes effect Monday; Marchetti set "
+            "argument for October; Lindqvist defended the schedule."
+        )
+        # Covers two of the three items once possessives are normalized.
+        assert _multi_topic_body(body, title) is False
+        # The same body under a headline that names none of it IS a list,
+        # so the assertion above is about coverage, not a benign body.
+        assert _multi_topic_body(body, "A quiet Tuesday") is True
+
+    def test_items_sharing_an_entity_are_not_a_list(self):
+        """Disjointness is the first of the two conditions and has to reject
+        on its own: three items that keep naming the same person are one
+        story told in three beats, whatever the headline says."""
+        from app.pipeline.analyze.action_center import _multi_topic_body
+
+        body = (
+            "Reporters pressed Okonkwo on the deal; Brandt defended the "
+            "rate decision; Okonkwo answered again hours later."
+        )
+        assert _multi_topic_body(body, "A quiet Tuesday") is False
+        # Same shape with the repeated name swapped out IS a list — the
+        # only difference between the two is the shared entity.
+        disjoint = body.replace("Okonkwo answered again", "Quillen spoke again")
+        assert _multi_topic_body(disjoint, "A quiet Tuesday") is True
+
+    def test_body_cut_at_the_summary_cap_does_not_invent_an_item(self):
+        """A description that hit MAX_SUMMARY_CHARS was cut mid-item. The
+        fragment names entities that by construction appear nowhere else,
+        so counting it turns a two-item blurb into a three-item list."""
+        from app.pipeline.analyze.action_center import _multi_topic_body
+        from app.pipeline.fetch.news_feeds import MAX_SUMMARY_CHARS
+
+        head = (
+            "Israel and Hamas agreed to a ceasefire framework. Wildfires "
+            "forced evacuations across Oregon. "
+        )
+        filler = "The framework runs to many pages of annexes and phased steps. "
+        prefix = (head + filler * 10)[:MAX_SUMMARY_CHARS - 22].rstrip()
+        body = (prefix + " Mediators from Qatar met in Cairo overnight")[:MAX_SUMMARY_CHARS]
+
+        assert len(body) == MAX_SUMMARY_CHARS
+        # Same text one character under the cap, not marked truncated, is
+        # NOT treated as cut, and the trailing fragment does read as a
+        # third topic — which is what makes the truncated flag load-bearing
+        # rather than cosmetic. news_feeds sets it directly at parse time
+        # now (two different caps can apply depending on the source), so
+        # the caller passes it explicitly rather than _multi_topic_body
+        # re-deriving it from a length comparison.
+        assert _multi_topic_body(body[:MAX_SUMMARY_CHARS - 1], "A quiet Tuesday", truncated=False) is True
+        assert _multi_topic_body(body, "A quiet Tuesday", truncated=True) is False
+
+    def test_digest_reason_skips_the_body_check_for_full_text_length_summaries(self):
+        """_digest_reason exempts any summary over MAX_SUMMARY_CHARS from the
+        body-shape check, since that length can now only come from
+        content:encoded full text rather than a teaser. Accepted tradeoff:
+        a genuinely multi-topic body that happens to arrive via full text
+        (e.g. a source publishing a multi-item briefing through
+        content:encoded) is not caught by this check — only by the
+        title-pattern check, which runs independently."""
+        from app.pipeline.analyze.action_center import _digest_reason
+        from app.pipeline.fetch.news_feeds import MAX_SUMMARY_CHARS
+
+        body = (
+            "Israel and Hamas agreed to a ceasefire framework. "
+            "The Federal Reserve held interest rates steady. "
+            "Wildfires forced evacuations across Oregon. "
+        )
+        long_body = (body * ((MAX_SUMMARY_CHARS // len(body)) + 2)).strip()
+        assert len(long_body) > MAX_SUMMARY_CHARS
+
+        article = _make_article("A quiet Tuesday")
+        article.summary = long_body
+        article.truncated = False
+        assert _digest_reason(article) is None
+
+    def test_bulleted_body_without_terminal_punctuation_is_still_analyzed(self):
+        """Trailing punctuation was the original truncation signal and it
+        discarded the final item of every list that ends without a period —
+        which is most bulleted lists."""
+        from app.pipeline.analyze.action_center import _split_body_items
+
+        body = "Ukraine aid clears the Senate • Brandt signals a pause • Texas sues"
+        assert len(_split_body_items(body)) == 3
+
+    def test_html_bulleted_digest_survives_parsing_into_the_detector(self):
+        """End to end across the two modules, which is where the original
+        bug lived. A WordPress-style digest arrives as escaped <li> markup;
+        the feed parser has to turn that into item boundaries the detector
+        can split on, or the body check sees one undifferentiated blob."""
+        from app.pipeline.analyze.action_center import _digest_reason, _split_body_items
+        from app.pipeline.fetch.news_feeds import _parse_rss_feed
+
+        article = _parse_rss_feed(
+            """<?xml version="1.0"?><rss><channel><item>
+              <title>Your Wednesday roundup</title>
+              <link>https://example.com/d</link>
+              <description>&lt;ul&gt;&lt;li&gt;Israel and Hamas agreed to a framework&lt;/li&gt;&lt;li&gt;The Federal Reserve held rates steady&lt;/li&gt;&lt;li&gt;Wildfires forced evacuations across Oregon&lt;/li&gt;&lt;/ul&gt;</description>
+            </item></channel></rss>""".encode(),
+            "Test",
+        )[0]
+
+        assert "<" not in article.summary
+        assert len(_split_body_items(article.summary)) == 3
+        assert _digest_reason(article) == "body lists unrelated stories"
+
+    def test_empty_input_short_circuits(self):
+        from app.pipeline.analyze.action_center import _filter_policy_relevant
+
+        assert _filter_policy_relevant([]) == []
+
+    def test_digests_are_dropped_before_embedding_and_counted(self):
+        from app.pipeline.analyze import action_metrics
+        from app.pipeline.analyze import action_center as ac
+
+        digest = _make_article("Up First briefing: three stories to start your day")
+        story = _make_article("House approves Pentagon funding framework")
+        embedded: list[list[str]] = []
+
+        def fake_embed(texts):
+            embedded.append(list(texts))
+            return np.array([[1.0, 0.0]] * len(texts))
+
+        action_metrics.reset()
+        with patch.object(ac, "_embed_texts_sim", side_effect=fake_embed), \
+                patch.object(ac, "_relevance_reference", return_value=np.array([[1.0, 0.0]])), \
+                patch.object(ac, "relevance_examples", return_value=[{"relevant": True}]), \
+                patch.object(ac, "relevance_calibration", return_value={"k": 1, "threshold": 0.5}):
+            kept = ac._filter_policy_relevant([digest, story])
+
+        assert [a.title for a, _ in kept] == [story.title]
+        # The digest never reaches the embedding model at all.
+        assert embedded == [[f"{story.title}. {story.summary}"]]
+        assert action_metrics.snapshot()["articles_dropped_digest"] == 1
+
+class TestSimilarityModelGates:
+    """2026-07 embedding-swap (step 2): the measured symmetric-similarity
+    gates run on the similarity model (see vector_store.
+    get_similarity_model). These exercise the swapped call sites with the
+    model patched — threshold values themselves were fit on real
+    measured distributions (see each constant's comment)."""
+
+    def _fake_model(self, vectors):
+        model = MagicMock()
+        model.encode.side_effect = vectors
+        return model
+
+    def test_embed_texts_sim_uses_similarity_model(self):
+        from app.pipeline.analyze.action_center import _embed_texts_sim
+
+        fake = MagicMock()
+        fake.encode.return_value = np.array([[1.0, 0.0]])
+        with patch("app.pipeline.vector_store.get_similarity_model", return_value=fake):
+            out = _embed_texts_sim(["hello"])
+        assert out.shape == (1, 2)
+        fake.encode.assert_called_once()
+
+    def test_policy_filter_keeps_articles_whose_neighbours_are_relevant(self):
+        """The gate is a vote among the nearest labelled examples, not a
+        similarity bar: an article lands with whichever examples it sits
+        closest to."""
+        from app.pipeline.analyze import action_center as ac
+
+        civic = _make_article("House approves Pentagon funding framework in narrow vote")
+        sports = _make_article("Spain defeats Argentina 1-0 in World Cup final")
+        # Two relevant examples along x, two not-relevant along y.
+        reference = np.array([[1.0, 0.0], [0.96, 0.28], [0.0, 1.0], [0.28, 0.96]])
+        examples = [{"relevant": True}, {"relevant": True}, {"relevant": False}, {"relevant": False}]
+
+        def fake_embed(texts):
+            return np.array([[0.98, 0.2] if "Pentagon" in t else [0.1, 0.995] for t in texts])
+
+        with patch.object(ac, "_embed_texts_sim", side_effect=fake_embed), \
+                patch.object(ac, "_relevance_reference", return_value=reference), \
+                patch.object(ac, "relevance_examples", return_value=examples), \
+                patch.object(ac, "relevance_calibration", return_value={"k": 2, "threshold": 0.85}):
+            kept = ac._filter_policy_relevant([civic, sports])
+        assert [a.title for a, _ in kept] == [civic.title]
+
+    def test_relevance_vote_is_similarity_weighted(self):
+        from app.pipeline.analyze.action_center import relevance_votes
+
+        reference = np.array([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])
+        labels = np.array([1.0, 0.0, 1.0])
+        article = np.array([[0.8, 0.6]])
+        # k=2: neighbours at cosine 0.8 (relevant) and 0.6 (not).
+        assert relevance_votes(article, reference, labels, 2)[0] == pytest.approx(0.8 / 1.4)
+        # k=3 adds the opposite example, which weighs nothing.
+        assert relevance_votes(article, reference, labels, 3)[0] == pytest.approx(0.8 / 1.4)
+        # k beyond the reference size is the whole set.
+        assert relevance_votes(article, reference, labels, 50)[0] == pytest.approx(0.8 / 1.4)
+
+    def test_policy_relevance_calibration_matches_examples(self):
+        """scripts/calibrate_policy_relevance.py fits k and the threshold to
+        one labelled set; editing the set without rerunning it would gate
+        on a fit to different data."""
+        from app.pipeline.analyze import action_center as ac
+
+        calibration = ac.relevance_calibration()
+        examples = ac.relevance_examples()
+        assert calibration["examples_hash"] == ac.relevance_examples_hash()
+        assert calibration["examples"] == len(examples)
+        assert 1 <= calibration["k"] <= len(examples)
+        assert 0.0 < calibration["threshold"] < 1.0
+        assert {e["relevant"] for e in examples} == {True, False}
+        assert {e["sample"] for e in examples} == {"feed", "clustered"}
+
+    def test_trending_boost_runs_on_sim_model(self):
+        from app.pipeline.analyze.action_center import _compute_trending_boost
+        from app.pipeline.fetch.trending import TrendingTopic
+
+        def fake_embed(texts):
+            return np.tile(np.array([1.0, 0.0]), (len(texts), 1))
+
+        clusters = [[_make_article("Senate passes appropriations bill")]]
+        trending = [TrendingTopic(title="Senate appropriations fight", source="test")]
+        with patch("app.pipeline.analyze.action_center._embed_texts_sim", side_effect=fake_embed):
+            boosts = _compute_trending_boost(clusters, trending)
+        assert len(boosts) == 1
+        assert boosts[0] > 0
+
+
+def test_get_similarity_model_lazy_singleton(monkeypatch):
+    from app.pipeline import vector_store
+
+    fake = MagicMock()
+    # The model a slow test loaded earlier is put back at teardown.
+    monkeypatch.setattr(vector_store, "_similarity_model", None)
+    with patch.object(vector_store, "SentenceTransformer", return_value=fake) as ctor:
+        first = vector_store.get_similarity_model()
+        second = vector_store.get_similarity_model()
+    assert first is fake and second is fake
+    ctor.assert_called_once_with(vector_store._SIMILARITY_MODEL_NAME)
+
+
+class TestCongressGovUrlBuilding:
+    """congress.gov bill URLs embed the congress ordinal ("119th", "101st");
+    a wrong suffix or wrong congress number is a dead link."""
+
+    def test_ordinal_suffixes(self):
+        from app.ordinals import ordinal
+
+        assert ordinal(119) == "119th"
+        assert ordinal(101) == "101st"
+        assert ordinal(102) == "102nd"
+        assert ordinal(103) == "103rd"
+        assert ordinal(111) == "111th"
+        assert ordinal(112) == "112th"
+        assert ordinal(113) == "113th"
+        assert ordinal(104) == "104th"
+        assert ordinal(93) == "93rd"
+        assert ordinal(121) == "121st"
+        assert ordinal(20) == "20th"
+
+    def test_a_bill_number_counts_when_its_title_is_named(self):
+        from app.config import settings
+        from app.pipeline.analyze.action_center import _resolve_bills
+
+        titles = {"HR.22": ["SAVE Act", "Safeguard American Voter Eligibility Act"]}
+        resolved = _resolve_bills(["The House passed H.R. 22, the SAVE Act, yesterday."], None, titles)
+
+        assert [b["id"] for b in resolved] == ["HR.22"]
+        assert resolved[0]["congress"] == settings.CURRENT_CONGRESS
+        assert resolved[0]["url"] == (
+            f"https://www.congress.gov/bill/{settings.CURRENT_CONGRESS}th-congress/house-bill/22"
+        )
+
+    @pytest.mark.parametrize("text", [
+        # 2026-10-08: "S.2026" and "S.50" on live issues came from prose.
+        "Trump's 2026 agenda faces the Senate.",
+        "The U.S. 50 states sued.",
+        # A number whose words don't name the bill: the last Congress's, or
+        # just a number.
+        "The House passed H.R. 22 on a party-line vote.",
+    ])
+    def test_a_number_alone_is_not_a_bill(self, text):
+        from app.pipeline.analyze.action_center import _resolve_bills
+
+        titles = {"S.2026": ["Rural Broadband Act"], "S.50": ["Clean Water Act"], "HR.22": ["SAVE Act"]}
+        assert _resolve_bills([text], None, titles) == []
+
+
+class TestCleanupOldUnpostedIssues:
+    """Extracted from _run_refresh (2026-07-23) for direct testability —
+    also switched its cutoff computation from the module's own utcnow()
+    (already correct) to confirm it stays on the canonical clock."""
+
+    @pytest.mark.parametrize("age_days, posted_days_ago, post_fields, deleted", [
+        pytest.param(20, None, {}, True, id="old_unposted_developing_issue_is_deleted"),
+        # A confirmed issue has a permalink in the sitemap's archive whether
+        # or not it was posted, and most aren't (only the day's top two).
+        pytest.param(20, None, {"status": "confirmed"}, False, id="old_unposted_confirmed_issue_is_kept"),
+        pytest.param(20, 19, {}, False, id="old_but_posted_issue_is_preserved"),
+        pytest.param(2, None, {}, False, id="recent_unposted_issue_is_preserved"),
+        # bsky_posted_at is NULL for two different reasons: never published,
+        # and published-then-flagged-for-a-repost (_apply_matched_issue_update
+        # clears it to hand the issue back to the poster). If that repost then
+        # fails to publish, or the story stops being matched, the row sits at
+        # NULL while a real post pointing at /issue/<id> is live in the feed —
+        # and deleting it 404s a link readers can still click.
+        pytest.param(20, None, {"bsky_last_post_text": "The House passed the defense bill 216-212."},
+                     False, id="published_issue_awaiting_a_repost_is_not_deleted"),
+        # The other side of the same rule: suppression marks the issue handled
+        # without publishing anything, so it has no permalink to protect and
+        # must not be retained forever by the fix above.
+        pytest.param(20, None, {"bsky_last_post_text": None, "bsky_posted_facts": '["nothing new to say"]'},
+                     True, id="near_duplicate_suppressed_issue_is_still_deleted"),
+    ])
+    def test_cleanup(self, db_session, age_days, posted_days_ago, post_fields, deleted):
+        from app.pipeline.analyze.action_center import _cleanup_old_unposted_issues
+
+        date = (utcnow() - timedelta(days=age_days)).strftime("%Y-%m-%d")
+        posted_at = None if posted_days_ago is None else utcnow() - timedelta(days=posted_days_ago)
+        fields = {"status": "developing", **post_fields}
+        db_session.add(ActionIssue(date=date, rank=1, title="Issue", bsky_posted_at=posted_at, **fields))
+        db_session.commit()
+
+        assert _cleanup_old_unposted_issues(db_session) == int(deleted)
+        assert db_session.query(ActionIssue).count() == int(not deleted)
+
+
+class TestPeriodicBlueskyPosts:
+    """The spotlight and weekly summary read senator scores and the
+    timeline, not the news — but they ran only as stage 6 of the refresh,
+    downstream of the two early aborts, so a bad hour of feeds silenced
+    them too."""
+
+    def test_runs_on_the_no_articles_abort_path(self, db_session):
+        from unittest.mock import patch
+
+        import app.pipeline.analyze.action_center as ac
+
+        with patch.object(ac, "check_roll_call_signals"), \
+                patch.object(ac, "check_federal_register_signals"), \
+                patch.object(ac, "expire_stale_developing_issues"), \
+                patch.object(ac, "fetch_news_articles", return_value=[]), \
+                patch.object(ac, "_run_periodic_bluesky_posts") as periodic, \
+                patch.object(ac, "_persist_metrics"), \
+                patch.object(ac, "_set_refresh_state"):
+            assert ac._run_refresh(db_session) == 0
+
+        periodic.assert_called_once()
+
+    def test_runs_on_the_no_relevant_articles_abort_path(self, db_session):
+        from unittest.mock import patch
+
+        import app.pipeline.analyze.action_center as ac
+
+        with patch.object(ac, "check_roll_call_signals"), \
+                patch.object(ac, "check_federal_register_signals"), \
+                patch.object(ac, "expire_stale_developing_issues"), \
+                patch.object(ac, "fetch_news_articles", return_value=["an article"]), \
+                patch.object(ac, "_filter_policy_relevant", return_value=[]), \
+                patch.object(ac, "_run_periodic_bluesky_posts") as periodic, \
+                patch.object(ac, "_persist_metrics"), \
+                patch.object(ac, "_set_refresh_state"):
+            assert ac._run_refresh(db_session) == 0
+
+        periodic.assert_called_once()
+
+    def test_a_failing_spotlight_never_takes_down_the_refresh(self, db_session):
+        from unittest.mock import patch
+
+        from app.pipeline.analyze.action_center import _run_periodic_bluesky_posts
+
+        with patch(
+            "app.pipeline.analyze.bluesky_spotlight.post_daily_spotlight",
+            side_effect=RuntimeError("bluesky down"),
+        ):
+            _run_periodic_bluesky_posts(db_session)  # must not raise
+
+
+class TestRefreshActionIssuesClearsIsRunningOnError:
+    """2026-07-27: _run_refresh only cleared the in-memory is_running flag
+    on its own explicit return paths, so an uncaught exception mid-run
+    (e.g. the national_monitors.slug IntegrityError this session's
+    incident hit) left it stuck true. That flag feeds
+    /api/admin/pipeline/status, which wedged both this job's own 4h
+    staleness override and check-and-deploy.sh's busy-check on the Pi for
+    5+ hours, blocking deploys of CI-green commits already on main."""
+
+    def test_is_running_cleared_when_run_refresh_raises(self, db_session):
+        import app.pipeline.analyze.action_center as ac
+
+        saved_state = ac.get_action_refresh_state()
+        try:
+            with patch.object(ac, "_run_refresh", side_effect=RuntimeError("boom")):
+                with pytest.raises(RuntimeError):
+                    ac.refresh_action_issues(db_session)
+
+            state = ac.get_action_refresh_state()
+            assert state["is_running"] is False
+            assert state["stage"] is None
+        finally:
+            ac._set_refresh_state(**saved_state)
+
+
+class TestPruneStaleApiCache:
+    """Extracted from _run_refresh (2026-07-23) for direct testability."""
+
+    def test_old_cache_entry_is_deleted(self, db_session):
+        from app.models import ApiCache
+        from app.pipeline.analyze.action_center import _prune_stale_api_cache
+
+        db_session.add(ApiCache(
+            tier="test-tier", cache_key="old-key", data_json="{}",
+            cached_at=utcnow() - timedelta(days=90),
+        ))
+        db_session.commit()
+
+        deleted = _prune_stale_api_cache(db_session)
+
+        assert deleted == 1
+        assert db_session.query(ApiCache).count() == 0
+
+    def test_recent_cache_entry_is_preserved(self, db_session):
+        from app.models import ApiCache
+        from app.pipeline.analyze.action_center import _prune_stale_api_cache
+
+        db_session.add(ApiCache(
+            tier="test-tier", cache_key="recent-key", data_json="{}",
+            cached_at=utcnow() - timedelta(days=5),
+        ))
+        db_session.commit()
+
+        deleted = _prune_stale_api_cache(db_session)
+
+        assert deleted == 0
+        assert db_session.query(ApiCache).count() == 1
+
+
+class TestFullNameMatchingIsWordAnchored:
+    """A member's full name used to be matched with a plain substring test
+    (`name.lower() in text.lower()`), which lets the name straddle word
+    boundaries. That silently re-admitted the exact false positives the bare
+    surname path is hardened against by _COMMON_WORD_SURNAMES — and did it
+    with the *higher* confidence "named in coverage" reason, so the linked
+    member looked more certain, not less.
+
+    Both names below are current members whose surnames are already on the
+    stoplist, so the surname pass refuses them correctly; only the full-name
+    pass was letting them through."""
+
+    def test_reported_cases_does_not_name_rep_ed_case(self, db_session):
+        db_session.add(Representative(
+            id="r-case", name="Ned Case", state="HI", party="D",
+        ))
+        db_session.commit()
+
+        result = _find_related_senators(
+            "Measles outbreak widens",
+            "Health officials said reported cases rose again this week.",
+            [], db_session,
+        )
+
+        assert result == []
+
+    def test_several_green_does_not_name_rep_al_green(self, db_session):
+        db_session.add(Representative(
+            id="r-green", name="Cal Green", state="TX", party="D",
+        ))
+        db_session.commit()
+
+        result = _find_related_senators(
+            "Energy package advances",
+            "The bill funds several green energy projects across the state.",
+            [], db_session,
+        )
+
+        assert result == []
+
+    def test_genuine_full_name_mention_still_matches(self, db_session):
+        """The anchoring must not cost real matches — these are the same two
+        members, actually named."""
+        db_session.add(Representative(
+            id="r-case", name="Ned Case", state="HI", party="D",
+        ))
+        db_session.add(Representative(
+            id="r-green", name="Cal Green", state="TX", party="D",
+        ))
+        db_session.commit()
+
+        result = _find_related_senators(
+            "Hawaii and Texas delegations split on the bill",
+            "Rep. Ned Case backed the measure, while Rep. Cal Green opposed it.",
+            [], db_session,
+        )
+
+        assert sorted(r["id"] for r in result) == ["r-case", "r-green"]
+        assert {r["match_reason"] for r in result} == {"named in coverage"}
+
+    def test_suffixed_member_name_still_matches(self, db_session):
+        """Regression guard for the anchoring itself: a \b-based version of
+        this rule drops every member whose name ends in a Jr./Sr. suffix."""
+        db_session.add(Senator(
+            id="s-king", name="Angus King Jr.", state="ME", party="I",
+        ))
+        db_session.commit()
+
+        result = _find_related_senators(
+            "Maine delegation splits",
+            "Sen. Angus King Jr. voted against the measure.",
+            [], db_session,
+        )
+
+        assert [r["id"] for r in result] == ["s-king"]
+
+    def test_justice_full_name_is_word_anchored_too(self, db_session):
+        """Same helper, same guarantee, for the SCOTUS path."""
+        db_session.add(Justice(
+            id="j-1", name="Mary Lane Barrett", last_name="Barrett",
+            appointing_party="R",
+        ))
+        db_session.commit()
+
+        matched = _find_related_officials(
+            "Trade policy shift",
+            "The barrettes and other imported goods face new tariffs.",
+            [], db_session,
+        )
+
+        assert [o for o in matched if o["id"] == "j-1"] == []
+
+
+class TestMentionsFullName:
+    """Unit-level coverage of the boundary rule itself."""
+
+    @pytest.mark.parametrize("text,name,expected", [
+        ("Health officials cited reported cases.", "Ned Case", False),
+        ("It funds several green projects.", "Cal Green", False),
+        ("Rep. Ned Case said so.", "Ned Case", True),
+        ("NED CASE voted no.", "Ned Case", True),
+        ("Signed by Cal Green, the letter...", "Cal Green", True),
+        ("A profile of Cal Greene, the singer.", "Cal Green", False),
+        ("", "Ned Case", False),
+        ("Some text", "", False),
+        # A name ending in a non-word character: \b would assert a transition
+        # *after* the period and refuse every one of these. Sen. Angus King's
+        # own FEC record carries the suffix, so this is live data, not a
+        # hypothetical.
+        ("Sen. Angus King Jr. voted no.", "Angus King Jr.", True),
+        ("Rep. Donald Payne Jr. introduced it.", "Donald Payne Jr.", True),
+        ("A statement from Harold Rhodes Jr.", "Harold Rhodes Jr.", True),
+        ("Rep. Robert F. Kennedy spoke.", "Robert F. Kennedy", True),
+        ("Rep. Lena Ortiz-Hale spoke.", "Lena Ortiz-Hale", True),
+        ("Sen. Kip O'Dwyer spoke.", "Kip O'Dwyer", True),
+    ])
+    def test_boundary_rule(self, text, name, expected):
+        assert _mentions_full_name(text, name) is expected
+
+
+def test_a_bill_named_by_its_short_title_is_resolved():
+    """2026-09-28: every outlet called S. 4668 "the Protect College Sports
+    Act" and none by number, so the issue recorded no bill and the
+    roll-call draft of the same vote couldn't see it was covered."""
+    from app.pipeline.analyze.action_center import _resolve_bills
+
+    titles = {"protect college sports act": {"S.4668"}, "college athlete protection act": {"S.10", "HR.20"}}
+    resolved = _resolve_bills(
+        ["The Senate passes the Protect College Sports Act, but the bill's future is unclear"], titles,
+    )
+    assert [b["id"] for b in resolved] == ["S.4668"]
+    # A title two bills share (companions) names neither; a title inside a
+    # longer word run doesn't count.
+    assert _resolve_bills(["The College Athlete Protection Act advanced."], titles) == []
+    assert _resolve_bills(["The Protect College Sports Actors Guild met."], titles) == []
+
+
+class TestElectionResultsIssuesMatchOnlyTheirRace:
+    """An election-night flip issue (live_results/signals.py) is a fixed
+    template — state, "District", a party, figures — so signature overlap
+    alone let news about another race in the same state promote it."""
+
+    @staticmethod
+    def _flip_issue(race_id="2026-HOUSE-GA-2", label="Georgia's 2nd Congressional District", current=True):
+        from app.models import ActionIssueStatus
+
+        return ActionIssue(
+            id=900, date="2026-11-04", rank=999, is_current=current, status=ActionIssueStatus.DEVELOPING,
+            source_type="election_results",
+            title=f"Republican leads {label} count in a seat Democrats hold",
+            facts=json.dumps(["Ray Jones (R): 600 votes, 60.0%", "Dana Smith (D): 400 votes, 40.0%",
+                              "The seat is held by a Democrat going into this election"]),
+            actions=json.dumps([{"text": f"Follow the count for {label}", "type": "follow_results",
+                                 "url": f"/elections/states/GA#race-{race_id}"}]),
+            source_urls=json.dumps(["https://results.example/ga"]),
+        )
+
+    @staticmethod
+    def _match(issue, title, facts=(), summary="", urls=None, db=None):
+        # Same title vector: the issue is always nominated as a candidate.
+        return _find_matching_issue(title, list(facts), [issue], np.array([[1.0, 0.0]]),
+                                    np.array([1.0, 0.0]), set(), source_urls=urls, summary=summary, db=db)
+
+    @staticmethod
+    def _senate_races(db, *race_ids):
+        from app.models import Race
+
+        for rid in race_ids:
+            db.add(Race(id=rid, cycle_year=int(rid[:4]), office="S", state=rid.split("-")[2], district=None))
+        db.commit()
+        return db
+
+    def test_the_source_type_is_the_one_the_sync_writes(self):
+        from app.live_results import signals
+        from app.pipeline.analyze import action_center
+
+        assert action_center._ELECTION_RESULTS_SOURCE == signals.SOURCE_TYPE
+
+    def test_news_about_another_district_does_not_promote_it(self):
+        issue = self._flip_issue()
+        assert self._match(issue, issue.title.replace("2nd", "6th"),
+                           ["Republican Ray Jones leads in Georgia's 6th District, a seat Democrats hold"]) is None
+
+    def test_news_naming_its_district_does(self):
+        issue = self._flip_issue()
+        assert self._match(issue, "Republican leads in Georgia's 2nd District",
+                           ["Ray Jones (R): 600 votes, 60.0%"]) is issue
+        assert self._match(issue, "Republicans gain a seat in Georgia",
+                           summary="Jones is ahead in GA-02 with most precincts in.") is issue
+
+    def test_a_shared_source_url_is_not_enough(self):
+        issue = self._flip_issue()
+        assert self._match(issue, "A different story", urls=["https://results.example/ga"]) is None
+
+    def test_a_retired_issue_is_never_promoted_back(self):
+        issue = self._flip_issue(current=False)
+        assert self._match(issue, "Republican leads in Georgia's 2nd District") is None
+
+    @pytest.mark.parametrize("with_db", [True, False])
+    def test_senate_regular_and_special_are_told_apart(self, db_session, with_db):
+        # With both races on the ballot — and, with no session to ask, always.
+        db = self._senate_races(db_session, "2026-SEN-GA", "2026-SEN-GA-SPECIAL") if with_db else None
+        regular = self._flip_issue("2026-SEN-GA", "Georgia's U.S. Senate")
+        special = self._flip_issue("2026-SEN-GA-SPECIAL", "Georgia's U.S. Senate special election")
+        assert self._match(regular, "Republican leads Georgia's Senate race", db=db) is regular
+        assert self._match(special, "Republican leads Georgia's Senate race", db=db) is None
+        assert self._match(special, "Republican leads Georgia's Senate special election", db=db) is special
+        assert self._match(regular, "Republican leads Georgia's Senate special election", db=db) is None
+
+    @pytest.mark.parametrize("text,names_special", [
+        # "special" before "Senate" / "U.S.", and "special election for …".
+        ("Brennan leads in the special Senate election in Georgia", True),
+        ("Special U.S. Senate race in Georgia too close to call", True),
+        ("Count tightens in the special U.S. Senate election in Georgia", True),
+        ("Georgia's special election for U.S. Senate tightens", True),
+        ("Georgia's special U.S. Senate race tightens", True),
+        ("Republican leads the special election for Georgia's Senate seat", True),
+        ("Count tightens in the special election for U.S. Senate in Georgia", True),
+        ("Democrat leads the U.S. Senate race in Georgia", False),
+        ("Republican leads Georgia's Senate race", False),
+    ])
+    def test_special_is_read_wherever_it_stands(self, db_session, text, names_special):
+        db = self._senate_races(db_session, "2026-SEN-GA", "2026-SEN-GA-SPECIAL")
+        regular = self._flip_issue("2026-SEN-GA", "Georgia's U.S. Senate")
+        special = self._flip_issue("2026-SEN-GA-SPECIAL", "Georgia's U.S. Senate special election")
+        assert (self._match(special, text, db=db) is special) is names_special
+        assert (self._match(regular, text, db=db) is regular) is not names_special
+
+    @pytest.mark.parametrize("race_id,text", [
+        ("2026-SEN-OH-SPECIAL", "Brown leads Halvorsen in Ohio Senate race"),
+        ("2026-SEN-OH-SPECIAL", "Democrat leads the U.S. Senate race in Ohio"),
+        ("2026-SEN-OH-SPECIAL", "Count tightens in the special U.S. Senate election in Ohio"),
+        ("2026-SEN-FL-SPECIAL", "Republican leads Florida's U.S. Senate count"),
+        ("2026-SEN-FL-SPECIAL", "Florida's special election for U.S. Senate tightens"),
+        # A state's only race is its only race either way round.
+        ("2026-SEN-GA", "Brennan leads in the special Senate election in Georgia"),
+    ])
+    def test_a_states_only_senate_race_is_named_by_any_senate_phrase(self, db_session, race_id, text):
+        """Florida and Ohio elect a senator in 2026 only to fill a vacancy:
+        their one race is "…-SPECIAL" (state_candidates._race_id_for keys
+        their records to it), and news calls it "the Ohio Senate race"."""
+        db = self._senate_races(db_session, race_id)
+        issue = self._flip_issue(race_id, "the U.S. Senate race")
+        assert self._match(issue, text, db=db) is issue
+
+    def test_the_issues_own_session_is_asked_when_none_is_passed(self, db_session):
+        self._senate_races(db_session, "2026-SEN-OH-SPECIAL")
+        issue = self._flip_issue("2026-SEN-OH-SPECIAL", "the U.S. Senate race")
+        db_session.add(issue)
+        db_session.commit()
+        assert self._match(issue, "Brown leads Halvorsen in Ohio Senate race") is issue
+
+    def test_a_state_senate_story_never_names_a_states_only_senate_race(self, db_session):
+        db = self._senate_races(db_session, "2026-SEN-OH-SPECIAL")
+        issue = self._flip_issue("2026-SEN-OH-SPECIAL", "the U.S. Senate race")
+        for text in ("Democrats flip Ohio state Senate seat", "Democrats flip a state-senate seat in Ohio",
+                     "The Senate race for Ohio's governor", "The state-senate race in Ohio's 14th district"):
+            assert self._match(issue, text, db=db) is None, text
+
+    @pytest.mark.parametrize("race_id,text", [
+        # "[State] Senate" is also the legislature's upper chamber, which
+        # elects the same night: a district, seat number or place inside
+        # the state after it, a bare "seat"/"election", or a count of seats.
+        ("2026-SEN-OH-SPECIAL", "Democrat flips Ohio Senate seat in Dayton-area district"),
+        ("2026-SEN-OH-SPECIAL", "Ohio Senate election results: GOP holds 24 seats"),
+        ("2026-SEN-OH-SPECIAL", "Republicans keep supermajority as Ohio Senate races are called"),
+        ("2026-SEN-OH-SPECIAL", "Ohio Senate seat 5"),
+        ("2026-SEN-OH-SPECIAL", "Ohio's Senate seat 5 goes to a recount"),
+        ("2026-SEN-OH-SPECIAL", "Ohio Senate race for District 14"),
+        ("2026-SEN-OH-SPECIAL", "Ohio Senate special election in the 13th district"),
+        ("2026-SEN-OH-SPECIAL", "Ohio Senate election bill"),
+        ("2026-SEN-FL-SPECIAL", "Florida Senate seat in Tampa flips"),
+        ("2026-SEN-FL-SPECIAL", "Republicans hold Senate seat in Florida"),
+        ("2026-SEN-GA", "Georgia Senate seat in Atlanta suburbs flips"),
+        ("2026-SEN-GA", "Georgia Senate race for District 14"),
+        ("2026-SEN-GA", "Georgia's Senate race in Atlanta's northern suburbs"),
+    ])
+    def test_a_state_legislature_seat_never_names_the_us_senate_race(self, db_session, race_id, text):
+        db = self._senate_races(db_session, race_id)
+        issue = self._flip_issue(race_id, "the U.S. Senate race")
+        assert self._match(issue, text, db=db) is None, text
+
+    @pytest.mark.parametrize("race_id,text", [
+        # Still named: a bare "race", a possessive, "special" or "U.S.", and
+        # a year or month after the phrase.
+        ("2026-SEN-OH-SPECIAL", "Brown leads Halvorsen in Ohio Senate race"),
+        ("2026-SEN-OH-SPECIAL", "Brown leads in the race for Ohio's Senate seat"),
+        ("2026-SEN-OH-SPECIAL", "Brown leads in Ohio's Senate seat race in November"),
+        ("2026-SEN-OH-SPECIAL", "Brown leads in Ohio's special Senate election"),
+        ("2026-SEN-OH-SPECIAL", "Brown leads in the Ohio U.S. Senate seat count"),
+        ("2026-SEN-FL-SPECIAL", "Moody leads in Florida's U.S. Senate special election"),
+        ("2026-SEN-GA", "Brennan leads in Georgia Senate race in 2026 rematch"),
+    ])
+    def test_the_us_senate_race_is_still_named_beside_those_rules(self, db_session, race_id, text):
+        db = self._senate_races(db_session, race_id)
+        issue = self._flip_issue(race_id, "the U.S. Senate race")
+        assert self._match(issue, text, db=db) is issue, text
+
+    def test_regular_names_the_regular_race_where_a_state_holds_both(self, db_session):
+        db = self._senate_races(db_session, "2020-SEN-GA", "2020-SEN-GA-SPECIAL")
+        regular = self._flip_issue("2020-SEN-GA", "Georgia's U.S. Senate")
+        special = self._flip_issue("2020-SEN-GA-SPECIAL", "Georgia's U.S. Senate special election")
+        text = "Brennan leads Purcell in Georgia's regular Senate race"
+        assert self._match(regular, text, db=db) is regular
+        assert self._match(special, text, db=db) is None
+        assert self._match(regular, "Brennan leads in the regular Senate race in Georgia", db=db) is regular
+
+    def test_an_issue_whose_race_cannot_be_read_is_not_promoted(self):
+        issue = self._flip_issue()
+        issue.actions = "[]"
+        assert self._match(issue, "Republican leads in Georgia's 2nd District") is None
+
+    def test_other_issues_are_unaffected(self):
+        issue = self._flip_issue()
+        issue.source_type = "vote"
+        assert self._match(issue, issue.title.replace("2nd", "6th"), json.loads(issue.facts)) is issue
+
+    def test_a_confirmed_results_issue_matches_its_story_again(self):
+        """Once news promotes a flip issue, promotion swaps its actions for
+        the cluster's (the #race- link goes), so gating it on its race made
+        the next hour's update of the same story a new row."""
+        from app.models import ActionIssueStatus
+
+        issue = self._flip_issue()
+        issue.status = ActionIssueStatus.CONFIRMED
+        issue.actions = json.dumps([{"text": "Read the AP story", "type": "read",
+                                     "url": "https://apnews.com/article/ga-2"}])
+        issue.source_urls = json.dumps(["https://apnews.com/article/ga-2"])
+        issue.title = "Republican Ray Jones flips Georgia's 2nd District"
+        issue.facts = json.dumps(["Ray Jones, a Republican, leads Democrat Dana Smith in southwest Georgia",
+                                  "The seat has been held by Democrats since 1993"])
+        # By shared URL…
+        assert self._match(issue, "Jones widens lead in southwest Georgia House race",
+                           urls=["https://apnews.com/article/ga-2"]) is issue
+        # …and by signature, with no URL in common.
+        assert self._match(issue, issue.title, json.loads(issue.facts),
+                           urls=["https://npr.org/other"]) is issue
+
+    @pytest.mark.parametrize("race_id,label,text", [
+        # The state name inside a longer one is not that state.
+        ("2026-HOUSE-VA-2", "Virginia's 2nd Congressional District",
+         "Republican leads in West Virginia's 2nd District"),
+        # A dateline names a city, not a seat.
+        ("2026-HOUSE-WA-3", "Washington's 3rd Congressional District",
+         "WASHINGTON (AP) — Republicans lead the 3rd District count in Oregon"),
+        # A roundup: the state and the district number belong to different races.
+        ("2026-HOUSE-GA-2", "Georgia's 2nd Congressional District",
+         "Republicans lead in Georgia's 6th and Florida's 2nd districts"),
+        ("2026-HOUSE-GA-2", "Georgia's 2nd Congressional District",
+         "Republicans lead in Georgia's 6th District and Florida's 2nd District"),
+        # A legislature's upper chamber is not the U.S. Senate.
+        ("2026-SEN-GA", "Georgia's U.S. Senate", "Democrats flip Georgia state Senate seat"),
+        ("2026-SEN-GA", "Georgia's U.S. Senate", "Democrats flip a state Senate seat in Georgia"),
+        # "Senate" with no race word, beside a state, is not the race.
+        ("2026-SEN-WA", "Washington's U.S. Senate", "WASHINGTON (AP) — The Senate returns next week"),
+        ("2026-HOUSE-AK-0", "Alaska's at-large seat", "Alaska voters weigh at-large seats on the borough assembly"),
+        # A hyphen doesn't turn a state senate into the U.S. Senate.
+        ("2026-SEN-GA", "Georgia's U.S. Senate", "The state-senate race in Georgia's 14th district"),
+        ("2026-HOUSE-GA-14", "Georgia's 14th Congressional District",
+         "The state-senate race in Georgia's 14th district"),
+        # Something of Georgia's, not Georgia's seat.
+        ("2026-SEN-GA", "Georgia's U.S. Senate", "The Senate race for Georgia's governor"),
+        ("2026-HOUSE-GA-2", "Georgia's 2nd Congressional District", "the 2nd district in Georgia's state Senate"),
+        ("2026-HOUSE-GA-2", "Georgia's 2nd Congressional District", "the 2nd district in Georgia state-house maps"),
+        ("2026-HOUSE-GA-2", "Georgia's 2nd Congressional District", "Georgia district 2 state house race"),
+        # A postal code inside a link is part of an address.
+        ("2026-HOUSE-GA-2", "Georgia's 2nd Congressional District", "see https://x.com/GA-2 for results"),
+        ("2026-HOUSE-GA-2", "Georgia's 2nd Congressional District", "more at www.example.com/GA-02"),
+        # A bare ordinal followed by another word is not a district.
+        ("2026-HOUSE-VA-2", "Virginia's 2nd Congressional District", "Virginia's 2nd largest city votes"),
+        ("2026-HOUSE-GA-3", "Georgia's 3rd Congressional District", "Georgia's 3rd straight win"),
+        ("2026-HOUSE-VA-2", "Virginia's 2nd Congressional District", "Virginia's second-place finisher"),
+        # Decided, not missed: a headline verb after a bare ordinal can't
+        # be told from "largest" without a word list (see _HOUSE_PHRASES).
+        ("2026-HOUSE-VA-2", "Virginia's 2nd Congressional District", "Virginia's 2nd flips"),
+        # A spelled-out ordinal is a district only before a district word:
+        # on its own it is ordinary English.
+        ("2026-HOUSE-GA-1", "Georgia's 1st Congressional District", "It was Georgia's first. Next came more"),
+        ("2026-HOUSE-GA-2", "Georgia's 2nd Congressional District", "Georgia's second"),
+        ("2026-HOUSE-GA-3", "Georgia's 3rd Congressional District", "Georgia's third."),
+        ("2026-HOUSE-GA-3", "Georgia's 3rd Congressional District", "In Georgia's third, fourth and fifth tries"),
+        # A bare domain with a path is a link too.
+        ("2026-HOUSE-GA-2", "Georgia's 2nd Congressional District", "Read more at x.com/GA-2"),
+        ("2026-HOUSE-GA-2", "Georgia's 2nd Congressional District", "Results at results.example.org/GA-02."),
+        # A comma closes a bare ordinal only after "in".
+        ("2026-HOUSE-GA-3", "Georgia's 3rd Congressional District", "Georgia's 3rd, and final, win"),
+        # Bare "[State] District N" is also a commission's or school board's.
+        ("2026-HOUSE-GA-2", "Georgia's 2nd Congressional District", "Georgia District 2 commissioner race"),
+        ("2026-HOUSE-GA-2", "Georgia's 2nd Congressional District", "the second district in Georgia's school board"),
+        # "lone"/"only" names an at-large seat, never a state House one.
+        ("2026-HOUSE-AK-0", "Alaska's at-large seat", "Alaska's only state House seat in the Aleutians"),
+    ])
+    def test_a_story_that_does_not_name_the_race_in_one_phrase_does_not_promote(self, race_id, label, text):
+        issue = self._flip_issue(race_id, label)
+        assert self._match(issue, text) is None
+
+    @pytest.mark.parametrize("race_id,label,text", [
+        ("2026-HOUSE-VA-2", "Virginia's 2nd Congressional District", "Republican leads in Virginia's 2nd District"),
+        ("2026-HOUSE-WV-2", "West Virginia's 2nd Congressional District",
+         "Republican leads in West Virginia's 2nd District"),
+        ("2026-HOUSE-GA-2", "Georgia's 2nd Congressional District",
+         "Republicans lead in Georgia's 2nd and 6th congressional districts"),
+        ("2026-HOUSE-GA-2", "Georgia's 2nd Congressional District", "Count tightens in Georgia's District 2"),
+        ("2026-HOUSE-GA-2", "Georgia's 2nd Congressional District",
+         "Count tightens in the 2nd Congressional District of Georgia"),
+        ("2026-HOUSE-TX-12", "Texas's 12th Congressional District", "Count tightens in Texas' 12th District"),
+        ("2026-HOUSE-AK-0", "Alaska's at-large seat", "Republican leads Alaska's at-large House race"),
+        ("2026-HOUSE-AK-0", "Alaska's at-large seat", "Count tightens in AK-AL"),
+        ("2026-SEN-GA", "Georgia's U.S. Senate", "Democrat leads the U.S. Senate race in Georgia"),
+        ("2026-SEN-GA", "Georgia's U.S. Senate", "Democrat leads in Georgia's U.S. Senate count"),
+        ("2026-SEN-GA-SPECIAL", "Georgia's U.S. Senate special election",
+         "Democrat leads the special election for Georgia's Senate seat"),
+        # "Washington state's", spelled ordinals, a bare ordinal closing a clause.
+        ("2026-HOUSE-WA-3", "Washington's 3rd Congressional District",
+         "Republican leads in Washington state's 3rd District"),
+        ("2026-HOUSE-VA-2", "Virginia's 2nd Congressional District", "Count tightens in Virginia's second district"),
+        ("2026-HOUSE-TX-21", "Texas's 21st Congressional District",
+         "Count tightens in the Twenty-First Congressional District of Texas"),
+        ("2026-HOUSE-CA-52", "California's 52nd Congressional District",
+         "Count tightens in California's fifty second district"),
+        ("2026-HOUSE-VA-2", "Virginia's 2nd Congressional District", "Republican leads in Virginia's 2nd."),
+        ("2026-HOUSE-VA-2", "Virginia's 2nd Congressional District", "Republican leads in Virginia's 2nd"),
+        ("2026-HOUSE-VA-2", "Virginia's 2nd Congressional District", "Virginia's 2nd House race tightens"),
+        ("2026-HOUSE-GA-2", "Georgia's 2nd Congressional District", "Results: GA-2 (https://x.com/results)"),
+        ("2026-HOUSE-GA-2", "Georgia's 2nd Congressional District", "GA-2 tightens; see x.com/results"),
+        ("2026-HOUSE-GA-2", "Georgia's 2nd Congressional District",
+         "Republicans lead in Georgia's second and sixth congressional districts"),
+        ("2026-HOUSE-GA-2", "Georgia's 2nd Congressional District", "Count tightens in Georgia congressional district 2"),
+        ("2026-HOUSE-CA-45", "California's 45th Congressional District", "In California's 45th, Tran pulls ahead"),
+        ("2026-HOUSE-AK-0", "Alaska's at-large seat", "Peltola leads in race for Alaska's lone House seat"),
+        ("2026-HOUSE-AK-0", "Alaska's at-large seat", "Peltola leads Begich for Alaska's only congressional seat"),
+        ("2026-HOUSE-AK-0", "Alaska's at-large seat", "Peltola leads for the only House seat in Alaska"),
+    ])
+    def test_a_story_naming_the_race_in_one_phrase_does(self, race_id, label, text):
+        issue = self._flip_issue(race_id, label)
+        assert self._match(issue, text) is issue
+
+    # --- Round 6: the phrase half on its own (no candidate on record) ---
+
+    @pytest.mark.parametrize("race_id,text", [
+        # A district or seat number after the phrase, whatever punctuation
+        # stands between them, is a legislature's district.
+        ("2026-SEN-OH-SPECIAL", "Ohio Senate race, District 5: Democrat leads"),
+        ("2026-SEN-OH-SPECIAL", "Ohio Senate race (District 5): Democrat leads"),
+        ("2026-SEN-OH-SPECIAL", "Ohio Senate race - District 5"),
+        ("2026-SEN-OH-SPECIAL", "Ohio Senate race: District 5 flips"),
+        ("2026-SEN-GA", "Georgia Senate race — SD 14"),
+        ("2026-SEN-GA", "Georgia Senate race, No. 14"),
+        # A state named last is followed by nothing of its own.
+        ("2026-SEN-OH-SPECIAL", "Democrat leads Senate race in Ohio District 5"),
+        ("2026-SEN-GA", "the Senate race in Georgia District 14"),
+        ("2026-SEN-GA", "Senate race in Georgia House district"),
+        ("2026-HOUSE-AK-0", "the only House seat in Alaska's Legislature to change hands"),
+        ("2026-HOUSE-AK-0", "the at-large seat in Alaska's Anchorage Assembly"),
+        ("2026-HOUSE-AK-0", "Alaska's at-large state Senate seat"),
+        ("2026-HOUSE-GA-2", "the 2nd District in Georgia Senate"),
+        # A congressional district is never followed by "state" or "Senate".
+        ("2026-HOUSE-MI-2", "Democrat wins Michigan's 2nd District state House seat"),
+        ("2026-HOUSE-MI-2", "Democrat wins Michigan's District 2 state House seat"),
+        ("2026-HOUSE-GA-14", "Georgia's 14th District state Senate race"),
+        ("2026-HOUSE-GA-14", "Georgia state's District 14 senate"),
+    ])
+    def test_round_six_legislature_phrases_never_name_the_race(self, db_session, race_id, text):
+        db = self._senate_races(db_session, race_id) if "-SEN-" in race_id else None
+        issue = self._flip_issue(race_id, "the race")
+        assert self._match(issue, text, db=db) is None, text
+
+    @pytest.mark.parametrize("race_id,text", [
+        ("2026-SEN-OH-SPECIAL", "Brown leads Halvorsen in Ohio Senate race, 2026 rematch"),
+        ("2026-SEN-OH-SPECIAL", "Brown leads Halvorsen in the Senate race in Ohio"),
+        ("2026-HOUSE-MI-2", "Democrat wins Michigan's 2nd District House race"),
+        ("2026-HOUSE-AK-0", "Peltola leads for the only House seat in Alaska"),
+    ])
+    def test_round_six_fixes_leave_the_us_race_named(self, db_session, race_id, text):
+        db = self._senate_races(db_session, race_id) if "-SEN-" in race_id else None
+        issue = self._flip_issue(race_id, "the race")
+        assert self._match(issue, text, db=db) is issue, text
+
+    # --- The candidate half: a story names a race only with one of its people, by full name ---
+
+    @staticmethod
+    def _count(db, race_id, *names):
+        """A stored count for `race_id`, most votes first."""
+        from app.models import RaceResult
+
+        db.add(RaceResult(race_id=race_id, election_date="2026-11-03", source_name="State results",
+                          tallies=json.dumps([{"name": n, "party": "DEM", "votes": 100 - i}
+                                              for i, n in enumerate(names)])))
+        db.commit()
+        return db
+
+    def test_a_story_naming_the_race_but_none_of_its_candidates_does_not_promote(self, db_session):
+        db = self._count(db_session, "2026-HOUSE-GA-2", "Leland D. Bishop Jr.", "Dale Carver")
+        issue = self._flip_issue()
+        assert self._match(issue, "Democrat leads in Georgia's 2nd Congressional District", db=db) is None
+        assert self._match(issue, "GA-2 tightens", db=db) is None
+        assert self._match(issue, "Leland Bishop leads in Georgia's 2nd Congressional District", db=db) is issue
+        assert self._match(issue, "Dale Carver pulls ahead in GA-02", db=db) is issue
+
+    def test_the_issues_own_session_supplies_the_candidates(self, db_session):
+        self._count(db_session, "2026-HOUSE-GA-2", "Leland Bishop", "Dale Carver")
+        issue = self._flip_issue()
+        db_session.add(issue)
+        db_session.commit()
+        assert self._match(issue, "Democrat leads in Georgia's 2nd Congressional District") is None
+        assert self._match(issue, "Leland Bishop leads in Georgia's 2nd Congressional District") is issue
+
+    @pytest.mark.parametrize("race_id,text", [
+        # Round 6's low-realism phrases: each names other people, or none.
+        ("2026-HOUSE-GA-2", "Georgia's 2nd seat on the Public Service Commission goes to Echols"),
+        ("2026-HOUSE-GA-2", "Georgia's second race of the season at Road Atlanta"),
+        ("2026-HOUSE-GA-2", "New readers in Georgia's 2nd, 3rd and 4th-grade classrooms"),
+        ("2026-HOUSE-VT-0", "Vermont's only House seat in Chittenden flips"),
+        ("2026-SEN-GA", "Georgia Senate race heats up in Savannah district"),
+        ("2026-SEN-GA", "Georgia Senate race: Democrat flips District 14"),
+        ("2026-SEN-GA", "Georgia's Senate election: GOP keeps majority"),
+    ])
+    def test_prose_without_a_candidate_is_not_the_race_once_candidates_are_known(self, db_session, race_id, text):
+        db = self._senate_races(db_session, race_id) if "-SEN-" in race_id else db_session
+        self._count(db, race_id, "Jon Brennan" if "-SEN-" in race_id else "Pat Quimby", "Lee Zwanziger")
+        issue = self._flip_issue(race_id, "the race")
+        assert self._match(issue, text, db=db) is None, text
+
+    @staticmethod
+    def _two_georgia_senate_races(db, special_runner_up="Kelsey Lofton"):
+        from app.models import Race
+
+        db.add(Race(id="2020-SEN-GA", cycle_year=2020, office="S", state="GA"))
+        db.add(Race(id="2020-SEN-GA-SPECIAL", cycle_year=2020, office="S", state="GA", is_special=True))
+        db.commit()
+        TestElectionResultsIssuesMatchOnlyTheirRace._count(db, "2020-SEN-GA", "David Purcell", "Jon Brennan")
+        TestElectionResultsIssuesMatchOnlyTheirRace._count(db, "2020-SEN-GA-SPECIAL", "Rafael Wexford",
+                                                           special_runner_up)
+        return db
+
+    def test_two_races_in_one_state_are_told_apart_by_their_candidates(self, db_session):
+        """Georgia 2020: "Rafael Wexford defeats Kelsey Lofton in Georgia
+        Senate runoff" says no "special", and named the REGULAR race by the
+        phrase alone. Wexford and Lofton are the special's candidates."""
+        db = self._two_georgia_senate_races(db_session)
+        regular = self._flip_issue("2020-SEN-GA", "Georgia's U.S. Senate")
+        special = self._flip_issue("2020-SEN-GA-SPECIAL", "Georgia's U.S. Senate special election")
+        for text in ("Rafael Wexford defeats Kelsey Lofton in Georgia Senate runoff",
+                     "Rafael Wexford leads in the Georgia Senate runoff"):
+            assert self._match(regular, text, db=db) is None, text
+            assert self._match(special, text, db=db) is special, text
+        text = "Jon Brennan leads David Purcell in Georgia Senate race"
+        assert self._match(regular, text, db=db) is regular
+        assert self._match(special, text, db=db) is None
+        # Both races' candidates in an unqualified phrase: about the two, so neither.
+        text = "Rafael Wexford and Jon Brennan lead in Georgia Senate runoffs"
+        assert self._match(regular, text, db=db) is None
+        assert self._match(special, text, db=db) is None
+        # An explicit word still decides, and never against it.
+        assert self._match(special, "Rafael Wexford leads in Georgia's special Senate election", db=db) is special
+        assert self._match(special, "Rafael Wexford leads in Georgia's regular Senate race", db=db) is None
+        assert self._match(regular, "Jon Brennan leads in Georgia's special Senate election", db=db) is None
+
+    @pytest.mark.parametrize("text", [
+        # Surnames only, however many: never a name (by design).
+        "Wexford defeats Lofton in Georgia Senate runoff",
+        "Sen. Wexford leads in Georgia Senate runoff",
+        "Wexford leads in Georgia's special Senate election",
+        # A candidate named King (round 8): a title, a place, a holiday.
+        "Georgia Senate runoff turnout surges on Martin Luther King Jr. Day",
+        "King Center: Georgia Senate race drew record early vote",
+        "The King Center: Georgia Senate race drew record early vote",
+        "The King Center says Georgia Senate race drew record early vote",
+    ])
+    def test_a_surname_never_names_one_of_two_races(self, db_session, text):
+        db = self._two_georgia_senate_races(db_session, special_runner_up="Jane King")
+        for race_id in ("2020-SEN-GA", "2020-SEN-GA-SPECIAL"):
+            issue = self._flip_issue(race_id, "Georgia's U.S. Senate")
+            assert self._match(issue, text, db=db) is None, (race_id, text)
+
+    def test_a_states_only_special_race_is_named_with_its_candidates(self, db_session):
+        db = self._senate_races(db_session, "2026-SEN-OH-SPECIAL")
+        self._count(db, "2026-SEN-OH-SPECIAL", "Sheldon Brown", "Jon Halvorsen")
+        issue = self._flip_issue("2026-SEN-OH-SPECIAL", "the U.S. Senate race")
+        assert self._match(issue, "Sheldon Brown leads Jon Halvorsen in Ohio Senate race", db=db) is issue
+        assert self._match(issue, "Jon Halvorsen leads in Ohio's special U.S. Senate election", db=db) is issue
+        assert self._match(issue, "Brown leads Halvorsen in Ohio Senate race", db=db) is None
+        assert self._match(issue, "Ohio's special U.S. Senate election tightens", db=db) is None
+        assert self._match(issue, "Sheldon Brown leads in Ohio Senate race, District 5", db=db) is None
+
+    @pytest.mark.parametrize("text", [
+        "Dale Carver flips Georgia's 2nd District",
+        "Dale Carver Flips Georgia's 2nd District",
+        "DALE CARVER LEADS IN GEORGIA'S 2ND DISTRICT",
+        "D. Carver leads in Georgia's 2nd District",
+        "Dale Carver's lead grows in GA-02",
+        "Leland D. Bishop Jr. leads in Georgia's 2nd District",
+        "Leland D. Bishop Leads In Georgia's 2nd District",
+        "Rep. Leland Bishop trails in Georgia's 2nd District",
+        "Georgia's 2nd District Republican Dale Carver leads",
+        "Georgia's 2nd District House race: Dale Carver leads",
+        "Dale Carver Flips Georgia's 2nd District Seat From Bishop",
+        "Georgia's 2nd District flips the seat to Dale Carver",
+        "Georgia's 2nd District heads to a recount; Dale Carver leads",
+        "Georgia's 2nd District House of Representatives seat goes to Dale Carver",
+        "Republican leads in Georgia's 2nd District\nDale Carver ahead with most precincts in",
+    ])
+    def test_the_race_is_named_by_a_candidates_full_name(self, db_session, text):
+        # The count prints "Leland D. Bishop, Jr.": the comma sets off a
+        # suffix, not a given name.
+        db = self._count(db_session, "2026-HOUSE-GA-2", "Dale Carver", "Leland D. Bishop, Jr.")
+        issue = self._flip_issue()
+        assert self._match(issue, text, db=db) is issue, text
+
+    @pytest.mark.parametrize("race_id,names,text", [
+        # A surname alone: the candidate, a namesake, or a word.
+        ("2026-HOUSE-GA-2", ("Dale Carver", "Leland Bishop"), "Bishop concedes in Georgia's 2nd District"),
+        ("2026-HOUSE-GA-2", ("Dale Carver", "Leland Bishop"), "Rep. Carver leads in Georgia's 2nd District"),
+        ("2026-HOUSE-GA-2", ("Dale Carver", "Leland Bishop"), "CARVER LEADS IN GEORGIA'S 2ND DISTRICT"),
+        ("2026-HOUSE-GA-2", ("Dale Carver", "Leland Bishop"), "the bishop of Georgia's 2nd District"),
+        ("2026-HOUSE-GA-2", ("Dale Carver", "Leland Bishop"),
+         "Captain Carver Honored In Georgia's 2nd District"),
+        ("2026-HOUSE-GA-2", ("Dale Carver", "Leland Bishop"),
+         "The Bishop Of Savannah Speaks In Georgia's 2nd District"),
+        ("2026-HOUSE-GA-2", ("Dale Carver", "Leland Bishop"),
+         "Bishop Lamor Whitehead preaches in Georgia's 2nd District"),
+        ("2026-HOUSE-TX-9", ("Cal Green", "Pat Quimby"), "Green energy booms in Texas's 9th District"),
+        ("2026-HOUSE-HI-1", ("Ned Case", "Pat Quimby"), "Case counts climb in Hawaii's 1st District"),
+        # Someone else of the same surname, whatever the initial or middle.
+        ("2026-HOUSE-GA-2", ("Dale Carver", "Leland Bishop"), "Alicia Carver wins in Georgia's 2nd District"),
+        ("2026-HOUSE-GA-2", ("Dale Carver", "Leland Bishop"),
+         "Alicia M. Carver wins in Georgia's 2nd District"),
+        ("2026-HOUSE-GA-2", ("Dale Carver", "Leland Bishop"), "A. Carver leads in Georgia's 2nd District"),
+        ("2026-HOUSE-GA-2", ("Dale Carver", "Leland Bishop"),
+         "Alicia Carver, a school board member, spoke about Georgia's 2nd District.\nJohnson said turnout was high."),
+        ("2026-HOUSE-GA-2", ("Dale Carver", "Leland Bishop"),
+         "Speaker Mike Carver hails Georgia's 2nd District result"),
+        ("2026-HOUSE-GA-2", ("Dale Carver", "Leland Bishop"),
+         "Dalton Carver wins in Georgia's 2nd District"),
+        ("2026-HOUSE-NC-1", ("Ron Davis", "Laurie Buckland"), "Ronna Davis wins in North Carolina's 1st District"),
+        ("2026-HOUSE-NC-1", ("Ron Davis", "Laurie Buckland"), "Ronald Davis wins in North Carolina's 1st District"),
+        # A given name and surname split across lines, or a longer surname.
+        ("2026-HOUSE-GA-2", ("Dale Carver", "Leland Bishop"), "Dale\nJohnson in Georgia's 2nd District"),
+        ("2026-HOUSE-GA-2", ("Dale Carver", "Leland Bishop"),
+         "Dale Carver-Smith wins Georgia's 2nd District"),
+        # Round 7: a namesake, and another body's district.
+        ("2026-HOUSE-GA-2", ("Dale Carver", "Leland Bishop"),
+         "Alicia Carver wins Georgia's District 2 Public Service Commission seat"),
+        ("2026-HOUSE-OH-2", ("Dave Taylor", "Lee Quimby"), "Judge Taylor of Ohio's 2nd District Court of Appeals rules"),
+        ("2026-HOUSE-GA-2", ("Dale Carver", "Leland Bishop"),
+         "Dale Carver flips Georgia's 2nd District Public Service Commission seat"),
+        ("2026-HOUSE-GA-2", ("Dale Carver", "Leland Bishop"),
+         "Dale Carver wins Georgia's 2nd District county commission seat"),
+        ("2026-HOUSE-GA-2", ("Dale Carver", "Leland Bishop"),
+         "Georgia's 2nd seat on the Public Service Commission"),
+        ("2026-HOUSE-OH-2", ("Dave Taylor", "Lee Quimby"),
+         "Ohio's 2nd District Court of Appeals: Taylor writes majority"),
+        ("2026-HOUSE-GA-2", ("Dale Carver", "Leland Bishop"),
+         "Carver Wins Georgia's 2nd District School Board Race"),
+        ("2026-HOUSE-CA-2", ("Jared Hoffstra", "Chris Price"),
+         "Price Gouging Case: California's 2nd District Court of Appeal Rules"),
+        ("2026-HOUSE-CA-2", ("Jared Hoffstra", "Chris Price"),
+         "California's 2nd District Court of Appeal rules on price gouging law. Price controls upheld."),
+    ])
+    def test_a_surname_a_namesake_or_another_bodys_district_is_not_the_race(self, db_session, race_id, names,
+                                                                            text):
+        db = self._count(db_session, race_id, *names)
+        issue = self._flip_issue(race_id, "the race")
+        assert self._match(issue, text, db=db) is None, text
+
+    @pytest.mark.parametrize("text", [
+        "Florida's 2nd District Court of Appeal rules on ballot case",
+        "Georgia's District 2 Public Service Commission seat flips",
+        "Alaska's at-large Board of Regents seat",
+        "Georgia's 2nd District House of Delegates seat",
+    ])
+    def test_another_bodys_district_is_not_the_race_by_the_phrase_alone(self, text):
+        race_id = "2026-HOUSE-AK-0" if "Alaska" in text else f"2026-HOUSE-{'FL' if 'Florida' in text else 'GA'}-2"
+        issue = self._flip_issue(race_id, "the race")
+        assert self._match(issue, text) is None, text
+
+    def test_full_names_are_read_as_names(self, db_session):
+        # Accents and curly apostrophes folded either way, multi-word and
+        # hyphenated surnames whole.
+        db = self._count(db_session, "2026-HOUSE-CA-38", "Lucia T. Peña", "Eric Tolan")
+        self._count(db, "2026-HOUSE-IA-1", "Marisol Hart-Keller", "Christina Wexley")
+        self._count(db, "2026-HOUSE-TX-16", "Kip O'Dwyer", "Pat Quimby")
+        self._count(db, "2026-HOUSE-TX-15", "Kip O’Dwyer", "Pat Quimby")
+        ca = self._flip_issue("2026-HOUSE-CA-38", "California's 38th")
+        assert self._match(ca, "Lucia Pena leads in California's 38th District", db=db) is ca
+        assert self._match(ca, "Lucia Peña leads in California's 38th District", db=db) is ca
+        assert self._match(ca, "Peña leads in California's 38th District", db=db) is None
+        ia = self._flip_issue("2026-HOUSE-IA-1", "Iowa's 1st")
+        assert self._match(ia, "Marisol Hart-Keller trails in Iowa's 1st District", db=db) is ia
+        assert self._match(ia, "Marisol Hart Keller trails in Iowa's 1st District", db=db) is ia
+        assert self._match(ia, "Marisol Keller trails in Iowa's 1st District", db=db) is None
+        assert self._match(ia, "Hart-Keller trails in Iowa's 1st District", db=db) is None
+        for race_id in ("2026-HOUSE-TX-16", "2026-HOUSE-TX-15"):
+            tx = self._flip_issue(race_id, "Texas")
+            district = race_id.rsplit("-", 1)[1] + "th"
+            assert self._match(tx, f"Kip O’Dwyer leads in Texas’ {district} District", db=db) is tx
+            assert self._match(tx, f"Kip O'Dwyer leads in Texas's {district} District", db=db) is tx
+            assert self._match(tx, f"O’Dwyer leads in Texas’ {district} District", db=db) is None
+
+    def test_candidate_rows_stand_in_before_a_count(self, db_session):
+        """No count stored: the certified nominees, by FEC's "LAST, FIRST"
+        and a nickname it quotes — not every filer."""
+        from app.models import Candidate, Race
+
+        db = db_session
+        db.add(Race(id="2026-SEN-NV", cycle_year=2026, office="S", state="NV"))
+        db.add(Candidate(id="S2NV00001", race_id="2026-SEN-NV", name="RUIZ ORTEGA, ELENA", party="DEM",
+                         confirmed_general=True))
+        db.add(Candidate(id="S2NV00002", race_id="2026-SEN-NV", name="SMITH, PAPER", party="REP"))
+        db.add(Race(id="2026-SEN-TX", cycle_year=2026, office="S", state="TX"))
+        db.add(Candidate(id="S2TX00001", race_id="2026-SEN-TX", name='DELGADO, MARTIN ALLEN "ROB"', party="REP"))
+        db.commit()
+        nv = self._flip_issue("2026-SEN-NV", "Nevada's U.S. Senate")
+        assert self._match(nv, "Elena Ruiz Ortega leads in Nevada Senate race", db=db) is nv
+        assert self._match(nv, "Ruiz Ortega leads in Nevada Senate race", db=db) is None
+        assert self._match(nv, "Paper Smith leads in Nevada Senate race", db=db) is None
+        tx = self._flip_issue("2026-SEN-TX", "Texas's U.S. Senate")
+        assert self._match(tx, "Rob Delgado leads in Texas Senate race", db=db) is tx
+        assert self._match(tx, "Martin Delgado leads in Texas Senate race", db=db) is tx
+        assert self._match(tx, "Martin Allen Delgado leads in Texas Senate race", db=db) is tx
+        assert self._match(tx, "Robert Delgado leads in Texas Senate race", db=db) is None
+
+    def test_a_count_that_prints_only_a_surname_takes_the_given_name_from_the_race(self, db_session):
+        from app.models import Candidate
+
+        db = db_session
+        db.add(Candidate(id="H2HI01001", race_id="2026-HOUSE-HI-1", name="CASE, NED", party="DEM"))
+        db.commit()
+        self._count(db, "2026-HOUSE-HI-1", "CASE", "QUIMBY")
+        issue = self._flip_issue("2026-HOUSE-HI-1", "Hawaii's 1st")
+        assert self._match(issue, "Ned Case leads in Hawaii's 1st District", db=db) is issue
+        assert self._match(issue, "Case counts climb in Hawaii's 1st District", db=db) is None
+
+    def test_a_suffix_after_a_comma_is_not_a_last_first_name(self, db_session):
+        from app.pipeline.analyze.action_center import _race_people
+
+        db = self._count(db_session, "2026-HOUSE-GA-2", "Leland D. Bishop, Jr.", "Dale Carver")
+        people = sorted(_race_people(db, "2026-HOUSE-GA-2"))
+        assert [(p.surname, sorted(p.leads)) for p in people] == [("bishop", ["leland"]), ("carver", ["dale"])]
+
+    def test_with_no_candidate_on_record_the_phrase_decides_alone(self, db_session):
+        db = self._senate_races(db_session, "2026-SEN-OH-SPECIAL")
+        issue = self._flip_issue("2026-SEN-OH-SPECIAL", "the U.S. Senate race")
+        assert self._match(issue, "Ohio's special U.S. Senate election tightens", db=db) is issue
+
+    @pytest.mark.parametrize("race_id,text", [
+        # One race's candidate by full name, the other's by surname: about both.
+        ("2020-SEN-GA-SPECIAL", "Georgia Senate runoff: Rafael Wexford leads as Purcell concedes to Brennan"),
+        ("2020-SEN-GA-SPECIAL",
+         "Brennan, Purcell trade leads in Georgia Senate runoff\nRaphael Wexford declared he would wait for every vote."),
+        ("2020-SEN-GA", "Georgia Senate runoff: Jon Brennan leads; Wexford and Lofton too close to call"),
+    ])
+    def test_any_mention_of_the_other_races_candidate_holds_a_story_back(self, db_session, race_id, text):
+        db = self._two_georgia_senate_races(db_session)
+        issue = self._flip_issue(race_id, "Georgia's U.S. Senate")
+        assert self._match(issue, text, db=db) is None, text
+
+    def test_a_count_printing_an_honorific_is_read_against_the_filing(self, db_session):
+        """Arkansas's feed prints "Congressman Steve Rowe"; FEC files
+        ROWE, STEPHEN ALLEN. The title is not his given name."""
+        from app.models import Candidate, RaceResult
+        from app.pipeline.analyze.action_center import _race_people
+
+        db = db_session
+        db.add(Candidate(id="H0AR03001", race_id="2026-HOUSE-AR-3", name="ROWE, STEPHEN ALLEN", party="REP"))
+        db.add(Candidate(id="H0AR04001", race_id="2026-HOUSE-AR-4", name="WESTBROOK, BRUCE", party="REP"))
+        db.commit()
+        db.add(RaceResult(race_id="2026-HOUSE-AR-3", election_date="2026-11-03", source_name="State results",
+                          tallies=json.dumps([
+                              {"name": "Pat Quimby", "votes": 12},
+                              {"name": "Congressman Steve Rowe", "votes": 10, "candidateId": "H0AR03001"},
+                          ])))
+        # Not linked to a Candidate row: the race's filing of that surname is the check.
+        db.add(RaceResult(race_id="2026-HOUSE-AR-4", election_date="2026-11-03", source_name="State results",
+                          tallies=json.dumps([
+                              {"name": "Pat Quimby", "votes": 12}, {"name": "Congressman Bruce Westbrook", "votes": 10},
+                          ])))
+        db.commit()
+        rowe = [p for p in _race_people(db, "2026-HOUSE-AR-3") if p.surname == "rowe"][0]
+        assert rowe.leads == {"steve", "stephen"} and rowe.initials == {"s"}
+        ar3 = self._flip_issue("2026-HOUSE-AR-3", "Arkansas's 3rd")
+        assert self._match(ar3, "Congressman Rowe concedes in Arkansas's 3rd District", db=db) is None
+        assert self._match(ar3, "Steve Rowe concedes in Arkansas's 3rd District", db=db) is ar3
+        assert self._match(ar3, "Stephen Rowe concedes in Arkansas's 3rd District", db=db) is ar3
+        ar4 = self._flip_issue("2026-HOUSE-AR-4", "Arkansas's 4th")
+        assert self._match(ar4, "Congressman Westbrook wins Arkansas's 4th District", db=db) is None
+        assert self._match(ar4, "Bruce Westbrook wins Arkansas's 4th District", db=db) is ar4
+
+    def test_a_printed_name_with_no_filing_stands_as_printed(self):
+        from app.pipeline.analyze.action_center import _person
+
+        assert _person(["Pat Quimby"], "Pat Quimby").leads == {"pat"}
+        # A filing of the person decides which word of a feed's printing is
+        # the given name ...
+        assert _person(["Senator Steve Rowe", "ROWE, STEPHEN"], "Senator Steve Rowe").leads == {
+            "steve", "stephen"}
+        assert _person(["Congressman Rowe", "ROWE, STEPHEN"], "Congressman Rowe").leads == {"stephen"}
+        # ... but the ballot's printing is the state's own, and stands: a
+        # nickname FEC doesn't quote ("Bob" for ROBERT) still names him.
+        assert _person(["Bob Caskey", "CASKEY, ROBERT P JR", "Bob Caskey"], None).leads == {"bob", "robert"}
+
+    @pytest.mark.parametrize("printed,filed,leads", [
+        # A title sharing only the filed name's initial is not a given name.
+        ("Senator Smith", "SMITH, SARAH", {"sarah"}),
+        ("Sen. Smith", "SMITH, SARAH", {"sarah"}),
+        ("Congressman Smith", "SMITH, CHARLES", {"charles"}),
+        # A short-form fit followed by a word that fits nothing filed: no
+        # printed given name ("Bob" is his, but nothing on file says so).
+        ("Representative Bob Lanza", "LANZA, ROBERT E", {"robert"}),
+        ("Congressman Bill Rowe", "ROWE, CHARLES", {"charles"}),
+        ("Chair Bob Smith", "SMITH, CHARLES", {"charles"}),
+        # Short forms still read, title or not before them.
+        ("Congressman Chuck Rowe", "ROWE, CHARLES", {"chuck", "charles"}),
+        ("Steve Allen Rowe", "ROWE, STEPHEN ALLEN", {"steve", "stephen"}),
+        ("Christopher Smith", "SMITH, CHRIS", {"christopher", "chris"}),
+        # A short form keeping only the initial is a miss, not a guess.
+        ("Jim Smith", "SMITH, JAMES", {"james"}),
+        # A parenthesised annotation is no nickname; a fitting one is.
+        ("Jon Brennan (Incumbent)", "BRENNAN, JON", {"jon"}),
+        ("Jon Brennan (Dem)", "BRENNAN, JON", {"jon"}),
+        ("Robert (Bob) Lanza", "LANZA, ROBERT E", {"robert"}),
+        ("Robert (Rob) Lanza", "LANZA, ROBERT E", {"robert", "rob"}),
+    ])
+    def test_a_title_in_a_printing_is_not_a_given_name(self, printed, filed, leads):
+        from app.pipeline.analyze.action_center import _person
+
+        assert _person([printed, filed], printed).leads == leads
+
+    def test_a_title_in_an_unlinked_printing_is_not_a_given_name(self, db_session):
+        """Round 10: "Representative Bob Lanza" linked to LANZA, ROBERT E,
+        and "Congressman Smith" linked to nothing beside SMITH, CHARLES,
+        once read the title as the given name, so "Representative Lanza"
+        and "Congressman Smith" — surnames alone — promoted the flip."""
+        from app.models import Candidate, RaceResult
+
+        db = db_session
+        db.add(Candidate(id="c1", race_id="2026-HOUSE-AR-3", name="LANZA, ROBERT E", party="REP"))
+        db.add(Candidate(id="d1", race_id="2026-HOUSE-AR-4", name="SMITH, CHARLES", party="REP"))
+        db.commit()
+        db.add(RaceResult(race_id="2026-HOUSE-AR-3", election_date="2026-11-03", source_name="State results",
+                          tallies=json.dumps([
+                              {"name": "Representative Bob Lanza", "votes": 10, "candidateId": "c1"},
+                              {"name": "Jane Doe", "votes": 9},
+                          ])))
+        db.add(RaceResult(race_id="2026-HOUSE-AR-4", election_date="2026-11-03", source_name="State results",
+                          tallies=json.dumps([{"name": "Congressman Smith", "votes": 10},
+                                              {"name": "Jane Roe", "votes": 9}])))
+        db.commit()
+        ar3 = self._flip_issue("2026-HOUSE-AR-3", "Arkansas's 3rd")
+        assert self._match(ar3, "Arkansas's 3rd District flips as Representative Lanza trails", db=db) is None
+        assert self._match(ar3, "Arkansas's 3rd District flips as Robert Lanza trails", db=db) is ar3
+        ar4 = self._flip_issue("2026-HOUSE-AR-4", "Arkansas's 4th")
+        assert self._match(ar4, "Arkansas's 4th District flips; Congressman Smith concedes", db=db) is None
+
+    @pytest.mark.parametrize("district,names,text,named", [
+        ("GA-2", ('CARVER, ANTHONY JAMES "A.J."', "BISHOP, LELAND D JR"),
+         "Georgia's 2nd District: a Carver aide said turnout was high", False),
+        ("GA-2", ('CARVER, ANTHONY JAMES "A.J."', "BISHOP, LELAND D JR"),
+         "Georgia's 2nd District: a Bishop aide says a Carver win is unlikely", False),
+        ("GA-2", ('CARVER, ANTHONY JAMES "A.J."', "BISHOP, LELAND D JR"),
+         "A.J. Carver leads in Georgia's 2nd District", True),
+        ("GA-2", ('CARVER, ANTHONY JAMES "A.J."', "BISHOP, LELAND D JR"),
+         "A. J. Carver leads in Georgia's 2nd District", True),
+        ("GA-2", ('CARVER, ANTHONY JAMES "A.J."', "BISHOP, LELAND D JR"),
+         "AJ Carver leads in Georgia's 2nd District", True),
+        ("GA-2", ('CARVER, ANTHONY JAMES "A.J."', "BISHOP, LELAND D JR"),
+         "A J Carver leads in Georgia's 2nd District", False),
+        ("TX-9", ('SMITH, TERRENCE "T.J."', 'GREEN, CALVIN "CAL"'),
+         "Texas's 9th District sees J Smith Elementary reopen", False),
+        ("TX-9", ('SMITH, TERRENCE "T.J."', 'GREEN, CALVIN "CAL"'),
+         "T.J. Smith leads in Texas's 9th District", True),
+        # A record that is all initials is named by them, together.
+        ("OH-2", ("CALLOWAY, J. D.", "QUIMBY, PAT"),
+         "J.D. Calloway leads in Ohio's 2nd District", True),
+        ("OH-2", ("CALLOWAY, J. D.", "QUIMBY, PAT"),
+         "J. D. Calloway leads in Ohio's 2nd District", True),
+        ("OH-2", ("CALLOWAY, J. D.", "QUIMBY, PAT"),
+         "JD Calloway leads in Ohio's 2nd District", True),
+        ("OH-2", ("CALLOWAY, J. D.", "QUIMBY, PAT"),
+         "D. Calloway leads in Ohio's 2nd District", False),
+    ])
+    def test_initials_are_a_name_only_together(self, db_session, district, names, text, named):
+        from app.models import Candidate
+
+        race_id = f"2026-HOUSE-{district}"
+        for i, name in enumerate(names):
+            db_session.add(Candidate(id=f"H{i}", race_id=race_id, name=name, party="DEM", confirmed_general=True))
+        db_session.commit()
+        issue = self._flip_issue(race_id, "the race")
+        assert (self._match(issue, text, db=db_session) is issue) is named, text
+
+    def test_a_single_quoted_letter_is_an_annotation_not_a_name(self):
+        from app.pipeline.analyze.action_center import _person
+
+        person = _person(["Dale Carver (I)"])
+        assert person.leads == {"dale"} and person.middles == frozenset()
+
+    @pytest.mark.parametrize("names,text,named", [
+        (("Mark Brown", "Pat Quimby"),
+         "Voters in Tennessee's 7th District will mark brown ribbons on their ballots", False),
+        (("Mark Brown", "Pat Quimby"), "Mark brown ribbons in Tennessee's 7th District", False),
+        (("Mark Brown", "Pat Quimby"), "Mark Brown wins Tennessee's 7th District", True),
+        (("Mark Brown", "Pat Quimby"), "MARK BROWN WINS TENNESSEE'S 7TH DISTRICT", True),
+        (("VAN DORN, CHRIS", "Pat Quimby"), "Chris van Dorn leads in Tennessee's 7th District", True),
+        (("Kip O'Dwyer", "Pat Quimby"), "Kip O'Dwyer leads in Tennessee's 7th District", True),
+        (("Kip O'Dwyer", "Pat Quimby"), "kip o'dwyer leads in Tennessee's 7th District", False),
+    ])
+    def test_a_name_is_written_as_a_name(self, db_session, names, text, named):
+        db = self._count(db_session, "2026-HOUSE-TN-7", *names)
+        issue = self._flip_issue("2026-HOUSE-TN-7", "Tennessee's 7th")
+        assert (self._match(issue, text, db=db) is issue) is named, text
+
+
+def test_a_date_or_a_possessive_is_not_a_story_s_identity():
+    from app.pipeline.analyze.action_center import _issue_signature
+
+    assert _issue_signature("Senate vote on September 28, 2026", []) == set()
+    assert _issue_signature("Iranian school memorial", ["It was held 2026-09-28 on Monday."]) == {"iranian"}
+    assert _issue_signature("Trump's arch", ["Trump spoke."]) == {"trump"}
+    assert _issue_signature("Varga’s tariff order", []) == {"varga"}
+    # A figure is still identity.
+    assert "5000" in _issue_signature("A $5,000 dividend", [])
+
+
+def test_monitors_merge_only_with_near_identical_titles(monkeypatch):
+    """Merging deletes a monitor. The old 0.55 floor on the retrieval model
+    merged every pair of different topics (2026-10-08: one monitor held the
+    Iran, Canada-trade and Korea stories); no cross-topic pair of update
+    titles reached 0.75 on the similarity model."""
+    from types import SimpleNamespace
+
+    import app.pipeline.analyze.action_center as ac
+
+    monitors = [SimpleNamespace(id=i, title=t, updates=[]) for i, t in enumerate(["Iran", "Canada", "Iran again"])]
+    vecs = {"Iran": [1.0, 0.0], "Canada": [0.74, (1 - 0.74 ** 2) ** 0.5], "Iran again": [0.99, (1 - 0.99 ** 2) ** 0.5]}
+    monkeypatch.setattr(ac, "_embed_texts_sim", lambda texts: [vecs[t] for t in texts])
+    merged = []
+    monkeypatch.setattr(ac, "_merge_monitors", lambda keep, absorb, db: merged.append((keep.id, absorb.id)))
+
+    assert ac._merge_similar_monitors(monitors, db=None) is True
+    assert merged == [(0, 2)]
+
+
+def test_a_story_leading_two_days_is_one_timeline_entry(db_session):
+    from app.models import TimelineEntry
+    from app.pipeline.analyze.action_center import _save_timeline_entry
+
+    for day in ("2026-10-04", "2026-10-05"):
+        issue = _make_issue(day, "AI czar named", ["NPR"])
+        issue.is_current = True
+        db_session.add(issue)
+    db_session.commit()
+    _save_timeline_entry("2026-10-04", db_session)
+    _save_timeline_entry("2026-10-05", db_session)
+    assert [e.date for e in db_session.query(TimelineEntry)] == ["2026-10-04"]
+    # A different lead story the next day is its own entry.
+    other = _make_issue("2026-10-06", "Budget vote", ["AP"])
+    other.is_current = True
+    db_session.add(other)
+    db_session.commit()
+    _save_timeline_entry("2026-10-06", db_session)
+    assert sorted(e.date for e in db_session.query(TimelineEntry)) == ["2026-10-04", "2026-10-06"]
+
+
+def test_contact_your_senators_only_for_a_federal_policy_story():
+    from app.pipeline.analyze.action_center import _build_actions_from_data
+
+    def contact(**kw):
+        return any(a["type"] == "contact_senator" for a in _build_actions_from_data("t", [], [], [], [], **kw))
+
+    assert contact(policy_areas=["ENERGY"])
+    assert not contact(policy_areas=[])  # a foreign election, a fundraising total
+
+
+def test_updates_of_a_deleted_monitor_are_swept(db_session):
+    from app.pipeline.analyze.action_center import _sweep_orphan_updates
+
+    live = NationalMonitor(slug="live", title="Live", description="d", category="defense", status="active")
+    db_session.add(live)
+    db_session.commit()
+    db_session.add_all([
+        MonitorUpdate(monitor_id=live.id, date="2026-10-01", summary="s", source_url="u1", source_name="AP"),
+        MonitorUpdate(monitor_id=live.id + 99, date="2026-10-01", summary="s", source_url="u2", source_name="AP"),
+    ])
+    db_session.commit()
+    assert _sweep_orphan_updates(db_session) == 1
+    assert [u.source_url for u in db_session.query(MonitorUpdate)] == ["u1"]

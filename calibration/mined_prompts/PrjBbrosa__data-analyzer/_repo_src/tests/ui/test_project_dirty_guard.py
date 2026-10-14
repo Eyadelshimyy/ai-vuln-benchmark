@@ -1,0 +1,1391 @@
+"""Task 5A: ProjectDirtyState holder + save-path serializer characterization.
+
+Holder tests are Qt-free aside from the tests/ui autouse fixtures. Digest tests
+reuse ``project_io.project_document_to_payload`` — the same object
+``save_project_to_json`` writes — so 5B/5C can review dirty against one
+semantic source.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from mf4_analyzer.ui.main_window.project_dirty import (
+    DirtyGuardResult,
+    ProjectDirtyState,
+)
+from mf4_analyzer.ui import project_io as pio
+
+
+def test_user_project_mutation_marks_dirty_once(qapp):
+    holder = ProjectDirtyState()
+    assert holder.revision == 0
+    assert holder.save_point == 0
+    assert holder.path is None
+    assert holder.restore_depth == 0
+    assert not holder.is_dirty
+
+    accepted = holder.mark_user_mutation(token="view.rename")
+    coalesced = holder.mark_user_mutation(token="view.rename")
+
+    assert accepted is True
+    assert coalesced is False
+    assert holder.revision == 1
+    assert holder.save_point == 0
+    assert holder.is_dirty
+
+    from mf4_analyzer.ui.view_state import ViewManager
+
+    funnel = ProjectDirtyState()
+
+    class _Host:
+        _project_dirty = funnel
+
+        def _on_project_semantic_views_changed(self):
+            self._project_dirty.mark_user_mutation()
+
+    host = _Host()
+    manager = ViewManager()
+    manager.views_changed.connect(host._on_project_semantic_views_changed)
+    manager.rename(0, "工况 A")
+    assert funnel.revision == 1
+    assert funnel.is_dirty
+
+
+def test_programmatic_view_projection_does_not_mark_dirty(qapp):
+    """Restore/View apply is not user intent (projection lesson)."""
+    holder = ProjectDirtyState()
+    holder.begin_restore()
+    holder.begin_restore()
+    assert holder.restore_depth == 2
+
+    assert holder.mark_user_mutation() is False
+    assert holder.mark_user_mutation(token="axis_groups_changed") is False
+    assert holder.revision == 0
+    assert not holder.is_dirty
+
+    holder.end_restore()
+    assert holder.restore_depth == 1
+    assert holder.mark_user_mutation(token="view.apply") is False
+    holder.end_restore()
+    holder.end_restore()  # clamp; already at 0
+    assert holder.restore_depth == 0
+
+    assert holder.mark_user_mutation(token="user.split") is True
+    assert holder.is_dirty
+    assert holder.revision == 1
+
+    from mf4_analyzer.ui.view_state import ViewManager
+
+    projected = ProjectDirtyState()
+
+    class _Host:
+        _project_dirty = projected
+
+        def _on_project_semantic_views_changed(self):
+            self._project_dirty.mark_user_mutation()
+
+    host = _Host()
+    manager = ViewManager()
+    manager.views_changed.connect(host._on_project_semantic_views_changed)
+    projected.begin_restore()
+    manager.rename(0, "restore")
+    manager.views_changed.emit()
+    projected.end_restore()
+    assert projected.revision == 0
+    assert not projected.is_dirty
+
+
+def test_successful_save_sets_clean_save_point():
+    holder = ProjectDirtyState()
+    holder.mark_user_mutation()
+    assert holder.is_dirty
+
+    holder.mark_saved(path="/tmp/session.tlproj")
+
+    assert not holder.is_dirty
+    assert holder.save_point == holder.revision
+    assert holder.path == "/tmp/session.tlproj"
+
+
+def test_adopt_restored_session_replaces_prior_revision_digest_and_token():
+    holder = ProjectDirtyState()
+    holder.mark_user_mutation(token="session-a")
+    holder.mark_saved(path="a.tlproj", digest="digest-a")
+    holder.mark_user_mutation(token="session-b")
+    holder.begin_restore()
+
+    holder.adopt_restored_session(path="b.tlproj", digest="digest-b")
+
+    assert holder.revision == 0
+    assert holder.save_point == 0
+    assert holder.path == "b.tlproj"
+    assert holder.saved_digest == "digest-b"
+    assert holder.restore_depth == 1
+    assert not holder.is_dirty
+    holder.end_restore()
+    assert holder.mark_user_mutation(token="session-b") is True
+
+
+def test_canonical_reconciliation_can_return_to_saved_payload_then_leave_it():
+    holder = ProjectDirtyState()
+    holder.mark_user_mutation()
+    holder.mark_saved(path="session.tlproj", digest="saved")
+
+    holder.mark_user_mutation()
+    assert holder.is_dirty
+    assert holder.reconcile_saved_digest("saved") is True
+    assert not holder.is_dirty
+
+    holder.mark_user_mutation()
+    assert holder.is_dirty
+    assert holder.reconcile_saved_digest("different") is False
+    assert holder.is_dirty
+
+
+def test_failed_or_cancelled_save_keeps_dirty():
+    holder = ProjectDirtyState()
+    holder.mark_user_mutation()
+    revision = holder.revision
+    save_point = holder.save_point
+    path = holder.path
+
+    # 5C will skip mark_saved on picker cancel / IO failure.
+    assert holder.is_dirty
+    assert holder.revision == revision
+    assert holder.save_point == save_point
+    assert holder.path is path
+
+
+def test_clear_resets_symmetrically_with_init():
+    holder = ProjectDirtyState()
+    holder.begin_restore()
+    holder.end_restore()
+    holder.mark_user_mutation(token="edit")
+    holder.mark_saved(path="a.tlproj")
+    holder.mark_user_mutation()
+
+    holder.clear()
+
+    assert holder == ProjectDirtyState()
+    assert not holder.is_dirty
+    assert holder.path is None
+    assert holder.restore_depth == 0
+
+
+def test_dirty_bool_listener_fires_once_per_bool_change():
+    holder = ProjectDirtyState()
+    events = []
+    holder.bind_dirty_bool_listener(events.append)
+
+    holder.mark_user_mutation()
+    holder.mark_user_mutation()
+    assert events == [True]
+
+    holder.mark_saved(path="a.tlproj", digest="saved")
+    assert events == [True, False]
+
+    holder.mark_user_mutation()
+    assert events == [True, False, True]
+    assert holder.reconcile_saved_digest("saved") is True
+    assert events == [True, False, True, False]
+
+    holder.mark_user_mutation()
+    holder.begin_restore()
+    assert holder.mark_user_mutation() is False
+    holder.end_restore()
+    holder.clear()
+    assert events[-1] is False
+    assert holder.mark_user_mutation() is True
+    assert events[-1] is True
+
+
+def _current_schema_time_filter():
+    from mf4_analyzer.ui.view_state import default_time_filter
+
+    return default_time_filter()
+
+
+def test_guard_result_enum_is_defined_for_later_close_wiring():
+    assert {item.name for item in DirtyGuardResult} == {
+        "PROCEED_SAVED",
+        "PROCEED_DISCARDED",
+        "CANCELLED",
+    }
+
+
+def test_runtime_selection_focus_hover_are_not_holder_mutations():
+    """Those surfaces have no mark API; only mark_user_mutation bumps revision."""
+    holder = ProjectDirtyState()
+    for name in (
+        "selection", "focus", "hover", "popup", "render_cache",
+        "job_progress", "toast", "preview",
+    ):
+        assert not hasattr(holder, f"mark_{name}")
+    assert holder.revision == 0
+    assert not holder.is_dirty
+
+
+def _characterization_doc(*, include_time_filter=True):
+    return pio.ProjectDocument(
+        active_file="f0",
+        current_mode="time",
+        files=[
+            pio.ProjectFileRef(
+                fid="f1",
+                path_abs="/data/b.mf4",
+                path_rel="b.mf4",
+                fs=1000.0,
+                time_source="generated",
+                channel_order=["torque", "rpm"],
+            ),
+            pio.ProjectFileRef(
+                fid="f0",
+                path_abs="/data/a.mf4",
+                path_rel="a.mf4",
+                fs=2000.0,
+                time_source="manual",
+                dbc_refs=[pio.ProjectPathRef("/dbc/x.dbc", "x.dbc")],
+                channel_order=["rpm"],
+            ),
+        ],
+        views=[
+            {
+                "name": "View 1",
+                "tab_color": "#2d7ff9",
+                "checked": [["f0", "rpm"]],
+                "axis_opts": {"tick_density": "normal"},
+                **(
+                    {"time_filter": _current_schema_time_filter()}
+                    if include_time_filter else {}
+                ),
+            }
+        ],
+        view_manager={"active": 0, "split_pairs": {"1": 0}},
+        analysis_views={
+            "fft": {
+                "active": 0,
+                "views": [{"name": "FFT 1", "tab_color": "#e8590c", "panes": []}],
+            }
+        },
+        filter={
+            "enabled": True,
+            "spec": {
+                "kind": "low",
+                "order": 4,
+                "cutoff": 40.0,
+                "cutoff_lo": 0.0,
+                "cutoff_hi": 0.0,
+            },
+            "show_original": True,
+            "show_filtered": True,
+        },
+        ultraview={
+            "schema": 5,
+            "workspace": {
+                "active_board_id": "board-a",
+                "show_card_actions": False,
+                "boards": [{"board_id": "board-a", "name": "对比", "placements": []}],
+            },
+        },
+    )
+
+
+def _walk_keys(node):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield key
+            yield from _walk_keys(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _walk_keys(item)
+
+
+def test_canonical_digest_matches_project_roundtrip_and_excludes_runtime_keys(tmp_path):
+    doc = _characterization_doc()
+    payload = pio.project_document_to_payload(doc)
+    assert tuple(payload) == pio.PROJECT_PAYLOAD_KEYS
+
+    shuffled = {key: payload[key] for key in reversed(list(payload))}
+    digest = pio.canonical_project_digest(doc)
+    assert digest == pio.canonical_project_digest(payload)
+    assert digest == pio.canonical_project_digest(shuffled)
+
+    rebuilt_files = list(reversed(list(doc.files)))
+    rebuilt_files.reverse()
+    same_order = pio.ProjectDocument(
+        active_file=doc.active_file,
+        current_mode=doc.current_mode,
+        files=rebuilt_files,
+        views=list(doc.views),
+        view_manager=dict(doc.view_manager),
+        analysis_views=dict(doc.analysis_views),
+        filter=dict(doc.filter),
+        ultraview=dict(doc.ultraview),
+    )
+    assert pio.canonical_project_digest(same_order) == digest
+    swapped_files = pio.ProjectDocument(
+        active_file=doc.active_file,
+        current_mode=doc.current_mode,
+        files=list(reversed(doc.files)),
+        views=list(doc.views),
+        view_manager=dict(doc.view_manager),
+        analysis_views=dict(doc.analysis_views),
+        filter=dict(doc.filter),
+        ultraview=dict(doc.ultraview),
+    )
+    assert pio.canonical_project_digest(swapped_files) != digest
+
+    path = tmp_path / "session.tlproj"
+    pio.save_project_to_json(doc, path)
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert tuple(on_disk) == pio.PROJECT_PAYLOAD_KEYS
+    loaded = pio.load_project_from_json(path)
+    assert pio.canonical_project_digest(loaded) == digest
+
+    runtime_probe = dict(payload)
+    for key in ("selection", "focus", "hover", "job_progress", "toast"):
+        runtime_probe[key] = {"ignored": True}
+    assert pio.canonical_project_digest(runtime_probe) != digest
+    for key in _walk_keys(payload):
+        assert key not in pio.PROJECT_RUNTIME_ONLY_KEYS, key
+
+
+def test_canonical_digest_missing_time_filter_fixture_is_codec_fill_not_corruption(
+    tmp_path,
+):
+    """Incomplete fixture vs legal current-schema project are different contracts.
+
+    Codec filling View ``time_filter`` defaults is expected schema migration,
+    not a damaged user file. The incomplete fixture digest must still change.
+    """
+    incomplete = _characterization_doc(include_time_filter=False)
+    current = _characterization_doc(include_time_filter=True)
+    payload = pio.project_document_to_payload(incomplete)
+    assert "time_filter" not in payload["views"][0]
+    assert "time_filter" in pio.project_document_to_payload(current)["views"][0]
+
+    path = tmp_path / "legacy-missing-filter.tlproj"
+    pio.save_project_to_json(incomplete, path)
+    loaded = pio.load_project_from_json(path)
+
+    incomplete_digest = pio.canonical_project_digest(incomplete)
+    loaded_digest = pio.canonical_project_digest(loaded)
+    current_digest = pio.canonical_project_digest(current)
+    assert loaded_digest != incomplete_digest
+    assert loaded.views[0]["time_filter"] == _current_schema_time_filter()
+    assert loaded_digest == current_digest
+
+
+def test_selection_render_preview_and_job_progress_do_not_mark_dirty():
+    test_runtime_selection_focus_hover_are_not_holder_mutations()
+
+
+class _GuardHost:
+    """Focused close/open-replace harness that reuses the real guard."""
+
+    def __init__(self):
+        from mf4_analyzer.ui.main_window._project_io_mixin import ProjectIOMixin
+
+        self._project_dirty = ProjectDirtyState()
+        self._project_path = "/tmp/current.tlproj"
+        self.save_ok = True
+        self.save_calls = []
+        self.prompt_choice = "cancel"
+        self.prompt_calls = 0
+        self.teardown_calls = []
+        self.reenter_close = False
+        self.confirm_leave_unsaved_project = (
+            ProjectIOMixin.confirm_leave_unsaved_project.__get__(self)
+        )
+        self._project_session_is_dirty = (
+            ProjectIOMixin._project_session_is_dirty.__get__(self)
+        )
+
+    def save_project_via_dialog(self):
+        self.save_calls.append(self._project_path)
+        if not self.save_ok:
+            return False
+        self._project_dirty.mark_saved(self._project_path)
+        return True
+
+    def _canonical_session_digest(self):
+        return self._project_dirty.saved_digest
+
+    def _prompt_unsaved_project(self):
+        self.prompt_calls += 1
+        if self.reenter_close:
+            self.reenter_close = False
+            self.close()
+        return self.prompt_choice
+
+    def close(self):
+        class _Event:
+            def __init__(self):
+                self.ignored = False
+                self.accepted = False
+
+            def ignore(self):
+                self.ignored = True
+
+            def accept(self):
+                self.accepted = True
+
+        event = _Event()
+        self.closeEvent(event)
+        return event
+
+    def closeEvent(self, event):
+        holder = self._project_dirty
+        if holder.guard_open or holder.close_teardown_started:
+            event.ignore()
+            return
+        result = self.confirm_leave_unsaved_project()
+        if result is DirtyGuardResult.CANCELLED:
+            event.ignore()
+            return
+        holder.close_teardown_started = True
+        self.teardown_calls.append("teardown")
+        event.accept()
+
+
+def test_failed_or_cancelled_save_keeps_dirty_and_current_project():
+    host = _GuardHost()
+    host._project_dirty.mark_user_mutation()
+    host._project_path = "/tmp/current.tlproj"
+    host.prompt_choice = "save"
+    host.save_ok = False
+
+    result = host.confirm_leave_unsaved_project()
+
+    assert result is DirtyGuardResult.CANCELLED
+    assert host._project_dirty.is_dirty
+    assert host._project_path == "/tmp/current.tlproj"
+    assert host.save_calls == ["/tmp/current.tlproj"]
+
+
+def test_open_replacement_uses_same_save_discard_cancel_guard():
+    from mf4_analyzer.ui.main_window._project_io_mixin import ProjectIOMixin
+
+    host = _GuardHost()
+    host._project_dirty.mark_user_mutation()
+    host.prompt_choice = "cancel"
+    opened = []
+
+    def _open_project(path):
+        opened.append(path)
+
+    host.open_project = _open_project
+    host.files = {"f0": object()}
+    host._open_data_paths = lambda paths: None
+    host._open_paths = ProjectIOMixin._open_paths.__get__(host)
+
+    host._open_paths(["/tmp/other.tlproj"])
+
+    assert host.prompt_calls == 1
+    assert opened == []
+    assert host._project_dirty.is_dirty
+
+    host.prompt_choice = "discard"
+    host._open_paths(["/tmp/other.tlproj"])
+    assert opened == ["/tmp/other.tlproj"]
+    assert host.prompt_calls == 2
+
+
+def test_close_cancel_happens_before_workers_or_tool_windows_stop():
+    host = _GuardHost()
+    host._project_dirty.mark_user_mutation()
+    host.prompt_choice = "cancel"
+
+    event = host.close()
+
+    assert event.ignored is True
+    assert host.prompt_calls == 1
+    assert host.teardown_calls == []
+    assert host._project_dirty.is_dirty
+    assert not host._project_dirty.close_teardown_started
+
+
+def test_reentrant_close_shows_one_prompt_and_tears_down_once():
+    host = _GuardHost()
+    host._project_dirty.mark_user_mutation()
+    host.prompt_choice = "discard"
+    host.reenter_close = True
+
+    event = host.close()
+
+    assert event.accepted is True
+    assert host.prompt_calls == 1
+    assert host.teardown_calls == ["teardown"]
+    assert host._project_dirty.close_teardown_started
+
+
+def test_real_main_window_close_cancel_stops_before_teardown(
+    qapp, qtbot, monkeypatch,
+):
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    qtbot.waitExposed(window)
+    window._project_dirty.mark_user_mutation()
+    monkeypatch.setattr(window, "_prompt_unsaved_project", lambda: "cancel")
+
+    window.close()
+    qapp.processEvents()
+
+    assert window.isVisible()
+    assert window._project_dirty.is_dirty
+    assert not window._project_dirty.close_teardown_started
+
+    monkeypatch.setattr(window, "_prompt_unsaved_project", lambda: "discard")
+    window.close()
+
+
+def test_real_main_window_close_discard_uses_production_teardown(
+    qapp, qtbot, monkeypatch,
+):
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    qtbot.waitExposed(window)
+    window._project_dirty.mark_user_mutation()
+    monkeypatch.setattr(window, "_prompt_unsaved_project", lambda: "discard")
+
+    window.close()
+    qapp.processEvents()
+
+    assert not window.isVisible()
+    assert window._project_dirty.close_teardown_started
+
+
+def test_real_main_window_reentrant_close_prompts_once(
+    qapp, qtbot, monkeypatch,
+):
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    qtbot.waitExposed(window)
+    window._project_dirty.mark_user_mutation()
+    prompt_calls = []
+
+    def _prompt():
+        prompt_calls.append("prompt")
+        assert window._project_dirty.guard_open
+        window.close()
+        assert window.isVisible()
+        return "discard"
+
+    monkeypatch.setattr(window, "_prompt_unsaved_project", _prompt)
+
+    window.close()
+    qapp.processEvents()
+
+    assert prompt_calls == ["prompt"]
+    assert not window.isVisible()
+    assert window._project_dirty.close_teardown_started
+
+
+def test_unsaved_prompt_defaults_to_save_not_discard(qapp, qtbot):
+    from PyQt5.QtWidgets import QWidget
+    from mf4_analyzer.ui.main_window._project_io_mixin import ProjectIOMixin
+
+    widget = QWidget()
+    qtbot.addWidget(widget)
+    widget._unsaved_project_prompt_buttons = (
+        ProjectIOMixin._unsaved_project_prompt_buttons.__get__(widget)
+    )
+    box, save_btn, discard_btn, cancel_btn = widget._unsaved_project_prompt_buttons()
+    qtbot.addWidget(box)
+    assert box.default_button() is save_btn
+    assert box.escape_button() is cancel_btn
+    assert box.default_button() is not discard_btn
+    assert save_btn.text() == "保存"
+    assert discard_btn.text() == "不保存"
+    assert cancel_btn.text() == "取消"
+    box.close()
+
+
+def test_close_project_prompt_defaults_to_cancel(qapp, qtbot):
+    from PyQt5.QtWidgets import QWidget
+    from mf4_analyzer.ui.main_window._project_io_mixin import ProjectIOMixin
+
+    widget = QWidget()
+    qtbot.addWidget(widget)
+    widget._project_path = "/tmp/工况A.tlproj"
+    widget._project_dirty = ProjectDirtyState(path="/tmp/工况A.tlproj")
+    widget._unsaved_prompt_intent = "close"
+    widget._project_session_display_name = (
+        ProjectIOMixin._project_session_display_name.__get__(widget)
+    )
+    widget._unsaved_project_prompt_copy = (
+        ProjectIOMixin._unsaved_project_prompt_copy.__get__(widget)
+    )
+    widget._unsaved_project_prompt_buttons = (
+        ProjectIOMixin._unsaved_project_prompt_buttons.__get__(widget)
+    )
+    box, save_btn, discard_btn, cancel_btn = widget._unsaved_project_prompt_buttons()
+    qtbot.addWidget(box)
+    assert box.windowTitle() == "关闭项目"
+    assert "工况A.tlproj" in box._text_label.text()
+    assert box.default_button() is cancel_btn
+    assert box.escape_button() is cancel_btn
+    assert save_btn.text() == "保存并关闭"
+    assert discard_btn.text() == "不保存并关闭"
+    box.close()
+
+
+def _binding_snapshot(window):
+    holder = window._project_dirty
+    uv = getattr(window, "_ultraview", None)
+    board = getattr(uv, "board", None) if uv is not None else None
+    return {
+        "files": tuple(window.files),
+        "n_views": len(window.view_manager.views),
+        "path": None if window._project_path is None else str(window._project_path),
+        "holder_path": holder.path,
+        "digest": holder.saved_digest,
+        "revision": holder.revision,
+        "save_point": holder.save_point,
+        "board_name": getattr(board, "name", None),
+    }
+
+
+def test_close_project_cancel_keeps_sources_board_and_both_paths(
+    qapp, qtbot, tmp_path, monkeypatch,
+):
+    import csv
+    from mf4_analyzer.ui.main_window import MainWindow
+    from mf4_analyzer.ui.ultraview_state import UltraViewRef, add_ref, membership_set
+
+    csv_path = tmp_path / "a.csv"
+    with open(csv_path, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["time", "rpm"])
+        for i in range(16):
+            writer.writerow([i / 100.0, float(i)])
+    project = tmp_path / "keep.tlproj"
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window._load_one(str(csv_path))
+    assert window.save_project(project) is True
+    uv = window._ultraview
+    view_id = str(window.view_manager.get(0).view_id)
+    add_ref(uv.board, UltraViewRef("time", view_id))
+    uv.board.name = "会话保留"
+    window.view_manager.rename(0, "未保存")
+    before = _binding_snapshot(window)
+    before_refs = membership_set(uv.board)
+    monkeypatch.setattr(window, "_prompt_unsaved_project", lambda: "cancel")
+
+    assert window.close_project() is False
+    assert _binding_snapshot(window) == before
+    assert membership_set(uv.board) == before_refs
+    assert window.view_manager.views[0].name == "未保存"
+
+
+def test_close_project_save_as_cancel_keeps_binding(
+    qapp, qtbot, tmp_path, monkeypatch,
+):
+    import csv
+    from PyQt5.QtWidgets import QFileDialog
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    csv_path = tmp_path / "a.csv"
+    with open(csv_path, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["time", "rpm"])
+        for i in range(16):
+            writer.writerow([i / 100.0, float(i)])
+    project = tmp_path / "keep-as.tlproj"
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window._load_one(str(csv_path))
+    assert window.save_project(project) is True
+    window._project_path = None
+    window._project_dirty.path = None
+    window.view_manager.rename(0, "另存取消")
+    before = _binding_snapshot(window)
+    monkeypatch.setattr(window, "_prompt_unsaved_project", lambda: "save")
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: ("", ""))
+
+    assert window.close_project() is False
+    assert _binding_snapshot(window) == before
+    assert window.files
+    assert window.view_manager.views[0].name == "另存取消"
+
+
+def test_close_project_write_failure_keeps_dirty_binding(
+    qapp, qtbot, tmp_path, monkeypatch,
+):
+    import csv
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    csv_path = tmp_path / "a.csv"
+    with open(csv_path, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["time", "rpm"])
+        for i in range(16):
+            writer.writerow([i / 100.0, float(i)])
+    project = tmp_path / "fail.tlproj"
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window._load_one(str(csv_path))
+    assert window.save_project(project) is True
+    window.view_manager.rename(0, "写入失败")
+    before = _binding_snapshot(window)
+    monkeypatch.setattr(window, "_prompt_unsaved_project", lambda: "save")
+    monkeypatch.setattr(
+        window, "save_project_via_dialog",
+        lambda: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    assert window.close_project() is False
+    assert _binding_snapshot(window) == before
+    assert window._project_dirty.is_dirty
+    assert str(window._project_path) == str(project)
+
+
+def test_close_project_degraded_save_cancel_blocks_close(
+    qapp, qtbot, tmp_path, monkeypatch,
+):
+    import csv
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    csv_path = tmp_path / "a.csv"
+    with open(csv_path, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["time", "rpm"])
+        for i in range(16):
+            writer.writerow([i / 100.0, float(i)])
+    project = tmp_path / "degraded.tlproj"
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window._load_one(str(csv_path))
+    assert window.save_project(project) is True
+    window.view_manager.rename(0, "恢复不完整")
+    health = window._project_restore_health
+    health.adopt_restore(missing_paths=("gone.csv",), missing_old_fids=())
+    before = _binding_snapshot(window)
+    monkeypatch.setattr(window, "_prompt_unsaved_project", lambda: "save")
+    monkeypatch.setattr(window, "_confirm_degraded_project_save", lambda *_a, **_k: False)
+
+    assert window.close_project() is False
+    assert _binding_snapshot(window) == before
+    assert window.files
+
+
+def test_successful_save_sets_clean_save_point_on_window(qapp, tmp_path):
+    import csv
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    csv_path = tmp_path / "a.csv"
+    with open(csv_path, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["time", "rpm"])
+        for i in range(20):
+            writer.writerow([i / 100.0, float(i)])
+    proj = tmp_path / "s.tlproj"
+    mw = MainWindow()
+    mw._load_one(str(csv_path))
+    assert mw._project_dirty.is_dirty
+    assert mw.save_project(proj) is True
+    assert not mw._project_dirty.is_dirty
+    assert mw._project_dirty.path == str(proj)
+    assert mw._project_dirty.saved_digest
+
+
+def test_user_mutation_projects_dirty_star_without_serializing(
+    qapp, qtbot, tmp_path, monkeypatch,
+):
+    """Bound chrome follows the dirty bool; edits must not serialize or write."""
+    import csv
+
+    from mf4_analyzer import app_meta
+    from mf4_analyzer.ui import project_io as pio
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    csv_path = tmp_path / "a.csv"
+    with open(csv_path, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["time", "rpm"])
+        for i in range(20):
+            writer.writerow([i / 100.0, float(i)])
+    project = tmp_path / "A.tlproj"
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window._load_one(str(csv_path))
+    assert window.save_project(project) is True
+    label = window.toolbar.lbl_project_session
+    assert "A.tlproj" in label.text()
+    assert "*" not in label.text()
+    assert "*" not in window.windowTitle()
+    assert window.windowTitle() == window._project_window_title()
+
+    digest_calls = []
+    save_calls = []
+    real_digest = pio.canonical_project_digest
+    real_save = pio.save_project_to_json
+
+    def _count_digest(source):
+        digest_calls.append(1)
+        return real_digest(source)
+
+    def _count_save(doc, path):
+        save_calls.append(path)
+        return real_save(doc, path)
+
+    monkeypatch.setattr(pio, "canonical_project_digest", _count_digest)
+    monkeypatch.setattr(pio, "save_project_to_json", _count_save)
+
+    window._on_markup_revision_changed()
+    window._on_markup_revision_changed()
+    assert window._project_dirty.is_dirty
+    assert "*" in label.text()
+    assert "*" in window.windowTitle()
+    assert window.windowTitle() == window._project_window_title()
+    assert digest_calls == []
+    assert save_calls == []
+
+    window._refresh_project_session_chrome()
+    window._refresh_project_session_chrome()
+    assert digest_calls == []
+    assert "*" in label.text()
+
+    assert window.save_project(project) is True
+    assert not window._project_dirty.is_dirty
+    assert "*" not in label.text()
+    assert "*" not in window.windowTitle()
+
+    window._on_markup_revision_changed()
+    assert "*" in label.text()
+    assert window._project_dirty.reconcile_saved_digest(
+        window._project_dirty.saved_digest,
+    )
+    assert not window._project_dirty.is_dirty
+    assert "*" not in label.text()
+    assert "*" not in window.windowTitle()
+
+    window._project_dirty.begin_restore()
+    window._on_markup_revision_changed()
+    assert not window._project_dirty.is_dirty
+    assert "*" not in label.text()
+    window._project_dirty.end_restore()
+
+    other = tmp_path / "B.tlproj"
+    assert window.save_project(other) is True
+    assert "B.tlproj" in label.text()
+    assert "*" not in label.text()
+
+    window._on_markup_revision_changed()
+    assert "*" in label.text()
+    assert window.close_project(already_confirmed=True) is True
+    assert label.isHidden()
+    assert window.windowTitle() == app_meta.WINDOW_TITLE
+
+
+def test_remark_after_save_marks_dirty(qapp, qtbot, tmp_path, loaded_csv, monkeypatch):
+    """A real time-domain remark is persistable user intent after save."""
+    from PyQt5.QtCore import QPoint
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    project = tmp_path / "remark.tlproj"
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    qtbot.waitExposed(window)
+    window._load_one(loaded_csv)
+    fid = next(iter(window.files))
+    window.navigator.set_checked_channels([(fid, "speed")])
+    window.plot_time()
+    qapp.processEvents()
+    assert window.save_project(project) is True
+    assert not window._project_session_is_dirty()
+
+    annotations = window.canvas_time._annotations
+    monkeypatch.setattr(
+        annotations,
+        "_nearest_data_point",
+        lambda _pos: ("speed", 0.5, 1.0, "#1769e0", "", (fid, "speed")),
+    )
+    annotations._add_remark(QPoint(120, 100))
+
+    assert annotations.snapshot_remarks()
+    assert window._project_session_is_dirty()
+
+
+def test_camera_change_after_save_is_caught_by_guard_digest(
+    qapp, qtbot, tmp_path, loaded_csv,
+):
+    """Guard-time capture observes the canvas without mutating View ownership."""
+    from PyQt5.QtCore import QSignalBlocker
+    from PyQt5.QtTest import QSignalSpy
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    project = tmp_path / "camera.tlproj"
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    qtbot.waitExposed(window)
+    window._load_one(loaded_csv)
+    fid = next(iter(window.files))
+    window.navigator.set_checked_channels([(fid, "speed")])
+    window.plot_time()
+    qapp.processEvents()
+    assert window.save_project(project) is True
+
+    views = window.view_manager.views
+    view_identities = tuple(id(view) for view in views)
+    state_before = views[window.view_manager.active].to_dict()
+    changed = QSignalSpy(window.view_manager.views_changed)
+    blocker = QSignalBlocker(window.canvas_time)
+    try:
+        window.canvas_time.set_xlim(0.2, 0.8)
+    finally:
+        del blocker
+    qapp.processEvents()
+
+    assert window.canvas_time.get_visible_xlim() == pytest.approx((0.2, 0.8))
+    assert views is window.view_manager.views
+    assert tuple(id(view) for view in window.view_manager.views) == view_identities
+    assert views[window.view_manager.active].to_dict() == state_before
+    assert len(changed) == 0
+    assert window._project_session_is_dirty()
+    assert views[window.view_manager.active].to_dict() == state_before
+    assert len(changed) == 0
+
+
+def test_save_computes_digest_before_writing(qapp, tmp_path, monkeypatch):
+    """A writer failure cannot leave an unbaselined project file behind."""
+    from mf4_analyzer.ui import project_io as pio
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    project = tmp_path / "write-fails.tlproj"
+    window = MainWindow()
+    window._project_dirty.mark_user_mutation()
+    digest_calls = []
+    real_digest = pio.canonical_project_digest
+
+    def capture_digest(document):
+        digest_calls.append(document)
+        return real_digest(document)
+
+    def reject_write(document, path):
+        assert digest_calls == [document]
+        raise OSError("simulated write failure")
+
+    monkeypatch.setattr(pio, "canonical_project_digest", capture_digest)
+    monkeypatch.setattr(window, "_write_project_document", reject_write)
+
+    with pytest.raises(OSError, match="simulated write failure"):
+        window.save_project(project)
+
+    assert not project.exists()
+    assert window._project_dirty.is_dirty
+    assert window._project_dirty.save_point == 0
+
+
+def test_save_a_then_open_b_replaces_digest_and_project_session(
+    qapp, qtbot, tmp_path,
+):
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    project_a = tmp_path / "a.tlproj"
+    project_b = tmp_path / "b.tlproj"
+    target = MainWindow()
+    source_b = MainWindow()
+    qtbot.addWidget(target)
+    qtbot.addWidget(source_b)
+    target.view_manager.rename(0, "项目 A")
+    source_b.view_manager.rename(0, "项目 B")
+    assert target.save_project(project_a) is True
+    assert source_b.save_project(project_b) is True
+    digest_a = target._project_dirty.saved_digest
+    digest_b_on_source = source_b._project_dirty.saved_digest
+    assert digest_a != digest_b_on_source
+
+    target.open_project(project_b)
+
+    assert target._project_dirty.path == str(project_b)
+    assert target._project_dirty.saved_digest != digest_a
+    assert target._project_dirty.saved_digest == target._canonical_session_digest()
+    assert target._project_dirty.revision == 0
+    assert target._project_dirty.save_point == 0
+    assert not target._project_dirty.is_dirty
+    assert "b.tlproj" in target.toolbar.lbl_project_session.text()
+    assert "*" not in target.toolbar.lbl_project_session.text()
+    assert "*" not in target.windowTitle()
+    assert target.windowTitle() == target._project_window_title()
+
+
+def test_fresh_open_seeds_canonical_baseline_and_leave_is_clean(
+    qapp, qtbot, tmp_path, monkeypatch,
+):
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    project = tmp_path / "fresh.tlproj"
+    source = MainWindow()
+    restored = MainWindow()
+    qtbot.addWidget(source)
+    qtbot.addWidget(restored)
+    source.view_manager.rename(0, "已保存")
+    assert source.save_project(project) is True
+
+    restored.open_project(project)
+
+    holder = restored._project_dirty
+    assert holder.saved_digest is not None
+    assert holder.saved_digest == restored._canonical_session_digest()
+    assert holder.revision == 0
+    assert holder.save_point == 0
+    assert not holder.is_dirty
+    monkeypatch.setattr(
+        restored,
+        "_prompt_unsaved_project",
+        lambda: (_ for _ in ()).throw(AssertionError("clean open prompted")),
+    )
+    assert (
+        restored.confirm_leave_unsaved_project()
+        is DirtyGuardResult.PROCEED_DISCARDED
+    )
+
+
+def test_ultraview_undo_to_saved_payload_is_clean_and_redo_is_dirty(
+    qapp, qtbot, tmp_path,
+):
+    from mf4_analyzer.ui import ultraview_state as uvs
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    project = tmp_path / "history.tlproj"
+    window = MainWindow()
+    qtbot.addWidget(window)
+    uv = window._ultraview
+    board = uv.board
+    saved_edit = uvs.create_author_object(
+        board,
+        uvs.StickyObject(
+            object_id="saved",
+            kind="sticky",
+            box=uvs.BoardBox(0, 0, 2, 2),
+            text="saved",
+            palette="yellow",
+            shape="square",
+            font_size="auto",
+        ),
+    )
+    assert uv._commit_author_mutation(board, saved_edit, label="create")
+    assert window.save_project(project) is True
+
+    later_edit = uvs.create_author_object(
+        board,
+        uvs.StickyObject(
+            object_id="later",
+            kind="sticky",
+            box=uvs.BoardBox(3, 0, 2, 2),
+            text="later",
+            palette="yellow",
+            shape="square",
+            font_size="auto",
+        ),
+    )
+    assert uv._commit_author_mutation(board, later_edit, label="create")
+    assert window._project_dirty.is_dirty
+    assert "*" in window.toolbar.lbl_project_session.text()
+    assert "*" in window.windowTitle()
+
+    uv._on_free_grid_undo()
+    assert [item.object_id for item in board.author_objects] == ["saved"]
+    assert not window._project_dirty.is_dirty
+    assert "*" not in window.toolbar.lbl_project_session.text()
+    assert "*" not in window.windowTitle()
+
+    uv._on_free_grid_redo()
+    assert [item.object_id for item in board.author_objects] == ["saved", "later"]
+    assert window._project_dirty.is_dirty
+    assert "*" in window.toolbar.lbl_project_session.text()
+    assert "*" in window.windowTitle()
+
+
+def test_empty_and_rejected_ultraview_undo_do_not_advance_dirty_revision(
+    qapp, qtbot, monkeypatch,
+):
+    from mf4_analyzer.ui import ultraview_state as uvs
+    from mf4_analyzer.ui.main_window import MainWindow
+    from mf4_analyzer.ui.main_window import ultraview_workspace_controller as uwc
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    uv = window._ultraview
+    holder = window._project_dirty
+    before_empty = holder.revision
+    uv._on_free_grid_undo()
+    assert holder.revision == before_empty
+    assert not holder.is_dirty
+
+    board = uv.board
+    mutation = uvs.create_author_object(
+        board,
+        uvs.StickyObject(
+            object_id="blocked",
+            kind="sticky",
+            box=uvs.BoardBox(0, 0, 2, 2),
+            text="blocked",
+            palette="yellow",
+            shape="square",
+            font_size="auto",
+        ),
+    )
+    assert uv._commit_author_mutation(board, mutation, label="create")
+    before_rejected = holder.revision
+    monkeypatch.setattr(uwc, "apply_board_edit_entry", lambda *_a, **_k: False)
+
+    uv._on_free_grid_undo()
+
+    assert holder.revision == before_rejected
+    assert holder.is_dirty
+
+
+def test_open_replacement_guard_on_real_window(qapp, tmp_path, monkeypatch):
+    import csv
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    def _csv(path):
+        with open(path, "w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["time", "rpm"])
+            for i in range(20):
+                writer.writerow([i / 100.0, float(i)])
+
+    a = tmp_path / "a.csv"
+    b = tmp_path / "b.csv"
+    _csv(a)
+    _csv(b)
+    proj = tmp_path / "s.tlproj"
+    mw = MainWindow()
+    mw._load_one(str(a))
+    mw.save_project(proj)
+    mw._load_one(str(b))
+    assert mw._project_dirty.is_dirty
+    monkeypatch.setattr(mw, "_prompt_unsaved_project", lambda: "cancel")
+    before = list(mw.files)
+    mw._open_paths([str(proj)])
+    assert list(mw.files) == before
+    assert mw._project_dirty.is_dirty
+
+
+def _fft_preset_window(qtbot, monkeypatch, tmp_path):
+    import csv
+
+    from mf4_analyzer.ui.main_window import MainWindow
+    from tests.ui.test_analysis_time_range_confirm import _enter_fft, _tick_fft_sources
+
+    csv_path = tmp_path / "preset-src.csv"
+    with open(csv_path, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["time", "sig"])
+        for i in range(101):
+            writer.writerow([i / 10.0, float(i)])
+    win = MainWindow()
+    qtbot.addWidget(win)
+    win._load_one(str(csv_path))
+    fid = next(iter(win.files))
+    channel = next(iter(win.files[fid].channels))
+    _enter_fft(win, [fid])
+    _tick_fft_sources(win, [(fid, channel)])
+    bar = win.inspector.fft_ctx.preset_bar
+    monkeypatch.setattr(bar, "_confirm_axis_preservation", lambda *a, **kw: "preset")
+    return win, fid, bar
+
+
+def _fft_view_baseline(win):
+    mgr = win.analysis_managers["fft"]
+    return mgr.get(mgr.active).preset_baseline
+
+
+def test_baseline_only_cross_slot_load_is_dirty_without_helper_capture(
+    qtbot, monkeypatch, tmp_path,
+):
+    """A13 / F03: save → equal-params load of another slot must dirty live View."""
+    win, _fid, bar = _fft_preset_window(qtbot, monkeypatch, tmp_path)
+    bar._load(1)
+    project = tmp_path / "review.tlproj"
+    assert win.save_project(project) is True
+    assert not win._project_session_is_dirty()
+    marks = []
+    real_mark = win._project_dirty.mark_user_mutation
+
+    def _mark(*args, **kwargs):
+        marks.append((args, kwargs))
+        return real_mark(*args, **kwargs)
+
+    monkeypatch.setattr(win._project_dirty, "mark_user_mutation", _mark)
+    bar._write(4, "identical", win.inspector.fft_ctx._collect_preset())
+    assert not win._project_session_is_dirty()
+    assert _fft_view_baseline(win)["slot"] == 1
+    bar._load(4)
+    assert bar.baseline()["slot"] == 4
+    assert _fft_view_baseline(win)["slot"] == 4
+    assert _fft_view_baseline(win)["version"] == 2
+    assert len(marks) == 1
+    assert win._project_session_is_dirty()
+
+
+def test_global_slot_write_without_load_does_not_dirty_saved_project(
+    qtbot, monkeypatch, tmp_path,
+):
+    win, _fid, bar = _fft_preset_window(qtbot, monkeypatch, tmp_path)
+    bar._load(1)
+    assert win.save_project(tmp_path / "slots.tlproj") is True
+    bar._write(4, "idle", win.inspector.fft_ctx._collect_preset())
+    assert bar.baseline()["slot"] == 1
+    assert _fft_view_baseline(win)["slot"] == 1
+    assert not win._project_session_is_dirty()
+
+
+def test_save_as_new_baseline_marks_dirty_once(qtbot, monkeypatch, tmp_path):
+    win, _fid, bar = _fft_preset_window(qtbot, monkeypatch, tmp_path)
+    bar._load(1)
+    assert win.save_project(tmp_path / "save-baseline.tlproj") is True
+    marks = []
+    real_mark = win._project_dirty.mark_user_mutation
+
+    def _mark(*args, **kwargs):
+        marks.append(1)
+        return real_mark(*args, **kwargs)
+
+    monkeypatch.setattr(win._project_dirty, "mark_user_mutation", _mark)
+    bar._save(4)
+    assert bar.baseline()["slot"] == 4
+    assert _fft_view_baseline(win)["slot"] == 4
+    assert marks == [1]
+    assert win._project_session_is_dirty()
+
+
+def test_different_params_preset_load_is_dirty_once(qtbot, monkeypatch, tmp_path):
+    win, _fid, bar = _fft_preset_window(qtbot, monkeypatch, tmp_path)
+    bar._load(1)
+    assert win.save_project(tmp_path / "diff.tlproj") is True
+    marks = []
+    real_mark = win._project_dirty.mark_user_mutation
+
+    def _mark(*args, **kwargs):
+        marks.append(1)
+        return real_mark(*args, **kwargs)
+
+    monkeypatch.setattr(win._project_dirty, "mark_user_mutation", _mark)
+    bar._load(2)
+    assert _fft_view_baseline(win)["slot"] == 2
+    assert marks == [1]
+    assert win._project_session_is_dirty()
+
+
+def test_apply_failure_does_not_dirty_or_change_view(qtbot, monkeypatch, tmp_path):
+    win, _fid, bar = _fft_preset_window(qtbot, monkeypatch, tmp_path)
+    bar._load(1)
+    assert win.save_project(tmp_path / "fail.tlproj") is True
+    before = dict(_fft_view_baseline(win))
+
+    def boom(_params):
+        raise RuntimeError("injected apply failure")
+
+    monkeypatch.setattr(bar, "_apply", boom)
+    bar._load(2)
+    assert _fft_view_baseline(win)["slot"] == before["slot"]
+    assert not win._project_session_is_dirty()
+
+
+def test_baseline_change_close_cancel_save_and_discard(
+    qapp, qtbot, monkeypatch, tmp_path,
+):
+    """A13 leave path: cancel keeps slot 4; save/reopen restores it; discard does not."""
+    win, _fid, bar = _fft_preset_window(qtbot, monkeypatch, tmp_path)
+    bar._load(1)
+    project = tmp_path / "guard.tlproj"
+    assert win.save_project(project) is True
+    bar._write(4, "identical", win.inspector.fft_ctx._collect_preset())
+    bar._load(4)
+    assert win._project_session_is_dirty()
+    monkeypatch.setattr(win, "_prompt_unsaved_project", lambda: "cancel")
+    assert win.confirm_leave_unsaved_project() is DirtyGuardResult.CANCELLED
+    assert bar.baseline()["slot"] == 4
+    assert _fft_view_baseline(win)["slot"] == 4
+    assert win._project_session_is_dirty()
+
+    monkeypatch.setattr(win, "_prompt_unsaved_project", lambda: "save")
+    monkeypatch.setattr(
+        win, "save_project_via_dialog", lambda: win.save_project(project),
+    )
+    assert win.confirm_leave_unsaved_project() is DirtyGuardResult.PROCEED_SAVED
+    assert not win._project_session_is_dirty()
+
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    restored = MainWindow()
+    qtbot.addWidget(restored)
+    restored.open_project(project)
+    qapp.processEvents()
+    assert restored.inspector.fft_ctx.preset_bar.baseline()["slot"] == 4
+    assert not restored._project_session_is_dirty()
+
+    discarded = MainWindow()
+    qtbot.addWidget(discarded)
+    discarded.open_project(project)
+    qapp.processEvents()
+    dbar = discarded.inspector.fft_ctx.preset_bar
+    monkeypatch.setattr(dbar, "_confirm_axis_preservation", lambda *a, **kw: "preset")
+    dbar._write(3, "later", discarded.inspector.fft_ctx._collect_preset())
+    dbar._load(3)
+    assert discarded._project_session_is_dirty()
+    monkeypatch.setattr(discarded, "_prompt_unsaved_project", lambda: "discard")
+    assert (
+        discarded.confirm_leave_unsaved_project()
+        is DirtyGuardResult.PROCEED_DISCARDED
+    )
+    discarded.open_project(project)
+    qapp.processEvents()
+    assert discarded.inspector.fft_ctx.preset_bar.baseline()["slot"] == 4
+    assert not discarded._project_session_is_dirty()
+
+
+def test_programmatic_preset_restore_is_clean_and_submits_no_jobs(
+    qapp, qtbot, monkeypatch, tmp_path,
+):
+    win, _fid, bar = _fft_preset_window(qtbot, monkeypatch, tmp_path)
+    bar._load(1)
+    project = tmp_path / "restore.tlproj"
+    assert win.save_project(project) is True
+
+    from mf4_analyzer.ui.main_window import MainWindow
+
+    restored = MainWindow()
+    qtbot.addWidget(restored)
+    submitted = []
+    real_submit = restored._analysis_jobs.submit_batch
+
+    def _submit(*args, **kwargs):
+        submitted.append((args, kwargs))
+        return real_submit(*args, **kwargs)
+
+    monkeypatch.setattr(restored._analysis_jobs, "submit_batch", _submit)
+    restored.open_project(project)
+    qapp.processEvents()
+    assert restored.inspector.fft_ctx.preset_bar.baseline()["slot"] == 1
+    assert restored.inspector.fft_ctx.preset_bar.baseline()["version"] == 2
+    assert not restored._project_session_is_dirty()
+    assert submitted == []
+
+    from mf4_analyzer.ui.analysis_view_bridge import apply_params_from_state
+
+    mgr = restored.analysis_managers["fft"]
+    state = mgr.get(mgr.active)
+    apply_params_from_state(restored.inspector.fft_ctx, state)
+    qapp.processEvents()
+    assert not restored._project_session_is_dirty()
+    assert submitted == []

@@ -1,0 +1,28 @@
+{
+  "repo": "Gunrunner444__BugForge",
+  "file": "backend/alembic/versions/026_phase38_lead_relationships.py",
+  "function": "upgrade",
+  "line": 21,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `upgrade` function.",
+  "prompt_source": "def upgrade() -> None:\n    \"\"\"Implement the `upgrade` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def upgrade() -> None:\n    op.add_column(\"research_leads\", sa.Column(\"hypothesis_ids\", sa.JSON(), nullable=True))\n    op.add_column(\"research_leads\", sa.Column(\"finding_ids\", sa.JSON(), nullable=True))\n    op.add_column(\"research_leads\", sa.Column(\"semantic_node_ids\", sa.JSON(), nullable=True))\n    connection = op.get_bind()\n    rows = connection.execute(\n        sa.text(\n            \"SELECT id, related_ids, evidence_ids, observation_ids, chain_ids FROM research_leads\"\n        )\n    )\n    for row in rows:\n        related = _json_list(row.related_ids)\n        evidence = _json_list(row.evidence_ids)\n        observations = _json_list(row.observation_ids)\n        chains = _json_list(row.chain_ids)\n        hypotheses = [\n            item\n            for item in related\n            if item and item not in set(evidence) | set(observations) | set(chains)\n        ]\n        connection.execute(\n            sa.text(\"UPDATE research_leads SET hypothesis_ids = :hypotheses WHERE id = :id\"),\n            {\"hypotheses\": json.dumps(hypotheses), \"id\": row.id},\n        )",
+  "module_source": "\"\"\"Typed research-lead relationships.\n\nRevision ID: 026\nRevises: 025\nCreate Date: 2026-09-25 00:00:00.000000\n\"\"\"\n\nimport json\nfrom collections.abc import Sequence\n\nimport sqlalchemy as sa\n\nfrom alembic import op\n\nrevision: str = \"026\"\ndown_revision: str | None = \"025\"\nbranch_labels: str | Sequence[str] | None = None\ndepends_on: str | Sequence[str] | None = None\n\n\ndef upgrade() -> None:\n    op.add_column(\"research_leads\", sa.Column(\"hypothesis_ids\", sa.JSON(), nullable=True))\n    op.add_column(\"research_leads\", sa.Column(\"finding_ids\", sa.JSON(), nullable=True))\n    op.add_column(\"research_leads\", sa.Column(\"semantic_node_ids\", sa.JSON(), nullable=True))\n    connection = op.get_bind()\n    rows = connection.execute(\n        sa.text(\n            \"SELECT id, related_ids, evidence_ids, observation_ids, chain_ids FROM research_leads\"\n        )\n    )\n    for row in rows:\n        related = _json_list(row.related_ids)\n        evidence = _json_list(row.evidence_ids)\n        observations = _json_list(row.observation_ids)\n        chains = _json_list(row.chain_ids)\n        hypotheses = [\n            item\n            for item in related\n            if item and item not in set(evidence) | set(observations) | set(chains)\n        ]\n        connection.execute(\n            sa.text(\"UPDATE research_leads SET hypothesis_ids = :hypotheses WHERE id = :id\"),\n            {\"hypotheses\": json.dumps(hypotheses), \"id\": row.id},\n        )\n\n\ndef _json_list(value: object) -> list[str]:\n    if value is None:\n        return []\n    if isinstance(value, list):\n        return [str(item) for item in value]\n    if isinstance(value, str):\n        parsed = json.loads(value)\n        if isinstance(parsed, list):\n            return [str(item) for item in parsed]\n    return []\n\n\ndef downgrade() -> None:\n    op.drop_column(\"research_leads\", \"semantic_node_ids\")\n    op.drop_column(\"research_leads\", \"finding_ids\")\n    op.drop_column(\"research_leads\", \"hypothesis_ids\")\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 24
+    },
+    "ai_commit": "267a8d459bc0",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      21,
+      44
+    ]
+  }
+}

@@ -1,0 +1,148 @@
+"""Collapse two FEC candidate_ids that are the same real person under one
+race. A real, observed FEC artifact -- a candidate refiles (a name
+correction, a party-declaration change) and is assigned a NEW
+candidate_id, but FEC's own bulk data links the same committee's
+financial totals to both. Verified live across 22 real 2026 races: 21 of
+22 pairs share a name (exact or an obvious variant, e.g. "ONDER JR,
+ROBERT FRANK" / "ONDER, ROBERT FOR JR."); the one exception (CA-4's
+"BROWN, SHARON" / "GHUSAR, MANDY", both $7,000 raised / $0 cash) proves
+identical financials ALONE is not safe evidence -- it takes a matching
+surname AND identical financials together, never either alone.
+
+Deliberately conservative: contributions and cash_on_hand must both be
+non-null and at least one non-zero (a shared "never synced"/$0 pair is
+common and proves nothing). Unlike state_candidates.py's _match_candidate,
+this never falls back to a looser rule on a miss -- the cost of NOT
+merging is one duplicate row; the cost of a wrong merge is misattributing
+a real candidate's identity, which this system treats as the worse
+failure everywhere else. Never touches the DB: both FEC ids are real,
+independently-filed records worth keeping for anyone who clicks through
+to fec.gov on either one -- this only shapes which rows a caller's
+response/decision includes, the same "never delete source data"
+precedent confirmed_general/on_primary_ballot already set.
+
+Lives under app/pipeline/, not app/api/ — Candidate rows are pipeline-
+owned data (FEC ingestion writes them), and app/api/elections.py already
+imports plenty of pipeline-derived logic the normal direction (e.g.
+app.pipeline.analyze.score_calculator, app.pipeline.election_pipeline) —
+this follows that same precedent rather than sitting at the app root,
+which would have implied the reverse (pipeline depending on API) was the
+risk being avoided, when the codebase's only real traffic runs api ->
+pipeline. Both app/api/elections.py (the original caller) and pipeline
+code (app/pipeline/analyze/election_bluesky.py's _roster_fact) import
+this without either depending on the other's own layer. A pipeline
+consumer that looks up a Candidate by a STORED id (a coverage item's
+matched_candidate_id, fetched in a prior run) needs dedupe_merge_map, not
+just dedupe_candidates: if that stored id was the one this rule would
+drop from a fresh race list, the caller must resolve it to the surviving
+id rather than silently looking up a row the site's own race page no
+longer shows.
+"""
+
+from app.models import Candidate
+
+_NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
+
+
+def normalized_surname(name: str) -> str:
+    """FEC's Candidate.name is "LAST, FIRST MIDDLE ..." -- the surname is
+    everything before the comma, with a trailing generational suffix
+    stripped, since FEC inconsistently attaches JR/SR/II/III to either
+    half of the name (see dedupe_merge_map)."""
+    tokens = name.split(",")[0].strip().lower().split()
+    while tokens and tokens[-1].strip(".") in _NAME_SUFFIXES:
+        tokens.pop()
+    return " ".join(tokens)
+
+
+def dedupe_merge_map(candidates: list[Candidate]) -> dict[str, str]:
+    """{dropped_id: surviving_id} for every duplicate pair found in
+    `candidates` — empty when none are found. Exposed as a mapping (not
+    just a drop set) so a caller holding a single, possibly-stale
+    candidate id can resolve it to the row the deduped list would
+    actually show, rather than only being able to detect that its id was
+    dropped."""
+    by_fingerprint: dict[tuple[float, float], list[Candidate]] = {}
+    for c in candidates:
+        if c.contributions is None or c.cash_on_hand is None:
+            continue
+        if c.contributions == 0 and c.cash_on_hand == 0:
+            continue
+        by_fingerprint.setdefault((c.contributions, c.cash_on_hand), []).append(c)
+
+    merge_map: dict[str, str] = {}
+    for group in by_fingerprint.values():
+        if len(group) < 2:
+            continue
+        by_surname: dict[str, list[Candidate]] = {}
+        for c in group:
+            by_surname.setdefault(normalized_surname(c.name), []).append(c)
+        for dupes in by_surname.values():
+            if len(dupes) < 2:
+                continue
+            # Rank confirmed_general over on_primary_ballot over neither, so
+            # whichever flag made the group real survives the merge -- not
+            # whichever id happens to sort first. A prior version treated
+            # "exactly one dupe carries confirmed_general OR on_primary_ballot"
+            # as the only safe case and fell back to an arbitrary id-sort
+            # otherwise, which could drop the one confirmed_general row when a
+            # second dupe separately had on_primary_ballot set.
+            keep = min(dupes, key=_survivor_rank)
+            merge_map.update({c.id: keep.id for c in dupes if c.id != keep.id})
+
+    # A second, narrower path: the same full name filed twice for the same
+    # party with no money on either record. Seen live (2026-10-03): NY-1
+    # listed "WILSON, CELINA MRS." twice and NY-21 "CARUSO, ALLEN" twice,
+    # each pair under consecutive FEC ids registered minutes apart, neither
+    # ever reporting a dollar. The financial fingerprint above can't see
+    # these (no figures to match), and the page showed the same name twice.
+    # Safe because nothing is misattributed: there are no financials to
+    # carry over, and two rows with identical names and parties are
+    # indistinguishable to a reader. A different given name ("SMITH, JOHN"
+    # / "SMITH, JANE") or any money on either record never merges here.
+    by_full_name: dict[tuple[str, str], list[Candidate]] = {}
+    for c in candidates:
+        if c.id in merge_map or not _no_money(c):
+            continue
+        by_full_name.setdefault((_normalized_full_name(c.name), c.party or ""), []).append(c)
+    for (name, _party), dupes in by_full_name.items():
+        if not name or len(dupes) < 2:
+            continue
+        keep = min(dupes, key=_survivor_rank)
+        merge_map.update({c.id: keep.id for c in dupes if c.id != keep.id})
+
+    return merge_map
+
+
+def _survivor_rank(c: Candidate) -> tuple[int, str]:
+    """confirmed_general over on_primary_ballot over neither, then id."""
+    if c.confirmed_general:
+        return (0, c.id)
+    if c.on_primary_ballot:
+        return (1, c.id)
+    return (2, c.id)
+
+
+def _no_money(c: Candidate) -> bool:
+    return not c.contributions and not c.cash_on_hand
+
+
+def _normalized_full_name(name: str) -> str:
+    """The whole FEC name, case, punctuation and spacing aside."""
+    return " ".join("".join(ch for ch in (name or "").lower() if ch.isalnum() or ch.isspace()).split())
+
+
+def dedupe_candidates(candidates: list[Candidate]) -> list[Candidate]:
+    """Collapse duplicates, keeping one row per real person. See
+    dedupe_merge_map's docstring for the matching rule."""
+    merge_map = dedupe_merge_map(candidates)
+    return [c for c in candidates if c.id not in merge_map]
+
+
+def resolve_candidate_id(candidate_id: str, candidates: list[Candidate]) -> str:
+    """`candidate_id` if it survives dedupe_candidates(candidates), or the
+    id of the candidate it was merged into otherwise. For a consumer that
+    holds one stored id and needs to look up "the" row the current race
+    list would show for that person — see election_bluesky.py's
+    _roster_fact."""
+    return dedupe_merge_map(candidates).get(candidate_id, candidate_id)

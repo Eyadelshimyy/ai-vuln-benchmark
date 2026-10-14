@@ -1,0 +1,28 @@
+{
+  "repo": "danielreuter__research-notes",
+  "file": "lanes/circuits-grid-models/feeder/twins.py",
+  "function": "log",
+  "line": 35,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `log` function (parameters: msg).",
+  "prompt_source": "def log(msg):\n    \"\"\"Implement the `log` function (parameters: msg).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def log(msg):\n    line = f\"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {'DRY ' if DRY else ''}{msg}\"\n    print(line, flush=True)\n    with open(HERE / \"twins.log\", \"a\") as f:\n        f.write(line + \"\\n\")",
+  "module_source": "#!/usr/bin/env python3\n\"\"\"circuits-grid-models' packed golden twins (note:20261001T1158Z-handoff-from-circuits-refill-node2-pack-goldens): one per small\nmodel, an already-run TP1 B1 256/32 greedy row resubmitted as `<key>-pk` on the plan tree, same config, its own sweep dir.\ncov-gm001 stands in for qwen3-06b: none of that model's B1 256 rows passed (their Commits did; each replay hit SiluMul_v1's\nexpf-overflow edge), so its twin compares the Commit (run root, binding map) and expects the same replay mismatch.\n\n    twins.py [--at HH:MM:SS] [--suffix pk2] [--bases cov-gm005,cov-gm008] [--build-mem GB] [--dry-run]\n        (on vy-nebius-1, as research, KUBECONFIG=$HOME/.kube/config; tmux `gm-twins`)\n\nWaits until --at (UTC, today), then submits each twin `<base>-<suffix>` (default pk) whose key log.jsonl doesn't name yet. `-pk2` is\nthe second twin of each base, submitted once PACK_MODELS listed its model (note:20261001T1412Z-handoff-from-circuits-drop-deadline-gate).\n`-pk3` is a third for gm005 and gm008, whose `-pk2` Builds node 2 took (n2_build.sh offloads a Build Kueue holds 2 min, and its Commit\nthen skips route()); --build-mem sizes the Build request by note:20261001T1516Z-finding-build-mem-trim so it admits on node 1.\nLog: twins.log beside it.\"\"\"\nimport calendar\nimport json\nimport subprocess\nimport sys\nimport time\nfrom pathlib import Path\n\nHERE = Path(__file__).resolve().parent\nLOG = Path(\"/workspace/jobs/dispatch/log.jsonl\")\nPY = \"/workspace/jobs/venv312/bin/python\"\nDISPATCH_PY = \"/workspace/jobs/dispatch/infra/nebius/dispatch.py\"\nTREE = \"/workspace/research/trees/cursor-grid-plan-gm-827a\"\nBASES = [\"cov-gm002\", \"cov-gm003\", \"cov-gm004\", \"cov-gm005\", \"cov-gm006\", \"cov-gm007\", \"cov-gm008\", \"cov-gm009\", \"cov-gm001\"]\nDRY = \"--dry-run\" in sys.argv\nSUFFIX = sys.argv[sys.argv.index(\"--suffix\") + 1] if \"--suffix\" in sys.argv else \"pk\"\nif \"--bases\" in sys.argv:\n    BASES = sys.argv[sys.argv.index(\"--bases\") + 1].split(\",\")\nBUILD_MEM = int(sys.argv[sys.argv.index(\"--build-mem\") + 1]) if \"--build-mem\" in sys.argv else None\n\n\ndef log(msg):\n    line = f\"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {'DRY ' if DRY else ''}{msg}\"\n    print(line, flush=True)\n    with open(HERE / \"twins.log\", \"a\") as f:\n        f.write(line + \"\\n\")\n\n\ndef main():\n    if \"--at\" in sys.argv:\n        at = sys.argv[sys.argv.index(\"--at\") + 1]\n        day = time.strftime(\"%Y-%m-%d\", time.gmtime())\n        t = calendar.timegm(time.strptime(f\"{day} {at}\", \"%Y-%m-%d %H:%M:%S\"))\n        log(f\"waiting until {at}Z\")\n        while time.time() < t:\n            time.sleep(min(30, max(1, t - time.time())))\n    items = {i[\"key\"]: i for i in json.loads((HERE / \"items.json\").read_text())}\n    named = LOG.read_text()\n    for base in BASES:\n        key = f\"{base}-{SUFFIX}\"\n        it = items[base][\"item\"]\n        if f'\"vllm-epoch-run/{key}\"' in named:\n            log(f\"skip {key}: log.jsonl names it\")\n            continue\n        env = {**it[\"env\"], \"SWEEP_DIR\": f\"/workspace/jobs/cov/{key}\",\n               \"RESEARCH_QUESTION\": (f\"Packed golden twin of {base}: does a packed Commit of {it['env']['ROW']} on the plan tree give \"\n                                     f\"the same run root, binding map and verdict as {base}'s unpacked one? (circuits-grid-models, \"\n                                     \"note:20261001T1158Z-handoff-from-circuits-refill-node2-pack-goldens)\")}\n        res = json.loads(json.dumps(it[\"resources\"]))\n        if BUILD_MEM:\n            res[\"build\"][\"memory\"] = BUILD_MEM\n        cmd = [PY, DISPATCH_PY, \"submit\", it[\"template\"], f\"vllm-epoch-run/{key}\", \"--tree\", TREE,\n               \"--resources\", json.dumps(res)]\n        for k, v in env.items():\n            cmd += [\"--env\", f\"{k}={v}\"]\n        if DRY:\n            cmd.append(\"--dry-run\")\n        r = subprocess.run(cmd, capture_output=True, text=True)\n        out = (r.stdout.strip().splitlines() or [\"\"])[-1] if not DRY else f\"rendered {len(r.stdout)} bytes\"\n        log(f\"submit {key} {it['env']['ROW']} rc {r.returncode}: {out} {r.stderr.strip()[-300:]}\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 5
+    },
+    "ai_commit": "2be6e6fc5d72",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      35,
+      39
+    ]
+  }
+}

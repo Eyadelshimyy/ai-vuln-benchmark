@@ -1,0 +1,426 @@
+"""Regenerate the help-guide panel screenshots (time / fft / fft_time /
+order / ultraview) by booting the real MainWindow, loading synthetic data,
+driving each mode to a populated state, and grabbing the whole window at 2x.
+
+Outputs lossless WebP to a STAGING dir (output/help-shots/) by default — review the images,
+then re-run with --promote to copy them over mf4_analyzer/help/assets/. The
+guides' numbered pins are tied to UI element positions, so after promoting
+NEW screenshots you must re-check the pin left/top% in each *-guide.html.
+
+The ``imports`` shot builds small valid WWT, ZFD and MAT parser fixtures, then
+loads them through the real import path.  It is used by the software manual as
+visual evidence that the current build opens those formats; unlike the four
+analysis panels, it is not a CSV synthetic-data demonstration.
+
+Renders against a REAL Qt platform (cocoa on macOS) by default so the panels
+look exactly as the user sees them. --platform offscreen is a headless
+fallback for layout/draft ONLY (offscreen != real render; do not treat an
+offscreen image as visually verified).
+
+Window geometry is FIXED at 1640x1010 to MATCH the shipped assets' framing
+(the original screenshots are 1640x1010, EPS-domain data: 方向盘扭矩 / 电机转速).
+Matching the original logical layout keeps the guides' numbered pins valid —
+they point at chrome (mode tabs / toolbar / channel list / View tabs) whose
+positions don't move. Still give the rendered guide a browser eyeball after
+promoting; only nudge pins if a control actually relocated.
+
+Usage:
+    .venv/bin/python tools/gen_help_screenshots.py                 # all 5 -> staging
+    .venv/bin/python tools/gen_help_screenshots.py --only time
+    .venv/bin/python tools/gen_help_screenshots.py --only imports
+    .venv/bin/python tools/gen_help_screenshots.py --platform offscreen
+    .venv/bin/python tools/gen_help_screenshots.py --promote       # copy staging -> assets
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import struct
+import sys
+import tempfile
+from pathlib import Path
+
+import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+PANEL_MODES = ("time", "fft", "fft_time", "order", "ultraview")
+PANEL_FILES = {
+    "time": "time-panel.webp",
+    "fft": "fft-panel.webp",
+    "fft_time": "ffttime-panel.webp",
+    "order": "order-panel.webp",
+    "ultraview": "ultraview-panel.webp",
+}
+EXTRA_SHOTS = ("imports",)
+EXTRA_FILES = {"imports": "imports-panel.webp"}
+STAGING_DIR = REPO_ROOT / "output" / "help-shots"
+ASSETS_DIR = REPO_ROOT / "mf4_analyzer" / "help" / "assets"
+# Match the shipped assets exactly (1640x1010): scale grab to logical size so
+# pins (which are % of the image) line up with the original framing.
+WIN_W, WIN_H = 1640, 1010
+GRAB_SCALE = 1
+
+# EPS-domain channel names (matches how the shipped *-panel.webp were made and
+# the project's EPS convention: order base = 电机转速). 信号 = 方向盘扭矩.
+CH_RPM = "电机转速"
+CH_SIGNAL = "方向盘扭矩"
+CH_TORQUE = "电机扭矩"
+
+IMPORT_SAMPLE_SUFFIXES = (".wwt", ".zfd", ".mat")
+
+
+def save_screenshot(pixmap, path: Path) -> None:
+    """Qt's WebP writer uses lossless encoding at quality 100."""
+    if not pixmap.save(str(path), "WEBP", 100):
+        raise OSError(f"Could not write lossless help screenshot: {path}")
+
+
+def _wwt_record(tag: str, n: int, *, name: str, unit: str = "",
+                a: float = 1.0, b: float = 0.0, c: float = 0.0,
+                payload: bytes = b"") -> bytes:
+    """Build one minimal WinWert 156-byte record plus its inline payload."""
+    record = bytearray(156)
+    record[:5] = tag.encode("ascii").ljust(5, b"\0")
+    struct.pack_into("<IH", record, 5, n, 0)
+    for offset, text, size in ((0x1B, name, 40), (0x43, unit, 17)):
+        encoded = text.encode("latin-1")[:size]
+        record[offset:offset + len(encoded)] = encoded
+    struct.pack_into("<ddd", record, 0x84, a, b, c)
+    return bytes(record) + payload
+
+
+def build_import_samples(directory: Path) -> tuple[Path, Path, Path]:
+    """Create valid WWT/ZFD/MAT files without depending on local test data."""
+    from scipy.io import savemat
+
+    directory.mkdir(parents=True, exist_ok=True)
+    n = 256
+    time = np.arange(n, dtype=np.float64) * 0.01
+    torque = np.sin(2 * np.pi * time)
+
+    wwt = directory / "generated-help-import.wwt"
+    header = bytearray(0x211)
+    header[:len(b"WinWert091293")] = b"WinWert091293"
+    struct.pack_into("<H", header, 0x20F, 2)
+    wwt.write_bytes(
+        bytes(header)
+        + _wwt_record("Zeit", n, name="Time", unit="s", b=0.01)
+        + _wwt_record(
+            "Real", n, name="Steering torque", unit="Nm",
+            payload=np.asarray(torque, dtype="<f8").tobytes(),
+        )
+    )
+
+    zfd = directory / "generated-help-import.zfd"
+    travel = np.linspace(-25.0, 25.0, n, dtype=np.float32)
+    zfd.write_bytes(
+        b"ZFGE2\nTraceLab generated ZFD\nHelp import sample\n" + b"\n" * 8
+        + struct.pack("<hb", 0, 2)
+        + struct.pack("<hbi", 0, 0, n) + b"Time\ns\n"
+        + struct.pack("<dd", 0.0, 0.01)
+        + struct.pack("<hi", 4, n) + b"E1: travel\nmm\n"
+        + struct.pack("<bbdd", 0, 0, float(travel.min()), float(travel.max()))
+        + travel.astype("<f4", copy=False).tobytes()
+    )
+
+    mat = directory / "generated-help-import.mat"
+    savemat(mat, {"time": time, "motor_torque": np.cos(2 * np.pi * time)})
+    return wwt, zfd, mat
+
+
+def _install_isolated_qsettings(settings_dir: Path) -> None:
+    """Divert screenshot-only UI persistence away from the user's settings.
+
+    The live Inspector imports ``_preset_settings`` into several modules, so
+    changing ``QSettings.setPath`` alone is insufficient for the explicit
+    ``QSettings(org, app)`` store.  Keep this list aligned with the UI test
+    fixture in ``tests/ui/conftest.py``.
+    """
+    from PyQt5.QtCore import QSettings
+    import mf4_analyzer.ui.inspector_sections as package
+    import mf4_analyzer.ui.inspector_sections._helpers as helpers
+    import mf4_analyzer.ui.inspector_sections.collapsible as collapsible
+    import mf4_analyzer.ui.inspector_sections.presets as presets
+    import mf4_analyzer.ui.inspector_sections.persistent_top as persistent_top
+
+    ini = str(settings_dir / "qsettings.ini")
+
+    def temp_settings(*_args, **_kwargs):
+        return QSettings(ini, QSettings.IniFormat)
+
+    for module in (package, helpers, collapsible, presets, persistent_top):
+        if hasattr(module, "_preset_settings"):
+            setattr(module, "_preset_settings", temp_settings)
+
+    QSettings.setDefaultFormat(QSettings.IniFormat)
+    QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, str(settings_dir))
+    QSettings.setPath(QSettings.IniFormat, QSettings.SystemScope, str(settings_dir))
+
+
+def build_synthetic_csv() -> Path:
+    """电机转速 ramp 600->3600 + 方向盘扭矩 (order1+order2) + 电机扭矩 channel."""
+    fs = 8000.0
+    dur = 6.0
+    n = int(fs * dur)
+    t = np.arange(n, dtype=float) / fs
+    rpm = np.linspace(600.0, 3600.0, n)
+    revs = np.cumsum(rpm / 60.0) / fs
+    phase = 2.0 * np.pi * revs
+    rng = np.random.default_rng(7)
+    signal = 1.0 * np.sin(phase) + 0.6 * np.sin(2.0 * phase) + 0.05 * rng.standard_normal(n)
+    torque = 8.0 + 2.0 * np.sin(2.0 * np.pi * 0.5 * t) + 0.02 * rng.standard_normal(n)
+    out = Path(tempfile.gettempdir()) / "_eps_demo.csv"
+    data = np.column_stack([t, rpm, signal, torque])
+    np.savetxt(out, data, delimiter=",",
+               header=f"time,{CH_RPM},{CH_SIGNAL},{CH_TORQUE}",
+               comments="", fmt="%.6g", encoding="utf-8")
+    return out
+
+
+def _select_combo_by_channel(combo, channel_name: str) -> bool:
+    for i in range(combo.count()):
+        data = combo.itemData(i)
+        if isinstance(data, tuple) and len(data) == 2 and data[1] == channel_name:
+            combo.setCurrentIndex(i)
+            return True
+    return False
+
+
+def _check_channels(win, names) -> None:
+    """Tick the named channel leaves in the left MultiFileChannelWidget tree."""
+    from PyQt5.QtCore import Qt
+    from mf4_analyzer.ui.widgets import MultiFileChannelWidget
+    widget = win.findChild(MultiFileChannelWidget)
+    if widget is None:
+        return
+    tree = widget.tree
+    for top in range(tree.topLevelItemCount()):
+        file_node = tree.topLevelItem(top)
+        for i in range(file_node.childCount()):
+            leaf = file_node.child(i)
+            if leaf.text(0) in names:
+                leaf.setCheckState(0, Qt.Checked)
+
+
+def _wait_for_analysis(
+    trigger, section: str, win, ready, timeout_ms=60_000,
+) -> bool:
+    """Run one section and wait for its result to be rendered and settled."""
+    from PyQt5.QtCore import QEventLoop, QTimer
+    loop = QEventLoop()
+    state = {"failed": "", "timed_out": False, "settled": False}
+
+    def poll():
+        running = win._analysis_jobs.is_running(section)
+        busy = win._analysis_jobs.is_busy(section)
+        if state["failed"] or (not running and not busy and ready()):
+            state["settled"] = True
+            loop.quit()
+
+    def on_finished(finished_section, _ctx, _result):
+        if finished_section == section:
+            poll()
+
+    def on_failed(failed_section, _ctx, message):
+        if failed_section == section:
+            state["failed"] = str(message)
+            poll()
+
+    win._analysis_jobs.finished.connect(on_finished)
+    win._analysis_jobs.failed.connect(on_failed)
+    poller = QTimer()
+    poller.timeout.connect(poll)
+    poller.start(20)
+    wd = QTimer()
+    wd.setSingleShot(True)
+    wd.timeout.connect(lambda: (state.__setitem__("timed_out", True), loop.quit()))
+    wd.start(timeout_ms)
+    trigger()
+    poll()
+    if not state["settled"]:
+        loop.exec_()
+    poller.stop()
+    wd.stop()
+    win._analysis_jobs.finished.disconnect(on_finished)
+    win._analysis_jobs.failed.disconnect(on_failed)
+    if state["failed"]:
+        print(f"FAIL: {section} analysis: {state['failed']}", file=sys.stderr)
+    if state["timed_out"]:
+        counts = win._analysis_jobs.progress_counts(section)
+        print(
+            f"FAIL: {section} render timeout; progress={counts}; "
+            f"status={win.statusBar.currentMessage()!r}",
+            file=sys.stderr,
+        )
+    return (
+        not state["timed_out"]
+        and not state["failed"]
+        and bool(ready())
+    )
+
+
+def _drive_imports(win, app, samples: tuple[Path, Path, Path]) -> None:
+    """Load three real measurement formats and show one WWT curve."""
+    from PyQt5.QtCore import QEventLoop, QTimer
+
+    missing = [str(path) for path in samples if not path.exists()]
+    if missing:
+        raise FileNotFoundError(f"missing import screenshot samples: {missing}")
+    for path in samples:
+        win.load_file(str(path))
+        app.processEvents()
+        # Let the real proxy/source models finish one file before the next
+        # source-model reset.  This keeps the captured navigator stable and
+        # avoids masking a mid-update model behind a successful grab.
+        loop = QEventLoop()
+        QTimer.singleShot(100, loop.quit)
+        loop.exec_()
+    _check_channels(win, {"Steering torque"})
+    app.processEvents()
+
+
+def _drive_mode(win, app, mode: str) -> None:
+    win.toolbar._set_mode(mode)
+    app.processEvents()
+    if mode in win.analysis_managers:
+        # Analysis Views own their file scope and start empty. Drive the same
+        # attach path as a user dropping/adding the loaded file into the
+        # active analysis View before selecting its signal.
+        win._attach_files_to_active_context(list(win.files))
+        app.processEvents()
+    if mode == "time":
+        _check_channels(win, {CH_SIGNAL, CH_TORQUE})
+        app.processEvents()
+        return
+    if mode == "fft":
+        if not _select_combo_by_channel(
+                win.inspector.fft_ctx.combo_sig, CH_SIGNAL):
+            raise RuntimeError(f"FFT signal selector is missing {CH_SIGNAL}")
+        app.processEvents()
+        win.do_fft()  # FFT renders synchronously
+        for _ in range(5):
+            app.processEvents()
+        return
+    if mode == "fft_time":
+        if not _select_combo_by_channel(
+                win.inspector.fft_time_ctx.combo_sig, CH_SIGNAL):
+            raise RuntimeError(
+                f"FFT-vs-Time signal selector is missing {CH_SIGNAL}"
+            )
+        app.processEvents()
+        canvas = win.chart_stack.page_fft_time.pane_canvas(0)
+        if not _wait_for_analysis(
+                lambda: win.do_fft_time(force=True), "fft_time", win,
+                canvas.has_result):
+            raise RuntimeError("FFT-vs-Time render did not complete")
+        for _ in range(5):
+            app.processEvents()
+        if not canvas.has_result():
+            raise RuntimeError("FFT-vs-Time completed without a rendered result")
+        return
+    if mode == "order":
+        ctx = win.inspector.order_ctx
+        if not _select_combo_by_channel(ctx.combo_sig, CH_SIGNAL):
+            raise RuntimeError(f"Order signal selector is missing {CH_SIGNAL}")
+        if not _select_combo_by_channel(ctx.combo_rpm, CH_RPM):
+            raise RuntimeError(f"Order RPM selector is missing {CH_RPM}")
+        ctx.set_fs(8000.0)
+        ctx.apply_params({"max_order": 6, "order_res": 0.05, "time_res": 0.05,
+                          "nfft": 4096, "amplitude_mode": "Amplitude",
+                          "x_auto": True, "y_auto": True, "z_auto": True})
+        app.processEvents()
+        canvas = win.chart_stack.page_order.pane_canvas(0)
+        if not _wait_for_analysis(
+                win.do_order_time, "order", win, canvas.has_result):
+            raise RuntimeError("Order render did not complete")
+        for _ in range(5):
+            app.processEvents()
+        if not canvas.has_result():
+            raise RuntimeError("Order completed without a rendered result")
+        return
+    if mode == "ultraview":
+        return
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--platform", default=None,
+                        help="QT_QPA_PLATFORM override (e.g. offscreen)")
+    parser.add_argument("--only", choices=PANEL_MODES + EXTRA_SHOTS, default=None)
+    parser.add_argument("--promote", action="store_true",
+                        help="copy staging PNGs over help/assets after review")
+    args = parser.parse_args()
+
+    if args.platform:
+        os.environ["QT_QPA_PLATFORM"] = args.platform
+    os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
+
+    from PyQt5.QtWidgets import QApplication
+    from mf4_analyzer.ui import MainWindow
+    from mf4_analyzer.ui_kit import (setup_chinese_font, load_stylesheet,
+                                     install_glass_tooltips)
+
+    setup_chinese_font()
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setStyle("Fusion")
+    load_stylesheet(app)
+    install_glass_tooltips(app)
+
+    settings_tmp = tempfile.TemporaryDirectory(prefix="tracelab-help-qsettings-")
+    _install_isolated_qsettings(Path(settings_tmp.name))
+
+    win = MainWindow()
+    win.resize(WIN_W, WIN_H)
+    win.show()
+    app.processEvents()
+
+    if args.only == "imports":
+        _drive_imports(
+            win, app,
+            build_import_samples(Path(settings_tmp.name) / "import-samples"),
+        )
+        modes = EXTRA_SHOTS
+    else:
+        win.load_file(str(build_synthetic_csv()))
+        app.processEvents()
+        modes = (args.only,) if args.only else PANEL_MODES
+    STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    saved = []
+    for mode in modes:
+        if mode in PANEL_MODES:
+            _drive_mode(win, app, mode)
+        pix = win.grab()
+        if GRAB_SCALE != 1:
+            pix = pix.scaled(WIN_W * GRAB_SCALE, WIN_H * GRAB_SCALE)
+        out = STAGING_DIR / (PANEL_FILES | EXTRA_FILES)[mode]
+        if pix.isNull() or pix.width() < 10:
+            print(f"FAIL: degenerate pixmap for {mode}", file=sys.stderr)
+            return 2
+        save_screenshot(pix, out)
+        saved.append(out)
+        print(f"saved staging: {out} ({pix.width()}x{pix.height()})")
+
+    if args.promote:
+        ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+        for src in saved:
+            dst = ASSETS_DIR / src.name
+            shutil.copy2(src, dst)
+            print(f"promoted: {dst}")
+
+    # Loading the synthetic/demo files mutates the temporary project session.
+    # The screenshot process owns no user project, so mark that throwaway
+    # session clean before closing instead of blocking on the production
+    # unsaved-project confirmation dialog.
+    win._project_dirty.mark_saved()
+    win.close()
+    app.processEvents()
+    settings_tmp.cleanup()
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

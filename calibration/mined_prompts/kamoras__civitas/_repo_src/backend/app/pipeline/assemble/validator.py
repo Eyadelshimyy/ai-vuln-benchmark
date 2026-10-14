@@ -1,0 +1,262 @@
+"""
+Validator — validates and fixes a senator record to match the Senator type.
+Ports all validation rules and valid sets. ``clamp`` is the one the
+scoring engine uses (score_bounds), so validation and scoring bound identically.
+"""
+
+import logging
+
+from app.config_definitions import VALID_INDUSTRIES
+from app.pipeline.analyze.score_bounds import clamp
+
+logger = logging.getLogger(__name__)
+
+VALID_PARTIES = {"D", "R", "I"}
+VALID_VOTES = {"Yea", "Nay", "Present", "Not Voting"}
+
+# Neutral prior for a score dimension we have no computed value for. Matches
+# the scoring engine's own standard (score_calculator's module docstring:
+# "Missing data yields a neutral 50, never a perfect 100 or 0") and its
+# _funding_independence_core no-funding early-return. Only applies when a
+# dimension key is genuinely ABSENT — a value that was actually computed
+# (even a real 0 for a fully-captured profile) is preserved as-is.
+NEUTRAL_SCORE = 50
+
+
+def _validate_vote(v: dict, default_category: str = "recent") -> dict:
+    """Validate and normalize a single vote dict."""
+    return {
+        "billName": v.get("billName", "Unknown Bill"),
+        "billId": v.get("billId", ""),
+        "date": v.get("date", ""),
+        "vote": (
+            v.get("vote")
+            if v.get("vote") in VALID_VOTES
+            else "Not Voting"
+        ),
+        "policyArea": v.get("policyArea", "PROCEDURAL"),
+        "policyAreas": v.get("policyAreas", []),
+        "partyAlignmentWeight": v.get("partyAlignmentWeight", 0.0),
+        "stance": v.get("stance", "neutral"),
+        "description": v.get("description", ""),
+        "partyLeaning": (
+            v.get("partyLeaning")
+            if v.get("partyLeaning") in ("R", "D", "bipartisan")
+            else None
+        ),
+        "votedWithParty": v.get("votedWithParty"),
+        "voteCategory": v.get("voteCategory", default_category),
+        "rollCall": v.get("rollCall"),
+    }
+
+
+def validate_senator(senator: dict) -> dict:
+    """
+    Validate and fix a senator record to match the Senator type.
+    Mutates the dict in place and returns it.
+
+    Args:
+        senator: Assembled senator record.
+
+    Returns:
+        Validated senator record.
+    """
+    warnings: list[str] = []
+
+    # Basic fields
+    if not senator.get("id"):
+        warnings.append("Missing id")
+    if not senator.get("name"):
+        warnings.append("Missing name")
+    state = senator.get("state", "")
+    if not state or len(state) != 2:
+        warnings.append(f"Invalid state: {state}")
+    if senator.get("party") not in VALID_PARTIES:
+        warnings.append(
+            f"Invalid party: {senator.get('party')}, defaulting to I"
+        )
+        senator["party"] = "I"
+    if (
+        not isinstance(senator.get("yearsInOffice"), (int, float))
+        or senator["yearsInOffice"] < 0
+    ):
+        senator["yearsInOffice"] = 0
+    if not senator.get("initials"):
+        name = senator.get("name", "")
+        parts = name.split()
+        senator["initials"] = "".join(
+            w[0].upper() for w in parts[:2] if w
+        )
+    # Representation score
+    cs = senator.get("representationScore") or {}
+    validated_score = {
+        "fundingIndependence": clamp(cs.get("fundingIndependence", NEUTRAL_SCORE)),
+        "promisePersistence": clamp(cs.get("promisePersistence", NEUTRAL_SCORE)),
+        "constituentAlignment": clamp(cs.get("constituentAlignment", NEUTRAL_SCORE)),
+        "fundingDiversity": clamp(cs.get("fundingDiversity", NEUTRAL_SCORE)),
+        "legislativeEffectiveness": clamp(cs.get("legislativeEffectiveness", NEUTRAL_SCORE)),
+    }
+    # Data-sufficiency grades (calculate_confidence) ride alongside the
+    # numeric scores, not IN them — pass through untouched so senator_service
+    # can persist it. Dropping this here silently zeroed score_confidence
+    # for every senator (stuck at "{}" since 2026-07-04): the House pipeline
+    # bypasses this validator and was unaffected, which is how the gap
+    # stayed invisible.
+    if cs.get("confidence") is not None:
+        validated_score["confidence"] = cs["confidence"]
+    senator["representationScore"] = validated_score
+
+    # Funding
+    f = senator.get("funding") or {}
+    # PAC money is part of contributions (FEC's other_political_committee_
+    # contributions is a line of its contributions total), so a PAC total
+    # above the contributions it is a share of is a data fault, and the
+    # share the site shows from it (pac_share_pct) would read over 100%.
+    pac_total, contributions = f.get("totalFromPACs") or 0, f.get("totalContributions")
+    if contributions is not None and pac_total > contributions > 0:
+        warnings.append(
+            f"PAC total ${pac_total:,.0f} exceeds contributions ${contributions:,.0f}: "
+            "the PAC share will read over 100%"
+        )
+    valid_donor_types = {
+        "PAC",
+        "Individual",
+        "SuperPAC",
+        "Org/Employees",
+        "Party/Ideological",
+        "CandidateAffiliated",
+        "Self-Funded",
+    }
+    senator["funding"] = {
+        "totalRaised": max(0, round(f.get("totalRaised", 0))),
+        "totalContributions": (
+            max(0, round(f["totalContributions"])) if f.get("totalContributions") is not None else None
+        ),
+        "totalFromPACs": max(0, round(f.get("totalFromPACs", 0))),
+        # None is "not measured" (the campaign itemizes every gift, v6.31),
+        # kept as None: clamping it raised, and the one senator it applies
+        # to failed every run and kept a stale record (2026-10-09).
+        "smallDonorPercentage": (
+            None if f.get("smallDonorPercentage", 0) is None else clamp(f.get("smallDonorPercentage", 0))
+        ),
+        "topDonors": [
+            {
+                "name": d.get("name", "Unknown"),
+                "total": max(0, round(d.get("total", 0))),
+                "type": (
+                    d.get("type")
+                    if d.get("type") in valid_donor_types
+                    else "Org/Employees"
+                ),
+                "industry": (
+                    d.get("industry")
+                    if d.get("industry") in VALID_INDUSTRIES
+                    else "OTHER"
+                ),
+                "pacSponsor": d.get("pacSponsor"),
+                "pacIndustry": d.get("pacIndustry"),
+                "pacAnalysis": d.get("pacAnalysis"),
+                # FEC committee_type, stored on Donor.committee_type.
+                # Dropping it here once NULLed it for every senator while
+                # the House path (which bypasses this validator) kept it.
+                "committeeType": d.get("committeeType"),
+            }
+            for d in (f.get("topDonors") or [])
+        ],
+        "industryBreakdown": [
+            {
+                "industry": (
+                    ind.get("industry")
+                    if ind.get("industry") in VALID_INDUSTRIES
+                    else "OTHER"
+                ),
+                "name": ind.get("name") or ind.get("industry", "Other"),
+                "total": max(0, round(ind.get("total", 0))),
+                "percentage": clamp(ind.get("percentage", 0)),
+            }
+            for ind in (f.get("industryBreakdown") or [])
+        ],
+    }
+
+    # Voting record
+    vr = senator.get("votingRecord") or {}
+    senator["votingRecord"] = {
+        "totalVotes": max(0, vr.get("totalVotes", 0)),
+        "votedWithPartyCount": max(0, vr.get("votedWithPartyCount", 0)),
+        "votedAgainstPartyCount": max(0, vr.get("votedAgainstPartyCount", 0)),
+        "partyLoyaltyPct": max(0.0, vr.get("partyLoyaltyPct", 0.0)),
+        # The party an Independent caucuses with (normalize_votes); kept so
+        # it is persisted and the score breakdown scores them the same way.
+        "effectiveParty": vr.get("effectiveParty") if vr.get("effectiveParty") in ("D", "R") else None,
+        # The whole Congress's party-line record (party_line_record), persisted
+        # for the score breakdown and the scorecard's list of breaks.
+        "partyLineRecord": vr.get("partyLineRecord") if isinstance(vr.get("partyLineRecord"), dict) else None,
+        "recentVotes": [
+            _validate_vote(v, "recent")
+            for v in (vr.get("recentVotes") or [])
+        ],
+        "keyVotes": [
+            _validate_vote(v, "key")
+            for v in (vr.get("keyVotes") or [])
+        ],
+    }
+
+    # Lobbying matches
+    senator["lobbyingMatches"] = [
+        {
+            "lobbyistOrg": m.get("lobbyistOrg", "Unknown"),
+            "industry": (
+                m.get("industry")
+                if m.get("industry") in VALID_INDUSTRIES
+                else "OTHER"
+            ),
+            "lobbyingSpend": max(0, round(m.get("lobbyingSpend", 0))),
+            "donationToSenator": max(
+                0, round(m.get("donationToSenator", 0))
+            ),
+            "billsInfluenced": (
+                m["billsInfluenced"]
+                if isinstance(m.get("billsInfluenced"), list)
+                else []
+            ),
+            "senatorVoteAligned": m.get("senatorVoteAligned"),
+            # Persisted for the score breakdown's on-demand recompute
+            # (models.LobbyingMatch.is_consensus_vote); was dropped here, so
+            # every senator row stored NULL.
+            "isConsensusVote": m.get("isConsensusVote"),
+            "description": m.get("description", ""),
+            "lobbiedBills": [
+                b for b in (m.get("lobbiedBills") or [])
+                if isinstance(b, dict) and b.get("billId")
+            ],
+            "lobbyingClients": [
+                c for c in (m.get("lobbyingClients") or [])
+                if isinstance(c, dict) and c.get("client")
+            ],
+            "lobbyingChecked": (
+                m["lobbyingChecked"] if isinstance(m.get("lobbyingChecked"), bool) else None
+            ),
+        }
+        for m in (senator.get("lobbyingMatches") or [])
+    ]
+
+    # Strip internal/pipeline-only fields not needed in the final output.
+    # Keep bioguideId — needed for DB storage and downstream lookups.
+    # officialWebsiteUrl used to be stripped here too, but upsert_senator
+    # (senate_pipeline.py) reads it from this same validated dict to
+    # populate Senator.website_url — stripping it first meant that column
+    # (and the platform-text fetch's primary source, which also reads it
+    # from this dict, falling back to a Wikipedia guess otherwise) has
+    # been silently empty for every senator since launch (confirmed live
+    # 2026-07-25: 0/101 had a stored website_url).
+    for _internal_key in ("lastNameForVoteMatch",):
+        senator.pop(_internal_key, None)
+
+    if warnings:
+        logger.warning(
+            "Validation warnings for %s: %s",
+            senator.get("name", "unknown"),
+            "; ".join(warnings),
+        )
+
+    return senator

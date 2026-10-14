@@ -1,0 +1,28 @@
+{
+  "repo": "kamoras__civitas",
+  "file": "backend/migrations/versions/0035_small_donor_share_nullable.py",
+  "function": "downgrade",
+  "line": 28,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `downgrade` function.",
+  "prompt_source": "def downgrade() -> None:\n    \"\"\"Implement the `downgrade` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def downgrade() -> None:\n    for table in ('senators', 'representatives'):\n        op.execute(f\"UPDATE {table} SET small_donor_percentage = 0 WHERE small_donor_percentage IS NULL\")\n        with op.batch_alter_table(table, schema=None) as batch_op:\n            batch_op.alter_column('small_donor_percentage', existing_type=sa.Float(), nullable=False)",
+  "module_source": "\"\"\"senators/representatives.small_donor_percentage nullable: NULL is a\ncampaign whose filings report no unitemized money (it itemizes every gift),\nso its small-donor share can't be read from them; 0 claimed none.\n\nOnly relaxes NOT NULL, so the previous image, which always writes a number,\nruns unchanged against the migrated schema.\n\nRevision ID: 0035\nRevises: 0034\nCreate Date: 2026-10-08\n\"\"\"\nfrom alembic import op\nimport sqlalchemy as sa\n\n\nrevision = '0035'\ndown_revision = '0034'\nbranch_labels = None\ndepends_on = None\n\n\ndef upgrade() -> None:\n    for table in ('senators', 'representatives'):\n        with op.batch_alter_table(table, schema=None) as batch_op:\n            batch_op.alter_column('small_donor_percentage', existing_type=sa.Float(), nullable=True)\n\n\ndef downgrade() -> None:\n    for table in ('senators', 'representatives'):\n        op.execute(f\"UPDATE {table} SET small_donor_percentage = 0 WHERE small_donor_percentage IS NULL\")\n        with op.batch_alter_table(table, schema=None) as batch_op:\n            batch_op.alter_column('small_donor_percentage', existing_type=sa.Float(), nullable=False)\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 5
+    },
+    "ai_commit": "798e85ca7f1a",
+    "evidence": "Generated with [Claude Code]",
+    "ai_line_fraction": 1.0,
+    "span": [
+      28,
+      32
+    ]
+  }
+}

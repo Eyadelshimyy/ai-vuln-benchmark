@@ -1,0 +1,294 @@
+"""Serialización de filas Pago y enriquecimiento para respuestas API."""
+
+from collections import defaultdict
+from datetime import date, datetime
+from typing import Optional
+
+from sqlalchemy import or_, select
+from sqlalchemy.orm import Session
+
+from app.core.documento import (
+    compose_numero_documento_almacenado,
+    normalize_documento,
+    split_numero_documento_almacenado,
+)
+from app.models.pago import Pago
+from app.services.conciliacion_bancos_service import (
+    pago_ids_ambiguo_bancario_multi,
+    pago_ids_conciliacion_bancaria_confirmada,
+)
+from app.models.pago_reportado import PagoReportado
+from app.models.cuota_pago import CuotaPago
+from app.services.cobros.pago_reportado_documento import claves_documento_pago_desde_campos
+from app.services.cuota_pago_integridad import pago_tiene_aplicaciones_cuotas
+from app.services.pagos.comprobante_link_desde_gmail import (
+    enriquecer_items_link_comprobante_desde_gmail,
+    enriquecer_items_link_comprobante_desde_pago_reportado,
+)
+
+
+def _pago_to_response(row: Pago, cuotas_atrasadas: Optional[int] = None) -> dict:
+    """Convierte fila Pago a dict para el frontend (campos en snake_case; fechas ISO)."""
+    fp = row.fecha_pago
+
+    if fp is None:
+        fecha_pago_str = ""
+    elif isinstance(fp, datetime):
+        fecha_pago_str = fp.date().isoformat()
+    elif isinstance(fp, date):
+        fecha_pago_str = fp.isoformat()
+    elif hasattr(fp, "isoformat"):
+        fecha_pago_str = fp.isoformat()
+    else:
+        fecha_pago_str = str(fp) if fp else ""
+
+    _nd_base, _nd_code = split_numero_documento_almacenado(row.numero_documento)
+
+    return {
+        "id": row.id,
+        "cedula_cliente": row.cedula_cliente or "",
+        "prestamo_id": row.prestamo_id,
+        "fecha_pago": fecha_pago_str,
+        "monto_pagado": float(row.monto_pagado) if row.monto_pagado is not None else 0,
+        "numero_documento": _nd_base or (row.numero_documento or ""),
+        "codigo_documento": _nd_code or "",
+        "institucion_bancaria": row.institucion_bancaria,
+        "estado": row.estado or "PENDIENTE",
+        "fecha_registro": row.fecha_registro.isoformat() if row.fecha_registro else None,
+        "fecha_conciliacion": row.fecha_conciliacion.isoformat() if row.fecha_conciliacion else None,
+        "conciliado": bool(row.conciliado),
+        "verificado_concordancia": getattr(row, "verificado_concordancia", None) or None,
+        "usuario_registro": row.usuario_registro or "",
+        "notas": row.notas,
+        "documento_nombre": getattr(row, "documento_nombre", None),
+        "documento_tipo": getattr(row, "documento_tipo", None),
+        "documento_ruta": getattr(row, "documento_ruta", None),
+        "link_comprobante": getattr(row, "link_comprobante", None),
+        "cuotas_atrasadas": cuotas_atrasadas,
+        "moneda_registro": getattr(row, "moneda_registro", None),
+        "monto_bs_original": float(row.monto_bs_original)
+        if getattr(row, "monto_bs_original", None) is not None
+        else None,
+        "tasa_cambio_bs_usd": float(row.tasa_cambio_bs_usd)
+        if getattr(row, "tasa_cambio_bs_usd", None) is not None
+        else None,
+        "fecha_tasa_referencia": row.fecha_tasa_referencia.isoformat()
+        if getattr(row, "fecha_tasa_referencia", None)
+        else None,
+    }
+
+
+def _enriquecer_items_tiene_aplicacion_cuotas(db: Session, items: list) -> None:
+    """Añade tiene_aplicacion_cuotas (filas en cuota_pagos) a cada ítem con id de pago."""
+    if not items:
+        return
+    ids: list[int] = []
+    for it in items:
+        pid = it.get("id")
+        if pid is not None:
+            try:
+                ids.append(int(pid))
+            except (TypeError, ValueError):
+                pass
+    if not ids:
+        for it in items:
+            it["tiene_aplicacion_cuotas"] = False
+        return
+    q = select(CuotaPago.pago_id).where(CuotaPago.pago_id.in_(ids)).distinct()
+    has_ids = {int(x[0]) for x in db.execute(q).all() if x[0] is not None}
+    for it in items:
+        pid = it.get("id")
+        try:
+            it["tiene_aplicacion_cuotas"] = int(pid) in has_ids if pid is not None else False
+        except (TypeError, ValueError):
+            it["tiene_aplicacion_cuotas"] = False
+
+
+
+
+def _enriquecer_items_conciliacion_bancaria_confirmada(db: Session, items: list) -> None:
+    """
+    True si el pago fue confirmado en Auditoria > Conciliacion Bancos
+    (check verde = CORREGIR con Ref. Banco o Ref. RapiC, aplicado).
+    Independiente de pagos.conciliado (autoconciliacion OCR/cuotas).
+    """
+    if not items:
+        return
+    ids: list[int] = []
+    for it in items:
+        pid = it.get("id")
+        if pid is not None:
+            try:
+                ids.append(int(pid))
+            except (TypeError, ValueError):
+                pass
+    if not ids:
+        for it in items:
+            it["conciliacion_bancaria_confirmada"] = False
+            it["conciliacion_bancaria_ambigua"] = False
+        return
+    confirmed = pago_ids_conciliacion_bancaria_confirmada(db, ids)
+    ambiguos = pago_ids_ambiguo_bancario_multi(db, ids)
+    for it in items:
+        pid = it.get("id")
+        try:
+            pid_i = int(pid) if pid is not None else None
+        except (TypeError, ValueError):
+            pid_i = None
+        it["conciliacion_bancaria_confirmada"] = (
+            pid_i in confirmed if pid_i is not None else False
+        )
+        it["conciliacion_bancaria_ambigua"] = (
+            pid_i in ambiguos if pid_i is not None else False
+        )
+
+def _enriquecer_pagos_pago_reportado_id(db: Session, items: list) -> None:
+    """
+    Si el Nº documento del pago coincide (normalizado) con alguna clave del reporte en Cobros
+    (numero_operacion, referencia_interna, formatos legacy COB-+RPC), expone pago_reportado_id
+    para enlazar al detalle / comprobante / recibo.
+
+    Optimización: solo lee pagos_reportados cuyo numero_operacion o referencia_interna aparece
+    en los documentos de la página (evita escanear toda la tabla en cada GET /pagos).
+    """
+    if not items:
+        return
+    cands: set[str] = set()
+    for it in items:
+        d = (it.get("numero_documento") or "").strip()
+        if d:
+            cands.add(d)
+            nd0 = normalize_documento(d)
+            if nd0:
+                cands.add(nd0)
+    by_nd: dict[str, int] = {}
+    _MAX_CANDS = 500
+    if not cands:
+        for it in items:
+            it["pago_reportado_id"] = None
+        return
+    cands_list = list(cands)
+    if len(cands_list) > _MAX_CANDS:
+        cands_list = cands_list[:_MAX_CANDS]
+    rows = db.execute(
+        select(
+            PagoReportado.id,
+            PagoReportado.referencia_interna,
+            PagoReportado.numero_operacion,
+        )
+        .where(
+            or_(
+                PagoReportado.numero_operacion.in_(cands_list),
+                PagoReportado.referencia_interna.in_(cands_list),
+            )
+        )
+        .order_by(PagoReportado.id.asc())
+    ).all()
+    for rid, ref_int, num_op in rows:
+        for k in claves_documento_pago_desde_campos(ref_int, num_op):
+            nd = normalize_documento(k)
+            if nd and nd not in by_nd:
+                by_nd[nd] = int(rid)
+    for it in items:
+        nd = normalize_documento(it.get("numero_documento"))
+        it["pago_reportado_id"] = by_nd.get(nd) if nd else None
+
+
+def _enriquecer_items_duplicado_clave_misma_pagina(rows: list, items: list) -> None:
+    """
+    Misma clave que el listado frontend (`claveDocumentoPagoListaNormalizada`): compuesto
+    comprobante+código. Si en la página hay más de un pago con esa clave, rellena datos del
+    otro registro para la columna Observaciones / recomendación en `/pagos`.
+    """
+    if not rows or not items or len(rows) != len(items):
+        return
+    by_clave: dict[str, list[int]] = defaultdict(list)
+    for row in rows:
+        raw = (getattr(row, "numero_documento", None) or "").strip()
+        base, code = split_numero_documento_almacenado(raw)
+        comp = compose_numero_documento_almacenado(base, code) or ""
+        clave = comp.strip().lower()
+        if clave:
+            by_clave[clave].append(int(row.id))
+    for i, row in enumerate(rows):
+        it = items[i]
+        it["dup_misma_pagina_otro_pago_id"] = None
+        it["dup_misma_pagina_otro_prestamo_id"] = None
+        it["dup_misma_pagina_otro_numero_documento"] = None
+        raw = (getattr(row, "numero_documento", None) or "").strip()
+        base, code = split_numero_documento_almacenado(raw)
+        comp = compose_numero_documento_almacenado(base, code) or ""
+        clave = comp.strip().lower()
+        if not clave:
+            continue
+        ids = sorted(by_clave.get(clave) or [])
+        if len(ids) < 2:
+            continue
+        me = int(row.id)
+        others = [x for x in ids if x != me]
+        if not others:
+            continue
+        other_id = others[0]
+        other_row = next((r for r in rows if int(r.id) == other_id), None)
+        if other_row is None:
+            continue
+        ob, _oc = split_numero_documento_almacenado(
+            (getattr(other_row, "numero_documento", None) or "").strip()
+        )
+        otro_pr = getattr(other_row, "prestamo_id", None)
+        it["dup_misma_pagina_otro_pago_id"] = other_id
+        it["dup_misma_pagina_otro_prestamo_id"] = int(otro_pr) if otro_pr is not None else None
+        it["dup_misma_pagina_otro_numero_documento"] = (ob or "").strip() or None
+
+
+def _enriquecer_items_duplicado_serial_cartera(
+    db: Session,
+    rows: list,
+    items: list,
+) -> None:
+    """
+    Otro ``Pago`` en cartera con el mismo serial (exacto o evasión Mercantil).
+
+    Usado en revisión manual y listado operativo: indica préstamo/pago donde ya
+    está aplicado el comprobante, distinto del registro actual.
+    """
+    if not rows or not items or len(rows) != len(items):
+        return
+    from app.services.pago_numero_documento import primer_pago_cartera_por_documento
+
+    for i, row in enumerate(rows):
+        it = items[i]
+        it["duplicado_serial_en_cartera"] = False
+        it["duplicado_en_cartera_pago_id"] = None
+        it["duplicado_en_cartera_prestamo_id"] = None
+        it["duplicado_en_cartera_numero_documento"] = None
+        raw = (getattr(row, "numero_documento", None) or "").strip()
+        if not raw:
+            continue
+        pid, prid = primer_pago_cartera_por_documento(
+            db, raw, exclude_pago_id=int(row.id)
+        )
+        if pid is None:
+            continue
+        nd = db.scalar(select(Pago.numero_documento).where(Pago.id == int(pid)))
+        base, _ = split_numero_documento_almacenado((nd or raw).strip())
+        it["duplicado_serial_en_cartera"] = True
+        it["duplicado_en_cartera_pago_id"] = int(pid)
+        it["duplicado_en_cartera_prestamo_id"] = (
+            int(prid) if prid is not None else None
+        )
+        it["duplicado_en_cartera_numero_documento"] = (base or nd or "").strip() or None
+
+
+def _pago_response_enriquecido(
+    db: Session,
+    row: Pago,
+    cuotas_atrasadas: Optional[int] = None,
+) -> dict:
+    """Dict listo para API: base + enlace Cobros + link Gmail/Drive si aplica."""
+    out = _pago_to_response(row, cuotas_atrasadas)
+    out["tiene_aplicacion_cuotas"] = pago_tiene_aplicaciones_cuotas(db, row.id)
+    _enriquecer_pagos_pago_reportado_id(db, [out])
+    enriquecer_items_link_comprobante_desde_gmail(db, [out])
+    enriquecer_items_link_comprobante_desde_pago_reportado(db, [out])
+    return out

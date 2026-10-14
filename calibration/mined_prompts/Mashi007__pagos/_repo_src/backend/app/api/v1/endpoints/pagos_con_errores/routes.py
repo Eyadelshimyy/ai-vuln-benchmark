@@ -1,0 +1,1683 @@
+"""
+
+Endpoints para pagos_con_errores: pagos con errores de validación desde Carga Masiva.
+
+Revisar Pagos y front apuntan a esta tabla. No se mezclan con pagos que cumplen validadores.
+
+"""
+
+import logging
+
+from datetime import date, datetime, time as dt_time
+
+from typing import Any, Optional
+
+from zoneinfo import ZoneInfo
+
+
+
+from fastapi import APIRouter, Depends, Query, HTTPException, Body
+
+from pydantic import BaseModel, field_validator
+
+from sqlalchemy import and_, delete, exists, func, or_, select
+
+from sqlalchemy.orm import Session
+
+
+
+from app.core.database import get_db
+
+from app.core.deps import get_current_user
+
+from app.models.pago_con_error import PagoConError
+from app.models.pago import Pago
+from app.models.prestamo import Prestamo
+from app.services.observacion_serial_compuesto import (
+    sql_excluir_observacion_serial_compuesto,
+)
+
+from app.schemas.auth import UserResponse
+
+from app.core.documento import (
+    compose_numero_documento_almacenado,
+    normalize_codigo_documento,
+    normalize_documento,
+    split_numero_documento_almacenado,
+)
+from app.services.pago_huella_funcional import (
+    mensaje_409_huella_funcional_con_id,
+    pago_con_error_conflicto_huella_existente,
+    rechazar_si_pago_con_error_serial_duplicado,
+)
+from app.services.pago_numero_documento import (
+    numero_documento_ya_registrado,
+    pago_con_error_ya_cargado_estricto,
+    pago_huerfano_adoptable_por_documento,
+    primer_pago_cartera_por_documento,
+)
+from app.services.pagos_gmail.gmail_service import extract_lote_it_master_cedula_from_subject
+from app.utils.cedula_almacenamiento import (
+    normalizar_cedula_almacenamiento,
+    resolver_cedula_almacenada_en_clientes,
+)
+
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(dependencies=[Depends(get_current_user)])
+
+_USUARIO_REGISTRO_FALLBACK = "import-masivo@sistema.rapicredit.com"
+
+
+def _usuario_registro_desde_current_user(current_user: Optional[Any]) -> str:
+
+    """Email o identificador estable para auditoría (misma idea que POST /pagos)."""
+
+    if current_user is None:
+
+        return _USUARIO_REGISTRO_FALLBACK
+
+    email = getattr(current_user, "email", None)
+
+    if isinstance(email, str) and email.strip():
+
+        return email.strip()[:255]
+
+    uid = getattr(current_user, "id", None)
+
+    if uid is not None:
+
+        return f"user_id:{uid}@{_USUARIO_REGISTRO_FALLBACK}"[:255]
+
+    return _USUARIO_REGISTRO_FALLBACK
+
+
+
+def _cedula_placeholder_error(valor: Optional[str]) -> bool:
+    s = (valor or "").strip().upper()
+    return not s or s in {"ERROR", "ERROR EMAIL", "ERROR_EMAIL"}
+
+
+def _cedula_lote_it_master_desde_pago_con_error(
+    db: Session, row: PagoConError
+) -> Optional[str]:
+    """
+    Pagos Gmail IT Master: si una fila histórica quedó con cédula ERROR, recuperar
+    la cédula desde `notas` ("Asunto: <cedula> | Correo: ...") antes de actualizar.
+    """
+    notas = (getattr(row, "notas", None) or "").strip()
+    if not notas or "Asunto:" not in notas:
+        return None
+    asunto = notas.split("Asunto:", 1)[1].split("|", 1)[0].strip()
+    cedula_asunto = extract_lote_it_master_cedula_from_subject(asunto)
+    return resolver_cedula_almacenada_en_clientes(db, cedula_asunto)
+
+
+def _resolver_prestamo_id_para_mover_a_cartera(
+    db: Session,
+    cedula_resuelta: str,
+    prestamo_id_hint: Optional[int] = None,
+) -> tuple[Optional[int], Optional[str]]:
+    """
+    Préstamo destino al pasar de pagos_con_errores a pagos.
+    Si la fila no trae prestamo_id, intenta el único APROBADO de la cédula.
+    """
+    if prestamo_id_hint is not None and int(prestamo_id_hint) > 0:
+        from app.services.pagos_desistimiento_politica import (
+            bloquear_carga_automatica_a_cartera_si_desistimiento,
+        )
+
+        pid = int(prestamo_id_hint)
+        err_desist = bloquear_carga_automatica_a_cartera_si_desistimiento(db, pid)
+        if err_desist:
+            return None, err_desist
+        return pid, None
+
+    from app.services.prestamos.prestamos_por_cedula_titular import (
+        select_prestamo_ids_por_cedula_titular,
+    )
+
+    prestamo_ids = select_prestamo_ids_por_cedula_titular(
+        db, cedula_resuelta, estados=("APROBADO",)
+    )
+    if len(prestamo_ids) == 1:
+        return int(prestamo_ids[0]), None
+    if len(prestamo_ids) > 1:
+        return None, (
+            f"cédula {cedula_resuelta} con {len(prestamo_ids)} préstamos APROBADOS: "
+            "asigne el préstamo en edición antes de mover a cartera"
+        )
+    return None, (
+        f"cédula {cedula_resuelta} sin préstamo APROBADO: "
+        "asigne el préstamo en edición antes de mover a cartera"
+    )
+
+
+def _mensaje_error_mover_pago_a_cartera(exc: BaseException) -> str:
+    raw = str(exc)
+    if "chk_pagos_prestamo_id_not_null" in raw:
+        return (
+            "falta préstamo (prestamo_id). Edite el pago, asigne un crédito APROBADO "
+            "y reintente."
+        )
+    linea = raw.split("\n", 1)[0].strip()
+    return linea[:400] if linea else "error al mover a cartera"
+
+
+
+
+class PagoConErrorCreate(BaseModel):
+
+    cedula_cliente: str
+
+    prestamo_id: Optional[int] = None
+
+    fecha_pago: str
+
+    monto_pagado: float
+
+    numero_documento: Optional[str] = None
+
+    codigo_documento: Optional[str] = None
+
+    institucion_bancaria: Optional[str] = None
+
+    notas: Optional[str] = None
+
+    conciliado: Optional[bool] = False
+
+    errores_descripcion: Optional[list[dict]] = None
+
+    observaciones: Optional[str] = None  # Nombres de campos con problema, separados por coma
+
+    fila_origen: Optional[int] = None
+
+
+
+
+
+class PagoConErrorUpdate(BaseModel):
+
+    cedula_cliente: Optional[str] = None
+
+    prestamo_id: Optional[int] = None
+
+    fecha_pago: Optional[str] = None
+
+    monto_pagado: Optional[float] = None
+
+    numero_documento: Optional[str] = None
+
+    codigo_documento: Optional[str] = None
+
+    institucion_bancaria: Optional[str] = None
+
+    notas: Optional[str] = None
+
+    conciliado: Optional[bool] = None
+
+    errores_descripcion: Optional[list[dict]] = None
+
+    observaciones: Optional[str] = None
+
+
+
+
+
+class PagoConErrorBatchBody(BaseModel):
+
+    """Hasta 500 pagos con error en una sola peticion."""
+
+    pagos: list[PagoConErrorCreate]
+
+
+
+    @field_validator("pagos")
+
+    @classmethod
+
+    def pagos_limite(cls, v: list) -> list:
+
+        if len(v) > 500:
+
+            raise ValueError("Maximo 500 items por lote.")
+
+        return v
+
+
+
+
+
+def _pago_con_error_to_response(
+    row: PagoConError,
+    db: Optional[Session] = None,
+) -> dict:
+
+    fp = row.fecha_pago
+
+    fecha_pago_str = fp.date().isoformat() if hasattr(fp, "date") and fp else (fp.isoformat() if fp else "")
+
+    _nb, _nc = split_numero_documento_almacenado(row.numero_documento)
+
+    out = {
+
+        "id": row.id,
+
+        "cedula_cliente": row.cedula_cliente or "",
+
+        "prestamo_id": row.prestamo_id,
+
+        "fecha_pago": fecha_pago_str,
+
+        "monto_pagado": float(row.monto_pagado) if row.monto_pagado is not None else 0,
+
+        "numero_documento": _nb or (row.numero_documento or ""),
+
+        "codigo_documento": _nc or "",
+
+        "institucion_bancaria": row.institucion_bancaria,
+
+        "estado": row.estado or "PENDIENTE",
+
+        "fecha_registro": row.fecha_registro.isoformat() if row.fecha_registro else None,
+
+        "fecha_conciliacion": row.fecha_conciliacion.isoformat() if row.fecha_conciliacion else None,
+
+        "conciliado": bool(row.conciliado),
+
+        "verificado_concordancia": getattr(row, "verificado_concordancia", None) or None,
+
+        "usuario_registro": row.usuario_registro or "",
+
+        "notas": row.notas,
+
+        "documento_nombre": getattr(row, "documento_nombre", None),
+
+        "documento_tipo": getattr(row, "documento_tipo", None),
+
+        "documento_ruta": getattr(row, "documento_ruta", None),
+
+        "errores_descripcion": row.errores_descripcion,
+
+        "observaciones": getattr(row, "observaciones", None) or "",
+
+        "fila_origen": row.fila_origen,
+
+    }
+
+    if db is not None:
+
+        dup_pid, dup_prid = primer_pago_cartera_por_documento(
+            db, row.numero_documento
+        )
+
+        out["duplicado_documento_en_pagos"] = dup_pid is not None
+
+        out["duplicado_en_cartera_pago_id"] = dup_pid
+
+        out["duplicado_en_cartera_prestamo_id"] = dup_prid
+
+    else:
+
+        out["duplicado_documento_en_pagos"] = False
+
+        out["duplicado_en_cartera_pago_id"] = None
+
+        out["duplicado_en_cartera_prestamo_id"] = None
+
+    return out
+
+
+
+
+
+@router.get("", response_model=dict)
+
+def listar_pagos_con_errores(
+
+    page: int = Query(1, ge=1),
+
+    per_page: int = Query(20, ge=1, le=100),
+
+    cedula: Optional[str] = Query(None),
+
+    estado: Optional[str] = Query(None),
+
+    fecha_desde: Optional[str] = Query(None),
+
+    fecha_hasta: Optional[str] = Query(None),
+    fecha_pago: Optional[str] = Query(None),
+    numero_documento: Optional[str] = Query(None),
+    tipo_revision: Optional[str] = Query(None),
+
+    conciliado: Optional[str] = Query(None),
+    include_exportados: bool = Query(False),
+
+    db: Session = Depends(get_db),
+
+):
+
+    """Listado paginado de pagos con errores (Revisar Pagos). Por defecto oculta exportados/archivados."""
+
+    try:
+
+        q = select(PagoConError)
+
+        count_q = select(func.count()).select_from(PagoConError)
+
+        if conciliado and conciliado.strip().lower() == "si":
+
+            q = q.where(PagoConError.conciliado == True)
+
+            count_q = count_q.where(PagoConError.conciliado == True)
+
+        elif conciliado and conciliado.strip().lower() == "no":
+
+            q = q.where(or_(PagoConError.conciliado == False, PagoConError.conciliado.is_(None)))
+
+            count_q = count_q.where(or_(PagoConError.conciliado == False, PagoConError.conciliado.is_(None)))
+
+        # Por defecto ocultar pagos ya exportados/archivados para no mezclar backlog operativo con histórico.
+        if not include_exportados:
+            q = q.where(or_(PagoConError.estado.is_(None), PagoConError.estado != "EXPORTADO_REVISION"))
+            count_q = count_q.where(or_(PagoConError.estado.is_(None), PagoConError.estado != "EXPORTADO_REVISION"))
+
+        # Serial compuesto en observaciones: informativo, no caso a revisión.
+        q = q.where(sql_excluir_observacion_serial_compuesto(PagoConError.observaciones))
+        count_q = count_q.where(
+            sql_excluir_observacion_serial_compuesto(PagoConError.observaciones)
+        )
+
+        if cedula and cedula.strip():
+
+            q = q.where(PagoConError.cedula_cliente.ilike(f"%{cedula.strip()}%"))
+
+            count_q = count_q.where(PagoConError.cedula_cliente.ilike(f"%{cedula.strip()}%"))
+
+        if estado and estado.strip():
+
+            q = q.where(PagoConError.estado == estado.strip().upper())
+
+            count_q = count_q.where(PagoConError.estado == estado.strip().upper())
+
+        if fecha_desde:
+
+            try:
+
+                fd = date.fromisoformat(fecha_desde)
+
+                q = q.where(PagoConError.fecha_pago >= datetime.combine(fd, dt_time.min))
+
+                count_q = count_q.where(PagoConError.fecha_pago >= datetime.combine(fd, dt_time.min))
+
+            except ValueError:
+
+                pass
+
+        if fecha_hasta:
+
+            try:
+
+                fh = date.fromisoformat(fecha_hasta)
+
+                q = q.where(PagoConError.fecha_pago <= datetime.combine(fh, dt_time.max))
+
+                count_q = count_q.where(PagoConError.fecha_pago <= datetime.combine(fh, dt_time.max))
+
+            except ValueError:
+
+                pass
+
+        if fecha_pago:
+            try:
+                fe = date.fromisoformat(fecha_pago)
+                q = q.where(PagoConError.fecha_pago >= datetime.combine(fe, dt_time.min))
+                q = q.where(PagoConError.fecha_pago <= datetime.combine(fe, dt_time.max))
+                count_q = count_q.where(PagoConError.fecha_pago >= datetime.combine(fe, dt_time.min))
+                count_q = count_q.where(PagoConError.fecha_pago <= datetime.combine(fe, dt_time.max))
+            except ValueError:
+                pass
+
+        if numero_documento and numero_documento.strip():
+            doc_raw = numero_documento.strip()
+            doc_norm = normalize_documento(doc_raw)
+            q_doc = or_(
+                PagoConError.numero_documento.ilike(f"%{doc_raw}%"),
+                func.upper(func.trim(func.coalesce(PagoConError.numero_documento, ""))).like(
+                    f"%{doc_norm}%"
+                ),
+            )
+            q = q.where(q_doc)
+            count_q = count_q.where(q_doc)
+
+        if tipo_revision and tipo_revision.strip():
+            tipo = tipo_revision.strip().lower()
+            hoy = date.today()
+            doc_key = func.upper(func.trim(func.coalesce(PagoConError.numero_documento, "")))
+            fecha_key = func.date(PagoConError.fecha_pago)
+            dup_subq = (
+                select(
+                    fecha_key.label("fecha_pago"),
+                    doc_key.label("doc_key"),
+                )
+                .where(doc_key != "")
+                .group_by(fecha_key, doc_key)
+                .having(func.count(PagoConError.id) > 1)
+                .subquery()
+            )
+
+            if tipo in {"duplicado", "duplicados", "duplicado_fecha_numero"}:
+                dup_cond = and_(
+                    func.date(PagoConError.fecha_pago) == dup_subq.c.fecha_pago,
+                    doc_key == dup_subq.c.doc_key,
+                )
+                q = q.join(dup_subq, dup_cond)
+                count_q = count_q.join(dup_subq, dup_cond)
+            elif tipo in {"irreal", "irreales"}:
+                total_pagos_prestamo = (
+                    select(func.coalesce(func.sum(Pago.monto_pagado), 0))
+                    .where(Pago.prestamo_id == PagoConError.prestamo_id)
+                    .scalar_subquery()
+                )
+                sobrepagado_cond = and_(
+                    PagoConError.prestamo_id.is_not(None),
+                    exists(
+                        select(1).where(
+                            Prestamo.id == PagoConError.prestamo_id,
+                            or_(
+                                total_pagos_prestamo > func.coalesce(Prestamo.total_financiamiento, 0),
+                                (total_pagos_prestamo + func.coalesce(PagoConError.monto_pagado, 0))
+                                > func.coalesce(Prestamo.total_financiamiento, 0),
+                            ),
+                        )
+                    ),
+                )
+                irreal_cond = or_(
+                    PagoConError.monto_pagado <= 0,
+                    func.date(PagoConError.fecha_pago) > hoy,
+                    sobrepagado_cond,
+                )
+                q = q.where(irreal_cond)
+                count_q = count_q.where(irreal_cond)
+            elif tipo in {"anomalo", "anomalos", "anómalo", "anómalos"}:
+                anomalo_cond = or_(
+                    func.coalesce(func.trim(PagoConError.observaciones), "") != "",
+                    PagoConError.errores_descripcion.is_not(None),
+                )
+                q = q.where(anomalo_cond)
+                count_q = count_q.where(anomalo_cond)
+
+        total = db.scalar(count_q) or 0
+
+        q = q.order_by(PagoConError.fecha_registro.desc().nullslast(), PagoConError.id.desc())
+
+        q = q.offset((page - 1) * per_page).limit(per_page)
+
+        rows = db.execute(q).scalars().all()
+
+        items = [_pago_con_error_to_response(r, db) for r in rows]
+
+        total_pages = (total + per_page - 1) // per_page if total else 0
+
+        return {
+
+            "pagos": items,
+
+            "total": total,
+
+            "page": page,
+
+            "per_page": per_page,
+
+            "total_pages": total_pages,
+
+        }
+
+    except Exception as e:
+
+        logger.exception("Error en GET /pagos/con-errores: %s", e)
+
+        db.rollback()
+
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+
+
+
+@router.post("", response_model=dict, status_code=201)
+
+def crear_pago_con_error(
+
+    payload: PagoConErrorCreate,
+
+    db: Session = Depends(get_db),
+
+    current_user: UserResponse = Depends(get_current_user),
+
+):
+
+    """Crea un pago con errores desde Carga Masiva (Revisar Pagos)."""
+
+    try:
+
+        fecha_ts = datetime.strptime(payload.fecha_pago, "%Y-%m-%d").replace(hour=0, minute=0, second=0, microsecond=0)
+
+    except ValueError:
+
+        raise HTTPException(status_code=400, detail="fecha_pago debe ser YYYY-MM-DD")
+
+    num_norm = compose_numero_documento_almacenado(
+
+        payload.numero_documento,
+
+        getattr(payload, "codigo_documento", None),
+
+    )
+
+    if num_norm and numero_documento_ya_registrado(db, num_norm):
+
+        raise HTTPException(
+
+            status_code=409,
+
+            detail="Ya existe un pago o registro en revisión con la misma combinación comprobante + código.",
+
+        )
+
+    ref = (num_norm or (payload.numero_documento or "").strip() or "N/A")[:100]
+
+    usuario_registro = _usuario_registro_desde_current_user(current_user)
+
+    row = PagoConError(
+
+        cedula_cliente=payload.cedula_cliente.strip(),
+
+        prestamo_id=payload.prestamo_id,
+
+        fecha_pago=fecha_ts,
+
+        monto_pagado=payload.monto_pagado,
+
+        numero_documento=num_norm,
+
+        institucion_bancaria=payload.institucion_bancaria.strip() if payload.institucion_bancaria else None,
+
+        estado="PENDIENTE",
+
+        conciliado=payload.conciliado if payload.conciliado is not None else False,
+
+        usuario_registro=usuario_registro,
+
+        notas=payload.notas,
+
+        referencia_pago=ref,
+
+        errores_descripcion=payload.errores_descripcion,
+
+        observaciones=(payload.observaciones or "").strip() or None,
+
+        fila_origen=payload.fila_origen,
+
+    )
+
+    db.add(row)
+
+    db.commit()
+
+    db.refresh(row)
+
+    return _pago_con_error_to_response(row, db)
+
+
+
+
+
+@router.post("/batch", response_model=dict, status_code=201)
+
+def crear_pagos_con_error_batch(
+
+    body: PagoConErrorBatchBody,
+
+    db: Session = Depends(get_db),
+
+    current_user: UserResponse = Depends(get_current_user),
+
+):
+
+    """Crea varios pagos con errores en una sola transaccion (Guardar todos desde Carga Masiva)."""
+
+    results: list[dict] = []
+
+    try:
+
+        usuario_registro = _usuario_registro_desde_current_user(current_user)
+
+        for payload in body.pagos:
+
+            try:
+
+                fecha_ts = datetime.strptime(payload.fecha_pago, "%Y-%m-%d").replace(
+
+                    hour=0, minute=0, second=0, microsecond=0
+
+                )
+
+            except ValueError:
+
+                results.append({"success": False, "error": "fecha_pago debe ser YYYY-MM-DD", "payload_index": len(results)})
+
+                continue
+
+            num_norm = compose_numero_documento_almacenado(
+
+                payload.numero_documento,
+
+                getattr(payload, "codigo_documento", None),
+
+            )
+
+            if num_norm and numero_documento_ya_registrado(db, num_norm):
+
+                results.append(
+
+                    {
+
+                        "success": False,
+
+                        "error": "Ya existe un pago o registro con la misma combinación comprobante + código.",
+
+                        "payload_index": len(results),
+
+                    }
+
+                )
+
+                continue
+
+            ref = (num_norm or (payload.numero_documento or "").strip() or "N/A")[:100]
+
+            row = PagoConError(
+
+                cedula_cliente=(payload.cedula_cliente or "").strip(),
+
+                prestamo_id=payload.prestamo_id,
+
+                fecha_pago=fecha_ts,
+
+                monto_pagado=payload.monto_pagado,
+
+                numero_documento=num_norm,
+
+                institucion_bancaria=(payload.institucion_bancaria or "").strip() or None if payload.institucion_bancaria else None,
+
+                estado="PENDIENTE",
+
+                conciliado=payload.conciliado if payload.conciliado is not None else False,
+
+                usuario_registro=usuario_registro,
+
+                notas=payload.notas,
+
+                referencia_pago=ref,
+
+                errores_descripcion=payload.errores_descripcion,
+
+                observaciones=(payload.observaciones or "").strip() or None if payload.observaciones else None,
+
+                fila_origen=payload.fila_origen,
+
+            )
+
+            db.add(row)
+
+            db.flush()
+
+            db.refresh(row)
+
+            results.append({"success": True, "pago": _pago_con_error_to_response(row, db)})
+
+        db.commit()
+
+        ok = sum(1 for r in results if r.get("success"))
+
+        return {"results": results, "ok_count": ok, "fail_count": len(results) - ok}
+
+    except Exception as e:
+
+        db.rollback()
+
+        logger.exception("Error en POST /pagos/con-errores/batch: %s", e)
+
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+
+
+
+class EliminarPorDescargaBody(BaseModel):
+
+    ids: list[int]
+
+
+
+
+
+@router.post("/eliminar-por-descarga", response_model=dict)
+
+def eliminar_por_descarga(payload: EliminarPorDescargaBody = Body(...), db: Session = Depends(get_db)):
+
+    """Elimina de pagos_con_errores los registros descargados (borrado en lote). La lista se vacia y se rellena al enviar desde Carga Masiva."""
+
+    valid_ids = [p for p in payload.ids if isinstance(p, int) and p > 0]
+
+    if not valid_ids:
+
+        return {"eliminados": 0, "mensaje": "No hay IDs"}
+
+    result = db.execute(delete(PagoConError).where(PagoConError.id.in_(valid_ids)))
+
+    eliminados = result.rowcount
+
+    db.commit()
+
+    return {"eliminados": eliminados, "mensaje": f"{eliminados} eliminados de pagos_con_errores"}
+
+
+@router.post("/archivar-por-descarga", response_model=dict)
+def archivar_por_descarga(
+    payload: EliminarPorDescargaBody = Body(...),
+    db: Session = Depends(get_db),
+    current_user: UserResponse = Depends(get_current_user),
+):
+    """Marca como EXPORTADO_REVISION en vez de borrar, para trazabilidad y auditoría."""
+    valid_ids = [p for p in payload.ids if isinstance(p, int) and p > 0]
+    if not valid_ids:
+        return {"archivados": 0, "mensaje": "No hay IDs"}
+
+    usuario = _usuario_registro_desde_current_user(current_user)
+    marca = datetime.now(ZoneInfo("America/Caracas")).isoformat(timespec="seconds")
+    rows = db.execute(select(PagoConError).where(PagoConError.id.in_(valid_ids))).scalars().all()
+    archivados = 0
+    for row in rows:
+        row.estado = "EXPORTADO_REVISION"
+        nota = f"Exportado a revisión ({marca}) por {usuario}"
+        row.observaciones = f'{(row.observaciones or "").strip()} | {nota}'.strip(" |")
+        archivados += 1
+    db.commit()
+    return {"archivados": archivados, "mensaje": f"{archivados} pago(s) archivado(s) para revisión"}
+
+
+
+
+
+@router.get("/export", response_model=list)
+
+def exportar_pagos_con_errores(
+
+    cedula: Optional[str] = Query(None),
+
+    fecha_desde: Optional[str] = Query(None),
+
+    fecha_hasta: Optional[str] = Query(None),
+
+    db: Session = Depends(get_db),
+
+):
+
+    """Exporta todos los pagos con errores para Excel (100% de datos). El archivado se realiza aparte."""
+
+    q = select(PagoConError).order_by(
+
+        PagoConError.fecha_registro.desc().nullslast(), PagoConError.id.desc()
+
+    )
+
+    if cedula and cedula.strip():
+
+        q = q.where(PagoConError.cedula_cliente.ilike(f"%{cedula.strip()}%"))
+
+    if fecha_desde:
+
+        try:
+
+            fd = date.fromisoformat(fecha_desde)
+
+            q = q.where(PagoConError.fecha_pago >= datetime.combine(fd, dt_time.min))
+
+        except ValueError:
+
+            pass
+
+    if fecha_hasta:
+
+        try:
+
+            fh = date.fromisoformat(fecha_hasta)
+
+            q = q.where(PagoConError.fecha_pago <= datetime.combine(fh, dt_time.max))
+
+        except ValueError:
+
+            pass
+
+    rows = db.execute(q).scalars().all()
+
+    return [_pago_con_error_to_response(r, db) for r in rows]
+
+
+
+
+
+class LimpiarYaCargadosBody(BaseModel):
+    """Cuerpo opcional para limpiar PagoConError redundantes (ya cargados en cartera + cuotas).
+
+    Si `ids` está vacío o ausente, se barre el universo completo de pagos_con_errores
+    (limitado por `max_revisar` para evitar barridos descontrolados).
+    """
+
+    ids: Optional[list[int]] = None
+    max_revisar: int = 5000
+
+    @field_validator("max_revisar")
+    @classmethod
+    def _max_pos(cls, v: int) -> int:
+        if v <= 0:
+            return 5000
+        return min(v, 20000)
+
+
+@router.post("/limpiar-ya-cargados", response_model=dict)
+def limpiar_pagos_con_error_ya_cargados(
+    payload: LimpiarYaCargadosBody = Body(default_factory=LimpiarYaCargadosBody),
+    db: Session = Depends(get_db),
+    current_user: UserResponse = Depends(get_current_user),
+) -> dict:
+    """
+    Elimina filas de `pagos_con_errores` cuyo equivalente ya está cargado y aplicado
+    en cartera (mismo numero_documento + cuota_pagos aplicado + misma cédula y préstamo
+    cuando el origen lo informa). El criterio es el mismo que usa `mover-a-pagos`
+    para detectar redundancia, pero aquí no movemos nada — solo limpiamos.
+
+    - `ids` vacío/ausente: barre todos los `PagoConError` (hasta `max_revisar`).
+    - `ids` con valores: solo se evalúan esos.
+
+    Aislamiento por fila: si una falla, se hace rollback parcial y se sigue.
+    """
+    _ = current_user
+
+    rows: list[PagoConError]
+    if payload.ids:
+        ids_validos = [int(i) for i in payload.ids if isinstance(i, int) and i > 0]
+        if not ids_validos:
+            return {
+                "eliminados": 0,
+                "evaluados": 0,
+                "errores": [],
+                "detalles": [],
+                "mensaje": "No hay IDs válidos para evaluar.",
+            }
+        rows = list(
+            db.execute(
+                select(PagoConError).where(PagoConError.id.in_(ids_validos))
+            ).scalars()
+        )
+    else:
+        rows = list(
+            db.execute(
+                select(PagoConError)
+                .order_by(PagoConError.id.asc())
+                .limit(payload.max_revisar)
+            ).scalars()
+        )
+
+    eliminados = 0
+    detalles: list[dict[str, Any]] = []
+    errores: list[str] = []
+
+    for row in rows:
+        pid = int(row.id)
+        try:
+            pago_existente_id = pago_con_error_ya_cargado_estricto(db, row)
+            if pago_existente_id is None:
+                pago_existente_id = pago_con_error_conflicto_huella_existente(db, row)
+            if pago_existente_id is None:
+                continue
+            detalles.append(
+                {
+                    "pago_con_error_id": pid,
+                    "pago_id": pago_existente_id,
+                    "cedula": row.cedula_cliente,
+                    "prestamo_id": row.prestamo_id,
+                    "numero_documento": row.numero_documento,
+                }
+            )
+            db.delete(row)
+            db.flush()
+            eliminados += 1
+        except Exception as e_row:
+            db.rollback()
+            logger.error(
+                "limpiar_pagos_con_error_ya_cargados: fallo evaluando id=%s: %s",
+                pid,
+                e_row,
+                exc_info=True,
+            )
+            errores.append(f"PagoConError {pid}: {e_row}")
+            continue
+
+    try:
+        db.commit()
+    except Exception as e_commit:
+        db.rollback()
+        logger.exception(
+            "limpiar_pagos_con_error_ya_cargados: fallo en commit final: %s", e_commit
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error al confirmar la limpieza: {e_commit}",
+        ) from e_commit
+
+    mensaje = (
+        f"Evaluados {len(rows)}; eliminados {eliminados} por estar ya cargados en cartera."
+    )
+    if errores:
+        mensaje += f" Errores: {len(errores)}."
+
+    return {
+        "eliminados": eliminados,
+        "evaluados": len(rows),
+        "errores": errores,
+        "detalles": detalles,
+        "mensaje": mensaje,
+    }
+
+
+@router.post("/mover-a-pagos", response_model=dict)
+
+def mover_a_pagos_normales(
+
+    payload: EliminarPorDescargaBody = Body(...),
+
+    db: Session = Depends(get_db),
+
+):
+
+    """Mueve pagos corregidos de pagos_con_errores a pagos (y los elimina de con_errores).
+    Por cada fila: alta en cartera + cascada incremental del pago + commit.
+    Al cerrar el lote: reconstruye cascada completa solo si el incremental no
+    abonó cuotas o el préstamo requiere corrección (evita sobrecarga multi-usuario).
+    """
+
+    ids = payload.ids
+
+    if not ids:
+
+        logger.info("mover_a_pagos_normales: lista vacía de IDs")
+        return {"movidos": 0, "mensaje": "No hay IDs"}
+
+    logger.info(f"mover_a_pagos_normales: iniciando con {len(ids)} pago(s): {ids}")
+
+    from app.models.pago import Pago
+
+    from app.api.v1.endpoints.pagos import _aplicar_pago_a_cuotas_interno
+
+
+
+    movidos = 0
+
+    cuotas_aplicadas = 0
+
+    errores_procesamiento = []
+    # Filas eliminadas en silencio porque ya están cargadas y aplicadas en cartera
+    # (mismo doc + cuota_pagos + cliente/préstamo): redundantes, no se mueven.
+    ya_cargado_eliminados: list[dict[str, Any]] = []
+    movidos_detalle: list[dict[str, Any]] = []
+    # Préstamos tocados: al final solo se reconstruye si hace falta (menos carga multi-usuario).
+    prestamos_para_cascada: set[int] = set()
+    prestamos_forzar_rebuild: set[int] = set()
+
+    for idx, pid in enumerate(ids, start=1):
+
+        if not isinstance(pid, int) or pid <= 0:
+
+            logger.warning(f"mover_a_pagos_normales: ID inválido (tipo/valor): {pid}")
+            continue
+
+        row = db.get(PagoConError, pid)
+
+        if not row:
+
+            logger.warning(f"mover_a_pagos_normales: PagoConError {pid} no encontrado")
+            continue
+
+        logger.debug(f"mover_a_pagos_normales: procesando pago {idx}/{len(ids)} (id={pid}, cedula={row.cedula_cliente}, monto={row.monto_pagado})")
+
+        # Aislar el procesamiento de cada fila: si una explota (constraint, cascada, etc.) hacemos
+        # rollback parcial y seguimos con las demás, evitando 500 por toda la lista.
+        try:
+
+            # Prechequeo estricto: si el documento ya está aplicado a cuotas con misma cédula y
+            # mismo préstamo (cuando el origen lo informa), la fila es redundante: la eliminamos
+            # silenciosamente y la reportamos como "ya_cargado_eliminados". Ahorra a operación
+            # tener que ir a borrar manualmente filas duplicadas que ya pasaron al préstamo.
+            pago_existente_id = pago_con_error_ya_cargado_estricto(db, row)
+            motivo_ya_cargado = "estricto"
+            if pago_existente_id is not None:
+                ya_cargado_eliminados.append(
+                    {
+                        "pago_con_error_id": pid,
+                        "pago_id": pago_existente_id,
+                        "cedula": row.cedula_cliente,
+                        "prestamo_id": row.prestamo_id,
+                        "numero_documento": row.numero_documento,
+                        "motivo": motivo_ya_cargado,
+                    }
+                )
+                logger.info(
+                    "mover_a_pagos_normales: pago_con_error_id=%s ya cargado en pago_id=%s (%s); eliminado por redundante",
+                    pid,
+                    pago_existente_id,
+                    motivo_ya_cargado,
+                )
+                db.delete(row)
+                db.commit()
+                continue
+
+            numero_documento_normalizado = row.numero_documento or ""
+
+            # Resolver la cédula EXACTA como está almacenada en `clientes` (FK fk_pagos_cedula).
+            cedula_resuelta = resolver_cedula_almacenada_en_clientes(db, row.cedula_cliente)
+            if not cedula_resuelta:
+                cedula_norm_orig = (
+                    normalizar_cedula_almacenamiento(row.cedula_cliente) or "(vacía)"
+                )
+                logger.warning(
+                    "mover_a_pagos_normales: pago %s sin cliente en `clientes` (cedula=%s)",
+                    pid,
+                    cedula_norm_orig,
+                )
+                errores_procesamiento.append(
+                    f"Pago {pid}: cliente '{cedula_norm_orig}' no existe en `clientes`. "
+                    "Registre/ajuste la cédula del cliente y reintente."
+                )
+                continue  # No insertar: violaría fk_pagos_cedula.
+
+            prestamo_id_destino, err_prestamo = _resolver_prestamo_id_para_mover_a_cartera(
+                db,
+                cedula_resuelta,
+                row.prestamo_id,
+            )
+            if err_prestamo:
+                logger.warning(
+                    "mover_a_pagos_normales: pago %s sin préstamo destino (%s)",
+                    pid,
+                    err_prestamo,
+                )
+                errores_procesamiento.append(f"Pago {pid}: {err_prestamo}")
+                continue
+
+            from app.services.pagos_desistimiento_politica import (
+                bloquear_carga_automatica_a_cartera_si_desistimiento,
+            )
+
+            err_desist = bloquear_carga_automatica_a_cartera_si_desistimiento(
+                db, prestamo_id_destino
+            )
+            if err_desist:
+                logger.warning(
+                    "mover_a_pagos_normales: pago %s bloqueado DESISTIMIENTO prestamo=%s",
+                    pid,
+                    prestamo_id_destino,
+                )
+                errores_procesamiento.append(f"Pago {pid}: {err_desist}")
+                continue
+
+            adopt_pago_id = None
+            if numero_documento_normalizado and prestamo_id_destino:
+                adopt_pago_id = pago_huerfano_adoptable_por_documento(
+                    db,
+                    numero_documento_normalizado,
+                    prestamo_id_destino=int(prestamo_id_destino),
+                    cedula_cliente=cedula_resuelta,
+                )
+
+            if adopt_pago_id is None and numero_documento_normalizado:
+                from app.services.pago_binance_serial_unico import (
+                    mensaje_conflicto_binance,
+                    primer_pago_id_mismo_serial_binance,
+                )
+
+                binance_id = primer_pago_id_mismo_serial_binance(
+                    db,
+                    numero_documento_normalizado,
+                    institucion_bancaria=getattr(row, "institucion_bancaria", None),
+                )
+                if binance_id is not None:
+                    msg_b = mensaje_conflicto_binance(binance_id)
+                    row.errores_descripcion = [msg_b[:400]]
+                    row.observaciones = (
+                        f"{(row.observaciones or '').strip()} | {msg_b}".strip(" |")
+                    )[:255]
+                    logger.warning(
+                        "mover_a_pagos_normales: pago %s bloqueado serial Binance vs pago_id=%s",
+                        pid,
+                        binance_id,
+                    )
+                    errores_procesamiento.append(f"Pago {pid}: {msg_b}")
+                    db.commit()
+                    continue
+
+                duplicado_existe = numero_documento_ya_registrado(
+                    db,
+                    numero_documento_normalizado,
+                    exclude_pago_con_error_id=pid,
+                )
+                if duplicado_existe:
+                    logger.warning(
+                        "mover_a_pagos_normales: pago %s documento duplicado en pagos: %s",
+                        pid,
+                        numero_documento_normalizado,
+                    )
+                    errores_procesamiento.append(
+                        f"Pago {pid}: documento '{numero_documento_normalizado}' ya existe en tabla pagos"
+                    )
+                    continue
+
+            pago_huella_id = pago_con_error_conflicto_huella_existente(db, row)
+            if pago_huella_id is not None and adopt_pago_id != pago_huella_id:
+                errores_procesamiento.append(
+                    f"Pago {pid}: {mensaje_409_huella_funcional_con_id(pago_huella_id)}"
+                )
+                continue
+
+            # «Guardar y procesar» = intención explícita de pasar a cartera. Si hay préstamo y monto,
+            # forzamos validación cartera (conciliado + verificado SI) para que la columna Cartera y la
+            # cascada queden alineadas con el estado final. Sin préstamo respetamos la fila origen.
+            debe_validar_cartera = bool(prestamo_id_destino) and float(row.monto_pagado or 0) > 0
+            if debe_validar_cartera:
+                conciliado = True
+            else:
+                conciliado = bool(row.conciliado) if row.conciliado is not None else False
+
+            ahora = datetime.now(ZoneInfo("America/Caracas")) if conciliado else None
+
+            # `chk_pagos_conciliado_pendiente_inconsistente` rechaza (conciliado=True ∧ estado=PENDIENTE).
+            # Si vamos a marcar conciliado y el origen estaba en PENDIENTE/sin estado, abrimos en PAGADO; la
+            # cascada posterior puede sobrescribir si aplica cuotas (mismo patrón que revision_manual).
+            estado_inicial = (row.estado or "PENDIENTE").strip().upper() or "PENDIENTE"
+            if conciliado and estado_inicial == "PENDIENTE":
+                estado_inicial = "PAGADO"
+
+            if adopt_pago_id is not None:
+                pago = db.get(Pago, int(adopt_pago_id))
+                if pago is None:
+                    errores_procesamiento.append(
+                        f"Pago {pid}: no se encontró pago huérfano id={adopt_pago_id} para adoptar"
+                    )
+                    continue
+                logger.info(
+                    "mover_a_pagos_normales: adoptando pago huérfano id=%s con datos de pago_con_error id=%s",
+                    adopt_pago_id,
+                    pid,
+                )
+            else:
+                pago = Pago(
+                    cedula_cliente=cedula_resuelta,
+                    prestamo_id=prestamo_id_destino,
+                    fecha_pago=row.fecha_pago,
+                    monto_pagado=row.monto_pagado,
+                    numero_documento=row.numero_documento or "",
+                    institucion_bancaria=row.institucion_bancaria,
+                    estado=estado_inicial,
+                    conciliado=conciliado,
+                    fecha_conciliacion=ahora,
+                    verificado_concordancia="SI" if conciliado else "",
+                    notas=row.notas,
+                    referencia_pago=row.referencia_pago or row.numero_documento or "N/A",
+                )
+                db.add(pago)
+                db.flush()
+                db.refresh(pago)
+
+            if adopt_pago_id is not None:
+                pago.cedula_cliente = cedula_resuelta
+                pago.prestamo_id = prestamo_id_destino
+                pago.fecha_pago = row.fecha_pago
+                pago.monto_pagado = row.monto_pagado
+                if row.institucion_bancaria:
+                    pago.institucion_bancaria = row.institucion_bancaria
+                pago.estado = estado_inicial
+                pago.conciliado = conciliado
+                pago.fecha_conciliacion = ahora
+                pago.verificado_concordancia = "SI" if conciliado else ""
+                if row.notas:
+                    pago.notas = row.notas
+                pago.referencia_pago = (
+                    row.referencia_pago or row.numero_documento or pago.referencia_pago or "N/A"
+                )
+                db.flush()
+                db.refresh(pago)
+
+            nuevo_pago_id = pago.id
+            cc_aplicadas = 0
+            cp_aplicadas = 0
+            prestamo_cascada_id = (
+                int(pago.prestamo_id) if pago.prestamo_id else None
+            )
+
+            if prestamo_cascada_id and float(pago.monto_pagado or 0) > 0:
+                try:
+                    cc, cp = _aplicar_pago_a_cuotas_interno(pago, db)
+                    cc_aplicadas = cc
+                    cp_aplicadas = cp
+
+                    if cc > 0 or cp > 0:
+                        pago.estado = "PAGADO"
+                        cuotas_aplicadas += cc + cp
+                        logger.info(
+                            f"mover_a_pagos_normales: pago id={nuevo_pago_id} aplicado a {cc} cuota(s) completa(s), {cp} parcial(es)"
+                        )
+                    else:
+                        logger.warning(
+                            f"mover_a_pagos_normales: pago id={nuevo_pago_id} no se aplicó a ninguna cuota (prestamo={pago.prestamo_id}); "
+                            "se reconstruirá cascada del préstamo al cerrar el lote"
+                        )
+                except Exception as e:
+                    # No dejar el pago en cartera sin cuotas: deshace el alta de esta fila.
+                    db.rollback()
+                    logger.error(
+                        f"mover_a_pagos_normales: error aplicando pago id={nuevo_pago_id} a cuotas: {str(e)}",
+                        exc_info=True,
+                    )
+                    errores_procesamiento.append(f"Pago {pid}: cuotas: {str(e)}")
+                    continue
+
+            db.delete(row)
+            logger.debug(
+                f"mover_a_pagos_normales: pago id={pid} eliminado de pagos_con_errores, creado pago id={nuevo_pago_id}"
+            )
+
+            # Commit por fila: libera el lock de cascada y acorta la tx.
+            db.commit()
+            movidos += 1
+            movidos_detalle.append(
+                {
+                    "pago_con_error_id": pid,
+                    "pago_id": nuevo_pago_id,
+                }
+            )
+            if prestamo_cascada_id and prestamo_cascada_id > 0:
+                prestamos_para_cascada.add(prestamo_cascada_id)
+                # Incremental sin abono → hay que reconstruir (tabla vacía / orden).
+                if float(pago.monto_pagado or 0) > 0 and (
+                    cc_aplicadas + cp_aplicadas
+                ) == 0:
+                    prestamos_forzar_rebuild.add(prestamo_cascada_id)
+
+        except Exception as e_row:
+            db.rollback()
+            logger.error(
+                f"mover_a_pagos_normales: fallo procesando pago_con_error id={pid}: {e_row}",
+                exc_info=True,
+            )
+            errores_procesamiento.append(
+                f"Pago {pid}: {_mensaje_error_mover_pago_a_cartera(e_row)}"
+            )
+            continue
+
+    # Cascada integrada: reconstruir solo si incremental falló/0 o el préstamo
+    # requiere corrección. Evita N reconstrucciones pesadas bajo muchos usuarios.
+    cascadas_ok = 0
+    cascadas_omitidas = 0
+    if prestamos_para_cascada:
+        from app.services.pagos_aplicacion_prestamo import (
+            aplicar_cascada_prestamo_pipeline,
+        )
+        from app.services.pagos_cuotas_reaplicacion import (
+            prestamo_requiere_correccion_cascada,
+        )
+
+        for prestamo_id in sorted(prestamos_para_cascada):
+            forzar = prestamo_id in prestamos_forzar_rebuild
+            try:
+                necesita = forzar or prestamo_requiere_correccion_cascada(
+                    db, prestamo_id
+                )
+            except Exception:
+                logger.exception(
+                    "mover_a_pagos_normales: chequeo correccion cascada prestamo_id=%s",
+                    prestamo_id,
+                )
+                necesita = True
+            if not necesita:
+                cascadas_omitidas += 1
+                logger.info(
+                    "mover_a_pagos_normales: omito reconstrucción prestamo_id=%s "
+                    "(incremental OK, sin corrección)",
+                    prestamo_id,
+                )
+                continue
+            try:
+                pipeline = aplicar_cascada_prestamo_pipeline(
+                    prestamo_id,
+                    db,
+                    reconstruir_completa=True,
+                )
+                if not pipeline.get("ok"):
+                    db.rollback()
+                    err = str(
+                        pipeline.get("error")
+                        or "No se pudo reconstruir la cascada"
+                    )
+                    codigo = str(pipeline.get("codigo") or "")
+                    logger.warning(
+                        "mover_a_pagos_normales: cascada prestamo_id=%s falló codigo=%s err=%s",
+                        prestamo_id,
+                        codigo,
+                        err,
+                    )
+                    errores_procesamiento.append(
+                        f"Préstamo {prestamo_id}: cascada: {err}"
+                    )
+                    continue
+                n_pagos = int(pipeline.get("pagos_con_aplicacion") or 0)
+                db.commit()
+                cascadas_ok += 1
+                if n_pagos > 0:
+                    cuotas_aplicadas = max(cuotas_aplicadas, n_pagos)
+                logger.info(
+                    "mover_a_pagos_normales: cascada reconstruida prestamo_id=%s pagos=%s forzar=%s",
+                    prestamo_id,
+                    n_pagos,
+                    forzar,
+                )
+            except Exception as e_casc:
+                db.rollback()
+                logger.exception(
+                    "mover_a_pagos_normales: excepción cascada prestamo_id=%s",
+                    prestamo_id,
+                )
+                errores_procesamiento.append(
+                    f"Préstamo {prestamo_id}: cascada: {e_casc}"
+                )
+
+    logger.info(
+        "mover_a_pagos_normales: COMPLETADO - movidos=%s cuotas=%s ya_cargado_eliminados=%s "
+        "cascadas=%s omitidas=%s prestamos=%s",
+        movidos,
+        cuotas_aplicadas,
+        len(ya_cargado_eliminados),
+        cascadas_ok,
+        cascadas_omitidas,
+        len(prestamos_para_cascada),
+    )
+
+    try:
+        from app.services.recibos_conciliacion_email_job import (
+            programar_intentar_envio_recibos_tras_pagos_en_cartera,
+        )
+
+        ids_rec = [
+            int(d["pago_id"])
+            for d in movidos_detalle
+            if d.get("pago_id") is not None
+        ]
+        programar_intentar_envio_recibos_tras_pagos_en_cartera(ids_rec)
+    except Exception:
+        logger.exception("mover_a_pagos_normales: Recibos no bloquea el alta")
+
+    mensaje = (
+        f"{movidos} pagos movidos a tabla pagos; cuotas aplicadas: {cuotas_aplicadas}"
+    )
+    if cascadas_ok:
+        mensaje += f"; cascada reconstruida en {cascadas_ok} préstamo(s)"
+    if cascadas_omitidas:
+        mensaje += f"; cascada omitida en {cascadas_omitidas} (ya OK)"
+    if ya_cargado_eliminados:
+        mensaje += (
+            f"; {len(ya_cargado_eliminados)} omitido(s) por estar ya cargado(s) "
+            "y aplicado(s) en cartera (eliminados de revisión)"
+        )
+
+    respuesta: dict[str, Any] = {
+        "movidos": movidos,
+        "cuotas_aplicadas": cuotas_aplicadas,
+        "movidos_detalle": movidos_detalle,
+        "ya_cargado_eliminados": ya_cargado_eliminados,
+        "ya_cargado_eliminados_count": len(ya_cargado_eliminados),
+        "cascadas_reconstruidas": cascadas_ok,
+        "cascadas_omitidas": cascadas_omitidas,
+        "prestamos_cascada": sorted(prestamos_para_cascada),
+        "mensaje": mensaje,
+    }
+
+    if errores_procesamiento:
+        logger.warning(f"mover_a_pagos_normales: errores durante procesamiento: {errores_procesamiento}")
+        respuesta["errores"] = errores_procesamiento
+        respuesta["mensaje"] += f" ({len(errores_procesamiento)} error(es))"
+
+    return respuesta
+
+
+
+
+
+@router.get("/{pago_id}", response_model=dict)
+
+def obtener_pago_con_error(pago_id: int, db: Session = Depends(get_db)):
+
+    row = db.get(PagoConError, pago_id)
+
+    if not row:
+
+        raise HTTPException(status_code=404, detail="Pago con error no encontrado")
+
+    return _pago_con_error_to_response(row, db)
+
+
+
+
+
+@router.put("/{pago_id}", response_model=dict)
+
+def actualizar_pago_con_error(pago_id: int, payload: PagoConErrorUpdate, db: Session = Depends(get_db)):
+
+    row = db.get(PagoConError, pago_id)
+
+    if not row:
+
+        raise HTTPException(status_code=404, detail="Pago con error no encontrado")
+
+    # Prechequeo estricto: si esta fila ya tiene un Pago equivalente cargado y aplicado a
+    # cuotas en cartera (mismo doc + cuota_pagos + cédula y préstamo cuando aplique), es
+    # redundante. La eliminamos en silencio en lugar de aceptar la edición y devolvemos
+    # `ya_cargado_eliminado=True` para que el frontend cierre el formulario sin alarma.
+    pago_existente_id = pago_con_error_ya_cargado_estricto(db, row)
+    if pago_existente_id is not None:
+        info = {
+            "ya_cargado_eliminado": True,
+            "pago_con_error_id": pago_id,
+            "pago_id": pago_existente_id,
+            "cedula": row.cedula_cliente,
+            "prestamo_id": row.prestamo_id,
+            "numero_documento": row.numero_documento,
+            "motivo": "estricto",
+            "mensaje": (
+                "Este pago ya estaba cargado y aplicado a cuotas en cartera; "
+                "se eliminó de revisión por ser redundante."
+            ),
+        }
+        logger.info(
+            "actualizar_pago_con_error: pago_con_error_id=%s ya cargado en pago_id=%s; eliminado por redundante",
+            pago_id,
+            pago_existente_id,
+        )
+        db.delete(row)
+        db.commit()
+        return info
+
+    data = payload.model_dump(exclude_unset=True)
+
+    cedula_enviada_o_actual = (
+        data.get("cedula_cliente")
+        if "cedula_cliente" in data
+        else getattr(row, "cedula_cliente", None)
+    )
+    if _cedula_placeholder_error(cedula_enviada_o_actual):
+        cedula_lote = _cedula_lote_it_master_desde_pago_con_error(db, row)
+        if cedula_lote:
+            data["cedula_cliente"] = cedula_lote
+        elif (row.usuario_registro or "").strip().upper() == "GMAIL_PIPELINE":
+            prestamo_id_destino = data.get("prestamo_id", row.prestamo_id)
+            if prestamo_id_destino:
+                prestamo_destino = db.get(Prestamo, prestamo_id_destino)
+                if prestamo_destino and getattr(prestamo_destino, "cedula", None):
+                    data["cedula_cliente"] = prestamo_destino.cedula
+
+    _doc_touch = "numero_documento" in data or "codigo_documento" in data
+
+    if _doc_touch:
+
+        b0, c0 = split_numero_documento_almacenado(row.numero_documento or "")
+
+        if "numero_documento" in data:
+
+            nb = normalize_documento(data["numero_documento"])
+
+        else:
+
+            nb = normalize_documento(b0)
+
+        if not nb:
+
+            raise HTTPException(status_code=400, detail="numero_documento no puede estar vacío.")
+
+        if "codigo_documento" in data:
+
+            nc = normalize_codigo_documento(data.get("codigo_documento"))
+
+        else:
+
+            nc = normalize_codigo_documento(c0) if c0 else None
+
+        new_stored = compose_numero_documento_almacenado(nb, nc)
+
+        if new_stored and numero_documento_ya_registrado(
+
+            db,
+
+            new_stored,
+
+            exclude_pago_con_error_id=pago_id,
+
+        ):
+
+            raise HTTPException(
+
+                status_code=409,
+
+                detail="Ya existe un pago o registro en revisión con la misma combinación comprobante + código.",
+
+            )
+
+        row.numero_documento = new_stored
+
+        row.referencia_pago = (new_stored or nb or "N/A")[:100]
+
+        data.pop("numero_documento", None)
+
+        data.pop("codigo_documento", None)
+
+    if "cedula_cliente" in data:
+
+        row.cedula_cliente = (data["cedula_cliente"] or "").strip()
+
+    if "prestamo_id" in data:
+
+        row.prestamo_id = data["prestamo_id"]
+
+    if "fecha_pago" in data and data["fecha_pago"] is not None:
+
+        try:
+
+            row.fecha_pago = datetime.strptime(data["fecha_pago"], "%Y-%m-%d").replace(
+
+                hour=0, minute=0, second=0, microsecond=0
+
+            )
+
+        except ValueError:
+
+            raise HTTPException(status_code=400, detail="fecha_pago debe ser YYYY-MM-DD")
+
+    if "monto_pagado" in data:
+
+        row.monto_pagado = data["monto_pagado"]
+
+    if "institucion_bancaria" in data:
+
+        row.institucion_bancaria = (
+
+            data["institucion_bancaria"].strip() if data["institucion_bancaria"] else None
+
+        )
+
+    if "notas" in data:
+
+        row.notas = data["notas"]
+
+    if "conciliado" in data:
+
+        row.conciliado = data["conciliado"]
+
+    if "errores_descripcion" in data:
+
+        row.errores_descripcion = data["errores_descripcion"]
+
+    if "observaciones" in data:
+
+        row.observaciones = (data["observaciones"] or "").strip() or None
+
+    rechazar_si_pago_con_error_serial_duplicado(
+        db, row, exclude_pago_con_error_id=pago_id
+    )
+
+    db.commit()
+
+    db.refresh(row)
+
+    return _pago_con_error_to_response(row, db)
+
+
+
+
+
+@router.delete("/{pago_id}", status_code=204)
+
+def eliminar_pago_con_error(pago_id: int, db: Session = Depends(get_db)):
+
+    row = db.get(PagoConError, pago_id)
+
+    if not row:
+
+        logger.warning(f"eliminar_pago_con_error: PagoConError {pago_id} no encontrado (404)")
+        raise HTTPException(status_code=404, detail="Pago con error no encontrado")
+
+    logger.info(f"eliminar_pago_con_error: eliminando pago {pago_id} (cedula={row.cedula_cliente}, monto={row.monto_pagado})")
+
+    db.delete(row)
+
+    db.commit()
+    
+    logger.info(f"eliminar_pago_con_error: pago {pago_id} eliminado exitosamente de pagos_con_errores")
+
+    return None
+
+
+
+
+
+
+

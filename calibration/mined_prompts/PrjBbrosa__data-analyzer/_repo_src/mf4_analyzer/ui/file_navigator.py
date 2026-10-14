@@ -1,0 +1,1172 @@
+"""Left pane: file list (replacing QTabWidget) + channel tree."""
+import json
+import logging
+from contextlib import nullcontext
+
+import qtawesome as qta
+from PyQt5.QtCore import (
+    QEvent, QMimeData, QPoint, QSignalBlocker, QSize, QTimer, Qt, pyqtSignal,
+)
+from PyQt5.QtGui import QDrag
+from PyQt5.QtWidgets import (
+    QApplication, QFrame, QHBoxLayout, QLabel, QMenu,
+    QScrollArea, QSizePolicy, QSplitter, QToolButton, QVBoxLayout, QWidget,
+)
+
+from ..ui_kit.icons import Icons
+from ..ui_kit.menus import apply_rounded_menu_chrome
+from ..ui_kit.popup_trigger import bind_popup_trigger, sync_popup_trigger
+from .widgets import INTERNAL_FILE_FIDS_MIME, MultiFileChannelWidget
+
+logger = logging.getLogger(__name__)
+_FILE_ORDER_BEFORE = "before"
+_FILE_ORDER_AFTER = "after"
+# Lock the expanded left rail to the Inspector outer width (272 content + 16
+# chrome). Content still wins if a future font/style needs more.
+NAVIGATOR_MIN_EXPANDED_WIDTH = 288
+NAVIGATOR_DEFAULT_EXPANDED_WIDTH = 288
+
+
+class _ElidedLabel(QLabel):
+    """QLabel that elides its text to fit available width and exposes the full
+    string via tooltip when truncation occurs."""
+
+    def __init__(self, text="", parent=None):
+        super().__init__(parent)
+        self._full_text = ""
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setMinimumWidth(0)
+        self.setText(text)
+
+    def setText(self, text):
+        self._full_text = text or ""
+        self._apply_elided()
+
+    def full_text(self):
+        """The complete (un-elided) string last assigned via ``setText``.
+
+        ``text()`` returns the possibly-elided string actually painted; callers
+        and tests that need the logical value should read this instead."""
+        return self._full_text
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_elided()
+
+    def _apply_elided(self):
+        fm = self.fontMetrics()
+        avail = max(0, self.width())
+        # MF4 names share long prefixes (DC2E_0011_*); keep head+tail visible.
+        elided = fm.elidedText(self._full_text, Qt.ElideMiddle, avail)
+        super().setText(elided)
+        if elided != self._full_text:
+            self.setToolTip(self._full_text)
+        else:
+            self.setToolTip("")
+
+
+class _FileRow(QFrame):
+    activated = pyqtSignal(str)       # emits primary fid
+    close_requested = pyqtSignal(str)  # emits rows_key (filepath_str or fid)
+    attach_requested = pyqtSignal(object)  # emits every logical fid on this card
+    # Keyboard equivalent of drag-reorder: rows_key, "up"|"down".
+    reorder_requested = pyqtSignal(str, str)
+    MIME_TYPE = INTERNAL_FILE_FIDS_MIME
+
+    def __init__(self, fid, fd, parent=None):
+        super().__init__(parent)
+        # --- fid list (ordered) ---
+        self._fids = [fid]
+        self._fds = [fd]
+        self.fid = fid  # primary fid (backwards compat)
+        self._rows_key = fid  # default key; caller may override via _set_rows_key
+        self.setObjectName("fileRow")
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._active = False
+        self._drag_start = None
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        lay = QVBoxLayout()
+        # Left inset 14 = former 3px accent stripe + 7 spacing + 4 inner pad,
+        # kept so the text column stays put now that the accent frame is gone.
+        lay.setContentsMargins(14, 8, 7, 8)
+        lay.setSpacing(4)
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        fp = getattr(fd, "filepath", None)
+        if fp is not None:
+            full_name = fp.stem
+        else:
+            full_name = getattr(fd, "filename", "") or getattr(fd, "short_name", "")
+        self._lbl_name = _ElidedLabel(full_name)
+        self._lbl_name.setObjectName("fileRowName")
+        self._lbl_name.setFocusPolicy(Qt.NoFocus)
+        self.setAccessibleName(full_name)
+        top.addWidget(self._lbl_name, stretch=1)
+        lay.addLayout(top)
+
+        meta = QHBoxLayout()
+        meta.setSpacing(5)
+        self._lbl_attachment = QLabel("")
+        self._lbl_attachment.setObjectName("fileRowAttachment")
+        self._lbl_attachment.setFocusPolicy(Qt.NoFocus)
+        self._lbl_attachment.hide()
+        meta.addWidget(self._lbl_attachment, 0, Qt.AlignVCenter)
+        self._lbl_meta = _ElidedLabel("")
+        self._lbl_meta.setObjectName("fileRowMeta")
+        self._lbl_meta.setFocusPolicy(Qt.NoFocus)
+        meta.addWidget(self._lbl_meta, stretch=1)
+        lay.addLayout(meta)
+
+        actions = QVBoxLayout()
+        actions.setContentsMargins(0, 8, 7, 8)
+        actions.setSpacing(4)
+        # 2026-04-26 R3 紧凑化 fix-4: setFixedSize(24, 24) on the file-row
+        # close button. The icon stays 16x16 but the outer chrome was
+        # eating ~30px before, dwarfing every other element on the row.
+        self._btn_close = QToolButton()
+        self._btn_close.setIcon(Icons.close_file())
+        self._btn_close.setIconSize(QSize(16, 16))
+        self._btn_close.setFixedSize(QSize(24, 24))
+        self._btn_close.setToolTip("关闭文件")
+        self._btn_close.setAccessibleName("关闭文件")
+        self._btn_close.setProperty("role", "icon")
+        self._btn_close.setAutoRaise(True)
+        self._btn_close.setFocusPolicy(Qt.StrongFocus)
+        self._btn_close.clicked.connect(
+            self._on_close_clicked
+        )
+        actions.addWidget(self._btn_close)
+        self._btn_attach = QToolButton()
+        self._btn_attach.setObjectName("fileRowAttach")
+        self._btn_attach.setIconSize(QSize(16, 16))
+        self._btn_attach.setFixedSize(QSize(24, 24))
+        self._btn_attach.setProperty("role", "icon")
+        self._btn_attach.setAutoRaise(True)
+        self._btn_attach.setFocusPolicy(Qt.StrongFocus)
+        self._btn_attach.clicked.connect(self._on_attach_clicked)
+        actions.addWidget(self._btn_attach)
+        # Both action buttons belong to the card's natural height. A stretch
+        # here advertises vertical expansion to the file-list layout, causing
+        # a single card to absorb the empty list area.
+        actions.setAlignment(Qt.AlignTop)
+        outer.addLayout(lay, stretch=1)
+        outer.addLayout(actions, 0)
+        self._attachment_target = None
+        self._attachment_available = False
+        self._refresh_meta()
+        self._refresh_attachment_status()
+
+    def _set_rows_key(self, key):
+        """Set the key this row emits on close (filepath_str in grouped mode, fid in flat)."""
+        self._rows_key = key
+
+    def _refresh_meta(self):
+        if len(self._fids) == 1:
+            fd = self._fds[0]
+            dur = fd.time_array[-1] if fd.time_array is not None and len(fd.time_array) else 0
+            self._lbl_meta.setText(
+                f"{len(fd.data)} 行 · {fd.fs:.1f} Hz · {dur:.2f} s"
+            )
+        else:
+            # N>1 fids: "N 轨 · fs1k/fs2k Hz · dur s"
+            hz_parts = "/".join(f"{fd.fs / 1000:.1f}k" for fd in self._fds)
+            max_dur = 0.0
+            for fd in self._fds:
+                if fd.time_array is not None and len(fd.time_array):
+                    max_dur = max(max_dur, fd.time_array[-1])
+            self._lbl_meta.setText(
+                f"{len(self._fids)} 轨 · {hz_parts} Hz · {max_dur:.2f} s"
+            )
+
+    def set_attachment_context(self, target, attached_fids, *, available=True):
+        """Refresh this card from a parent-provided, View-scoped projection.
+
+        File rows deliberately retain no MainWindow/ViewState reference: the
+        navigator supplies the currently projected attachment facts and target
+        text whenever the owner switches its context.
+        """
+        self._attachment_target = str(target or "")
+        self._attachment_available = bool(available)
+        self._attached_fids = {str(fid) for fid in (attached_fids or ())}
+        self._refresh_attachment_status()
+
+    def _refresh_attachment_status(self):
+        attached = getattr(self, "_attached_fids", set())
+        attached_count = sum(str(fid) in attached for fid in self._fids)
+        total = len(self._fids)
+        target = self._attachment_target or "当前 View"
+        if not self._attachment_available:
+            state = "unavailable"
+            icon = qta.icon("mdi6.plus", color="#94a3b8")
+            tooltip = "没有可接收的 View；请先选择目标 View"
+            accessible = tooltip
+            enabled = False
+            attachment_text = ""
+        elif total and attached_count == total:
+            state = "attached"
+            icon = qta.icon("mdi6.check", color="#899db5")
+            tooltip = f"已加入 {target}"
+            accessible = tooltip
+            enabled = False
+            attachment_text = ""
+        else:
+            state = "partial" if attached_count else "available"
+            icon = qta.icon("mdi6.plus", color="#1769e0")
+            missing = total - attached_count
+            if attached_count:
+                attachment_text = f"已加入 {attached_count}/{total} 轨"
+                tooltip = f"补齐剩余 {missing} 轨到 {target}"
+            else:
+                attachment_text = ""
+                tooltip = f"加入 {target}"
+            accessible = tooltip
+            enabled = True
+        self._lbl_attachment.setText(attachment_text)
+        self._lbl_attachment.setToolTip(attachment_text)
+        self._lbl_attachment.setVisible(bool(attachment_text))
+        self._btn_attach.setIcon(icon)
+        self._btn_attach.setToolTip(tooltip)
+        self._btn_attach.setAccessibleName(accessible)
+        self._btn_attach.setEnabled(enabled)
+        self._btn_attach.setProperty("attachmentState", state)
+        self._btn_attach.style().unpolish(self._btn_attach)
+        self._btn_attach.style().polish(self._btn_attach)
+
+    def _on_close_clicked(self):
+        self.close_requested.emit(self._rows_key)
+
+    def _on_attach_clicked(self):
+        if self._attachment_available:
+            self.attach_requested.emit(tuple(str(fid) for fid in self._fids))
+
+    def add_fid(self, fid, fd):
+        """Merge a new fid into this group card and refresh the meta label."""
+        self._fids.append(fid)
+        self._fds.append(fd)
+        self._refresh_meta()
+        self._refresh_attachment_status()
+
+    def remove_fid(self, fid):
+        """Remove a fid from this group. Returns True if the group is now empty."""
+        try:
+            idx = self._fids.index(fid)
+            self._fids.pop(idx)
+            self._fds.pop(idx)
+        except ValueError:
+            pass
+        if self._fids:
+            self.fid = self._fids[0]
+            self._refresh_meta()
+            self._refresh_attachment_status()
+            return False
+        return True
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_start = QPoint(event.pos())
+            self.activated.emit(self.fid)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (
+            not (event.buttons() & Qt.LeftButton)
+            or self._drag_start is None
+            or (event.pos() - self._drag_start).manhattanLength()
+            < QApplication.startDragDistance()
+        ):
+            return super().mouseMoveEvent(event)
+        self._drag_start = None
+        host = self.window()
+        if host is None:
+            host = self.parent() or self
+        drag = QDrag(host)
+        drag.setMimeData(self._build_drag_mime())
+        drag.exec_(Qt.CopyAction | Qt.MoveAction, Qt.CopyAction)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_start = None
+        super().mouseReleaseEvent(event)
+
+    def _build_drag_mime(self):
+        mime = QMimeData()
+        mime.setData(
+            self.MIME_TYPE,
+            json.dumps([str(fid) for fid in self._fids]).encode("utf-8"),
+        )
+        return mime
+
+    def keyPressEvent(self, event):  # noqa: N802
+        key = event.key()
+        mods = event.modifiers()
+        if key in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            self.activated.emit(self.fid)
+            event.accept()
+            return
+        if key in (Qt.Key_Delete, Qt.Key_Backspace):
+            self.close_requested.emit(self._rows_key)
+            event.accept()
+            return
+        if (mods & Qt.AltModifier) and key in (Qt.Key_Up, Qt.Key_Down):
+            direction = "up" if key == Qt.Key_Up else "down"
+            self.reorder_requested.emit(self._rows_key, direction)
+            event.accept()
+            return
+        if key in (Qt.Key_Up, Qt.Key_Down) and not (mods & Qt.AltModifier):
+            delta = -1 if key == Qt.Key_Up else 1
+            self._move_neighbor_focus(delta)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _move_neighbor_focus(self, delta):
+        nav = self.parent()
+        while nav is not None:
+            move = getattr(nav, "_move_file_row_focus", None)
+            if callable(move):
+                move(self._rows_key, delta)
+                return
+            nav = nav.parent()
+
+    def set_active(self, active):
+        self._active = active
+        self.setProperty("active", "true" if active else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+
+class FileNavigator(QWidget):
+    file_activated = pyqtSignal(str)
+    file_close_requested = pyqtSignal(str)
+    # Physical card close: every logical source in the group, once.
+    file_group_close_requested = pyqtSignal(list)
+    close_all_requested = pyqtSignal()
+    channels_changed = pyqtSignal()
+    visibility_changed = pyqtSignal(str, str, bool)
+    # Bubbled from the channel tree's 设为左轴 menu: (fid, channel).
+    primary_channel_requested = pyqtSignal(str, str)
+    channel_context_menu_requested = pyqtSignal()
+    # Bubbled from the channel pane's 编辑通道 button.
+    channel_editor_requested = pyqtSignal()
+    files_attach_requested = pyqtSignal(object)
+    files_detach_requested = pyqtSignal(object, str)
+    channel_order_requested = pyqtSignal(str, str, str, str)
+    # Structured file-card reorder: (source_fids, target_fids, "before"|"after").
+    file_order_requested = pyqtSignal(object, object, str)
+    # Item-1 shim: still emitted when attach_on_load flips so older callers
+    # (and tests) keep working without knowing about the follow menu.
+    auto_attach_changed = pyqtSignal(bool)
+    # Stage 1.1: full follow-prefs payload (FollowPrefs dataclass).
+    follow_prefs_changed = pyqtSignal(object)
+    channel_config_save_requested = pyqtSignal()
+    channel_config_apply_requested = pyqtSignal(str)
+    channel_config_manage_requested = pyqtSignal(object)
+    channel_config_selection_changed = pyqtSignal(object)
+    record_curve_visibility_toggled = pyqtSignal(str, str, bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # QSS (FileNavigator { border-radius:10px; background:#fff }) only paints
+        # on a plain QWidget subclass once WA_StyledBackground is set; without it
+        # Qt skips the styled fill/border and the rounded card never renders.
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
+        # rows_key -> _FileRow
+        # rows_key = filepath_str when label_suffix is non-empty (grouped mode)
+        # rows_key = fid when label_suffix is empty (flat mode, backwards compat)
+        self._rows = {}
+        # fid -> rows_key
+        self._fid_to_key = {}
+        self._active_fid = None
+        self._close_project_available = False
+        # Presentation-only attachment context. ViewState owns the underlying
+        # facts; these fields exist solely to render file-card affordances.
+        self._attachment_target = ""
+        self._attachment_available = False
+        self._min_width_sync_pending = False
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(3, 3, 3, 3)
+        lay.setSpacing(4)
+
+        splitter = QSplitter(Qt.Vertical, self)
+        splitter.setObjectName("navigatorSplitter")
+        lay.addWidget(splitter, stretch=1)
+
+        file_area = QWidget(self)
+        file_area.setObjectName("fileArea")
+        # QWidget#fileArea { background:#fff } needs WA_StyledBackground too,
+        # otherwise the inner white surface above the channel splitter is unpainted.
+        file_area.setAttribute(Qt.WA_StyledBackground, True)
+        file_lay = QVBoxLayout(file_area)
+        file_lay.setContentsMargins(8, 0, 8, 8)
+        file_lay.setSpacing(4)
+
+        # Header with kebab
+        head = QHBoxLayout()
+        head.setContentsMargins(10, 6, 6, 4)
+        head.setSpacing(8)
+        self._lbl_header = QLabel("文件")
+        self._lbl_header.setObjectName("paneHeader")
+        head.addWidget(self._lbl_header)
+        head.addStretch()
+        self._lbl_count = QLabel("0")
+        self._lbl_count.setObjectName("paneCount")
+        head.addWidget(self._lbl_count)
+        self.btn_auto_attach = QToolButton()
+        self.btn_auto_attach.setObjectName("autoAttachFiles")
+        self.btn_auto_attach.setIconSize(QSize(16, 16))
+        self.btn_auto_attach.setFixedSize(QSize(24, 24))
+        self.btn_auto_attach.setProperty("role", "icon")
+        self.btn_auto_attach.setAutoRaise(True)
+        # Same chrome as the kebab: icon-only click opens a menu. Do not use
+        # InstantPopup+setMenu — that paints the gray dropdown triangle.
+        self._follow_menu = apply_rounded_menu_chrome(
+            QMenu(self.btn_auto_attach), gutter="check"
+        )
+        self._act_attach_on_load = self._follow_menu.addAction("新文件加入当前 View")
+        self._act_attach_on_load.setCheckable(True)
+        self._act_attach_on_load.setChecked(True)
+        self._act_inherit_on_new_view = self._follow_menu.addAction(
+            "新建 View 继承文件范围"
+        )
+        self._act_inherit_on_new_view.setCheckable(True)
+        self._act_inherit_on_new_view.setChecked(False)
+        self._act_fill_on_mode_entry = self._follow_menu.addAction(
+            "切换分析时填充空 View"
+        )
+        self._act_fill_on_mode_entry.setCheckable(True)
+        self._act_fill_on_mode_entry.setChecked(False)
+        for act in (
+            self._act_attach_on_load,
+            self._act_inherit_on_new_view,
+            self._act_fill_on_mode_entry,
+        ):
+            act.toggled.connect(self._on_follow_action_toggled)
+        bind_popup_trigger(self._follow_menu, self.btn_auto_attach)
+        self.btn_auto_attach.clicked.connect(self._open_follow_menu)
+        self._sync_auto_attach_button()
+        head.addWidget(self.btn_auto_attach)
+        # 2026-04-26 R3 紧凑化 fix-4: setFixedSize(24, 24) — same as
+        # _btn_close above; kebab is admin-only and shouldn't dwarf the
+        # "文件" header label.
+        self._btn_kebab = QToolButton()
+        self._btn_kebab.setIcon(Icons.menu())
+        self._btn_kebab.setIconSize(QSize(16, 16))
+        self._btn_kebab.setFixedSize(QSize(24, 24))
+        self._btn_kebab.setToolTip("文件操作")
+        self._btn_kebab.setAccessibleName("文件操作")
+        self._btn_kebab.setProperty("role", "icon")
+        self._btn_kebab.setAutoRaise(True)
+        self._btn_kebab.clicked.connect(self._open_kebab)
+        head.addWidget(self._btn_kebab)
+        file_lay.addLayout(head)
+
+        # File list (scrollable rows)
+        self._file_holder = QWidget()
+        self._file_holder.setAutoFillBackground(False)
+        self._file_holder.setAttribute(Qt.WA_TranslucentBackground, True)
+        self._file_holder.setAttribute(Qt.WA_NoSystemBackground, True)
+        self._file_layout = QVBoxLayout(self._file_holder)
+        self._file_layout.setContentsMargins(0, 0, 0, 0)
+        self._file_layout.setSpacing(2)
+        self._file_layout.addStretch()
+        scroll = QScrollArea()
+        scroll.setObjectName("fileScroll")
+        scroll.setAttribute(Qt.WA_StyledBackground, True)
+        scroll.setAutoFillBackground(False)
+        scroll.viewport().setAutoFillBackground(False)
+        scroll.viewport().setAttribute(Qt.WA_TranslucentBackground, True)
+        scroll.viewport().setAttribute(Qt.WA_NoSystemBackground, True)
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self._file_holder)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setMinimumHeight(150)
+        self._file_scroll = scroll
+        self._file_holder.setAcceptDrops(True)
+        self._file_holder.setAccessibleName("文件列表")
+        scroll.viewport().setAcceptDrops(True)
+        scroll.viewport().setAccessibleName("文件列表排序")
+        self._file_insert_line = QFrame(self._file_holder)
+        self._file_insert_line.setObjectName("fileInsertLine")
+        self._file_insert_line.setAccessibleName("文件插入位置")
+        self._file_insert_line.setFixedHeight(2)
+        self._file_insert_line.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._file_insert_line.hide()
+        self._file_holder.installEventFilter(self)
+        scroll.viewport().installEventFilter(self)
+        file_lay.addWidget(scroll, stretch=1)
+        splitter.addWidget(file_area)
+
+        # Channel tree
+        self.channel_list = MultiFileChannelWidget(self)
+        self.channel_list.channels_changed.connect(self.channels_changed)
+        self.channel_list.visibility_changed.connect(self.visibility_changed)
+        self.channel_list.primary_channel_requested.connect(
+            self.primary_channel_requested
+        )
+        self.channel_list.channel_context_menu_requested.connect(
+            self.channel_context_menu_requested
+        )
+        self.channel_list.channel_editor_requested.connect(
+            self.channel_editor_requested
+        )
+        self.channel_list.files_attach_requested.connect(
+            self.files_attach_requested
+        )
+        self.channel_list.files_detach_requested.connect(
+            self.files_detach_requested
+        )
+        self.channel_list.channel_order_requested.connect(
+            self.channel_order_requested
+        )
+        self.channel_list.file_tree_order_requested.connect(
+            self._on_tree_file_order_requested
+        )
+        self.channel_list.record_curve_visibility_toggled.connect(
+            self.record_curve_visibility_toggled
+        )
+        config_bar = self.channel_list.config_bar
+        config_bar.save_requested.connect(self.channel_config_save_requested)
+        config_bar.apply_requested.connect(self.channel_config_apply_requested)
+        config_bar.manage_requested.connect(self.channel_config_manage_requested)
+        config_bar.selection_changed.connect(
+            self.channel_config_selection_changed
+        )
+        self.channel_list.setMinimumHeight(260)
+        splitter.addWidget(self.channel_list)
+        splitter.setChildrenCollapsible(False)
+        splitter.setSizes([260, 520])
+        self._min_width_sync_pending = False
+        self._sync_expanded_minimum_width()
+        self._schedule_expanded_min_width_sync()
+
+    def expanded_minimum_width(self) -> int:
+        """Floor for an expanded left pane; collapsed still allows 0 width."""
+        return max(NAVIGATOR_MIN_EXPANDED_WIDTH, int(self._content_min_width()))
+
+    def default_expanded_width(self) -> int:
+        return max(NAVIGATOR_DEFAULT_EXPANDED_WIDTH, self.expanded_minimum_width())
+
+    def showEvent(self, event):  # noqa: N802
+        super().showEvent(event)
+        self._schedule_expanded_min_width_sync()
+
+    def changeEvent(self, event):  # noqa: N802
+        super().changeEvent(event)
+        if event is not None and event.type() in (
+            QEvent.FontChange, QEvent.StyleChange, QEvent.Polish,
+        ):
+            self._schedule_expanded_min_width_sync()
+
+    def _schedule_expanded_min_width_sync(self) -> None:
+        if self._min_width_sync_pending:
+            return
+        self._min_width_sync_pending = True
+        QTimer.singleShot(0, self._sync_expanded_minimum_width)
+
+    def _sync_expanded_minimum_width(self) -> None:
+        self._min_width_sync_pending = False
+        width = self.expanded_minimum_width()
+        if self.minimumWidth() != width:
+            self.setMinimumWidth(width)
+
+    def _content_min_width(self) -> int:
+        channel = getattr(self, "channel_list", None)
+        if channel is None:
+            return 0
+        inner = int(channel.uncroppable_min_width())
+        layout = self.layout()
+        if layout is None:
+            return inner
+        margins = layout.contentsMargins()
+        return inner + margins.left() + margins.right()
+
+    # ---- public API used by MainWindow ----
+    def add_file(self, fid, fd):
+        label_suffix = getattr(fd, 'label_suffix', '')
+        fp = getattr(fd, 'filepath', None)
+
+        if label_suffix and fp is not None:
+            # GROUPED MODE: use filepath_str as the rows key
+            fp_str = str(fp)
+            if fp_str in self._rows:
+                # Add to existing group card
+                self._rows[fp_str].add_fid(fid, fd)
+                self._fid_to_key[fid] = fp_str
+            else:
+                # Create new group card
+                row = _FileRow(fid, fd, self)
+                row._set_rows_key(fp_str)
+                row.activated.connect(self._activate)
+                row.close_requested.connect(self._request_close_group)
+                row.attach_requested.connect(self._on_row_attach_requested)
+                row.reorder_requested.connect(self._on_row_reorder_requested)
+                insert_pos = self._file_layout.count() - 1  # before the stretch
+                self._file_layout.insertWidget(insert_pos, row)
+                self._rows[fp_str] = row
+                self._fid_to_key[fid] = fp_str
+        else:
+            # FLAT MODE: use fid as the rows key (backwards compat)
+            row = _FileRow(fid, fd, self)
+            row._set_rows_key(fid)
+            row.activated.connect(self._activate)
+            row.close_requested.connect(self._request_close_group)
+            row.attach_requested.connect(self._on_row_attach_requested)
+            row.reorder_requested.connect(self._on_row_reorder_requested)
+            insert_pos = self._file_layout.count() - 1  # before the stretch
+            self._file_layout.insertWidget(insert_pos, row)
+            self._rows[fid] = row
+            self._fid_to_key[fid] = fid
+
+        self.channel_list.add_file(fid, fd)
+        self._refresh_attachment_rows()
+        self._refresh_header()
+        self._activate(fid)
+
+    def ordered_file_fids(self):
+        """Logical-source ids in the current file-card layout order."""
+        ordered = []
+        for row in self._ordered_file_rows():
+            ordered.extend(str(fid) for fid in row._fids)
+        return ordered
+
+    def project_file_order(self, ordered_fids):
+        """Move existing file cards and channel-tree roots to ``ordered_fids``."""
+        desired_rows = []
+        seen = set()
+        for fid in ordered_fids or ():
+            key = self._fid_to_key.get(str(fid))
+            if key is None or key in seen:
+                continue
+            row = self._rows.get(key)
+            if row is None:
+                continue
+            seen.add(key)
+            desired_rows.append(row)
+        for row in self._ordered_file_rows():
+            key = row._rows_key
+            if key in seen:
+                continue
+            seen.add(key)
+            desired_rows.append(row)
+        current = self._ordered_file_rows()
+        if current != desired_rows:
+            for row in current:
+                self._file_layout.removeWidget(row)
+            for idx, row in enumerate(desired_rows):
+                self._file_layout.insertWidget(idx, row)
+        self.channel_list.project_file_order(ordered_fids)
+
+    def _ordered_file_rows(self):
+        rows = []
+        for idx in range(self._file_layout.count()):
+            item = self._file_layout.itemAt(idx)
+            widget = item.widget() if item is not None else None
+            if isinstance(widget, _FileRow):
+                rows.append(widget)
+        return rows
+
+    def eventFilter(self, watched, event):
+        hosts = (self._file_holder, self._file_scroll.viewport())
+        if watched in hosts:
+            etype = event.type()
+            if etype == QEvent.DragEnter:
+                self._handle_file_list_drag_enter(event)
+                return True
+            if etype == QEvent.DragMove:
+                self._handle_file_list_drag_move(event, watched)
+                return True
+            if etype == QEvent.DragLeave:
+                self._clear_file_insert_line()
+                event.accept()
+                return True
+            if etype == QEvent.Drop:
+                self._handle_file_list_drop(event, watched)
+                return True
+        return super().eventFilter(watched, event)
+
+    def _file_order_payload(self, mime):
+        if mime is None or not mime.hasFormat(INTERNAL_FILE_FIDS_MIME):
+            return None
+        try:
+            payload = json.loads(
+                bytes(mime.data(INTERNAL_FILE_FIDS_MIME)).decode("utf-8")
+            )
+        except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, list):
+            return None
+        known = []
+        seen = set()
+        for value in payload:
+            if not isinstance(value, str) or value in seen:
+                continue
+            if value not in self._fid_to_key:
+                continue
+            seen.add(value)
+            known.append(value)
+        if not known:
+            return None
+        keys = {self._fid_to_key[fid] for fid in known}
+        if len(keys) != 1:
+            return None
+        row = self._rows.get(next(iter(keys)))
+        if row is None:
+            return None
+        return [str(fid) for fid in row._fids]
+
+    def _file_group_fids_for(self, fid):
+        key = self._fid_to_key.get(str(fid))
+        row = self._rows.get(key) if key is not None else None
+        if row is None:
+            return ()
+        return tuple(str(member) for member in row._fids)
+
+    def _on_tree_file_order_requested(self, source_fid, target_fid, placement):
+        """Expand tree root anchors into physical file-card blocks."""
+        if placement not in (_FILE_ORDER_BEFORE, _FILE_ORDER_AFTER):
+            return
+        source_fids = self._file_group_fids_for(source_fid)
+        target_fids = self._file_group_fids_for(target_fid)
+        if not source_fids or not target_fids:
+            return
+        if self._file_order_is_noop(source_fids, target_fids, placement):
+            return
+        self.file_order_requested.emit(source_fids, target_fids, placement)
+
+    def _on_row_reorder_requested(self, rows_key, direction):
+        """Alt+Up/Down keyboard equivalent of file-card drag reorder."""
+        if direction not in ("up", "down"):
+            return
+        rows = self._ordered_file_rows()
+        row = self._rows.get(rows_key)
+        if row is None:
+            return
+        try:
+            idx = rows.index(row)
+        except ValueError:
+            return
+        neighbor_idx = idx - 1 if direction == "up" else idx + 1
+        if not (0 <= neighbor_idx < len(rows)):
+            return
+        neighbor = rows[neighbor_idx]
+        placement = (
+            _FILE_ORDER_BEFORE if direction == "up" else _FILE_ORDER_AFTER
+        )
+        source_fids = tuple(str(fid) for fid in row._fids)
+        target_fids = tuple(str(fid) for fid in neighbor._fids)
+        if self._file_order_is_noop(source_fids, target_fids, placement):
+            return
+        self.file_order_requested.emit(source_fids, target_fids, placement)
+
+    def _move_file_row_focus(self, rows_key, delta):
+        rows = self._ordered_file_rows()
+        row = self._rows.get(rows_key)
+        if row is None:
+            return
+        try:
+            idx = rows.index(row)
+        except ValueError:
+            return
+        nxt = idx + int(delta)
+        if 0 <= nxt < len(rows):
+            rows[nxt].setFocus(Qt.TabFocusReason)
+
+    def _holder_pos(self, event, watched):
+        pos = event.pos()
+        if watched is self._file_scroll.viewport():
+            return self._file_holder.mapFrom(watched, pos)
+        return pos
+
+    def _file_drop_target(self, event, watched):
+        rows = self._ordered_file_rows()
+        if not rows:
+            return None, None
+        y = self._holder_pos(event, watched).y()
+        for row in rows:
+            geo = row.geometry()
+            if y < geo.top():
+                return row, _FILE_ORDER_BEFORE
+            if y <= geo.bottom():
+                mid = geo.top() + geo.height() / 2.0
+                placement = (
+                    _FILE_ORDER_BEFORE if y < mid else _FILE_ORDER_AFTER
+                )
+                return row, placement
+        return rows[-1], _FILE_ORDER_AFTER
+
+    def _file_order_is_noop(self, source_fids, target_fids, placement):
+        rows = self._ordered_file_rows()
+        source_key = self._fid_to_key.get(str(source_fids[0])) if source_fids else None
+        target_key = self._fid_to_key.get(str(target_fids[0])) if target_fids else None
+        if source_key is None or target_key is None:
+            return True
+        source_row = self._rows.get(source_key)
+        target_row = self._rows.get(target_key)
+        if source_row is None or target_row is None:
+            return True
+        if source_row is target_row:
+            return True
+        try:
+            source_at = rows.index(source_row)
+            target_at = rows.index(target_row)
+        except ValueError:
+            return True
+        if placement == _FILE_ORDER_BEFORE:
+            return source_at == target_at - 1
+        if placement == _FILE_ORDER_AFTER:
+            return source_at == target_at + 1
+        return True
+
+    def _show_file_insert_line(self, row, placement):
+        geo = row.geometry()
+        y = geo.top() if placement == _FILE_ORDER_BEFORE else geo.bottom() - 1
+        width = max(8, self._file_holder.width() - 8)
+        self._file_insert_line.setGeometry(4, max(0, y - 1), width, 2)
+        self._file_insert_line.show()
+        self._file_insert_line.raise_()
+
+    def _clear_file_insert_line(self):
+        self._file_insert_line.hide()
+
+    def _handle_file_list_drag_enter(self, event):
+        try:
+            if self._file_order_payload(event.mimeData()) is None:
+                self._clear_file_insert_line()
+                event.ignore()
+                return
+            event.setDropAction(Qt.MoveAction)
+            event.accept()
+        except Exception:
+            logger.exception("file list drag enter failed")
+            self._clear_file_insert_line()
+            event.ignore()
+
+    def _handle_file_list_drag_move(self, event, watched):
+        try:
+            payload = self._file_order_payload(event.mimeData())
+            target_row, placement = self._file_drop_target(event, watched)
+            if payload is None or target_row is None:
+                self._clear_file_insert_line()
+                event.ignore()
+                return
+            if self._file_order_is_noop(payload, list(target_row._fids), placement):
+                self._clear_file_insert_line()
+            else:
+                self._show_file_insert_line(target_row, placement)
+            event.setDropAction(Qt.MoveAction)
+            event.accept()
+        except Exception:
+            logger.exception("file list drag move failed")
+            self._clear_file_insert_line()
+            event.ignore()
+
+    def _handle_file_list_drop(self, event, watched):
+        self._clear_file_insert_line()
+        try:
+            payload = self._file_order_payload(event.mimeData())
+            target_row, placement = self._file_drop_target(event, watched)
+            if payload is None or target_row is None:
+                event.ignore()
+                return
+            target_fids = [str(fid) for fid in target_row._fids]
+            event.setDropAction(Qt.MoveAction)
+            event.accept()
+            if self._file_order_is_noop(payload, target_fids, placement):
+                return
+            self.file_order_requested.emit(
+                tuple(payload), tuple(target_fids), placement
+            )
+        except Exception:
+            logger.exception("file list drop failed")
+            event.ignore()
+
+    def refresh_file(self, fid, fd, channel_order=None):
+        """Refresh channel rows for an existing file without changing cards."""
+        self.channel_list.refresh_file(fid, fd, channel_order=channel_order)
+
+    def remove_file(self, fid, *, emit=True):
+        rows_key = self._fid_to_key.pop(fid, None)
+        if rows_key is not None:
+            row = self._rows.get(rows_key)
+            if row is not None:
+                empty = row.remove_fid(fid)
+                if empty:
+                    self._rows.pop(rows_key)
+                    row.setParent(None)
+                    row.deleteLater()
+        self.channel_list.remove_file(fid, emit=emit)
+        # ChannelTree owns the filtered attachment list. A real source close
+        # changes that projection for every remaining card, so refresh their
+        # presentation state after (not before) its removal bookkeeping.
+        self._refresh_attachment_rows()
+        if self._active_fid == fid:
+            remaining = list(self._fid_to_key.keys())
+            new_active = remaining[0] if remaining else None
+            self._active_fid = None
+            if new_active is not None:
+                self._activate(new_active)
+            else:
+                self.file_activated.emit("")
+        self._refresh_header()
+
+    def file_list_count(self):
+        """Returns the number of unique source file cards (not fid count)."""
+        return len(self._rows)
+
+    def set_active(self, fid):
+        self._activate(fid)
+
+    def get_checked_channels(self):
+        return self.channel_list.get_checked_channels()
+
+    def set_checked_channels(self, checked):
+        self.channel_list.set_checked_channels(checked)
+
+    def channel_projection_batch(self):
+        """Expose the tree owner's nested View-projection transaction."""
+        scope = getattr(self.channel_list, "channel_projection_batch", None)
+        return scope() if callable(scope) else nullcontext()
+
+    def get_attached_file_ids(self):
+        return self.channel_list.get_attached_file_ids()
+
+    def set_attached_file_ids(self, fids):
+        self.channel_list.set_attached_file_ids(fids)
+        self._refresh_attachment_rows()
+
+    def set_attachment_context(
+        self, *, section_label=None, view_name=None, pane_role=None,
+        available=True,
+    ):
+        """Set the target wording for the same attachment projection as rows.
+
+        This stays in the navigator's presentation layer. Callers must project
+        the actual attachment collection separately through
+        :meth:`set_attached_file_ids` before (or in the same event turn as)
+        this method.
+        """
+        if available:
+            parts = [str(value) for value in (section_label, view_name, pane_role) if value]
+            self._attachment_target = " · ".join(parts) or "当前 View"
+        else:
+            self._attachment_target = ""
+        self._attachment_available = bool(available)
+        self._refresh_attachment_rows()
+
+    def _refresh_attachment_rows(self):
+        attached = self.channel_list.get_attached_file_ids()
+        for row in self._rows.values():
+            row.set_attachment_context(
+                self._attachment_target,
+                attached,
+                available=self._attachment_available,
+            )
+
+    def invalidate_channel_filter_context(self):
+        self.channel_list.invalidate_filter_context()
+
+    def auto_attach_enabled(self):
+        """Item-1 shim: whether new loads attach into the active context."""
+        return self._act_attach_on_load.isChecked()
+
+    def set_auto_attach_enabled(self, enabled):
+        """Item-1 shim: update attach_on_load without emitting prefs signals."""
+        blocker = QSignalBlocker(self._act_attach_on_load)
+        self._act_attach_on_load.setChecked(bool(enabled))
+        del blocker
+        self._sync_auto_attach_button()
+
+    def follow_prefs(self):
+        from .main_window.file_scope_follow import FollowPrefs
+
+        return FollowPrefs(
+            attach_on_load=self._act_attach_on_load.isChecked(),
+            inherit_on_new_view=self._act_inherit_on_new_view.isChecked(),
+            fill_on_mode_entry=self._act_fill_on_mode_entry.isChecked(),
+        )
+
+    def set_follow_prefs(self, prefs):
+        """Apply FollowPrefs (or duck-typed equivalent) without emitting."""
+        blockers = [
+            QSignalBlocker(self._act_attach_on_load),
+            QSignalBlocker(self._act_inherit_on_new_view),
+            QSignalBlocker(self._act_fill_on_mode_entry),
+        ]
+        self._act_attach_on_load.setChecked(bool(getattr(prefs, "attach_on_load", True)))
+        self._act_inherit_on_new_view.setChecked(
+            bool(getattr(prefs, "inherit_on_new_view", False))
+        )
+        self._act_fill_on_mode_entry.setChecked(
+            bool(getattr(prefs, "fill_on_mode_entry", False))
+        )
+        del blockers
+        self._sync_auto_attach_button()
+
+    def get_hidden_channels(self):
+        return self.channel_list.get_hidden_channels()
+
+    def set_hidden_channels(self, hidden):
+        self.channel_list.set_hidden_channels(hidden)
+
+    def get_visible_checked_channels(self):
+        return self.channel_list.get_visible_checked_channels()
+
+    def set_channel_visible(self, fid, channel, visible, *, emit=True):
+        return self.channel_list.set_channel_visible(
+            fid, channel, visible, emit=emit
+        )
+
+    def set_time_visibility_available(self, available):
+        self.channel_list.set_time_visibility_available(available)
+
+    def set_record_curve_rows(self, view_id, rows):
+        self.channel_list.set_record_curve_rows(view_id, rows)
+
+    def clear_record_curve_rows(self):
+        self.channel_list.clear_record_curve_rows()
+
+    def projection_role(self):
+        return self.channel_list.projection_role()
+
+    def set_projection_role(self, role):
+        self.channel_list.set_projection_role(role)
+
+    def set_empty_state_context(self, *, section_label=None, view_name=None):
+        self.channel_list.set_empty_state_context(
+            section_label=section_label, view_name=view_name
+        )
+
+    def get_channel_colors(self):
+        return self.channel_list.get_channel_colors()
+
+    def get_channel_color_overrides(self):
+        return self.channel_list.get_channel_color_overrides()
+
+    def set_channel_colors(self, colors):
+        self.channel_list.set_channel_colors(colors)
+
+    def restore_channel_color_overrides(self, colors):
+        self.channel_list.restore_channel_color_overrides(colors)
+
+    def get_file_data(self, fid):
+        return self.channel_list.get_file_data(fid)
+
+    def check_first_channel(self, fid):
+        self.channel_list.check_first_channel(fid)
+
+    # ---- private slots ----
+    def _activate(self, fid):
+        if fid == self._active_fid:
+            return
+        # Deactivate old active row
+        if self._active_fid is not None:
+            old_key = self._fid_to_key.get(self._active_fid)
+            if old_key is not None and old_key in self._rows:
+                new_key = self._fid_to_key.get(fid)
+                if old_key != new_key:
+                    self._rows[old_key].set_active(False)
+        self._active_fid = fid
+        new_key = self._fid_to_key.get(fid)
+        if new_key is not None and new_key in self._rows:
+            self._rows[new_key].set_active(True)
+        self.file_activated.emit(fid)
+
+    def _on_row_attach_requested(self, fids):
+        """Forward a card's complete logical-source group to the shared path."""
+        known = set(self._fid_to_key)
+        selected = tuple(
+            fid for fid in dict.fromkeys(str(value) for value in (fids or ()))
+            if fid in known
+        )
+        if selected:
+            self.files_attach_requested.emit(selected)
+
+    def _on_follow_action_toggled(self, _checked=False):
+        prefs = self.follow_prefs()
+        self._sync_auto_attach_button()
+        self.follow_prefs_changed.emit(prefs)
+        # Keep the legacy bool signal in sync with item 1 for older callers.
+        self.auto_attach_changed.emit(bool(prefs.attach_on_load))
+
+    def _sync_auto_attach_button(self):
+        # Read actions directly so chrome sync never imports main_window.
+        flags = (
+            self._act_attach_on_load.isChecked(),
+            self._act_inherit_on_new_view.isChecked(),
+            self._act_fill_on_mode_entry.isChecked(),
+        )
+        enabled = any(flags)
+        count = sum(1 for flag in flags if flag)
+        self.btn_auto_attach.setIcon(qta.icon(
+            "mdi.link-variant" if enabled else "mdi.link-variant-off",
+            color="#4b6078" if enabled else "#8b98aa",
+        ))
+        self.btn_auto_attach.setToolTip(
+            f"已启用 {count} 项文件范围跟随 · 点击调整"
+            if enabled
+            else "未启用文件范围跟随"
+        )
+        self.btn_auto_attach.setAccessibleName(self.btn_auto_attach.toolTip())
+        # QSS matches [active="true"|"false"] string attrs (same as #fileRow).
+        self.btn_auto_attach.setProperty(
+            "active", "true" if enabled else "false",
+        )
+        self.btn_auto_attach.style().unpolish(self.btn_auto_attach)
+        self.btn_auto_attach.style().polish(self.btn_auto_attach)
+
+    def _request_close_group(self, rows_key):
+        """Emit one group-close request for ALL fids under ``rows_key``.
+
+        Physical-card close must be atomic: MainWindow aggregates dependencies
+        once and either keeps or unloads every logical source together.
+        """
+        fids = [f for f, k in self._fid_to_key.items() if k == rows_key]
+        if not fids:
+            return
+        self.file_group_close_requested.emit(list(fids))
+
+    # Backwards-compat alias used by existing tests that call _request_close(fid)
+    def _request_close(self, fid):
+        rows_key = self._fid_to_key.get(fid, fid)
+        fids = [f for f, k in self._fid_to_key.items() if k == rows_key]
+        if len(fids) > 1:
+            self.file_group_close_requested.emit(list(fids))
+            return
+        target = fids[0] if fids else fid
+        self.file_close_requested.emit(target)
+
+    def _open_follow_menu(self):
+        """Open the follow prefs menu under the link icon (no dropdown triangle)."""
+        btn = self.btn_auto_attach
+        gp = btn.mapToGlobal(btn.rect().bottomLeft())
+        self._follow_menu.exec_(gp)
+        sync_popup_trigger(btn, popup=self._follow_menu)
+
+    def _open_kebab(self):
+        menu = apply_rounded_menu_chrome(QMenu(self))
+        bind_popup_trigger(menu, self._btn_kebab)
+        act = menu.addAction("关闭项目…")
+        act.setEnabled(bool(self._rows) or bool(self._close_project_available))
+        gp = self._btn_kebab.mapToGlobal(self._btn_kebab.rect().bottomLeft())
+        try:
+            chosen = menu.exec_(gp)
+            sync_popup_trigger(self._btn_kebab, popup=menu)
+            if chosen == act:
+                # Confirm lives in MainWindow.close_project so last-source /
+                # dirty leave share one product transaction.
+                self.close_all_requested.emit()
+        finally:
+            menu.close()
+            menu.deleteLater()
+
+    def set_close_project_available(self, available):
+        """Owner projection: bound or persistable sessions can close with zero rows."""
+        self._close_project_available = bool(available)
+
+    def _refresh_header(self):
+        self._lbl_count.setText(str(len(self._rows)))

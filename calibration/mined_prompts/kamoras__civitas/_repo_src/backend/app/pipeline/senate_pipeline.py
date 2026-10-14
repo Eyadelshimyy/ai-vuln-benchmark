@@ -1,0 +1,2395 @@
+"""
+Pipeline orchestrator — unified data pipeline.
+
+The 7 phases:
+  1. FETCH      — Congress.gov members, bills and votes; Senate.gov roll
+                  calls; FEC finance
+  2. TRANSFORM  — normalize members, votes, finance
+  3. ANALYZE    — classify bills/donors, cross-reference, score
+  7. FINALIZE   — persist stats and mark complete
+
+Phases 4–6 (EXPLORE, JUSTICES, PRESIDENTS) moved to supplementary_pipeline.py
+in 2026-07; FINALIZE keeps its number because PipelineRun.current_phase and
+the logs still name it that way.
+
+Uses SQLAlchemy sessions for persistence and PipelineRun records to track progress.
+"""
+
+import json
+import logging
+import time
+
+import httpx
+from sqlalchemy.orm import Session
+
+from app.config import settings
+from app.database import SessionLocal
+from app.http_client import make_async_client
+from app.models import (
+    CampaignPromise,
+    Donor,
+    IndustryDonation,
+    KeyVote,
+    LobbyingMatch,
+    PipelineRun,
+    PipelineStatus,
+    PromiseAlignment,
+    ScoreSnapshot,
+    Senator,
+    SponsoredBill,
+)
+
+# Fetch modules
+from app.pipeline.analyze.bill_stage import became_law_action, classify_bill_stage_from_actions, is_enacted
+from app.pipeline.analyze.party_line_record import party_line_records
+from app.pipeline.fetch.congress import (
+    extract_official_title,
+    fetch_bill,
+    fetch_bill_actions,
+    fetch_bill_cosponsors,
+    fetch_bill_summaries,
+    fetch_bill_titles,
+    fetch_member_detail,
+    fetch_member_sponsored,
+    fetch_recent_roll_calls,
+    fetch_roll_call_vote,
+    fetch_senators,
+    fetch_significant_bills,
+)
+from app.pipeline.fetch.fec import (
+    FecUnavailable,
+    compute_recent_election_cycles,
+    fetch_candidate_committees,
+    fetch_candidate_financials,
+    committee_id_of,
+    committee_master_cycles,
+    fetch_committee_master,
+    fetch_committee_contributions,
+    fetch_committee_receipts,
+    fetch_contribution_detail,
+    fetch_pac_receipts,
+    find_candidate,
+    resolve_committee_meta,
+)
+from app.pipeline.fetch.govinfo import fetch_bill_text
+from app.pipeline.fetch.lda import alert_if_lda_down, enrich_lobbying_matches_with_lda
+from app.member_ids import assign_member_ids
+from app.pipeline.member_lifecycle import (
+    CHAMBER_SENATE,
+    purge_departed_members,
+    reconcile_roster,
+)
+from app.pipeline.run_checks import alert_member_failures, persist_ground_truth_failures, run_calibration_check
+from app.pipeline.bill_refresh import keep_newer_latest_actions
+from app.pipeline.progress_tracker import ProgressTracker
+# Transform modules
+from app.pipeline.transform.normalize_finance import MISSING_VALUE_TEXT, committee_donor_name, normalize_finance
+from app.pipeline.transform.normalize_members import normalize_members
+from app.pipeline.transform.committee_data import load_leadership_tenures
+from app.pipeline.transform.normalize_votes import (
+    compute_party_split,
+    compute_party_vote_split,
+    dedupe_votes,
+    extract_senator_vote,
+    find_senate_roll_call,
+    is_housekeeping,
+    majority_leader_spans,
+    normalize_recent_votes,
+    resolve_senate_lis_ids,
+    normalize_votes,
+    stamp_roll_call_outcome,
+    vote_identity,
+    vote_date_iso,
+)
+
+# Analyze modules
+from app.pipeline.analyze.bill_analyzer import (
+    classify_all_bills,
+    classify_recent_votes,
+    clear_bill_embedding_cache,
+    recent_roll_call_key,
+)
+from app.pipeline.analyze.bill_learning import clear_reference_cache, stamp_motion_type
+from app.pipeline.analyze.party_platform import (
+    clear_platform_cache,
+    initialize_platform_embeddings,
+    refine_with_vote_data,
+)
+from app.pipeline.vector_store import (
+    check_model_version,
+    embed_bills,
+    clear_bills,
+    invalidate_on_model_change,
+    _write_model_version,
+)
+from app.pipeline.analyze.cross_reference import analyze_senator_batch, precompute_senator_analysis
+from app.pipeline.analyze.donor_classifier_ai import classify_donors_hybrid
+from app.pipeline.analyze.ollama_client import get_llm_stats, reset_client, reset_stats
+from app.pipeline.analyze.policy_alignment import clear_alignment_cache
+from app.pipeline.analyze.score_calculator import calculate_confidence, calculate_scores
+from app.pipeline.live_references import (
+    live_constituent_reference_measured,
+    live_funding_reference,
+    live_les_reference,
+)
+from app.pipeline.partisan_depth_store import finalize_stored_partisan_depth
+from app.pipeline.sponsorship_backfill import backfill_withheld_sponsorship_scores
+
+# Assemble modules
+from app.pipeline.assemble.senator_builder import build_senator
+from app.time_utils import utcnow
+
+logger = logging.getLogger(__name__)
+
+
+PIPELINE_STEPS = [
+    ("fetch_senators",       "fetch",     "Fetch senator list"),
+    ("fetch_member_details", "fetch",     "Fetch member details"),
+    ("normalize_members",    "transform", "Normalize members"),
+    ("discover_bills",       "fetch",     "Discover significant bills"),
+    ("fetch_bill_details",   "fetch",     "Fetch bill details"),
+    ("fetch_roll_calls",     "fetch",     "Fetch roll call votes"),
+    ("fetch_recent_rcs",     "fetch",     "Fetch recent roll calls"),
+    ("fetch_cosponsors",     "fetch",     "Fetch bill cosponsors"),
+    ("fetch_sponsored",      "fetch",     "Fetch sponsored legislation"),
+    ("fetch_official_titles", "fetch",    "Fetch official bill titles"),
+    ("fetch_fec",            "fetch",     "Fetch FEC financial data"),
+    ("classify_bills",       "analyze",   "Classify bills"),
+    ("classify_recent",      "analyze",   "Classify recent votes"),
+    ("embed_bills",          "analyze",   "Embed bills in vector DB"),
+    ("classify_donors",      "analyze",   "Classify donors"),
+    ("prepare_senators",     "analyze",   "Prepare senator data"),
+    ("classify_sponsored_stages", "analyze", "Classify sponsored-bill stages"),
+    ("fetch_sponsored_cosponsors", "fetch", "Fetch cosponsors for sponsored bills"),
+    ("sponsorship_analysis", "analyze",   "Sponsorship leadership & ideology (SVD/PageRank)"),
+    ("analyze_senators",     "analyze",   "Analyze senators"),
+    ("finalize",             "finalize",  "Finalize & save"),
+]
+
+MAX_SIGNIFICANT_BILLS = 100
+RECENT_RC_COUNT_PER_SESSION = 100
+RECENT_RC_SESSIONS = 2
+MIN_CONGRESS_FOR_BILL_TITLES = 116
+
+
+
+def party_line_members(scored: list[dict], roster: list[dict]) -> list[dict]:
+    """The members party_line_records reads: the senators this run scores,
+    first (their records come back in that order), then the rest of the
+    roster (a filtered run's unscored senators, or any whose prep failed),
+    without a voting record, whose positions the Senate's roll calls reach
+    only through the members passed."""
+    ids = {m.get("id") for m in scored}
+    return scored + [s for s in roster if s.get("id") not in ids]
+
+
+def _record_json(record: dict | None) -> str | None:
+    return json.dumps(record) if record else None
+
+
+def upsert_senator(db: Session, data: dict) -> None:
+    """
+    Upsert a fully assembled senator record into the database.
+    Replaces all child records (donors, votes, lobbying matches, industry donations).
+    """
+    senator_id = data["id"]
+
+    existing = db.query(Senator).filter(Senator.id == senator_id).first()
+
+    funding = data.get("funding", {})
+    corruption = data.get("representationScore", data.get("corruptionScore", {}))
+
+    senator_fields = {
+        "id": senator_id,
+        "bioguide_id": data.get("bioguideId"),
+        "name": data.get("name") or "",
+        "state": data.get("state") or "",
+        "party": data.get("party") or "I",
+        "years_in_office": data.get("yearsInOffice") or 0,
+        "initials": data.get("initials") or "",
+        # A dimension we never computed is unknown, not "fully captured" —
+        # default an ABSENT score to the neutral 50, matching the scoring
+        # standard (score_calculator: "Missing data yields a neutral 50").
+        # `.get(key, 50)` (not `... or 0`) so a genuinely-computed 0 is
+        # preserved rather than being conflated with missing data.
+        "score_funding_independence": corruption.get("fundingIndependence", 50),
+        "score_promise_persistence": corruption.get("promisePersistence", 50),
+        "score_constituent_alignment": corruption.get("constituentAlignment", 50),
+        "score_funding_diversity": corruption.get("fundingDiversity", 50),
+        "score_legislative_effectiveness": corruption.get("legislativeEffectiveness", 50),
+        # Data-sufficiency grades and the vote-part status
+        # (calculate_confidence). Never persisted for senators before
+        # v6.15 — only the House wrote it — so senators served none.
+        "score_confidence": json.dumps(corruption.get("confidence") or {}),
+        "total_raised": funding.get("totalRaised") or 0,
+        "total_contributions": funding.get("totalContributions"),
+        "caucus_party": (data.get("votingRecord") or {}).get("effectiveParty"),
+        "party_line_record": _record_json((data.get("votingRecord") or {}).get("partyLineRecord")),
+        "total_from_pacs": funding.get("totalFromPACs") or 0,
+        "small_donor_percentage": funding.get("smallDonorPercentage"),
+        "website_url": data.get("officialWebsiteUrl") or "",
+        "contact_form_url": data.get("contactFormUrl") or "",
+        "office_phone": data.get("officePhone") or "",
+        "office_address": data.get("officeAddress") or "",
+        "updated_at": utcnow(),
+    }
+    # Leadership title and committees (normalize_members). Never persisted
+    # for senators before 2026-09 — only the House path
+    # (representative_service.upsert_representative) wrote them, so every
+    # senator served leadershipTitle null and no committees. Same rule as
+    # the House: a record without the key leaves the stored value alone.
+    if "leadershipTitle" in data:
+        senator_fields["leadership_title"] = data["leadershipTitle"]
+    if "committees" in data:
+        senator_fields["committees"] = json.dumps(data["committees"] or [])
+
+    if existing:
+        for key, value in senator_fields.items():
+            setattr(existing, key, value)
+        # Delete old child records
+        db.query(Donor).filter(Donor.senator_id == senator_id).delete()
+        db.query(IndustryDonation).filter(
+            IndustryDonation.senator_id == senator_id
+        ).delete()
+        db.query(KeyVote).filter(KeyVote.senator_id == senator_id).delete()
+        db.query(LobbyingMatch).filter(
+            LobbyingMatch.senator_id == senator_id
+        ).delete()
+    else:
+        senator_fields["created_at"] = utcnow()
+        existing = Senator(**senator_fields)
+        db.add(existing)
+
+    # Add top donors
+    for rank, donor_data in enumerate(funding.get("topDonors", []), start=1):
+        db.add(
+            Donor(
+                senator_id=senator_id,
+                name=donor_data.get("name") or "Unknown",
+                total=donor_data.get("total") or 0,
+                type=donor_data.get("type") or "PAC",
+                industry=donor_data.get("industry") or "OTHER",
+                rank=rank,
+                pac_sponsor=donor_data.get("pacSponsor"),
+                pac_industry=donor_data.get("pacIndustry"),
+                pac_analysis=donor_data.get("pacAnalysis"),
+                committee_type=donor_data.get("committeeType"),
+            )
+        )
+
+    # Add industry donations
+    for ind_data in funding.get("industryBreakdown", []):
+        db.add(
+            IndustryDonation(
+                senator_id=senator_id,
+                industry=ind_data.get("industry") or "OTHER",
+                name=ind_data.get("name") or "Other",
+                total=ind_data.get("total") or 0,
+                percentage=ind_data.get("percentage") or 0,
+            )
+        )
+
+    # Add votes (both key and recent)
+    voting_record = data.get("votingRecord", {})
+    all_vote_entries = [
+        (v, "key") for v in voting_record.get("keyVotes", [])
+    ] + [
+        (v, "recent") for v in voting_record.get("recentVotes", [])
+    ]
+    for vote_data, category in all_vote_entries:
+        db.add(
+            KeyVote(
+                senator_id=senator_id,
+                bill_name=vote_data.get("billName") or "Unknown Bill",
+                bill_id=vote_data.get("billId") or "",
+                # ISO, so the voting record's date order is the calendar's:
+                # Senate.gov's "October 14, 2025, 05:34 PM" sorted September
+                # ahead of October.
+                date=vote_date_iso(vote_data.get("date")) or vote_data.get("date") or "",
+                vote=vote_data.get("vote") or "Not Voting",
+                policy_area=vote_data.get("policyArea") or "PROCEDURAL",
+                policy_areas=json.dumps(vote_data.get("policyAreas") or []),
+                party_alignment_weight=vote_data.get("partyAlignmentWeight") or 0.0,
+                stance=vote_data.get("stance") or "neutral",
+                description=vote_data.get("description") or "",
+                party_leaning=vote_data.get("partyLeaning"),
+                voted_with_party=vote_data.get("votedWithParty"),
+                vote_category=vote_data.get("voteCategory") or category,
+                roll_call=vote_data.get("rollCall"),
+            )
+        )
+
+    # Add lobbying matches
+    for match_data in data.get("lobbyingMatches", []):
+        db.add(
+            LobbyingMatch(
+                senator_id=senator_id,
+                lobbyist_org=match_data.get("lobbyistOrg") or "Unknown",
+                industry=match_data.get("industry") or "OTHER",
+                lobbying_spend=match_data.get("lobbyingSpend") or 0,
+                donation_to_senator=match_data.get("donationToSenator") or 0,
+                bills_influenced=json.dumps(
+                    match_data.get("billsInfluenced") or []
+                ),
+                senator_vote_aligned=match_data.get("senatorVoteAligned"),
+                is_consensus_vote=match_data.get("isConsensusVote"),
+                description=match_data.get("description") or "",
+                lobbied_bills=json.dumps(match_data.get("lobbiedBills") or []),
+                lobbying_clients=json.dumps(match_data.get("lobbyingClients") or []),
+                lobbying_checked=match_data.get("lobbyingChecked"),
+            )
+        )
+
+    # Add campaign promises
+    db.query(CampaignPromise).filter(
+        CampaignPromise.senator_id == senator_id
+    ).delete()
+    for promise_data in data.get("campaignPromises", []):
+        db.add(
+            CampaignPromise(
+                senator_id=senator_id,
+                promise_text=promise_data.get("promiseText") or "",
+                category=promise_data.get("category") or "other",
+                alignment=promise_data.get("alignment") or PromiseAlignment.UNCLEAR,
+                related_votes=json.dumps(
+                    promise_data.get("relatedVotes") or []
+                ),
+                related_bills=json.dumps(
+                    promise_data.get("relatedBills") or []
+                ),
+                analysis=promise_data.get("analysis") or "",
+                party_alignment=promise_data.get("partyAlignment"),
+            )
+        )
+
+    # Add sponsored bills — unless this run couldn't fetch them, in which
+    # case the empty list is not a record and the stored bills stay.
+    if not data.get("sponsoredBillsUnavailable"):
+        keep_newer_latest_actions(
+            db, SponsoredBill, SponsoredBill.senator_id == senator_id, data.get("sponsoredBills", []),
+        )
+        db.query(SponsoredBill).filter(
+            SponsoredBill.senator_id == senator_id
+        ).delete()
+    for sp_data in data.get("sponsoredBills", []):
+        db.add(
+            SponsoredBill(
+                senator_id=senator_id,
+                bill_id=sp_data.get("billId") or "",
+                title=sp_data.get("title") or "",
+                introduced_date=sp_data.get("introducedDate") or "",
+                latest_action=sp_data.get("latestAction") or "",
+                latest_action_date=sp_data.get("latestActionDate") or "",
+                policy_area=sp_data.get("policyArea") or "",
+                policy_areas=json.dumps(sp_data.get("policyAreas") or []),
+                party_leaning=sp_data.get("partyLeaning"),
+                congress=sp_data.get("congress") or 0,
+                bill_type=sp_data.get("billType") or "",
+                is_law=sp_data.get("isLaw") or False,
+                stage=sp_data.get("stage") or "",
+                commemorative=bool(sp_data.get("commemorative")),
+            )
+        )
+
+    # Save partisan depth profile as JSON on the senator row
+    partisan_depth_data = data.get("partisanDepth")
+    if partisan_depth_data and existing:
+        existing.partisan_depth = json.dumps(partisan_depth_data)
+
+    # Save sponsorship analysis scores (PageRank leadership + SVD ideology).
+    # Only overwrite when this run actually produced a value — the pipeline
+    # already backfills a withheld dict from the last stored value before
+    # this point (sponsorship_backfill.backfill_withheld_sponsorship_scores), but this is a
+    # second, independent guard: storage must never wipe a real score to
+    # None just because the value it was handed this run happens to be
+    # None, same principle as president_pipeline.py's `live` dict.
+    if existing:
+        ls = data.get("leadershipScore")
+        if ls is not None:
+            existing.leadership_score = ls
+        bs = data.get("bipartisanshipScore")
+        if bs is not None:
+            existing.bipartisanship_score = bs
+        abs_score = data.get("attractedBipartisanshipScore")
+        if abs_score is not None:
+            existing.attracted_bipartisanship_score = abs_score
+        ids = data.get("ideologyScore")
+        if ids is not None:
+            existing.ideology_score = ids
+        existing.sponsorship_description = data.get("sponsorshipDescription") or ""
+
+    db.flush()
+def _record_score_snapshots(db: Session, failed: "set[str] | frozenset[str]" = frozenset()) -> None:
+    """Snapshot today's scores for all senators so we can compute trends.
+
+    `failed`: ids of members this run did not score. They keep the scores
+    of the last run they passed, which an older algorithm may have
+    produced, so they get no snapshot today rather than one stamped with
+    this run's ALGORITHM_VERSION (and keep any earlier one from today)."""
+    from app.pipeline.analyze.score_calculator import ALGORITHM_VERSION, compute_overall_score
+
+    today = utcnow().strftime("%Y-%m-%d")
+    db.query(ScoreSnapshot).filter(
+        ScoreSnapshot.entity_type == "senator",
+        ScoreSnapshot.date == today,
+        ScoreSnapshot.entity_id.notin_(failed),
+    ).delete(synchronize_session=False)
+
+    senators = [s for s in db.query(Senator).all() if s.id not in failed]
+    for s in senators:
+        db.add(ScoreSnapshot(
+            entity_type="senator",
+            entity_id=s.id,
+            date=today,
+            overall_score=compute_overall_score(s),
+            score_1=s.score_funding_independence,
+            score_2=s.score_promise_persistence,
+            score_3=s.score_constituent_alignment,
+            score_4=s.score_funding_diversity,
+            score_5=s.score_legislative_effectiveness,
+            algorithm_version=ALGORITHM_VERSION,
+        ))
+    db.commit()
+    logger.info("Recorded score snapshots for %d senators on %s", len(senators), today)
+
+
+def _acquire_pipeline_lock(db: Session, *, lease_token: str | None = None) -> "tuple[PipelineRun | None, str | None]":
+    """Atomically create a new locked run: (run, None), or (None, why) —
+    run_tracker.acquire_pipeline_lock_why.
+
+    `lease_token`: the lease.SENATE_RUN this run holds, tagged with the new
+    row's id in the row's own transaction (lease.tag), so if this run dies
+    its lease proves exactly this row dead (run_tracker._proven_dead).
+
+    Uses the shared SQLite database so the lock works across blue/green
+    containers. Atomicity is enforced by the database itself: a partial
+    UNIQUE index allows at most one status='running' row (see
+    database._ensure_indexes), so the INSERT — not a check racing ahead
+    of it — is the lock acquisition. A check-then-insert shape would let
+    two containers hitting the same tick during a blue/green overlap
+    both pass the check and both start a full pipeline run.
+    """
+    from app.pipeline import lease
+    from app.pipeline.run_tracker import STALE_PIPELINE_TIMEOUT, acquire_pipeline_lock_why
+
+    def tag(run: PipelineRun) -> bool:
+        return lease_token is None or lease.tag(db, lease.SENATE_RUN, lease_token, run.id)
+
+    return acquire_pipeline_lock_why(db, PipelineRun, STALE_PIPELINE_TIMEOUT, on_insert=tag)
+
+
+# Hashed paths that cannot change how anything is classified or scored, so
+# editing them must not wipe learned data. The holdings ingest reads
+# filer-declared asset types (mapped in fetch/, already unhashed) and
+# classifies nothing; filer matching only decides whose filing a filing is.
+# The run-coordination modules (_COORDINATION_PATHS) decide when a run may
+# go and record how far it got — none imports analysis code (tested).
+_COORDINATION_PATHS = {
+    "pipeline/lease.py",
+    "pipeline/run_tracker.py",
+    "pipeline/progress_tracker.py",
+    "pipeline/rate_limiter.py",
+}
+# What gets published and how it is worded (app/broadcast.py stores and
+# delivers it): these read finished issues, scores and records and write
+# posts, which nothing classifies or scores. Hashed modules may call their
+# post_*/process_* entry points and nothing else (tested), so a change here
+# can't reach an analysis result.
+_PUBLISHING_PATHS = {
+    "pipeline/analyze/bluesky_poster.py",
+    "pipeline/analyze/bluesky_spotlight.py",
+    "pipeline/analyze/bluesky_utils.py",
+    "pipeline/analyze/congress_bluesky.py",
+    "pipeline/analyze/election_bluesky.py",
+}
+# The Action Center's hourly run: news clustering, the claim layer that
+# quotes sources, the developing-issue drafts and its engagement. It reads
+# scores and records and writes issues, and keeps nothing in the learning
+# store, the analysis cache or the reference corpus, which are all the
+# fingerprint protects. Hashed code imports none of these (tested), so an
+# edit here can't move a classification or a score, but each one used to
+# make the next nightly run cold.
+_ACTION_CENTER_PATHS = {
+    "pipeline/analyze/action_center.py",
+    "pipeline/analyze/action_thresholds.py",
+    "pipeline/analyze/bluesky_engagement.py",
+    "pipeline/analyze/claims.py",
+    "pipeline/analyze/early_signal.py",
+    "pipeline/analyze/post_composer.py",
+    "pipeline/analyze/story_actor.py",
+}
+_NOT_ANALYSIS_PATHS = {
+    "pipeline/holdings_pipeline.py",
+    # Trade ingest: its industry labels come from SEC codes (fetch/
+    # sec_tickers.py), never the learning store or an embedding, and are
+    # read by no score (test_stock_pipeline_imports_no_analysis_code).
+    "pipeline/stock_pipeline.py",
+    "pipeline/filer_matching.py",
+    # Which bills a lobbying filing names: shown beside donor-vote
+    # connections, read by no classifier or score.
+    "pipeline/analyze/lobbying_records.py",
+    # The election run's orchestration: candidate rosters, ballots, measures
+    # and coverage, none of it classified or scored. Its matching and
+    # posting logic lives in analyze/ and fetch/, and is hashed (or not)
+    # there.
+    "pipeline/election_pipeline.py",
+    # Reads finished scores after a run to check two components still
+    # measure different things; nothing it computes feeds a score.
+    "pipeline/analyze/signal_overlap.py",
+    # The Explore summary prompt and its parser: read only by
+    # services/explore_summary.py, a reader's on-request summary. Nothing
+    # classified or scored reads it.
+    "pipeline/analyze/prompts.py",
+    *_COORDINATION_PATHS,
+    *_PUBLISHING_PATHS,
+    *_ACTION_CENTER_PATHS,
+}
+
+# Top-level names, per hashed file, that are display settings rather than
+# analysis inputs — dropped from that file's fingerprint (see
+# _normalized_source's `exempt`), so recoloring a chart slice doesn't reset
+# self-training. Only add a name that no pipeline code reads.
+_DISPLAY_ONLY_NAMES = {
+    "config_definitions.py": {"HOLDING_CATEGORIES"},
+}
+
+
+def _normalized_source(source: str, exempt: set[str] | frozenset[str] = frozenset()) -> bytes:
+    """A module's source reduced to what can change its behavior: the AST
+    with every docstring removed. Comments never reach the AST at all.
+
+    The raw-bytes hash this replaces cleared the learning store, analysis
+    cache and reference corpus on ANY edit to a hashed file — including a
+    comment reworded in a module that classifies nothing. In a codebase that
+    documents every calibration change inline, that meant self-training
+    rarely survived more than a few runs. Nothing in app/ reads `__doc__`,
+    so dropping docstrings can't hide a behavior change; any change to code,
+    a string constant, a prototype description, or a threshold still
+    changes the dump.
+    """
+    import ast
+
+    tree = ast.parse(source)
+    if exempt:
+        def assigns_exempt(stmt: ast.stmt) -> bool:
+            targets = stmt.targets if isinstance(stmt, ast.Assign) else (
+                [stmt.target] if isinstance(stmt, ast.AnnAssign) else []
+            )
+            return any(isinstance(t, ast.Name) and t.id in exempt for t in targets)
+
+        tree.body = [stmt for stmt in tree.body if not assigns_exempt(stmt)] or [ast.Pass()]
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                # Keep the body non-empty so the tree stays well-formed.
+                node.body = body[1:] or [ast.Pass()]
+    return ast.dump(tree, annotate_fields=False).encode()
+
+
+def _compute_analysis_code_hash() -> str:
+    """SHA-256 fingerprint of all analysis-relevant source files.
+
+    Covers pipeline modules (analyze, transform, assemble, orchestrator,
+    vector_store, cache) and config_definitions.py (weights, prototypes,
+    industry codes).  Excludes fetch modules — raw data retrieval does not
+    affect how that data is classified or scored — and the few other paths
+    and display-only constants listed in _NOT_ANALYSIS_PATHS and
+    _DISPLAY_ONLY_NAMES.
+
+    Hashes each file's docstring-stripped AST (see _normalized_source), not
+    its raw bytes, so comment and docstring edits don't wipe learned data.
+
+    Also folds in the resolved generative-model identity (backend + model
+    id). Those live in config.py (env-driven), not in any hashed .py source,
+    so without this an operator swapping OLLAMA_MODEL/LLM_BACKEND would leave
+    every cached LLM classification labelled by the previous model
+    indefinitely — the fingerprint wouldn't change and the cache wouldn't
+    clear. (The embedding model is already covered: EMBEDDING_MODEL_NAME is a
+    literal in vector_store.py, which is hashed above.)
+    """
+    import hashlib
+    import pathlib
+
+    from app.config import settings
+
+    app_dir = pathlib.Path(__file__).resolve().parent.parent  # app/
+    paths: list[pathlib.Path] = []
+    for p in sorted((app_dir / "pipeline").rglob("*.py")):
+        if "/fetch/" not in str(p) and p.relative_to(app_dir).as_posix() not in _NOT_ANALYSIS_PATHS:
+            paths.append(p)
+    cfg = app_dir / "config_definitions.py"
+    if cfg.exists():
+        paths.append(cfg)
+
+    h = hashlib.sha256()
+    for p in sorted(paths):
+        h.update(str(p.relative_to(app_dir)).encode())
+        h.update(b"\x00")
+        rel = p.relative_to(app_dir).as_posix()
+        h.update(_normalized_source(p.read_text(), _DISPLAY_ONLY_NAMES.get(rel, frozenset())))
+        h.update(b"\x00")
+    h.update(b"\x00llm:")
+    h.update((settings.LLM_BACKEND or "").encode())
+    h.update(b"\x00")
+    h.update((settings.OLLAMA_MODEL or "").encode())
+    return h.hexdigest()[:16]
+
+
+def _clear_analysis_artifacts(db: Session) -> None:
+    """Purge analysis artifacts only when pipeline code has changed.
+
+    Computes a SHA-256 fingerprint of all analysis source files and
+    compares it to the fingerprint stored from the last pipeline run.
+
+    Same code  → preserves learning store, analysis cache, and ChromaDB
+                 reference corpus so the self-training system accumulates
+                 knowledge across runs.
+    Changed    → clears all three persistence layers so updated algorithms
+                 start fresh without stale classifications or narratives.
+
+    The API cache (raw Congress.gov / FEC / GovInfo responses) is never
+    cleared — it reflects source data, not processing logic.
+    """
+    from app.models import AnalysisCache, ApiCache, LearnedClassification
+
+    current_hash = _compute_analysis_code_hash()
+
+    stored_entry = (
+        db.query(ApiCache)
+        .filter(ApiCache.tier == "_internal", ApiCache.cache_key == "analysis_code_hash")
+        .first()
+    )
+    stored_hash = json.loads(stored_entry.data_json) if stored_entry else None
+
+    if stored_hash == current_hash:
+        logger.info(
+            "Pipeline code unchanged (hash=%s) — preserving learning data",
+            current_hash,
+        )
+        return
+
+    n_analysis = db.query(AnalysisCache).delete()
+    n_learned = db.query(LearnedClassification).delete()
+    db.commit()
+
+    n_bills = 0
+    try:
+        try:
+            n_bills = clear_bills()
+        except Exception:
+            logger.debug("No existing bills collection to clear")
+    except Exception:
+        logger.debug("ChromaDB not available for cache clear")
+
+    from app.pipeline.cache import api_cache_set
+    api_cache_set(db, "_internal", "analysis_code_hash", current_hash)
+
+    logger.info(
+        "Pipeline code changed (%s -> %s) — cleared %d cached LLM results, "
+        "%d learned classifications, %d reference bills",
+        stored_hash or "none", current_hash, n_analysis, n_learned, n_bills,
+    )
+
+
+def invalidate_stale_analysis(db: Session) -> None:
+    """At the start of a member pipeline (Senate or House), under its run
+    lock: purge analysis-derived data from prior runs when the analysis
+    code changed, and stored embeddings when the embedding model did, so
+    updated algorithms always produce fresh results. Preserves the API cache
+    (raw Congress.gov / FEC / GovInfo responses) since those reflect source
+    data, not our processing logic.
+
+    Both chambers run it because either may be the first to run after a
+    deploy — a House run doesn't wait on a Senate one succeeding
+    (app.pipeline_chain). Whichever runs first clears; the other finds the
+    stored hash and model version current and keeps everything.
+    """
+    _clear_analysis_artifacts(db)
+    if not check_model_version():
+        invalidate_on_model_change(db_session=db)
+    else:
+        _write_model_version()
+
+
+async def _fetch_senator_fec(
+    client: httpx.AsyncClient, db: Session, senator: dict,
+    committee_contributions, committee_master,
+) -> dict | None:
+    """One senator's FEC data for normalize_finance: None when no FEC
+    candidate matches, {"unavailable": True} when the FEC could not be read
+    — not "raised nothing": the senator is skipped at prepare and keeps the
+    stored record."""
+    try:
+        candidate = await find_candidate(
+            client, db, senator["name"], senator["state"],
+            bioguide_id=senator.get("bioguideId"),
+        )
+        if not candidate or not candidate.get("candidate_id"):
+            logger.warning("No FEC match for %s (%s)", senator["name"], senator["state"])
+            return None
+        candidate_id = candidate["candidate_id"]
+        financials = await fetch_candidate_financials(client, db, candidate_id)
+        committees = await fetch_candidate_committees(client, db, candidate_id)
+        committee_id = committees[0].get("committee_id") if committees else None
+
+        # Match the receipt-detail and outside-spending windows to the
+        # receipt-totals window (normalize_finance sums only the most recent
+        # election, one deduped totals row).
+        recent_cycles = compute_recent_election_cycles(financials, "S")
+        receipts: list = []
+        pac_receipts: list = []
+        if committee_id:
+            receipts = await fetch_committee_receipts(client, db, committee_id, cycles=recent_cycles)
+            pac_receipts = await fetch_pac_receipts(client, db, committee_id, cycles=recent_cycles)
+        detail = await fetch_contribution_detail(
+            client, db, candidate_id, [committee_id] if committee_id else [],
+            recent_cycles, committee_contributions, committee_master,
+        )
+    except FecUnavailable as e:
+        logger.warning("FEC unreachable for %s: %s", senator["name"], e)
+        return {"unavailable": True}
+    return {
+        "candidate": candidate,
+        "financials": financials,
+        "receipts": receipts,
+        "pacReceipts": pac_receipts,
+        "detail": detail,
+    }
+
+
+def _build_donor_entries(senators: list[dict], fec_data: dict) -> list[dict]:
+    """Flatten every senator's FEC receipts into donor entries for
+    classify_donors_hybrid.
+
+    Each entry must carry `fec_receipt` when one exists — it's the only way
+    Tier 1 (classify_donor_type_from_fec) can resolve a donor from FEC's own
+    entity_type instead of falling through to the noisy semantic-embedding
+    tier, which has no reliable signal for a bare company name: a one-word
+    company name (e.g. "Airbnb") can score closer to the Party/Ideological
+    prototype than Org/Employees.
+    """
+    entries: list[dict] = []
+    for senator in senators:
+        fec = fec_data.get(senator["id"])
+        if not fec:
+            continue
+        cand_name = (fec.get("candidate") or {}).get("name", "")
+        for r in fec.get("pacReceipts") or []:
+            name = r.get("contributor_name") or ""
+            if not name:
+                committee = r.get("committee") or {}
+                name = committee.get("name", "")
+            if name and name != "Unknown":
+                entries.append({
+                    "name": name,
+                    "amount": r.get("contribution_receipt_amount", 0) or 0,
+                    "fec_receipt": r,
+                    "candidate_name": cand_name,
+                })
+        for r in fec.get("receipts") or []:
+            employer = (r.get("contributor_employer") or "").strip()
+            if employer:
+                entries.append({
+                    "name": employer,
+                    "amount": r.get("contribution_receipt_amount", 0) or 0,
+                    "fec_receipt": r,
+                })
+        # The complete detail's donors, under the names normalize_finance
+        # looks them up by. A giving committee's type is already known from
+        # its registration (committee_donor_type); only its industry is
+        # asked of the classifier.
+        detail = fec.get("detail") or {}
+        committees = detail.get("committees") or {}
+        for cid, amount in (detail.get("pacs") or {}).items():
+            entries.append({
+                "name": committee_donor_name(committees.get(cid), cid),
+                "amount": amount,
+                "candidate_name": cand_name,
+            })
+        for r in detail.get("employers") or []:
+            # "NULL" is no employer; classified, it became a learned
+            # Org/Employees example.
+            if r.get("employer") and r["employer"].upper().strip() not in MISSING_VALUE_TEXT:
+                entries.append({"name": r["employer"], "amount": r.get("total") or 0, "candidate_name": cand_name})
+    return entries
+
+
+def _build_current_term_sponsored_for_cosponsor(senator_prepared: list[dict]) -> list[dict]:
+    """Every current-congress sponsored bill, for every senator, formatted
+    for the cosponsorship-enrichment fetch that feeds SVD ideology and
+    PageRank leadership scoring.
+
+    No per-senator cap — see the call site's comment for why a prior 10-
+    bill cap silently starved prolific sponsors of most of their own
+    signal. Restricted to the current congress only (not `>=` some older
+    congress) to match this platform's "current term, not career"
+    principle (AGENTS.md "6. Current term, not career") and to keep the
+    now-uncapped total bounded to a known quantity.
+    """
+    entries: list[dict] = []
+    for prep in senator_prepared:
+        senator = prep["senator"]
+        bio_id = senator.get("bioguideId", "")
+        party = senator.get("party", "")
+        if not bio_id:
+            continue
+        for sp in prep.get("sponsoredBills", []):
+            if sp.get("congress", 0) != settings.CURRENT_CONGRESS or not sp.get("billId"):
+                continue
+            entries.append({
+                "billId": sp["billId"],
+                "congress": sp["congress"],
+                "sponsorBioguide": bio_id,
+                "sponsorParty": party,
+                "isLaw": sp.get("isLaw", False),
+                "latestAction": sp.get("latestAction", ""),
+            })
+    return entries
+
+
+def _build_analysis_input(prepared: dict) -> dict:
+    """Build the analysis input dict for a senator's embedding pre-computation."""
+    senator = prepared["senator"]
+    funding = prepared["funding"]
+    voting_record = prepared["votingRecord"]
+    all_votes = dedupe_votes(
+        (voting_record.get("keyVotes") or []) + (voting_record.get("recentVotes") or [])
+    )
+    return {
+        "senator": senator,
+        "donors": funding.get("topDonors", []),
+        "industryBreakdown": funding.get("industryBreakdown", []),
+        "keyVotes": voting_record.get("keyVotes", []),
+        "allVotes": all_votes,
+        "sponsoredBills": prepared.get("sponsoredBills", []),
+    }
+
+
+async def _sponsored_bill_actions(client, db: Session, sp: dict) -> list[dict]:
+    """Congress.gov actions for one sponsored-bill entry ([] when its id is
+    incomplete). Cached upstream by fetch_bill_actions."""
+    bill_number = "".join(ch for ch in (sp.get("billId") or "").split(".")[-1] if ch.isdigit())
+    if not (sp.get("billType") and bill_number and sp.get("congress")):
+        return []
+    return await fetch_bill_actions(
+        client, db, sp["congress"], sp["billType"].lower(), int(bill_number),
+    ) or []
+
+
+_PROGRESS_EVERY = 50
+
+
+async def _classify_sponsored_stages(db: Session, senator_prepared: list[dict], progress=None) -> None:
+    """Every sponsored bill's stage — and, with its action history to hand,
+    its is_law as every writer reads it (is_enacted), agreeing with the
+    stage — before anything reads either. Legislative Effectiveness credits
+    bills by stage reached, and its population reference must be measured
+    on the same inputs members are scored on; the cosponsorship graph
+    (sponsorship_analysis's edge weights) reads is_law earlier still. Stage
+    used to be classified after calculate_scores had already run, so Senate
+    LE was scored on the latestAction keyword fallback — which misses a bill
+    that passed the Senate once its latest action is a House referral —
+    while the House (house_pipeline phase 4b) classified first. One
+    action-history read per bill (cached by fetch_bill_actions): its own
+    progress step, as it can run a while on a cold cache."""
+    bills = [sp for prepared in senator_prepared for sp in prepared.get("sponsoredBills", [])]
+    if progress is not None:
+        progress.begin("classify_sponsored_stages", total=len(bills))
+    stage_failures = 0
+    async with make_async_client() as client:
+        for done, sp in enumerate(bills, 1):
+            try:
+                sp_actions = await _sponsored_bill_actions(client, db, sp)
+                sp["isLaw"] = sp.get("isLaw", False) or is_enacted(sp.get("latestAction"), sp_actions)
+                sp["stage"] = classify_bill_stage_from_actions(sp_actions, sp["isLaw"], sp.get("billType"))
+            except Exception:
+                # Leave stage unset: _les_bill_stage falls back to
+                # isLaw/latestAction for this bill. One unreachable
+                # bill must not abort every senator's scoring.
+                stage_failures += 1
+            # Every _PROGRESS_EVERY bills, not each: an update commits the
+            # run row, and a warm cache makes each bill a fast cache hit.
+            if progress is not None and (done % _PROGRESS_EVERY == 0 or done == len(bills)):
+                progress.update("classify_sponsored_stages", done=done)
+    if stage_failures:
+        logger.warning(
+            "Bill-stage classification failed for %d sponsored bills — "
+            "those use the latestAction fallback", stage_failures,
+        )
+    if progress is not None:
+        progress.complete(
+            "classify_sponsored_stages", detail=f"{len(bills) - stage_failures} classified, {stage_failures} failed",
+        )
+
+
+def _recent_not_covered_by_key_bills(
+    classified_recent: list[dict], roll_call_data_map: dict[str, dict],
+) -> list[dict]:
+    """Recent roll calls that aren't already a key bill's roll call.
+
+    A key bill's passage vote is often also one of the session's recent
+    roll calls. Both paths used to feed the member's record, so that one
+    vote was counted twice. The key-bill entry wins — it carries the bill's
+    real name and content classification.
+    """
+    covered = {recent_roll_call_key(rc) for rc in roll_call_data_map.values()}
+    return [rc for rc in classified_recent if rc.get("rcKey") not in covered]
+
+
+def _key_bill_votes_only(
+    votes: list[dict], roll_call_data_map: dict[str, dict],
+) -> list[dict]:
+    """normalize_votes' output restricted to key-bill votes, each stamped
+    with its roll call's rcKey so vote_identity is unique for it too.
+
+    normalize_votes is also handed the recent roll calls (for its aggregate
+    counts); those come back carrying an rcKey and are dropped here because
+    normalize_recent_votes produces them as recentVotes.
+    """
+    out = []
+    for v in votes:
+        if v.get("rcKey"):
+            continue
+        rc = roll_call_data_map.get(v.get("billId", ""))
+        out.append({**v, "rcKey": recent_roll_call_key(rc) if rc else None})
+    return out
+
+
+def split_key_and_recent_votes(
+    key_bill_votes: list[dict],
+    recent_votes: list[dict],
+    key_vote_ids: set[str],
+    fallback_keys: int = 5,
+) -> tuple[list[dict], list[dict]]:
+    """Partition a member's votes into (key, recent), each roll call once.
+
+    key_vote_ids are vote_identity values from select_key_votes. When none
+    were selected, the first `fallback_keys` key-bill votes are shown as key
+    instead. Everything else is recent — the full record stays available to
+    scoring and partisan-depth analysis, which read keyVotes + recentVotes.
+    """
+    pool = dedupe_votes(key_bill_votes + recent_votes)
+    key = [v for v in pool if vote_identity(v) in key_vote_ids]
+    if not key:
+        key = dedupe_votes(key_bill_votes)[:fallback_keys]
+    key_ids = {vote_identity(v) for v in key}
+    recent = [v for v in pool if vote_identity(v) not in key_ids]
+    for v in key:
+        v["voteCategory"] = "key"
+    for v in recent:
+        v["voteCategory"] = "recent"
+    return key, recent
+
+
+# A busy database (another writer past SQLite's busy timeout) delays the
+# Senate run's lease; this many tries, each waiting that timeout out.
+_SENATE_LEASE_ATTEMPTS = 5
+
+
+def _take_senate_run_lease(stack) -> "tuple[str | None, str | None]":
+    """Hold lease.SENATE_RUN on its own session until `stack` closes:
+    (None, its token) once held, or (the lease.refusal_code why it can't be
+    had, None). Taken before the Senate run lock, and held until after the
+    run's row is final; the lock tags it with the run's id
+    (_acquire_pipeline_lock). So a live run's lease is renewed beside its
+    RUNNING row, and a dead run's, left behind, lapses — an hour without a
+    beat (lease.stale_after) — which proves that row dead
+    (run_tracker._proven_dead). Short of that it still counts as held: a
+    live run's beats can stall behind a writer for minutes.
+
+    The evidence is acted on as it is replaced: taking over a lapsed lease
+    marks the run it names stale in the same transaction (lease.acquire's
+    on_replace), so a proven-dead row is never left RUNNING with nothing to
+    say so. Held by another, a Senate run (or a reset) may be live and this
+    one doesn't start; a busy database is waited out a few times first."""
+    from app.models import PipelineStatus
+    from app.pipeline import lease
+    from app.pipeline.run_tracker import DEAD_RUN_MESSAGE
+
+    def mark_named_run_stale(db: Session, data: dict) -> None:
+        named = data.get("run")
+        if isinstance(named, int):
+            db.query(PipelineRun).filter(
+                PipelineRun.id == named, PipelineRun.status == PipelineStatus.RUNNING,
+            ).update({
+                "status": PipelineStatus.STALE, "completed_at": utcnow(), "error_message": DEAD_RUN_MESSAGE,
+            }, synchronize_session=False)
+
+    lease_db = SessionLocal()
+    stack.callback(lease_db.close)
+    why = lease.REFUSED_BUSY
+    for _ in range(_SENATE_LEASE_ATTEMPTS):
+        token = stack.enter_context(
+            lease.holding(lease_db, lease.SENATE_RUN, yield_to=lease.DATA_RESET, on_replace=mark_named_run_stale),
+        )
+        if token is not None:
+            return None, token
+        why = lease.refusal_code(lease_db, lease.SENATE_RUN)
+        if why != lease.REFUSED_BUSY:
+            break
+    return why, None  # logged by the caller, with the run lock's refusals
+
+
+async def run_senate_pipeline(
+    senator_filter: str | None = None,
+    fetch_only: bool = False,
+) -> dict:
+    """
+    Full pipeline implementation.
+
+    Args:
+        senator_filter: Optional name/id filter to process a single senator.
+        fetch_only: If True, stop after fetch phase (no LLM analysis).
+
+    Returns:
+        Dict with pipeline run stats.
+    """
+    start_time = time.time()
+    db: Session = SessionLocal()
+
+    # Acquire the run lock BEFORE any global/DB mutation. In run 69 the
+    # next night's scheduled trigger fired while the run was finalizing:
+    # it reset the shared LLM counters (the run recorded llm_calls=0) and
+    # purged analysis artifacts mid-write before hitting the lock check.
+    from contextlib import ExitStack
+
+    run_lease = ExitStack()
+    try:
+        refused, lease_token = _take_senate_run_lease(run_lease)
+        pipeline_run = None
+        if refused is None:
+            pipeline_run, refused = _acquire_pipeline_lock(db, lease_token=lease_token)
+    except BaseException:
+        # Before the run's own try: let go of the lease (and its heartbeat)
+        # here, or it would be renewed for as long as the process lives.
+        run_lease.close()
+        db.close()
+        raise
+    if pipeline_run is None:
+        from app.pipeline import lease
+        from app.pipeline.run_tracker import skip_reason_text
+
+        logger.warning("Senate pipeline not started: %s", skip_reason_text(refused, lease.SENATE_RUN))
+        db.close()
+        run_lease.close()
+        # Why, for the nightly chain's skip alert: a data reset, a busy
+        # database, or a run already going.
+        return {"status": "skipped", "reason": refused}
+
+    try:
+        reset_stats()
+        reset_client()
+
+        # Clear in-memory caches from prior runs to bound memory usage.
+        clear_alignment_cache()
+        clear_bill_embedding_cache()
+        clear_reference_cache()
+        clear_platform_cache()
+        from app.pipeline.transform.industry_classifier import clear_industry_embedding_cache
+        clear_industry_embedding_cache()
+
+        invalidate_stale_analysis(db)
+
+        # Build party platform centroids from seeds + accumulated bill data.
+        # This implements Bayesian self-training: seed descriptions act as a
+        # prior, and real bill data from previous runs updates the posterior.
+        initialize_platform_embeddings(db)
+
+        progress = ProgressTracker(pipeline_run, PIPELINE_STEPS, db, start_time)
+
+        logger.info("=== CIVITAS DATA PIPELINE ===")
+        if senator_filter:
+            logger.info("Single senator: %s", senator_filter)
+        if fetch_only:
+            logger.info("Fetch only mode -- no LLM analysis")
+
+        pipeline_run.current_phase = "fetch"
+        pipeline_run.elapsed_seconds = 0
+        db.commit()
+
+        # Validate API keys
+        if not settings.DATA_GOV_API_KEY:
+            raise RuntimeError(
+                "DATA_GOV_API_KEY not set. Add it to .env file. "
+                "Sign up free at https://api.data.gov/signup/"
+            )
+
+        # ========================================
+        # PHASE 1: FETCH
+        # ========================================
+        logger.info("--- Phase 1: FETCH ---")
+
+        async with make_async_client() as client:
+            # 1a. Fetch all current senators from Congress.gov
+            logger.info("Fetching senator list from Congress.gov...")
+            progress.begin("fetch_senators")
+            raw_members = await fetch_senators(client, db)
+            if not raw_members:
+                raise RuntimeError(
+                    "Failed to fetch senators. Check your DATA_GOV_API_KEY."
+                )
+            logger.info("Found %d senators", len(raw_members))
+            progress.complete("fetch_senators", detail=f"{len(raw_members)} found")
+
+            # 1b. Fetch detailed member info
+            logger.info("Fetching member details...")
+            progress.begin("fetch_member_details", total=len(raw_members))
+            member_details: dict[str, dict] = {}
+            for mi, m in enumerate(raw_members):
+                bioguide_id = m.get("bioguideId")
+                if bioguide_id:
+                    detail = await fetch_member_detail(client, db, bioguide_id)
+                    if detail:
+                        member_details[bioguide_id] = detail
+                progress.update("fetch_member_details", done=mi + 1)
+            progress.complete("fetch_member_details", detail=f"{len(member_details)} detailed")
+
+            # ========================================
+            # PHASE 2: TRANSFORM (members)
+            # ========================================
+            pipeline_run.current_phase = "transform"
+            pipeline_run.elapsed_seconds = round(time.time() - start_time, 1)
+            db.commit()
+            logger.info("--- Phase 2: TRANSFORM (members) ---")
+            progress.begin("normalize_members")
+            senators = normalize_members(raw_members, member_details)
+            # Settle ids against the stored members by bioguide id, renaming
+            # any whose id changed, before anything below writes by id.
+            assign_member_ids(db, CHAMBER_SENATE, senators)
+            db.commit()
+            roster = list(senators)  # the whole chamber, for the party-line records
+            logger.info("Normalized %d senators", len(senators))
+            progress.complete("normalize_members", detail=f"{len(senators)} senators")
+
+            # Filter to single senator if specified
+            if senator_filter:
+                query = senator_filter.lower()
+                senators = [
+                    s
+                    for s in senators
+                    if query in s["name"].lower() or query in s["id"].lower()
+                ]
+                if not senators:
+                    raise RuntimeError(f"Senator not found: {senator_filter}")
+                logger.info(
+                    "Filtered to: %s",
+                    ", ".join(s["name"] for s in senators),
+                )
+
+            pipeline_run.senators_total = len(senators)
+            db.commit()
+
+            # 2b. Reconcile the roster: anyone in the database but not in
+            # tonight's fetch has left office, and anyone who left long
+            # enough ago gets removed. Skipped for a filtered run — the
+            # normalized list is a single senator there, which every other
+            # senator would look "absent" against.
+            if senator_filter:
+                logger.info("Skipping roster reconciliation — filtered run (%s)", senator_filter)
+            else:
+                reconcile_roster(
+                    db, CHAMBER_SENATE, {m.get("bioguideId", "") for m in raw_members},
+                )
+                # The purge deletes rows outright, so it stays out of
+                # fetch-only runs — those exist to exercise the fetch path
+                # without side effects beyond refreshed data. Marking a
+                # departure above is fine there: it is derived purely from
+                # this fetch and the next full run reverses it if wrong.
+                if not fetch_only:
+                    purge_departed_members(db, CHAMBER_SENATE)
+                db.commit()
+
+            # 1c. Dynamically discover significant bills
+            logger.info("Discovering significant bills...")
+            progress.begin("discover_bills")
+            discovered_bills = await fetch_significant_bills(client, db, max_bills=MAX_SIGNIFICANT_BILLS)
+            logger.info("Found %d significant bills", len(discovered_bills))
+            progress.complete("discover_bills", detail=f"{len(discovered_bills)} discovered")
+
+            # Fetch detailed data for each discovered bill
+            progress.begin("fetch_bill_details", total=len(discovered_bills))
+            bills_data: list[dict] = []
+            for bill_idx, bill_ref in enumerate(discovered_bills):
+                bill = await fetch_bill(
+                    client, db, bill_ref["congress"], bill_ref["type"], bill_ref["number"]
+                )
+                summaries = await fetch_bill_summaries(
+                    client, db, bill_ref["congress"], bill_ref["type"], bill_ref["number"]
+                )
+                actions = await fetch_bill_actions(
+                    client, db, bill_ref["congress"], bill_ref["type"], bill_ref["number"]
+                )
+                titles = await fetch_bill_titles(
+                    client, db, bill_ref["congress"], bill_ref["type"], bill_ref["number"]
+                )
+
+                # Fetch full bill text from GovInfo
+                full_text = await fetch_bill_text(
+                    client, db, bill_ref["congress"], bill_ref["type"], bill_ref["number"]
+                )
+
+                if bill:
+                    sponsors = bill.get("sponsors", [])
+                    sponsor_party = None
+                    sponsor_bioguide = None
+                    if sponsors:
+                        sponsor_party = sponsors[0].get("party")
+                        sponsor_bioguide = sponsors[0].get("bioguideId")
+
+                    official_title = extract_official_title(titles)
+                    crs_policy_area = (bill.get("policyArea") or {}).get("name", "")
+                    # actions[0] is the most recent (Congress.gov returns
+                    # newest-first) — the same is_law reading (is_enacted)
+                    # as sponsored bills below, so a significant
+                    # bill's cosponsorship-edge weight (sponsorship_analysis.
+                    # _cosponsorship_edge_weight) reflects the same notion
+                    # of "advanced" everywhere in the pipeline.
+                    latest_action_text = (actions or [{}])[0].get("text", "") if actions else ""
+                    is_law = is_enacted(latest_action_text, actions)
+
+                    bills_data.append(
+                        {
+                            "billId": f"{bill_ref['type'].upper()}.{bill_ref['number']}",
+                            "billName": bill_ref["name"],
+                            "congress": bill_ref["congress"],
+                            "summary": (
+                                summaries[0].get("text", "")
+                                if summaries
+                                else bill.get("title", "")
+                            ),
+                            "officialTitle": official_title,
+                            "crsPolicyArea": crs_policy_area,
+                            "fullText": full_text or "",
+                            "actions": actions or [],
+                            "sponsorParty": sponsor_party,
+                            "sponsorBioguide": sponsor_bioguide,
+                            "isLaw": is_law,
+                            "latestAction": latest_action_text,
+                        }
+                    )
+                progress.update("fetch_bill_details", done=bill_idx + 1)
+            logger.info(
+                "Fetched details for %d/%d discovered bills",
+                len(bills_data),
+                len(discovered_bills),
+            )
+            progress.complete("fetch_bill_details", detail=f"{len(bills_data)} fetched")
+
+            # 1d. Fetch roll call votes for each bill
+            logger.info("Fetching roll call votes...")
+            progress.begin("fetch_roll_calls", total=len(bills_data))
+            roll_call_data_map: dict[str, dict] = {}
+            for rc_idx, bill in enumerate(bills_data):
+                roll_call_ref = find_senate_roll_call(bill.get("actions"))
+                if roll_call_ref:
+                    roll_call_data = await fetch_roll_call_vote(
+                        client,
+                        db,
+                        roll_call_ref["congress"],
+                        roll_call_ref["session"],
+                        roll_call_ref["rollCallNumber"],
+                    )
+                    if roll_call_data:
+                        roll_call_data_map[bill["billId"]] = roll_call_data
+                progress.update("fetch_roll_calls", done=rc_idx + 1)
+            logger.info(
+                "Roll call data fetched for %d/%d bills",
+                len(roll_call_data_map),
+                len(bills_data),
+            )
+            progress.complete("fetch_roll_calls", detail=f"{len(roll_call_data_map)} matched")
+
+            # 1d.2 Fetch recent roll calls from Senate.gov, current congress only —
+            # "current term" is defined as the current congress; see AGENTS.md.
+            logger.info("Fetching recent Senate roll calls (multi-session)...")
+            progress.begin("fetch_recent_rcs", total=RECENT_RC_SESSIONS)
+            all_recent_roll_calls: list[dict] = []
+            seen_roll_ids: set[str] = set()
+
+            fetch_sessions = [
+                (settings.CURRENT_CONGRESS, 1),      # e.g. 119th sess 1 (2025)
+                (settings.CURRENT_CONGRESS, 2),      # 119th sess 2 (2026, if started)
+            ]
+
+            for sess_idx, (congress_num, session_num) in enumerate(fetch_sessions):
+                session_rcs = await fetch_recent_roll_calls(
+                    client, db,
+                    congress=congress_num,
+                    session_number=session_num,
+                    count=RECENT_RC_COUNT_PER_SESSION,
+                )
+                if session_rcs is None:
+                    # Senate.gov could not be read: fail before any senator
+                    # is saved with an empty recent-vote record.
+                    raise RuntimeError(
+                        f"Senate roll calls for congress {congress_num} session "
+                        f"{session_num} could not be read from senate.gov"
+                    )
+                added = 0
+                for rc in session_rcs:
+                    # Dedupe by the unique roll-call identity, NOT by
+                    # documentName: the Senate votes on the same document
+                    # repeatedly (cloture + confirmation on one "PN"
+                    # nomination; motion-to-proceed + passage on one bill),
+                    # and keying on documentName silently discarded all but
+                    # the newest such vote (in a nomination-heavy session,
+                    # a large share of the recent-vote sample).
+                    rc_id = recent_roll_call_key(rc)
+                    if rc_id not in seen_roll_ids:
+                        seen_roll_ids.add(rc_id)
+                        all_recent_roll_calls.append(rc)
+                        added += 1
+                logger.info(
+                    "Congress %d session %d: %d roll calls (%d new)",
+                    congress_num, session_num, len(session_rcs), added,
+                )
+                progress.update("fetch_recent_rcs", done=sess_idx + 1)
+
+            recent_roll_calls = all_recent_roll_calls
+
+            # Build a map for recent roll calls keyed by the unique roll-call
+            # key (congress-session-rollNumber) — same key stamped as
+            # "rcKey" on classify_recent_votes' output, so lookups below
+            # resolve the exact roll call even when several share one
+            # documentName.
+            recent_rc_map: dict[str, dict] = {}
+            for rc in recent_roll_calls:
+                recent_rc_map[recent_roll_call_key(rc)] = rc
+            logger.info("Total unique recent roll calls: %d", len(recent_roll_calls))
+            progress.complete("fetch_recent_rcs", detail=f"{len(recent_roll_calls)} unique")
+
+            # 1d.3 Fetch cosponsors for significant bills.
+            # Cosponsorship is a proactive signal of political alignment —
+            # a senator chooses to endorse a bill by cosponsoring it. Combined
+            # with the bill's sponsor party, this builds a per-senator
+            # cosponsorship profile for caucus inference (Fowler 2006).
+            logger.info("Fetching bill cosponsors for cosponsorship analysis...")
+            progress.begin("fetch_cosponsors", total=len(bills_data))
+            # bill_id → list of cosponsor dicts (each has bioguideId, party)
+            cosponsors_map: dict[str, list[dict]] = {}
+            for cs_idx, bill_ref in enumerate(bills_data):
+                bill_id = bill_ref.get("billId", "")
+                # Parse bill type and number from the composite ID (e.g. "S.123")
+                parts = bill_id.split(".")
+                if len(parts) == 2 and parts[1].isdigit():
+                    cosponsors = await fetch_bill_cosponsors(
+                        client, db,
+                        bill_ref["congress"],
+                        parts[0].lower(),
+                        int(parts[1]),
+                    )
+                    if cosponsors:
+                        cosponsors_map[bill_id] = cosponsors
+                progress.update("fetch_cosponsors", done=cs_idx + 1)
+            total_cosponsors = sum(len(v) for v in cosponsors_map.values())
+            logger.info(
+                "Cosponsors fetched for %d/%d bills (%d total cosponsorships)",
+                len(cosponsors_map), len(bills_data), total_cosponsors,
+            )
+            progress.complete(
+                "fetch_cosponsors",
+                detail=f"{len(cosponsors_map)} bills, {total_cosponsors} cosponsorships",
+            )
+
+            # Build per-senator cosponsorship profiles: for each senator, count
+            # how many D-sponsored vs R-sponsored bills they cosponsored.
+            cosponsorship_profiles: dict[str, dict] = {}
+            for bill_ref in bills_data:
+                bill_id = bill_ref.get("billId", "")
+                sponsor_party = bill_ref.get("sponsorParty")
+                if not sponsor_party or sponsor_party not in ("D", "R"):
+                    continue
+                for cosponsor in cosponsors_map.get(bill_id, []):
+                    bio_id = cosponsor.get("bioguideId", "")
+                    if not bio_id:
+                        continue
+                    profile = cosponsorship_profiles.setdefault(
+                        bio_id, {"d_cosponsored": 0, "r_cosponsored": 0},
+                    )
+                    if sponsor_party == "D":
+                        profile["d_cosponsored"] += 1
+                    else:
+                        profile["r_cosponsored"] += 1
+            logger.info(
+                "Cosponsorship profiles built for %d senators",
+                len(cosponsorship_profiles),
+            )
+
+            # 1d.4 Fetch each senator's sponsored legislation.
+            logger.info("Fetching sponsored legislation...")
+            progress.begin("fetch_sponsored", total=len(senators))
+            sponsored_map: dict[str, list[dict]] = {}
+            # Members whose request failed with nothing cached: scored
+            # neutral on Legislative Effectiveness, never as zero bills.
+            sponsored_unavailable: set[str] = set()
+            for sp_idx, senator in enumerate(senators):
+                bio_id = senator.get("bioguideId", "")
+                if bio_id:
+                    raw_sponsored = await fetch_member_sponsored(client, db, bio_id)
+                    if raw_sponsored is None:
+                        sponsored_unavailable.add(bio_id)
+                    elif raw_sponsored:
+                        sponsored_map[bio_id] = raw_sponsored
+                progress.update("fetch_sponsored", done=sp_idx + 1)
+            total_sponsored = sum(len(v) for v in sponsored_map.values())
+            logger.info(
+                "Sponsored legislation fetched for %d senators (%d total bills)",
+                len(sponsored_map), total_sponsored,
+            )
+            progress.complete(
+                "fetch_sponsored",
+                detail=f"{len(sponsored_map)} senators, {total_sponsored} bills",
+            )
+
+            # 1d.5 Fetch official titles for sponsored bills with short names.
+            # Bills named after people (e.g., "Jaime's Law") or acronyms
+            # (e.g., "ARMAS Act") carry no policy signal for the embedding
+            # classifier. The official title from the titles endpoint
+            # (e.g., "A bill to prevent the purchase of ammunition...")
+            # provides the semantic content needed for accurate classification.
+            min_congress_for_titles = MIN_CONGRESS_FOR_BILL_TITLES
+            short_title_bills: dict[str, tuple[int, str, int]] = {}
+            for sp_bills in sponsored_map.values():
+                for sp in sp_bills:
+                    title = sp.get("title", "")
+                    bill_type = sp.get("type", "")
+                    bill_number = sp.get("number", "")
+                    congress = sp.get("congress", 0)
+                    if (
+                        title and len(title) < 50
+                        and bill_type and bill_number
+                        and congress >= min_congress_for_titles
+                    ):
+                        bid = f"{bill_type}.{bill_number}"
+                        if bid not in short_title_bills:
+                            short_title_bills[bid] = (
+                                congress, bill_type.lower(), int(bill_number),
+                            )
+
+            official_titles_map: dict[str, str] = {}
+            if short_title_bills:
+                logger.info(
+                    "Fetching official titles for %d short-title sponsored bills...",
+                    len(short_title_bills),
+                )
+                # Tracked as its own progress step: in run 69 this loop ran
+                # for 80 minutes between fetch_sponsored and fetch_fec with
+                # nothing in progress_detail to show for it.
+                progress.begin("fetch_official_titles", total=len(short_title_bills))
+                for ot_idx, (bid, (cg, bt, bn)) in enumerate(short_title_bills.items()):
+                    titles = await fetch_bill_titles(client, db, cg, bt, bn)
+                    official = extract_official_title(titles)
+                    if official:
+                        official_titles_map[bid] = official
+                    progress.update("fetch_official_titles", done=ot_idx + 1)
+                progress.complete(
+                    "fetch_official_titles",
+                    detail=f"{len(official_titles_map)}/{len(short_title_bills)} titles",
+                )
+                logger.info(
+                    "Official titles fetched for %d/%d bills",
+                    len(official_titles_map), len(short_title_bills),
+                )
+            else:
+                progress.skip("fetch_official_titles", detail="no short-title bills")
+
+            # 1e. Fetch FEC data for each senator
+            logger.info("Fetching FEC financial data...")
+            progress.begin("fetch_fec", total=len(senators))
+            fec_data: dict[str, dict] = {}
+            # The FEC's bulk files, once for every senator: every committee's
+            # registration (type, designation, connected organization) and
+            # every committee-to-candidate contribution, each one download
+            # per cycle where the API would take thousands of requests.
+            committee_master = await fetch_committee_master(
+                client, db, committee_master_cycles(),
+            )
+            committee_contributions = await fetch_committee_contributions(
+                client, db, committee_master_cycles(),
+            )
+            for fec_idx, senator in enumerate(senators):
+                fec = await _fetch_senator_fec(
+                    client, db, senator, committee_contributions, committee_master,
+                )
+                if fec is not None:
+                    fec_data[senator["id"]] = fec
+                progress.update("fetch_fec", done=fec_idx + 1)
+            unreachable = sum(1 for f in fec_data.values() if f.get("unavailable"))
+            matched = len(fec_data) - unreachable
+            logger.info(
+                "FEC data fetched for %d/%d senators (%d unreachable)",
+                matched, len(senators), unreachable,
+            )
+            progress.complete(
+                "fetch_fec",
+                detail=f"{matched}/{len(senators)} matched, {unreachable} unreachable",
+            )
+
+            # 1e-2. Resolve contributing committees' FEC registrations (type,
+            # designation, connected organization) once per unique committee
+            # across the whole run — the tier-1 political-committee rule and
+            # the lobbying client name in normalize_finance. A single
+            # global pass here (rather than a per-senator lookup) means a PAC
+            # that gives to 30 different senators is looked up exactly once,
+            # not 30 times, on top of the committee master's weekly cache.
+            pac_committee_ids: set[str] = set()
+            for fec in fec_data.values():
+                for r in fec.get("pacReceipts") or []:
+                    if committee_id_of(r):
+                        pac_committee_ids.add(r["contributor_id"])
+            logger.info("Resolving committee type for %d unique contributing PACs...", len(pac_committee_ids))
+            # The bulk committee master (loaded above) answers type,
+            # designation and connected organization for nearly every PAC;
+            # the per-committee API covers only what it lacks.
+            committee_meta_map = await resolve_committee_meta(
+                client, db, pac_committee_ids, committee_master,
+            )
+
+        if fetch_only:
+            logger.info("=== FETCH COMPLETE (fetch-only mode) ===")
+            # Every step not yet started, whatever the list holds, so a step
+            # added later isn't left pending in a completed run.
+            progress.skip_pending(detail="fetch-only mode")
+            elapsed = time.time() - start_time
+            pipeline_run.status = PipelineStatus.COMPLETED
+            pipeline_run.completed_at = utcnow()
+            pipeline_run.elapsed_seconds = elapsed
+            db.commit()
+            return {
+                "status": PipelineStatus.COMPLETED,
+                "fetch_only": True,
+                "senators_fetched": len(senators),
+                "bills_fetched": len(bills_data),
+                "elapsed_seconds": round(elapsed, 1),
+            }
+
+        # ========================================
+        # PHASE 3: ANALYZE
+        # ========================================
+        pipeline_run.current_phase = "analyze"
+        pipeline_run.elapsed_seconds = round(time.time() - start_time, 1)
+        db.commit()
+        logger.info("--- Phase 3: ANALYZE ---")
+
+        # Invalidate stale bill classifications from prior runs where the
+        # bill was classified with insufficient text (e.g., person-name
+        # titles like "Jaime's Law" with no summary/official title).  This
+        # forces reclassification with the richer text we now provide.
+        from app.pipeline.analyze.bill_learning import invalidate_thin_classifications
+        n_invalidated = invalidate_thin_classifications(db)
+        if n_invalidated:
+            clear_reference_cache()
+
+        # 3a. Classify bills using embeddings (zero LLM calls)
+        logger.info("Classifying key bills (embedding-based)...")
+        progress.begin("classify_bills", total=len(bills_data))
+        try:
+            classified_bills = await classify_all_bills(bills_data, db_session=db)
+            logger.info("Classified %d key bills", len(classified_bills))
+            progress.complete("classify_bills", detail=f"{len(classified_bills)} classified")
+        except Exception as e:
+            logger.error("Bill classification failed: %s — continuing with empty bill list", e)
+            classified_bills = []
+            progress.complete("classify_bills", detail="failed")
+
+        # The roll call's own party split wins over the bill's content label
+        # wherever a split exists (refine_with_vote_data; AGENTS.md §4).
+        for bill in classified_bills:
+            roll_call_data = roll_call_data_map.get(bill["billId"])
+            if roll_call_data:
+                stamp_roll_call_outcome(bill, roll_call_data)
+                stamp_motion_type(bill, roll_call_data)
+                if bill.get("housekeeping"):
+                    continue
+                split = compute_party_vote_split(roll_call_data)
+                vote_split = split["label"] if split else None
+                bill["partyLeaning"] = refine_with_vote_data(
+                    bill.get("partyLeaning", "bipartisan"), vote_split,
+                )
+
+        # 3a.2 Classify recent roll call votes (embedding-based, zero LLM)
+        classified_recent: list[dict] = []
+        if recent_roll_calls:
+            logger.info("Classifying %d recent votes (embedding-based)...", len(recent_roll_calls))
+            progress.begin("classify_recent", total=len(recent_roll_calls))
+            classified_recent = await classify_recent_votes(
+                recent_roll_calls, db_session=db
+            )
+            logger.info("Classified %d recent votes", len(classified_recent))
+            progress.complete("classify_recent", detail=f"{len(classified_recent)} classified")
+        else:
+            progress.skip("classify_recent", detail="no roll calls")
+
+        pipeline_run.bills_classified = len(classified_bills) + len(classified_recent)
+        db.commit()
+
+        # Refine party alignment for recent votes with vote data. Same rule as
+        # key bills (party_platform.refine_with_vote_data): the actual roll-call
+        # split wins whenever it exists; content analysis is only the fallback.
+        for rc in classified_recent:
+            rc_id = rc.get("rcKey") or rc.get("billId", "")
+            roll_call_data = recent_rc_map.get(rc_id)
+            if roll_call_data:
+                stamp_roll_call_outcome(rc, roll_call_data)
+                stamp_motion_type(rc, roll_call_data)
+                split = compute_party_vote_split(roll_call_data)
+                computed_split = split["label"] if split else None
+                if computed_split and not rc.get("housekeeping"):
+                    rc["partyLeaning"] = refine_with_vote_data(
+                        rc.get("partyLeaning", "bipartisan"), computed_split,
+                    )
+
+        # 3a.3 Embed classified bills in vector database for semantic search
+        logger.info("Embedding bills in vector database...")
+        all_bills_for_embedding = classified_bills + classified_recent
+        progress.begin("embed_bills", total=len(all_bills_for_embedding))
+        try:
+            embed_bills(all_bills_for_embedding)
+            logger.info("Embedded %d bills in vector database", len(all_bills_for_embedding))
+            progress.complete("embed_bills", detail=f"{len(all_bills_for_embedding)} embedded")
+        except Exception as e:
+            logger.error("Bill embedding failed: %s — vector search will be unavailable this run", e)
+            progress.complete("embed_bills", detail="failed")
+
+        # 3a.3 Hybrid donor classification (FEC metadata → rules → embeddings → kNN)
+        logger.info("Collecting unique donors for hybrid classification...")
+        progress.begin("classify_donors")
+        all_donor_entries: list[dict] = _build_donor_entries(senators, fec_data)
+
+        ai_classifications: dict[str, dict] = {}
+        if all_donor_entries:
+            progress.update("classify_donors", detail=f"{len(all_donor_entries)} donors queued")
+
+            def _flush_donor_progress():
+                s = get_llm_stats()
+                pipeline_run.llm_calls = s["total_calls"]
+                pipeline_run.cache_hits = s["cache_hits"]
+                pipeline_run.cache_misses = s["cache_misses"]
+                pipeline_run.elapsed_seconds = round(time.time() - start_time, 1)
+                db.commit()
+
+            ai_classifications = await classify_donors_hybrid(
+                all_donor_entries, db_session=db, on_progress=_flush_donor_progress
+            )
+            progress.complete("classify_donors", detail=f"{len(ai_classifications)} classified")
+        else:
+            progress.skip("classify_donors", detail="no donors")
+
+        _flush = get_llm_stats()
+        pipeline_run.llm_calls = _flush["total_calls"]
+        pipeline_run.cache_hits = _flush["cache_hits"]
+        pipeline_run.cache_misses = _flush["cache_misses"]
+        pipeline_run.elapsed_seconds = round(time.time() - start_time, 1)
+        db.commit()
+
+        # 3b. Prepare senator data for batch LLM analysis
+        logger.info("Preparing senator data for batch analysis...")
+        progress.begin("prepare_senators", total=len(senators))
+        results: list[dict] = []
+        success_count = 0
+        fail_count = 0
+        # (member id, exception) for each senator that failed: one ops
+        # alert after the scoring loop (alert_member_failures).
+        member_failures: list[tuple[str, BaseException]] = []
+
+        # A seat passed to someone of the same surname: the roll calls'
+        # member id says which of them cast each vote.
+        lis_ids = resolve_senate_lis_ids(senators, [
+            m for rc in [*roll_call_data_map.values(), *recent_rc_map.values()] for m in rc.get("members") or []
+        ])
+        senator_prepared: list[dict] = []
+        for prep_idx, senator in enumerate(senators):
+            try:
+                fec = fec_data.get(senator["id"])
+                if fec and fec.get("unavailable"):
+                    raise FecUnavailable(f"no FEC data read for {senator['name']}")
+                if fec:
+                    funding = normalize_finance(
+                        # The chamber bounds the election window
+                        # (seat_winning_floor); a crosswalk match carries
+                        # only the id.
+                        {**fec["candidate"], "office": "S"},
+                        fec.get("financials") or [],
+                        fec.get("receipts") or [],
+                        fec.get("pacReceipts") or [],
+                        ai_classifications=ai_classifications,
+                        db_session=db,
+                        committee_meta_map=committee_meta_map,
+                        detail=fec.get("detail"),
+                    )
+                else:
+                    funding = senator.get("funding", {})
+
+                # Use the pre-extracted last name that handles multi-word
+                # surnames (e.g. "De la Rosa", "Van Doren") and accents.
+                last_name = senator.get("lastNameForVoteMatch", "")
+                if not last_name:
+                    name_parts = senator["name"].split()
+                    last_name = name_parts[-1] if name_parts else ""
+                if not last_name:
+                    logger.warning(
+                        "Senator %s has no parseable last name — vote matching will be skipped",
+                        senator.get("id", "unknown"),
+                    )
+
+                senator_votes: dict[str, str] = {}
+                recent_only = _recent_not_covered_by_key_bills(
+                    classified_recent, roll_call_data_map,
+                )
+                for bill in classified_bills:
+                    roll_call_data = roll_call_data_map.get(bill["billId"])
+                    if roll_call_data:
+                        vote = extract_senator_vote(
+                            roll_call_data,
+                            last_name,
+                            senator["state"],
+                            lis_id=lis_ids.get(senator["id"]),
+                        )
+                        if vote:
+                            senator_votes[bill["billId"]] = vote
+
+                # Also extract recent roll call votes into the same map so they
+                # contribute to stance breakdown in normalize_votes
+                for rc in recent_only:
+                    rc_id = rc.get("rcKey") or rc.get("billId", "")
+                    roll_call_data = recent_rc_map.get(rc_id)
+                    if roll_call_data:
+                        vote = extract_senator_vote(
+                            roll_call_data,
+                            last_name,
+                            senator["state"],
+                            lis_id=lis_ids.get(senator["id"]),
+                        )
+                        if vote:
+                            senator_votes[rc_id] = vote
+
+                # Pass both key bills and recent roll calls to normalize_votes
+                # so all tracked votes contribute to the policy breakdown
+                # and loyalty counts — each roll call exactly once.
+                all_classified = classified_bills + recent_only
+                senator_cosponsor_profile = cosponsorship_profiles.get(
+                    senator.get("bioguideId", ""),
+                )
+                # The majority leader's Nay on a failing motion is the
+                # reconsider switch, not a break (MAJORITY_LEADER_TITLES).
+                leader_spans = majority_leader_spans(
+                    senator.get("leadershipTitle"),
+                    load_leadership_tenures().get(senator.get("bioguideId", "")),
+                )
+                voting_record = normalize_votes(
+                    senator.get("bioguideId", ""),
+                    all_classified,
+                    senator_votes,
+                    senator_party=senator.get("party", "I"),
+                    cosponsorship_profile=senator_cosponsor_profile,
+                    leader_spans=leader_spans,
+                )
+
+                # Normalize recent votes for display in the UI
+                # Pass effective_party so Independents get correct party alignment
+                recent_senator_votes = normalize_recent_votes(
+                    recent_only,
+                    recent_rc_map,
+                    last_name,
+                    senator["state"],
+                    senator.get("party", "I"),
+                    effective_party=voting_record.get("effectiveParty"),
+                    leader_spans=leader_spans,
+                    lis_id=lis_ids.get(senator["id"]),
+                )
+                voting_record["recentVotes"] = recent_senator_votes
+                # normalize_votes saw the recent roll calls too (for the
+                # aggregate counts above); they belong in recentVotes only.
+                voting_record["keyVotes"] = _key_bill_votes_only(
+                    voting_record["keyVotes"], roll_call_data_map,
+                )
+
+                # Collect this senator's sponsored bills
+                bio_id = senator.get("bioguideId", "")
+                raw_sponsored = sponsored_map.get(bio_id, [])
+                senator_sponsored: list[dict] = []
+                for sp in raw_sponsored:
+                    title = sp.get("title", "")
+                    if not title:
+                        continue
+                    bill_type = sp.get("type", "")
+                    bill_number = sp.get("number", "")
+                    bill_id = f"{bill_type}.{bill_number}" if bill_type and bill_number else ""
+                    latest = sp.get("latestAction") or {}
+                    pa = sp.get("policyArea") or {}
+                    became_law = became_law_action(latest.get("text"))
+                    senator_sponsored.append({
+                        "billId": bill_id,
+                        "title": title,
+                        "officialTitle": official_titles_map.get(bill_id, ""),
+                        "introducedDate": sp.get("introducedDate", ""),
+                        "latestAction": latest.get("text", ""),
+                        "latestActionDate": latest.get("actionDate", ""),
+                        "policyArea": pa.get("name", ""),
+                        "congress": sp.get("congress", 0),
+                        "billType": bill_type,
+                        "isLaw": became_law,
+                    })
+
+                senator_prepared.append(
+                    {
+                        "senator": senator,
+                        "funding": funding,
+                        "votingRecord": voting_record,
+                        "sponsoredBills": senator_sponsored,
+                    }
+                )
+                progress.update("prepare_senators", done=prep_idx + 1)
+            except Exception as e:
+                logger.error(
+                    "  Prep failed for %s: %s", senator["name"], str(e)
+                )
+                fail_count += 1
+                member_failures.append((senator.get("id") or senator.get("bioguideId") or senator["name"], e))
+                results.append(senator)
+                progress.update("prepare_senators", done=prep_idx + 1)
+
+        progress.complete("prepare_senators", detail=f"{len(senator_prepared)} ready, {fail_count} failed")
+
+        # Every sponsored bill's is_law and stage, before anything reads
+        # them: the cosponsorship graph below (edge weights), then scoring.
+        await _classify_sponsored_stages(db, senator_prepared, progress)
+
+        # 3f. Enrich cosponsorship data with senators' own sponsored bills
+        # The significant-bills cosponsorship matrix (33 bills) is too sparse
+        # for 100 senators. Pull every current-congress sponsored bill (not a
+        # capped sample) and fetch their cosponsors to build a richer
+        # senator-senator cosponsorship graph for SVD ideology and PageRank.
+        #
+        # Previously capped at 10 bills/senator across two congresses:
+        # harmless for a low-volume sponsor (their whole record fit under
+        # the cap anyway), but for a prolific sponsor it meant computing
+        # their ideology position from a small fraction of their actual
+        # legislative footprint, understating genuinely extreme positions.
+        # Restricting to the current congress only — instead of two —
+        # also brings this in line with this platform's "current term,
+        # not career" principle applied everywhere else (AGENTS.md
+        # "6. Current term, not career"), and keeps the now-uncapped total
+        # bounded to a known quantity (measured at ~6,000 bills across all
+        # 100 senators — comparable to the official-titles fetch phase,
+        # which already handles a similar volume).
+        sponsored_bills_for_cosponsor = _build_current_term_sponsored_for_cosponsor(senator_prepared)
+
+        if sponsored_bills_for_cosponsor:
+            logger.info(
+                "Enriching cosponsorship data: fetching cosponsors for %d recent sponsored bills...",
+                len(sponsored_bills_for_cosponsor),
+            )
+            progress.begin("fetch_sponsored_cosponsors", total=len(sponsored_bills_for_cosponsor))
+            enriched_count = 0
+            async with make_async_client() as enrich_client:
+                for sc_idx, sp_bill in enumerate(sponsored_bills_for_cosponsor):
+                    bill_id = sp_bill["billId"]
+                    if bill_id in cosponsors_map:
+                        progress.update("fetch_sponsored_cosponsors", done=sc_idx + 1)
+                        continue
+                    parts = bill_id.split(".")
+                    if len(parts) == 2 and parts[1].isdigit():
+                        cosponsors = await fetch_bill_cosponsors(
+                            enrich_client, db,
+                            sp_bill["congress"],
+                            parts[0].lower(),
+                            int(parts[1]),
+                        )
+                        if cosponsors:
+                            cosponsors_map[bill_id] = cosponsors
+                            enriched_count += 1
+                    progress.update("fetch_sponsored_cosponsors", done=sc_idx + 1)
+            enriched_total = sum(len(v) for v in cosponsors_map.values())
+            logger.info(
+                "Cosponsorship enrichment: added %d bills (%d total cosponsorships now)",
+                enriched_count, enriched_total,
+            )
+            progress.complete(
+                "fetch_sponsored_cosponsors",
+                detail=f"{enriched_count} new bills, {enriched_total} total cosponsorships",
+            )
+            all_bills_for_analysis = bills_data + sponsored_bills_for_cosponsor
+        else:
+            progress.skip("fetch_sponsored_cosponsors", detail="no eligible sponsored bills")
+            all_bills_for_analysis = bills_data
+
+        # 3f. Sponsorship analysis: PageRank leadership + SVD ideology
+        from app.pipeline.analyze.sponsorship_analysis import (
+            compute_bipartisanship_scores,
+            compute_ideology_scores,
+            compute_leadership_scores,
+            describe_senator_position,
+            party_ideology_bounds,
+        )
+        progress.begin("sponsorship_analysis")
+        senator_bio_ids = {
+            s.get("bioguideId", "")
+            for s in senators
+            if s.get("bioguideId")
+        }
+        senator_party_map = {
+            s.get("bioguideId", ""): s.get("party", "")
+            for s in senators
+            if s.get("bioguideId")
+        }
+        leadership_scores = compute_leadership_scores(
+            all_bills_for_analysis, cosponsors_map, senator_bio_ids, senator_party_map,
+        )
+        ideology_scores = compute_ideology_scores(
+            all_bills_for_analysis, cosponsors_map, senator_bio_ids, senator_party_map,
+        )
+        # Refresh this chamber's roll-call ideal points from Voteview
+        # (position-congruence component, score_calculator v6.11).
+        # Best-effort: never raises; a fetch/gate failure keeps the last
+        # good /data/member_ideal_points.json section.
+        from app.pipeline.fetch.voteview import refresh_member_ideal_points
+        await refresh_member_ideal_points("senate", settings.CURRENT_CONGRESS)
+        bipartisanship_scores = compute_bipartisanship_scores(
+            all_bills_for_analysis, cosponsors_map, senator_party_map,
+        )
+        # Receive-only variant for Legislative Effectiveness's coalition-
+        # attraction component (score_calculator v6.11): HVW 2023's
+        # effectiveness finding is specifically about ATTRACTING cross-party
+        # cosponsors, so LE must not consume the give+receive blend above.
+        attracted_bipartisanship_scores = compute_bipartisanship_scores(
+            all_bills_for_analysis, cosponsors_map, senator_party_map,
+            direction="receive",
+        )
+        # compute_leadership_scores/compute_ideology_scores/compute_bipartisan
+        # ship_scores each withhold (return {}) under whole-cohort data-quality
+        # gates (most recently the SVD-axis-not-partisan check) — every
+        # senator is missing from the dict at once, not just one. Every
+        # downstream reader of these dicts previously did a bare
+        # `.get(bio_id)`, so a withheld run silently overwrote every
+        # senator's real score with None instead of leaving it as "couldn't
+        # compute this run" — collapsing many senators' Constituent
+        # Alignment (constituentAlignment) score toward the same shared
+        # neutral default. Same "keep what we had" principle
+        # president_pipeline.py already applies to its own live-fetch
+        # failures — backfilling here, once, means every consumer below
+        # (this dimension's score, the partisan-depth analysis, the
+        # persisted raw stat, and the label-threshold computation next)
+        # gets the same fix for free.
+        backfill_withheld_sponsorship_scores(
+            db, Senator, senator_bio_ids,
+            leadership_scores, ideology_scores,
+            bipartisanship_scores, attracted_bipartisanship_scores,
+        )
+        # Party-relative ideology label thresholds, computed once over the
+        # full cohort (see party_ideology_bounds) so progressive/moderate/
+        # centrist reflects position WITHIN a party, not just party identity.
+        ideology_bounds_by_party = party_ideology_bounds(
+            [(ideology_scores.get(bio), senator_party_map.get(bio)) for bio in senator_bio_ids]
+        )
+        logger.info(
+            "Sponsorship analysis: %d leadership, %d ideology, %d bipartisanship scores",
+            len(leadership_scores), len(ideology_scores), len(bipartisanship_scores),
+        )
+        progress.complete(
+            "sponsorship_analysis",
+            detail=f"{len(leadership_scores)} leadership, {len(ideology_scores)} ideology",
+        )
+
+        _flush = get_llm_stats()
+        pipeline_run.llm_calls = _flush["total_calls"]
+        pipeline_run.cache_hits = _flush["cache_hits"]
+        pipeline_run.cache_misses = _flush["cache_misses"]
+        pipeline_run.elapsed_seconds = round(time.time() - start_time, 1)
+        db.commit()
+
+        logger.info(
+            "Processing %d senators (producer-consumer: embedding prefetch + LLM)...",
+            len(senator_prepared),
+        )
+
+        progress.begin("analyze_senators", total=len(senator_prepared))
+        # Commemorative bills (V&W's 1x tier) — before the LES reference
+        # is measured, since its stage totals are significance-weighted.
+        from app.pipeline.analyze.commemorative import mark_commemorative
+        mark_commemorative([sp for p in senator_prepared for sp in p.get("sponsoredBills", [])])
+
+        # Each senator's party-line record over the whole Congress (v6.20),
+        # before the reference is measured on it.
+        # The rest of the chamber is passed too (a filtered run's unscored
+        # senators, or any whose prep failed): a break is read against the
+        # other defectors and the party, whose roll-call votes are tied to
+        # positions only through these members.
+        scored = [{**p["senator"], "votingRecord": p["votingRecord"]} for p in senator_prepared]
+        for p, record in zip(senator_prepared, party_line_records(db, "senate", party_line_members(scored, roster))
+                             if scored else []):
+            p["votingRecord"]["partyLineRecord"] = record
+
+        funding_reference = live_funding_reference(
+            "senate", [p.get("funding") or {} for p in senator_prepared],
+            [p["senator"].get("state", "") for p in senator_prepared],
+            [p["senator"].get("party", "") for p in senator_prepared],
+        )
+        constituent_reference, constituent_reference_measured = live_constituent_reference_measured(
+            "senate",
+            [{**p["senator"], "votingRecord": p["votingRecord"]} for p in senator_prepared],
+        )
+        les_reference = live_les_reference(
+            "senate",
+            [
+                (
+                    p.get("sponsoredBills", []),
+                    p["votingRecord"].get("effectiveParty") or p["senator"].get("party"),
+                )
+                for p in senator_prepared
+            ],
+            db,
+        )
+
+        lda_totals: dict[str, int] = {}
+        for senator_idx in range(len(senator_prepared)):
+            prepared = senator_prepared[senator_idx]
+            senator = prepared["senator"]
+            funding = prepared["funding"]
+            voting_record = prepared["votingRecord"]
+
+            logger.info(
+                "  [%d/%d] %s",
+                senator_idx + 1,
+                len(senator_prepared),
+                senator["name"],
+            )
+            progress.update("analyze_senators", done=senator_idx, detail=senator["name"])
+
+            try:
+                analysis_input = _build_analysis_input(prepared)
+                precomputed = precompute_senator_analysis(analysis_input)
+
+                analysis_results = await analyze_senator_batch(
+                    [analysis_input],
+                    db_session=db,
+                    precomputed=precomputed,
+                )
+                analysis = analysis_results[0] if analysis_results else {}
+                # Clean promises BEFORE scoring and persistence so the
+                # Promise Persistence score is computed from exactly the
+                # promises users will see (the read path applies the same
+                # rules only as a legacy safety net).
+                from app.pipeline.analyze.promise_quality import clean_promises
+                platform_data = {
+                    "campaignPromises": clean_promises(
+                        analysis.get("campaignPromises", [])
+                    ),
+                }
+                final_key_votes, final_recent_votes = split_key_and_recent_votes(
+                    voting_record.get("keyVotes") or [],
+                    voting_record.get("recentVotes") or [],
+                    set(analysis.get("keyVoteIds", [])),
+                )
+                voting_record["keyVotes"] = final_key_votes
+                voting_record["recentVotes"] = final_recent_votes
+
+                lobbying_matches = analysis.get("lobbyingMatches", [])
+
+                # Enrich matches with real registered lobbying activity
+                # (LDA filings) so lobbyingSpend reflects actual disclosed
+                # federal lobbying by the matched organization, not a
+                # placeholder. Cached per org+year, so only the first
+                # pipeline run pays the fetch.
+                lda_stats = await enrich_lobbying_matches_with_lda(
+                    lobbying_matches, db, utcnow().year - 1,
+                    votes=(voting_record.get("keyVotes") or []) + (voting_record.get("recentVotes") or []),
+                )
+                for k, v in lda_stats.items():
+                    lda_totals[k] = lda_totals.get(k, 0) + v
+
+                bio_id_for_score = senator.get("bioguideId", "")
+                temp_senator = {
+                    **senator,
+                    "funding": funding,
+                    "votingRecord": voting_record,
+                    "lobbyingMatches": lobbying_matches,
+                    "campaignPromises": platform_data.get("campaignPromises", []),
+                    "leadershipScore": leadership_scores.get(bio_id_for_score),
+                    "bipartisanshipScore": bipartisanship_scores.get(bio_id_for_score),
+                    "attractedBipartisanshipScore": attracted_bipartisanship_scores.get(bio_id_for_score),
+                    "sponsoredBills": prepared.get("sponsoredBills", []),
+                    "sponsoredBillsUnavailable": bio_id_for_score in sponsored_unavailable,
+                    "ideologyScore": ideology_scores.get(bio_id_for_score),
+                    "lesReference": les_reference,
+                    "fundingReference": funding_reference,
+                    "constituentReference": constituent_reference,
+                }
+                corruption_score = calculate_scores(temp_senator)
+                corruption_score["confidence"] = calculate_confidence(temp_senator)
+
+                result = build_senator(
+                    senator,
+                    funding,
+                    voting_record,
+                    lobbying_matches,
+                    corruption_score,
+                )
+
+                result["campaignPromises"] = platform_data.get("campaignPromises", [])
+
+                from app.pipeline.analyze.party_platform import analyze_partisan_depth
+                senator_ideology = ideology_scores.get(senator.get("bioguideId", ""))
+                partisan_profile = analyze_partisan_depth(
+                    platform_data.get("campaignPromises", []),
+                    senator.get("party", ""),
+                    voting_record=voting_record,
+                    ideology_score=senator_ideology,
+                )
+                result["partisanDepth"] = partisan_profile
+                if partisan_profile.get("totalPositions", 0) > 0:
+                    logger.info(
+                        "    partisan depth: %s (%s, %d positions, %d cross-party)",
+                        partisan_profile["depth"],
+                        partisan_profile["overallParty"],
+                        partisan_profile["totalPositions"],
+                        partisan_profile["crossPartyCount"],
+                    )
+
+                # Classify policy areas for this senator's sponsored bills.
+                # Builds the richest possible text for the embedding model:
+                # official title (from pre-fetched titles), CRS policy area,
+                # and the short display title.
+                from app.pipeline.analyze.bill_analyzer import classify_policy_areas_multi
+                from app.pipeline.analyze.party_platform import classify_party_alignment_multi
+                raw_sponsored = prepared.get("sponsoredBills", [])
+                classified_sponsored: list[dict] = []
+                for sp in raw_sponsored:
+                    title = sp.get("title", "")
+                    api_policy = sp.get("policyArea", "")
+                    bill_id = sp.get("billId", "")
+                    # sp["stage"] was set before scoring (top of this phase).
+                    if api_policy:
+                        sp["policyArea"] = api_policy.upper().replace(" ", "_")
+                    parts = [title]
+                    official = official_titles_map.get(bill_id, "")
+                    if official and official.lower() != title.lower():
+                        parts.append(official)
+                    if api_policy:
+                        parts.append(api_policy)
+                    classify_text = " ".join(parts)
+                    if classify_text and len(classify_text) > 10:
+                        areas = classify_policy_areas_multi(classify_text, db_session=db)
+                        if areas:
+                            alignment = classify_party_alignment_multi(
+                                classify_text, areas, "pro",
+                            )
+                            sp["policyAreas"] = [
+                                {
+                                    "area": a["area"],
+                                    "confidence": a["confidence"],
+                                    "party": {
+                                        pa["area"]: pa["party"]
+                                        for pa in alignment.get("areas", [])
+                                    }.get(a["area"], "bipartisan"),
+                                }
+                                for a in areas
+                            ]
+                            sp["partyLeaning"] = alignment.get("overall", "bipartisan")
+                            # Most sponsored bills never reach a floor
+                            # vote, so there's usually no roll call to
+                            # refine against — but when a sponsored bill
+                            # *did* also get voted on (it's a key bill
+                            # or recent vote elsewhere in this same
+                            # pipeline run), refine with the real
+                            # roll-call split the same way those two
+                            # paths already do, instead of leaving this
+                            # entry on content-only classification (was
+                            # producing a different label for the same
+                            # bill in different parts of the scorecard).
+                            roll_call_data = roll_call_data_map.get(bill_id)
+                            if roll_call_data and not is_housekeeping(
+                                roll_call_data.get("question"), roll_call_data.get("chamber"),
+                            ):
+                                vote_split = compute_party_split(roll_call_data)
+                                sp["partyLeaning"] = refine_with_vote_data(
+                                    sp["partyLeaning"], vote_split,
+                                )
+                            if not sp["policyArea"] and areas:
+                                sp["policyArea"] = areas[0]["area"]
+                    classified_sponsored.append(sp)
+                result["sponsoredBills"] = classified_sponsored
+                result["sponsoredBillsUnavailable"] = bio_id_for_score in sponsored_unavailable
+                if classified_sponsored:
+                    logger.info(
+                        "    sponsored bills: %d (%d became law)",
+                        len(classified_sponsored),
+                        sum(1 for s in classified_sponsored if s.get("isLaw")),
+                    )
+
+                bio_id = senator.get("bioguideId", "")
+                l_score = leadership_scores.get(bio_id)
+                i_score = ideology_scores.get(bio_id)
+                result["leadershipScore"] = round(l_score, 4) if l_score is not None else None
+                b_score = bipartisanship_scores.get(bio_id)
+                result["bipartisanshipScore"] = round(b_score, 4) if b_score is not None else None
+                ab_score = attracted_bipartisanship_scores.get(bio_id)
+                result["attractedBipartisanshipScore"] = round(ab_score, 4) if ab_score is not None else None
+                result["ideologyScore"] = round(i_score, 4) if i_score is not None else None
+                if l_score is not None and i_score is not None:
+                    result["sponsorshipDescription"] = describe_senator_position(
+                        i_score, l_score, senator.get("party", ""),
+                        years_in_office=senator.get("yearsInOffice"),
+                        ideology_bounds=ideology_bounds_by_party.get(senator.get("party", "")),
+                    )
+                    logger.info(
+                        "    sponsorship: leadership=%.2f ideology=%.2f (%s)",
+                        l_score, i_score, result["sponsorshipDescription"],
+                    )
+                else:
+                    result["sponsorshipDescription"] = None
+
+                results.append(result)
+                success_count += 1
+
+                upsert_senator(db, result)
+                pipeline_run.senators_processed = success_count
+                incremental_stats = get_llm_stats()
+                pipeline_run.llm_calls = incremental_stats["total_calls"]
+                pipeline_run.cache_hits = incremental_stats["cache_hits"]
+                pipeline_run.cache_misses = incremental_stats["cache_misses"]
+                pipeline_run.bills_classified = len(classified_bills)
+                pipeline_run.elapsed_seconds = round(time.time() - start_time, 1)
+                db.commit()
+
+                from app.config_definitions import SCORE_WEIGHTS
+                weighted_score = round(sum(
+                    corruption_score.get(k, 0) * w
+                    for k, w in SCORE_WEIGHTS.items()
+                ))
+                logger.info("    score %d/100", weighted_score)
+                progress.update("analyze_senators", done=senator_idx + 1)
+            except Exception as e:
+                logger.exception("  Failed for %s", senator["name"])
+                db.rollback()
+                fail_count += 1
+                member_failures.append((senator.get("id") or senator.get("bioguideId") or senator["name"], e))
+                results.append(senator)
+                pipeline_run.senators_failed = fail_count
+                pipeline_run.senators_processed = success_count
+                pipeline_run.elapsed_seconds = round(time.time() - start_time, 1)
+                db.commit()
+                progress.update("analyze_senators", done=senator_idx + 1)
+
+        alert_if_lda_down(lda_totals, "senate")
+        alert_member_failures("senate", member_failures, close_when_clean=not senator_filter)
+
+        progress.complete(
+            "analyze_senators",
+            detail=f"{success_count} OK, {fail_count} failed",
+        )
+
+        # ========================================
+        # PHASE 4: FINALIZE
+        # ========================================
+        pipeline_run.current_phase = "finalize"
+        pipeline_run.elapsed_seconds = round(time.time() - start_time, 1)
+        db.commit()
+
+        finalize_stored_partisan_depth(db, Senator)
+        _record_score_snapshots(db, {member_id for member_id, _ in member_failures})
+
+        run_calibration_check("senator")
+
+        try:
+            from app.pipeline.analyze.ground_truth import (
+                check_ground_truth,
+                check_score_distribution,
+            )
+            gt_report = check_ground_truth(
+                db, constituent_reference=constituent_reference,
+                reference_measured=constituent_reference_measured,
+            )
+            # Persist on the run record so failures surface in the admin
+            # dashboard instead of living only in logs — a silent drift
+            # between scores and their raw records across an algorithm
+            # change has no other automated alarm.
+            gt_failures = gt_report.get("failures", [])
+            # Population-level distribution check — catches the failure
+            # mode the per-metric checks can't: everyone converging to
+            # the same score.
+            gt_failures += check_score_distribution(db)
+            lines = "\n".join(
+                f"- {f.get('senator', '?')} {f.get('dimension', '?')}="
+                f"{f.get('score', '?')} expected {f.get('expected', '?')}"
+                for f in gt_failures
+            )
+            persist_ground_truth_failures(
+                db, pipeline_run, gt_failures,
+                alert_title=f"Ground-truth gate failed ({len(gt_failures)})",
+                alert_body=(
+                    f"Derived score-consistency checks failed "
+                    f"(run #{pipeline_run.id}):\n{lines}"
+                ),
+                dedupe_key=f"ground-truth-run-{pipeline_run.id}",
+                condition="ground-truth-senate",
+            )
+        except Exception:
+            logger.exception("Ground truth check failed (non-fatal)")
+
+        # Two components measured from related data must stay distinct
+        # (analyze/signal_overlap.py); non-fatal, like the gate above.
+        from app.pipeline.analyze.signal_overlap import record_signal_overlap
+
+        record_signal_overlap(db, "senate")
+
+        logger.info("--- Phase 7: FINALIZE ---")
+        progress.begin("finalize")
+
+        llm_stats = get_llm_stats()
+        elapsed = time.time() - start_time
+
+        pipeline_run.status = PipelineStatus.COMPLETED
+        pipeline_run.completed_at = utcnow()
+        pipeline_run.senators_processed = success_count
+        pipeline_run.senators_failed = fail_count
+        pipeline_run.bills_classified = len(classified_bills)
+        pipeline_run.llm_calls = llm_stats["total_calls"]
+        pipeline_run.cache_hits = llm_stats["cache_hits"]
+        pipeline_run.cache_misses = llm_stats["cache_misses"]
+        pipeline_run.elapsed_seconds = round(elapsed, 1)
+        db.commit()
+        progress.complete("finalize", detail="done")
+
+        logger.info("=== PIPELINE COMPLETE ===")
+        logger.info(
+            "Senators: %d success, %d failed", success_count, fail_count
+        )
+        logger.info("Bills classified: %d", len(classified_bills))
+        logger.info(
+            "LLM: %d calls, %s",
+            llm_stats["total_calls"],
+            llm_stats["estimated_cost"],
+        )
+        logger.info("Time: %.1fs", elapsed)
+
+        return {
+            "status": PipelineStatus.COMPLETED,
+            "senators_processed": success_count,
+            "senators_failed": fail_count,
+            "bills_classified": len(classified_bills),
+            "llm_stats": llm_stats,
+            "elapsed_seconds": round(elapsed, 1),
+        }
+
+    except BaseException as e:
+        logger.exception("Pipeline failed: %s", e)
+        try:
+            db.rollback()
+            pipeline_run.status = PipelineStatus.FAILED
+            pipeline_run.completed_at = utcnow()
+            pipeline_run.error_message = "Senate pipeline failed — see server logs"
+            pipeline_run.elapsed_seconds = round(time.time() - start_time, 1)
+            db.commit()
+        except Exception:
+            logger.exception("Failed to record pipeline failure in DB")
+        raise
+    finally:
+        db.close()
+        run_lease.close()

@@ -1,0 +1,33 @@
+import time
+
+import requests
+
+from measure.powermeter.errors import PowerMeterError, UnsupportedFeatureError
+from measure.powermeter.powermeter import PowerMeasurementResult, PowerMeter
+
+
+class MyStromPowerMeter(PowerMeter):
+    def __init__(self, device_ip: str) -> None:
+        self._device_ip = device_ip
+
+    def get_power(self, include_voltage: bool = False) -> PowerMeasurementResult:
+        """Get a new power reading from the MyStrom device. Voltage readings are not supported."""
+        if include_voltage:
+            # The MyStrom /report endpoint only exposes power, so voltage cannot be derived from it.
+            raise UnsupportedFeatureError("Voltage measurement is not yet implemented for MyStrom devices.")
+
+        r = requests.get(
+            f"http://{self._device_ip}/report",
+            timeout=10,
+        )
+        json = r.json()
+
+        try:
+            power = json["power"]
+        except KeyError as error:
+            raise PowerMeterError("Unexpected JSON response format") from error
+
+        return PowerMeasurementResult(power=float(power), updated=time.time())
+
+    def has_voltage_support(self) -> bool:
+        return False

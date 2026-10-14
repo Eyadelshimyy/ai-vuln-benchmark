@@ -1,0 +1,1003 @@
+"""Deterministic grounding checks for LLM-generated text.
+
+The generation prompts instruct the model to use only information from
+its source material, but nothing enforced that: a local model can (and
+does) drift — inventing statistics, or attributing actions to officials
+the coverage never named. These checks verify the two highest-precision
+hallucination signals mechanically, with no model in the loop:
+
+  - Numbers: every digit group in the generated text must appear in the
+    source text. Fabricated statistics are the most damaging class of
+    hallucination for a data-transparency platform, and digit groups are
+    cheap to compare exactly.
+  - Titled officials: every "Senator X" / "Rep. Y" style reference must
+    name a surname that appears somewhere in the source text.
+
+Both checks compare generated text against ONLY the source material it
+was generated from — nothing here encodes what the text should say.
+"""
+
+import calendar
+import logging
+import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from app.pipeline.analyze import action_metrics
+
+logger = logging.getLogger(__name__)
+
+_US_EAST = ZoneInfo("America/New_York")
+
+# Digit groups, tolerant of thousands separators and decimals:
+# "120,000" -> "120000", "2.5" -> "2.5", "$67M" -> "67".
+_DIGIT_GROUP_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+_TITLED_NAME_RE = re.compile(
+    r"\b(?:U\.?S\.?\s+)?(?:Senator|Sen\.|Representative|Rep\.|"
+    r"Congressman|Congresswoman|Speaker|Justice|Gov(?:ernor)?\.?)\s+"
+    r"([A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+)?)"
+)
+
+# Appositive form: a role description set off by commas rather than a title
+# word directly prefixing the name — "the Senate Republican leader, Jane
+# Doe, has said ...". _TITLED_NAME_RE requires the title word immediately
+# before the name and doesn't cover this at all, which is exactly how a
+# fabricated name reached production ungrounded (2026-07: a full-story
+# generation attributed a statement to a party leader of the wrong party,
+# about a death the source did not report, with no mention of that leader
+# anywhere in the source material, and the only grounding
+# check run on full-story text was for fabricated statistics). A short
+# unclaimed span between the role keyword and the comma keeps this from
+# crossing into an unrelated clause; requiring the trailing comma (not just
+# any capitalized word) keeps it from matching an ordinary sentence start.
+_APPOSITIVE_ROLE_RE = re.compile(
+    r"\b(?:leader|chairman|chairwoman|chair|whip|speaker|majority|minority|"
+    r"secretary|director|governor|president)\b[^,\n]{0,40},\s*"
+    r"([A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+)?),",
+    re.IGNORECASE,
+)
+
+
+def _normalize_token(raw: str) -> str:
+    tok = raw.replace(",", "").rstrip(".")
+    if "." not in tok:
+        # "09" (from 2026-07-09) and "9" (from "July 9") are the same
+        # number; decimals keep their leading zero ("0.5").
+        tok = tok.lstrip("0") or "0"
+    return tok
+
+
+def _number_tokens(text: str) -> set[str]:
+    return {
+        _normalize_token(m.group(0)) for m in _DIGIT_GROUP_RE.finditer(text or "")
+    }
+
+
+def ungrounded_numbers(generated: str, source: str) -> list[str]:
+    """Digit groups in ``generated`` that never appear in ``source``."""
+    source_numbers = _number_tokens(source)
+    return sorted(
+        n for n in _number_tokens(generated) if n not in source_numbers
+    )
+
+
+# The name patterns accept apostrophes so O'Brien and D'Amato survive as
+# single tokens, which also swallows the possessive in "Sen. Doe's": the
+# surname came out as "doe's" and could never match a source saying "Doe",
+# so every possessive reference to a real, sourced official was flagged as
+# fabricated. Stripping the possessive is a false-positive fix only — the bare
+# surname still has to appear in the source.
+_POSSESSIVE_SUFFIX_RE = re.compile(r"['’]s?$")
+
+
+def _surname(name: str) -> str:
+    """Last token of a captured name, lowercased, minus any possessive."""
+    return _POSSESSIVE_SUFFIX_RE.sub("", name.split()[-1].lower())
+
+
+def ungrounded_titled_names(generated: str, source: str) -> list[str]:
+    """Titled-official references in ``generated`` whose surname is absent
+    from ``source``.
+
+    Covers both a title word directly prefixing a name ("Sen. Doe") and
+    a role description set off by commas ("the Senate Republican leader,
+    Jane Doe,") — see _APPOSITIVE_ROLE_RE for why the second form
+    matters.
+
+    Only the surname (last token of the captured name) is required to
+    appear, so "Sen. Rivera" is grounded by source text that says
+    "Maria Rivera" without a title. The surname must appear as a whole
+    WORD (2026-07 fix): the original bare-substring check grounded
+    "Rep. Ford" in any source containing "affordable" and "Sen. Price"
+    in "prices" — short surnames were effectively never checkable.
+    """
+    source_lower = (source or "").lower()
+
+    def _grounded(surname: str) -> bool:
+        return re.search(rf"\b{re.escape(surname)}\b", source_lower) is not None
+
+    missing = []
+    for m in _TITLED_NAME_RE.finditer(generated or ""):
+        if not _grounded(_surname(m.group(1))):
+            missing.append(m.group(0))
+    for m in _APPOSITIVE_ROLE_RE.finditer(generated or ""):
+        name = m.group(1)
+        if not _grounded(_surname(name)):
+            missing.append(name)
+    return sorted(set(missing))
+
+
+_HEDGE_PHRASE_RE = re.compile(
+    r"\b(?:recent\s+)?(?:reports?|coverage|sources?|officials?|developments?|"
+    r"discussions?|debates?|experts?|analysts?|observers?|critics?)\s+"
+    r"(?:say|says|said|suggest(?:s|ed)?|indicate(?:s|d)?|show(?:s|ed)?|reveal(?:s|ed)?|"
+    r"highlight(?:s|ed)?|emphasiz(?:e|es|ed)|stress(?:es|ed)?|note(?:s|d)?|"
+    r"focus(?:es|ed)?\s+on|aim(?:s|ed)?\s+to|"
+    # 2026-07 audit additions, each from a published live example: "These
+    # developments point to a more nuanced landscape" / "This development
+    # reflects the broader challenges" / "The coverage from BBC World and
+    # PBS NewsHour captured these developments" — same middle-man framing
+    # as the original verbs, different verb.
+    r"underscore(?:s|d)?|point(?:s|ed)?\s+to|reflect(?:s|ed)?|"
+    r"illustrate(?:s|d)?|captur(?:e|es|ed))\b"
+    r"|\baccording to (?:reports?|coverage|sources?)\b"
+    # "The coverage from BBC World and PBS NewsHour captured these
+    # developments" — the noun+verb form above requires adjacency, and the
+    # live example puts the source list between them.
+    r"|\bcaptur(?:e|es|ed)\s+these\s+developments\b"
+    r"|\bthe\s+coverage\s+from\b",
+    re.IGNORECASE,
+)
+
+
+def hedge_language(generated: str) -> list[str]:
+    """Attribution-hedge phrases ("recent reports say," "coverage indicates,"
+    "sources suggest," "according to reports," "recent discussions highlight,"
+    "officials stress") that talk about the news instead of reporting it
+    directly.
+
+    The generation prompt already instructs the model to report events
+    directly rather than through this kind of middle-man phrasing, but a
+    locally-run model doesn't reliably follow that instruction (observed
+    2026-07 on a newer local model). Unlike the other checks in this module,
+    this doesn't compare against source material — it only looks at how the
+    generated text itself is phrased.
+
+    The noun/verb lists were widened 2026-07 after live Bluesky posts kept
+    hedging with words just outside the original narrow list — "recent
+    discussions emphasize," "officials stress," "recent reports highlight" —
+    each individually distinct from the phrases the original regex covered
+    ("reports say," "coverage shows") but doing the exact same middle-man
+    framing. This is inherently a whack-a-mole list, not a closed set; treat
+    any newly observed hedge phrase the same way.
+    """
+    return sorted({m.group(0) for m in _HEDGE_PHRASE_RE.finditer(generated or "")})
+
+
+_EDITORIALIZING_RE = re.compile(
+    r"\b(?:is|was|are|were)\s+(?:warranted|justified)\b"
+    r"|\b(?:rightly|understandably)\b"
+    r"|\bhelps?\s+(?:advance|move|push)\s+(?:the\s+)?(?:legislation|bill|agenda)\b"
+    r"|\bmakes sense given\b"
+    r"|\breflects?\s+(?:a\s+|an\s+|broader\s+)?efforts?\s+to\b"
+    r"|\bin an effort to\b"
+    r"|\b(?:aims?|seeks?)\s+to\s+(?:shape|manage|control)\s+(?:public\s+)?perception\b"
+    # 2026-07 audit additions, each from a published live example:
+    # speculation about future effect ("This shift may influence how
+    # political leaders frame their messaging") and unattributed motive/
+    # causation claims ("The timing of her announcement was influenced by
+    # President Trump's public statements, which shaped the tone and focus
+    # of the race") — asserting why an actor did something or what it will
+    # accomplish, rather than what was done.
+    r"|\b(?:may|could|might)\s+(?:influence|shape|affect)\s+how\b"
+    r"|\b(?:influenced|shaped)\s+the\s+(?:timing|tone|focus|narrative)\b"
+    r"|\bremains?\s+a\s+point\s+of\s+discussion\b",
+    re.IGNORECASE,
+)
+
+
+def editorializing_language(generated: str) -> list[str]:
+    """Phrases that pass judgment on whether an action was legitimate,
+    justified, or well-motivated, rather than only reporting what happened.
+
+    Civitas doesn't take a position on whether an actor's stated rationale
+    for an action holds up. This isn't a factual error the other checks
+    would catch (no fabricated number or name) but a violation of the
+    "report, don't opine" instruction that — like the hedge-phrase pattern
+    above — prompting alone hasn't reliably prevented on a newer local
+    model (observed 2026-07: a full story framed a senator's speech as
+    "warranted" by referencing the speaker's own disputed claims, and
+    editorialized about how the speech "helps move legislation"). This is
+    deliberately narrow, matching this module's high-precision philosophy —
+    it catches clear-cut legitimizing language, not every possible way a
+    model could editorialize.
+
+    The "reflects efforts to" / "in an effort to" / "aims to shape
+    perception" patterns were added 2026-07 after a live full story wrote
+    that an administration's actions "reflect broader efforts to manage
+    public perception around election integrity" — a different flavor of
+    editorializing than the original set: not judging whether an action was
+    warranted, but asserting the *strategic motive behind* an action as
+    established fact rather than reporting only what was said or done.
+    """
+    return sorted({m.group(0) for m in _EDITORIALIZING_RE.finditer(generated or "")})
+
+
+# Deliberately NOT part of hedge_and_editorializing_violations, and not a
+# rejection reason anywhere — every other list in this module started life
+# as a live failure a human actually saw published, then got promoted to a
+# blocking check (see hedge_language/editorializing_language's own history
+# in their docstrings). This one is the opposite direction: a rule added
+# proactively (2026-08, from a craft-writing review) with no observed live
+# incident yet showing this model actually reaches for one of these instead
+# of a real number. Measure it first via action_metrics
+# (intensifier_word_used_{surface}); only promote it to a blocking check if
+# that data shows the same reactive pattern the others did.
+_INTENSIFIER_RE = re.compile(
+    r"\b(?:significant(?:ly)?|substantial(?:ly)?|sweeping|dramatic(?:ally)?|"
+    r"major|massive|considerable|extensive|numerous|widespread)\b",
+    re.IGNORECASE,
+)
+
+
+def intensifier_words(generated: str) -> list[str]:
+    """Vague-magnitude words ("significant," "sweeping," "major") that a
+    specific number from the source material could replace. Observational
+    only — see the comment above this function for why it isn't a
+    rejection reason.
+    """
+    return sorted({m.group(0).lower() for m in _INTENSIFIER_RE.finditer(generated or "")})
+
+
+def log_intensifier_usage(surface: str, generated: str, source: str) -> None:
+    """Non-blocking metric: did the generated text reach for a vague
+    intensifier in a piece whose source material actually had a number it
+    could have used instead? Only counts that specific case — an
+    intensifier with no number anywhere in the source isn't necessarily a
+    missed opportunity. Never raises; a metrics failure must not affect
+    publishing.
+    """
+    try:
+        if not intensifier_words(generated) or not _DIGIT_GROUP_RE.search(source or ""):
+            return
+        from app.pipeline.analyze import action_metrics
+
+        action_metrics.increment(f"intensifier_word_used_{surface}")
+    except Exception:
+        pass
+
+
+# Electoral-contest framing in the GENERATED text — a claim that someone is
+# running, being challenged, or competing for an office. High-specificity
+# phrases only: bare "opponent"/"challenger" are excluded because they also
+# describe opponents of a bill or challengers to a ruling.
+_ELECTORAL_CLAIM_RE = re.compile(
+    r"\b(?:"
+    r"(?:senate|house|gubernatorial|presidential|congressional|governor'?s?)\s+race"
+    r"|race\s+for\s+(?:the\s+)?(?:senate|house|white\s+house|governor|governorship|president|presidency|congress)"
+    r"|re-?election(?:\s+bid|\s+campaign|\s+race)?"
+    r"|primar(?:y|ies)\s+challeng(?:e|er)|primary\s+opponent|primaried"
+    r"|general\s+election|on\s+the\s+ballot|up\s+for\s+re-?election"
+    r"|running\s+(?:for|against)|run\s+for\s+(?:the\s+)?(?:senate|house|office|president|governor|re-?election)"
+    r"|facing\s+(?:competition|a\s+challenge|a\s+challenger|a\s+primary|a\s+re-?election|an?\s+opponent)"
+    r"|campaign(?:ing)?\s+(?:against|for\s+re-?election)"
+    r"|unseat|electoral\s+challenge|bid\s+for\s+(?:the\s+)?(?:senate|house|governorship|presidency)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Electoral vocabulary in the SOURCE material. Still the permissive side of
+# the check (a match silences the whole guard), but no longer *vacuously*
+# permissive (2026-07 fix): the original list included words whose dominant
+# sense in civic prose is NON-electoral — "constituents" (constituent
+# service), "poll(s)" (approval polling), bare "campaign" (pressure
+# campaign, campaign finance), bare "race" (incl. the demographic sense in
+# civil-rights coverage), and "elected" (the boilerplate "elected
+# officials" appears in a large share of all political text) — so nearly
+# any source disarmed the check and the fabricated-election guard almost
+# never fired. Those senses are now excluded; genuinely electoral sources
+# remain covered by the compound forms and the many unambiguous terms
+# below. "vote" stays excluded on purpose — it is overwhelmingly a
+# legislative floor-vote word in this domain — while "voters"/"ballot" are
+# kept.
+_ELECTORAL_CONTEXT_RE = re.compile(
+    r"\b(?:"
+    r"(?:senate|house|gubernatorial|presidential|congressional|governor'?s?)\s+race"
+    r"|race\s+for\b|elect(?:ion|ions|oral)\b|re-?election"
+    r"|campaign\s+(?:trail|rally|ad|stop|event)|ballot|"
+    r"primar(?:y|ies)|challenger|opponent|candidate|candidacy|midterms?|"
+    r"unseat|incumbent|voters?|"
+    r"running\s+for|contest(?:ed|ing|s)?|nominee|nomination)\b",
+    re.IGNORECASE,
+)
+
+
+def ungrounded_electoral_claims(generated: str, source: str) -> list[str]:
+    """Electoral-contest claims in ``generated`` with no electoral basis in
+    ``source``.
+
+    A recurring, high-damage hallucination class for a civic platform is the
+    model inventing an *electoral contest* between two officials who both
+    appear in the source material for an unrelated reason — e.g. a post about
+    one senator's death that said the senator "was facing competition from"
+    another senator named in the same source (2026-07). Both surnames were grounded and no
+    number was fabricated, so neither ungrounded_titled_names nor
+    ungrounded_numbers caught it: the fabrication was the *relationship*,
+    framed as a campaign that never existed.
+
+    High precision by construction — the claim is flagged only when the source
+    contains NO electoral vocabulary whatsoever. A post summarizing a genuine
+    race is grounded by the election coverage it draws from and passes
+    untouched; only electoral framing with zero electoral basis in the source
+    is rejected. Like the rest of this module, nothing here encodes what the
+    text *should* say — only that a campaign asserted out of nowhere is not.
+    """
+    if _ELECTORAL_CONTEXT_RE.search(source or ""):
+        return []
+    return sorted({m.group(0).strip() for m in _ELECTORAL_CLAIM_RE.finditer(generated or "")})
+
+
+# Telling a reader how to vote, or ranking candidates against each other.
+#
+# Unlike every other check in this module, this one takes NO source
+# argument and is deliberately absolute. The rest ask "is this supported
+# by the source?"; this one asks "may Civitas say this at all?", and the
+# answer is no regardless of support. That distinction is the whole
+# lesson of the 2026-09-23 incident: the platform posted a member of the
+# public's "VOTE <CANDIDATE>! ... better for <state> than <senator>!" and every existing
+# guard passed it, correctly — the source was a member of the public's
+# campaign post, so the endorsement was perfectly grounded, and
+# ungrounded_electoral_claims is (by design) silent whenever the source
+# carries real electoral vocabulary. A faithful restatement of an
+# endorsement is still an endorsement.
+#
+# Kept narrow so ordinary reporting survives: it fires on the imperative
+# voter directive ("vote for X", "re-elect X", "cast your ballot for")
+# and on a bare comparative ranking of candidates ("better for the state
+# than Doe"). Reporting that someone ELSE endorsed or outperformed
+# someone is untouched — "Smith endorsed Jones" has no imperative and no
+# first-person comparative, and "leads Doe by six points" is a
+# measurement, not a judgment.
+
+# What separates "vote for Doe" from the legislative floor-vote
+# sense that dominates this domain ("vote for the third time", "vote for
+# cloture") is what FOLLOWS the preposition: an endorsement names a
+# person, procedure names a thing. Listing the function words and
+# procedural nouns that can legitimately follow keeps the check
+# case-insensitive — needed for "VOTE JANE DOE!" and "Vote for
+# ..." alike — without a capitalisation test that all-caps shouting
+# defeats anyway.
+_NOT_A_CANDIDATE = (
+    r"(?!(?:the|a|an|his|her|its|their|our|your|this|that|these|those|another|"
+    r"each|both|any|some|it|us|them|me|him|final|first|second|third|fourth|"
+    r"cloture|passage|impeachment|confirmation|adjournment|recess|amendments?|"
+    r"bills?|measures?|motions?|resolutions?|legislation|funding|approval)\b)"
+)
+
+_ELECTIONEERING_RE = re.compile(
+    "(?:"
+    rf"\b(?:go\s+)?vote\s+(?:for|against)\s+{_NOT_A_CANDIDATE}"
+    rf"|\bcast\s+(?:your|a)\s+ballot\s+for\s+{_NOT_A_CANDIDATE}"
+    rf"|\b(?:re-)?elect\s+(?!new\b){_NOT_A_CANDIDATE}"
+    r"|\bis\s+(?:the\s+)?(?:better|best)\s+(?:choice|candidate|for)\b"
+    r"|\bbetter\s+for\s+\w+\s+than\s+\w"
+    r"|\bdeserves?\s+your\s+vote\b"
+    ")",
+    re.IGNORECASE,
+)
+
+
+# The bare imperative with no preposition — "VOTE <NAME>!",
+# the shape of the text this platform published. _ELECTIONEERING_RE misses it
+# because that one keys on "vote for"/"vote against"; here the name
+# follows directly. Case-SENSITIVE on purpose: the capitalisation is what
+# separates the imperative-plus-name from the ordinary lowercase verb
+# ("lawmakers vote Tuesday"), and the stop-list covers the adverbs and
+# procedural words that legitimately follow a capitalised "Vote" at the
+# start of a sentence.
+# An imperative is clause-initial ("VOTE JANE DOE!"), which is
+# what distinguishes it from the same capitalised word inside a Title Case
+# headline — "the House Came One Vote From Telling Trump to End the Iran
+# War" is a real coverage headline in this database and must not flag. So
+# Title-case "Vote" is only an imperative at the start of the text or
+# right after sentence-ending punctuation; all-caps VOTE is treated as
+# unambiguous anywhere, since headline case never shouts a single word.
+_ELECTIONEERING_IMPERATIVE_RE = re.compile(
+    r"(?:(?:^|(?<=[.!?\n]))\s*Vote|\bVOTE)\s+"
+    r"(?!(?:For|Against|On|To|Yes|No|Early|Today|Tomorrow|Now|Here|Again|From|By|In|At|"
+    r"Count|Counts|Tally|Tallies|Share|Shares|Total|Totals|Margin|Result|Results|"
+    r"Rigging|Fraud|Recount|Threshold)\b)"
+    r"[A-Z][\w.'’-]+"
+)
+
+
+def electioneering_language(generated: str) -> list[str]:
+    """Voter directives and candidate endorsements in ``generated``.
+
+    Source-independent on purpose — see _ELECTIONEERING_RE. A non-partisan
+    civic platform does not tell people how to vote, and "the source said
+    it first" is not a defence, because restating it in Civitas's own
+    voice is what makes it an endorsement.
+    """
+    found = {m.group(0).strip() for m in _ELECTIONEERING_RE.finditer(generated or "")}
+    found |= {m.group(0).strip() for m in _ELECTIONEERING_IMPERATIVE_RE.finditer(generated or "")}
+    return sorted(found)
+
+
+# Unfilled template tokens: "[date]", "[name]", "[specific date]". Every
+# other check in this module is digit- or name-based, which is exactly why
+# this class reached production unchecked (2026-07 audit: a published fact
+# read "<Senator> announced the tribute details on [date]." and the Bluesky
+# post shipped with the literal "[date]" in it — no digits, no fabricated
+# name, nothing else fired). Alphabetic-only content keeps this from
+# flagging legitimate bracketed material like vote tallies "[216-212]" or
+# citations, which generated civic prose shouldn't contain anyway but a
+# narrow pattern costs nothing.
+_PLACEHOLDER_TOKEN_RE = re.compile(r"\[[A-Za-z][A-Za-z ]{0,24}\]")
+
+
+def placeholder_tokens(generated: str) -> list[str]:
+    """Literal unfilled placeholders ("[date]", "[name]") in generated text."""
+    return sorted({m.group(0) for m in _PLACEHOLDER_TOKEN_RE.finditer(generated or "")})
+
+
+# Offices held by exactly one person at a time. "A president"/"a Speaker"
+# reads as if there were several to pick from — there's one, and the
+# source almost always names them (2026-07 live example: a post read "a
+# U.S. president stated fines... should be fully reversed" when the
+# source title was "Trump calls for EU investigation into tech fines,"
+# the name right there). Plural-role titles like "a senator"/"a
+# representative" are excluded on purpose: 100/435 people hold those, so
+# an indefinite article there is genuinely correct English, not vague
+# hedging. The generation prompt already instructs "use specific names...
+# rather than vaguer substitutes" (bluesky_poster.py rule 9) — same as
+# every other check in this module, prompting alone doesn't reliably stop
+# this on a local model.
+_VAGUE_SINGULAR_OFFICE_RE = re.compile(
+    r"\b(?:a|an)\s+(?:U\.?S\.?\s+|current\s+|sitting\s+)*"
+    r"(?:president|vice[- ]president|speaker(?:\s+of\s+the\s+house)?|"
+    r"chief\s+justice|senate\s+majority\s+leader|senate\s+minority\s+leader|"
+    r"house\s+majority\s+leader|house\s+minority\s+leader)\b",
+    re.IGNORECASE,
+)
+
+
+def vague_singular_office_references(generated: str) -> list[str]:
+    """Indefinite-article references ("a president," "a Speaker") to an
+    office exactly one person holds. Unlike the rest of this module, this
+    doesn't compare against source material — the phrasing itself is
+    wrong regardless of what the source says, the same way hedge_language
+    and editorializing_language check generated text alone."""
+    return sorted({m.group(0) for m in _VAGUE_SINGULAR_OFFICE_RE.finditer(generated or "")})
+
+
+# Anaphoric stand-ins for a person the piece could have just named. Live
+# case (issue 522, reported via Bluesky 2026-08-06): a title naming Trump
+# ("Trump comments on El-Sayed's Michigan run") was followed by a summary
+# that never named him, calling him "A political figure from Wayne County,
+# Michigan" (that location actually describes El-Sayed, not Trump) and
+# then "The individual referenced El-Sayed's decision..." — the same
+# vague-actor failure as _VAGUE_SINGULAR_OFFICE_RE, but for a specific
+# named person rather than a fixed office, so that regex didn't match.
+# Like that check, this doesn't compare against source material — the
+# phrasing is wrong regardless of what the source says.
+#
+# Deliberately narrower than the live case's own wording might suggest:
+# "public figure"/"prominent figure" are NOT included even though they
+# read like natural siblings of "political figure" — "public figure" is
+# the actual First Amendment defamation-law term (NYT v. Sullivan: whether
+# a plaintiff must prove actual malice), and this pipeline already covers
+# defamation cases (see the "found guilty of defamation" grounding check
+# in action_center.py), so a real, correctly-sourced fact could legitimately
+# use that exact phrase. Every other pattern in this module is anchored to
+# an observed live incident — add these only if one actually occurs.
+#
+# "the individual" is scoped to only the reporting-verb construction from
+# the live case (a lookahead, so the flagged span stays "the individual"),
+# not the bare two-word phrase — this is a stock phrase in policy/legal
+# coverage this pipeline already handles ("the individual mandate," "the
+# individual was detained/charged/sentenced" in immigration or criminal-
+# justice coverage) and an unscoped match would false-positive on those.
+_VAGUE_PERSON_REFERENCE_RE = re.compile(
+    r"\b(?:a|an)\s+political\s+figure\b"
+    r"|\bthe\s+individual\b(?=\s+(?:referenced|said|stated|claimed|argued|"
+    r"noted|added|told|continued|explained|described|criticized|praised|"
+    r"condemned|announced)\b)",
+    re.IGNORECASE,
+)
+
+
+def vague_person_references(generated: str) -> list[str]:
+    """Anaphoric placeholders ("a political figure," "the individual
+    said/argued/...") used in place of a name the piece already has (often
+    right there in its own title). See _VAGUE_PERSON_REFERENCE_RE for the
+    live case and the deliberate scoping decisions."""
+    return sorted({m.group(0) for m in _VAGUE_PERSON_REFERENCE_RE.finditer(generated or "")})
+
+
+# Family/personal-relationship claims in the GENERATED text. Same fabrication
+# class as ungrounded_electoral_claims — the model inventing a *relationship*
+# between two grounded people, with no fabricated number or titled name for
+# the other checks to catch (2026-07 audit: a published fact stated a
+# candidate announced "for the seat left by her brother" — a family tie
+# asserted as fact with nothing in the pipeline able to check it).
+_RELATIONSHIP_CLAIM_RE = re.compile(
+    r"\b(?:his|her|their)\s+(?:brother|sister|father|mother|son|daughter|"
+    r"husband|wife|widow|widower|cousin|uncle|aunt|nephew|niece|"
+    r"grandfather|grandmother|grandson|granddaughter)\b"
+    r"|\b(?:brother|sister|son|daughter|widow|widower|father|mother)\s+of\b",
+    re.IGNORECASE,
+)
+
+# Relationship vocabulary in the SOURCE — a single family word grounds the
+# claim (permissive side, same design as _ELECTORAL_CONTEXT_RE: only a
+# relationship asserted out of NOWHERE is flagged).
+_RELATIONSHIP_CONTEXT_RE = re.compile(
+    r"\b(?:brother|sister|father|mother|son|daughter|husband|wife|widow|"
+    r"widower|cousin|uncle|aunt|nephew|niece|grandfather|grandmother|"
+    r"grandson|granddaughter|family|sibling)\b",
+    re.IGNORECASE,
+)
+
+
+def ungrounded_relationship_claims(generated: str, source: str) -> list[str]:
+    """Family-relationship claims in ``generated`` with no family vocabulary
+    anywhere in ``source`` — see _RELATIONSHIP_CLAIM_RE for the live case."""
+    if _RELATIONSHIP_CONTEXT_RE.search(source or ""):
+        return []
+    return sorted({m.group(0).strip() for m in _RELATIONSHIP_CLAIM_RE.finditer(generated or "")})
+
+
+# "Former <office>" status claims in the GENERATED text. This is the
+# stale-training-data hallucination class: the local model's weights encode
+# who held an office as of its training cutoff, so it silently "corrects" a
+# sitting official's title to match its outdated world knowledge (2026-07:
+# a live Bluesky post called the sitting president "former President"
+# while the source material said "President" — no fabricated number, the
+# surname was grounded, no electoral or family claim, and "President"
+# isn't a _TITLED_NAME_RE title, so nothing fired). Like the electoral and
+# relationship guards, nothing here encodes who actually holds an office —
+# the check is purely: the source never called this office "former," so
+# the generated text may not either.
+_FORMER_CLAIM_RE = re.compile(
+    r"\b(?:former|ex)[-\s]+(?:(?:vice|deputy|acting)\s+)?"
+    r"(president|senator|sen\.?|representative|rep\.?|congressman|"
+    r"congresswoman|governor|gov\.?|speaker|justice|secretary)\b",
+    re.IGNORECASE,
+)
+
+# Equivalent surface forms per title word, so "former Sen. Smith" in the
+# source grounds "former Senator Smith" in the generated text and vice
+# versa. Titles without an abbreviated form fall through to re.escape.
+_TITLE_FORMS = {
+    "sen": r"sen(?:ator)?",
+    "senator": r"sen(?:ator)?",
+    "rep": r"rep(?:resentative)?",
+    "representative": r"rep(?:resentative)?",
+    "gov": r"gov(?:ernor)?",
+    "governor": r"gov(?:ernor)?",
+}
+
+
+def ungrounded_former_official_claims(generated: str, source: str) -> list[str]:
+    """"Former <office>" references in ``generated`` where ``source`` never
+    applies "former"/"ex" to that office.
+
+    Permissive side (same design as the electoral and relationship guards):
+    the source grounds the claim if it says "former"/"formerly"/"ex" within
+    a couple of words of the same office title — "the former president,"
+    "former U.S. Senator," "formerly served as governor" all count. Only a
+    former-status claim with zero basis in the source is flagged; a post
+    genuinely about a former office-holder is grounded by the coverage it
+    draws from and passes untouched.
+    """
+    source_text = source or ""
+    missing = []
+    for m in _FORMER_CLAIM_RE.finditer(generated or ""):
+        title = m.group(1).rstrip(".").lower()
+        title_re = _TITLE_FORMS.get(title, re.escape(title))
+        grounded = re.search(
+            rf"\b(?:former(?:ly)?|ex)[-\s]+(?:[\w.]+[-\s]+){{0,2}}{title_re}\b",
+            source_text,
+            re.IGNORECASE,
+        )
+        if not grounded:
+            missing.append(m.group(0))
+    return sorted(set(missing))
+
+
+# Party-affiliation claims in the GENERATED text. Same stale-training-data
+# class as _FORMER_CLAIM_RE: the model attaches a party label to an official
+# from its own memory rather than the source material, which is exactly how
+# "former President <name>" reached production (2026-07) when the
+# source only ever said "President Trump." A party label carries the same
+# risk — it can be wrong (a since-corrected training error, a party switch)
+# with no source basis for anyone to catch it before it publishes.
+_PARTY_CLAIM_RE = re.compile(
+    r"\b(?:Republican|Democratic|Democrat|GOP)\s+"
+    r"(?:Senator|Sen\.|Representative|Rep\.|Congressman|Congresswoman|Governor|Gov\.)\b"
+    r"|\([RD]-[A-Za-z]{2}\)",
+    re.IGNORECASE,
+)
+
+# Permissive side, same design as the electoral/relationship/former guards:
+# any party vocabulary anywhere in the source grounds the claim. A post
+# asserting a party label with zero party vocabulary anywhere in its source
+# material is the only case flagged.
+#
+# Plurals are matched too: "Senate Republicans agreed" and "Democrats withheld
+# support" are how civic prose overwhelmingly refers to a party, and the
+# singular-only pattern treated those sources as having no party vocabulary at
+# all — flagging "Republican Senator Doe" as unsourced against a source
+# that plainly discusses Republicans.
+_PARTY_CONTEXT_RE = re.compile(
+    r"\bRepublicans?\b|\bDemocratic\b|\bDemocrats?\b|\bGOP\b|\([RD]-[A-Za-z]{2}\)",
+    re.IGNORECASE,
+)
+
+
+def ungrounded_party_claims(generated: str, source: str) -> list[str]:
+    """Party-affiliation claims in ``generated`` with no party vocabulary
+    anywhere in ``source`` — see _PARTY_CLAIM_RE for the failure mode."""
+    if _PARTY_CONTEXT_RE.search(source or ""):
+        return []
+    return sorted({m.group(0).strip() for m in _PARTY_CLAIM_RE.finditer(generated or "")})
+
+
+# Wanting a thing to happen is not the thing happening.
+#
+# 2026-09-23: the Action Center published the headline "Iran War Ends
+# Quickly to Lower Prices". Its own summary was accurate — "Recent
+# statements emphasize the NEED FOR an immediate conclusion to the Iran
+# conflict... Officials from Michigan and Iowa have CALLED FOR measures"
+# — but the title turned that advocacy into a completed event. The war
+# had not ended. Titles are generated in the same call as the summary
+# and were never run through this module at all, so nothing looked.
+#
+# The check keys on the asymmetry that makes the error detectable: the
+# generated text asserts an event in plain indicative mood, while every
+# mention of that event in the source sits inside an advocacy frame.
+_ADVOCACY_FRAME_RE = re.compile(
+    r"\b(?:call(?:s|ed|ing)?\s+for|urg(?:e|es|ed|ing)|push(?:es|ed|ing)?\s+for|"
+    r"press(?:es|ed|ing)?\s+for|demand(?:s|ed|ing)?|need\s+for|needs?\s+to|"
+    r"should|must|ought\s+to|propos(?:e|es|ed|al|als)|plan(?:s|ned)?\s+to|"
+    r"seek(?:s|ing)?\s+to|aim(?:s|ing)?\s+to|want(?:s|ed)?\s+to|"
+    r"hop(?:e|es|ed)\s+to|effort\s+to|bid\s+to|would\s+\w+|"
+    r"push\s+to|drive\s+to|move\s+to|campaign\s+to|fight\s+to|"
+    r"legislation\s+to|bill\s+to|measure\s+to|resolution\s+to)\b",
+    re.IGNORECASE,
+)
+
+# Event words whose indicative use asserts that something HAS happened.
+# Each maps to the root to look for in the source. Kept explicit rather
+# than stemmed: a wrong stem here silently disables the check.
+_COMPLETED_EVENT_VERBS = {
+    "ends": "end", "ended": "end", "end": "end",
+    "passes": "pass", "passed": "pass",
+    "approves": "approv", "approved": "approv",
+    "signs": "sign", "signed": "sign",
+    "resigns": "resign", "resigned": "resign",
+    "wins": "win", "won": "win",
+    "halts": "halt", "halted": "halt",
+    "bans": "ban", "banned": "ban",
+    "cuts": "cut", "repeals": "repeal", "repealed": "repeal",
+    "withdraws": "withdraw", "withdrew": "withdraw",
+    "reaches": "reach", "reached": "reach",
+    "begins": "begin", "began": "begin",
+    "settles": "settl", "settled": "settl",
+    "releases": "releas", "released": "releas",
+}
+
+def _governing_clause(text: str, index: int) -> str:
+    """The text from the start of `index`'s own sentence up to it.
+
+    Sentence-bounded on purpose: a flat character window reached back
+    across a full stop and let "Advocates urged the Senate to pass it.
+    The Senate passed it Thursday." read as advocacy-governed, which
+    inverts the check — the second sentence is exactly the factual
+    report that should silence it.
+    """
+    start = max(text.rfind(".", 0, index), text.rfind("!", 0, index),
+                text.rfind("?", 0, index), text.rfind("\n", 0, index))
+    return text[start + 1:index]
+
+
+def proposal_stated_as_fact(generated: str, source: str) -> list[str]:
+    """Events ``generated`` asserts as done that ``source`` only wishes for.
+
+    Fires when the source is arguing FOR something and nowhere reports it
+    as having happened. Both halves are required, which is what keeps
+    ordinary paraphrase safe: a source that reports the event (in any
+    sentence, under any wording this list's root matches) silences the
+    check, and a source with no advocacy framing at all never triggers it
+    — so a title using a synonym of a plainly-reported event is not
+    flagged just for choosing a different word.
+
+    The absent-root case is deliberately INCLUDED, unlike the first draft
+    of this check: the real 2026-09-23 failure ("Iran War Ends Quickly")
+    drew on a source that said "conclusion", never "end", so requiring
+    the root to appear would have missed the very headline this exists
+    to catch.
+    """
+    src = source or ""
+    if not _ADVOCACY_FRAME_RE.search(src):
+        return []  # nothing is being urged here; this check has no opinion
+    low_src = src.lower()
+    problems = []
+    for hit in re.finditer(r"[A-Za-z]+", generated or ""):
+        word = hit.group(0)
+        root = _COMPLETED_EVENT_VERBS.get(word.lower())
+        if not root:
+            continue
+        # The generated text may be reporting the advocacy correctly
+        # ("Lawmakers call for an end to the war") — that is the right
+        # sentence, not the error. Only an unhedged assertion counts.
+        if _ADVOCACY_FRAME_RE.search(_governing_clause(generated, hit.start())):
+            continue
+        spots = [m.start() for m in re.finditer(re.escape(root), low_src)]
+        # Reported as fact anywhere in the source -> not an inversion.
+        if any(not _ADVOCACY_FRAME_RE.search(_governing_clause(src, i)) for i in spots):
+            continue
+        problems.append(word)
+    return sorted(set(problems))
+
+
+def grounding_violations(generated: str, source: str) -> list[str]:
+    """Human-readable list of grounding failures, empty when clean."""
+    problems = []
+    numbers = ungrounded_numbers(generated, source)
+    if numbers:
+        problems.append(f"numbers not in source: {', '.join(numbers)}")
+    names = ungrounded_titled_names(generated, source)
+    if names:
+        problems.append(f"officials not in source: {', '.join(names)}")
+    electoral = ungrounded_electoral_claims(generated, source)
+    if electoral:
+        problems.append(
+            f"electoral contest not in source: {', '.join(electoral)}"
+        )
+    relationships = ungrounded_relationship_claims(generated, source)
+    if relationships:
+        problems.append(
+            f"family relationship not in source: {', '.join(relationships)}"
+        )
+    former = ungrounded_former_official_claims(generated, source)
+    if former:
+        problems.append(
+            f"'former' office-holder status not in source: {', '.join(former)}"
+        )
+    party = ungrounded_party_claims(generated, source)
+    if party:
+        problems.append(f"party affiliation not in source: {', '.join(party)}")
+    # Deliberately ignores `source`: the whole point is that a faithful
+    # restatement of someone else's endorsement is still an endorsement
+    # (2026-09-23). Placed in this combinator rather than at one call
+    # site because that is exactly how the Bluesky poster went unchecked
+    # for months — see hedge_and_editorializing_violations' docstring.
+    electioneering = electioneering_language(generated)
+    if electioneering:
+        problems.append(
+            f"tells the reader how to vote or ranks candidates: {', '.join(electioneering)}"
+        )
+    return problems
+
+
+def hedge_and_editorializing_violations(
+    generated: str, allow_hedging: bool = False,
+) -> list[str]:
+    """Human-readable list of hedge-phrase and editorializing findings, empty
+    when clean.
+
+    Every LLM generation path that publishes text (Bluesky posts, action-
+    center issue summaries/facts, full stories) needs both checks, and
+    duplicating the "if hedges: ... if editorial: ..." formatting at each
+    call site was itself how one path — the Bluesky poster — went
+    unchecked for months after the checks were added elsewhere (2026-07).
+    Centralizing the formatting here means a future third check only needs
+    to be added in one place.
+
+    `allow_hedging=True` skips the hedge/editorializing checks only — for
+    early_signal.py's primary-source-only "developing" stories, where
+    stating that press coverage hasn't yet appeared IS the correct, honest
+    voice, not a defect. The remaining three checks (placeholders, vague
+    office/person references) stay unconditional: none of them are ever
+    desirable, regardless of confidence tier.
+    """
+    problems = []
+    if not allow_hedging:
+        hedges = hedge_language(generated)
+        if hedges:
+            problems.append(f"hedging attribution phrases ({', '.join(hedges)})")
+        editorial = editorializing_language(generated)
+        if editorial:
+            problems.append(
+                f"language evaluating whether an action was justified ({', '.join(editorial)})"
+            )
+    placeholders = placeholder_tokens(generated)
+    if placeholders:
+        problems.append(
+            f"literal unfilled placeholder tokens ({', '.join(placeholders)})"
+        )
+    vague_offices = vague_singular_office_references(generated)
+    if vague_offices:
+        problems.append(
+            f"vague reference to a single-holder office ({', '.join(vague_offices)})"
+        )
+    vague_people = vague_person_references(generated)
+    if vague_people:
+        problems.append(
+            f"vague anaphoric reference to a person ({', '.join(vague_people)})"
+        )
+    return problems
+
+
+def validate_facts(facts: list, source_text: str | None = None) -> list:
+    """Drop hallucinated or self-referential facts before saving.
+
+    Lives here (not in action_center.py, its original home) rather than
+    behind a function-local import, so early_signal.py can reuse it
+    without an action_center<->early_signal circular import — a shared
+    fact validator belongs in this module alongside the other generated-
+    text-vs-source checks, not gated behind whichever caller happened to
+    need it first.
+
+    Catches five LLM failure modes:
+    - Self-comparison: "Meta surpasses Meta Platforms" — same root word on both sides
+    - Non-list return: LLM occasionally wraps facts in a dict or returns a string
+    - Stale future dates: fact says "will remain until December 2025" in June 2026
+    - Fabricated statistics: when ``source_text`` (the source text the LLM
+      was shown) is provided, any fact containing a digit group that never
+      appears in the source is dropped. The prompt already forbids inferred
+      numbers; this enforces it mechanically.
+    - Meta-facts: "No specific dates were provided in the articles" describes
+      the source material's limits, not something that happened in the world —
+      the prompt's fact rules already forbid this, but unlike the other
+      three prompt-only rules above it had no mechanical backstop. It's the
+      single most common failure mode of the current small local model:
+      self-referencing the source material as the fact's subject instead of
+      describing an actual event.
+    """
+    if not isinstance(facts, list):
+        return []
+
+    _DATE_MONTH_YEAR = re.compile(
+        r'\b(January|February|March|April|May|June|July|August|'
+        r'September|October|November|December)\s+(\d{4})\b',
+        re.IGNORECASE,
+    )
+    _FORWARD_PHRASES = ("will remain", "is expected", "continue", "until ", "through ", "by the end")
+    _META_PHRASES = (
+        "in the article", "in the articles", "in the coverage", "in the report",
+        "in the reporting", "the coverage ", "the reporting ",
+        # "The articles" can also be the sentence's grammatical SUBJECT
+        # ("The articles focused on...", "The articles referenced..."),
+        # which the "in the articles" form above doesn't catch.
+        "the article ", "the articles ",
+    )
+    # A second meta-fact shape _META_PHRASES doesn't cover: reporting that a
+    # detail is ABSENT, rather than naming "the article(s)" as the subject
+    # ("No specific date was provided...", "Specific names were not
+    # disclosed..."). Two grammatical shapes cover this (negation in the
+    # subject via "no", negation in the verb via "not"); both require one
+    # of the qualifying words below so a genuine positive fact is never
+    # caught, only the quantified-absence claim is. Narrow and
+    # evidence-based on purpose, like _HEDGE_PHRASE_RE above — widen with
+    # real examples, not speculative phrasing.
+    _ABSENCE_NO_SUBJECT_RE = re.compile(
+        r"\bno (?:specific|official|further|additional)\b[^.]{0,50}\b(?:was|were)\s+"
+        r"(?:provided|disclosed|specified|released|given|available)\b",
+        re.IGNORECASE,
+    )
+    _ABSENCE_NOT_VERB_RE = re.compile(
+        r"\b(?:specific|official)\b[^.]{0,50}\b(?:was|were)\s+not\s+"
+        r"(?:provided|disclosed|specified|released|given|available)\b",
+        re.IGNORECASE,
+    )
+    _today = datetime.now(_US_EAST).date()
+    _month_index = {m: i for i, m in enumerate(calendar.month_name) if m}
+
+    clean = []
+    for fact in facts:
+        if not isinstance(fact, str) or not fact.strip():
+            continue
+        lower = fact.lower()
+
+        # Literal unfilled placeholders — "[date]", "[name]". Every other
+        # check here is digit-based, so a placeholder with no digits in it
+        # would otherwise slip through untouched.
+        placeholders = placeholder_tokens(fact)
+        if placeholders:
+            logger.warning(
+                "Dropping fact with placeholder tokens (%s): %s",
+                ", ".join(placeholders), fact[:120],
+            )
+            action_metrics.increment("facts_dropped_placeholder")
+            continue
+
+        # Family-relationship claims with no family vocabulary anywhere in
+        # the source articles — same fabricated-relationship class as the
+        # electoral-claims guard.
+        if source_text and ungrounded_relationship_claims(fact, source_text):
+            logger.warning(
+                "Dropping fact with ungrounded family relationship: %s", fact[:120],
+            )
+            action_metrics.increment("facts_dropped_relationship")
+            continue
+
+        # "Former <office>" status the source articles never asserted — the
+        # model demoting a sitting official from its own stale training data.
+        if source_text and ungrounded_former_official_claims(fact, source_text):
+            logger.warning(
+                "Dropping fact with ungrounded 'former' office-holder status: %s", fact[:120],
+            )
+            action_metrics.increment("facts_dropped_former_status")
+            continue
+
+        # Detect self-referential comparisons: extract capitalized words and check
+        # if any word root appears on both sides of a comparison verb.
+        comparison_verbs = ("surpass", "overtake", "exceed", "beat", "top", "outpace")
+        if any(verb in lower for verb in comparison_verbs):
+            words = re.findall(r"\b[A-Z][a-z]{3,}\b", fact)
+            roots = [w.lower()[:6] for w in words]  # stem to first 6 chars
+            if len(roots) != len(set(roots)):  # duplicate root → self-comparison
+                logger.warning(
+                    "Dropping self-referential fact: %s", fact[:120],
+                )
+                action_metrics.increment("facts_dropped_self_comparison")
+                continue
+
+        # Detect stale future-tense facts with past dates — e.g. the LLM writes
+        # "the ban will remain until December 2025" when it's now June 2026.
+        stale = False
+        if any(phrase in lower for phrase in _FORWARD_PHRASES):
+            for m in _DATE_MONTH_YEAR.finditer(fact):
+                month_num = _month_index.get(m.group(1).capitalize(), 0)
+                if month_num == 0:
+                    continue
+                try:
+                    mentioned = datetime(int(m.group(2)), month_num, 1).date()
+                    if mentioned < _today:
+                        logger.warning(
+                            "Dropping stale future-dated fact: %s", fact[:120],
+                        )
+                        action_metrics.increment("facts_dropped_stale_date")
+                        stale = True
+                        break
+                except ValueError:
+                    pass
+        if stale:
+            continue
+
+        # Detect meta-facts that describe the source material's limits rather
+        # than an actual event — see the docstring for real production examples.
+        if any(phrase in lower for phrase in _META_PHRASES):
+            logger.warning(
+                "Dropping meta-fact referencing the coverage itself: %s", fact[:120],
+            )
+            action_metrics.increment("facts_dropped_meta")
+            continue
+
+        # Second meta-fact shape: reports the ABSENCE of a detail rather
+        # than naming "the article(s)" as subject — see the docstring.
+        if _ABSENCE_NO_SUBJECT_RE.search(fact) or _ABSENCE_NOT_VERB_RE.search(fact):
+            logger.warning(
+                "Dropping fact reporting an absence of information: %s", fact[:120],
+            )
+            action_metrics.increment("facts_dropped_absence_of_info")
+            continue
+
+        # Fabricated-statistic check against the articles the LLM was shown.
+        if source_text:
+            novel = ungrounded_numbers(fact, source_text)
+            if novel:
+                logger.warning(
+                    "Dropping fact with numbers not in source (%s): %s",
+                    ", ".join(novel), fact[:120],
+                )
+                action_metrics.increment("facts_dropped_ungrounded_number")
+                continue
+
+        clean.append(fact.strip())
+
+    return clean

@@ -1,0 +1,722 @@
+"""Canonical, GUI-free batch recipe normalization and fingerprinting.
+
+This module deliberately does not import :mod:`mf4_analyzer.batch`.  Callers
+may therefore use it from ``batch.py``, preset I/O, and the PyQt layer without
+creating an import cycle.  ``normalize_analysis_preset`` accepts either a
+mapping or any duck-typed object exposing ``AnalysisPreset``-like attributes.
+
+Normalization is intentionally conservative:
+
+* analysis defaults stay absent; stable output-schema defaults are materialized;
+* unknown fields survive so a newer recipe can pass through an older UI;
+* only fields known to belong to a different method are removed;
+* JSON container/scalar representations are made deterministic.
+"""
+from __future__ import annotations
+
+from collections.abc import Mapping
+import hashlib
+import json
+import math
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from . import db_reference
+
+
+SUPPORTED_RECIPE_METHODS = frozenset({
+    "time", "fft", "fft_time", "frf", "order_time",
+})
+
+TIME_RENDER_DEFAULTS = {
+    "render_group_by": "none",
+    "render_layout": "overlay",
+    "x_source": "time",
+    "x_channel": "",
+    "x_origin": "zero",
+}
+CHART_STATISTICS_DEFAULTS = {
+    "enabled": False,
+    "range_mode": "full",
+    "x_min": None,
+    "x_max": None,
+    "metrics": ("max", "min", "mean"),
+}
+SLICE_DEFAULTS = {
+    "enabled": False,
+    "axis": "time",
+    "positions": (),
+}
+
+COMMON_PARAM_FIELDS = frozenset({
+    "fs",
+    "time_range",
+    "time_preprocess",
+    "filter",
+    "x_auto",
+    "x_min",
+    "x_max",
+    "y_auto",
+    "y_min",
+    "y_max",
+    "z_auto",
+    "z_min",
+    "z_max",
+    "z_floor",
+    "z_ceiling",
+    "amplitude_mode",
+    "weighting",
+    "db_reference",
+    "db_reference_mode",
+    "cmap",
+    # Report presentation: axis tick counts and the text-size multiplier.
+    # They change the exported bytes, so they belong in the fingerprint.
+    "tick_density_x",
+    "tick_density_y",
+    "font_scale",
+})
+
+METHOD_PARAM_FIELDS = {
+    "time": frozenset((*TIME_RENDER_DEFAULTS, "chart_statistics")),
+    "fft": frozenset({
+        "window",
+        "nfft",
+        "nfft_mode",
+        "t_win_s",
+        "overlap",
+        "avg_mode",
+        "avg_overlap",
+        "amplitude_definition",
+        "amp_y",
+    }),
+    "fft_time": frozenset({
+        "window",
+        "nfft",
+        "nfft_mode",
+        "t_win_s",
+        "overlap",
+        "remove_mean",
+        "slice",
+    }),
+    "frf": frozenset({
+        "estimator",
+        "window",
+        "periodic_window",
+        "t_win_s",
+        "overlap",
+        "nfft_mode",
+        "nfft",
+        "detrend",
+        "magnitude_scale",
+        "frequency_scale",
+        "phase_mode",
+        "coherence_threshold",
+        "fade_low_coherence",
+        "render_group_by",
+    }),
+    "order_time": frozenset({
+        "window",
+        "nfft",
+        "nfft_mode",
+        "max_order",
+        "order_res",
+        "time_res",
+        "samples_per_rev",
+        "rpm_factor",
+        # ``rpm_signal`` normally lives on AnalysisPreset, but old/hand-made
+        # recipes can carry it inside params.  Mark it as known so a method
+        # switch can discard it explicitly instead of treating it as future
+        # opaque data.
+        "rpm_signal",
+        "rpm_channel",
+        "slice",
+    }),
+}
+
+#: Fields no method owns any more.  Manual RPM was removed from batch order
+#: analysis (design 2026-08-03 D-C1): every batch order task now requires an
+#: RPM channel.  These two stay in ``KNOWN_PARAM_FIELDS`` on purpose — a
+#: retired field must NOT fall into the "unknown field survives" branch of
+#: ``normalize_batch_params``, or an old recipe would keep silently carrying
+#: dead params that the runner no longer reads.
+_RETIRED_PARAM_FIELDS = frozenset({"rpm_mode", "manual_rpm"})
+
+KNOWN_PARAM_FIELDS = (
+    COMMON_PARAM_FIELDS
+    | frozenset().union(*METHOD_PARAM_FIELDS.values())
+    | _RETIRED_PARAM_FIELDS
+)
+
+_RPM_MANUAL_MODE_TOKENS = frozenset({"manual", "fixed", "手动"})
+
+#: Wording deliberately mirrors ``_legacy_image_format_warning`` (batch.py).
+LEGACY_MANUAL_RPM_WARNING = (
+    "旧预设的手动 RPM 已移除；批处理阶次分析需要指定 RPM 通道。"
+)
+
+
+def legacy_manual_rpm_warning(
+    params: Mapping[str, Any] | None, method: object,
+) -> str | None:
+    """Return the manual-RPM migration warning if *params* requested it.
+
+    ``rpm_mode``/``manual_rpm`` are retired: :func:`normalize_batch_params`
+    always drops them now, for every method.  Discarding ``rpm_mode=
+    "channel"`` (or an absent ``rpm_mode``) changes nothing observable, so it
+    stays silent.  Discarding ``rpm_mode="manual"`` DOES change behavior --
+    a fixed RPM becomes "no RPM configured" -- so a caller that stores or
+    imports a recipe (e.g. preset I/O) can surface this warning next to the
+    normalized params.  Returns ``None`` when no warning applies, including
+    when *method* is not ``order_time``.
+    """
+
+    if _method_key(method) != "order_time":
+        return None
+    if not isinstance(params, Mapping):
+        return None
+    rpm_mode = str(params.get("rpm_mode", "") or "").strip().lower()
+    if rpm_mode in _RPM_MANUAL_MODE_TOKENS:
+        return LEGACY_MANUAL_RPM_WARNING
+    return None
+
+
+_FLOAT_PARAM_FIELDS = frozenset({
+    "fs",
+    "t_win_s",
+    "overlap",
+    "avg_overlap",
+    "x_min",
+    "x_max",
+    "y_min",
+    "y_max",
+    "z_min",
+    "z_max",
+    "z_floor",
+    "z_ceiling",
+    "db_reference",
+    "max_order",
+    "order_res",
+    "time_res",
+    "rpm_factor",
+    "font_scale",
+    "coherence_threshold",
+})
+_INT_PARAM_FIELDS = frozenset({
+    "nfft",
+    "samples_per_rev",
+    "tick_density_x",
+    "tick_density_y",
+})
+_BOOL_PARAM_FIELDS = frozenset({
+    "x_auto",
+    "y_auto",
+    "z_auto",
+    "remove_mean",
+    "periodic_window",
+    "fade_low_coherence",
+})
+_NORMALIZED_ENUM_PARAM_FIELDS = frozenset({
+    "render_group_by",
+    "render_layout",
+    "x_source",
+    "x_origin",
+    "estimator",
+    "magnitude_scale",
+    "frequency_scale",
+    "phase_mode",
+    "detrend",
+})
+
+FRF_COMPUTE_PARAM_FIELDS = frozenset({
+    "time_range", "fs", "estimator", "window", "periodic_window",
+    "t_win_s", "overlap", "nfft_mode", "nfft", "detrend",
+})
+FRF_RENDER_PARAM_FIELDS = frozenset({
+    "magnitude_scale", "frequency_scale", "phase_mode",
+    "coherence_threshold", "fade_low_coherence",
+    "x_auto", "x_min", "x_max", "y_auto", "y_min", "y_max",
+    "tick_density_x", "tick_density_y", "font_scale", "render_group_by",
+})
+
+_PRESET_FIELDS = (
+    "name",
+    "method",
+    "source",
+    "params",
+    "outputs",
+    "signal",
+    "rpm_signal",
+    "signal_pattern",
+    "rpm_channel",
+    "target_signals",
+    "frf_pair_rules",
+    "target_pairs",
+    "source_ids",
+    "source_paths",
+    "target_policy",
+    "file_ids",
+    "file_paths",
+)
+OUTPUT_DEFAULTS = {
+    "export_data": True,
+    "export_image": True,
+    "data_format": "csv",
+    "image_format": "png",
+    "image_size": "1920x1080",
+    "image_width": 1920,
+    "image_height": 1080,
+    "image_dpi": 144,
+    "image_background": "white",
+    "image_line_width": 1.5,
+    "conflict_policy": "auto_number",
+    "write_manifest": True,
+    "resume_policy": "none",
+    "requested_image_format": None,
+    "migration_warnings": (),
+}
+_OUTPUT_FIELDS = tuple(OUTPUT_DEFAULTS)
+
+# Only settings that change the requested artifact set or bytes participate in
+# the run-recipe fingerprint.  Operational controls may change between a first
+# run and a resume/retry without making otherwise identical artifacts stale.
+_FINGERPRINT_OUTPUT_FIELDS = (
+    "export_data",
+    "export_image",
+    "data_format",
+    "image_format",
+    "image_size",
+    "image_width",
+    "image_height",
+    "image_dpi",
+    "image_background",
+    "image_line_width",
+)
+
+
+def _method_key(method: object) -> str:
+    key = str(method or "").strip().lower()
+    if key not in SUPPORTED_RECIPE_METHODS:
+        raise ValueError(f"unsupported batch method: {method!r}")
+    return key
+
+
+def compatible_param_fields(method: object) -> frozenset[str]:
+    """Return the known parameter fields compatible with *method*.
+
+    Unknown fields are not part of this schema, but normalization preserves
+    them by design.
+    """
+
+    key = _method_key(method)
+    if key == "frf":
+        # FRF deliberately does not inherit legacy spectral common fields
+        # such as weighting/db_reference, heatmap Z state, or preprocessing.
+        return FRF_COMPUTE_PARAM_FIELDS | FRF_RENDER_PARAM_FIELDS
+    return COMMON_PARAM_FIELDS | METHOD_PARAM_FIELDS[key]
+
+
+def _json_safe(value: Any) -> Any:
+    """Return a deterministic JSON-compatible copy of *value*.
+
+    NumPy scalars/arrays are common in analysis state.  Tuples and arrays use
+    JSON's single sequence representation (list), making an imported JSON
+    recipe equivalent to the in-memory tuple form.  Unsupported opaque values
+    fail loudly rather than being fingerprinted through unstable ``repr``.
+    """
+
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if isinstance(value, np.ndarray):
+        return [_json_safe(item) for item in value.tolist()]
+    if isinstance(value, Mapping):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("batch recipe mapping keys must be strings")
+            out[key] = _json_safe(item)
+        return out
+    if isinstance(value, (tuple, list)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        items = [_json_safe(item) for item in value]
+        return sorted(items, key=_canonical_json)
+    if isinstance(value, Path):
+        return str(value)
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    raise TypeError(
+        "batch recipe values must be JSON-compatible; "
+        f"got {type(value).__name__}"
+    )
+
+
+def _normalize_known_value(field: str, value: Any) -> Any:
+    value = _json_safe(value)
+    if field == "amplitude_definition" and isinstance(value, str):
+        return value.strip().lower()
+    if field in _NORMALIZED_ENUM_PARAM_FIELDS and isinstance(value, str):
+        return value.strip().lower()
+    if field == "time_range" and isinstance(value, list):
+        if len(value) == 2 and all(
+            isinstance(item, (int, float)) and not isinstance(item, bool)
+            for item in value
+        ):
+            return [float(value[0]), float(value[1])]
+        return value
+    if field == "chart_statistics" and isinstance(value, Mapping):
+        raw = dict(value)
+        enabled = bool(raw.get("enabled", False))
+        mode = str(raw.get("range_mode", "full") or "full").strip().lower()
+        metrics = raw.get("metrics", ())
+        if not isinstance(metrics, (tuple, list)):
+            metrics = ()
+        canonical = tuple(
+            metric for metric in ("max", "min", "mean")
+            if metric in {str(item).strip().lower() for item in metrics}
+        )
+        return {
+            "enabled": enabled,
+            "range_mode": mode,
+            "x_min": _normalize_statistics_bound(raw.get("x_min")),
+            "x_max": _normalize_statistics_bound(raw.get("x_max")),
+            "metrics": list(canonical),
+        }
+    if field == "slice" and isinstance(value, Mapping):
+        raw = dict(value)
+        axis = str(raw.get("axis", "time") or "time").strip().lower()
+        items = raw.get("positions", ())
+        if not isinstance(items, (tuple, list)):
+            items = ()
+        numbers = []
+        for item in items:
+            if not isinstance(item, (int, float)) or isinstance(item, bool):
+                continue
+            number = float(item)
+            if math.isfinite(number):
+                numbers.append(number)
+        return {
+            "enabled": bool(raw.get("enabled", False)),
+            "axis": axis,
+            # 排序 + 去重：fingerprint 必须对输入顺序不敏感（设计 D7）
+            "positions": sorted(dict.fromkeys(numbers)),
+        }
+    if field in _FLOAT_PARAM_FIELDS:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    elif field in _INT_PARAM_FIELDS:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return int(value)
+    elif field in _BOOL_PARAM_FIELDS and isinstance(value, bool):
+        return bool(value)
+    return value
+
+
+def _normalize_statistics_bound(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return value
+
+
+def normalize_batch_params(params: Mapping[str, Any] | None, method: object) -> dict:
+    """Normalize *params* for *method* without introducing defaults.
+
+    Known fields owned by another method are discarded.  Every unknown field
+    is retained as a JSON-compatible value so old UI code cannot erase a
+    future parameter it does not yet understand.
+    """
+
+    method_key = _method_key(method)
+    if params is None:
+        params = {}
+    if not isinstance(params, Mapping):
+        raise TypeError("batch params must be a mapping")
+    for key in params:
+        if not isinstance(key, str):
+            raise TypeError("batch recipe mapping keys must be strings")
+
+    migrated = db_reference.migrate_legacy_reference_params(params)
+    compatible = compatible_param_fields(method_key)
+    normalized: dict[str, Any] = {}
+    for field, value in migrated.items():
+        if field in KNOWN_PARAM_FIELDS and field not in compatible:
+            continue
+        normalized[field] = _normalize_known_value(field, value)
+    # A source-data window is an FFT-only analysis input.  FFT-vs-Time and
+    # order analysis deliberately consume the full valid time domain; keeping
+    # a legacy ``time_range`` merely because it is a common historical field
+    # would silently crop their matrices in ``batch_preprocess``.
+    if method_key in {"fft_time", "order_time"}:
+        normalized.pop("time_range", None)
+        slice_params = normalized.get("slice")
+        if isinstance(slice_params, Mapping) and not slice_params.get("enabled", False):
+            # Discard an unopened slice so existing spectrogram presets keep
+            # their fingerprint byte-for-byte (design D6).
+            normalized.pop("slice", None)
+    if method_key == "time":
+        # Time-domain output is linear engineering data.  dB reference is a
+        # spectral display concern and must neither occupy the compact UI nor
+        # leak through an imported legacy recipe.
+        normalized.pop("db_reference", None)
+        normalized.pop("db_reference_mode", None)
+        group_by = normalized.get(
+            "render_group_by", TIME_RENDER_DEFAULTS["render_group_by"],
+        )
+        if group_by == "none":
+            normalized.pop("render_layout", None)
+
+        x_source = normalized.get(
+            "x_source", TIME_RENDER_DEFAULTS["x_source"],
+        )
+        if x_source == "channel":
+            normalized.pop("x_origin", None)
+        else:
+            normalized.pop("x_channel", None)
+
+        for field, default in TIME_RENDER_DEFAULTS.items():
+            if normalized.get(field) == default:
+                normalized.pop(field, None)
+        statistics = normalized.get("chart_statistics")
+        if isinstance(statistics, Mapping) and not statistics.get("enabled", False):
+            normalized.pop("chart_statistics", None)
+    elif method_key == "frf":
+        # FRF is an output/input transfer ratio and may carry engineering units.
+        # Absolute spectrum reference, preprocessing/filter state, heatmap axes
+        # and custom-X intent belong to other analyses and must not leak through
+        # method switching.
+        owned_known = FRF_COMPUTE_PARAM_FIELDS | FRF_RENDER_PARAM_FIELDS
+        for field in tuple(normalized):
+            if field in KNOWN_PARAM_FIELDS and field not in owned_known:
+                normalized.pop(field, None)
+        # These names pre-date FRF and existing FFT recipes preserve their
+        # spelling. Canonicalize them only on the new FRF route so adding FRF
+        # cannot change old recipe fingerprints.
+        for field in ("window", "nfft_mode"):
+            value = normalized.get(field)
+            if isinstance(value, str):
+                normalized[field] = value.strip().lower()
+        nfft_mode = normalized.get("nfft_mode")
+        if nfft_mode in {"fixed", "固定", "手动", "manual"}:
+            normalized["nfft_mode"] = "manual"
+        elif nfft_mode in {"auto", "自动"}:
+            normalized["nfft_mode"] = "auto"
+    return normalized
+
+
+def normalize_frf_compute_params(params: Mapping[str, Any] | None) -> dict:
+    """Return only canonical parameters that can change numeric FRF arrays."""
+
+    normalized = normalize_batch_params(params, "frf")
+    return {
+        field: value for field, value in normalized.items()
+        if field in FRF_COMPUTE_PARAM_FIELDS
+    }
+
+
+def _duck_outputs(outputs: object) -> Any:
+    if isinstance(outputs, Mapping):
+        supplied = _json_safe(outputs)
+        result = _json_safe({**OUTPUT_DEFAULTS, **supplied})
+    else:
+        result = {
+            field: getattr(outputs, field, default)
+            for field, default in OUTPUT_DEFAULTS.items()
+        }
+        result = _json_safe(result)
+    image_format = str(result.get("image_format", "png") or "").strip().lower()
+    if image_format != "png":
+        raise ValueError("batch image_format must be png")
+    result["image_format"] = "png"
+    return result
+
+
+def normalize_analysis_preset(preset: Mapping[str, Any] | object) -> dict:
+    """Return a canonical mapping for a mapping or AnalysisPreset-like object.
+
+    Mapping input retains unknown top-level fields.  For duck-typed objects,
+    the public ``AnalysisPreset`` fields are copied when present.  No import of
+    the concrete dataclass is required.
+    """
+
+    if isinstance(preset, Mapping):
+        raw = dict(preset)
+    else:
+        raw = {
+            field: getattr(preset, field)
+            for field in _PRESET_FIELDS
+            if hasattr(preset, field)
+        }
+    if "method" not in raw or not str(raw.get("method") or "").strip():
+        raise ValueError("batch analysis preset requires a method")
+
+    method = _method_key(raw["method"])
+    normalized: dict[str, Any] = {}
+    for field, value in raw.items():
+        if field == "method":
+            normalized[field] = method
+        elif field == "params":
+            normalized[field] = normalize_batch_params(value, method)
+        elif field == "outputs":
+            normalized[field] = _duck_outputs(value)
+        elif field == "frf_pair_rules":
+            normalized[field] = [
+                {
+                    "input_channel": str(
+                        rule.get("input_channel", "")
+                        if isinstance(rule, Mapping)
+                        else getattr(rule, "input_channel")
+                    ),
+                    "output_channels": _json_safe(
+                        rule.get("output_channels", ())
+                        if isinstance(rule, Mapping)
+                        else getattr(rule, "output_channels")
+                    ),
+                }
+                for rule in tuple(value or ())
+            ]
+        else:
+            normalized[field] = _json_safe(value)
+    return normalized
+
+
+def _fingerprint_json_safe(value: Any) -> Any:
+    """Tag non-finite floats so even an invalid recipe hashes deterministically.
+
+    Validation owns whether NaN/Inf is executable; fingerprinting must not turn
+    those values into valid numbers or depend on JSON's non-standard NaN mode.
+    """
+
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            label = "nan"
+        elif value > 0:
+            label = "+inf"
+        else:
+            label = "-inf"
+        return {"__nonfinite_float__": label}
+    if isinstance(value, dict):
+        return {key: _fingerprint_json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_fingerprint_json_safe(item) for item in value]
+    return value
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        _fingerprint_json_safe(value),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def recipe_fingerprint(
+    params: Mapping[str, Any] | None,
+    method: object,
+    *,
+    source_identity: object | None = None,
+    group_identity: object | None = None,
+    channel_identity: object | None = None,
+    outputs: Mapping[str, Any] | object | None = None,
+) -> str:
+    """Return a stable SHA-256 task/recipe fingerprint.
+
+    Identity fields are optional so the same helper covers both pure recipe
+    equality and the Phase-1 task-id contract.  Callers use ``digest[:8]`` for
+    human-readable filenames while retaining the full digest in result facts.
+    """
+
+    method_key = _method_key(method)
+    payload = {
+        "method": method_key,
+        "params": normalize_batch_params(params, method_key),
+    }
+    if outputs is not None:
+        normalized_outputs = _duck_outputs(outputs)
+        payload["outputs"] = {
+            field: normalized_outputs[field]
+            for field in _FINGERPRINT_OUTPUT_FIELDS
+        }
+    identities = {
+        "source_identity": source_identity,
+        "group_identity": group_identity,
+        "channel_identity": channel_identity,
+    }
+    for field, value in identities.items():
+        if value is not None:
+            payload[field] = _json_safe(value)
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def frf_compute_params_fingerprint(
+    params: Mapping[str, Any] | None,
+) -> str:
+    """Fingerprint only normalized FRF numeric parameters, without identity."""
+
+    payload = {
+        "method": "frf",
+        "params": normalize_frf_compute_params(params),
+    }
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def frf_compute_fingerprint(
+    params: Mapping[str, Any] | None,
+    *,
+    source_identity: object,
+    group_identity: object,
+    input_channel: object,
+    output_channel: object,
+) -> str:
+    """Fingerprint one directional FRF compute result/cache entry.
+
+    Result/cache identity is never display-only: all four composite identity
+    fields are mandatory and the directional endpoints must differ. Artifact
+    reservation still uses :func:`build_frf_task_output_identity`, whose hash
+    additionally includes render and requested-output byte settings.
+    """
+
+    identity = {}
+    for field, value in {
+        "source_identity": source_identity,
+        "group_identity": group_identity,
+        "input_channel": input_channel,
+        "output_channel": output_channel,
+    }.items():
+        normalized = str(value or "").strip()
+        if not normalized:
+            raise ValueError(f"FRF compute fingerprint requires non-empty {field}")
+        identity[field] = normalized
+    if identity["input_channel"] == identity["output_channel"]:
+        raise ValueError("FRF compute fingerprint requires directional endpoints")
+    payload = {
+        "method": "frf",
+        "params": normalize_frf_compute_params(params),
+        **identity,
+    }
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+__all__ = [
+    "COMMON_PARAM_FIELDS",
+    "FRF_COMPUTE_PARAM_FIELDS",
+    "FRF_RENDER_PARAM_FIELDS",
+    "KNOWN_PARAM_FIELDS",
+    "LEGACY_MANUAL_RPM_WARNING",
+    "METHOD_PARAM_FIELDS",
+    "OUTPUT_DEFAULTS",
+    "SUPPORTED_RECIPE_METHODS",
+    "TIME_RENDER_DEFAULTS",
+    "compatible_param_fields",
+    "legacy_manual_rpm_warning",
+    "normalize_analysis_preset",
+    "normalize_batch_params",
+    "normalize_frf_compute_params",
+    "frf_compute_params_fingerprint",
+    "frf_compute_fingerprint",
+    "recipe_fingerprint",
+]

@@ -1,0 +1,372 @@
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+import json
+import logging
+import os
+from threading import Lock
+import time
+from uuid import uuid4
+
+from pydantic import SecretStr
+
+from measure.ha_app.contribution.models import (
+    AUTOMATIC_CONTRIBUTION_MESSAGE,
+    ContributionApiError,
+    ContributionApiErrorCode,
+    ContributionAuthStatus,
+    ContributionPreviewRequest,
+    ContributionPreviewResponse,
+    ContributionService,
+    ContributionState,
+    ContributionStatus,
+    ContributionSubmissionResult,
+    ContributionSubmitRequest,
+    DeviceFlowPollResponse,
+    DeviceFlowPollStatus,
+    DeviceFlowStartResponse,
+    contribution_entity_ids,
+    supports_automatic_contribution,
+)
+from measure.ha_app.contribution.preview import draft_from_request
+from measure.ha_app.contribution.service import create_contribution_service
+from measure.ha_app.session import ACTIVE_SESSION_STATES, SessionSnapshot, SessionState
+from measure.ha_app.storage import SessionStorage
+from measure.request import MeasurementRequest
+from measure.utils.clock import utc_now
+
+_LOGGER = logging.getLogger("measure")
+_OAUTH_CLIENT_ID_ENV = "POWERCALC_GITHUB_CLIENT_ID"
+
+#: Resolves optional profile metadata for every measured entity in a single lookup.
+EntityValueResolver = Callable[[Sequence[str]], Mapping[str, str | None]]
+
+
+@dataclass(frozen=True)
+class _DeviceFlow:
+    device_code: str
+    expires_at: float
+
+
+class ContributionApiCoordinator:
+    """API-facing orchestration of the contribution flow for one app install.
+
+    Locking: ``_lock`` protects ``_status`` and ``_device_flows``. Helpers whose
+    docstring says so (``_prune_device_flows``) must be called with the lock held;
+    every other method acquires it itself. ``submit`` deliberately releases the
+    lock while the service performs network I/O — the SUBMITTING state written
+    beforehand is what prevents concurrent submissions.
+    """
+
+    def __init__(
+        self,
+        storage: SessionStorage,
+        *,
+        service_factory: Callable[[], ContributionService] | None = None,
+        resolve_integration: EntityValueResolver | None = None,
+        resolve_manufacturer: EntityValueResolver | None = None,
+        resolve_model_id: EntityValueResolver | None = None,
+        resolve_connectivity: EntityValueResolver | None = None,
+        oauth_client_id: str | None = None,
+    ) -> None:
+        self._storage = storage
+        self._service_factory = service_factory or (lambda: create_contribution_service(storage.data_root))
+        self._resolve_integration = resolve_integration
+        self._resolve_manufacturer = resolve_manufacturer
+        self._resolve_model_id = resolve_model_id
+        self._resolve_connectivity = resolve_connectivity
+        self._oauth_client_id = oauth_client_id if oauth_client_id is not None else os.environ.get(_OAUTH_CLIENT_ID_ENV)
+        self._lock = Lock()
+        self._device_flows: dict[str, _DeviceFlow] = {}
+        self._status = storage.load_contribution_status()
+        if self._status.state == ContributionState.SUBMITTING:
+            self._update_status(
+                state=ContributionState.FAILED,
+                error="App stopped during contribution submission; preview can be submitted again",
+            )
+
+    @property
+    def device_flow_available(self) -> bool:
+        return bool(self._oauth_client_id)
+
+    def _with_device_flow(self, status: ContributionAuthStatus) -> ContributionAuthStatus:
+        return status.model_copy(update={"device_flow_available": self.device_flow_available})
+
+    def auth_status(self) -> ContributionAuthStatus:
+        return self._with_device_flow(self._service_factory().auth_status())
+
+    def connect_pat(self, token: SecretStr) -> ContributionAuthStatus:
+        return self._with_device_flow(self._service_factory().connect_pat(token))
+
+    def disconnect(self) -> ContributionAuthStatus:
+        return self._with_device_flow(self._service_factory().disconnect())
+
+    def start_device_flow(self) -> DeviceFlowStartResponse:
+        client_id = self._require_oauth_client_id()
+        start = self._service_factory().start_device_flow(client_id)
+        flow_id = uuid4().hex
+        with self._lock:
+            self._prune_device_flows()
+            self._device_flows[flow_id] = _DeviceFlow(
+                device_code=start.device_code,
+                expires_at=time.monotonic() + start.expires_in,
+            )
+        return start.with_flow_id(flow_id)
+
+    def poll_device_flow(self, flow_id: str) -> DeviceFlowPollResponse:
+        client_id = self._require_oauth_client_id()
+        with self._lock:
+            self._prune_device_flows()
+            flow = self._device_flows.get(flow_id)
+        if flow is None:
+            raise ContributionApiError(
+                ContributionApiErrorCode.FLOW_NOT_FOUND,
+                "GitHub Device Flow is unknown or expired; start a new login",
+            )
+        response = self._service_factory().poll_device_flow(client_id, flow.device_code)
+        if response.status in {
+            DeviceFlowPollStatus.AUTHORIZED,
+            DeviceFlowPollStatus.EXPIRED,
+            DeviceFlowPollStatus.DENIED,
+        }:
+            with self._lock:
+                self._device_flows.pop(flow_id, None)
+        auth = self._with_device_flow(response.auth) if response.auth else None
+        return response.model_copy(update={"auth": auth})
+
+    def status(self) -> ContributionStatus:
+        with self._lock:
+            return self._status
+
+    def draft(self, snapshot: SessionSnapshot) -> ContributionPreviewResponse:
+        self._require_completed_session(snapshot)
+        request = self._storage.load_request(snapshot.id)
+        settings = self._storage.load_settings()
+        return draft_from_request(
+            session_id=snapshot.id,
+            request=request,
+            artifact_root=self._storage.artifact_directory(snapshot.id, request.model_id),
+            auth=self.auth_status(),
+            integration=self._integration(request),
+            manufacturer=self._shared_entity_value(request, self._resolve_manufacturer),
+            default_connectivity=self._shared_entity_value(request, self._resolve_connectivity),
+            default_model_id=(
+                self._shared_entity_value(request, self._resolve_model_id) if not request.model_id else None
+            ),
+            default_measure_device_firmware=settings.default_measure_device_firmware,
+            default_contributor_name=settings.default_contributor_name,
+            default_contributor_github=settings.default_contributor_github,
+            default_contributor_email=settings.default_contributor_email,
+        )
+
+    def preview(
+        self,
+        snapshot: SessionSnapshot,
+        payload: ContributionPreviewRequest | None = None,
+    ) -> ContributionPreviewResponse:
+        self._require_completed_session(snapshot)
+        request = self._storage.load_request(snapshot.id)
+        self._require_supported_request(request)
+        artifact_root = self._storage.artifact_directory(snapshot.id, request.model_id)
+        if not artifact_root.exists():
+            raise ContributionApiError(
+                ContributionApiErrorCode.ARTIFACTS_REQUIRED,
+                "No measurement artifacts are available to contribute",
+            )
+        preview = self._service_factory().build_preview(
+            session_id=snapshot.id,
+            request=request,
+            artifact_root=artifact_root,
+            payload=payload,
+            integration=self._integration(request),
+        )
+        with self._lock:
+            self._status = ContributionStatus(
+                state=ContributionState.PREVIEW_READY,
+                session_id=snapshot.id,
+                preview=preview,
+                message="Preview is ready",
+                updated_at=utc_now(),
+            )
+            self._storage.save_contribution_status(self._status)
+        return preview
+
+    def prepared_archive(self, snapshot: SessionSnapshot, job_id: str) -> bytes:
+        """Download only the prepared package belonging to this session's latest preview."""
+
+        self._require_completed_session(snapshot)
+        request = self._storage.load_request(snapshot.id)
+        self._require_supported_request(request)
+        with self._lock:
+            preview = self._status.preview
+            if preview is None or preview.session_id != snapshot.id or preview.job_id != job_id:
+                raise ContributionApiError(
+                    ContributionApiErrorCode.PREVIEW_REQUIRED,
+                    "Refresh the profile preview before downloading",
+                )
+        return self._service_factory().prepared_archive(job_id)
+
+    def submit(self, snapshot: SessionSnapshot, payload: ContributionSubmitRequest) -> ContributionSubmissionResult:
+        if not payload.confirmed:  # pragma: no cover - validated requests require Literal[True]
+            raise ContributionApiError(
+                ContributionApiErrorCode.PREVIEW_REQUIRED,
+                "Review and explicitly confirm the contribution preview before submitting",
+            )
+        if not self.auth_status().authenticated:
+            raise ContributionApiError(
+                ContributionApiErrorCode.AUTH_UNAVAILABLE,
+                "Connect GitHub before submitting a contribution",
+            )
+        self._require_completed_session(snapshot)
+        request = self._storage.load_request(snapshot.id)
+        self._require_supported_request(request)
+        with self._lock:
+            if self._status.state == ContributionState.SUBMITTING:
+                raise ContributionApiError(
+                    ContributionApiErrorCode.CONTRIBUTION_ACTIVE,
+                    "A contribution is already being submitted",
+                )
+            if self._status.session_id != snapshot.id or self._status.preview is None:
+                raise ContributionApiError(
+                    ContributionApiErrorCode.PREVIEW_REQUIRED,
+                    "Preview the current session before submitting it",
+                )
+            preview = self._status.preview
+            if _build_preview_comparison(preview) != _build_preview_comparison(payload):
+                raise ContributionApiError(
+                    ContributionApiErrorCode.PREVIEW_REQUIRED,
+                    "Contribution details changed after preview; refresh the preview before submitting",
+                )
+            self._status = self._status.model_copy(
+                update={
+                    "state": ContributionState.SUBMITTING,
+                    "message": "Submitting contribution",
+                    "error": None,
+                    "updated_at": utc_now(),
+                },
+            )
+            self._storage.save_contribution_status(self._status)
+        artifact_root = self._storage.artifact_directory(snapshot.id, request.model_id)
+        try:
+            result = self._service_factory().submit(
+                preview=preview,
+                artifact_root=artifact_root,
+            )
+        except Exception as error:
+            _LOGGER.warning("Contribution submission failed: %s", error)
+            self._update_status(
+                state=ContributionState.FAILED,
+                error=str(error),
+                message="Contribution submission failed",
+            )
+            if isinstance(error, ContributionApiError):
+                raise
+            raise ContributionApiError(ContributionApiErrorCode.SUBMISSION_FAILED, str(error)) from error
+        else:
+            self._update_status(
+                state=ContributionState.SUBMITTED,
+                submission_url=result.pull_request_url,
+                message=result.message,
+                error=None,
+            )
+            return result
+
+    def _integration(self, request: MeasurementRequest) -> str | None:
+        """Return the Home Assistant integration providing every measured entity, when they agree on one."""
+        return self._shared_entity_value(request, self._resolve_integration)
+
+    @staticmethod
+    def _shared_entity_value(
+        request: MeasurementRequest,
+        resolver: EntityValueResolver | None,
+    ) -> str | None:
+        entity_ids = contribution_entity_ids(request)
+        if resolver is None or not entity_ids:
+            return None
+        # Resolved in one call: a resolver reads a Home Assistant snapshot and the published
+        # library, which are far too expensive to fetch once per measured entity.
+        resolved = resolver(entity_ids)
+        values = {resolved.get(entity_id) for entity_id in entity_ids}
+        # A single unresolved entity yields {None}, which pops back to None just the same.
+        return values.pop() if len(values) == 1 else None
+
+    def _require_oauth_client_id(self) -> str:
+        if not self._oauth_client_id:
+            raise ContributionApiError(
+                ContributionApiErrorCode.AUTH_UNAVAILABLE,
+                "GitHub Device Flow is unavailable because POWERCALC_GITHUB_CLIENT_ID is not configured",
+            )
+        return self._oauth_client_id
+
+    def _prune_device_flows(self) -> None:
+        """Drop expired flows; must be called while holding the lock."""
+        now = time.monotonic()
+        expired = [flow_id for flow_id, flow in self._device_flows.items() if flow.expires_at <= now]
+        for flow_id in expired:
+            del self._device_flows[flow_id]
+
+    def _update_status(self, **updates: object) -> None:
+        with self._lock:
+            self._status = self._status.model_copy(update=updates | {"updated_at": utc_now()})
+            self._storage.save_contribution_status(self._status)
+
+    @staticmethod
+    def _require_completed_session(snapshot: SessionSnapshot) -> None:
+        if snapshot.state in ACTIVE_SESSION_STATES:
+            raise ContributionApiError(
+                ContributionApiErrorCode.SESSION_NOT_READY,
+                "Contribution is available after the measurement stops",
+            )
+        if snapshot.state is not SessionState.COMPLETED:
+            raise ContributionApiError(
+                ContributionApiErrorCode.SESSION_NOT_READY,
+                "Contribution requires a completed measurement session",
+            )
+
+    @staticmethod
+    def _require_supported_request(request: MeasurementRequest) -> None:
+        if not supports_automatic_contribution(request):
+            raise ContributionApiError(
+                ContributionApiErrorCode.ARTIFACTS_REQUIRED,
+                AUTOMATIC_CONTRIBUTION_MESSAGE,
+            )
+
+
+@dataclass(frozen=True)
+class _PreviewComparison:
+    manufacturer_name: str
+    model_id: str
+    product_name: str
+    contributor: str
+    contributor_github: str
+    contributor_email: str
+    aliases: list[str]
+    gtins: list[str]
+    product_url: str
+    mains_voltage: int | None
+    device_specs_json: str | None
+    measure_device: str
+    measure_device_firmware: str
+    measure_description: str
+    notes: str
+
+
+def _build_preview_comparison(value: ContributionPreviewResponse | ContributionPreviewRequest) -> _PreviewComparison:
+    """Normalize optional metadata to check that submission still matches the preview."""
+    return _PreviewComparison(
+        manufacturer_name=value.manufacturer_name,
+        model_id=value.model_id,
+        product_name=value.product_name,
+        contributor=value.contributor,
+        contributor_github=value.contributor_github or "",
+        contributor_email=value.contributor_email or "",
+        aliases=value.aliases,
+        gtins=value.gtins,
+        product_url=value.product_url or "",
+        mains_voltage=value.mains_voltage,
+        # Compare the JSON representation so values like True and 1 remain distinct.
+        device_specs_json=json.dumps(value.device_specs, sort_keys=True) if value.device_specs is not None else None,
+        measure_device=value.measure_device or "",
+        measure_device_firmware=value.measure_device_firmware or "",
+        measure_description=value.measure_description or "",
+        notes=value.notes,
+    )

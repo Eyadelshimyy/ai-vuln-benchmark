@@ -1,0 +1,988 @@
+"""
+Endpoints para notificaciones por cuota (retrasadas 1 dia de atraso, prejudicial).
+Routers: solo rol admin (Depends(require_admin)).
+
+Politica: sin envios "previos" ni el dia del vencimiento; previas/dia-pago devuelven listas vacias.
+Datos reales desde BD. get_db en todos los procesos.
+
+Paquete de correo al cliente (NOTIFICACIONES_PAQUETE_ESTRICTO=True por defecto):
+1) Plantilla de correo: HTML/texto con variables sustituidas por datos del cliente/cuota.
+2) PDF variable Carta_Cobranza.pdf: generado con variables de cobranza (plantilla PDF / contexto).
+3) Al menos un PDF fijo adicional: documentos de pestaña "Documentos PDF anexos" y/o adjunto global;
+   siempre se envia junto al PDF variable cuando el paquete es estricto.
+
+Excepcion PAGO_2_DIAS_ANTES_PENDIENTE («2 dias antes»): no se exige plantilla guardada en BD
+(textos por defecto del modulo si falta plantilla_id) ni Carta_Cobranza / adjuntos obligatorios;
+los PDFs de pestañas 2 y 3 son opcionales segun la fila de configuracion.
+"""
+import logging
+from datetime import date
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+from fastapi import APIRouter, Depends, HTTPException, HTTPException, Query
+from sqlalchemy import func, select, text
+from sqlalchemy.orm import Session
+
+from app.core.config import settings
+from app.core.database import get_db
+from app.core.deps import require_admin
+from app.core.email import cuerpo_parece_html, send_email
+from app.core.email_config_holder import sync_from_db as sync_email_config_from_db
+from app.api.v1.endpoints.notificaciones import (
+    build_prejudicial_items,
+    get_notificaciones_tabs_data,
+    get_notificaciones_envios_config,
+    get_plantilla_asunto_cuerpo,
+    build_contexto_cobranza_para_item,
+    contexto_cobranza_aplica_a_prestamo,
+    plantilla_usa_variables_cobranza,
+)
+from app.models.cliente import Cliente
+from app.models.plantilla_notificacion import PlantillaNotificacion
+from app.models.envio_notificacion import EnvioNotificacion
+from app.services.envio_notificacion_snapshot import persistir_snapshot_envio_notificacion
+from app.services.notificaciones_envios_store import coerce_modo_pruebas_notificaciones
+from app.services.notificaciones_exclusion_desistimiento import (
+    cliente_ids_bloqueados_para_notificacion,
+)
+from app.services.carta_cobranza_pdf import generar_carta_cobranza_pdf
+from app.services.adjunto_fijo_cobranza import get_adjunto_fijo_cobranza_bytes, get_adjuntos_fijos_por_caso
+from app.services.notificacion_service import (
+    alinear_items_contacto_titular_prestamo,
+    build_cuotas_pendiente_2_dias_antes_items,
+)
+from app.utils.cliente_emails import (
+    lista_correo_principal_para_notificaciones,
+    lista_correo_principal_notificaciones_desde_objeto,
+    secundario_distinto_del_principal,
+    unir_destinatarios_log,
+)
+from app.services.notificacion_logging import (
+    log_envio_inicio,
+    log_envio_config,
+    log_envio_contexto_cobranza,
+    log_envio_adjuntos,
+    log_envio_paquete_incompleto,
+    log_envio_email,
+    log_envio_persistencia,
+    log_envio_resumen,
+    log_envio_fallo,
+)
+
+from app.services.notificaciones_envio_pipeline import (
+    ASUNTO_DEFAULT_PAGO_2_DIAS_ANTES_PENDIENTE,
+    CUERPO_DEFAULT_PAGO_2_DIAS_ANTES_PENDIENTE,
+    NOMBRE_PDF_CARTA_VARIABLE,
+    _CONFIG_TIPO_TO_TAB,
+    _adjuntos_cumplen_paquete_completo,
+    _bytes_son_pdf_valido,
+    _cfg_incluir_pdf_anexo,
+    _enviar_correos_items,
+    _flags_adjuntos_envio,
+    _parse_plantilla_id_desde_config,
+    _tipo_dos_dias_antes_solo_correo,
+    _tipo_menor_60_solo_pdf_fijo,
+    _tipo_prejudicial_solo_html,
+    _tipo_tab_para_persistencia,
+    _validar_plantilla_email_estricta,
+)
+
+
+def _fecha_referencia_desde_query(fecha_caracas: Optional[str]) -> Optional[date]:
+    from app.services.cuota_estado import parse_fecha_referencia_negocio
+
+    try:
+        return parse_fecha_referencia_negocio(fecha_caracas)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+
+router_previas = APIRouter(dependencies=[Depends(require_admin)])
+router_dia_pago = APIRouter(dependencies=[Depends(require_admin)])
+router_retrasadas = APIRouter(dependencies=[Depends(require_admin)])
+router_prejudicial = APIRouter(dependencies=[Depends(require_admin)])
+router_estado_cuenta = APIRouter(dependencies=[Depends(require_admin)])
+
+logger = logging.getLogger(__name__)
+
+# --- Notificaciones previas (5, 3, 1 d�as antes) ---
+
+_FC_Q = Query(
+    None,
+    description=(
+        "Fecha de referencia America/Caracas (YYYY-MM-DD). Listado/envio como si fuera ese dia. "
+        "Omitir = hoy en Caracas."
+    ),
+)
+
+
+@router_previas.get("")
+def get_notificaciones_previas(
+    estado: str = None,
+    fecha_caracas: Optional[str] = _FC_Q,
+    db: Session = Depends(get_db),
+):
+    """Lista de notificaciones previas: cuotas que vencen en 5, 3 o 1 d�a. Verifica c�dula y email en tabla clientes."""
+    fecha_ref = _fecha_referencia_desde_query(fecha_caracas)
+    data = get_notificaciones_tabs_data(db, fecha_referencia=fecha_ref)
+    items = data["dias_5"] + data["dias_3"] + data["dias_1"]
+    return {
+        "items": items,
+        "total": len(items),
+        "dias_5": len(data["dias_5"]),
+        "dias_3": len(data["dias_3"]),
+        "dias_1": len(data["dias_1"]),
+    }
+
+
+def _tipo_previas(item: dict) -> str:
+    d = item.get("dias_antes_vencimiento")
+    return {5: "PAGO_5_DIAS_ANTES", 3: "PAGO_3_DIAS_ANTES", 1: "PAGO_1_DIA_ANTES"}.get(d, "PAGO_5_DIAS_ANTES")
+
+
+@router_previas.post("/enviar")
+def enviar_notificaciones_previas(
+    fecha_caracas: Optional[str] = _FC_Q,
+    db: Session = Depends(get_db),
+):
+    """Env�a correo a cada cliente en notificaciones previas. Respeta config env�os (habilitado/CCO) desde BD."""
+    fecha_ref = _fecha_referencia_desde_query(fecha_caracas)
+    config_envios = get_notificaciones_envios_config(db)
+    data = get_notificaciones_tabs_data(db, fecha_referencia=fecha_ref)
+    items = data["dias_5"] + data["dias_3"] + data["dias_1"]
+    asunto = "Recordatorio: cuota por vencer - Rapicredit"
+    cuerpo = (
+        "Estimado/a {nombre} (c�dula {cedula}),\n\n"
+        "Le recordamos que tiene una cuota por vencer.\n"
+        "Fecha de vencimiento: {fecha_vencimiento}\n"
+        "N�mero de cuota: {numero_cuota}\n"
+        "Monto: {monto}\n\n"
+        "Por favor realice el pago a tiempo.\n\n"
+        "Saludos,\nRapicredit"
+    )
+    res = _enviar_correos_items(
+        items,
+        asunto,
+        cuerpo,
+        config_envios,
+        _tipo_previas,
+        db,
+        fecha_referencia=fecha_ref,
+    )
+    return {"mensaje": "Env�o de notificaciones previas finalizado.", **res}
+
+
+# --- D�a de pago (vence hoy) ---
+
+@router_dia_pago.get("")
+def get_notificaciones_dia_pago(
+    estado: str = None,
+    fecha_caracas: Optional[str] = _FC_Q,
+    db: Session = Depends(get_db),
+):
+    """Lista de notificaciones del d�a de pago: cuotas que vencen hoy. Email desde tabla clientes."""
+    fecha_ref = _fecha_referencia_desde_query(fecha_caracas)
+    data = get_notificaciones_tabs_data(db, fecha_referencia=fecha_ref)
+    items = data["hoy"]
+    return {"items": items, "total": len(items)}
+
+
+def _tipo_dia_pago(_item: dict) -> str:
+    return "PAGO_DIA_0"
+
+
+def _tipo_pago_2_dias_antes_pendiente(_item: dict) -> str:
+    return "PAGO_2_DIAS_ANTES_PENDIENTE"
+
+
+@router_dia_pago.post("/enviar")
+def enviar_notificaciones_dia_pago(
+    fecha_caracas: Optional[str] = _FC_Q,
+    db: Session = Depends(get_db),
+):
+    """Env�a correo a cada cliente con cuota que vence hoy. Respeta config env�os (habilitado/CCO) desde BD."""
+    fecha_ref = _fecha_referencia_desde_query(fecha_caracas)
+    config_envios = get_notificaciones_envios_config(db)
+    data = get_notificaciones_tabs_data(db, fecha_referencia=fecha_ref)
+    items = data["hoy"]
+    asunto = "Vencimiento hoy: cuota de pago - Rapicredit"
+    cuerpo = (
+        "Estimado/a {nombre} (c�dula {cedula}),\n\n"
+        "Le informamos que su cuota vence HOY.\n"
+        "Fecha de vencimiento: {fecha_vencimiento}\n"
+        "N�mero de cuota: {numero_cuota}\n"
+        "Monto: {monto}\n\n"
+        "Por favor realice el pago hoy.\n\n"
+        "Saludos,\nRapicredit"
+    )
+    res = _enviar_correos_items(
+        items,
+        asunto,
+        cuerpo,
+        config_envios,
+        _tipo_dia_pago,
+        db,
+        fecha_referencia=fecha_ref,
+    )
+    return {"mensaje": "Env�o de notificaciones d�a de pago finalizado.", **res}
+
+
+# --- Notificaciones retrasadas (1 dia de atraso; listado agregado legacy) ---
+
+@router_retrasadas.get("")
+def get_notificaciones_retrasadas(
+    estado: str = None,
+    fecha_caracas: Optional[str] = _FC_Q,
+    db: Session = Depends(get_db),
+):
+    """Lista de notificaciones retrasadas: cuotas con 1 dia de atraso calendario. Email desde tabla clientes."""
+    fecha_ref = _fecha_referencia_desde_query(fecha_caracas)
+    data = get_notificaciones_tabs_data(db, fecha_referencia=fecha_ref)
+    # PAGO_10_DIAS_ATRASADO: no forma parte de este listado agregado; solo submodulo + enviar-caso-manual.
+    items = list(data["dias_1_retraso"])
+    return {
+        "items": items,
+        "total": len(items),
+        "dias_1": len(data["dias_1_retraso"]),
+    }
+
+
+def _tipo_retrasadas(item: dict) -> str:
+    # Solo 1 dia de atraso en este lote agregado. PAGO_10_DIAS_ATRASADO (menor a 60)
+    # es exclusivamente manual via enviar-caso-manual; no mapear por dias_atraso aqui.
+    return "PAGO_1_DIA_ATRASADO"
+
+
+@router_retrasadas.post("/enviar")
+def enviar_notificaciones_retrasadas(
+    fecha_caracas: Optional[str] = _FC_Q,
+    db: Session = Depends(get_db),
+):
+    """Env�a correo a cada cliente con cuota retrasada. Respeta config env�os (habilitado/CCO) desde BD."""
+    fecha_ref = _fecha_referencia_desde_query(fecha_caracas)
+    config_envios = get_notificaciones_envios_config(db)
+    data = get_notificaciones_tabs_data(db, fecha_referencia=fecha_ref)
+    # Sin dias_10_retraso en este POST agregado: PAGO_10_DIAS_ATRASADO solo por enviar-caso-manual (submodulo dedicado).
+    items = list(data["dias_1_retraso"])
+    asunto = "Cuenta con cuota atrasada - Rapicredit"
+    cuerpo = (
+        "Estimado/a {nombre} (c�dula {cedula}),\n\n"
+        "Le recordamos que tiene una cuota en mora.\n"
+        "Fecha de vencimiento: {fecha_vencimiento}\n"
+        "N�mero de cuota: {numero_cuota}\n"
+        "Monto: {monto}\n\n"
+        "Por favor regularice su pago lo antes posible.\n\n"
+        "Saludos,\nRapicredit"
+    )
+    res = _enviar_correos_items(
+        items,
+        asunto,
+        cuerpo,
+        config_envios,
+        _tipo_retrasadas,
+        db,
+        fecha_referencia=fecha_ref,
+    )
+    return {"mensaje": "Env�o de notificaciones retrasadas finalizado.", **res}
+
+
+# --- Notificaciones prejudiciales (2 Cuotas: >=2 atrasadas, atraso >=1) ---
+
+@router_prejudicial.get("")
+def get_notificaciones_prejudicial(
+    estado: str = None,
+    fecha_caracas: Optional[str] = _FC_Q,
+    db: Session = Depends(get_db),
+):
+    """Lista PREJUDICIAL: >=2 cuotas atrasadas (atraso >=1). Puede solapar con dia siguiente."""
+    fecha_ref = _fecha_referencia_desde_query(fecha_caracas)
+    items = build_prejudicial_items(db, fecha_referencia=fecha_ref)
+    return {"items": items, "total": len(items)}
+
+
+def _tipo_prejudicial(_item: dict) -> str:
+    return "PREJUDICIAL"
+
+
+@router_prejudicial.post("/enviar")
+def enviar_notificaciones_prejudicial(
+    fecha_caracas: Optional[str] = _FC_Q,
+    db: Session = Depends(get_db),
+):
+    """Envio MANUAL PREJUDICIAL (2 Cuotas). Sin cron ni enviar-todas; solo este POST o enviar-caso-manual."""
+    fecha_ref = _fecha_referencia_desde_query(fecha_caracas)
+    from app.services.notificacion_plantilla_prejudicial import (
+        ASUNTO_PREJUDICIAL_FALLBACK,
+        CUERPO_PREJUDICIAL_FALLBACK,
+        asegurar_modulo_prejudicial,
+    )
+    try:
+        asegurar_modulo_prejudicial(db, forzar_contenido_plantilla=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+    config_envios = get_notificaciones_envios_config(db)
+    items = build_prejudicial_items(db, fecha_referencia=fecha_ref)
+    # Defensa: no enviar nada fuera de regla aunque venga de caché/UI.
+    from app.services.notificacion_service import item_cumple_regla_prejudicial_estricta as _ok_prej
+    items = [it for it in items if _ok_prej(it, fecha_ref)]
+    asunto = ASUNTO_PREJUDICIAL_FALLBACK
+    cuerpo = CUERPO_PREJUDICIAL_FALLBACK
+    res = _enviar_correos_items(
+        items,
+        asunto,
+        cuerpo,
+        config_envios,
+        _tipo_prejudicial,
+        db,
+        fecha_referencia=fecha_ref,
+    )
+    return {"mensaje": "Envio de notificaciones prejudiciales finalizado.", **res}
+
+
+# --- Notificaciones Estado de cuenta (APROBADO, 1 correo/prestamo, tope 600/dia) ---
+
+@router_estado_cuenta.get("")
+def get_notificaciones_estado_cuenta(
+    estado: str = None,
+    fecha_caracas: Optional[str] = _FC_Q,
+    db: Session = Depends(get_db),
+):
+    """Lista ESTADO_CUENTA: prestamos APROBADO con email; sin exclusion por otras notificaciones de mora."""
+    from app.services.estado_cuenta_notificacion_envio import build_estado_cuenta_items
+    from app.services.estado_cuenta_notificacion_cursor import (
+        obtener_cursor_estado_cuenta,
+    )
+    from app.services.notificacion_plantilla_estado_cuenta import (
+        asegurar_modulo_estado_cuenta,
+    )
+
+    plantilla_info: dict = {}
+    try:
+        plantilla_info = asegurar_modulo_estado_cuenta(
+            db, forzar_contenido_plantilla=False
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    items = build_estado_cuenta_items(db)
+    cursor = obtener_cursor_estado_cuenta(db)
+    total = len(items)
+    cupo_restante = int(cursor.get("cupo_restante") or 0)
+    enviados_hoy = int(cursor.get("enviados_hoy") or 0)
+    max_diarios = int(cursor.get("max_diarios") or 600)
+    envios_hoy_previstos = min(cupo_restante, total)
+    return {
+        "items": items,
+        "total": total,
+        "cursor": cursor,
+        "enviados_hoy": enviados_hoy,
+        "cupo_restante": cupo_restante,
+        "max_diarios": max_diarios,
+        "envios_hoy_previstos": envios_hoy_previstos,
+        "plantilla": {
+            "id": plantilla_info.get("plantilla_id"),
+            "nombre": plantilla_info.get("plantilla_nombre"),
+            "asunto": plantilla_info.get("plantilla_asunto"),
+            "pdf_estado_cuenta": plantilla_info.get(
+                "pdf_estado_cuenta", "generado_al_enviar"
+            ),
+        },
+    }
+
+
+@router_estado_cuenta.post("/enviar")
+def enviar_notificaciones_estado_cuenta(
+    fecha_caracas: Optional[str] = _FC_Q,
+    db: Session = Depends(get_db),
+):
+    """Preferir POST /notificaciones/enviar-caso-manual con tipo ESTADO_CUENTA (BG + progreso)."""
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "Use POST /notificaciones/enviar-caso-manual con "
+            '{"tipo":"ESTADO_CUENTA"} (envio en segundo plano, tope 600/dia).'
+        ),
+    )
+
+
+# Tipos alineados con CRITERIOS_ENVIO_TABLA (frontend) y _CONFIG_TIPO_TO_TAB
+TIPOS_CASO_MANUAL = frozenset(
+    {
+        "PAGO_5_DIAS_ANTES",
+        "PAGO_3_DIAS_ANTES",
+        "PAGO_1_DIA_ANTES",
+        "PAGO_2_DIAS_ANTES_PENDIENTE",
+        "PAGO_DIA_0",
+        "PAGO_1_DIA_ATRASADO",
+        "PAGO_10_DIAS_ATRASADO",
+        "PREJUDICIAL",
+        "ESTADO_CUENTA",
+    }
+)
+
+# Politica producto: cobranza por segmento SOLO manual (POST /enviar-caso-manual
+# o POST dedicado de la pestana). Nunca cron ni POST /enviar-todas.
+TIPOS_NOTIFICACION_SOLO_ENVIO_MANUAL = frozenset(
+    {
+        "PAGO_2_DIAS_ANTES_PENDIENTE",
+        "PAGO_1_DIA_ATRASADO",
+        "PAGO_10_DIAS_ATRASADO",
+        "PREJUDICIAL",
+        "ESTADO_CUENTA",
+        "MASIVOS",
+    }
+)
+
+
+def tipo_permite_envio_automatico_o_lote(tipo: str) -> bool:
+    """False si el tipo solo admite disparo manual (sin cron ni enviar-todas)."""
+    return (tipo or "").strip() not in TIPOS_NOTIFICACION_SOLO_ENVIO_MANUAL
+
+
+def _config_envios_forzar_habilitado_casos(config_envios: dict, tipos: Sequence[str]) -> dict:
+    """Copia superficial con habilitado=True para cada tipo indicado."""
+    out = dict(config_envios) if isinstance(config_envios, dict) else {}
+    for tipo in tipos:
+        t = (tipo or "").strip()
+        if not t:
+            continue
+        cur = out.get(t)
+        merged = dict(cur) if isinstance(cur, dict) else {}
+        merged["habilitado"] = True
+        out[t] = merged
+    return out
+
+
+def _config_envios_forzar_habilitado_caso(config_envios: dict, tipo: str) -> dict:
+    """
+    Copia superficial de la config de envios con habilitado=True solo para el tipo indicado.
+    El envio manual y la prueba de paquete deben ejecutarse aunque el toggle Envio este apagado.
+    """
+    return _config_envios_forzar_habilitado_casos(config_envios, (tipo,))
+
+
+def _resolver_tipo_envio_manual_fijo(tipo_caso: str) -> Callable[[dict], str]:
+    """
+    POST /notificaciones/enviar-caso-manual debe usar siempre la misma clave de configuracion
+    (plantilla, CCO, PDFs, tipo_tab) para todos los destinatarios del lote, la del caso elegido.
+
+    No usar _tipo_previas / _tipo_retrasadas aqui: infieren por dias_antes_vencimiento / dias_atraso
+    de cada fila y pueden mezclar PAGO_1_DIA_ANTES con otro tipo si se usara inferencia por fila.
+    """
+
+    def _inner(_item: dict) -> str:
+        return tipo_caso
+
+    return _inner
+
+
+_RES_ENVIO_KEYS = (
+    "enviados",
+    "sin_email",
+    "fallidos",
+    "omitidos_config",
+    "omitidos_desistimiento",
+    "omitidos_paquete_incompleto",
+    "omitidos_ya_enviado",
+    "omitidos_ya_pagado",
+    "procesados",
+)
+
+
+def _res_envio_vacio() -> dict:
+    return {k: 0 for k in _RES_ENVIO_KEYS} | {
+        "pausado_limite_gmail": False,
+        "cancelado_usuario": False,
+        "motivo_pausa": None,
+    }
+
+
+def _acumular_res_envio(acc: dict, nxt: dict) -> dict:
+    out = dict(acc)
+    for k in _RES_ENVIO_KEYS:
+        out[k] = int(out.get(k) or 0) + int(nxt.get(k) or 0)
+    if nxt.get("pausado_limite_gmail"):
+        out["pausado_limite_gmail"] = True
+        if nxt.get("motivo_pausa"):
+            out["motivo_pausa"] = nxt.get("motivo_pausa")
+    if nxt.get("cancelado_usuario"):
+        out["cancelado_usuario"] = True
+        if nxt.get("motivo_pausa"):
+            out["motivo_pausa"] = nxt.get("motivo_pausa")
+    return out
+
+
+def _progress_con_offset(on_progress, offset: int, total: int, prev: dict):
+    if not on_progress:
+        return None
+
+    def _inner(p: dict) -> None:
+        try:
+            on_progress(
+                {
+                    "procesados": offset + int(p.get("procesados") or 0),
+                    "total_en_lista": total,
+                    "enviados": int(prev.get("enviados") or 0) + int(p.get("enviados") or 0),
+                    "fallidos": int(prev.get("fallidos") or 0) + int(p.get("fallidos") or 0),
+                    "sin_email": int(prev.get("sin_email") or 0) + int(p.get("sin_email") or 0),
+                    "omitidos_config": int(prev.get("omitidos_config") or 0)
+                    + int(p.get("omitidos_config") or 0),
+                    "omitidos_paquete_incompleto": int(
+                        prev.get("omitidos_paquete_incompleto") or 0
+                    )
+                    + int(p.get("omitidos_paquete_incompleto") or 0),
+                    "omitidos_desistimiento": int(prev.get("omitidos_desistimiento") or 0)
+                    + int(p.get("omitidos_desistimiento") or 0),
+                    "omitidos_ya_enviado": int(prev.get("omitidos_ya_enviado") or 0)
+                    + int(p.get("omitidos_ya_enviado") or 0),
+                    "omitidos_ya_pagado": int(prev.get("omitidos_ya_pagado") or 0)
+                    + int(p.get("omitidos_ya_pagado") or 0),
+                }
+            )
+        except Exception:
+            logger.debug("[notif] on_progress offset fallo", exc_info=True)
+
+    return _inner
+
+
+def _enviar_dia_siguiente_y_otras_reglas(
+    db: Session,
+    *,
+    items_dia_siguiente: List[dict],
+    items_10_retraso: List[dict],
+    fecha_referencia: Optional[date],
+    config_raw: dict,
+    respetar_toggle_envio: bool,
+    on_progress,
+    omitir_exitos_desde: Optional[date],
+    asunto_ret: str,
+    cuerpo_ret: str,
+    asunto_prej: str,
+    cuerpo_prej: str,
+) -> dict:
+    """
+    Envia dia siguiente y, a los mismos titulares, 2 Cuotas / 1 Cuota / 3 dias antes
+    si esas reglas aplican. Cuentas SMTP distintas pueden seguir si una se pausa.
+    """
+    from app.services.notificacion_service import (
+        build_cuotas_pendiente_2_dias_antes_items,
+        item_cumple_regla_menor_60_estricta,
+        item_cumple_regla_prejudicial_estricta,
+    )
+    from app.services.notificaciones_dedup_segmentos import (
+        filtrar_items_de_titulares,
+        filtrar_items_menor_60_sin_prejudicial,
+        titulares_desde_items,
+    )
+
+    items_d1 = list(items_dia_siguiente or [])
+    cids, ceds = titulares_desde_items(items_d1)
+
+    prej_all = build_prejudicial_items(db, fecha_referencia=fecha_referencia)
+    items_prej = [
+        it
+        for it in filtrar_items_de_titulares(prej_all, cids, ceds)
+        if item_cumple_regla_prejudicial_estricta(it, fecha_referencia)
+    ]
+
+    items_m60 = [
+        it
+        for it in (items_10_retraso or [])
+        if item_cumple_regla_menor_60_estricta(it, fecha_referencia)
+    ]
+    items_m60 = filtrar_items_de_titulares(items_m60, cids, ceds)
+    items_m60 = filtrar_items_menor_60_sin_prejudicial(db, items_m60, fecha_referencia)
+
+    items_3d = filtrar_items_de_titulares(
+        build_cuotas_pendiente_2_dias_antes_items(db, fecha_referencia=fecha_referencia),
+        cids,
+        ceds,
+    )
+
+    lotes: List[Tuple[str, List[dict], str, str]] = [
+        ("PAGO_1_DIA_ATRASADO", items_d1, asunto_ret, cuerpo_ret),
+        ("PREJUDICIAL", items_prej, asunto_prej, cuerpo_prej),
+        ("PAGO_10_DIAS_ATRASADO", items_m60, asunto_ret, cuerpo_ret),
+        (
+            "PAGO_2_DIAS_ANTES_PENDIENTE",
+            items_3d,
+            ASUNTO_DEFAULT_PAGO_2_DIAS_ANTES_PENDIENTE,
+            CUERPO_DEFAULT_PAGO_2_DIAS_ANTES_PENDIENTE,
+        ),
+    ]
+    total = sum(len(its) for _t, its, _a, _c in lotes)
+    acc = _res_envio_vacio()
+    offset = 0
+    if on_progress:
+        try:
+            on_progress(
+                {
+                    "procesados": 0,
+                    "total_en_lista": total,
+                    "enviados": 0,
+                    "fallidos": 0,
+                    "sin_email": 0,
+                }
+            )
+        except Exception:
+            pass
+
+    for tipo_lote, its, asunto, cuerpo in lotes:
+        if not its:
+            continue
+        if respetar_toggle_envio:
+            cfg = dict(config_raw) if isinstance(config_raw, dict) else {}
+        else:
+            cfg = _config_envios_forzar_habilitado_caso(config_raw, tipo_lote)
+        nxt = _enviar_correos_items(
+            its,
+            asunto,
+            cuerpo,
+            cfg,
+            _resolver_tipo_envio_manual_fijo(tipo_lote),
+            db,
+            fecha_referencia=fecha_referencia,
+            on_progress=_progress_con_offset(on_progress, offset, total, acc),
+            omitir_exitos_desde=omitir_exitos_desde,
+        )
+        acc = _acumular_res_envio(acc, nxt)
+        offset += len(its)
+        if acc.get("cancelado_usuario"):
+            break
+        # Si se pauso Gmail en este buzon, los lotes de otra cuenta SMTP siguen.
+
+    acc["detalles_casos_adicionales"] = {
+        "dia_siguiente": len(items_d1),
+        "prejudicial": len(items_prej),
+        "una_cuota": len(items_m60),
+        "tres_dias_antes": len(items_3d),
+    }
+    acc["total_en_lista"] = total
+    return acc
+
+
+def ejecutar_envio_caso_manual(
+    db: Session,
+    tipo: str,
+    fecha_referencia: Optional[date] = None,
+    *,
+    respetar_toggle_envio: bool = False,
+    on_progress=None,
+    omitir_exitos_desde: Optional[date] = None,
+) -> dict:
+    """
+    Envio sincrono de un criterio (una fila de configuracion: PAGO_1_DIA_ANTES, etc.).
+    Excepcion PAGO_1_DIA_ATRASADO: ademas envia 2 Cuotas, 1 Cuota y 3 dias antes
+    a los mismos titulares si esas reglas tambien aplican.
+
+    Lista de destinatarios = la misma regla que la pestaña correspondiente; cada correo usa
+    la config de ese tipo (plantilla/CCO/PDF del caso), sin inferir otro tipo por fila.
+
+    fecha_referencia: mismo criterio que ?fecha_caracas= en GET listados (America/Caracas).
+
+    respetar_toggle_envio: si True, respeta habilitado=False de la fila en BD (omitidos_config).
+        Reservado para integraciones internas; la API POST /enviar-caso-manual usa False (fuerza habilitado).
+    """
+    tipo = (tipo or "").strip()
+    if tipo not in TIPOS_CASO_MANUAL:
+        raise ValueError("tipo_caso_manual_invalido")
+
+    config_raw = get_notificaciones_envios_config(db)
+    if respetar_toggle_envio:
+        config_envios = dict(config_raw) if isinstance(config_raw, dict) else {}
+    else:
+        config_envios = _config_envios_forzar_habilitado_caso(config_raw, tipo)
+
+    asunto_prev = "Recordatorio: cuota por vencer - Rapicredit"
+    cuerpo_prev = (
+        "Estimado/a {nombre} (c\u00e9dula {cedula}),\n\n"
+        "Le recordamos que tiene una cuota por vencer.\n"
+        "Fecha de vencimiento: {fecha_vencimiento}\n"
+        "N\u00famero de cuota: {numero_cuota}\n"
+        "Monto: {monto}\n\n"
+        "Por favor realice el pago a tiempo.\n\n"
+        "Saludos,\nRapicredit"
+    )
+    asunto_hoy = "Vencimiento hoy: cuota de pago - Rapicredit"
+    cuerpo_hoy = (
+        "Estimado/a {nombre} (c\u00e9dula {cedula}),\n\n"
+        "Le informamos que su cuota vence HOY.\n"
+        "Fecha de vencimiento: {fecha_vencimiento}\n"
+        "N\u00famero de cuota: {numero_cuota}\n"
+        "Monto: {monto}\n\n"
+        "Por favor realice el pago hoy.\n\n"
+        "Saludos,\nRapicredit"
+    )
+    asunto_ret = "Cuenta con cuota atrasada - Rapicredit"
+    cuerpo_ret = (
+        "Estimado/a {nombre} (c\u00e9dula {cedula}),\n\n"
+        "Le recordamos que tiene una cuota en mora.\n"
+        "Fecha de vencimiento: {fecha_vencimiento}\n"
+        "N\u00famero de cuota: {numero_cuota}\n"
+        "Monto: {monto}\n\n"
+        "Por favor regularice su pago lo antes posible.\n\n"
+        "Saludos,\nRapicredit"
+    )
+    from app.services.notificacion_plantilla_prejudicial import (
+        ASUNTO_PREJUDICIAL_FALLBACK as asunto_prej,
+        CUERPO_PREJUDICIAL_FALLBACK as cuerpo_prej,
+    )
+
+    ref = fecha_referencia
+    if tipo == "ESTADO_CUENTA":
+        from app.services.estado_cuenta_notificacion_envio import (
+            ejecutar_envio_estado_cuenta,
+        )
+
+        res = ejecutar_envio_estado_cuenta(db, on_progress=on_progress)
+        # Si agoto cupo proactivo 600, marcar pausa para watchdog / 409 mismo dia.
+        if res.get("pausado_cupo_diario") and not res.get("pausado_limite_gmail"):
+            res = dict(res)
+            res["pausado_limite_gmail"] = True
+            if not res.get("motivo_pausa"):
+                res["motivo_pausa"] = "cupo_proactivo_600"
+        return res
+    if tipo == "PREJUDICIAL":
+        items = build_prejudicial_items(db, fecha_referencia=ref)
+        from app.services.notificacion_service import (
+            item_cumple_regla_prejudicial_estricta as _ok_prej,
+        )
+        items = [it for it in items if _ok_prej(it, ref)]
+        res = _enviar_correos_items(
+            items,
+            asunto_prej,
+            cuerpo_prej,
+            config_envios,
+            _resolver_tipo_envio_manual_fijo("PREJUDICIAL"),
+            db,
+            fecha_referencia=ref,
+            on_progress=on_progress,
+            omitir_exitos_desde=omitir_exitos_desde,
+        )
+    else:
+        data = get_notificaciones_tabs_data(db, fecha_referencia=ref)
+        if tipo == "PAGO_5_DIAS_ANTES":
+            items = data["dias_5"]
+            res = _enviar_correos_items(
+                items,
+                asunto_prev,
+                cuerpo_prev,
+                config_envios,
+                _resolver_tipo_envio_manual_fijo("PAGO_5_DIAS_ANTES"),
+                db,
+                fecha_referencia=ref,
+                on_progress=on_progress,
+            omitir_exitos_desde=omitir_exitos_desde,
+            )
+        elif tipo == "PAGO_3_DIAS_ANTES":
+            items = data["dias_3"]
+            res = _enviar_correos_items(
+                items,
+                asunto_prev,
+                cuerpo_prev,
+                config_envios,
+                _resolver_tipo_envio_manual_fijo("PAGO_3_DIAS_ANTES"),
+                db,
+                fecha_referencia=ref,
+                on_progress=on_progress,
+            omitir_exitos_desde=omitir_exitos_desde,
+            )
+        elif tipo == "PAGO_1_DIA_ANTES":
+            items = data["dias_1"]
+            res = _enviar_correos_items(
+                items,
+                asunto_prev,
+                cuerpo_prev,
+                config_envios,
+                _resolver_tipo_envio_manual_fijo("PAGO_1_DIA_ANTES"),
+                db,
+                fecha_referencia=ref,
+                on_progress=on_progress,
+            omitir_exitos_desde=omitir_exitos_desde,
+            )
+        elif tipo == "PAGO_2_DIAS_ANTES_PENDIENTE":
+            items = build_cuotas_pendiente_2_dias_antes_items(db, fecha_referencia=ref)
+            res = _enviar_correos_items(
+                items,
+                ASUNTO_DEFAULT_PAGO_2_DIAS_ANTES_PENDIENTE,
+                CUERPO_DEFAULT_PAGO_2_DIAS_ANTES_PENDIENTE,
+                config_envios,
+                _resolver_tipo_envio_manual_fijo("PAGO_2_DIAS_ANTES_PENDIENTE"),
+                db,
+                fecha_referencia=ref,
+                on_progress=on_progress,
+            omitir_exitos_desde=omitir_exitos_desde,
+            )
+        elif tipo == "PAGO_DIA_0":
+            items = data["hoy"]
+            res = _enviar_correos_items(
+                items,
+                asunto_hoy,
+                cuerpo_hoy,
+                config_envios,
+                _resolver_tipo_envio_manual_fijo("PAGO_DIA_0"),
+                db,
+                fecha_referencia=ref,
+                on_progress=on_progress,
+            omitir_exitos_desde=omitir_exitos_desde,
+            )
+        elif tipo == "PAGO_1_DIA_ATRASADO":
+            items = list(data["dias_1_retraso"])
+            res = _enviar_dia_siguiente_y_otras_reglas(
+                db,
+                items_dia_siguiente=items,
+                items_10_retraso=list(data.get("dias_10_retraso") or []),
+                fecha_referencia=ref,
+                config_raw=config_raw,
+                respetar_toggle_envio=respetar_toggle_envio,
+                on_progress=on_progress,
+                omitir_exitos_desde=omitir_exitos_desde,
+                asunto_ret=asunto_ret,
+                cuerpo_ret=cuerpo_ret,
+                asunto_prej=asunto_prej,
+                cuerpo_prej=cuerpo_prej,
+            )
+        elif tipo == "PAGO_10_DIAS_ATRASADO":
+            items = data["dias_10_retraso"]
+            from app.services.notificacion_service import (
+                item_cumple_regla_menor_60_estricta as _ok_m60,
+            )
+            items = [it for it in items if _ok_m60(it, ref)]
+            from app.services.notificaciones_dedup_segmentos import (
+                filtrar_items_menor_60_sin_prejudicial as _sin_prej,
+            )
+
+            # «2 Cuotas» recorta «1 Cuota»; dia siguiente ya no recorta.
+            items = _sin_prej(db, items, ref)
+            res = _enviar_correos_items(
+                items,
+                asunto_ret,
+                cuerpo_ret,
+                config_envios,
+                _resolver_tipo_envio_manual_fijo("PAGO_10_DIAS_ATRASADO"),
+                db,
+                fecha_referencia=ref,
+                on_progress=on_progress,
+            omitir_exitos_desde=omitir_exitos_desde,
+            )
+        else:
+            raise ValueError("tipo_caso_manual_invalido")
+
+    pausado = bool(res.get("pausado_limite_gmail"))
+    mensaje = (
+        f"Envio manual del caso {tipo} pausado por limite diario Gmail. "
+        f"Quedaron pendientes; se reanuda al siguiente dia de negocio "
+        f"(los ya enviados con exito hoy se omiten)."
+        if pausado
+        else f"Envio manual del caso {tipo} finalizado."
+    )
+    return {
+        "mensaje": mensaje,
+        "tipo_caso": tipo,
+        **res,
+        # Dia siguiente acumula 2 Cuotas / 1 Cuota / 3d en res.total_en_lista.
+        "total_en_lista": int(res.get("total_en_lista") or len(items)),
+    }
+
+
+def ejecutar_envio_todas_notificaciones(db: Session) -> dict:
+    """
+    Ejecuta en un solo batch varias familias de notificacion: previas y dia de pago.
+    Sin PREJUDICIAL, COBRANZAS_EXCEL ni PAGO_10_DIAS_ATRASADO (solo manual). Cada tipo usa su propia configuracion en notificaciones_envios (habilitado,
+    CCO, modo pruebas, etc.); no se mezclan entre si.
+
+    No incluye PAGO_2_DIAS_ANTES_PENDIENTE (2 dias antes del vencimiento), que tiene envio propio.
+    No incluye tipos en TIPOS_NOTIFICACION_SOLO_ENVIO_MANUAL (3 dias antes, dia siguiente, 1 Cuota, 2 Cuotas): solo POST /enviar-caso-manual
+    (o POST notificaciones-prejudicial/enviar) desde el submodulo dedicado.
+    Sin cron ni programador de servidor para esos tipos.
+
+    Solo desde POST /notificaciones/enviar-todas (BackgroundTasks); sin envio automatico por hora.
+    """
+    # Defensa: TIPOS_NOTIFICACION_SOLO_ENVIO_MANUAL (PAGO_10_DIAS_ATRASADO, PREJUDICIAL,
+    # COBRANZAS_EXCEL, etc.) no se incluyen abajo; el lote usa previas/hoy.
+
+    config_envios = get_notificaciones_envios_config(db)
+    data = get_notificaciones_tabs_data(db)
+    total_enviados = 0
+    total_fallidos = 0
+    total_sin_email = 0
+    total_omitidos_config = 0
+    total_omitidos_paquete = 0
+    detalles = {}
+
+    # Previas (5, 3, 1 d�as antes)
+    items_previas = data["dias_5"] + data["dias_3"] + data["dias_1"]
+    asunto_p = "Recordatorio: cuota por vencer - Rapicredit"
+    cuerpo_p = (
+        "Estimado/a {nombre} (c�dula {cedula}),\n\n"
+        "Le recordamos que tiene una cuota por vencer.\n"
+        "Fecha de vencimiento: {fecha_vencimiento}\n"
+        "N�mero de cuota: {numero_cuota}\n"
+        "Monto: {monto}\n\n"
+        "Por favor realice el pago a tiempo.\n\n"
+        "Saludos,\nRapicredit"
+    )
+    r = _enviar_correos_items(items_previas, asunto_p, cuerpo_p, config_envios, _tipo_previas, db)
+    total_enviados += r.get("enviados", 0)
+    total_fallidos += r.get("fallidos", 0)
+    total_sin_email += r.get("sin_email", 0)
+    total_omitidos_config += r.get("omitidos_config", 0)
+    total_omitidos_paquete += r.get("omitidos_paquete_incompleto", 0)
+    detalles["previas"] = r
+
+    # D�a de pago (vence hoy)
+    items_hoy = data["hoy"]
+    asunto_h = "Vencimiento hoy: cuota de pago - Rapicredit"
+    cuerpo_h = (
+        "Estimado/a {nombre} (c�dula {cedula}),\n\n"
+        "Le informamos que su cuota vence HOY.\n"
+        "Fecha de vencimiento: {fecha_vencimiento}\n"
+        "N�mero de cuota: {numero_cuota}\n"
+        "Monto: {monto}\n\n"
+        "Por favor realice el pago hoy.\n\n"
+        "Saludos,\nRapicredit"
+    )
+    r = _enviar_correos_items(items_hoy, asunto_h, cuerpo_h, config_envios, _tipo_dia_pago, db)
+    total_enviados += r.get("enviados", 0)
+    total_fallidos += r.get("fallidos", 0)
+    total_sin_email += r.get("sin_email", 0)
+    total_omitidos_config += r.get("omitidos_config", 0)
+    total_omitidos_paquete += r.get("omitidos_paquete_incompleto", 0)
+    detalles["dia_pago"] = r
+
+    # Retrasadas (1 dia): PAGO_1_DIA_ATRASADO esta en TIPOS_NOTIFICACION_SOLO_ENVIO_MANUAL.
+    # No se envia en este lote; solo POST /enviar-caso-manual (o pestana retrasadas dedicada).
+    detalles["retrasadas"] = {
+        "enviados": 0,
+        "fallidos": 0,
+        "sin_email": 0,
+        "omitidos_config": 0,
+        "omitidos_paquete_incompleto": 0,
+        "omitido_solo_manual": True,
+        "motivo": "PAGO_1_DIA_ATRASADO solo envio manual",
+    }
+
+    # Sin prejudicial en enviar-todas: PREJUDICIAL (2 Cuotas) solo por
+    # enviar-caso-manual / POST notificaciones-prejudicial/enviar (submodulo dedicado).
+    # Esta en TIPOS_NOTIFICACION_SOLO_ENVIO_MANUAL: sin cron ni lote automatico.
+
+    detalles["masivos"] = {
+        "enviados": 0,
+        "fallidos": 0,
+        "sin_email": 0,
+        "omitidos_config": 0,
+        "omitidos_paquete_incompleto": 0,
+        "omitido_retirado": True,
+        "motivo": "MASIVOS retirado del producto",
+    }
+
+    return {
+        "enviados": total_enviados,
+        "fallidos": total_fallidos,
+        "sin_email": total_sin_email,
+        "omitidos_config": total_omitidos_config,
+        "omitidos_paquete_incompleto": total_omitidos_paquete,
+        "detalles": detalles,
+    }

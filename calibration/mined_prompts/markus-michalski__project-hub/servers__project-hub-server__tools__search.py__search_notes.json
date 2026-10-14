@@ -1,0 +1,28 @@
+{
+  "repo": "markus-michalski__project-hub",
+  "file": "servers/project-hub-server/tools/search.py",
+  "function": "search_notes",
+  "line": 7,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Search notes by title or content (case-insensitive).\n\nproject_id: limit to a specific project (0 = all projects).\nReturns matching notes ordered by created_at DESC.",
+  "prompt_source": "def search_notes(query: str, project_id: int = 0) -> list[dict]:\n    \"\"\"Search notes by title or content (case-insensitive).\n\n    project_id: limit to a specific project (0 = all projects).\n    Returns matching notes ordered by created_at DESC.\n    \"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def search_notes(query: str, project_id: int = 0) -> list[dict]:\n    \"\"\"Search notes by title or content (case-insensitive).\n\n    project_id: limit to a specific project (0 = all projects).\n    Returns matching notes ordered by created_at DESC.\n    \"\"\"\n    if not query.strip():\n        return []\n    pattern = f\"%{query}%\"\n    with db_connection() as conn:\n        if project_id:\n            rows = conn.execute(\n                \"\"\"SELECT n.*, p.name as project_name, p.slug as project_slug\n                   FROM notes n\n                   JOIN projects p ON p.id = n.project_id\n                   WHERE n.project_id = ?\n                     AND (n.title LIKE ? OR n.content LIKE ?)\n                   ORDER BY n.created_at DESC\"\"\",\n                (project_id, pattern, pattern),\n            ).fetchall()\n        else:\n            rows = conn.execute(\n                \"\"\"SELECT n.*, p.name as project_name, p.slug as project_slug\n                   FROM notes n\n                   JOIN projects p ON p.id = n.project_id\n                   WHERE n.title LIKE ? OR n.content LIKE ?\n                   ORDER BY n.created_at DESC\"\"\",\n                (pattern, pattern),\n            ).fetchall()\n        return [dict(r) for r in rows]",
+  "module_source": "\"\"\"Full-text search across notes and contacts.\"\"\"\nfrom __future__ import annotations\n\nfrom .db import db_connection\n\n\ndef search_notes(query: str, project_id: int = 0) -> list[dict]:\n    \"\"\"Search notes by title or content (case-insensitive).\n\n    project_id: limit to a specific project (0 = all projects).\n    Returns matching notes ordered by created_at DESC.\n    \"\"\"\n    if not query.strip():\n        return []\n    pattern = f\"%{query}%\"\n    with db_connection() as conn:\n        if project_id:\n            rows = conn.execute(\n                \"\"\"SELECT n.*, p.name as project_name, p.slug as project_slug\n                   FROM notes n\n                   JOIN projects p ON p.id = n.project_id\n                   WHERE n.project_id = ?\n                     AND (n.title LIKE ? OR n.content LIKE ?)\n                   ORDER BY n.created_at DESC\"\"\",\n                (project_id, pattern, pattern),\n            ).fetchall()\n        else:\n            rows = conn.execute(\n                \"\"\"SELECT n.*, p.name as project_name, p.slug as project_slug\n                   FROM notes n\n                   JOIN projects p ON p.id = n.project_id\n                   WHERE n.title LIKE ? OR n.content LIKE ?\n                   ORDER BY n.created_at DESC\"\"\",\n                (pattern, pattern),\n            ).fetchall()\n        return [dict(r) for r in rows]\n\n\ndef search_contacts(query: str, project_id: int = 0) -> list[dict]:\n    \"\"\"Search contacts by name, role, email, or company (case-insensitive).\n\n    project_id: limit to a specific project (0 = all projects).\n    Returns matching contacts ordered by name.\n    \"\"\"\n    if not query.strip():\n        return []\n    pattern = f\"%{query}%\"\n    with db_connection() as conn:\n        if project_id:\n            rows = conn.execute(\n                \"\"\"SELECT c.*, p.name as project_name, p.slug as project_slug\n                   FROM contacts c\n                   JOIN projects p ON p.id = c.project_id\n                   WHERE (c.project_id = ? OR c.is_shared = 1)\n                     AND (c.name LIKE ? OR c.role LIKE ? OR c.email LIKE ? OR c.company LIKE ?)\n                   ORDER BY c.name\"\"\",\n                (project_id, pattern, pattern, pattern, pattern),\n            ).fetchall()\n        else:\n            rows = conn.execute(\n                \"\"\"SELECT c.*, p.name as project_name, p.slug as project_slug\n                   FROM contacts c\n                   JOIN projects p ON p.id = c.project_id\n                   WHERE c.name LIKE ? OR c.role LIKE ? OR c.email LIKE ? OR c.company LIKE ?\n                   ORDER BY c.name\"\"\",\n                (pattern, pattern, pattern, pattern),\n            ).fetchall()\n        return [dict(r) for r in rows]\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 30
+    },
+    "ai_commit": "9b2f6a09d11d",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 1.0,
+    "span": [
+      7,
+      36
+    ]
+  }
+}

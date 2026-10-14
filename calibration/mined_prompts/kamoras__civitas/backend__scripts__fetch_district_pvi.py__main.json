@@ -1,0 +1,29 @@
+{
+  "repo": "kamoras__civitas",
+  "file": "backend/scripts/fetch_district_pvi.py",
+  "function": "main",
+  "line": 52,
+  "candidate_cwes": [
+    "CWE-22",
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main() -> int:\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main() -> int:\n    ap = argparse.ArgumentParser()\n    ap.add_argument(\"output\", nargs=\"?\", default=str(DEFAULT_OUTPUT))\n    ap.add_argument(\n        \"--congress\", type=int, required=True,\n        help=\"the Congress whose table goes in the top-level \\\"districts\\\" (the one in office)\",\n    )\n    args = ap.parse_args()\n\n    payload, failures = asyncio.run(_build(args.congress))\n    for f in failures:\n        print(\"GATE FAILED:\", f)\n    if payload is None:\n        return 1\n    for c, block in sorted(payload[\"congresses\"].items()):\n        vals = list(block[\"districts\"].values())\n        print(\n            f\"{ordinal(int(c))} Congress: {len(vals)} districts, R {sum(v > 0 for v in vals)}, \"\n            f\"D {sum(v < 0 for v in vals)}, EVEN {sum(v == 0 for v in vals)} \u2014 {block['_lines']}\"\n        )\n    pathlib.Path(args.output).write_text(\n        json.dumps(payload, indent=1, sort_keys=True, ensure_ascii=False) + \"\\n\"\n    )\n    print(f\"wrote {args.output} (member lines: the {ordinal(payload['congress'])} Congress's)\")\n    return 0",
+  "module_source": "\"\"\"Regenerate the bundled app/data/district_pvi.json.\n\nThe primary data path is app/pipeline/fetch/district_pvi.py, which the\nSupplementary pipeline runs weekly (and district_pvi.run_house_on_sitting_lines\nruns before every House run, whenever the persistent file lacks the sitting\nCongress's table or its pins moved), writing /data/district_pvi.json. The bundled copy this script writes is only the\nfallback served before a fresh deployment's first ingest completes.\n\nIt runs the exact same fetch and gates, from the same pinned sources\n(app/data/district_pvi_sources.json): one immutable revision of\nWikipedia's \"Cook Partisan Voting Index\" article per Congress's district\nlines, each gated against the House Clerk's apportionment (network\nrequired for both). See the fetch module's docstring for why the source is pinned\nrather than scraped from each district's live infobox.\n\nOutput: \"districts\" is the sitting Congress's table (what member scoring\nreads \u2014 \"ST-N\" -> signed int, positive = R lean, at-large seats \"ST-0\");\n\"congresses\" holds every configured Congress's table with its provenance.\n\nRun from the repo (network required):\n    python3 backend/scripts/fetch_district_pvi.py --congress N [output.json]\n\n--congress (required) names the Congress whose table goes in the top-level\n\"districts\" (the newest pinned table at or below it when it has none of\nits own). It is explicit, not read from the clock, so the checked-in file\ndoes not change meaning with the day someone happens to regenerate it:\nthe fallback's top level is only read before a deployment's first ingest,\nevery House run re-selects the sitting Congress's table from \"congresses\"\n(fetch/district_pvi._reselect), and the tests check the file against the\nCongress it names. Give it the Congress in office when you regenerate\n(app.time_utils.congress_in_session). Exits 1 if any gate fails, writing nothing.\n\"\"\"\n\nimport argparse\nimport asyncio\nimport json\nimport pathlib\nimport sys\n\nsys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))\n\nfrom app.ordinals import ordinal  # noqa: E402\nfrom app.pipeline.fetch import district_pvi as dp  # noqa: E402\n\nDEFAULT_OUTPUT = pathlib.Path(__file__).resolve().parent.parent / \"app\" / \"data\" / \"district_pvi.json\"\n\n\nasync def _build(congress: int) -> tuple[dict | None, list[str]]:\n    return await dp.build_payload(dp.load_sources(), congress)\n\n\ndef main() -> int:\n    ap = argparse.ArgumentParser()\n    ap.add_argument(\"output\", nargs=\"?\", default=str(DEFAULT_OUTPUT))\n    ap.add_argument(\n        \"--congress\", type=int, required=True,\n        help=\"the Congress whose table goes in the top-level \\\"districts\\\" (the one in office)\",\n    )\n    args = ap.parse_args()\n\n    payload, failures = asyncio.run(_build(args.congress))\n    for f in failures:\n        print(\"GATE FAILED:\", f)\n    if payload is None:\n        return 1\n    for c, block in sorted(payload[\"congresses\"].items()):\n        vals = list(block[\"districts\"].values())\n        print(\n            f\"{ordinal(int(c))} Congress: {len(vals)} districts, R {sum(v > 0 for v in vals)}, \"\n            f\"D {sum(v < 0 for v in vals)}, EVEN {sum(v == 0 for v in vals)} \u2014 {block['_lines']}\"\n        )\n    pathlib.Path(args.output).write_text(\n        json.dumps(payload, indent=1, sort_keys=True, ensure_ascii=False) + \"\\n\"\n    )\n    print(f\"wrote {args.output} (member lines: the {ordinal(payload['congress'])} Congress's)\")\n    return 0\n\n\nif __name__ == \"__main__\":\n    sys.exit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 24
+    },
+    "ai_commit": "e70e15e7e0aa",
+    "evidence": "Co-authored-by: Claude <noreply@anthropic.com>",
+    "ai_line_fraction": 0.96,
+    "span": [
+      52,
+      76
+    ]
+  }
+}

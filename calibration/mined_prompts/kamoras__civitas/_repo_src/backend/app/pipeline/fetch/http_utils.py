@@ -1,0 +1,404 @@
+"""Shared rate-limited HTTP fetch-with-retry helper.
+
+Extracted from 4 independent, near-identical implementations
+(congress.py, congressional_record.py, house_ptr.py, senate_ptr.py) that
+each redefined MAX_RETRIES/RETRY_BACKOFF_S and reimplemented the same
+rate-limit -> try -> 429-backoff -> exception-retry loop.
+
+The four callers differed in two ways that are exposed as parameters
+here rather than hardcoded, so unifying them doesn't silently change
+any caller's behavior:
+  - Whether a 4xx status is retried at all. congress.py retried
+    everything but 429 (including 4xx); congressional_record.py,
+    house_ptr.py, and senate_ptr.py never retried a 4xx (client errors
+    are terminal, not transient). -> retry_on_4xx
+  - The 429 backoff multiplier: congress.py/congressional_record.py used
+    attempt*backoff; house_ptr.py/senate_ptr.py used attempt*backoff*2
+    (they poll a stricter, more rate-limit-sensitive government site).
+    -> rate_limit_backoff_multiplier
+
+URL construction (e.g. API key query params) stays in each caller — a
+genuinely per-source concern, not part of the retry mechanics.
+Response-body extraction is a per-caller concern too, EXCEPT for the one
+shape three callers converged on exactly (fetch_with_retry, then
+`.json()`, then log-and-return-None on a bad body): see
+fetch_json_with_retry below, extracted for that reason alone once a
+third copy showed up — `.content`/`.text`/the raw Response stay in each
+caller's own hands as before.
+"""
+
+import asyncio
+import logging
+
+import httpx
+import requests
+
+from app.contact import CONTACT_EMAIL
+from app.error_utils import redact_sensitive_params
+from app.http_client import DEFAULT_FETCH_TIMEOUT_S, bounded, is_bot_challenge
+from app.pipeline.rate_limiter import RateLimiter
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_RETRY_BACKOFF_S = 2.0
+
+__all__ = [
+    "DEFAULT_FETCH_TIMEOUT_S",
+    "DEFAULT_MAX_RETRIES",
+    "DEFAULT_RETRY_BACKOFF_S",
+    "fetch_json_with_retry",
+    "fetch_with_retry",
+    "fetch_with_retry_requests",
+    "redact_url",
+]
+
+# Two callers (congress.py, congressional_record.py) used to build their URL
+# with an API key embedded directly in the query string, which meant the raw
+# key got logged on every request/retry/failure (CodeQL
+# py/clear-text-logging-sensitive-data, 2026-07). Both now keep the
+# credential out of the `url` this function logs entirely, passing it via
+# `request_url` instead (see fetch_with_retry's docstring) — CodeQL's
+# taint-tracking doesn't recognize an arbitrary regex substitution as a
+# sanitizer, so removing the credential from the logged value at the source
+# is what actually clears the alert, not redacting it after the fact. This
+# stays as a defensive backstop for exception messages (which can still
+# embed a URL from underlying library internals) and any future caller that
+# reintroduces the anti-pattern.
+redact_url = redact_sensitive_params
+
+
+# Identify honestly, but send a COMPLETE request.
+#
+# A good number of state election sites sit behind a WAF that rejects on
+# the SHAPE of a request rather than on who is making it: a bare
+# User-Agent with no Accept, Accept-Language or Sec-Fetch-* headers looks
+# like a script and gets a 403 or a challenge page. Measured 2026-08-19
+# against the real sites — Ohio, Missouri, Tennessee and New York's
+# results portals all went from 403 to 200 with no change of identity,
+# purely by sending the headers a normal client always sends.
+#
+# The User-Agent still says who we are and how to reach us, and the rate
+# limits still apply. robots.txt governs crawling: the one module that
+# wanders a site looking for pages (state_source_crawler) checks it at every
+# request; the readers here fetch the documents a source publishes for
+# exactly this use, at addresses written into their config. This is standards-compliance, not disguise: a site that
+# wants to refuse Civitas can still refuse Civitas.
+CIVIC_CONTACT = f"Civitas/1.0 (+{CONTACT_EMAIL})"
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/151.0.0.0 Safari/537.36 {CIVIC_CONTACT}"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+# The same, shaped as a page's own script would send when fetching data.
+BROWSER_JSON_HEADERS = {
+    **BROWSER_HEADERS,
+    "Accept": "application/json, text/plain, */*",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+}
+
+
+def retryable_status(status: int) -> bool:
+    """Whether a failed HTTP status could succeed if asked again without
+    the resource changing: a rate limit, a timeout (408) or a server error
+    can, and so can 425 (Too Early: retry later, by definition) and a
+    refusal (401/403) — a key the operator has to fix, or a refusal that
+    lifts; remembered, it would keep being served after it lifted. A bot
+    wall's challenge is never retried within a fetch (fetch_with_retry),
+    only tried again on a later run. Any other client
+    error (not found, gone, a malformed request) is the same answer next
+    time, and may be remembered."""
+    return status in (401, 403, 408, 425, 429) or status >= 500
+
+
+async def fetch_with_retry(
+    client: httpx.AsyncClient,
+    rate_limiter: RateLimiter,
+    method: str,
+    url: str,
+    *,
+    retries: int = DEFAULT_MAX_RETRIES,
+    backoff_s: float = DEFAULT_RETRY_BACKOFF_S,
+    rate_limit_backoff_multiplier: float = 1.0,
+    retry_on_4xx: bool = True,
+    no_retry_statuses: tuple[int, ...] = (),
+    expected_statuses: tuple[int, ...] = (),
+    timeout: float = DEFAULT_FETCH_TIMEOUT_S,
+    log_label: str = "",
+    request_url: str | None = None,
+    **request_kwargs,
+) -> httpx.Response | None:
+    """Rate-limited HTTP request with retry+backoff.
+
+    `url` is what gets logged on every request/retry/failure — callers
+    whose real request needs a credential in the query string (an API key)
+    pass the credential-bearing URL separately via `request_url`, so the
+    credential is never even constructed as part of the value this
+    function might log. (httpx's `params=` kwarg replaces rather than
+    merges an existing query string, so it can't be used here without
+    dropping a caller's other query params — hence this two-URL split
+    instead. See congress.py/congressional_record.py for callers.)
+
+    Redirects are followed unless the caller says otherwise. A moved page
+    answers 301 with an empty body, and returning that as success made a
+    source whose landing page moved read as a page with nothing on it
+    (Alaska's /candidates/ -> /election-candidates/, 2026-09-26).
+
+    Returns the raw Response on success (any status < 400), or None if
+    retries are exhausted or a non-retried 4xx is hit. Callers extract
+    .json() / .content / .text as needed for their source.
+
+    `no_retry_statuses` lists statuses that terminate immediately with None
+    without retrying or raising (e.g. GovInfo's 404 "bill text not published
+    yet", which is an expected miss, not a transient error). It is checked
+    before the generic >=400 handling, so it applies even when
+    retry_on_4xx is True.
+
+    `expected_statuses` is the same idea for a caller that needs THREE
+    outcomes rather than two: the Response is returned as-is (not retried,
+    not collapsed to None), so the caller can tell an expected miss from a
+    genuine failure, which `no_retry_statuses`' None cannot express. Google
+    Civic's voterinfo is the real case — a 404 "No information for this
+    address" is its normal answer for a precinct whose ballot it hasn't
+    published yet, while None there must keep meaning the fetch itself
+    broke. Checked before `no_retry_statuses`, so a status in both wins
+    here.
+    """
+    await rate_limiter.acquire()
+    actual_url = request_url or url
+    label = log_label or url
+    request_kwargs.setdefault("follow_redirects", True)
+    for attempt in range(1, retries + 1):
+        try:
+            logger.debug("%s: %s (attempt %d)", label, url, attempt)
+            # Hard wall-clock backstop on top of `timeout=` below — see
+            # app/http_client.py's module docstring for the CLOSE_WAIT hang
+            # this exists to bound. Redundant when `client` came from
+            # make_async_client() (its send() applies the same bound), and
+            # deliberately kept anyway: this function accepts any AsyncClient
+            # a caller hands it, and the bound has to hold for those too.
+            resp = await bounded(
+                client.request(method, actual_url, timeout=timeout, **request_kwargs),
+                timeout,
+                label=label,
+            )
+
+            if resp.status_code == 429:
+                wait = backoff_s * attempt * rate_limit_backoff_multiplier
+                logger.warning("%s rate limited, waiting %.1fs...", label, wait)
+                await asyncio.sleep(wait)
+                continue
+
+            if is_bot_challenge(resp):
+                # Not retried: a retry is how a wall gets passed (AGENTS.md
+                # §7). The caller sees a failed fetch, as for any refusal.
+                logger.warning("%s: %s — bot challenge (HTTP %d), not retried", label, url, resp.status_code)
+                return None
+
+            if resp.status_code in expected_statuses:
+                logger.debug("%s: %s — HTTP %d (expected)", label, url, resp.status_code)
+                return resp
+
+            if resp.status_code in no_retry_statuses:
+                logger.debug("%s: %s — HTTP %d (no retry)", label, url, resp.status_code)
+                return None
+
+            if resp.status_code >= 400:
+                if not retry_on_4xx and 400 <= resp.status_code < 500:
+                    logger.error("%s client error (no retry): %s — HTTP %d", label, url, resp.status_code)
+                    return None
+                raise httpx.HTTPStatusError(
+                    f"HTTP {resp.status_code}", request=resp.request, response=resp,
+                )
+
+            return resp
+        except Exception as e:
+            if attempt == retries:
+                # The exception's own message can embed the request URL,
+                # including request_url if one was given (e.g.
+                # httpx.ConnectError/ReadTimeout do) — redact it too.
+                logger.error(
+                    "%s failed after %d attempts: %s — %s",
+                    label, retries, url, redact_url(str(e)),
+                )
+                return None
+            await asyncio.sleep(backoff_s * attempt)
+
+    return None
+
+
+async def fetch_json_with_retry(
+    client: httpx.AsyncClient,
+    rate_limiter: RateLimiter,
+    url: str,
+    label: str,
+    *,
+    headers: dict = BROWSER_JSON_HEADERS,
+    timeout: float = 30.0,
+    **retry_kwargs,
+) -> dict | list | None:
+    """fetch_with_retry + `.json()`, for the common case of a GET that
+    just wants the parsed body or None. Extracted once state_candidates_
+    ar.py, state_candidates_ct.py (byte-identical), and state_candidates_
+    in.py (differing only by an extra vendor-specific "Root" envelope
+    unwrap, kept local to that module rather than pulled in here — see
+    this module's docstring) each carried their own copy of this same
+    fetch-then-parse-then-log-on-bad-json wrapper.
+
+    `**retry_kwargs` forwards to fetch_with_retry (retries, backoff_s,
+    rate_limit_backoff_multiplier, retry_on_4xx, no_retry_statuses) —
+    none of today's three callers need anything but the defaults, but
+    without this a future JSON-fetching caller against a rate-limit-
+    sensitive site would have to bypass this helper entirely and
+    reimplement the parse-and-log-None wrapper just to tune backoff.
+    """
+    resp = await fetch_with_retry(
+        client, rate_limiter, "GET", url, timeout=timeout, log_label=label, headers=headers,
+        **retry_kwargs,
+    )
+    if resp is None:
+        return None
+    try:
+        return resp.json()
+    except ValueError:
+        logger.warning("%s did not return valid JSON", label)
+        return None
+
+
+async def fetch_text_with_retry(
+    client: httpx.AsyncClient,
+    rate_limiter: RateLimiter,
+    url: str,
+    label: str,
+    *,
+    headers: dict = BROWSER_HEADERS,
+    timeout: float = 30.0,
+    **retry_kwargs,
+) -> str | None:
+    """fetch_with_retry + `.text`, for the common case of a GET that just
+    wants the response body as a string or None. Extracted once
+    ballot_measures_mo.py, ballot_measures_va.py, and state_candidates_
+    totalvote.py each carried their own byte-identical copy of this same
+    fetch-then-return-text wrapper — this module's own "3 strikes" rule
+    for when a helper earns extraction (see fetch_json_with_retry above).
+
+    `**retry_kwargs` forwards to fetch_with_retry, same as
+    fetch_json_with_retry.
+    """
+    resp = await fetch_with_retry(
+        client, rate_limiter, "GET", url, timeout=timeout, log_label=label, headers=headers,
+        **retry_kwargs,
+    )
+    return resp.text if resp is not None else None
+
+
+async def fetch_bytes_with_retry(
+    client: httpx.AsyncClient,
+    rate_limiter: RateLimiter,
+    url: str,
+    label: str,
+    *,
+    headers: dict = BROWSER_HEADERS,
+    timeout: float = 60.0,
+    **retry_kwargs,
+) -> bytes | None:
+    """fetch_with_retry + `.content`, for the common case of a GET that
+    just wants the raw response body (a PDF, a zip, ...) or None.
+    Extracted once ballot_measures_va.py's `_get_bytes`, house_ptr.py's
+    `_fetch_bytes_with_retry`, and state_candidates_wy.py each carried
+    their own copy of this same fetch-then-return-content wrapper — this
+    module's own "3 strikes" rule (see fetch_json_with_retry above).
+    Defaults to a longer 60s timeout than fetch_text_with_retry's 30s,
+    matching what every one of those three callers already used for a
+    binary download.
+
+    `**retry_kwargs` forwards to fetch_with_retry, same as
+    fetch_json_with_retry/fetch_text_with_retry — house_ptr.py's own
+    copy set `rate_limit_backoff_multiplier=2.0, retry_on_4xx=False`,
+    which is exactly the kind of per-caller difference this parameter
+    exists to carry rather than force every caller onto one fixed
+    policy.
+    """
+    resp = await fetch_with_retry(
+        client, rate_limiter, "GET", url, timeout=timeout, log_label=label, headers=headers,
+        **retry_kwargs,
+    )
+    return resp.content if resp is not None else None
+
+
+async def fetch_with_retry_requests(
+    rate_limiter: RateLimiter,
+    method: str,
+    url: str,
+    *,
+    retries: int = DEFAULT_MAX_RETRIES,
+    backoff_s: float = DEFAULT_RETRY_BACKOFF_S,
+    timeout: float = DEFAULT_FETCH_TIMEOUT_S,
+    log_label: str = "",
+    **request_kwargs,
+) -> "requests.Response | None":
+    """Same rate-limited retry/backoff shape as fetch_with_retry, but issues
+    the request via `requests` (run off-thread via asyncio.to_thread) instead
+    of httpx.
+
+    presidency.ucsb.edu — the sole live source for every UCSB-derived
+    president fetcher — started blanket-403ing httpx's requests sometime
+    around 2026-07-23 regardless of User-Agent value or header casing
+    (confirmed live: identical headers succeed via `requests`, fail via
+    httpx, from the same container/IP), which silently starved the
+    president pipeline's roster/EO/approval/election-margin fetches and,
+    combined with a DROP-TABLE-on-schema-mismatch migration around the same
+    time, left the presidents table empty with no way to rebuild itself.
+    `requests` isn't blocked, so every UCSB-sourced fetcher routes through
+    this instead of fetch_with_retry.
+    """
+    label = log_label or url
+    for attempt in range(1, retries + 1):
+        try:
+            await rate_limiter.acquire()
+            # Same wall-clock backstop as fetch_with_retry. One honest
+            # caveat: cancelling a wait_for around asyncio.to_thread frees
+            # the *event loop*, not the worker thread — `requests` has no
+            # cancellation, so a truly wedged socket keeps its thread until
+            # urllib3's own socket timeout releases it. That is still the
+            # difference between "the pipeline continues" and "the pipeline
+            # is stopped for 12 hours", which is the failure being fixed;
+            # requests' timeout is a real per-socket-operation timeout and
+            # does fire, so the thread is not leaked indefinitely.
+            resp = await bounded(
+                asyncio.to_thread(requests.request, method, url, timeout=timeout, **request_kwargs),
+                timeout,
+                label=label,
+            )
+
+            if resp.status_code == 429:
+                wait = backoff_s * attempt
+                logger.warning("%s rate limited, waiting %.1fs...", label, wait)
+                await asyncio.sleep(wait)
+                continue
+
+            if resp.status_code >= 400:
+                raise requests.HTTPError(f"HTTP {resp.status_code}", response=resp)
+
+            return resp
+        except Exception as e:
+            if attempt == retries:
+                logger.error(
+                    "%s failed after %d attempts: %s — %s",
+                    label, retries, url, redact_url(str(e)),
+                )
+                return None
+            await asyncio.sleep(backoff_s * attempt)
+
+    return None

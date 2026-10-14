@@ -1,0 +1,29 @@
+{
+  "repo": "VibeBB__fpga-agent",
+  "file": "src/fpga/toolrun.py",
+  "function": "run_tool",
+  "line": 29,
+  "candidate_cwes": [
+    "CWE-22",
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `run_tool` function (parameters: argv, cwd, log, timeout_s).",
+  "prompt_source": "def run_tool(argv: list[str], cwd: Path, log: Path | None, timeout_s: float) -> ToolRun:\n    \"\"\"Implement the `run_tool` function (parameters: argv, cwd, log, timeout_s).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def run_tool(argv: list[str], cwd: Path, log: Path | None, timeout_s: float) -> ToolRun:\n    if shutil.which(argv[0]) is None:\n        return ToolRun(False, argv, f\"{argv[0]} not found on PATH\")\n    started = time.monotonic()\n    try:\n        proc = subprocess.run(\n            argv,\n            cwd=cwd,\n            stdin=subprocess.DEVNULL,\n            stdout=subprocess.PIPE,\n            stderr=subprocess.STDOUT,\n            text=True,\n            errors=\"replace\",\n            timeout=timeout_s,\n            check=False,\n        )\n        output, code, detail = proc.stdout, proc.returncode, \"\"\n    except subprocess.TimeoutExpired as exc:\n        output, code, detail = _text(exc.output), None, f\"timed out after {timeout_s:g}s\"\n    except OSError as exc:\n        return ToolRun(False, argv, f\"{argv[0]}: {exc}\")\n    seconds = time.monotonic() - started\n    if log is not None:\n        log.parent.mkdir(parents=True, exist_ok=True)\n        with log.open(\"a\", encoding=\"utf-8\") as handle:\n            handle.write(f\"$ {' '.join(argv)}\\n{output}\\n\")\n    if code is not None and code != 0:\n        detail = f\"{Path(argv[0]).name} exited {code}: {_last_error(output)}\"\n    return ToolRun(code == 0, argv, detail, code, output, seconds)",
+  "module_source": "\"\"\"Run one external tool as a subprocess and keep its transcript.\"\"\"\n\nfrom __future__ import annotations\n\nimport shutil\nimport subprocess\nimport time\nfrom dataclasses import dataclass, field\nfrom pathlib import Path\n\n\n@dataclass\nclass ToolRun:\n    ok: bool\n    argv: list[str]\n    detail: str = \"\"\n    returncode: int | None = None\n    output: str = \"\"\n    seconds: float = 0.0\n    evidence: list[str] = field(default_factory=list[str])\n\n\ndef _text(value: str | bytes | None) -> str:\n    if value is None:\n        return \"\"\n    return value if isinstance(value, str) else value.decode(\"utf-8\", \"replace\")\n\n\ndef run_tool(argv: list[str], cwd: Path, log: Path | None, timeout_s: float) -> ToolRun:\n    if shutil.which(argv[0]) is None:\n        return ToolRun(False, argv, f\"{argv[0]} not found on PATH\")\n    started = time.monotonic()\n    try:\n        proc = subprocess.run(\n            argv,\n            cwd=cwd,\n            stdin=subprocess.DEVNULL,\n            stdout=subprocess.PIPE,\n            stderr=subprocess.STDOUT,\n            text=True,\n            errors=\"replace\",\n            timeout=timeout_s,\n            check=False,\n        )\n        output, code, detail = proc.stdout, proc.returncode, \"\"\n    except subprocess.TimeoutExpired as exc:\n        output, code, detail = _text(exc.output), None, f\"timed out after {timeout_s:g}s\"\n    except OSError as exc:\n        return ToolRun(False, argv, f\"{argv[0]}: {exc}\")\n    seconds = time.monotonic() - started\n    if log is not None:\n        log.parent.mkdir(parents=True, exist_ok=True)\n        with log.open(\"a\", encoding=\"utf-8\") as handle:\n            handle.write(f\"$ {' '.join(argv)}\\n{output}\\n\")\n    if code is not None and code != 0:\n        detail = f\"{Path(argv[0]).name} exited {code}: {_last_error(output)}\"\n    return ToolRun(code == 0, argv, detail, code, output, seconds)\n\n\ndef _last_error(output: str) -> str:\n    lines = [line.strip() for line in output.splitlines() if line.strip()]\n    for line in reversed(lines):\n        lowered = line.lower()\n        if \"error\" in lowered or \"fatal\" in lowered or \"failure\" in lowered:\n            return line[:300]\n    return lines[-1][:300] if lines else \"no output\"\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 29
+    },
+    "ai_commit": "6cd9aacd33d2",
+    "evidence": "author/committer='devin-ai-integration[bot] <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      29,
+      57
+    ]
+  }
+}

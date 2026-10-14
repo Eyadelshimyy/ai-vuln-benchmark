@@ -1,0 +1,28 @@
+{
+  "repo": "airbytehq__airbyte",
+  "file": "tools/schema_generator/schema_generator/configure_catalog.py",
+  "function": "configure_catalog",
+  "line": 11,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `configure_catalog` function.",
+  "prompt_source": "def configure_catalog():\n    \"\"\"Implement the `configure_catalog` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def configure_catalog():\n    record_dict = json.loads(input())\n    catalog_streams = record_dict.get(\"catalog\", {}).get(\"streams\", [])\n    for stream in catalog_streams:\n        stream[\"json_schema\"] = {}\n    streams = [\n        ConfiguredAirbyteStream(\n            stream=stream.get(\"name\"), sync_mode=stream.get(\"supported_sync_modes\", [])[0], destination_sync_mode=DestinationSyncMode.append\n        )\n        for stream in catalog_streams\n        if stream.get(\"supported_sync_modes\")\n    ]\n    configured_catalog = ConfiguredAirbyteCatalog(streams=streams)\n\n    default_folder = os.path.join(os.getcwd(), \"integration_tests\")\n    if not os.path.exists(default_folder):\n        os.mkdir(default_folder)\n    output_file_name = os.path.join(default_folder, \"configured_catalog.json\")\n    with open(output_file_name, \"w\") as outfile:\n        # Create a dictionary representation of the configured catalog\n        result = {\"streams\": []}\n        for stream in configured_catalog.streams:\n            stream_dict = {\n                \"stream\": {\n                    \"name\": stream.stream.name if hasattr(stream.stream, \"name\") else stream.stream,\n                    \"supported_sync_modes\": [\"full_refresh\"],\n                    \"json_schema\": {},\n                },\n                \"sync_mode\": str(stream.sync_mode),\n                \"destination_sync_mode\": \"append\",\n            }\n            result[\"streams\"].append(stream_dict)\n        json.dump(result, outfile, indent=2, sort_keys=True)",
+  "module_source": "#\n# Copyright (c) 2023 Airbyte, Inc., all rights reserved.\n#\n\nimport json\nimport os\n\nfrom airbyte_cdk.models import ConfiguredAirbyteCatalog, ConfiguredAirbyteStream, DestinationSyncMode\n\n\ndef configure_catalog():\n    record_dict = json.loads(input())\n    catalog_streams = record_dict.get(\"catalog\", {}).get(\"streams\", [])\n    for stream in catalog_streams:\n        stream[\"json_schema\"] = {}\n    streams = [\n        ConfiguredAirbyteStream(\n            stream=stream.get(\"name\"), sync_mode=stream.get(\"supported_sync_modes\", [])[0], destination_sync_mode=DestinationSyncMode.append\n        )\n        for stream in catalog_streams\n        if stream.get(\"supported_sync_modes\")\n    ]\n    configured_catalog = ConfiguredAirbyteCatalog(streams=streams)\n\n    default_folder = os.path.join(os.getcwd(), \"integration_tests\")\n    if not os.path.exists(default_folder):\n        os.mkdir(default_folder)\n    output_file_name = os.path.join(default_folder, \"configured_catalog.json\")\n    with open(output_file_name, \"w\") as outfile:\n        # Create a dictionary representation of the configured catalog\n        result = {\"streams\": []}\n        for stream in configured_catalog.streams:\n            stream_dict = {\n                \"stream\": {\n                    \"name\": stream.stream.name if hasattr(stream.stream, \"name\") else stream.stream,\n                    \"supported_sync_modes\": [\"full_refresh\"],\n                    \"json_schema\": {},\n                },\n                \"sync_mode\": str(stream.sync_mode),\n                \"destination_sync_mode\": \"append\",\n            }\n            result[\"streams\"].append(stream_dict)\n        json.dump(result, outfile, indent=2, sort_keys=True)\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 23
+    },
+    "ai_commit": "7b485beb44e5",
+    "evidence": "author/committer='devin-ai-integration[bot] <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 0.697,
+    "span": [
+      11,
+      43
+    ]
+  }
+}

@@ -1,0 +1,144 @@
+from typing import Any
+
+from homeassistant import data_entry_flow
+from homeassistant.const import CONF_ENTITY_ID, STATE_ON
+from homeassistant.core import HomeAssistant
+import pytest
+import voluptuous as vol
+
+from custom_components.powercalc.config_flow import Step
+from custom_components.powercalc.const import (
+    CONF_CREATE_ENERGY_SENSOR,
+    CONF_CREATE_UTILITY_METERS,
+    CONF_FIXED,
+    CONF_MANUFACTURER,
+    CONF_MODE,
+    CONF_MODEL,
+    CONF_POWER,
+    CONF_SELF_USAGE_INCLUDED,
+    CONF_SENSOR_TYPE,
+    CalculationStrategy,
+    SensorType,
+)
+from tests.common import (
+    assert_entity_state,
+    create_mock_config_entry,
+    mock_device_with_entities,
+    run_powercalc_setup,
+    set_states,
+)
+from tests.config_flow.common import (
+    DEFAULT_UNIQUE_ID,
+    confirm_auto_discovered_model,
+    handle_options_flow_update,
+    initialize_options_flow,
+    select_menu_item,
+)
+
+
+@pytest.mark.parametrize(
+    "user_input,expected_fixed_power",
+    [
+        ({CONF_POWER: 20, CONF_SELF_USAGE_INCLUDED: True}, 20),
+        ({CONF_POWER: 20, CONF_SELF_USAGE_INCLUDED: False}, 20.70),
+        ({CONF_POWER: 20}, 20.70),
+        ({}, 0.70),
+    ],
+)
+async def test_smart_switch_flow(
+    hass: HomeAssistant,
+    user_input: dict[str, Any],
+    expected_fixed_power: float,
+) -> None:
+    await run_powercalc_setup(hass)
+
+    mock_device_with_entities(
+        hass,
+        "switch.test",
+        "test",
+        "smart_switch_without_pm",
+        unique_id=DEFAULT_UNIQUE_ID,
+    )
+
+    result = await select_menu_item(hass, Step.MENU_LIBRARY)
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_ENTITY_ID: "switch.test",
+            CONF_CREATE_UTILITY_METERS: False,
+            CONF_CREATE_ENERGY_SENSOR: False,
+        },
+    )
+
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == Step.LIBRARY
+
+    result = await confirm_auto_discovered_model(hass, result)
+
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == Step.SMART_SWITCH
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input,
+    )
+
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == Step.POWER_ADVANCED
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {},
+    )
+
+    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_MODE] == CalculationStrategy.FIXED
+
+    await set_states(hass, [("switch.test", STATE_ON)])
+    assert_entity_state(hass, "sensor.test_power", f"{expected_fixed_power:.2f}")
+
+
+async def test_smart_switch_options(hass: HomeAssistant) -> None:
+    entry = await create_mock_config_entry(
+        hass,
+        {
+            CONF_ENTITY_ID: "switch.test",
+            CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
+            CONF_MODE: CalculationStrategy.FIXED,
+            CONF_SELF_USAGE_INCLUDED: False,
+            CONF_FIXED: {CONF_POWER: 40},
+            CONF_MANUFACTURER: "test",
+            CONF_MODEL: "smart_switch_without_pm",
+        },
+    )
+
+    await handle_options_flow_update(hass, entry, Step.FIXED, {CONF_SELF_USAGE_INCLUDED: True})
+
+    assert entry.data[CONF_SELF_USAGE_INCLUDED] is True
+
+
+async def test_smart_switch_options_correctly_loaded(hass: HomeAssistant) -> None:
+    entry = await create_mock_config_entry(
+        hass,
+        {
+            CONF_ENTITY_ID: "switch.test",
+            CONF_SENSOR_TYPE: SensorType.VIRTUAL_POWER,
+            CONF_MODE: CalculationStrategy.FIXED,
+            CONF_POWER: 40,
+            CONF_FIXED: {CONF_POWER: 40.85},
+            CONF_SELF_USAGE_INCLUDED: True,
+            CONF_MANUFACTURER: "test",
+            CONF_MODEL: "smart_switch_without_pm",
+        },
+    )
+
+    result = await initialize_options_flow(hass, entry, Step.FIXED)
+
+    schema_keys: list[vol.Optional] = list(result["data_schema"].schema.keys())
+    assert schema_keys[schema_keys.index(CONF_SELF_USAGE_INCLUDED)].description == {
+        "suggested_value": True,
+    }
+    assert schema_keys[schema_keys.index(CONF_POWER)].description == {
+        "suggested_value": 40,
+    }

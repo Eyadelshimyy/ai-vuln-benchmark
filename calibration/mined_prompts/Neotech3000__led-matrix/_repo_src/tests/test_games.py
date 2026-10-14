@@ -1,0 +1,547 @@
+import json
+import os
+import tempfile
+import threading
+import unittest
+from http.client import HTTPConnection
+from unittest.mock import patch
+
+from matrix_deck import HEIGHT, PIXELS
+from matrix_deck.anim import create_animation
+from matrix_deck.canvas import Canvas, line_cells
+from matrix_deck.engine import Deck
+from matrix_deck.server import WEB_ROOT, make_server
+
+
+class LineCellsTests(unittest.TestCase):
+    def test_horizontal(self):
+        self.assertEqual(line_cells(0, 2, 3, 2), [(0, 2), (1, 2), (2, 2), (3, 2)])
+
+    def test_single_point(self):
+        self.assertEqual(line_cells(4, 10, 4, 10), [(4, 10)])
+
+    def test_steep_line_is_inclusive(self):
+        cells = line_cells(1, 0, 2, 4)
+        self.assertEqual(cells[0], (1, 0))
+        self.assertEqual(cells[-1], (2, 4))
+        self.assertGreaterEqual(len(cells), 5)
+
+
+class SketchTests(unittest.TestCase):
+    def test_drag_stroke_fills_the_line(self):
+        sketch = create_animation("sketch")
+        sketch.stroke([(1, 5), (6, 5)])
+        for x in range(1, 7):
+            self.assertEqual(sketch.pixels[5 * 9 + x], 255, msg=f"missing LED {x},5")
+
+    def test_shift_stroke_erases(self):
+        sketch = create_animation("sketch")
+        sketch.stroke([(2, 8), (4, 8)])
+        sketch.stroke([(2, 8), (4, 8)], erase=True)
+        for x in range(2, 5):
+            self.assertEqual(sketch.pixels[8 * 9 + x], 0)
+
+    def test_c_clears(self):
+        sketch = create_animation("sketch")
+        sketch.click(3, 3)
+        sketch.key("KeyC")
+        self.assertEqual(sum(sketch.pixels), 0)
+
+
+class ExtraAnimTests(unittest.TestCase):
+    def test_sand_pours_and_falls(self):
+        anim = create_animation("sand")
+        anim.click(4, 2)
+        self.assertGreater(sum(anim.cells), 0)
+        canvas = Canvas()
+        for _ in range(80):
+            anim.step(0.05, canvas)
+        bottom = sum(anim.cells[(HEIGHT - 1) * 9 : HEIGHT * 9])
+        self.assertGreater(bottom, 0)
+
+    def test_breakout_drag_takes_over(self):
+        anim = create_animation("breakout")
+        anim.stroke([(6, 30)])
+        self.assertFalse(anim.auto)
+
+    def test_tetris_and_invaders_take_keys(self):
+        tetris = create_animation("tetris")
+        tetris.key("ArrowLeft")
+        self.assertFalse(tetris.auto)
+        invaders = create_animation("invaders")
+        invaders.key("Space")
+        self.assertFalse(invaders.auto)
+        self.assertIsNotNone(invaders.shot)
+
+    def test_tetris_score_starts_at_zero(self):
+        tetris = create_animation("tetris")
+        self.assertEqual(tetris.score, 0)
+        self.assertEqual(tetris.info()["score"], 0)
+        self.assertGreaterEqual(tetris.py, tetris.PLAY_Y0)
+        self.assertGreater(tetris.PLAY_Y0, tetris.SCORE_H)
+
+    def test_tetris_line_clears_increase_score(self):
+        tetris = create_animation("tetris")
+        from matrix_deck import WIDTH
+
+        def fill_rows(count):
+            tetris.grid = bytearray(PIXELS)
+            for n in range(count):
+                y = HEIGHT - 1 - n
+                for x in range(WIDTH):
+                    tetris.grid[y * WIDTH + x] = 1
+
+        fill_rows(1)
+        self.assertEqual(tetris._clear_lines(), 1)
+        self.assertEqual(tetris.score, 100)
+        fill_rows(2)
+        self.assertEqual(tetris._clear_lines(), 2)
+        self.assertEqual(tetris.score, 400)
+        fill_rows(3)
+        self.assertEqual(tetris._clear_lines(), 3)
+        self.assertEqual(tetris.score, 900)
+        fill_rows(4)
+        self.assertEqual(tetris._clear_lines(), 4)
+        self.assertEqual(tetris.score, 999)
+        tetris.score = 0
+        fill_rows(4)
+        tetris._clear_lines()
+        self.assertEqual(tetris.score, 800)
+
+    def test_tetris_score_digits_use_top_rows_not_spawn(self):
+        from matrix_deck import WIDTH
+
+        tetris = create_animation("tetris")
+        tetris.acc = 0.0
+        canvas = Canvas()
+        tetris.step(0.0, canvas)
+        top = sum(canvas.pixels[: tetris.SCORE_H * WIDTH])
+        self.assertGreater(top, 0)
+        self.assertEqual(tetris.py, tetris.PLAY_Y0)
+        for dx, dy in tetris.shape:
+            self.assertGreaterEqual(tetris.py + dy, tetris.PLAY_Y0)
+            self.assertEqual(canvas.get(tetris.px + dx, tetris.py + dy), 255)
+            self.assertGreaterEqual(tetris.py + dy, tetris.SEP_ROW + 1)
+        tetris.score = 8
+        tetris._score_glow = 0.0
+        later = Canvas()
+        tetris.step(0.0, later)
+        self.assertGreater(sum(later.pixels[: tetris.SCORE_H * WIDTH]), 0)
+        # Packed 3×5 "8" sits in the rightmost three columns when score is 8.
+        self.assertGreater(later.get(7, 0), 0)
+        self.assertGreater(later.get(6, 2), 0)
+        tetris.score = 300
+        tetris.alive = False
+        over = Canvas()
+        tetris.step(0.0, over)
+        self.assertEqual(tetris.score, 300)
+        self.assertGreater(sum(over.pixels[: tetris.SCORE_H * WIDTH]), 0)
+
+    def test_marquee_custom_text_skips_side_columns(self):
+        anim = create_animation("marquee")
+        anim.set_text("HI")
+        canvas = Canvas()
+        lit = False
+        for _ in range(40):
+            anim.step(0.08, canvas)
+            for y in range(HEIGHT):
+                self.assertEqual(canvas.pixels[y * 9 + 0], 0)
+                self.assertEqual(canvas.pixels[y * 9 + 8], 0)
+            if sum(canvas.pixels) > 0:
+                lit = True
+        self.assertTrue(lit)
+        self.assertIn("HI", anim.text)
+
+    def test_marquee_defaults_to_framework(self):
+        anim = create_animation("marquee")
+        self.assertIn("FRAMEWORK", anim.text)
+
+    def test_marquee_scrolls_down_from_the_top_and_loops(self):
+        anim = create_animation("marquee")
+        anim.set_text("A")
+        anim.t = 0.0
+        first = Canvas()
+        anim.step(0.0, first)
+
+        def top_lit(canvas):
+            for y in range(HEIGHT):
+                if any(canvas.pixels[y * 9 + x] for x in range(9)):
+                    return y
+            return None
+
+        y0 = top_lit(first)
+        self.assertIsNotNone(y0)
+        self.assertLess(y0, 4)
+        later = Canvas()
+        anim.step(0.5, later)
+        y1 = top_lit(later)
+        self.assertIsNotNone(y1)
+        self.assertGreater(y1, y0)
+        for _ in range(120):
+            anim.step(0.25, later)
+        self.assertGreater(sum(later.pixels), 0)
+
+    def test_clock_draws_local_digits(self):
+        from datetime import datetime
+        from unittest.mock import patch
+
+        anim = create_animation("clock")
+        self.assertEqual(anim.name, "Clock")
+        fixed = datetime(2026, 9, 21, 9, 41, 3, 120000)
+        canvas = Canvas()
+        with patch("matrix_deck.extra.datetime") as dt:
+            dt.now.return_value = fixed
+            anim.step(0.05, canvas)
+            self.assertEqual(anim.info()["time"], "09:41:03")
+        self.assertGreater(sum(canvas.pixels), 0)
+        # Top band is hours — 09 should light something in the first 8 rows.
+        self.assertGreater(sum(canvas.pixels[: 8 * 9]), 0)
+        # Bottom row is the minute progress bar.
+        self.assertGreater(sum(canvas.pixels[32 * 9 :]), 0)
+
+    def test_time_alias_opens_clock(self):
+        anim = create_animation("time")
+        self.assertEqual(anim.id, "clock")
+
+    def test_ecg_is_a_trace_not_a_heart_icon(self):
+        anim = create_animation("ecg")
+        self.assertEqual(anim.name, "ECG")
+        canvas = Canvas()
+        anim.step(0.05, canvas)
+        # Old heartbeat drew a 7-pixel heart around (4,6). An EKG trace
+        # should not light that whole cluster at once.
+        cluster = [
+            canvas.get(4, 6),
+            canvas.get(3, 7),
+            canvas.get(5, 7),
+            canvas.get(4, 8),
+            canvas.get(4, 7),
+            canvas.get(3, 6),
+            canvas.get(5, 6),
+        ]
+        self.assertLess(sum(1 for v in cluster if v > 180), 6)
+        self.assertGreater(sum(canvas.pixels), 0)
+
+    def test_hearts_fall(self):
+        anim = create_animation("hearts")
+        self.assertEqual(anim.name, "Hearts")
+        canvas = Canvas()
+        for _ in range(30):
+            anim.step(0.2, canvas)
+        self.assertGreater(sum(canvas.pixels), 0)
+        self.assertGreater(len(anim.hearts), 0)
+
+    def test_hourglass_replaces_candle(self):
+        anim = create_animation("hourglass")
+        self.assertEqual(anim.id, "hourglass")
+        alias = create_animation("candle")
+        self.assertEqual(alias.id, "hourglass")
+
+
+
+class NewGameSmokeTests(unittest.TestCase):
+    GAMES = (
+        "frogger",
+        "asteroids",
+        "centipede",
+        "space-shooter",
+        "brick-stack",
+        "catcher",
+        "whack",
+        "slither",
+        "racetrack",
+        "jumper",
+        "sokoban",
+        "minesweeper",
+        "memory",
+        "lights-out",
+        "2048",
+        "connect4",
+        "simon",
+        "rhythm",
+        "cannons",
+        "pinball-game",
+    )
+    INPUTS = {
+        "frogger": ("key", "ArrowUp"),
+        "asteroids": ("key", "Space"),
+        "centipede": ("key", "Space"),
+        "space-shooter": ("key", "Space"),
+        "brick-stack": ("key", "Space"),
+        "catcher": ("key", "ArrowLeft"),
+        "whack": ("click", (4, 10)),
+        "slither": ("key", "ArrowRight"),
+        "racetrack": ("key", "ArrowLeft"),
+        "jumper": ("key", "Space"),
+        "sokoban": ("key", "ArrowRight"),
+        "minesweeper": ("click", (4, 4)),
+        "memory": ("click", (1, 1)),
+        "lights-out": ("click", (4, 14)),
+        "2048": ("key", "ArrowLeft"),
+        "connect4": ("key", "Space"),
+        "simon": ("click", (2, 8)),
+        "rhythm": ("key", "Space"),
+        "cannons": ("click", (4, 10)),
+        "pinball-game": ("key", "Space"),
+    }
+
+    def test_twenty_new_games_step_and_take_input(self):
+        canvas = Canvas()
+        for anim_id in self.GAMES:
+            anim = create_animation(anim_id)
+            self.assertEqual(anim.id, anim_id)
+            self.assertEqual(anim.kind, "game")
+            anim.step(0.05, canvas)
+            anim.step(0.05, canvas)
+            self.assertTrue(anim.auto)
+            kind, payload = self.INPUTS[anim_id]
+            if kind == "key":
+                anim.key(payload)
+            else:
+                anim.click(*payload)
+            self.assertFalse(anim.auto, msg=anim_id)
+            self.assertIn("score", anim.info())
+            anim.step(0.05, canvas)
+
+
+class GameInputTests(unittest.TestCase):
+    def test_flappy_space_takes_over(self):
+        anim = create_animation("flappy")
+        anim.key("Space")
+        self.assertFalse(anim.game.auto)
+        self.assertLess(anim.game.vy, 0)
+
+    def test_flappy_drag_flaps_once(self):
+        anim = create_animation("flappy")
+        anim.game.auto = False
+        anim.game.vy = 0
+        anim.stroke([(0, 0), (8, 20), (3, 10)])
+        self.assertLess(anim.game.vy, 0)
+
+    def test_snake_arrows_disable_auto(self):
+        anim = create_animation("snake")
+        anim.key("ArrowRight")
+        self.assertFalse(anim.auto)
+        self.assertEqual(anim.pending, (1, 0))
+
+    def test_snake_click_steers_from_well_center(self):
+        anim = create_animation("snake")
+        anim.click(8, 17)
+        self.assertFalse(anim.auto)
+        self.assertEqual(anim.pending, (1, 0))
+        anim.click(0, 17)
+        self.assertEqual(anim.pending, (-1, 0))
+
+    def test_snake_reverse_still_takes_over(self):
+        anim = create_animation("snake")
+        self.assertEqual(anim.dir, (0, 1))
+        anim.key("ArrowUp")
+        self.assertFalse(anim.auto)
+        self.assertIsNone(anim.pending)
+
+    def test_pong_keys_move_paddle(self):
+        anim = create_animation("pong")
+        start = anim.p2
+        anim.key("ArrowRight")
+        anim.key("KeyD")
+        self.assertGreater(anim.p2, start)
+        anim.key("ArrowLeft")
+        anim.key("KeyA")
+        self.assertLessEqual(anim.p2, start)
+
+    def test_pong_drag_tracks_x(self):
+        anim = create_animation("pong")
+        anim.stroke([(0, 30), (6, 30)])
+        self.assertFalse(anim.auto)
+        self.assertAlmostEqual(anim.p2, 5.0)
+
+    def test_life_paint_and_reseed(self):
+        anim = create_animation("life")
+        anim.cells[:] = b"\x00" * len(anim.cells)
+        anim.click(4, 10)
+        self.assertEqual(anim.cells[10 * 9 + 4], 1)
+        anim.key("KeyR")
+        self.assertGreater(sum(anim.cells), 1)
+
+    def test_life_pauses(self):
+        anim = create_animation("life")
+        canvas = Canvas()
+        anim.paused = False
+        anim.key("KeyP")
+        self.assertTrue(anim.paused)
+        before = bytes(anim.cells)
+        anim.step(1.0, canvas)
+        self.assertEqual(bytes(anim.cells), before)
+
+
+class DeckInputTests(unittest.TestCase):
+    def test_stroke_and_key_go_to_the_chosen_side(self):
+        deck = Deck()
+        deck.set_animation("left", "sketch")
+        deck.set_animation("right", "flappy")
+        deck.stroke("left", [(0, 0), (2, 0)])
+        self.assertEqual(deck.left_anim.pixels[0], 255)
+        self.assertEqual(deck.left_anim.pixels[2], 255)
+        deck.key("right", "Space")
+        self.assertFalse(deck.right_anim.game.auto)
+
+
+class ApiTests(unittest.TestCase):
+    def setUp(self):
+        self.deck = Deck()
+        self.deck.set_animation("left", "sketch")
+        self.deck.set_animation("right", "snake")
+        self.httpd = make_server(self.deck, "127.0.0.1", 0)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def post(self, path, payload):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=2)
+        body = json.dumps(payload).encode()
+        conn.request("POST", path, body=body, headers={"Content-Type": "application/json"})
+        response = conn.getresponse()
+        data = json.loads(response.read().decode())
+        conn.close()
+        return response.status, data
+
+    def test_stroke_draws_on_sketch(self):
+        status, data = self.post(
+            "/api/stroke",
+            {"side": "left", "points": [[1, 2], [4, 2]]},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+        for x in range(1, 5):
+            self.assertEqual(self.deck.left_anim.pixels[2 * 9 + x], 255)
+
+    def test_key_steers_snake(self):
+        status, data = self.post("/api/key", {"side": "right", "code": "KeyA"})
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+        self.assertFalse(self.deck.right_anim.auto)
+        self.assertEqual(self.deck.right_anim.pending, (-1, 0))
+
+    def test_speed_and_text_endpoints(self):
+        status, data = self.post("/api/speed", {"value": 1.5})
+        self.assertEqual(status, 200)
+        self.assertAlmostEqual(data["speed"], 1.5)
+        self.deck.set_animation("left", "marquee")
+        status, data = self.post("/api/text", {"side": "left", "text": "hey"})
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+        self.assertIn("HEY", self.deck.left_anim.text)
+
+    def test_random_endpoint_starts_shuffle(self):
+        status, data = self.post("/api/random", {"enabled": True})
+        self.assertEqual(status, 200)
+        self.assertTrue(data["random"])
+        self.assertTrue(self.deck.random_mode)
+        status, data = self.post("/api/random", {"enabled": False})
+        self.assertFalse(data["random"])
+        self.assertFalse(self.deck.random_mode)
+
+    def test_rejects_bad_side(self):
+        status, data = self.post("/api/key", {"side": "middle", "code": "Space"})
+        self.assertEqual(status, 400)
+        self.assertFalse(data["ok"])
+
+
+class LibraryApiTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = patch.dict(os.environ, {"HOME": self.tmp.name})
+        self.home.start()
+        self.deck = Deck()
+        self.httpd = make_server(self.deck, "127.0.0.1", 0)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.home.stop()
+        self.tmp.cleanup()
+
+    def get(self, path):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=2)
+        conn.request("GET", path)
+        response = conn.getresponse()
+        data = json.loads(response.read().decode())
+        conn.close()
+        return response.status, data
+
+    def post(self, path, payload):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=2)
+        body = json.dumps(payload).encode()
+        conn.request("POST", path, body=body, headers={"Content-Type": "application/json"})
+        response = conn.getresponse()
+        data = json.loads(response.read().decode())
+        conn.close()
+        return response.status, data
+
+    def test_favorite_and_group_endpoints(self):
+        status, data = self.get("/api/library")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["favorites"], [])
+        self.assertEqual(data["groups"], [])
+        status, data = self.post("/api/favorite", {"id": "fire", "on": True})
+        self.assertEqual(status, 200)
+        self.assertIn("fire", data["favorites"])
+        status, data = self.post("/api/groups", {"name": "Desk mix"})
+        self.assertEqual(status, 200)
+        self.assertEqual(len(data["groups"]), 1)
+        group_id = data["group"]["id"]
+        status, data = self.post("/api/groups/item", {"groupId": group_id, "animId": "warp", "on": True})
+        self.assertIn("warp", data["groups"][0]["ids"])
+        status, data = self.post("/api/group-random", {"groupId": group_id, "enabled": True})
+        self.assertTrue(data["random"])
+        self.assertEqual(data["randomGroup"], group_id)
+        self.assertIn(self.deck.left_id, {"warp"})
+        status, data = self.post("/api/groups/delete", {"id": group_id})
+        self.assertEqual(data["groups"], [])
+        self.assertFalse(self.deck.random_mode)
+
+    def test_group_create_visible_on_frame_without_restart(self):
+        status, before = self.get("/api/frame")
+        self.assertEqual(status, 200)
+        self.assertEqual(before["groups"], [])
+        status, data = self.post("/api/groups", {"name": "Desk mix"})
+        self.assertEqual(status, 200)
+        self.assertIn("group", data)
+        self.assertEqual(data["group"]["name"], "Desk mix")
+        self.assertEqual(data["group"]["ids"], [])
+        self.assertEqual(len(data["groups"]), 1)
+        status, frame = self.get("/api/frame")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(frame["groups"]), 1)
+        self.assertEqual(frame["groups"][0]["name"], "Desk mix")
+        self.assertEqual(frame["groups"][0]["id"], data["group"]["id"])
+        self.assertEqual(frame["groups"][0]["ids"], [])
+
+    def test_empty_group_still_allows_filing(self):
+        status, data = self.post("/api/groups", {"name": "Desk mix"})
+        self.assertEqual(status, 200)
+        group_id = data["group"]["id"]
+        self.assertEqual(data["groups"][0]["ids"], [])
+        status, data = self.post("/api/groups/item", {"groupId": group_id, "animId": "fire", "on": True})
+        self.assertEqual(status, 200)
+        self.assertIn("fire", data["groups"][0]["ids"])
+        status, frame = self.get("/api/frame")
+        self.assertIn("fire", frame["groups"][0]["ids"])
+        js = (WEB_ROOT / "app.js").read_text()
+        self.assertIn("does not require a library filter", js)
+        self.assertIn("activeGroup && !selectionGroup", js)
+        self.assertIn("selectionGroup", js)
+        self.assertIn("group-add", js)
+        self.assertIn('data-add', js)
+        self.assertIn("Adding to", js)
+        self.assertIn("tap cards to add", js)
+        self.assertIn("Esc or Done to exit", js)
+        self.assertIn("enterSelectionMode", js)
+        self.assertIn("selection-done", js)

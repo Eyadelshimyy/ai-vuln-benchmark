@@ -1,0 +1,21 @@
+{
+  "repo_url": "https://github.com/kamoras/civitas.git",
+  "commit": "",
+  "file": "backend/scripts/build_county_district_crosswalk.py",
+  "function": "load_county_names",
+  "cwe": "CWE-22",
+  "param": "path",
+  "payload": "/tmp/tier2_proof_k2mkjlaj/secret_3e873725d07b.txt",
+  "verdict": "SETUP_FAILED",
+  "detail": "clone/checkout failed",
+  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_k2mkjlaj/secret_3e873725d07b.txt (proven by live execution trace; read-traversal, no output echo required)",
+  "tier2_sink": "open",
+  "reachable": true,
+  "entry_kind": "api",
+  "call_path": [
+    "load_county_names"
+  ],
+  "reproduce_verdict": "SETUP_FAILED",
+  "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
+  "repo_full": "kamoras/civitas"
+}

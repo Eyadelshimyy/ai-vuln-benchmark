@@ -1,0 +1,471 @@
+"""
+Nearest-neighbor classifier using sentence-transformer embeddings.
+
+Classifies donors by finding the most similar already-labeled entities
+in the learning store. Supports dynamic categories — any label that
+exists in the learning store is automatically a valid classification target.
+
+Academic rationale
+------------------
+Instance-based learning via kNN (Cover & Hart 1967, "Nearest Neighbor
+Pattern Classification," IEEE Trans. Info Theory 13:1) is chosen over
+parametric classifiers because: (1) the category set evolves as new
+entity types appear in FEC data, (2) no retraining is needed when
+new labeled examples arrive — they are simply added to the reference
+set, and (3) the method is naturally non-parametric and adapts to
+arbitrary decision boundaries.
+
+Similarity-weighted voting (Dudani 1976) is used instead of unweighted
+majority vote, which reduces sensitivity to the choice of k and gives
+higher influence to closer neighbors. This is equivalent to a kernel
+density estimate with a cosine-similarity kernel in embedding space.
+
+The approach mirrors prototypical networks (Snell, Swersky & Zemel
+2017, "Prototypical Networks for Few-Shot Learning," NeurIPS) where
+classification is performed by comparing query embeddings to class
+prototypes — here, the prototypes are real labeled examples rather
+than learned centroids.
+
+This replaces the LLM-based classification fallback, cutting the
+classification phase from ~40+ minutes to under 5 seconds while
+producing more consistent results (LLM hallucinated invalid categories).
+
+References
+----------
+- Cover, T. & Hart, P. (1967). IEEE Trans. Info Theory, 13(1), 21-27.
+- Dudani, S. (1976). IEEE Trans. SMC, 6(4), 325-327.
+- Snell, J. et al. (2017). NeurIPS 2017, 4077-4087.
+"""
+
+import logging
+from collections import Counter
+
+import numpy as np
+from sqlalchemy.orm import Session
+
+from app.config_definitions import INDUSTRIES
+from app.models import LearnedClassification
+
+logger = logging.getLogger(__name__)
+
+_category_norm_cache: dict[str, str] = {}
+
+# 2026-07 fix: caps the inverse-frequency kNN vote weight computed in
+# classify_batch_nn — see that function's inline comment for the measured
+# real-production numbers behind this value (5.0).
+_MAX_INV_FREQ_WEIGHT = 5.0
+
+# LearnedClassification.source value for labels this module's classify_batch_nn
+# produced. Writers tag kNN results with it; _load_references excludes it.
+KNN_SOURCE = "nn"
+
+# Canonical donor type names — kNN and learning store may use mixed case
+DONOR_TYPE_CANONICAL: dict[str, str] = {
+    "PAC": "PAC",
+    "ORG/EMPLOYEES": "Org/Employees",
+    "CANDIDATEAFFILIATED": "CandidateAffiliated",
+    "PARTY/IDEOLOGICAL": "Party/Ideological",
+    "SELF-FUNDED": "Self-Funded",
+    "SELFFUNDED": "Self-Funded",
+    "SELF_FUNDED": "Self-Funded",
+    "SKIP": "SKIP",
+    "OTHER": "OTHER",
+    # Already-correct mixed case forms
+    "Org/Employees": "Org/Employees",
+    "CandidateAffiliated": "CandidateAffiliated",
+    "Party/Ideological": "Party/Ideological",
+    "Self-Funded": "Self-Funded",
+}
+
+DONOR_TYPE_PROTOTYPES: dict[str, str] = {
+    "PAC": "political action committee PAC campaign contributions political fund",
+    "Org/Employees": "corporation company employees business organization employer firm group",
+    "Party/Ideological": "democratic republican party committee national senatorial congressional club growth",
+    "CandidateAffiliated": "candidate senator representative campaign friends of committee elect",
+    "Self-Funded": "candidate personal loan self-funded own money personal contribution senator governor",
+    "SKIP": (
+        "payment processor earmark conduit WinRed ActBlue Anedot joint fundraising "
+        "individual person self employed retired homemaker occupation title profession"
+    ),
+}
+
+
+def _get_model():
+    from app.pipeline.vector_store import get_embedding_model
+    return get_embedding_model()
+
+
+def _normalize_category(value: str) -> str:
+    """Map any category string to the nearest valid industry via embedding similarity.
+
+    Uses the industry description embeddings from industry_classifier.py as
+    semantic prototypes for each valid category. Unknown/stale categories are
+    resolved by cosine similarity (Reimers & Gurevych 2019) rather than a
+    hardcoded alias table.
+
+    2026-07-24 fix: the query was encoded without
+    prompt_name="query", unlike classify_industry (industry_classifier.py),
+    which documents that snowflake-arctic-embed-xs requires it for queries
+    (asymmetric retrieval model — encoding a query as a document shifts the
+    whole similarity scale). That mismatch, combined with a 0.25 floor
+    already below the model's real ~0.74 baseline, made the "ghost class
+    deletion" path in normalize_learning_store dead code — nothing could
+    ever score below the floor. Fixed encoding + threshold, both measured
+    together (changing one changes what the other means):
+    real near-miss category strings (a hallucinated "SPORTS" that should
+    resolve to MEDIA, "HEALTH" -> HEALTHCARE, "AUTO" -> MANUFACTURING,
+    etc. — 19 realistic cases spanning all 26 industries) score 0.52-0.72
+    with the corrected encoding. But a broader set of genuinely
+    out-of-taxonomy business terms (TOURISM, CONSUMER_GOODS,
+    ENTERTAINMENT — real categories, just not ones in this platform's 26)
+    overlaps that same range (0.47-0.67, p90 0.61) — there is no cosine
+    threshold that cleanly separates "should resolve to an existing
+    industry" from "is a plausible but out-of-taxonomy term," so this
+    isn't a threshold-tuning problem with one right answer. The choice
+    made: bias toward precision over recall. A false REJECT here just
+    means the row gets deleted from the learning store (re-classified
+    fresh next run — a safe failure). A false ACCEPT silently writes a
+    wrong-but-confident label that then feeds future kNN votes as if it
+    were ground truth — a worse, compounding failure. 0.65 sits just
+    above the broad-garbage p90 (0.61) and rejects several weaker real
+    near-misses (SPORTS 0.56, AUTO 0.52) in exchange for not laundering
+    out-of-taxonomy noise into the corpus.
+    """
+    v = value.strip().upper()
+    if v in VALID_INDUSTRIES:
+        return v
+    if not v or v == "UNKNOWN":
+        return "OTHER"
+    if v in _category_norm_cache:
+        return _category_norm_cache[v]
+
+    from app.pipeline.transform.industry_classifier import _get_industry_embeddings
+
+    model = _get_model()
+    industry_embs = _get_industry_embeddings()
+    query_emb = model.encode([v.replace("_", " ")], prompt_name="query", show_progress_bar=False)[0]
+    norm = np.linalg.norm(query_emb)
+    if norm > 0:
+        query_emb = query_emb / norm
+
+    best_cat = "OTHER"
+    best_score = 0.65
+    for cat, cat_emb in industry_embs.items():
+        score = float(np.dot(query_emb, cat_emb))
+        if score > best_score:
+            best_score = score
+            best_cat = cat
+
+    _category_norm_cache[v] = best_cat
+    if best_cat != "OTHER":
+        logger.info("Semantic category normalization: %s -> %s (%.3f)", v, best_cat, best_score)
+    return best_cat
+
+
+def normalize_donor_type(value: str) -> str:
+    """Normalize donor type to canonical mixed-case form."""
+    return DONOR_TYPE_CANONICAL.get(value, DONOR_TYPE_CANONICAL.get(value.upper(), value))
+
+
+def _load_references(
+    db_session: Session,
+    entity_type: str,
+    prototype_descriptions: dict[str, str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Load labeled reference examples from the learning store.
+
+    Returns (names_list, labels_list) excluding OTHER/UNKNOWN.
+    Prototype descriptions are appended as seed anchors for categories
+    that may have few real-world examples.
+    """
+    skip_values = {"OTHER", "UNKNOWN", "SKIP", ""}
+
+    # kNN's own earlier outputs (source "nn", the lowest-confidence tier)
+    # are not reference examples. Voting with them lets one run's guess
+    # become the next run's evidence: a misclassified name pulls its
+    # neighbors toward the same wrong label, and those then pull theirs.
+    # Only labels an upstream tier produced (FEC metadata, rules,
+    # prototype-similarity) seed the vote. This matters more now that the
+    # learning store survives comment-only code edits (see senate_pipeline.
+    # _normalized_source) — kNN labels would otherwise compound across many
+    # more runs than before.
+    rows = (
+        db_session.query(
+            LearnedClassification.entity_name,
+            LearnedClassification.value,
+        )
+        .filter(
+            LearnedClassification.entity_type == entity_type,
+            LearnedClassification.source != KNN_SOURCE,
+        )
+        .all()
+    )
+
+    names: list[str] = []
+    labels: list[str] = []
+
+    for name, value in rows:
+        if entity_type == "donor_type":
+            normalized = normalize_donor_type(value)
+        else:
+            normalized = _normalize_category(value)
+        if normalized in skip_values:
+            continue
+        names.append(name)
+        labels.append(normalized)
+
+    if prototype_descriptions:
+        for label, description in prototype_descriptions.items():
+            names.append(description)
+            labels.append(label)
+
+    return names, labels
+
+
+def classify_batch_nn(
+    query_names: list[str],
+    db_session: Session,
+    entity_type: str,
+    prototype_descriptions: dict[str, str] | None = None,
+    k: int = 7,
+    min_similarity: float = 0.65,
+    min_agreement: int = 1,
+) -> dict[str, str]:
+    """Classify names by kNN in sentence-transformer embedding space.
+
+    For each query name, finds the K most similar labeled entities from
+    the learning store and assigns the category by similarity-weighted
+    majority vote.
+
+    Args:
+        query_names: Names to classify.
+        db_session: DB session for loading reference data.
+        entity_type: "industry" or "donor_type".
+        prototype_descriptions: Optional seed descriptions per category.
+        k: Number of nearest neighbors to consider.
+        min_similarity: Minimum cosine similarity to count as a neighbor.
+            2026-07 fix: was 0.20, far below this model's real floor
+            for entity-name-to-entity-name comparisons — live-measured on
+            real donor names (661 same-type pairs, 187 cross-type pairs):
+            same-type cosine mean=0.734/p10=0.681, cross-type mean=0.708/
+            p90=0.757 (no clean gap; ranges overlap heavily). 0.65 sits
+            below the same-type p10 so genuine neighbors still count as
+            neighbors. In practice it rejects almost nothing: measured
+            2026-10-09, a query's nearest reference scores 0.81 at the 10th
+            percentile, and both callers' results were identical at every
+            floor from 0.20 to 0.75. Precision comes from the vote
+            (min_agreement, inverse-frequency weighting), not this floor.
+
+        min_agreement: How many of the k neighbours must carry the winning
+            label for it to be returned; with fewer the name is OTHER.
+
+    Returns:
+        Dict mapping query name -> predicted category.
+    """
+    if not query_names:
+        return {}
+
+    ref_names, ref_labels = _load_references(
+        db_session, entity_type, prototype_descriptions,
+    )
+
+    if not ref_names:
+        logger.warning("No reference examples for entity_type=%s, returning OTHER", entity_type)
+        return {name: "OTHER" for name in query_names}
+
+    logger.info(
+        "kNN classifier: %d reference examples, %d unique categories, %d queries",
+        len(ref_names),
+        len(set(ref_labels)),
+        len(query_names),
+    )
+
+    model = _get_model()
+
+    from app.pipeline.vector_store import encode_normalized
+
+    ref_embs = encode_normalized(model, ref_names)
+    query_embs = encode_normalized(model, query_names)
+
+    similarities = query_embs @ ref_embs.T
+
+    # Inverse-frequency weighting to counteract class imbalance in the
+    # reference set (He & Garcia 2009, "Learning from Imbalanced Data,"
+    # IEEE TKDE 21:9).  Without this, over-represented classes like
+    # FINANCE dominate kNN votes simply due to population, not semantic
+    # proximity.  Each vote is divided by sqrt(class_frequency).
+    #
+    # 2026-07 fix: the sqrt alone is NOT bounded — it slows growth
+    # but a count-1 class still gets weight sqrt(total_refs), which grows
+    # with the corpus. Live production counts (donor_type reference set,
+    # prototype_descriptions seeded once per category, real SKIP-labeled
+    # rows never stored — see _load_references' skip_values): SKIP's
+    # count is always exactly 1, giving weight sqrt(5879/1)=72.95 against
+    # a well-represented class like Org/Employees at sqrt(5879/3973)=1.16.
+    # One marginal SKIP neighbor at the min_similarity floor (0.65) casts
+    # a vote of 0.65*72.95=47.4 — enough to outvote 6 genuine Org/Employees
+    # neighbors at a typical real similarity (~0.72 mean; see classify_
+    # batch_nn's min_similarity docstring) combined: 6*0.72*1.16=5.0. A cap
+    # of 5.0 keeps that same 6-neighbor genuine consensus safely ahead
+    # (0.65*5.0=3.25 < 5.0) while still giving genuinely rare classes
+    # (Party/Ideological, Self-Funded) a real, bounded boost instead of
+    # none — this was never a "should rare classes get a boost" question,
+    # only "should one anomalous match be able to overrule a consensus."
+    label_counts = Counter(ref_labels)
+    total_refs = len(ref_labels)
+    inv_freq: dict[str, float] = {}
+    for label, count in label_counts.items():
+        inv_freq[label] = min(1.0 / (count / total_refs) ** 0.5, _MAX_INV_FREQ_WEIGHT)
+
+    results: dict[str, str] = {}
+    for i, name in enumerate(query_names):
+        top_k_idx = np.argsort(similarities[i])[-k:][::-1]
+        top_k_sims = similarities[i][top_k_idx]
+
+        votes: Counter[str] = Counter()
+        voters: Counter[str] = Counter()
+        for idx, sim in zip(top_k_idx, top_k_sims):
+            if sim >= min_similarity:
+                label = ref_labels[idx]
+                votes[label] += float(sim) * inv_freq.get(label, 1.0)
+                voters[label] += 1
+
+        winner = votes.most_common(1)[0][0] if votes else None
+        results[name] = winner if winner and voters[winner] >= min_agreement else "OTHER"
+
+    category_counts = Counter(results.values())
+    logger.info(
+        "kNN classification complete: %s",
+        ", ".join(f"{cat}={cnt}" for cat, cnt in category_counts.most_common(10)),
+    )
+
+    return results
+
+
+# The real industry codes, derived from the config_definitions single source
+# of truth minus the three non-industry contribution buckets — so a new
+# INDUSTRIES entry is recognized here automatically instead of silently
+# dropping until this copy is hand-updated.
+VALID_INDUSTRIES = set(INDUSTRIES) - {"SMALL_DONORS", "LARGE_INDIVIDUAL", "UNCLASSIFIED"}
+
+VALID_DONOR_TYPES = {
+    "PAC", "Org/Employees", "Party/Ideological", "CandidateAffiliated",
+    "Self-Funded", "SKIP",
+}
+
+
+def normalize_learning_store(db_session: Session) -> int:
+    """Normalize hallucinated LLM categories and mismatched case to canonical forms.
+
+    Fixes both industry aliases (e.g. SPORTS->MEDIA) and donor type case
+    mismatches (e.g. ORG/EMPLOYEES->Org/Employees) that cause kNN vote dilution.
+
+    Also deletes entries with values that can't be mapped to any valid category,
+    preventing ghost classes from accumulating.
+
+    Returns the number of rows updated.
+    """
+    updated = 0
+    deleted = 0
+
+    industry_rows = (
+        db_session.query(LearnedClassification)
+        .filter(LearnedClassification.entity_type == "industry")
+        .all()
+    )
+    for row in industry_rows:
+        canonical = _normalize_category(row.value)
+        if canonical not in VALID_INDUSTRIES:
+            db_session.delete(row)
+            deleted += 1
+        elif canonical != row.value:
+            row.value = canonical
+            updated += 1
+
+    dtype_rows = (
+        db_session.query(LearnedClassification)
+        .filter(LearnedClassification.entity_type == "donor_type")
+        .all()
+    )
+    for row in dtype_rows:
+        canonical = normalize_donor_type(row.value)
+        if canonical not in VALID_DONOR_TYPES:
+            db_session.delete(row)
+            deleted += 1
+        elif canonical != row.value:
+            row.value = canonical
+            updated += 1
+
+    if updated or deleted:
+        db_session.commit()
+        logger.info(
+            "Normalized %d learning store entries, deleted %d invalid entries",
+            updated, deleted,
+        )
+
+    return updated + deleted
+
+
+def cross_validate_donor_types(db_session: Session) -> int:
+    """Re-check PAC-labeled entries against Org/Employees prototype via embedding.
+
+    Companies (LLC, Inc, Bank, etc.) often get mislabeled as PAC in the
+    learning store due to early kNN runs. This uses embedding cosine
+    similarity to detect entries where the Org/Employees prototype is a
+    significantly better match than PAC, and corrects them.
+
+    Returns the number of rows corrected.
+    """
+    from app.pipeline.analyze.donor_classifier_ai import (
+        _get_semantic_type_embeddings,
+    )
+    from app.pipeline.vector_store import encode_normalized, get_embedding_model
+
+    pac_rows = (
+        db_session.query(LearnedClassification)
+        .filter(
+            LearnedClassification.entity_type == "donor_type",
+            LearnedClassification.value == "PAC",
+        )
+        .all()
+    )
+
+    if not pac_rows:
+        return 0
+
+    model = get_embedding_model()
+    type_embs = _get_semantic_type_embeddings()
+
+    org_emb = type_embs.get("Org/Employees")
+    pac_emb = type_embs.get("PAC")
+    if org_emb is None or pac_emb is None:
+        return 0
+
+    names = [r.entity_name for r in pac_rows]
+    query_embs = encode_normalized(model, names)
+
+    org_scores = query_embs @ org_emb
+    pac_scores = query_embs @ pac_emb
+
+    corrected = 0
+    _MARGIN = 0.05
+    # 2026-07: the org_scores floor was 0.30; live-measured on 246 real
+    # PAC-labeled donors it was already functionally redundant — org_score
+    # mean=0.700/p90=0.744, well above 0.30, so _MARGIN (org beating pac by
+    # 0.05) was always the actual gate (6/246 real rows crossed it). Raised
+    # to 0.65 to match the measured floor honestly; in practice this changes
+    # nothing for real data since _MARGIN was already doing the work.
+    for i, row in enumerate(pac_rows):
+        if org_scores[i] > pac_scores[i] + _MARGIN and org_scores[i] > 0.65:
+            logger.info(
+                "Reclassifying %s: PAC -> Org/Employees (org=%.3f, pac=%.3f)",
+                row.entity_name, org_scores[i], pac_scores[i],
+            )
+            row.value = "Org/Employees"
+            corrected += 1
+
+    if corrected:
+        db_session.commit()
+        logger.info("Cross-validated %d PAC entries to Org/Employees", corrected)
+
+    return corrected

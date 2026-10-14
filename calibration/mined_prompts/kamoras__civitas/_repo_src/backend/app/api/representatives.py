@@ -1,0 +1,131 @@
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
+
+from app.api.response_helpers import (
+    CACHE_TTL_DETAIL_S,
+    CACHE_TTL_LIST_S,
+    PARTY_QUERY_PATTERN,
+    cached_json as _cached_json,
+    score_history_json,
+)
+from app.database import get_db
+from app.member_ids import resolve_member_id
+from app.services.holdings_service import HOLDING_CATEGORY_PATTERN, get_rep_holdings
+from app.services.representative_service import (
+    get_rep_leaderboard,
+    get_rep_states_with_counts,
+    get_rep_stock_trades,
+    get_rep_votes,
+    get_representative_by_id,
+    get_representative_score_breakdown,
+    get_representatives_by_state,
+)
+
+router = APIRouter()
+
+
+@router.get("/representatives/states")
+def list_rep_states(db: Session = Depends(get_db)) -> JSONResponse:
+    data = get_rep_states_with_counts(db)
+    return _cached_json(data, max_age=CACHE_TTL_LIST_S)
+
+
+@router.get("/representatives/leaderboard")
+def list_rep_leaderboard(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(50, ge=1, le=100),
+    party: str | None = Query(None, pattern=PARTY_QUERY_PATTERN),
+    sort: str = Query("score", pattern="^(score|pac_dollars|pac_pct|ideology|leadership)$"),
+    dir: str | None = Query(None, pattern="^(asc|desc)$"),
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    data = get_rep_leaderboard(db, page=page, per_page=per_page, party=party, sort=sort, direction=dir)
+    return _cached_json(data, max_age=CACHE_TTL_LIST_S)
+
+
+@router.get("/representatives/{rep_id}/history")
+def get_rep_history(rep_id: str, db: Session = Depends(get_db)) -> JSONResponse:
+    """Return historical score snapshots for a representative."""
+    return score_history_json(db, "representative", resolve_member_id(db, resolve_member_id(db, rep_id)))
+
+
+@router.get("/representatives/{rep_id}/score-breakdown")
+def get_rep_score_breakdown_route(rep_id: str, db: Session = Depends(get_db)) -> JSONResponse:
+    """Return the full component-level derivation behind each of a
+    representative's scored dimensions — the "show the math" panel's data source."""
+    breakdown = get_representative_score_breakdown(db, resolve_member_id(db, rep_id))
+    if breakdown is None:
+        raise HTTPException(status_code=404, detail="Representative not found")
+    return _cached_json(breakdown, max_age=CACHE_TTL_DETAIL_S)
+
+
+@router.get("/representatives/{rep_id}/votes")
+def get_votes(
+    rep_id: str,
+    category: str = Query("recent", pattern="^(recent|key|all)$"),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(15, ge=1, le=100),
+    filter: str = Query("all", pattern="^(all|yea|nay|against-party)$"),
+    q: str | None = Query(None, max_length=100, description="Bill number, title or question to search for"),
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    result = get_rep_votes(db, resolve_member_id(db, rep_id), category, page, per_page, filter, q)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Representative not found")
+    return _cached_json(result, max_age=CACHE_TTL_DETAIL_S)
+
+
+@router.get("/representatives/{rep_id}/stock-trades")
+def get_rep_stock_trades_route(
+    rep_id: str,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(15, ge=1, le=100),
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    """Return paginated STOCK Act trade disclosures for a representative."""
+    result = get_rep_stock_trades(db, resolve_member_id(db, rep_id), page, per_page)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Representative not found")
+    return _cached_json(result.model_dump(by_alias=True), max_age=CACHE_TTL_DETAIL_S)
+
+
+@router.get("/representatives/{rep_id}/holdings")
+def get_rep_holdings_route(
+    rep_id: str,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(15, ge=1, le=100),
+    category: str | None = Query(None, pattern=HOLDING_CATEGORY_PATTERN),
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    """Return the asset holdings from the latest annual financial disclosure:
+    a by-category breakdown plus a page of holdings, largest first
+    (optionally one category's)."""
+    result = get_rep_holdings(db, resolve_member_id(db, rep_id), page, per_page, category)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Representative not found")
+    return _cached_json(result.model_dump(by_alias=True), max_age=CACHE_TTL_DETAIL_S)
+
+
+@router.get("/representatives/{rep_id}")
+def get_representative(rep_id: str, db: Session = Depends(get_db)) -> JSONResponse:
+    result = get_representative_by_id(db, resolve_member_id(db, rep_id))
+    if result is None:
+        raise HTTPException(status_code=404, detail="Representative not found")
+    return _cached_json(result.model_dump(by_alias=True), max_age=CACHE_TTL_DETAIL_S)
+
+
+@router.get("/representatives")
+def list_representatives(
+    state: str = Query(..., min_length=2, max_length=2, description="Two-letter state code"),
+    page: int = Query(1, ge=1),
+    # le=60, not 50: the compare page requests per_page=60 to fetch a whole
+    # state's delegation in one call (CA has 52 districts). With the cap at
+    # 50, FastAPI 422'd every House state selection and the frontend's
+    # .catch() rendered an empty member list — House comparison was
+    # entirely unusable from the picker.
+    per_page: int = Query(10, ge=1, le=60),
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    data = get_representatives_by_state(db, state, page=page, per_page=per_page)
+    return _cached_json(data.model_dump(by_alias=True), max_age=CACHE_TTL_DETAIL_S)

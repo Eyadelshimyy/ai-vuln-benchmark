@@ -1,0 +1,638 @@
+"""Tests for ``BatchRunnerThread`` and ``BatchSheet`` cancel-button wiring.
+
+Per spec §6.2: unlock is bound to ``QThread.finished`` (Qt-emitted signal),
+NOT to ``finished_with_result``. This guarantees the dialog never gets
+stuck locked even if ``runner.run()`` raises before the result signal.
+"""
+
+from pathlib import Path
+
+
+def test_runner_thread_marshals_real_render_to_gui_and_returns_complete_result(
+    qtbot, qapp, tmp_path, monkeypatch,
+):
+    """Real data+PNG execution must block-marshal render work to the GUI."""
+    import numpy as np
+    import pandas as pd
+    from PyQt5.QtCore import QThread
+    from mf4_analyzer.batch import (
+        AnalysisPreset, BatchRunner, BatchOutput,
+    )
+    from mf4_analyzer.batch_manifest import load_batch_manifest
+    import mf4_analyzer.batch_render_qt as qt_renderer
+    from mf4_analyzer.io import FileData
+    from mf4_analyzer.ui.drawers.batch.runner_thread import BatchRunnerThread
+
+    import threading
+
+    render_threads = []
+    encode_thread_ids = []
+    original_builder = qt_renderer.build_batch_scene
+    original_save = qt_renderer.save_png
+
+    def build_with_warning(*args, warnings_out=None, **kwargs):
+        render_threads.append(QThread.currentThread())
+        warnings_out.append("gui-thread-render-warning")
+        return original_builder(*args, warnings_out=warnings_out, **kwargs)
+
+    def save_on_caller_thread(image, path):
+        encode_thread_ids.append(threading.get_ident())
+        return original_save(image, path)
+
+    monkeypatch.setattr(qt_renderer, "build_batch_scene", build_with_warning)
+    monkeypatch.setattr(qt_renderer, "save_png", save_on_caller_thread)
+
+    n = 1024
+    t = np.arange(n) / 512.0
+    df = pd.DataFrame({"Time": t, "sig": np.sin(2 * np.pi * 50 * t)})
+    fd = FileData(tmp_path / "x.csv", df, list(df.columns), {}, idx=0)
+    preset = AnalysisPreset.from_current_single(
+        name="t", method="fft", signal=(0, "sig"),
+        outputs=BatchOutput(export_data=True, export_image=True),
+        params={"fs": 512.0, "window": "hanning", "nfft": 512},
+    )
+    runner = BatchRunner({0: fd})
+    th = BatchRunnerThread(runner, preset, tmp_path / "out")
+    events, results, thread_finished = [], [], []
+    th.progress.connect(events.append)
+    th.finished_with_result.connect(results.append)
+    th.finished.connect(lambda: thread_finished.append(True))
+    th.start()
+    try:
+        qtbot.waitUntil(lambda: len(results) == 1, timeout=10_000)
+        assert results[0].status == "done"
+        assert render_threads == [qapp.thread()]
+        assert len(encode_thread_ids) == 1
+        assert encode_thread_ids[0] != threading.main_thread().ident
+        item = results[0].items[0]
+        assert item.warnings == ["gui-thread-render-warning"]
+        assert set(item.artifact_facts) == {"data", "image"}
+        assert all(
+            facts["checksum_status"] == "complete" and facts["sha256"]
+            for facts in item.artifact_facts.values()
+        )
+        manifest = load_batch_manifest(results[0].manifest_path)
+        assert manifest["entries"][0]["warnings"] == [
+            "gui-thread-render-warning"
+        ]
+        assert set(manifest["entries"][0]["artifacts"]) == {"data", "image"}
+        assert any(e.kind == "run_finished" for e in events)
+    finally:
+        th.request_cancel()
+        qtbot.waitUntil(lambda: bool(thread_finished), timeout=2_000)
+
+
+def test_runner_thread_propagates_gui_render_failure_and_rolls_back_set(
+    qtbot, tmp_path, monkeypatch,
+):
+    import numpy as np
+    import pandas as pd
+
+    from mf4_analyzer.batch import AnalysisPreset, BatchRunner
+    import mf4_analyzer.batch_render_qt as qt_renderer
+    from mf4_analyzer.io import FileData
+    from mf4_analyzer.ui.drawers.batch.runner_thread import BatchRunnerThread
+
+    def fail_on_gui(*_args, **_kwargs):
+        raise RuntimeError("gui-render-marker")
+
+    monkeypatch.setattr(qt_renderer, "build_batch_scene", fail_on_gui)
+    t = np.arange(1024) / 512.0
+    frame = pd.DataFrame({"Time": t, "sig": np.sin(2 * np.pi * 50 * t)})
+    fd = FileData(tmp_path / "failure.csv", frame, list(frame.columns), {}, idx=0)
+    preset = AnalysisPreset.from_current_single(
+        name="failure",
+        method="fft",
+        signal=(0, "sig"),
+        params={"fs": 512.0, "window": "hanning", "nfft": 512},
+    )
+    output_dir = tmp_path / "out"
+    thread = BatchRunnerThread(BatchRunner({0: fd}), preset, output_dir)
+    results, thread_finished = [], []
+    thread.finished_with_result.connect(results.append)
+    thread.finished.connect(lambda: thread_finished.append(True))
+
+    thread.start()
+    try:
+        qtbot.waitUntil(lambda: len(results) == 1, timeout=10_000)
+
+        result = results[0]
+        assert result.status == "blocked"
+        assert result.items[0].status == "failed"
+        assert "gui-render-marker" in result.items[0].message
+        assert not list(output_dir.glob("*.csv"))
+        assert not list(output_dir.glob("*.png"))
+        assert not list(output_dir.glob(".*.batch-stage.*"))
+        assert not list(output_dir.glob(".*.batch-reserve"))
+    finally:
+        thread.request_cancel()
+        qtbot.waitUntil(lambda: bool(thread_finished), timeout=2_000)
+
+
+def test_runner_thread_cancellation_waits_for_result_and_qthread_finished(
+    qtbot, tmp_path,
+):
+    """Cancellation owns both the business result and the thread lifetime."""
+    import threading
+
+    from mf4_analyzer.batch import BatchRunResult
+    from mf4_analyzer.ui.drawers.batch.runner_thread import BatchRunnerThread
+
+    started = threading.Event()
+
+    class _CancellationAwareRunner:
+        def run(self, _preset, _output_dir, *, cancel_token, **_kwargs):
+            started.set()
+            assert cancel_token.wait(2.0), "test teardown must request cancel"
+            return BatchRunResult(status="cancelled")
+
+    thread = BatchRunnerThread(
+        _CancellationAwareRunner(), "preset", tmp_path / "out",
+    )
+    results, thread_finished = [], []
+    thread.finished_with_result.connect(results.append)
+    thread.finished.connect(lambda: thread_finished.append(True))
+    thread.start()
+    try:
+        qtbot.waitUntil(started.is_set, timeout=1_000)
+        thread.request_cancel()
+        qtbot.waitUntil(lambda: len(results) == 1, timeout=2_000)
+        qtbot.waitUntil(lambda: bool(thread_finished), timeout=2_000)
+        assert results[0].status == "cancelled"
+    finally:
+        thread.request_cancel()
+        qtbot.waitUntil(lambda: not thread.isRunning(), timeout=2_000)
+
+
+def test_sheet_cancel_button_unlocks_editing(qtbot, tmp_path):
+    """Click 中断 → cancel_token set → thread.finished → editing unlocked,
+    buttons restored. Pinned to QThread.finished, not finished_with_result.
+    """
+    import numpy as np
+    import pandas as pd
+    from mf4_analyzer.batch import AnalysisPreset, BatchOutput, BatchRunner
+    from mf4_analyzer.io import FileData
+    from mf4_analyzer.ui.drawers.batch import BatchSheet
+
+    # Build a 3-file batch so cancel mid-run is observable
+    fds = {}
+    for i in range(3):
+        n = 4096
+        t = np.arange(n) / 512.0
+        df = pd.DataFrame({"Time": t, "sig": np.sin(2 * np.pi * 50 * t)})
+        fds[i] = FileData(tmp_path / f"x{i}.csv", df,
+                          list(df.columns), {}, idx=i)
+    sheet = BatchSheet(None, files=fds)
+    qtbot.addWidget(sheet)
+    sheet.apply_files(file_ids=tuple(fds.keys()), file_paths=())
+    sheet.apply_signals(("sig",))
+    sheet.apply_method("fft")
+    sheet.apply_params({"window": "hanning", "nfft": 512})
+    sheet.apply_outputs(BatchOutput(
+        export_data=True, export_image=False, data_format="csv"))
+    sheet._output_panel.apply_directory(str(tmp_path / "out"))
+
+    sheet._on_run_clicked()
+    qtbot.waitUntil(lambda: sheet._running is True, timeout=1000)
+    sheet._on_cancel_clicked()  # 中断 button handler
+    qtbot.waitUntil(lambda: sheet._running is False, timeout=5000)
+    # Editing must be re-enabled
+    assert sheet._input_panel.isEnabled()
+    assert sheet._analysis_panel.isEnabled()
+    assert sheet._output_panel.isEnabled()
+
+
+def test_sheet_preview_uses_private_thread_state_and_cleans_temp(qtbot, tmp_path):
+    """Preview may render a PNG, but must not become a completed Batch run."""
+    import numpy as np
+    import pandas as pd
+
+    from mf4_analyzer.batch import BatchOutput
+    from mf4_analyzer.io import FileData
+    from mf4_analyzer.ui.drawers.batch import BatchSheet
+
+    t = np.arange(1024) / 512.0
+    frame = pd.DataFrame({"Time": t, "sig": np.sin(2 * np.pi * 50 * t)})
+    fd = FileData(tmp_path / "preview.csv", frame, list(frame.columns), {}, idx=0)
+    output_dir = tmp_path / "formal-output"
+    sheet = BatchSheet(None, files={0: fd})
+    qtbot.addWidget(sheet)
+    sheet.apply_files(file_ids=(0,), file_paths=())
+    sheet.apply_signals(("sig",))
+    sheet.apply_method("fft")
+    sheet.apply_params({"window": "hanning", "nfft": 512})
+    sheet.apply_outputs(BatchOutput(export_data=True, export_image=True))
+    sheet._output_panel.apply_directory(str(output_dir))
+
+    sheet._on_preview_clicked()
+    qtbot.waitUntil(lambda: sheet._preview_thread is None, timeout=10_000)
+
+    result = sheet._preview_result
+    assert result.status == "done"
+    image_path = Path(result.image_path)
+    assert image_path.is_file()
+    assert sheet._last_result is None
+    assert not output_dir.exists()
+    assert sheet._preview_dialog is not None
+    sheet._preview_dialog.reject()
+    qtbot.waitUntil(lambda: not image_path.exists(), timeout=2_000)
+
+
+def test_sheet_run_passes_db_reference_catalog_snapshot_from_parent(qtbot, tmp_path):
+    """dB-reference-defaults Task 10 Part A regression: ``BatchSheet``'s
+    ``_on_run_clicked`` is the ONLY live Batch Run path (``MainWindow.
+    open_batch``'s own ``BatchRunner`` call is dead code -- ``dlg.exec_()``
+    never returns ``Accepted``). It must read ``parent().db_reference_store``
+    and forward ``snapshot()``/``prefer_channel_metadata`` into
+    ``BatchRunner`` exactly like Task 9 already wired the (unreachable)
+    ``open_batch`` call site.
+
+    Proven end-to-end: a channel carries a quantity/unit
+    (``torque``/``Nm``) absent from the factory catalog, so an unwired Run
+    path would resolve the neutral ``generic`` default (``1.0``, no
+    warning) -- resolving instead to the ISOLATED store's custom override
+    value (``3.0``, source ``user``) is only possible if the live click
+    handler actually forwarded the snapshot.
+    """
+    import numpy as np
+    import pandas as pd
+    import pytest
+    from PyQt5.QtWidgets import QWidget
+
+    from mf4_analyzer.io import FileData
+    from mf4_analyzer.ui.db_reference_settings import DbReferenceSettingsStore
+    from mf4_analyzer.ui.drawers.batch import BatchSheet
+    from PyQt5.QtCore import QSettings
+
+    ini_path = tmp_path / "isolated-db-reference.ini"
+    store = DbReferenceSettingsStore(settings=QSettings(str(ini_path), QSettings.IniFormat))
+    result = store.save(
+        overrides=[],
+        custom=[{
+            "id": "user.torque_custom",
+            "quantity": "torque",
+            "label": "自定义扭矩基准",
+            "unit": "Nm",
+            "aliases": ["Nm"],
+            "reference": 3.0,
+        }],
+        hidden_builtin_ids=[],
+        prefer_channel_metadata=True,
+    )
+    assert result.ok is True
+
+    parent = QWidget()
+    qtbot.addWidget(parent)
+    parent.db_reference_store = store
+
+    n = 1024
+    t = np.arange(n) / 512.0
+    df = pd.DataFrame({"Time": t, "sig": np.sin(2 * np.pi * 50 * t)})
+    fd = FileData(
+        tmp_path / "x.csv", df, list(df.columns), {}, idx=0,
+        channel_metadata={"sig": {"quantity": "torque", "unit": "Nm"}},
+    )
+
+    sheet = BatchSheet(parent, files={0: fd})
+    qtbot.addWidget(sheet)
+    sheet.apply_files(file_ids=(0,), file_paths=())
+    sheet.apply_signals(("sig",))
+    sheet.apply_method("fft")
+    sheet.apply_params({"window": "hanning", "nfft": 512, "amp_y": "dB"})
+    from mf4_analyzer.batch import BatchOutput
+    sheet.apply_outputs(BatchOutput(
+        export_data=False, export_image=True, data_format="csv"))
+    sheet._output_panel.apply_directory(str(tmp_path / "out"))
+
+    # Read the result back via ``sheet._last_result`` (set by the Sheet's
+    # OWN ``finished_with_result`` handler, wired BEFORE ``thread.start()``
+    # inside ``_on_run_clicked``) rather than connecting a spy to
+    # ``sheet._runner_thread.finished_with_result`` after the fact: a
+    # cross-thread ``pyqtSignal.emit()`` only reaches receivers connected
+    # AT THE MOMENT of emission, so a post-``_on_run_clicked()`` connect
+    # racing an already-fast-finishing worker thread could silently drop
+    # the one-shot signal. ``sheet._running is False`` mirrors the
+    # existing ``test_sheet_cancel_button_unlocks_editing`` convention.
+    sheet._on_run_clicked()
+    qtbot.waitUntil(lambda: sheet._running is False, timeout=5000)
+
+    result = sheet._last_result
+    assert result is not None and result.status == "done"
+    item = result.items[0]
+    assert item.db_reference_value == pytest.approx(3.0)
+    assert item.db_reference_source == "user"
+
+
+def test_sheet_preview_and_result_share_channel_metadata_reference(qtbot, tmp_path):
+    import dataclasses
+
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from mf4_analyzer.batch import BatchOutput, BatchRunner
+    from mf4_analyzer.io import FileData
+    from mf4_analyzer.ui.drawers.batch import BatchSheet
+
+    n = 1024
+    t = np.arange(n) / 512.0
+    fd = FileData(
+        tmp_path / "metadata.csv",
+        pd.DataFrame({"Time": t, "sig": np.sin(2 * np.pi * 50 * t)}),
+        ["Time", "sig"], {"sig": "Nm"}, idx=0,
+        channel_metadata={
+            "sig": {
+                "quantity": "torque", "unit": "Nm", "db_reference": 4.5,
+            },
+        },
+    )
+    sheet = BatchSheet(None, files={0: fd})
+    qtbot.addWidget(sheet)
+    sheet.apply_files(file_ids=(0,), file_paths=())
+    sheet.apply_signals(("sig",))
+    sheet.apply_method("fft")
+    sheet.apply_params({"window": "hanning", "nfft": 512})
+    sheet.apply_outputs(BatchOutput(
+        export_data=False, export_image=True, data_format="csv",
+    ))
+
+    # ``BatchSheet`` refreshes its summary through a short debounce timer.
+    # Read it only once the queued refresh has incorporated channel metadata.
+    qtbot.waitUntil(
+        lambda: "4.5" in sheet._output_panel.effective_preview_text(),
+        timeout=1_000,
+    )
+    preview = sheet._output_panel.effective_preview_text()
+    assert "1×metadata" in preview
+    assert "4.5" in preview
+
+    # Keep the test focused on reference parity: the live FileData is already
+    # keyed by source_id, so no physical-path resolution is needed here.
+    preset = dataclasses.replace(sheet.get_preset(), source_paths=(), file_paths=())
+    result = BatchRunner({0: fd}).run(preset, str(tmp_path / "out"))
+
+    assert result.status == "done"
+    assert len(result.items) == 1
+    assert result.items[0].db_reference_source == "metadata"
+    assert result.items[0].db_reference_value == pytest.approx(4.5)
+
+
+def test_runner_thread_forwards_resume_and_retry_runtime_paths(tmp_path):
+    from mf4_analyzer.batch import BatchRunResult
+    from mf4_analyzer.ui.drawers.batch.runner_thread import BatchRunnerThread
+
+    calls = []
+
+    class Runner:
+        def run(self, preset, output_dir, **kwargs):
+            calls.append((preset, output_dir, kwargs))
+            return BatchRunResult(status="done")
+
+    for resume_path, retry_path in (
+        (tmp_path / "resume.json", None),
+        (None, tmp_path / "retry.json"),
+    ):
+        thread = BatchRunnerThread(
+            Runner(), "preset", tmp_path / "out",
+            resume_manifest=resume_path,
+            retry_failed_manifest=retry_path,
+        )
+        results = []
+        thread.finished_with_result.connect(results.append)
+
+        thread.run()
+
+        assert results[0].status == "done"
+
+    assert calls[0][2]["resume_manifest"] == tmp_path / "resume.json"
+    assert calls[0][2]["retry_failed_manifest"] is None
+    assert calls[1][2]["resume_manifest"] is None
+    assert calls[1][2]["retry_failed_manifest"] == tmp_path / "retry.json"
+
+
+def test_sheet_does_not_forward_hidden_runtime_manifest_state_to_runner(
+    qtbot, tmp_path, monkeypatch,
+):
+    import numpy as np
+    import pandas as pd
+
+    from mf4_analyzer.batch import BatchOutput, BatchRunResult, BatchRunner
+    from mf4_analyzer.io import FileData
+    from mf4_analyzer.ui.drawers.batch import BatchSheet
+
+    calls = []
+
+    def fake_run(self, preset, output_dir, **kwargs):
+        calls.append(kwargs)
+        return BatchRunResult(status="done")
+
+    monkeypatch.setattr(BatchRunner, "run", fake_run)
+    t = np.arange(128, dtype=float) / 128.0
+    fd = FileData(
+        tmp_path / "source.csv",
+        pd.DataFrame({"Time": t, "sig": np.sin(2 * np.pi * 8 * t)}),
+        ["Time", "sig"], {}, idx=0, fs=128.0,
+    )
+    sheet = BatchSheet(None, files={0: fd})
+    qtbot.addWidget(sheet)
+    sheet.apply_files((0,), ())
+    sheet.apply_signals(("sig",))
+    sheet.apply_method("fft")
+    sheet.apply_params({"window": "hanning", "nfft": 128})
+    sheet.apply_outputs(BatchOutput(export_data=True, export_image=False))
+    sheet._output_panel.apply_directory(str(tmp_path / "out"))
+
+    sheet._on_run_clicked()
+    qtbot.waitUntil(lambda: sheet._running is False, timeout=3000)
+
+    sheet._on_run_clicked()
+    qtbot.waitUntil(lambda: len(calls) == 2 and not sheet._running, timeout=3000)
+
+    assert calls[0]["resume_manifest"] is None
+    assert calls[0]["retry_failed_manifest"] is None
+    assert calls[1]["resume_manifest"] is None
+
+
+def test_sheet_preview_forwards_probed_channel_sets_to_the_planner(
+    qtbot, tmp_path, monkeypatch,
+):
+    """Planning is no-load, so the sheet must hand over what it probed.
+
+    Without it ``preview_outputs`` takes group one blind, which is how a
+    four-way-split HDF previewed a sub-source holding none of the selected
+    channels.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from mf4_analyzer.batch import BatchOutput, BatchRunner
+    from mf4_analyzer.io import FileData
+    from mf4_analyzer.ui.drawers.batch import BatchSheet
+
+    t = np.arange(1024) / 512.0
+    frame = pd.DataFrame({"Time": t, "sig": np.sin(2 * np.pi * 50 * t)})
+    fd = FileData(tmp_path / "preview.csv", frame, list(frame.columns), {}, idx=0)
+    sheet = BatchSheet(None, files={0: fd})
+    qtbot.addWidget(sheet)
+    sheet.apply_files(file_ids=(0,), file_paths=())
+    sheet.apply_signals(("sig",))
+    sheet.apply_method("fft")
+    sheet.apply_params({"window": "hanning", "nfft": 512})
+    sheet.apply_outputs(BatchOutput(export_data=False, export_image=True))
+    sheet._output_panel.apply_directory(str(tmp_path / "formal-output"))
+
+    captured = {}
+    original = BatchRunner.preview_outputs
+
+    def spy(self, preset, output_dir, *, source_channels=None):
+        captured["source_channels"] = source_channels
+        return original(
+            self, preset, output_dir, source_channels=source_channels,
+        )
+
+    monkeypatch.setattr(BatchRunner, "preview_outputs", spy)
+
+    sheet._on_preview_clicked()
+    qtbot.waitUntil(lambda: sheet._preview_thread is None, timeout=10_000)
+
+    assert captured["source_channels"] == sheet._input_panel.source_channel_sets()
+    assert "sig" in captured["source_channels"][0]
+    sheet._cleanup_preview_temp()
+
+
+def test_sheet_names_the_sub_source_gap_instead_of_preview_unavailable(
+    qtbot, tmp_path, monkeypatch,
+):
+    """"预览不可用" alone sent the user hunting; name the actual cause."""
+    import numpy as np
+    import pandas as pd
+
+    from mf4_analyzer.batch import (
+        BatchOutput, BatchOutputPreview, BatchRepresentativeGroup, BatchRunner,
+    )
+    from mf4_analyzer.io import FileData
+    from mf4_analyzer.ui.drawers.batch import BatchSheet
+
+    t = np.arange(256) / 128.0
+    frame = pd.DataFrame({"Time": t, "sig": np.sin(t)})
+    fd = FileData(tmp_path / "eps-run.hdf", frame, list(frame.columns), {}, idx=0)
+    sheet = BatchSheet(None, files={0: fd})
+    qtbot.addWidget(sheet)
+    # One physical HDF that split into four logical sub-sources.
+    container = str(tmp_path / "eps-run.hdf")
+    for index in range(4):
+        sheet._input_panel._file_list.add_loaded_file(
+            f"hdf:eps-run:{index}", container, frozenset({"Time", "sig"}),
+        )
+    sheet.apply_signals(("sig",))
+    sheet.apply_method("fft")
+    sheet.apply_params({"window": "hanning", "nfft": 128})
+    sheet.apply_outputs(BatchOutput(export_data=False, export_image=True))
+    sheet._output_panel.apply_directory(str(tmp_path / "formal-output"))
+
+    def blocked(self, preset, output_dir, *, source_channels=None):
+        return BatchOutputPreview(
+            task_count=4, artifact_count=4, conflict_count=0,
+            image_format="png", image_width=960, image_height=540,
+            image_dpi=144, conflict_policy="auto_number", group_count=4,
+            representative_group=BatchRepresentativeGroup(
+                group_id="g0", display_name="eps-run.hdf", group_by="source",
+                member_count=1, required_source_count=1,
+                planned_stem="eps-run__time__deadbeef", ordinal=1,
+                total_groups=4, channel_available=False,
+            ),
+        )
+
+    monkeypatch.setattr(BatchRunner, "preview_outputs", blocked)
+
+    sheet._on_preview_clicked()
+
+    assert sheet._last_toast_kind == "warning"
+    assert sheet._last_toast_text == (
+        "预览不可用：代表来源 eps-run.hdf 不含所选通道"
+        "；该文件按采样率拆成了 4 个子来源"
+    )
+    # A knowingly-empty render must not be started at all.
+    assert sheet._preview_thread is None
+    assert sheet._preview_dialog is None
+
+
+def test_representative_channel_group_gap_message_is_detail_free(qtbot):
+    from mf4_analyzer.batch import BatchRepresentativeGroup
+    from mf4_analyzer.ui.drawers.batch import BatchSheet
+
+    sheet = BatchSheet(None, files={})
+    qtbot.addWidget(sheet)
+    group = BatchRepresentativeGroup(
+        group_id="g0", display_name="torque · filtered", group_by="channel",
+        member_count=1, required_source_count=1,
+        planned_stem="torque__time__deadbeef", ordinal=1,
+        total_groups=1, channel_available=False,
+    )
+
+    assert sheet._representative_channel_gap_message(group) == (
+        "预览不可用：代表分组 torque · filtered 不含所选通道"
+    )
+
+
+def test_representative_source_gap_keeps_middle_dot_in_filename(qtbot, tmp_path):
+    from mf4_analyzer.batch import BatchRepresentativeGroup
+    from mf4_analyzer.ui.drawers.batch import BatchSheet
+
+    sheet = BatchSheet(None, files={})
+    qtbot.addWidget(sheet)
+    container = str(tmp_path / "eps · run.hdf")
+    for index in range(2):
+        sheet._input_panel._file_list.add_loaded_file(
+            f"hdf:eps-run:{index}", container, frozenset({"Time", "sig"}),
+        )
+    group = BatchRepresentativeGroup(
+        group_id="g0", display_name="eps · run.hdf", group_by="source",
+        member_count=1, required_source_count=1,
+        planned_stem="eps-run__time__deadbeef", ordinal=1,
+        total_groups=2, channel_available=False,
+    )
+
+    assert sheet._representative_channel_gap_message(group) == (
+        "预览不可用：代表来源 eps · run.hdf 不含所选通道"
+        "；该文件按采样率拆成了 2 个子来源"
+    )
+
+
+def test_sheet_runner_carries_the_probe_channels_into_planning(qtbot, tmp_path):
+    """Run must plan against the channels the input panel already probed.
+
+    Preview got the map through ``preview_outputs(source_channels=...)``; Run
+    had no such seam, so a file that split into logical sources with disjoint
+    channels planned the target onto a source that never held it and reported
+    a phantom ``missing signal`` failure.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from mf4_analyzer.io import FileData
+    from mf4_analyzer.ui.drawers.batch import BatchSheet
+
+    t = np.arange(256) / 128.0
+    frame = pd.DataFrame({"Time": t, "Rack Force": np.sin(t)})
+    fd = FileData(tmp_path / "sfns.wwt", frame, list(frame.columns), {}, idx=0)
+    sheet = BatchSheet(None, files={0: fd})
+    qtbot.addWidget(sheet)
+
+    # One physical WWT whose two Zeit blocks carry disjoint channels.
+    container = str(tmp_path / "sfns.wwt")
+    sheet._input_panel._file_list.add_loaded_file(
+        "wwt:sfns:0", container, frozenset({"Time", "Weg"}),
+    )
+    sheet._input_panel._file_list.add_loaded_file(
+        "wwt:sfns:1", container, frozenset({"Time", "Rack Force"}),
+    )
+
+    runner = sheet._make_runner()
+
+    assert runner._source_channel_cache["wwt:sfns:0"] == frozenset(
+        {"Time", "Weg"}
+    )
+    assert runner._source_channel_cache["wwt:sfns:1"] == frozenset(
+        {"Time", "Rack Force"}
+    )

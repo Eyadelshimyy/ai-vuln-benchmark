@@ -1,0 +1,1027 @@
+"""Pyqtgraph chart-axis adapter protocols.
+
+``ChartOptionsDialog`` and ``_axis_interaction`` consume the
+``AxisHandle`` contract. Runtime callers now pass existing pyqtgraph
+handles; raw renderer objects are not wrapped here.
+"""
+from __future__ import annotations
+
+import json
+import math
+from typing import Protocol, runtime_checkable
+
+
+PG_AXIS_NEUTRAL_COLOR = "#9ca3af"
+PG_AXIS_NEUTRAL_WIDTH = 1.0
+
+
+def _plain_axis_text(value) -> str:
+    text = str(value or "")
+    if "<" not in text:
+        return text
+    import re
+    return re.sub(r"<[^>]+>", "", text)
+
+
+def snapshot_axis_appearance(handle) -> dict[str, object]:
+    """Plain chart-options fields currently on ``handle``."""
+    title = ""
+    getter = getattr(handle, "get_title", None)
+    if callable(getter):
+        title = _plain_axis_text(getter())
+    xlabel = ""
+    getter = getattr(handle, "get_xlabel", None)
+    if callable(getter):
+        xlabel = _plain_axis_text(getter())
+    ylabel = ""
+    getter = getattr(handle, "get_ylabel", None)
+    if callable(getter):
+        ylabel = _plain_axis_text(getter())
+    x_scale = "linear"
+    getter = getattr(handle, "get_xscale", None)
+    if callable(getter):
+        x_scale = "log" if getter() == "log" else "linear"
+    y_scale = "linear"
+    getter = getattr(handle, "get_yscale", None)
+    if callable(getter):
+        y_scale = "log" if getter() == "log" else "linear"
+    grid = False
+    getter = getattr(handle, "is_grid_enabled", None)
+    if callable(getter):
+        try:
+            grid = bool(getter())
+        except (AttributeError, RuntimeError):
+            # Teardown / sip-deleted PlotItem: treat grid as off rather than
+            # failing a chart-options snapshot of a handle that is going away.
+            grid = False
+    return {
+        "title": title,
+        "xlabel": xlabel,
+        "y_label": ylabel,
+        "x_scale": x_scale,
+        "y_scale": y_scale,
+        "grid": grid,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Line protocol + pyqtgraph wrapper
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class LineHandle(Protocol):
+    """Renderer-agnostic view of a single curve on an axis.
+
+    Today's ``ChartOptionsDialog`` only reads label/color/visibility and
+    writes color. Keep the surface minimal; widen only when a real
+    caller needs more.
+    """
+
+    def get_label(self) -> str: ...
+    def get_color(self) -> str: ...
+    def set_color(self, color: str) -> None: ...
+    def get_visible(self) -> bool: ...
+
+# ---------------------------------------------------------------------------
+# Axis protocol
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class AxisHandle(Protocol):
+    """Renderer-agnostic axis surface consumed by ``ChartOptionsDialog``
+    and ``_axis_interaction``. Signatures are pinned by design §5.3."""
+
+    def get_xlim(self) -> tuple[float, float]: ...
+    def set_xlim(self, lo: float, hi: float) -> None: ...
+    def get_ylim(self) -> tuple[float, float]: ...
+    def set_ylim(self, lo: float, hi: float) -> None: ...
+    def autoscale(self, axis: str = "both") -> None: ...
+    def set_xscale(self, scale: str) -> None: ...
+    def set_yscale(self, scale: str) -> None: ...
+    def get_xscale(self) -> str: ...
+    def get_yscale(self) -> str: ...
+    def get_xlabel(self) -> str: ...
+    def set_xlabel(self, label: str) -> None: ...
+    def get_ylabel(self) -> str: ...
+    def set_ylabel(self, label: str) -> None: ...
+    def get_title(self) -> str: ...
+    def set_title(self, title: str) -> None: ...
+    def grid(self, enabled: bool) -> None: ...
+    def is_grid_enabled(self) -> bool: ...
+    def get_lines(self) -> list[LineHandle]: ...
+    def get_mappables(self) -> list[object]: ...
+    def rebuild_legend(self) -> None: ...
+    def sync_line_axis_color(self, line: LineHandle, color: str) -> None: ...
+    def request_redraw(self) -> None: ...
+
+# ---------------------------------------------------------------------------
+# pyqtgraph line + axis wrappers
+# ---------------------------------------------------------------------------
+
+
+class _PgLineHandle:
+    """Thin wrapper around a pyqtgraph ``PlotDataItem``.
+
+    ``ChartOptionsDialog`` sees the minimal ``LineHandle`` Protocol. Read
+    accessors prefer ``opts['name']`` / ``opts['pen']`` over private
+    artist state because the public API surface across pyqtgraph 0.14
+    keeps those keys.
+    """
+
+    def __init__(self, plot_data_item, *, label_fallback: str | None = None):
+        self._pdi = plot_data_item
+        # PlotDataItem stores name() but it's empty unless set at
+        # construction. Allow a fallback so the axis can pin the
+        # user-visible channel name when none was provided to the curve.
+        self._label_fallback = label_fallback
+
+    # Read accessors -------------------------------------------------------
+    def get_label(self) -> str:
+        name = self._pdi.name() if callable(getattr(self._pdi, "name", None)) else None
+        if name:
+            return str(name)
+        if self._label_fallback is not None:
+            return self._label_fallback
+        return ""
+
+    def get_color(self) -> str:
+        pen = self._pdi.opts.get("pen") if hasattr(self._pdi, "opts") else None
+        if pen is None:
+            pen = getattr(self._pdi, "_tracelab_dense_native_pen", None)
+        # Pens can be QPen, color string, tuple, or pyqtgraph format.
+        try:
+            from PyQt5.QtGui import QColor, QPen
+
+            if isinstance(pen, QPen):
+                return pen.color().name()
+            if isinstance(pen, str):
+                return QColor(pen).name()
+            if isinstance(pen, (tuple, list)) and len(pen) >= 3:
+                return QColor(*pen[:4]).name()
+            # Fall through: pyqtgraph mkPen-friendly object — pass
+            # through pg.mkColor to extract a QColor.
+            import pyqtgraph as pg
+
+            return pg.mkColor(pen).name()
+        except Exception:
+            return ""
+
+    def get_visible(self) -> bool:
+        is_visible = getattr(self._pdi, "isVisible", None)
+        return bool(is_visible()) if callable(is_visible) else True
+
+    # Write accessors ------------------------------------------------------
+    def set_color(self, color: str) -> None:
+        # Use the existing pen's width if possible so we only swap color.
+        width = 1.0
+        style = None
+        if hasattr(self._pdi, "opts"):
+            pen = self._pdi.opts.get("pen")
+            if pen is None:
+                pen = getattr(self._pdi, "_tracelab_dense_native_pen", None)
+            try:
+                from PyQt5.QtGui import QPen
+
+                if isinstance(pen, QPen):
+                    width = max(0.5, float(pen.widthF() or 1.0))
+                    style = pen.style()
+            except Exception:
+                pass
+        try:
+            import pyqtgraph as pg
+
+            kwargs = {"color": color, "width": width}
+            if style is not None:
+                kwargs["style"] = style
+            self._pdi.setPen(pg.mkPen(**kwargs))
+        except Exception:
+            # Last-resort: rely on setPen accepting a raw color string.
+            try:
+                self._pdi.setPen(color)
+            except Exception:
+                pass
+
+    # Escape hatch ---------------------------------------------------------
+    @property
+    def plot_data_item(self):
+        """Raw pyqtgraph ``PlotDataItem`` for owning-canvas sync paths."""
+        return self._pdi
+
+
+class PgAxisHandle:
+    """Concrete ``AxisHandle`` for the pyqtgraph TimeDomain canvas.
+
+    Wraps a pyqtgraph ``PlotItem`` (the container that owns one
+    ``ViewBox`` plus the four ``AxisItem`` siblings). Delegating to the
+    PlotItem rather than the raw ViewBox lets us cover xlim/ylim AND
+    label/title/grid/scale in one adapter, matching design §5.3.
+
+    Construction accepts either a positional ``PlotItem`` or the two
+    keyword forms used by current callers:
+
+    - ``PgAxisHandle(plot_item=...)`` — preferred new form.
+    - ``PgAxisHandle(view_box=..., axis_item=...)`` — kept for
+      backward-compat with the T3 stub signature.
+
+    ``get_mappables`` returns ``[]`` for time-domain canvases (design
+    §5.3: the ColorMap/ColorScale group of ChartOptionsDialog is
+    disabled when there are no mappables, NOT removed).
+    """
+
+    def __init__(
+        self,
+        plot_item=None,
+        *,
+        view_box=None,
+        axis_item=None,
+        owner_canvas=None,
+        allow_y_grid=True,
+    ):
+        # Resolve the PlotItem first: it owns the ViewBox + AxisItems and
+        # is the only object we need to delegate to. Tolerate the legacy
+        # (view_box=, axis_item=) call form by reconstructing the
+        # PlotItem from the ViewBox when possible, otherwise store the
+        # raw pair so partial test usage still works for non-label methods.
+        if plot_item is None and view_box is not None:
+            # PlotItem keeps its ViewBox at .vb; use parentItem() as a
+            # heuristic for the inverse lookup. Falls back to None when
+            # the test constructs a bare ViewBox without a PlotItem.
+            parent = getattr(view_box, "parentItem", None)
+            plot_item = parent() if callable(parent) else None
+        self._plot_item = plot_item
+        # Cache the ViewBox; if no PlotItem was given fall back to the
+        # explicit view_box kw arg.
+        if view_box is not None:
+            self._view_box = view_box
+        elif plot_item is not None and hasattr(plot_item, "getViewBox"):
+            self._view_box = plot_item.getViewBox()
+        else:
+            self._view_box = None
+        self._axis_item = axis_item  # historical compat; not strictly used
+        self._owner_canvas = owner_canvas
+        self._allow_y_grid = bool(allow_y_grid)
+        self._grid_enabled = self._read_grid_enabled()
+        self._xscale = self._read_log_scale("x")
+        self._yscale = self._read_log_scale("y")
+        self._line_items = []
+        self._title_changed_callbacks = []
+        # Canvas sets these before opening chart options. Defaults keep a
+        # handle usable when the canvas has not classified it yet.
+        self._shares_x_axis = False
+        self._chart_options_target = ""
+
+    # Internal helpers -----------------------------------------------------
+    def _ax(self, side: str):
+        """Return the ``AxisItem`` for ``side`` ('left'|'bottom'|...)."""
+        pi = self._plot_item
+        if pi is None or not hasattr(pi, "getAxis"):
+            return None
+        try:
+            return pi.getAxis(side)
+        except Exception:
+            return None
+
+    def _read_grid_enabled(self) -> bool:
+        try:
+            bottom = self._ax("bottom")
+            if bottom is not None and bool(getattr(bottom, "grid", False)):
+                return True
+            if self._allow_y_grid:
+                y_axis = self.y_axis_item()
+                if y_axis is not None and bool(getattr(y_axis, "grid", False)):
+                    return True
+        except Exception:
+            pass
+        pi = self._plot_item
+        ctrl = getattr(pi, "ctrl", None)
+        checks = [getattr(ctrl, "xGridCheck", None)]
+        if self._allow_y_grid:
+            checks.append(getattr(ctrl, "yGridCheck", None))
+        for check in checks:
+            is_checked = getattr(check, "isChecked", None)
+            if callable(is_checked) and is_checked():
+                return True
+        return False
+
+    def _read_log_scale(self, axis: str) -> str:
+        pi = self._plot_item
+        ctrl = getattr(pi, "ctrl", None)
+        name = "logXCheck" if axis == "x" else "logYCheck"
+        check = getattr(ctrl, name, None)
+        is_checked = getattr(check, "isChecked", None)
+        if callable(is_checked) and is_checked():
+            return "log"
+        return "linear"
+
+    # Limits ----------------------------------------------------------------
+    def get_xlim(self) -> tuple[float, float]:
+        vb = self._view_box
+        if vb is None or not hasattr(vb, "viewRange"):
+            return (0.0, 0.0)
+        x_range, _y_range = vb.viewRange()
+        return float(x_range[0]), float(x_range[1])
+
+    def set_xlim(self, lo: float, hi: float) -> None:
+        vb = self._view_box
+        if vb is None or not hasattr(vb, "setXRange"):
+            return
+        # padding=0 keeps set_xlim as an exact range assignment; otherwise
+        # pyqtgraph adds ~2 % padding on top of the requested range.
+        vb.setXRange(float(lo), float(hi), padding=0)
+
+    def get_ylim(self) -> tuple[float, float]:
+        vb = self._view_box
+        if vb is None or not hasattr(vb, "viewRange"):
+            return (0.0, 0.0)
+        _x_range, y_range = vb.viewRange()
+        return float(y_range[0]), float(y_range[1])
+
+    def set_ylim(self, lo: float, hi: float) -> None:
+        vb = self._view_box
+        if vb is None or not hasattr(vb, "setYRange"):
+            return
+        before = self.get_ylim()
+        vb.setYRange(float(lo), float(hi), padding=0)
+        after = self.get_ylim()
+        if before != after:
+            self._notify_dense_raster_y_changed()
+
+    def get_engineering_xlim(self) -> tuple[float, float]:
+        """Visible X limits in user engineering units.
+
+        Linear mode matches ``get_xlim``. Log mode inverts the ViewBox's
+        log10 coordinates so the result is the range the ticks read.
+        """
+        lo, hi = self.get_xlim()
+        return _view_to_engineering_limits(self.get_xscale(), lo, hi)
+
+    def get_engineering_ylim(self) -> tuple[float, float]:
+        """Visible Y limits in user engineering units. See ``get_engineering_xlim``."""
+        lo, hi = self.get_ylim()
+        return _view_to_engineering_limits(self.get_yscale(), lo, hi)
+
+    def set_engineering_xlim(self, lo, hi) -> bool:
+        """Apply an engineering X range. Returns False when the range is rejected.
+
+        ``get_xlim`` / ``set_xlim`` stay in ViewBox coordinates. This method is
+        the dialog boundary: linear values pass through, log values become
+        ``log10`` so they line up with already log-mapped curves and ticks.
+        Illegal limits (non-finite, non-positive on a log axis, empty or
+        reversed) leave the ViewBox and curves untouched. Non-scalar shape or
+        a non-numeric dtype raises ``ValueError`` before any write.
+        """
+        return self._set_engineering_limit("x", lo, hi)
+
+    def set_engineering_ylim(self, lo, hi) -> bool:
+        """Apply an engineering Y range. See ``set_engineering_xlim``."""
+        return self._set_engineering_limit("y", lo, hi)
+
+    def _set_engineering_limit(self, axis: str, lo, hi) -> bool:
+        limits = _engineering_to_view_limits(
+            self.get_xscale() if axis == "x" else self.get_yscale(),
+            lo,
+            hi,
+        )
+        if limits is None:
+            return False
+        vb = self._view_box
+        setter_name = "setXRange" if axis == "x" else "setYRange"
+        if vb is None or not hasattr(vb, setter_name):
+            return False
+        if axis == "x":
+            self.set_xlim(*limits)
+        else:
+            self.set_ylim(*limits)
+        return True
+
+    def supports_log_scale(self, axis: str) -> bool:
+        """Whether this chart can put ``axis`` into log mode.
+
+        The base implementation accepts every axis. Heatmap subclasses
+        override this when their image has no log mapping.
+        """
+        return True
+
+    def supports_legend_rebuild(self) -> bool:
+        """Whether automatic legend rebuild applies to this chart."""
+        return True
+
+    def chart_options_target_text(self) -> str:
+        """Name the chart-options target: explicit canvas text, else axis role."""
+        custom = getattr(self, "_chart_options_target", "")
+        if isinstance(custom, str) and custom.strip():
+            return custom.strip()
+        role = "副轴" if self._is_secondary_y_axis() else "主轴"
+        title = _normalized_title(self.get_title())
+        if title:
+            return f"{role}：{title}"
+        return role
+
+    def shares_x_axis(self) -> bool:
+        """True when this pane's X limits are shared with another pane."""
+        return bool(getattr(self, "_shares_x_axis", False))
+
+    def _is_secondary_y_axis(self) -> bool:
+        axis = self.y_axis_item()
+        return getattr(axis, "orientation", "") == "right"
+
+    def autoscale(self, axis: str = "both") -> None:
+        vb = self._view_box
+        if vb is None:
+            return
+        # ViewBox.enableAutoRange accepts axis flags ('x', 'y',
+        # 'both'/'xy'). Treat anything else as a no-op for compatibility
+        # with the dialog's loose axis argument handling.
+        if not hasattr(vb, "enableAutoRange"):
+            return
+        if axis == "x":
+            # TimeDomain PlotDataItems hold only the current viewport envelope.
+            # Prime them from the owner's raw X union before asking pyqtgraph to
+            # calculate auto bounds, otherwise Auto-X expands iteratively from
+            # the already-clipped curve and briefly paints only its middle.
+            owner = self._owner_canvas
+            get_union = getattr(owner, "get_data_x_union", None)
+            restore = getattr(owner, "restore_visible_xlim", None)
+            if callable(get_union) and callable(restore):
+                x_union = get_union()
+                if x_union is not None:
+                    restore(x_union, flush=True)
+            vb.enableAutoRange(axis="x")
+        elif axis == "y":
+            vb.enableAutoRange(axis="y")
+            self._notify_dense_raster_y_changed()
+        else:
+            vb.enableAutoRange()
+            self._notify_dense_raster_y_changed()
+
+    # Scales ----------------------------------------------------------------
+    def _is_primary_plot_view(self) -> bool:
+        pi = self._plot_item
+        if pi is None or not hasattr(pi, "getViewBox"):
+            return False
+        try:
+            return self._view_box is pi.getViewBox()
+        except Exception:
+            return False
+
+    def _plot_data_items(self):
+        items = []
+        if self._line_items:
+            items.extend(self._line_items)
+        pi = self._plot_item
+        if pi is not None and self._is_primary_plot_view() and hasattr(pi, "listDataItems"):
+            try:
+                items.extend(list(pi.listDataItems()))
+            except Exception:
+                pass
+        unique = []
+        for item in items:
+            if item not in unique:
+                unique.append(item)
+        return unique
+
+    def _apply_data_log_mode(self):
+        x_log = self._xscale == "log"
+        y_log = self._yscale == "log"
+        for item in self._plot_data_items():
+            setter = getattr(item, "setLogMode", None)
+            if callable(setter):
+                try:
+                    setter(x_log, y_log)
+                except Exception:
+                    pass
+
+    def set_xscale(self, scale: str) -> None:
+        normalized = "log" if scale == "log" else "linear"
+        changed = normalized != self._xscale
+        self._xscale = normalized
+        pi = self._plot_item
+        if pi is not None and hasattr(pi, "setLogMode") and self._is_primary_plot_view():
+            pi.setLogMode(x=(normalized == "log"))
+        axis = self.x_axis_item()
+        if axis is not None and hasattr(axis, "setLogMode"):
+            try:
+                axis.setLogMode(normalized == "log")
+            except Exception:
+                pass
+        self._apply_data_log_mode()
+        if changed:
+            self._notify_dense_raster_scale_changed()
+        self._note_owner_axis_scale("x", normalized)
+
+    def set_yscale(self, scale: str) -> None:
+        normalized = "log" if scale == "log" else "linear"
+        changed = normalized != self._yscale
+        self._yscale = normalized
+        pi = self._plot_item
+        if pi is not None and hasattr(pi, "setLogMode") and self._is_primary_plot_view():
+            pi.setLogMode(y=(normalized == "log"))
+        axis = self.y_axis_item()
+        if axis is not None and hasattr(axis, "setLogMode"):
+            try:
+                axis.setLogMode(normalized == "log")
+            except Exception:
+                pass
+        self._apply_data_log_mode()
+        if changed:
+            self._notify_dense_raster_scale_changed()
+        self._note_owner_axis_scale("y", normalized)
+
+    def _note_owner_axis_scale(self, axis: str, scale: str) -> None:
+        """Tell a line canvas which role just changed scale.
+
+        Chart options set the scale, then the analysis range policy replots.
+        The canvas has to know the new scale before that replot writes ranges.
+        """
+        owner = getattr(self, "_owner_canvas", None)
+        note = getattr(owner, "note_chart_axis_scale", None)
+        if not callable(note):
+            return
+        role = getattr(self, "_chart_options_target", "")
+        note(str(role or ""), axis, scale)
+
+    def _notify_dense_raster_scale_changed(self) -> None:
+        owner = getattr(self, "_owner_canvas", None)
+        callback = getattr(owner, "_on_pg_axis_scale_changed", None)
+        if callable(callback):
+            callback()
+
+    def _notify_dense_raster_y_changed(self) -> None:
+        owner = getattr(self, "_owner_canvas", None)
+        callback = getattr(owner, "_on_pg_axis_ylim_changed", None)
+        if callable(callback):
+            callback()
+
+    def get_xscale(self) -> str:
+        # Prefer the cached write-through state. If a caller toggled the
+        # PlotItem controls directly before constructing the handle, the
+        # constructor seeded this value from those checkboxes.
+        return self._xscale
+
+    def get_yscale(self) -> str:
+        return self._yscale
+
+    # Labels ----------------------------------------------------------------
+    def get_xlabel(self) -> str:
+        ax = self._ax("bottom")
+        if ax is None:
+            return ""
+        # AxisItem stores its label inside .labelText (a plain string) on
+        # 0.14; fall back to introspecting the QGraphicsTextItem for older
+        # builds.
+        text = getattr(ax, "labelText", None)
+        if text:
+            return str(text)
+        lbl = getattr(ax, "label", None)
+        if lbl is not None and hasattr(lbl, "toPlainText"):
+            return str(lbl.toPlainText())
+        return ""
+
+    def set_xlabel(self, label: str) -> None:
+        ax = self._ax("bottom")
+        if ax is None:
+            return
+        ax.setLabel(text=label)
+
+    def get_ylabel(self) -> str:
+        ax = self.y_axis_item()
+        if ax is None:
+            return ""
+        text = getattr(ax, "labelText", None)
+        if text:
+            return str(text)
+        lbl = getattr(ax, "label", None)
+        if lbl is not None and hasattr(lbl, "toPlainText"):
+            return str(lbl.toPlainText())
+        return ""
+
+    def set_ylabel(self, label: str) -> None:
+        ax = self.y_axis_item()
+        if ax is None:
+            return
+        ax.setLabel(text=label)
+
+    def get_title(self) -> str:
+        pi = self._plot_item
+        if pi is None:
+            return ""
+        # PlotItem keeps the title on .titleLabel (a LabelItem). Fall
+        # back to its 'text' attribute or the underlying TextItem.
+        title_label = getattr(pi, "titleLabel", None)
+        if title_label is None:
+            return ""
+        text = getattr(title_label, "text", "")
+        if isinstance(text, str):
+            return text
+        # LabelItem.text may be an HTML-wrapped string; return as-is so
+        # callers can compare on a substring.
+        try:
+            return str(text)
+        except Exception:
+            return ""
+
+    def set_title(self, title: str) -> None:
+        pi = self._plot_item
+        if pi is None or not hasattr(pi, "setTitle"):
+            return
+        # Blank input is an explicit delete. pyqtgraph only collapses the
+        # title row for None; "" still occupies the 30 px display branch.
+        # The callback still receives "" so inside-labels can come back.
+        normalized = _normalized_title(title)
+        if normalized == "":
+            pi.setTitle(None)
+            _clear_title_label_text(pi)
+        else:
+            pi.setTitle(normalized)
+        for callback in list(self._title_changed_callbacks):
+            try:
+                callback(self, normalized)
+            except Exception:
+                pass
+
+    def add_title_changed_callback(self, callback) -> None:
+        if callback not in self._title_changed_callbacks:
+            self._title_changed_callbacks.append(callback)
+
+    # Grid ------------------------------------------------------------------
+    def grid(self, enabled: bool) -> None:
+        pi = self._plot_item
+        if pi is None or not hasattr(pi, "showGrid"):
+            return
+        self._grid_enabled = bool(enabled)
+        from mf4_analyzer.ui.pg_canvas import _shared
+        _shared.show_major_grid_left_bottom_only(
+            pi,
+            x=self._grid_enabled,
+            y=self._grid_enabled if self._allow_y_grid else False,
+            alpha=0.28,
+        )
+
+    def is_grid_enabled(self) -> bool:
+        try:
+            bottom = self._ax("bottom")
+            if bottom is not None:
+                return bool(getattr(bottom, "grid", False))
+        except Exception:
+            pass
+        return bool(self._grid_enabled)
+
+    def analysis_range_policy(self):
+        adapter = getattr(self._owner_canvas, "analysis_range_adapter", None)
+        # The spectrum preview has a different coordinate space.
+        primary = getattr(self._owner_canvas, "_plot_amp", self._plot_item)
+        if adapter is None or self._plot_item is not primary:
+            return None
+        return adapter[0]()
+
+    def apply_analysis_range_policy(self, policies):
+        if self.analysis_range_policy() is None:
+            return False
+        self._owner_canvas.analysis_range_adapter[1](policies)
+        return True
+
+    def is_autorange(self, axis: str = "x") -> bool:
+        policy = self.analysis_range_policy()
+        if policy is not None:
+            return bool(policy.get(axis + "_auto", policy.get("autoscale", True) if axis == "x" else True))
+        vb = self._view_box
+        state = getattr(vb, "state", None) if vb is not None else None
+        if not isinstance(state, dict):
+            return False
+        flags = state.get("autoRange") or [False, False]
+        idx = 1 if str(axis).lower().startswith("y") else 0
+        try:
+            return bool(flags[idx])
+        except (IndexError, KeyError, TypeError):
+            return False
+
+    # Lines + mappables -----------------------------------------------------
+    def get_lines(self) -> list[LineHandle]:
+        if hasattr(self, "_line_items") and self._line_items:
+            return [
+                _PgLineHandle(pdi)
+                for pdi in list(self._line_items)
+                if not hasattr(pdi, "isVisible") or pdi.isVisible()
+            ]
+        pi = self._plot_item
+        if pi is None:
+            return []
+        # PlotItem.listDataItems() returns PlotDataItems attached to the
+        # plot (the curves we drew via pi.plot() or pi.addItem(pdi)).
+        items = []
+        if hasattr(pi, "listDataItems"):
+            try:
+                items = list(pi.listDataItems())
+            except Exception:
+                items = []
+        return [
+            _PgLineHandle(pdi)
+            for pdi in items
+            if not hasattr(pdi, "isVisible") or pdi.isVisible()
+        ]
+
+    def get_mappables(self) -> list[object]:
+        # Time-domain has no images / colorscales; design §5.3 says the
+        # mappable list returns empty so the ColorMap/ColorScale group
+        # of ChartOptionsDialog disables (not hides) itself.
+        return []
+
+    def rebuild_legend(self) -> None:
+        pi = self._plot_item
+        if pi is None:
+            return
+        legend = getattr(pi, "legend", None)
+        if legend is None:
+            add_legend = getattr(pi, "addLegend", None)
+            if not callable(add_legend):
+                return
+            legend = add_legend()
+        clear = getattr(legend, "clear", None)
+        if callable(clear):
+            clear()
+        # Deduplicate by the curve itself (or its composite source/channel
+        # key), never by the display string. Two channels can share a
+        # truncated label and still be different curves.
+        entries = []
+        seen_items: set[int] = set()
+        seen_keys: set[tuple] = set()
+        for line in self.get_lines():
+            label = line.get_label()
+            if not label or label.startswith("_"):
+                continue
+            item = getattr(line, "plot_data_item", line)
+            item_id = id(item)
+            if item_id in seen_items:
+                continue
+            composite = self._composite_key_for_line(
+                getattr(self, "_owner_canvas", None), line,
+            )
+            key = _legend_identity_key(composite)
+            if key is not None and key in seen_keys:
+                continue
+            seen_items.add(item_id)
+            if key is not None:
+                seen_keys.add(key)
+            entries.append((item, label, composite))
+        label_counts: dict[str, int] = {}
+        for _item, label, _composite in entries:
+            label_counts[label] = label_counts.get(label, 0) + 1
+        for item, label, composite in entries:
+            text = label
+            if label_counts[label] > 1:
+                qualifier = _legend_source_text(composite, label)
+                if qualifier:
+                    text = f"{label} [{qualifier}]"
+            try:
+                legend.addItem(item, text)
+            except Exception:
+                continue
+
+    def sync_line_axis_color(self, line: LineHandle, color: str) -> None:
+        try:
+            import pyqtgraph as pg
+        except Exception:
+            return
+        axis = self.y_axis_item()
+        if axis is None:
+            return
+        try:
+            axis.setPen(
+                pg.mkPen(color=PG_AXIS_NEUTRAL_COLOR, width=PG_AXIS_NEUTRAL_WIDTH)
+            )
+        except Exception:
+            pass
+        try:
+            axis.setTextPen(pg.mkPen(color=color))
+        except Exception:
+            pass
+        owner = getattr(self, "_owner_canvas", None)
+        sync = getattr(owner, "_sync_pg_channel_color", None)
+        if not callable(sync):
+            return
+        # Resolve the COMPOSITE (data_id, name) identity of the exact curve the
+        # user recolored, not the bare display label. Two files whose names
+        # truncate to the same ``[short_name]`` prefix share a display label, so
+        # a bare-name write resolves (last-bound-wins) to the WRONG file's
+        # entry; this is the same multi-file same-name collision class the
+        # canvas storage already fixes with the composite key. ``get_lines``
+        # hands back a FRESH _PgLineHandle each call, so match on the underlying
+        # PlotDataItem identity (stable), then prefer that composite key.
+        target = self._composite_key_for_line(owner, line)
+        if target is None:
+            try:
+                target = line.get_label()
+            except Exception:
+                target = ""
+        if target:
+            sync(target, color)
+
+    def _composite_key_for_line(self, owner, line):
+        """Return the composite (data_id, name) key for ``line`` on ``owner``.
+
+        Matches by the underlying ``PlotDataItem`` identity against the owner
+        canvas's ``_channel_lines`` (which stores ``(axis_handle, line_handle)``
+        under each composite key). Returns ``None`` when no match — the caller
+        then falls back to the bare display label so legacy/non-canvas hosts
+        still sync.
+        """
+        if owner is None:
+            return None
+        channel_lines = getattr(owner, "_channel_lines", None)
+        composite_items = getattr(channel_lines, "composite_items", None)
+        if not callable(composite_items):
+            return None
+        try:
+            target_pdi = line.plot_data_item
+        except Exception:
+            target_pdi = None
+        if target_pdi is None:
+            return None
+        try:
+            for ck, _name, pair in composite_items():
+                stored_line = pair[1] if len(pair) > 1 else None
+                stored_pdi = getattr(stored_line, "plot_data_item", None)
+                if stored_pdi is target_pdi:
+                    return ck
+        except Exception:
+            return None
+        return None
+
+    def x_axis_item(self):
+        return self._ax("bottom")
+
+    def y_axis_item(self):
+        if self._axis_item is not None:
+            return self._axis_item
+        return self._ax("left")
+
+    def add_line_item(self, plot_data_item) -> None:
+        if not hasattr(self, "_line_items"):
+            self._line_items = []
+        if plot_data_item not in self._line_items:
+            self._line_items.append(plot_data_item)
+
+    # Redraw ----------------------------------------------------------------
+    def request_redraw(self) -> None:
+        # ChartOptionsDialog applies every scale/range/label mutation before
+        # reaching this tail.  A TimeDomain PlotDataItem contains only the
+        # current viewport envelope, so finish any X-range refresh now instead
+        # of briefly repainting that stale envelope against the new ViewBox.
+        # Ordering is load-bearing: mutate first, then flush once.
+        owner = self._owner_canvas
+        flush = getattr(owner, "_flush_pending_refresh", None)
+        if callable(flush) and bool(getattr(owner, "_refresh_pending", False)):
+            flush()
+        pi = self._plot_item
+        if pi is None:
+            return
+        # The PlotItem's scene re-renders automatically on data/limit
+        # changes; we trigger an explicit update() pass on the scene so
+        # the chart-options dialog Apply path sees a frame promptly.
+        try:
+            scene = pi.scene() if callable(getattr(pi, "scene", None)) else None
+            if scene is not None and hasattr(scene, "update"):
+                scene.update()
+        except Exception:
+            pass
+
+    # Escape hatch ---------------------------------------------------------
+    @property
+    def plot_item(self):
+        """Raw pyqtgraph ``PlotItem`` for code that still needs the
+        underlying artist. Migration-temporary."""
+        return self._plot_item
+
+    @property
+    def view_box(self):
+        """Raw pyqtgraph ``ViewBox``. Used by interaction helpers and
+        the cursor/overlay layer. Migration-temporary."""
+        return self._view_box
+
+
+def _normalized_title(title) -> str:
+    """Map None and whitespace to an explicit empty title."""
+    if title is None:
+        return ""
+    return str(title).strip()
+
+
+def _clear_title_label_text(plot_item) -> None:
+    """Drop readable title text without reopening the title row.
+
+    ``PlotItem.setTitle(None)`` hides the row but leaves ``titleLabel.text``
+    in place, so the next dialog would read the deleted title back.
+    """
+    label = getattr(plot_item, "titleLabel", None)
+    if label is None:
+        return
+    label.text = ""
+    item = getattr(label, "item", None)
+    set_plain = getattr(item, "setPlainText", None)
+    if callable(set_plain):
+        set_plain("")
+
+
+def _limit_scalar(value) -> float:
+    """Coerce one numeric limit. Non-scalars fail instead of being shortened."""
+    if isinstance(value, bool):
+        raise ValueError("axis limit must be a real scalar, not bool")
+    shape = getattr(value, "shape", None)
+    if shape is not None:
+        shape = tuple(shape)
+        size = getattr(value, "size", None)
+        if shape != () and size != 1:
+            raise ValueError(f"axis limit must be one scalar, got shape {shape}")
+        dtype = getattr(value, "dtype", None)
+        kind = getattr(dtype, "kind", None)
+        if kind is not None and kind not in "iuf":
+            raise ValueError(f"axis limit dtype {dtype} is not real")
+        if shape != ():
+            value = value.reshape(-1)[0]
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("axis limit must be a real scalar") from exc
+
+
+def _engineering_to_view_limits(scale: str, lo, hi):
+    """Return ViewBox limits, or None when the engineering range must not be written."""
+    lo_f = _limit_scalar(lo)
+    hi_f = _limit_scalar(hi)
+    if not math.isfinite(lo_f) or not math.isfinite(hi_f) or lo_f >= hi_f:
+        return None
+    if scale == "log":
+        if lo_f <= 0.0 or hi_f <= 0.0:
+            return None
+        return (math.log10(lo_f), math.log10(hi_f))
+    return (lo_f, hi_f)
+
+
+def _view_to_engineering_limits(scale: str, lo: float, hi: float) -> tuple[float, float]:
+    if scale != "log":
+        return (float(lo), float(hi))
+    lo_f = float(lo)
+    hi_f = float(hi)
+    if not math.isfinite(lo_f) or not math.isfinite(hi_f):
+        raise ValueError(f"log view range is not finite: {(lo_f, hi_f)}")
+    eng_lo = 10.0 ** lo_f
+    eng_hi = 10.0 ** hi_f
+    if not math.isfinite(eng_lo) or not math.isfinite(eng_hi):
+        raise ValueError("log view range is outside a finite engineering span")
+    return (eng_lo, eng_hi)
+
+
+def _legend_identity_key(composite):
+    if composite is None:
+        return None
+    if isinstance(composite, (list, tuple)):
+        return ("composite", tuple(composite))
+    return ("composite", composite)
+
+
+def _split_composite_identity(composite):
+    if isinstance(composite, (list, tuple)):
+        source = composite[0] if composite else None
+        channel = composite[1] if len(composite) > 1 else None
+        return source, channel
+    if isinstance(composite, str):
+        try:
+            parsed = json.loads(composite)
+        except json.JSONDecodeError:
+            return composite, None
+        if isinstance(parsed, list):
+            source = parsed[0] if parsed else None
+            channel = parsed[1] if len(parsed) > 1 else None
+            return source, channel
+    return composite, None
+
+
+def _legend_source_text(composite, display_label: str) -> str:
+    """Source text for a duplicate legend label. Display name is not the key."""
+    source, channel = _split_composite_identity(composite)
+    parts = []
+    if source not in (None, ""):
+        parts.append(str(source))
+    if channel not in (None, "") and str(channel) != display_label:
+        parts.append(str(channel))
+    if not parts and composite not in (None, ""):
+        return str(composite)
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Construction-site dispatcher
+# ---------------------------------------------------------------------------
+
+
+def make_handle(axis_or_handle) -> AxisHandle:
+    """Return an existing pyqtgraph chart-axis handle.
+
+    Callers must pass objects that already satisfy ``AxisHandle``; raw
+    renderer objects are no longer adapted here.
+    """
+    if isinstance(axis_or_handle, AxisHandle):
+        return axis_or_handle
+    raise TypeError(f"unsupported axis object: {type(axis_or_handle).__name__}")

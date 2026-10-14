@@ -1,0 +1,276 @@
+from enum import StrEnum
+from pathlib import Path
+from typing import Any, Literal, Protocol
+
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
+
+from measure.const import MODEL_ID_MAX_LENGTH, MeasureType
+from measure.contribution.github import UPSTREAM_BRANCH, UPSTREAM_OWNER, UPSTREAM_REPO
+from measure.request import FixedMeasurementRequest, MeasurementRequest, RecorderMeasurementRequest, RecorderPurpose
+
+SUPPORTED_MEASURE_TYPES = {
+    MeasureType.LIGHT,
+    MeasureType.SPEAKER,
+    MeasureType.FAN,
+    MeasureType.SMART_SWITCH,
+    MeasureType.FIXED,
+    MeasureType.CHARGING,
+    MeasureType.RECORDER,
+}
+
+AUTOMATIC_CONTRIBUTION_MESSAGE = (
+    "Automatic contribution is available for light, speaker, fan, smart switch, fixed, charging, "
+    "and analysed recorder profiles"
+)
+
+
+def supports_automatic_contribution(request: MeasurementRequest) -> bool:
+    """Return whether this request can produce a profile-library contribution."""
+
+    if request.measure_type not in SUPPORTED_MEASURE_TYPES:
+        return False
+    return not isinstance(request, RecorderMeasurementRequest) or (
+        request.recorder_purpose is RecorderPurpose.COMPLEX_PROFILE
+    )
+
+
+def contribution_entity_ids(request: MeasurementRequest) -> list[str]:
+    """Return the entities which identify the contributed device.
+
+    Recorder analysis intentionally models the first recorded entity. Other recorded
+    entities are explanatory inputs and may belong to a different Home Assistant
+    device, so they must not dilute the integration or device metadata defaults.
+    """
+
+    if isinstance(request, RecorderMeasurementRequest):
+        return request.recorded_entity_ids[:1]
+    if isinstance(request, FixedMeasurementRequest):
+        return [request.device_id]
+    return request.controlled_entity_ids
+
+
+class ContributionAuthMethod(StrEnum):
+    NONE = "none"
+    PAT = "token"
+    OAUTH_DEVICE = "device"
+
+
+class ContributionState(StrEnum):
+    """UI-facing contribution state, one per app install, persisted by ``SessionStorage``.
+
+    Tracks where the user is in the preview/submit flow. The per-job source of truth
+    is ``measure.contribution.models.ContributionJobStatus``; this state adds the
+    app-only ``IDLE``/``PREVIEW_READY`` phases and drives the frontend.
+    """
+
+    IDLE = "idle"
+    PREVIEW_READY = "preview_ready"
+    SUBMITTING = "submitting"
+    SUBMITTED = "submitted"
+    FAILED = "failed"
+
+
+class ContributionApiErrorCode(StrEnum):
+    AUTH_UNAVAILABLE = "auth_unavailable"
+    SESSION_REQUIRED = "session_required"
+    SESSION_NOT_READY = "session_not_ready"
+    PREVIEW_REQUIRED = "preview_required"
+    CONTRIBUTION_ACTIVE = "contribution_active"
+    ARTIFACTS_REQUIRED = "artifacts_required"
+    INVALID_METADATA = "invalid_metadata"
+    FLOW_NOT_FOUND = "flow_not_found"
+    SUBMISSION_FAILED = "submission_failed"
+
+
+class ContributionApiError(Exception):
+    def __init__(self, code: ContributionApiErrorCode, message: str, *, field: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.field = field
+
+
+class ContributionIdentity(BaseModel):
+    login: str
+
+
+class ContributionAuthStatus(BaseModel):
+    authenticated: bool
+    connected: bool = False
+    method: ContributionAuthMethod = ContributionAuthMethod.NONE
+    identity: ContributionIdentity | None = None
+    username: str | None = None
+    device_flow_available: bool = False
+    scopes: list[str] = Field(default_factory=list)
+    permissions_verified: bool = False
+
+
+class ConnectPatRequest(BaseModel):
+    token: SecretStr = Field(min_length=1)
+
+
+class DeviceFlowStart(BaseModel):
+    """What GitHub returns when a device flow starts, before the app assigns a public flow id.
+
+    ``device_code`` is the secret used to poll for the token; it is excluded from
+    serialization so it can never reach a client.
+    """
+
+    device_code: str = Field(exclude=True)
+    user_code: str
+    verification_uri: str
+    verification_uri_complete: str | None = None
+    expires_in: int
+    interval: int
+    message: str
+
+    def with_flow_id(self, flow_id: str) -> DeviceFlowStartResponse:
+        """Attach the app-assigned flow id clients poll with."""
+        # vars() rather than model_dump(): the latter drops the excluded device_code.
+        return DeviceFlowStartResponse(flow_id=flow_id, **vars(self))
+
+
+class DeviceFlowStartResponse(DeviceFlowStart):
+    flow_id: str
+
+
+class DeviceFlowPollStatus(StrEnum):
+    PENDING = "pending"
+    SLOW_DOWN = "slow_down"
+    AUTHORIZED = "authorized"
+    EXPIRED = "expired"
+    DENIED = "denied"
+
+
+class DeviceFlowPollResponse(BaseModel):
+    status: DeviceFlowPollStatus
+    auth: ContributionAuthStatus | None = None
+    message: str | None = None
+    retry_after: int | None = Field(default=None, ge=1)
+
+
+class ContributionFile(BaseModel):
+    name: str
+    path: str
+    size: int
+    content: str | None = None
+    rendered_json: Any | None = None
+
+
+class ContributionPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    manufacturer_name: str = Field(min_length=1, max_length=200)
+    model_id: str = Field(min_length=1, max_length=MODEL_ID_MAX_LENGTH)
+    product_name: str = Field(min_length=1, max_length=200)
+    contributor: str = Field(min_length=1, max_length=200)
+    contributor_github: str | None = Field(default=None, max_length=100)
+    contributor_email: str | None = Field(default=None, max_length=200)
+    aliases: list[str] = Field(default_factory=list)
+    gtins: list[str] = Field(default_factory=list)
+    product_url: str | None = Field(default=None, max_length=2_000)
+    mains_voltage: Literal[120, 230] | None = None
+    device_specs: dict[str, Any] | None = None
+    standby_power: float | None = Field(default=None, ge=0.05, allow_inf_nan=False, strict=True)
+    standby_power_estimated: bool | None = None
+    measure_device: str | None = Field(default=None, max_length=200)
+    measure_device_firmware: str | None = Field(default=None, max_length=200)
+    measure_description: str | None = Field(default=None, max_length=2_000)
+    notes: str = Field(default="", max_length=2_000)
+
+
+class ContributionSubmitRequest(ContributionPreviewRequest):
+    confirmed: Literal[True]
+
+
+class ContributionPreviewResponse(BaseModel):
+    session_id: str
+    eligible: bool
+    reason: str | None = None
+    repository: str = f"{UPSTREAM_OWNER}/{UPSTREAM_REPO}"
+    fork_repository: str | None = None
+    base_branch: str = UPSTREAM_BRANCH
+    base_sha: str | None = None
+    manufacturer_name: str
+    manufacturer_directory: str
+    manufacturer_library_url: str | None = None
+    model_id: str
+    product_name: str
+    contributor: str
+    contributor_github: str = ""
+    contributor_email: str = ""
+    aliases: list[str] = Field(default_factory=list)
+    gtins: list[str] = Field(default_factory=list)
+    product_url: str = ""
+    mains_voltage: Literal[120, 230] | None = None
+    voltage_range: dict[str, float] | None = None
+    device_specs: dict[str, Any] | None = None
+    device_type: str = ""
+    standby_power: float | None = None
+    standby_power_estimated: bool = False
+    measure_device: str = ""
+    measure_device_firmware: str = ""
+    measure_description: str = ""
+    device_info: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+    home_assistant: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+    notes: str = ""
+    files: list[ContributionFile]
+    model_json: Any | None = None
+    commit_message: str
+    pr_title: str
+    pr_body: str
+    branch_name: str
+    job_id: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ContributionSubmissionResult(BaseModel):
+    status: Literal["success", "failed", "pending"] = "success"
+    pull_request_url: str | None = None
+    repository: str = f"{UPSTREAM_OWNER}/{UPSTREAM_REPO}"
+    branch_name: str | None = None
+    message: str
+
+
+class ContributionStatus(BaseModel):
+    state: ContributionState = ContributionState.IDLE
+    session_id: str | None = None
+    preview: ContributionPreviewResponse | None = None
+    submission_url: str | None = None
+    message: str | None = None
+    error: str | None = None
+    updated_at: str | None = None
+
+
+class ContributionService(Protocol):
+    def auth_status(self) -> ContributionAuthStatus: ...
+
+    def connect_pat(self, token: SecretStr) -> ContributionAuthStatus: ...
+
+    def disconnect(self) -> ContributionAuthStatus: ...
+
+    def start_device_flow(self, client_id: str) -> DeviceFlowStart: ...
+
+    def poll_device_flow(self, client_id: str, device_code: str) -> DeviceFlowPollResponse: ...
+
+    def build_preview(
+        self,
+        *,
+        session_id: str,
+        request: MeasurementRequest,
+        artifact_root: Path,
+        payload: ContributionPreviewRequest | None,
+        integration: str | None = None,
+    ) -> ContributionPreviewResponse: ...
+
+    def prepared_archive(self, job_id: str) -> bytes: ...
+
+    def submit(
+        self,
+        *,
+        preview: ContributionPreviewResponse,
+        artifact_root: Path,
+    ) -> ContributionSubmissionResult: ...
+
+
+class ContributionServiceFactory(Protocol):
+    def __call__(self) -> ContributionService: ...

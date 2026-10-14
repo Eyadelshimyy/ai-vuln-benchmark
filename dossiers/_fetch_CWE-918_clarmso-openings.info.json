@@ -1,0 +1,22 @@
+{
+  "repo_url": "https://github.com/clarmso/openings.info.git",
+  "commit": "",
+  "file": "src/http.py",
+  "function": "_fetch",
+  "cwe": "CWE-918",
+  "param": "url",
+  "payload": "http://127.0.0.1:46707/fc74377d3442",
+  "verdict": "NEEDS_MANUAL",
+  "detail": "target '_fetch' is internal (underscore-prefixed or under a private module). An external attacker reaches it only via a public caller / CLI / HTTP entry -- trace that path by hand before disclosing.",
+  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:46707/fc74377d3442",
+  "tier2_sink": "urllib.request.urlopen",
+  "reachable": true,
+  "entry_kind": "api",
+  "call_path": [
+    "fetch_json",
+    "_fetch"
+  ],
+  "reproduce_verdict": "NEEDS_MANUAL",
+  "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
+  "repo_full": "clarmso/openings.info"
+}

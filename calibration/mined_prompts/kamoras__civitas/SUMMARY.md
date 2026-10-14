@@ -1,0 +1,278 @@
+# Mined prompts: kamoras__civitas
+
+265 on-topic candidate function(s) found across 404 files.
+265 selected (spread across CWEs, capped at --limit 300).
+
+- CWE-22: 81 selected (of 81 total candidates)
+- CWE-611: 82 selected (of 82 total candidates)
+- CWE-78: 21 selected (of 21 total candidates)
+- CWE-89: 71 selected (of 71 total candidates)
+- CWE-918: 24 selected (of 24 total candidates)
+
+## Selected functions
+
+- **write_text_atomic** (CWE-22) -- `backend/app/atomic_write.py:59`
+- **_senate_amended_bill** (CWE-611) -- `backend/app/pipeline/congress_activity.py:439`
+- **get_explore_document_summary** (CWE-78) -- `backend/app/api/explore.py:407`
+- **health_check** (CWE-89) -- `backend/app/api/health.py:28`
+- **check_feedback_token_expiration** (CWE-918) -- `backend/app/ops_alerts.py:364`
+- **update_json_file** (CWE-22) -- `backend/app/atomic_write.py:116`
+- **statement_links** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_al.py:78`
+- **limit** (CWE-78) -- `backend/app/api/explore.py:450`
+- **_open** (CWE-89) -- `backend/app/api/throttle.py:161`
+- **_resolve_url** (CWE-918) -- `backend/app/pipeline/analyze/action_center.py:1157`
+- **_init_lock** (CWE-22) -- `backend/app/database.py:859`
+- **issue_links** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_ar.py:125`
+- **_run_pipeline_background** (CWE-78) -- `backend/app/api/justices.py:45`
+- **__enter__** (CWE-89) -- `backend/app/api/throttle.py:249`
+- **fetch_og_card** (CWE-918) -- `backend/app/pipeline/analyze/bluesky_utils.py:134`
+- **read_json** (CWE-22) -- `backend/app/file_cache.py:88`
+- **pamphlet_urls** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_az.py:287`
+- **_run_pipeline_background** (CWE-78) -- `backend/app/api/presidents.py:51`
+- **__exit__** (CWE-89) -- `backend/app/api/throttle.py:259`
+- **build_link_card** (CWE-918) -- `backend/app/pipeline/analyze/bluesky_utils.py:147`
+- **_take_pipeline_role_lock** (CWE-22) -- `backend/app/main.py:319`
+- **names_general_election** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_ca.py:88`
+- **run** (CWE-78) -- `backend/app/api/public_mcp.py:155`
+- **_purge_expired** (CWE-89) -- `backend/app/api/throttle.py:311`
+- **_call_llama_server** (CWE-918) -- `backend/app/pipeline/analyze/ollama_client.py:169`
+- **own_totals** (CWE-22) -- `backend/app/net_stats.py:45`
+- **proposition_links** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_ca.py:96`
+- **check** (CWE-78) -- `backend/app/api/rate_limit.py:87`
+- **_rotate** (CWE-89) -- `backend/app/api/throttle.py:342`
+- **_ftp_list** (CWE-918) -- `backend/app/pipeline/fetch/state_candidates_canvass_xml.py:51`
+- **page_words** (CWE-22) -- `backend/app/pipeline/fetch/ballot_measures_az.py:110`
+- **quick_reference_numbers** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_ca.py:116`
+- **try_spend_upstream** (CWE-78) -- `backend/app/api/rate_limit.py:161`
+- **_truncate_wal** (CWE-89) -- `backend/app/api/throttle.py:406`
+- **_ftp_get** (CWE-918) -- `backend/app/pipeline/fetch/state_candidates_canvass_xml.py:66`
+- **pdf_words** (CWE-22) -- `backend/app/pipeline/fetch/ballot_measures_ga.py:325`
+- **parse_title_summary** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_ca.py:160`
+- **spend_upstream** (CWE-78) -- `backend/app/api/rate_limit.py:180`
+- **hit** (CWE-89) -- `backend/app/api/throttle.py:537`
+- **_fetch_google_trends** (CWE-611, CWE-918) -- `backend/app/pipeline/fetch/trending.py:61`
+- **pdf_text** (CWE-22) -- `backend/app/pipeline/fetch/ballot_measures_in.py:107`
+- **parse_quick_reference** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_ca.py:186`
+- **public_read_limit** (CWE-78) -- `backend/app/api/rate_limit.py:219`
+- **claim** (CWE-89) -- `backend/app/api/throttle.py:605`
+- **download** (CWE-22, CWE-918) -- `backend/scripts/build_county_district_crosswalk.py:244`
+- **pdf_lines** (CWE-22) -- `backend/app/pipeline/fetch/ballot_measures_mi.py:109`
+- **search_form_fields** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_fl.py:77`
+- **track_visit** (CWE-78) -- `backend/app/api/visits.py:673`
+- **hold** (CWE-89) -- `backend/app/api/throttle.py:634`
+- **fetch** (CWE-22, CWE-918) -- `backend/scripts/build_name_casing.py:94`
+- **_first_page_text** (CWE-22) -- `backend/app/pipeline/fetch/ballot_measures_mt.py:173`
+- **listed_measures** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_fl.py:84`
+- **run_recorder** (CWE-78) -- `backend/app/net_stats.py:149`
+- **take** (CWE-89) -- `backend/app/api/throttle.py:653`
+- **_govtrack** (CWE-22, CWE-918) -- `backend/scripts/calibrate_commemorative.py:93`
+- **fetch_measures** (CWE-22) -- `backend/app/pipeline/fetch/ballot_measures_nm.py:180`
+- **parse_detail** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_fl.py:142`
+- **_refresh_open_comment_views** (CWE-78) -- `backend/app/pipeline/analyze/action_center.py:2543`
+- **held** (CWE-89) -- `backend/app/api/throttle.py:673`
+- **_get** (CWE-22, CWE-918) -- `backend/scripts/calibrate_lda_bill_match.py:73`
+- **pdf_words** (CWE-22) -- `backend/app/pipeline/fetch/ballot_measures_oh.py:396`
+- **find_booklet_url** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_ga.py:129`
+- **_retry_after_lapse** (CWE-78) -- `backend/app/pipeline/holdings_pipeline.py:902`
+- **tally** (CWE-89) -- `backend/app/api/throttle.py:696`
+- **_csv** (CWE-22, CWE-918) -- `backend/scripts/calibrate_position_confidence.py:120`
+- **fetch_measures** (CWE-22) -- `backend/app/pipeline/fetch/ballot_measures_or.py:93`
+- **parse_page** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_hi.py:53`
+- **_run_link** (CWE-78) -- `backend/app/pipeline_chain.py:156`
+- **tallied** (CWE-89) -- `backend/app/api/throttle.py:712`
+- **published** (CWE-918) -- `backend/scripts/check_torch_cpu_pin.py:85`
+- **fetch_measures** (CWE-22) -- `backend/app/pipeline/fetch/ballot_measures_ri.py:164`
+- **fetch_measures** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_hi.py:87`
+- **_mapshaper** (CWE-78) -- `backend/scripts/build_district_topology.py:154`
+- **clear** (CWE-89) -- `backend/app/api/throttle.py:731`
+- **load_donor_task** (CWE-918) -- `backend/scripts/evaluate_embedding_models.py:213`
+- **pdf_text** (CWE-22) -- `backend/app/pipeline/fetch/ballot_measures_state_common.py:150`
+- **election_option_value** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_il.py:55`
+- **routed_outcomes** (CWE-78) -- `backend/scripts/calibrate_committee_routing.py:150`
+- **_load_or_create_salt** (CWE-89) -- `backend/app/api/visits.py:341`
+- **main** (CWE-22, CWE-918) -- `backend/scripts/fetch_fec_party_codes.py:37`
+- **pdf_text_flow** (CWE-22) -- `backend/app/pipeline/fetch/ballot_measures_state_common.py:158`
+- **postback_form** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_il.py:66`
+- **nested** (CWE-78) -- `backend/scripts/calibrate_position_confidence.py:777`
+- **_set_sqlite_pragmas** (CWE-89) -- `backend/app/database.py:74`
+- **fetch** (CWE-22, CWE-918) -- `backend/scripts/fetch_occupation_industry.py:132`
+- **pdf_pages** (CWE-22) -- `backend/app/pipeline/fetch/ballot_measures_state_common.py:167`
+- **parse_questions_page** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_il.py:81`
+- **encode** (CWE-78) -- `backend/scripts/evaluate_embedding_models.py:371`
+- **_backfill_bsky_posted_facts** (CWE-89) -- `backend/app/database.py:310`
+- **main** (CWE-22, CWE-918) -- `backend/scripts/fetch_peer_gdp.py:38`
+- **_pdf_text** (CWE-22) -- `backend/app/pipeline/fetch/ballot_measures_wa.py:180`
+- **_summary_hrefs** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_in.py:88`
+- **main** (CWE-78) -- `backend/scripts/evaluate_industry_classifier.py:97`
+- **_migrate_state_office_tables** (CWE-89) -- `backend/app/database.py:360`
+- **main** (CWE-22, CWE-918) -- `backend/scripts/fetch_poll_close_times.py:178`
+- **_parse_pdf** (CWE-22) -- `backend/app/pipeline/fetch/ballot_pdf.py:320`
+- **parse_page** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_ky.py:66`
+- **main** (CWE-22, CWE-78) -- `backend/scripts/fetch_district_pvi.py:52`
+- **_migrate_presidents_schema_rebuild** (CWE-89) -- `backend/app/database.py:421`
+- **download** (CWE-22, CWE-918) -- `backend/scripts/fetch_state_leg_crosswalk.py:343`
+- **fetch_committee_contributions** (CWE-22) -- `backend/app/pipeline/fetch/fec.py:843`
+- **parse_page** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_md.py:79`
+- **main** (CWE-78) -- `backend/scripts/fetch_senate_classes.py:30`
+- **_migrate_president_ids** (CWE-89) -- `backend/app/database.py:454`
+- **_query** (CWE-918) -- `backend/scripts/fetch_state_leg_crosswalk.py:365`
+- **parse_annual_pdf** (CWE-22) -- `backend/app/pipeline/fetch/house_fd.py:251`
+- **_pdf_links** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_mi.py:87`
+- **_migrate_visits_data_to_own_db** (CWE-89) -- `backend/app/database.py:630`
+- **fetch_state_populations** (CWE-918) -- `backend/scripts/fetch_state_population.py:83`
+- **parse_pdf_bytes** (CWE-22) -- `backend/app/pipeline/fetch/ptr_common.py:601`
+- **parse_page** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_mn.py:69`
+- **_add_missing_baseline_columns** (CWE-89) -- `backend/app/database.py:805`
+- **fetch** (CWE-22, CWE-918) -- `backend/scripts/research_constituent_alignment.py:108`
+- **_rows** (CWE-22) -- `backend/app/pipeline/fetch/state_candidates_certified_table.py:562`
+- **fetch_measures** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_mo.py:250`
+- **_rekey_legacy_visitor_hashes** (CWE-89) -- `backend/app/database.py:930`
+- **fetch** (CWE-22, CWE-918) -- `backend/scripts/research_justice_loyalty.py:112`
+- **parse_endorsements** (CWE-22) -- `backend/app/pipeline/fetch/state_candidates_ct.py:299`
+- **sample_ballot_urls** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_ms.py:75`
+- **rekey** (CWE-89) -- `backend/app/database.py:947`
+- **_parse_recap_pdf** (CWE-22) -- `backend/app/pipeline/fetch/state_candidates_ms.py:199`
+- **qualified_issues** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_mt.py:76`
+- **_copy_page_load_timings** (CWE-89) -- `backend/app/database.py:976`
+- **fetch_confirmed_candidates** (CWE-22) -- `backend/app/pipeline/fetch/state_candidates_nj.py:171`
+- **_resolve_pdf** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_mt.py:150`
+- **_rename_all** (CWE-89) -- `backend/app/member_ids.py:189`
+- **_federal_contests** (CWE-22) -- `backend/app/pipeline/fetch/state_candidates_or.py:243`
+- **ballot_language_links** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_nd.py:78`
+- **_move** (CWE-89) -- `backend/app/member_ids.py:218`
+- **_statewide_contests** (CWE-22) -- `backend/app/pipeline/fetch/state_candidates_or.py:418`
+- **read_elections_page** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_ne.py:103`
+- **_record_alias** (CWE-89) -- `backend/app/member_ids.py:265`
+- **_bundled_rows** (CWE-22) -- `backend/app/pipeline/justice_pipeline.py:35`
+- **slip_law_url** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_ne.py:209`
+- **record_classification** (CWE-89) -- `backend/app/pipeline/analyze/bill_learning.py:227`
+- **_data** (CWE-22) -- `backend/app/pipeline/transform/occupation_industry.py:41`
+- **find_questions_url** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_nh.py:93`
+- **update_document_authority** (CWE-89) -- `backend/app/pipeline/analyze/document_authority.py:372`
+- **read_record** (CWE-22) -- `backend/app/shared_state.py:234`
+- **find_publication_url** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_nm.py:75`
+- **api_cache_set** (CWE-89) -- `backend/app/pipeline/cache.py:96`
+- **fetch** (CWE-22) -- `backend/scripts/audit_funding_components.py:43`
+- **booklet_urls** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_nv.py:91`
+- **acquire** (CWE-89) -- `backend/app/pipeline/lease.py:146`
+- **main** (CWE-22) -- `backend/scripts/audit_pac_ratio.py:56`
+- **find_sample_ballot_url** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_oh.py:154`
+- **_fts_available** (CWE-89) -- `backend/app/pipeline/lexical_index.py:89`
+- **load_les** (CWE-22) -- `backend/scripts/benchmark_validation.py:244`
+- **reaches_before** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_ok.py:272`
+- **_run_backfill** (CWE-89) -- `backend/app/pipeline/lexical_index.py:208`
+- **load_county_names** (CWE-22) -- `backend/scripts/build_county_district_crosswalk.py:284`
+- **next_page_form** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_ok.py:300`
+- **_create_triggers** (CWE-89) -- `backend/app/pipeline/lexical_index.py:228`
+- **main** (CWE-22) -- `backend/scripts/build_county_district_crosswalk.py:317`
+- **book_url** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_or.py:50`
+- **rebuild_index** (CWE-89) -- `backend/app/pipeline/lexical_index.py:270`
+- **_write_cd120_assignments** (CWE-22) -- `backend/scripts/build_district_topology.py:197`
+- **statewide_rows** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_sc.py:79`
+- **_swap_tables** (CWE-89) -- `backend/app/pipeline/vector_store.py:323`
+- **main** (CWE-22) -- `backend/scripts/build_district_topology.py:299`
+- **parse_detail** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_sc.py:121`
+- **get_vec_conn** (CWE-89) -- `backend/app/pipeline/vector_store.py:359`
+- **main** (CWE-22) -- `backend/scripts/build_name_casing.py:128`
+- **certified_questions** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_sd.py:99`
+- **_read_conn** (CWE-89) -- `backend/app/pipeline/vector_store.py:403`
+- **main** (CWE-22) -- `backend/scripts/calibrate_action_thresholds.py:26`
+- **pamphlet_url** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_sd.py:129`
+- **_snapshot** (CWE-89) -- `backend/app/pipeline/vector_store.py:438`
+- **main** (CWE-22) -- `backend/scripts/calibrate_constituent_reference.py:42`
+- **parse_results** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_tx.py:67`
+- **_ensure_schema** (CWE-89) -- `backend/app/pipeline/vector_store.py:450`
+- **main** (CWE-22) -- `backend/scripts/calibrate_explore_ranking.py:26`
+- **find_certification_url** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_ut.py:89`
+- **_writing** (CWE-89) -- `backend/app/pipeline/vector_store.py:553`
+- **main** (CWE-22) -- `backend/scripts/calibrate_lda_bill_match.py:217`
+- **measure_links** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_wa.py:70`
+- **_set_meta** (CWE-89) -- `backend/app/pipeline/vector_store.py:583`
+- **main** (CWE-22) -- `backend/scripts/calibrate_les_credit_scale.py:50`
+- **listing_rows** (CWE-611) -- `backend/app/pipeline/fetch/ballot_measures_wv.py:75`
+- **_delete_ids** (CWE-89) -- `backend/app/pipeline/vector_store.py:849`
+- **main** (CWE-22) -- `backend/scripts/calibrate_position_confidence.py:1504`
+- **_xml_root** (CWE-611) -- `backend/app/pipeline/fetch/committee_leadership.py:118`
+- **_record_chunks_per_doc** (CWE-89) -- `backend/app/pipeline/vector_store.py:978`
+- **main** (CWE-22) -- `backend/scripts/check_signal_correlations.py:57`
+- **speech_granules** (CWE-611) -- `backend/app/pipeline/fetch/congressional_record.py:147`
+- **_ready_count** (CWE-89) -- `backend/app/pipeline/vector_store.py:1005`
+- **main** (CWE-22) -- `backend/scripts/fetch_ces_approval.py:202`
+- **_parse_survey_table** (CWE-611) -- `backend/app/pipeline/fetch/cspan_historians_survey.py:85`
+- **collection_stats** (CWE-89) -- `backend/app/pipeline/vector_store.py:1128`
+- **main** (CWE-22) -- `backend/scripts/fetch_committee_data.py:77`
+- **parse_house_floor** (CWE-611) -- `backend/app/pipeline/fetch/floor_logs.py:62`
+- **get_bill_reference** (CWE-89) -- `backend/app/pipeline/vector_store.py:1161`
+- **_pdf_text** (CWE-22) -- `backend/scripts/fetch_committee_jurisdictions.py:77`
+- **parse_senate_floor** (CWE-611) -- `backend/app/pipeline/fetch/floor_logs.py:102`
+- **purge_bills** (CWE-89) -- `backend/app/pipeline/vector_store.py:1191`
+- **main** (CWE-22) -- `backend/scripts/fetch_committee_jurisdictions.py:193`
+- **_fetch_body_text** (CWE-611) -- `backend/app/pipeline/fetch/fr_rulemaking.py:108`
+- **clear_bills** (CWE-89) -- `backend/app/pipeline/vector_store.py:1204`
+- **labels** (CWE-22) -- `backend/scripts/fetch_occupation_industry.py:144`
+- **_parse_eo_table** (CWE-611) -- `backend/app/pipeline/fetch/historical_executive_orders.py:167`
+- **_record_text_hash** (CWE-89) -- `backend/app/pipeline/vector_store.py:1237`
+- **crosstab** (CWE-22) -- `backend/scripts/fetch_occupation_industry.py:156`
+- **parse_sworn_dates** (CWE-611) -- `backend/app/pipeline/fetch/house_clerk.py:32`
+- **get_embedded_explore_ids** (CWE-89) -- `backend/app/pipeline/vector_store.py:1245`
+- **titles** (CWE-22) -- `backend/scripts/fetch_occupation_industry.py:208`
+- **parse_caucuses** (CWE-611) -- `backend/app/pipeline/fetch/house_clerk.py:76`
+- **get_embedded_hashes** (CWE-89) -- `backend/app/pipeline/vector_store.py:1256`
+- **main** (CWE-22) -- `backend/scripts/fetch_occupation_industry.py:245`
+- **parse_apportionment** (CWE-611) -- `backend/app/pipeline/fetch/house_clerk.py:119`
+- **update_explore_metadata** (CWE-89) -- `backend/app/pipeline/vector_store.py:1263`
+- **rederive** (CWE-22) -- `backend/scripts/fetch_poll_close_times.py:147`
+- **parse_clerk_leadership** (CWE-611) -- `backend/app/pipeline/fetch/house_leadership.py:44`
+- **index_is_whole** (CWE-89) -- `backend/app/pipeline/vector_store.py:1554`
+- **main** (CWE-22) -- `backend/scripts/fetch_site_fonts.py:140`
+- **official_names** (CWE-611) -- `backend/app/pipeline/fetch/house_leadership.py:66`
+- **_collapse_duplicates** (CWE-89) -- `backend/app/services/explore_search.py:95`
+- **bef_rows** (CWE-22) -- `backend/scripts/fetch_state_leg_crosswalk.py:401`
+- **_fetch_index_entries** (CWE-611) -- `backend/app/pipeline/fetch/house_ptr.py:79`
+- **full_text** (CWE-89) -- `backend/app/services/explore_search.py:113`
+- **build_state** (CWE-22) -- `backend/scripts/fetch_state_leg_crosswalk.py:424`
+- **_parse_index** (CWE-611) -- `backend/app/pipeline/fetch/president_ptr.py:235`
+- **_hydrate** (CWE-89) -- `backend/app/services/explore_search.py:185`
+- **main** (CWE-22) -- `backend/scripts/fetch_state_leg_crosswalk.py:462`
+- **_fetch_body_text** (CWE-611) -- `backend/app/pipeline/fetch/presidential_actions.py:46`
+- **write_row** (CWE-89) -- `backend/app/shared_state.py:61`
+- **main** (CWE-22) -- `backend/scripts/fetch_state_population.py:106`
+- **parse_approval_index** (CWE-611) -- `backend/app/pipeline/fetch/presidential_approval.py:313`
+- **switch_to_wal** (CWE-89) -- `backend/app/sqlite_wal.py:18`
+- **main** (CWE-22) -- `backend/scripts/fetch_state_pvi.py:288`
+- **_mandates_rows** (CWE-611) -- `backend/app/pipeline/fetch/presidential_elections.py:142`
+- **upgrade** (CWE-89) -- `backend/migrations/versions/0006_trade_owner_reread.py:34`
+- **main** (CWE-22) -- `backend/scripts/fetch_state_small_donor_baseline.py:87`
+- **_parse_election_year_page** (CWE-611) -- `backend/app/pipeline/fetch/presidential_elections.py:225`
+- **upgrade** (CWE-89) -- `backend/migrations/versions/0008_retract_mixed_issues.py:29`
+- **main** (CWE-22) -- `backend/scripts/fetch_statewide_district_towns.py:212`
+- **parse_dates_in_office** (CWE-611) -- `backend/app/pipeline/fetch/presidential_roster.py:252`
+- **upgrade** (CWE-89) -- `backend/migrations/versions/0018_measure_coverage_freshness.py:36`
+- **_tenure** (CWE-22) -- `backend/scripts/research_justice_loyalty.py:439`
+- **parse_senate_classes** (CWE-611) -- `backend/app/pipeline/fetch/senate_classes.py:39`
+- **upgrade** (CWE-89) -- `backend/migrations/versions/0021_action_issue_iso_dates.py:40`
+- **write_bundle** (CWE-22) -- `backend/scripts/research_justice_loyalty.py:717`
+- **_as_doc** (CWE-611) -- `backend/app/pipeline/fetch/senate_fd.py:139`
+- **downgrade** (CWE-89) -- `backend/migrations/versions/0022_member_trade_undated.py:32`
+- **main** (CWE-22) -- `backend/scripts/research_les_stage_classifier.py:81`
+- **_fetch_document** (CWE-611) -- `backend/app/pipeline/fetch/state_candidates_canvass_xml.py:132`
+- **upgrade** (CWE-89) -- `backend/migrations/versions/0030_issue_fact_links.py:25`
+- **main** (CWE-22) -- `backend/scripts/research_president_scores.py:140`
+- **html_table_rows** (CWE-611) -- `backend/app/pipeline/fetch/state_candidates_certified_table.py:414`
+- **downgrade** (CWE-89) -- `backend/migrations/versions/0035_small_donor_share_nullable.py:28`
+- **outline_rows** (CWE-611) -- `backend/app/pipeline/fetch/state_candidates_certified_table.py:442`
+- **load_bill_task** (CWE-89) -- `backend/scripts/evaluate_embedding_models.py:246`
+- **report_grid_rows** (CWE-611) -- `backend/app/pipeline/fetch/state_candidates_certified_table.py:471`
+- **load_fec_caches** (CWE-89) -- `backend/scripts/rescore.py:85`
+- **_form_fields** (CWE-611) -- `backend/app/pipeline/fetch/state_candidates_certified_table.py:944`
+- **attach_live_references** (CWE-89) -- `backend/scripts/rescore.py:226`
+- **parse_canlist** (CWE-611) -- `backend/app/pipeline/fetch/state_candidates_dos_canlist.py:186`
+- **sheet_rows** (CWE-611) -- `backend/app/pipeline/fetch/state_candidates_oh.py:109`
+- **_rows** (CWE-611) -- `backend/app/pipeline/fetch/state_candidates_sd_vip.py:99`
+- **_contests** (CWE-611) -- `backend/app/pipeline/fetch/state_candidates_totalvote.py:190`
+- **general_contests** (CWE-611) -- `backend/app/pipeline/fetch/state_candidates_totalvote.py:433`
+- **_search_form** (CWE-611) -- `backend/app/pipeline/fetch/state_candidates_vrems.py:89`
+- **_rows** (CWE-611) -- `backend/app/pipeline/fetch/state_candidates_vrems.py:178`
+- **parse_slip_opinions** (CWE-611) -- `backend/app/pipeline/fetch/supreme_court.py:34`
+- **bill_titles** (CWE-611) -- `backend/scripts/calibrate_lda_bill_match.py:87`
+- **_bills** (CWE-611) -- `backend/scripts/research_les_stage_classifier.py:52`

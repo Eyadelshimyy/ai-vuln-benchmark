@@ -1,0 +1,28 @@
+{
+  "repo": "markus-michalski__project-hub",
+  "file": "servers/project-hub-server/tools/config.py",
+  "function": "get_config",
+  "line": 10,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Load config from ~/.project-hub/config.yaml, falling back to defaults.",
+  "prompt_source": "def get_config() -> dict:\n    \"\"\"Load config from ~/.project-hub/config.yaml, falling back to defaults.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def get_config() -> dict:\n    \"\"\"Load config from ~/.project-hub/config.yaml, falling back to defaults.\"\"\"\n    global _config_cache\n    if _config_cache is not None:\n        return _config_cache\n\n    defaults = {\n        \"docs_root\": str(Path.home() / \".project-hub\" / \"projects\"),\n        \"db_path\": str(Path.home() / \".project-hub\" / \"project-hub.db\"),\n        \"user\": {\n            \"name\": \"\",\n            \"email\": \"\",\n            \"organization\": \"\",\n        },\n        \"default_language\": \"en\",\n        \"communication\": {\n            \"email_signature\": \"\",\n            \"default_tone\": \"professional\",\n        },\n    }\n\n    config_path = Path.home() / \".project-hub\" / \"config.yaml\"\n    if config_path.exists():\n        try:\n            import yaml\n            with open(config_path) as f:\n                user_config = yaml.safe_load(f) or {}\n            _deep_merge(defaults, user_config)\n        except Exception as e:\n            print(f\"[project-hub] WARNING: Failed to load config from {config_path}: {e}\", file=sys.stderr)\n\n    # Expand ~ in paths\n    for key in (\"docs_root\", \"db_path\"):\n        if key in defaults:\n            defaults[key] = str(Path(str(defaults[key])).expanduser())\n\n    _config_cache = defaults\n    return _config_cache",
+  "module_source": "\"\"\"Configuration loader for project-hub.\"\"\"\nfrom __future__ import annotations\n\nimport sys\nfrom pathlib import Path\n\n_config_cache: dict | None = None\n\n\ndef get_config() -> dict:\n    \"\"\"Load config from ~/.project-hub/config.yaml, falling back to defaults.\"\"\"\n    global _config_cache\n    if _config_cache is not None:\n        return _config_cache\n\n    defaults = {\n        \"docs_root\": str(Path.home() / \".project-hub\" / \"projects\"),\n        \"db_path\": str(Path.home() / \".project-hub\" / \"project-hub.db\"),\n        \"user\": {\n            \"name\": \"\",\n            \"email\": \"\",\n            \"organization\": \"\",\n        },\n        \"default_language\": \"en\",\n        \"communication\": {\n            \"email_signature\": \"\",\n            \"default_tone\": \"professional\",\n        },\n    }\n\n    config_path = Path.home() / \".project-hub\" / \"config.yaml\"\n    if config_path.exists():\n        try:\n            import yaml\n            with open(config_path) as f:\n                user_config = yaml.safe_load(f) or {}\n            _deep_merge(defaults, user_config)\n        except Exception as e:\n            print(f\"[project-hub] WARNING: Failed to load config from {config_path}: {e}\", file=sys.stderr)\n\n    # Expand ~ in paths\n    for key in (\"docs_root\", \"db_path\"):\n        if key in defaults:\n            defaults[key] = str(Path(str(defaults[key])).expanduser())\n\n    _config_cache = defaults\n    return _config_cache\n\n\ndef get_docs_root() -> Path:\n    \"\"\"Return the configured docs root directory.\"\"\"\n    return Path(get_config()[\"docs_root\"])\n\n\ndef get_db_path_from_config() -> Path:\n    \"\"\"Return the configured database path.\"\"\"\n    return Path(get_config()[\"db_path\"])\n\n\ndef get_knowledge_root() -> Path:\n    \"\"\"Return the local knowledge base root directory.\"\"\"\n    cfg = get_config()\n    raw = cfg.get(\"knowledge_root\", str(Path.home() / \".project-hub\" / \"knowledge\"))\n    return Path(raw).expanduser()\n\n\ndef _deep_merge(base: dict, override: dict) -> None:\n    \"\"\"Recursively merge override into base (in-place).\"\"\"\n    for key, value in override.items():\n        if key in base and isinstance(base[key], dict) and isinstance(value, dict):\n            _deep_merge(base[key], value)\n        else:\n            base[key] = value\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 38
+    },
+    "ai_commit": "2007aba6813b",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 1.0,
+    "span": [
+      10,
+      47
+    ]
+  }
+}

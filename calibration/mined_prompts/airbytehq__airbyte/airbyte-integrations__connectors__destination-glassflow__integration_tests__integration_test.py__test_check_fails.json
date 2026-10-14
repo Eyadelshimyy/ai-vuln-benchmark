@@ -1,0 +1,28 @@
+{
+  "repo": "airbytehq__airbyte",
+  "file": "airbyte-integrations/connectors/destination-glassflow/integration_tests/integration_test.py",
+  "function": "test_check_fails",
+  "line": 63,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `test_check_fails` function.",
+  "prompt_source": "def test_check_fails():\n    \"\"\"Implement the `test_check_fails` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def test_check_fails():\n    f = open(\n        \"integration_tests/invalid_config.json\",\n    )\n    config = json.load(f)\n    destination = DestinationGlassflow()\n    status = destination.check(logger=Mock(), config=config)\n    assert status.status == Status.FAILED",
+  "module_source": "#\n# Copyright (c) 2024 Airbyte, Inc., all rights reserved.\n#\n\nimport json\nfrom unittest.mock import Mock\n\nfrom destination_glassflow.destination import DestinationGlassflow, create_sink_connection\n\nfrom airbyte_cdk.models import AirbyteMessage, Status, Type\nfrom airbyte_cdk.models.airbyte_protocol import (\n    AirbyteRecordMessage,\n    AirbyteStateMessage,\n    AirbyteStream,\n    ConfiguredAirbyteCatalog,\n    ConfiguredAirbyteStream,\n    DestinationSyncMode,\n    SyncMode,\n)\n\n\nTEST_STREAM = \"test\"\nTEST_NAMESPACE = \"test_namespace\"\nTEST_MESSAGE = {\"name\": \"John Smith\"}\n\n\ndef _configured_catalog() -> ConfiguredAirbyteCatalog:\n    stream_schema = {\"type\": \"object\", \"properties\": {}}\n    append_stream = ConfiguredAirbyteStream(\n        stream=AirbyteStream(name=TEST_STREAM, json_schema=stream_schema, supported_sync_modes=[SyncMode.incremental]),\n        sync_mode=SyncMode.incremental,\n        destination_sync_mode=DestinationSyncMode.append,\n    )\n    return ConfiguredAirbyteCatalog(streams=[append_stream])\n\n\ndef consume(config):\n    connection = create_sink_connection(config=config)\n\n    while True:\n        # Consume transformed event from the pipeline\n        res = connection.consume()\n\n        if res.status_code == 200:\n            record = res.event()\n            assert record[\"data\"] == TEST_MESSAGE\n            assert record[\"stream\"] == TEST_STREAM\n            assert record[\"namespace\"] == TEST_NAMESPACE\n            assert \"emitted_at\" in record\n            break\n\n\ndef _state() -> AirbyteMessage:\n    return AirbyteMessage(type=Type.STATE, state=AirbyteStateMessage(data={}))\n\n\ndef _record() -> AirbyteMessage:\n    return AirbyteMessage(\n        type=Type.RECORD, record=AirbyteRecordMessage(stream=TEST_STREAM, data=TEST_MESSAGE, emitted_at=0, namespace=TEST_NAMESPACE)\n    )\n\n\ndef test_check_fails():\n    f = open(\n        \"integration_tests/invalid_config.json\",\n    )\n    config = json.load(f)\n    destination = DestinationGlassflow()\n    status = destination.check(logger=Mock(), config=config)\n    assert status.status == Status.FAILED\n\n\ndef test_check_succeeds():\n    f = open(\n        \"secrets/config.json\",\n    )\n    config = json.load(f)\n    destination = DestinationGlassflow()\n    status = destination.check(logger=Mock(), config=config)\n    assert status.status == Status.SUCCEEDED\n\n\ndef test_write():\n    f = open(\n        \"secrets/config.json\",\n    )\n    config = json.load(f)\n    messages = [_record(), _state()]\n    destination = DestinationGlassflow()\n    for m in destination.write(config=config, configured_catalog=_configured_catalog(), input_messages=messages):\n        assert m.type == Type.STATE\n    consume(config)\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 8
+    },
+    "ai_commit": "658f1b5ffc8a",
+    "evidence": "author/committer='devin-ai-integration[bot] <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      63,
+      70
+    ]
+  }
+}

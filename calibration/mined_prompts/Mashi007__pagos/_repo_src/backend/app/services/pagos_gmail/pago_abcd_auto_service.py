@@ -1,0 +1,452 @@
+# -*- coding: utf-8 -*-
+"""
+Alta en `pagos` + aplicación en cascada a cuotas para comprobantes Gmail plantilla **A/B/C/D**
+(Mercantil / BNC / BINANCE / BNV), cuando:
+
+- el serial **no** está duplicado en `pagos` / `pagos_con_errores` (lo comprueba el caller), y
+- el cliente tiene **exactamente un** préstamo `APROBADO` (misma regla que carga masiva Excel).
+
+Conciliación: `conciliado=True`, `verificado_concordancia=SI`, `fecha_conciliacion` al crear
+(ajuste posterior si no hubo aplicación a cuotas: ver `_estado_conciliacion_post_cascada` en `pagos.py`).
+"""
+from __future__ import annotations
+
+import logging
+from datetime import date, datetime, time as dt_time
+from decimal import Decimal
+from typing import Any, Optional
+
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.api.v1.endpoints.pagos.pago_integridad_db import _integridad_error_pgcode_y_constraint
+from app.core.documento import compose_numero_documento_almacenado
+from app.models.cliente import Cliente
+from app.models.pago import Pago
+from app.models.pagos_gmail_abcd_cuotas_traza import PagosGmailAbcdCuotasTraza
+from app.models.prestamo import Prestamo
+from app.services.pago_numero_documento import numero_documento_ya_registrado
+from app.services.pago_registro_moneda import resolver_monto_registro_pago
+from app.services.pagos_gmail.helpers import format_monto_excel_pagos_gmail, normalizar_fecha_pago
+from app.services.cuota_pago_integridad import (
+    pago_tiene_aplicaciones_cuotas,
+    validar_suma_aplicada_vs_monto_pago,
+)
+from app.utils.cedula_almacenamiento import normalizar_cedula_almacenamiento
+
+logger = logging.getLogger(__name__)
+
+USUARIO_REGISTRO_GMAIL_ABCD = "pagos-gmail-plantilla-abcd@sistema.rapicredit.com"
+
+
+def _fecha_pago_date_desde_gmail(fecha_str: str) -> Optional[date]:
+    raw = (fecha_str or "").strip()
+    if not raw:
+        return None
+    norm = normalizar_fecha_pago(raw)
+    for cand in (norm, raw):
+        if not cand:
+            continue
+        for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(cand[:10], fmt).date()
+            except ValueError:
+                continue
+    return None
+
+
+def _monto_decimal_desde_gmail(monto_str: str, monto_min: float, monto_max: float) -> Optional[Decimal]:
+    s = format_monto_excel_pagos_gmail(monto_str)
+    if not s:
+        return None
+    try:
+        v = float(s)
+    except (TypeError, ValueError):
+        return None
+    if v < monto_min or v > monto_max:
+        return None
+    return Decimal(str(round(v, 2)))
+
+
+def crear_pago_conciliado_y_aplicar_cuotas_gmail_plantilla_abcd(
+    db: Session,
+    *,
+    cedula_columna: str,
+    fecha_pago_str: str,
+    monto_str: str,
+    numero_referencia: str,
+    institucion_bancaria: Optional[str],
+    link_comprobante: Optional[str],
+    fmt: str,
+    filename: Optional[str] = None,
+    sync_id: Optional[int] = None,
+    sync_item_id: Optional[int] = None,
+    comprobante_imagen_id: Optional[str] = None,
+    control_usuario_operaciones: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Crea `Pago`, aplica cascada y hace `commit` en BD si todo OK.
+    En error de negocio / validación: `rollback` y devuelve ``ok: False`` (sin excepción).
+    """
+    from zoneinfo import ZoneInfo
+
+    from app.api.v1.endpoints import pagos as pagos_ep
+    from app.api.v1.endpoints.pagos.constants import (
+        _MAX_LEN_NUMERO_DOCUMENTO,
+        _MAX_MONTO_PAGADO,
+        _MIN_MONTO_PAGADO,
+    )
+    from app.services.pago_huella_funcional import conflicto_huella_para_creacion
+    from app.services.pago_huella_metricas import registrar_rechazo_huella_funcional
+
+    def _fail(motivo: str, detalle: str = "") -> dict[str, Any]:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        out: dict[str, Any] = {"ok": False, "motivo": motivo}
+        if detalle:
+            out["detalle"] = detalle
+        return out
+
+    fmt_u = (fmt or "").strip().upper()
+    if fmt_u not in ("A", "B", "C", "D"):
+        return _fail("no_abcd", fmt_u)
+
+    cedula_raw = (cedula_columna or "").strip()
+    if not cedula_raw:
+        return _fail("cedula_vacia")
+
+    if fmt_u == "C":
+        from app.services.pagos_gmail.plantilla_abcd_proceso_negocio import (
+            fecha_pago_date_gmail_plantilla_c,
+        )
+
+        fecha_pago = fecha_pago_date_gmail_plantilla_c(fecha_pago_str)
+    else:
+        fecha_pago = _fecha_pago_date_desde_gmail(fecha_pago_str)
+        if fecha_pago is None:
+            return _fail("fecha_invalida", (fecha_pago_str or "")[:80])
+
+    from app.services.pagos_gmail.parse_campos_comprobante import (
+        fecha_pago_es_futura_revision_manual,
+    )
+
+    if fecha_pago_es_futura_revision_manual(fecha_pago):
+        return _fail("fecha_futura", fecha_pago.isoformat())
+
+    monto_dec_in = _monto_decimal_desde_gmail(
+        monto_str,
+        float(_MIN_MONTO_PAGADO),
+        float(_MAX_MONTO_PAGADO),
+    )
+    if monto_dec_in is None:
+        return _fail("monto_invalido", (monto_str or "")[:80])
+
+    from app.services.pagos_gmail.plantilla_abcd_proceso_negocio import (
+        PAGOS_GMAIL_UMBRAL_REVISION_MANUAL_USD,
+        monto_gmail_sync_requiere_revision_manual_usd,
+    )
+
+    if monto_gmail_sync_requiere_revision_manual_usd(monto_str):
+        return _fail(
+            "monto_umbral_revision_manual",
+            f"Monto >= {PAGOS_GMAIL_UMBRAL_REVISION_MANUAL_USD}: requiere revision manual.",
+        )
+
+    if fmt_u == "C":
+        from app.services.pagos_gmail.plantilla_abcd_proceso_negocio import (
+            PAGOS_GMAIL_OBS_USUARIO_OPERACIONES,
+            binance_requiere_revision_usuario_operaciones,
+        )
+        from app.services.pagos_gmail.binance_gmail_rescate import (
+            cargar_comprobante_bytes_gmail,
+            resolver_control_usuario_operaciones_gmail_plantilla_c,
+        )
+
+        if binance_requiere_revision_usuario_operaciones(control_usuario_operaciones):
+            img_bytes, img_name = cargar_comprobante_bytes_gmail(db, comprobante_imagen_id)
+            if not img_bytes and filename:
+                img_name = filename or img_name
+            ctrl_res, rescate, motivo = resolver_control_usuario_operaciones_gmail_plantilla_c(
+                control_actual=control_usuario_operaciones,
+                monto_str=monto_str,
+                numero_referencia=numero_referencia,
+                cedula_columna=cedula_columna,
+                fecha_pago_str=fecha_pago_str,
+                image_bytes=img_bytes,
+                filename=img_name,
+            )
+            if rescate:
+                control_usuario_operaciones = ctrl_res
+                logger.info(
+                    "[PAGOS_GMAIL] ABCD plantilla C: control elevado por rescate (%s) ref=%s",
+                    motivo,
+                    (numero_referencia or "")[:24],
+                )
+
+        if binance_requiere_revision_usuario_operaciones(control_usuario_operaciones):
+            return _fail(
+                "usuario_operaciones",
+                PAGOS_GMAIL_OBS_USUARIO_OPERACIONES,
+            )
+
+    ref_raw = (numero_referencia or "").strip()
+    numero_doc_norm = compose_numero_documento_almacenado(ref_raw, None)
+    if not numero_doc_norm:
+        return _fail("documento_vacio")
+
+    if numero_documento_ya_registrado(db, numero_doc_norm):
+        return _fail("duplicado_documento")
+
+    from app.services.pago_binance_serial_unico import (
+        mensaje_conflicto_binance,
+        primer_pago_id_mismo_serial_binance,
+    )
+
+    if fmt_u == "C" or "BINANCE" in (institucion_bancaria or "").upper():
+        cid_b = primer_pago_id_mismo_serial_binance(
+            db,
+            numero_doc_norm,
+            institucion_bancaria=institucion_bancaria or "BINANCE",
+        )
+        if cid_b is not None:
+            return _fail("duplicado_binance", mensaje_conflicto_binance(cid_b))
+
+    from app.services.prestamos.prestamos_por_cedula_titular import (
+        cedula_lookup_norm,
+        select_prestamo_ids_por_cedula_titular,
+    )
+
+    cedula_norm = cedula_lookup_norm(cedula_raw)
+    prestamo_ids_activos = select_prestamo_ids_por_cedula_titular(
+        db, cedula_raw, estados=("APROBADO",)
+    )
+
+    n_prest = len(prestamo_ids_activos)
+    if n_prest == 0:
+        from app.constants.prestamo_estados import ESTADO_PRESTAMO_DESISTIMIENTO
+        from app.services.pagos_desistimiento_politica import (
+            MSG_DESISTIMIENTO_NO_CARTERA_AUTO,
+        )
+
+        from app.utils.cedula_almacenamiento import expr_cedula_normalizada_para_comparar
+
+        n_desist = (
+            db.execute(
+                select(func.count())
+                .select_from(Prestamo)
+                .join(Cliente, Prestamo.cliente_id == Cliente.id)
+                .where(
+                    expr_cedula_normalizada_para_comparar(Cliente.cedula) == cedula_norm,
+                    Prestamo.estado == ESTADO_PRESTAMO_DESISTIMIENTO,
+                )
+            ).scalar()
+            or 0
+        )
+        if int(n_desist) > 0:
+            return _fail("prestamo_desistimiento", MSG_DESISTIMIENTO_NO_CARTERA_AUTO)
+        return _fail("sin_prestamo_aprobado")
+    if n_prest > 1:
+        return _fail("varios_prestamos", str(n_prest))
+
+    prestamo_id = int(prestamo_ids_activos[0])
+    from app.services.pagos_desistimiento_politica import (
+        bloquear_carga_automatica_a_cartera_si_desistimiento,
+    )
+
+    err_desist = bloquear_carga_automatica_a_cartera_si_desistimiento(db, prestamo_id)
+    if err_desist:
+        return _fail("prestamo_desistimiento", err_desist)
+
+    prest = db.get(Prestamo, prestamo_id)
+    if not prest:
+        return _fail("prestamo_no_encontrado")
+    cli = db.get(Cliente, prest.cliente_id)
+    if not cli:
+        return _fail("cliente_prestamo")
+
+    ced_norm_cli = normalizar_cedula_almacenamiento(cli.cedula)
+    if ced_norm_cli and ced_norm_cli != (cli.cedula or ""):
+        cli.cedula = ced_norm_cli
+        db.flush()
+    cedula_fk = normalizar_cedula_almacenamiento(cli.cedula) or normalizar_cedula_almacenamiento(
+        prest.cedula
+    )
+    if not cedula_fk:
+        return _fail("cedula_cliente_bd")
+
+    cedula_input = normalizar_cedula_almacenamiento(cedula_raw)
+    cn_body = (cedula_input or "").replace("-", "").upper()
+    cn_fk = (cedula_fk or "").replace("-", "").upper()
+    if cedula_input and cn_body != cn_fk:
+        return _fail("cedula_no_coincide_cliente", cedula_fk)
+
+    ref_pago = (numero_doc_norm or ref_raw or "Gmail")[: int(_MAX_LEN_NUMERO_DOCUMENTO)]
+
+    try:
+        monto_usd_g, moneda_fin_g, monto_bs_g, tasa_g, fecha_tasa_g = resolver_monto_registro_pago(
+            db,
+            cedula_normalizada=(cedula_fk or "").strip().upper(),
+            fecha_pago=fecha_pago,
+            monto_pagado=monto_dec_in,
+            moneda_registro="USD",
+            tasa_cambio_manual=None,
+        )
+    except Exception as e:
+        logger.warning("[PAGOS_GMAIL] [ABCD_PAGO] resolver_monto: %s", e)
+        return _fail("resolver_monto", str(e)[:500])
+
+    msg_h = conflicto_huella_para_creacion(
+        db,
+        prestamo_id=prestamo_id,
+        fecha_pago=fecha_pago,
+        monto_pagado=monto_usd_g,
+        numero_documento=numero_doc_norm,
+        referencia_pago=ref_pago,
+    )
+    if msg_h:
+        registrar_rechazo_huella_funcional()
+        return _fail("huella_funcional", msg_h[:500])
+
+    from app.services.institucion_bancaria_requerida import error_si_falta_institucion
+    err_ib = error_si_falta_institucion(institucion_bancaria)
+    if err_ib:
+        return _fail("institucion_bancaria", err_ib[:500])
+    ib = (institucion_bancaria or "").strip()[:255]
+    link_c = (link_comprobante or "").strip() or None
+    if link_c and len(link_c) > 4000:
+        link_c = link_c[:4000]
+
+    ahora = datetime.now(ZoneInfo(pagos_ep.TZ_NEGOCIO))
+    notas = f"Gmail plantilla {fmt_u}"
+    if filename:
+        notas = f"{notas} | {filename}"[:900]
+
+    pago = Pago(
+        cedula_cliente=cedula_fk,
+        prestamo_id=prestamo_id,
+        fecha_pago=datetime.combine(fecha_pago, dt_time.min),
+        monto_pagado=monto_usd_g,
+        numero_documento=numero_doc_norm,
+        institucion_bancaria=ib,
+        estado="PAGADO",
+        referencia_pago=ref_pago,
+        conciliado=True,
+        fecha_conciliacion=ahora,
+        verificado_concordancia="SI",
+        usuario_registro=USUARIO_REGISTRO_GMAIL_ABCD,
+        moneda_registro=moneda_fin_g,
+        monto_bs_original=monto_bs_g,
+        tasa_cambio_bs_usd=tasa_g,
+        fecha_tasa_referencia=fecha_tasa_g,
+        link_comprobante=link_c,
+        notas=notas,
+    )
+    db.add(pago)
+    try:
+        db.flush()
+    except IntegrityError as e:
+        pgcode, cname = _integridad_error_pgcode_y_constraint(e)
+        logger.warning(
+            "[PAGOS_GMAIL] [ABCD_PAGO] integridad al insertar (pgcode=%s constraint=%s): %s",
+            pgcode,
+            cname,
+            e,
+        )
+        if "ux_pagos_fingerprint_activos" in (cname or "").lower():
+            registrar_rechazo_huella_funcional()
+            return _fail(
+                "huella_funcional",
+                "Pago duplicado por huella funcional: mismo préstamo, fecha, monto y referencia normalizada.",
+            )
+        return _fail("integridad", "No se pudo registrar el pago por una restricción de datos.")
+
+    cc, cp = 0, 0
+    if pago.prestamo_id and float(pago.monto_pagado or 0) > 0:
+        try:
+            cc, cp = pagos_ep._aplicar_pago_a_cuotas_interno(pago, db)
+        except Exception as e:
+            logger.warning("[PAGOS_GMAIL] [ABCD_PAGO] aplicar cuotas: %s", e)
+            db.rollback()
+            return _fail("aplicar_cuotas", str(e)[:500])
+
+    pagos_ep._estado_conciliacion_post_cascada(pago, cc, cp)
+    try:
+        validar_suma_aplicada_vs_monto_pago(db, int(pago.id), pago.monto_pagado)
+    except Exception as e:
+        logger.warning("[PAGOS_GMAIL] [ABCD_PAGO] validacion suma aplicada: %s", e)
+        db.rollback()
+        return _fail("validacion_suma_aplicada", str(e)[:500])
+
+    if not pago_tiene_aplicaciones_cuotas(db, int(pago.id)) or (cc <= 0 and cp <= 0):
+        db.rollback()
+        return _fail("sin_cuotas_aplicadas")
+
+    if not bool(pago.conciliado):
+        db.rollback()
+        return _fail("autoconciliacion_no_lograda")
+
+    etapa_traza = "CUOTAS_OK" if (cc > 0 or cp > 0) else "PAGO_SIN_CUOTAS"
+    cid_hex = (comprobante_imagen_id or "").strip()[:32] or None
+    traza = PagosGmailAbcdCuotasTraza(
+        sync_id=sync_id,
+        sync_item_id=sync_item_id,
+        plantilla_fmt=fmt_u,
+        cedula=(cedula_fk or "")[:50] or None,
+        numero_referencia=(ref_raw or "")[:200] or None,
+        banco_excel=ib,
+        archivo_adjunto=(filename or "")[:500] or None,
+        comprobante_imagen_id=cid_hex,
+        duplicado_documento=False,
+        etapa_final=etapa_traza,
+        motivo=None,
+        detalle=None,
+        pago_id=pago.id,
+        prestamo_id=prestamo_id,
+        cuotas_completadas=cc,
+        cuotas_parciales=cp,
+        conciliado_final=bool(pago.conciliado),
+        pago_estado_final=(pago.estado or "")[:30] or None,
+    )
+    db.add(traza)
+
+    try:
+        db.commit()
+    except Exception as e:
+        logger.warning("[PAGOS_GMAIL] [ABCD_PAGO] commit: %s", e)
+        db.rollback()
+        return _fail("commit", str(e)[:400])
+
+    try:
+        from app.services.recibos_conciliacion_email_job import (
+            programar_intentar_envio_recibos_tras_pagos_en_cartera,
+        )
+
+        if pago.id is not None:
+            programar_intentar_envio_recibos_tras_pagos_en_cartera([int(pago.id)])
+    except Exception:
+        logger.exception("[PAGOS_GMAIL] [ABCD_PAGO] Recibos no bloquea pago_id=%s", pago.id)
+
+    logger.info(
+        "[PAGOS_GMAIL] [ABCD_PAGO] pago_id=%s prestamo_id=%s fmt=%s cc=%s cp=%s conciliado=%s estado=%s",
+        pago.id,
+        prestamo_id,
+        fmt_u,
+        cc,
+        cp,
+        bool(pago.conciliado),
+        (pago.estado or "")[:32],
+    )
+    return {
+        "ok": True,
+        "pago_id": pago.id,
+        "prestamo_id": prestamo_id,
+        "cuotas_completadas": cc,
+        "cuotas_parciales": cp,
+        "conciliado": bool(pago.conciliado),
+        "estado": pago.estado,
+        "etapa_final": etapa_traza,
+        "traza_id": getattr(traza, "id", None),
+    }

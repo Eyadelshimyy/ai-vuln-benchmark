@@ -1,0 +1,28 @@
+{
+  "repo": "kamoras__civitas",
+  "file": "backend/migrations/versions/0018_measure_coverage_freshness.py",
+  "function": "upgrade",
+  "line": 36,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `upgrade` function.",
+  "prompt_source": "def upgrade() -> None:\n    \"\"\"Implement the `upgrade` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def upgrade() -> None:\n    with op.batch_alter_table(\"measure_coverage\") as batch:\n        batch.add_column(sa.Column(\"last_success_at\", sa.DateTime(), nullable=True))\n        batch.add_column(sa.Column(\"pending_shrink\", sa.Text(), nullable=True))\n        batch.add_column(sa.Column(\"shrink_streak\", sa.Integer(), nullable=False, server_default=\"0\"))\n        batch.add_column(sa.Column(\"operator_note\", sa.Text(), nullable=True))\n        batch.add_column(sa.Column(\"operator_actions\", sa.Text(), nullable=True))\n    # last_success_at means \"an answer was established\" \u2014 covered or\n    # confirmed none, the only statuses a successful read writes. For\n    # those rows the old checked_at is the best record of when; a\n    # not_yet_covered or ingest_failed row established nothing and gets\n    # none.\n    op.execute(\n        \"UPDATE measure_coverage SET last_success_at = checked_at \"\n        \"WHERE status IN ('covered', 'confirmed_none')\"\n    )",
+  "module_source": "\"\"\"measure coverage: last successful check, and the shrink streak\n\nFive nullable/defaulted columns on measure_coverage, so the previous\nimage runs unchanged against the migrated schema (expand only):\n\n- last_success_at: when the status shown was last established by a read\n  that worked. A failed read no longer refreshes the page's \"checked\"\n  date, so a state serving yesterday's measures after tonight's failure\n  says so.\n- pending_shrink / shrink_streak: a direct read returning fewer measures\n  than are on file is held back (MEASURE_SHRINK_FLOOR) until the same\n  shorter list has come back on MEASURE_SHRINK_CONFIRM_RUNS consecutive\n  runs; these remember which list and how many runs.\n- operator_note: set when an operator accepted a state's absence for an\n  election (POST /api/admin/ballot-measures/{state}/{date}/accept-absence);\n  while set, a reader reporting the document as not published leaves that\n  accepted answer standing instead of alarming every night.\n- operator_actions: every accept-absence action (JSON list: when, note,\n  force, rows marked). An audit trail that a reader's later answer does\n  not clear, unlike operator_note.\n\nRevision ID: 0018\nRevises: 0017\nCreate Date: 2026-09-28\n\"\"\"\nfrom alembic import op\nimport sqlalchemy as sa\n\n\nrevision = \"0018\"\ndown_revision = \"0017\"\nbranch_labels = None\ndepends_on = None\n\n\ndef upgrade() -> None:\n    with op.batch_alter_table(\"measure_coverage\") as batch:\n        batch.add_column(sa.Column(\"last_success_at\", sa.DateTime(), nullable=True))\n        batch.add_column(sa.Column(\"pending_shrink\", sa.Text(), nullable=True))\n        batch.add_column(sa.Column(\"shrink_streak\", sa.Integer(), nullable=False, server_default=\"0\"))\n        batch.add_column(sa.Column(\"operator_note\", sa.Text(), nullable=True))\n        batch.add_column(sa.Column(\"operator_actions\", sa.Text(), nullable=True))\n    # last_success_at means \"an answer was established\" \u2014 covered or\n    # confirmed none, the only statuses a successful read writes. For\n    # those rows the old checked_at is the best record of when; a\n    # not_yet_covered or ingest_failed row established nothing and gets\n    # none.\n    op.execute(\n        \"UPDATE measure_coverage SET last_success_at = checked_at \"\n        \"WHERE status IN ('covered', 'confirmed_none')\"\n    )\n\n\ndef downgrade() -> None:\n    with op.batch_alter_table(\"measure_coverage\") as batch:\n        batch.drop_column(\"operator_actions\")\n        batch.drop_column(\"operator_note\")\n        batch.drop_column(\"shrink_streak\")\n        batch.drop_column(\"pending_shrink\")\n        batch.drop_column(\"last_success_at\")\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 16
+    },
+    "ai_commit": "9e5c456272b2",
+    "evidence": "Co-authored-by: Claude <noreply@anthropic.com>",
+    "ai_line_fraction": 1.0,
+    "span": [
+      36,
+      51
+    ]
+  }
+}

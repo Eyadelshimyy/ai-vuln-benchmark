@@ -1,0 +1,353 @@
+"""Tests for run_supplementary_pipeline's admin-visible run tracking.
+
+Extracted from senate_pipeline.py (2026-07): explore-document ingestion,
+SCOTUS justice scoring, and president scoring had no data dependency on
+Senate's own work — they were only nested inside run_senate_pipeline()
+because that pipeline already existed. SupplementaryPipelineRun mirrors
+HousePipelineRun/StockTradesPipelineRun so these three genuinely
+independent domains get the same admin-dashboard visibility Senate/
+House/stock trades already have, instead of piggybacking on Senate's
+own PipelineRun row.
+"""
+
+import json
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from app.models import Justice, PipelineStatus, SupplementaryPipelineRun
+from app.pipeline import supplementary_pipeline
+from app.time_utils import utcnow
+
+
+@asynccontextmanager
+async def _granted(_tier, **_kw):
+    from app.pipeline.lease import Granted
+
+    yield Granted(None)
+
+
+@pytest.fixture(autouse=True)
+def _job_leases_granted():
+    """These tests stub the pipelines' work; the leases each step holds are
+    tested in test_database_reset.TestLease."""
+    with patch("app.pipeline.lease.job_async", _granted):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_tracker():
+    supplementary_pipeline._tracker.clear()
+    yield
+    supplementary_pipeline._tracker.clear()
+
+
+def _run(db_session, explore_result=None, justice_result=None, president_result=None,
+         committee_leadership_result=None, district_pvi_result=None):
+    with patch("app.pipeline.supplementary_pipeline.SessionLocal", return_value=db_session), \
+         patch("app.pipeline.explore_pipeline.run_explore_pipeline", new_callable=AsyncMock) as mock_explore, \
+         patch("app.pipeline.justice_pipeline.run_justice_pipeline", new_callable=AsyncMock) as mock_justice, \
+         patch("app.pipeline.president_pipeline.run_president_pipeline", new_callable=AsyncMock) as mock_president, \
+         patch("app.pipeline.fetch.committee_leadership.refresh_committee_leadership_data",
+               new_callable=AsyncMock) as mock_committee_leadership, \
+         patch("app.pipeline.fetch.district_pvi.refresh_district_pvi",
+               new_callable=AsyncMock) as mock_district_pvi:
+        # An exception or a callable becomes the mock's side effect;
+        # anything else its return value (None -> that phase's default).
+        for mock, result, default in (
+            (mock_explore, explore_result, {"total": 0}),
+            (mock_justice, justice_result, {"justices": 0}),
+            (mock_president, president_result, {"updated": 0}),
+            (mock_committee_leadership, committee_leadership_result, True),
+            (mock_district_pvi, district_pvi_result, True),
+        ):
+            if isinstance(result, Exception) or callable(result):
+                mock.side_effect = result
+            else:
+                mock.return_value = result if result is not None else default
+
+        import asyncio
+        return asyncio.run(supplementary_pipeline.run_supplementary_pipeline())
+
+
+class TestSupplementaryPipelineRunTracking:
+    def test_creates_a_run_row_and_marks_it_completed(self, db_session):
+        # Empty Justice table -> justices_missing=True -> always runs,
+        # regardless of which day of the week the test happens to run on.
+        # Mirrors run_explore_pipeline's real return shape. total_embedded
+        # is deliberately huge: the ingested count must come from
+        # new_documents only, not from summing every int in the dict (the
+        # old behavior reported the entire embedded corpus as "ingested").
+        result = _run(
+            db_session,
+            explore_result={
+                "status": "completed",
+                "new_documents": {"senate_floor": 5, "fr_rulemaking": 7},
+                "total_embedded": 9999,
+                "elapsed_seconds": 1.0,
+            },
+            justice_result={"justices": 9},
+            president_result={"updated": 1},
+        )
+
+        assert result["status"] == "completed"
+        assert result["explore_docs_ingested"] == 12
+        assert result["justices_scored"] == 9
+        assert result["presidents_updated"] == 1
+
+        run = db_session.query(SupplementaryPipelineRun).one()
+        assert run.status == "completed"
+        assert run.explore_docs_ingested == 12
+        assert run.justices_scored == 9
+        assert run.justices_skipped is False
+        assert run.presidents_updated == 1
+        assert run.current_phase == "finalize"
+        assert run.completed_at is not None
+        assert run.elapsed_seconds is not None
+
+    def test_in_memory_flag_is_set_during_and_cleared_after(self, db_session):
+        seen_during = []
+
+        def explore(*_args, **_kwargs):
+            seen_during.append(supplementary_pipeline.is_supplementary_pipeline_running())
+            return {"total": 0}
+
+        _run(db_session, explore_result=explore)
+        assert seen_during == [True]
+        # Cleared by the finally block once the (synchronous, in this
+        # test) run completes.
+        assert supplementary_pipeline.is_supplementary_pipeline_running() is False
+
+    def test_justices_skipped_outside_weekly_cadence_when_not_missing(self, db_session):
+        db_session.add(Justice(id="j1", name="Test Justice", last_name="Justice", loyalty_through_term=2025))
+        db_session.commit()
+
+        # Pin "now" to a Wednesday (weekday() == 2), not Sunday (6).
+        with patch("app.pipeline.supplementary_pipeline.utcnow",
+                   return_value=datetime(2026, 7, 15)):  # a Wednesday
+            result = _run(db_session, justice_result={"justices": 9})
+
+        assert result["justices_scored"] == 0
+        run = db_session.query(SupplementaryPipelineRun).one()
+        assert run.justices_skipped is True
+        assert run.justices_scored == 0
+
+    def test_justices_run_off_cadence_until_loyalty_is_first_measured(self, db_session):
+        # A sitting justice whose loyalty was never measured (the release
+        # that adds it, or a source down on the last run) must not wait for
+        # Sunday to be scored.
+        db_session.add(Justice(id="j1", name="Test Justice", last_name="Justice"))
+        db_session.commit()
+        with patch("app.pipeline.supplementary_pipeline.utcnow",
+                   return_value=datetime(2026, 7, 15)):  # a Wednesday
+            result = _run(db_session, justice_result={"justices": 9})
+        assert result["justices_scored"] == 9
+
+    def test_justices_run_off_cadence_once_after_the_v3_change(self, db_session):
+        # Measured before justice v3 (votes counted) but its own estimate
+        # never stored: refresh now rather than show nothing until Sunday.
+        # A justice the Database doesn't cover (no votes counted) doesn't
+        # keep re-running it.
+        db_session.add_all([
+            Justice(id="j1", name="Old Row", last_name="Row", loyalty_through_term=2025, loyalty_votes_in=50),
+            Justice(id="j2", name="New Justice", last_name="Justice", loyalty_through_term=2025),
+        ])
+        db_session.commit()
+        with patch("app.pipeline.supplementary_pipeline.utcnow", return_value=datetime(2026, 7, 15)):
+            assert _run(db_session, justice_result={"justices": 9})["justices_scored"] == 9
+        db_session.query(Justice).filter(Justice.id == "j1").update({"appointer_effect": 0.1, "appointer_effect_se": 0.05})
+        db_session.query(SupplementaryPipelineRun).delete()
+        db_session.commit()
+        with patch("app.pipeline.supplementary_pipeline.utcnow", return_value=datetime(2026, 7, 15)):
+            assert _run(db_session, justice_result={"justices": 9})["justices_scored"] == 0
+
+    def test_justice_step_says_when_loyalty_was_not_measured(self, db_session):
+        # The voting record refreshing is not the score being measured: a
+        # bare "9 scored" hid the SCDB 403 of 2026-09-29.
+        why = "the Supreme Court Database could not be read"
+        with patch("app.pipeline.supplementary_pipeline.send_ops_alert") as alert:
+            _run(db_session, justice_result={"justices": 9, "loyalty_unmeasured": why})
+        steps = json.loads(db_session.query(SupplementaryPipelineRun).one().progress_detail)
+        step = next(s for s in steps if s["key"] == "justice_scorecards")
+        assert step["detail"] == f"9 refreshed, appointer estimate not measured: {why}"
+        # The alert carries the reason: the logs that named it rotated away.
+        alert.assert_called_once()
+        assert why in alert.call_args.args[1]
+
+    def test_a_measured_run_sends_no_alert_and_resolves_an_open_one(self, db_session):
+        with patch("app.pipeline.supplementary_pipeline.send_ops_alert") as alert, \
+             patch("app.pipeline.supplementary_pipeline.resolve_ops_alert") as resolve:
+            _run(db_session, justice_result={"justices": 9, "loyalty_unmeasured": None})
+        alert.assert_not_called()
+        resolve.assert_called_once_with("justice-loyalty-unmeasured")
+
+    def test_committee_leadership_skipped_outside_weekly_cadence_when_not_missing(self, db_session):
+        with patch("app.pipeline.supplementary_pipeline.utcnow",
+                   return_value=datetime(2026, 7, 15)), \
+             patch("app.pipeline.transform.committee_data.load_leadership_roles",
+                   return_value={"T000250": "Senate Majority Leader"}), \
+             patch("app.pipeline.transform.committee_data.leadership_tenures_on_volume",
+                   return_value=True):
+            _run(db_session)
+
+        run = db_session.query(SupplementaryPipelineRun).one()
+        assert run.committee_leadership_skipped is True
+        assert run.committee_leadership_refreshed is False
+
+    def test_committee_leadership_runs_when_tenures_file_missing(self, db_session):
+        """A volume that predates leadership_tenures.json has titles but no
+        tenure dates — refresh at once rather than wait for Sunday."""
+        with patch("app.pipeline.supplementary_pipeline.utcnow",
+                   return_value=datetime(2026, 7, 15)), \
+             patch("app.pipeline.transform.committee_data.load_leadership_roles",
+                   return_value={"T000250": "Senate Majority Leader"}), \
+             patch("app.pipeline.transform.committee_data.leadership_tenures_on_volume",
+                   return_value=False):
+            _run(db_session, committee_leadership_result=True)
+
+        run = db_session.query(SupplementaryPipelineRun).one()
+        assert run.committee_leadership_skipped is False
+        assert run.committee_leadership_refreshed is True
+
+    def test_committee_leadership_runs_when_missing_regardless_of_day(self, db_session):
+        with patch("app.pipeline.supplementary_pipeline.utcnow",
+                   return_value=datetime(2026, 7, 15)), \
+             patch("app.pipeline.transform.committee_data.load_leadership_roles",
+                   return_value={}):
+            _run(db_session, committee_leadership_result=True)
+
+        run = db_session.query(SupplementaryPipelineRun).one()
+        assert run.committee_leadership_skipped is False
+        assert run.committee_leadership_refreshed is True
+
+    def test_committee_leadership_failure_does_not_block_other_phases(self, db_session):
+        with patch("app.pipeline.transform.committee_data.load_leadership_roles",
+                   return_value={}):
+            result = _run(
+                db_session,
+                justice_result={"justices": 3},
+                president_result={"updated": 1},
+                committee_leadership_result=RuntimeError("fetch failed"),
+            )
+
+        assert result["status"] == "completed"
+        run = db_session.query(SupplementaryPipelineRun).one()
+        assert run.committee_leadership_refreshed is False
+
+    def test_district_pvi_skipped_outside_weekly_cadence_when_not_missing(self, db_session):
+        with patch("app.pipeline.supplementary_pipeline.utcnow",
+                   return_value=datetime(2026, 7, 15)), \
+             patch("app.pipeline.analyze.score_calculator._district_pvi",
+                   return_value={"CA-12": -20}):
+            _run(db_session)
+
+        run = db_session.query(SupplementaryPipelineRun).one()
+        assert run.district_pvi_skipped is True
+        assert run.district_pvi_refreshed is False
+
+    def test_district_pvi_runs_when_missing_regardless_of_day(self, db_session):
+        with patch("app.pipeline.supplementary_pipeline.utcnow",
+                   return_value=datetime(2026, 7, 15)), \
+             patch("app.pipeline.analyze.score_calculator._district_pvi",
+                   return_value={}):
+            _run(db_session, district_pvi_result=True)
+
+        run = db_session.query(SupplementaryPipelineRun).one()
+        assert run.district_pvi_skipped is False
+        assert run.district_pvi_refreshed is True
+
+    def test_district_pvi_failure_does_not_block_other_phases(self, db_session):
+        with patch("app.pipeline.analyze.score_calculator._district_pvi",
+                   return_value={}):
+            result = _run(
+                db_session,
+                justice_result={"justices": 3},
+                president_result={"updated": 1},
+                district_pvi_result=RuntimeError("fetch failed"),
+            )
+
+        assert result["status"] == "completed"
+        run = db_session.query(SupplementaryPipelineRun).one()
+        assert run.district_pvi_refreshed is False
+
+    def test_one_phase_failing_does_not_block_the_others(self, db_session):
+        """Best-effort per phase, matching stock_pipeline's per-chamber pattern."""
+        result = _run(
+            db_session,
+            explore_result=RuntimeError("Explore fetch down"),
+            justice_result={"justices": 5},
+            president_result={"updated": 2},
+        )
+
+        assert result["status"] == "completed"
+        assert result["justices_scored"] == 5
+        assert result["presidents_updated"] == 2
+
+        run = db_session.query(SupplementaryPipelineRun).one()
+        assert run.status == "completed"
+        assert run.explore_docs_ingested == 0
+        assert run.justices_scored == 5
+        assert run.presidents_updated == 2
+
+
+class TestSupplementaryPipelineLock:
+    """run_supplementary_pipeline gained a real lock 2026-07-23 — before
+    this it unconditionally created a new run row every call, so a row
+    orphaned by a killed process (a deploy restarting the container
+    mid-run) never blocked a later attempt from double-running, but ALSO
+    never got cleared — it just sat there. Confirmed live as (part of)
+    why supplementary data went stale for 1+ day after a since-fixed
+    deploy-race incident: this pipeline itself didn't cause the skip
+    (only Senate's own lock did, taking the whole chain with it), but had
+    this pipeline been retried directly, a stale row would have had no
+    auto-clear.
+    """
+
+    def test_skips_when_a_recent_run_is_already_marked_running(self, db_session):
+        db_session.add(SupplementaryPipelineRun(started_at=utcnow() - timedelta(minutes=5), status=PipelineStatus.RUNNING))
+        db_session.commit()
+
+        with patch("app.pipeline.supplementary_pipeline.SessionLocal", return_value=db_session):
+            import asyncio
+            result = asyncio.run(supplementary_pipeline.run_supplementary_pipeline())
+
+        assert result == {"status": "skipped", "reason": "already_running"}
+        assert db_session.query(SupplementaryPipelineRun).count() == 1
+
+    def test_stale_running_row_is_cleared_and_a_fresh_run_proceeds(self, db_session):
+        stale = SupplementaryPipelineRun(started_at=utcnow() - timedelta(hours=13), status=PipelineStatus.RUNNING)
+        db_session.add(stale)
+        db_session.commit()
+        stale_id = stale.id
+
+        result = _run(db_session, explore_result={"total": 0}, justice_result={"justices": 0}, president_result={"updated": 0})
+
+        assert result["status"] == "completed"
+        cleared = db_session.query(SupplementaryPipelineRun).filter(SupplementaryPipelineRun.id == stale_id).one()
+        assert cleared.status == PipelineStatus.STALE
+
+
+def test_a_step_whose_lease_is_held_elsewhere_is_skipped(db_session):
+    """A manual re-embed (or a reset) holding the explore lease: the nightly
+    explore step doesn't run beside it, and the other steps still do."""
+    import json
+
+    from app.pipeline import lease
+
+    @asynccontextmanager
+    async def explore_held(tier, **_kw):
+        yield lease.Granted("it is running elsewhere" if tier == lease.EXPLORE else None)
+
+    # Recorded through _run's own explore mock: a mock patched outside
+    # _run would be shadowed by it and could never see a call.
+    explore_calls = []
+    with patch("app.pipeline.lease.job_async", explore_held):
+        _run(db_session, explore_result=lambda *a, **k: explore_calls.append(a) or {"total": 0})
+    assert explore_calls == []
+    run = db_session.query(SupplementaryPipelineRun).one()
+    steps = {step["key"]: step["status"] for step in json.loads(run.progress_detail)}
+    assert steps["explore_documents"] == "skipped" and steps["president_scorecards"] == "done"
+    detail = {step["key"]: step.get("detail") for step in json.loads(run.progress_detail)}
+    assert detail["explore_documents"] == "skipped: it is running elsewhere"

@@ -1,0 +1,401 @@
+"""Normalize Congress.gov member data into base senator records."""
+
+import logging
+import re
+import unicodedata
+
+from app.election_calendar import federal_states
+from app.member_ids import member_slug
+from app.state_names import STATE_NAME_TO_CODE as STATE_NAMES_TO_CODES
+from app.time_utils import utcnow
+from app.pipeline.transform.committee_data import (
+    load_committee_membership,
+    load_leadership_roles,
+)
+
+logger = logging.getLogger(__name__)
+
+# Neutral prior for a base member record that has not yet been scored.
+# Per the scoring standard (score_calculator's module docstring: "Missing
+# data yields a neutral 50, never a perfect 100 or 0"), an un-scored member
+# — e.g. one with no FEC match, or one whose analysis pass fails and falls
+# back to this base record — must surface as neutral/unknown (50), NOT as a
+# 0 that reads as "fully captured." The keys here are the five currently
+# scored dimensions (score_calculator.calculate_scores); the old stub seeded
+# 0s under stale keys (transparency/accessibility, removed years ago), which
+# both misrepresented unknown members as maximally captured and no longer
+# matched the columns downstream code reads.
+NEUTRAL_SCORE = 50
+_NEUTRAL_REPRESENTATION_SCORE = {
+    "fundingIndependence": NEUTRAL_SCORE,
+    "promisePersistence": NEUTRAL_SCORE,
+    "constituentAlignment": NEUTRAL_SCORE,
+    "fundingDiversity": NEUTRAL_SCORE,
+    "legislativeEffectiveness": NEUTRAL_SCORE,
+}
+
+STATE_NAME_TO_CODE = STATE_NAMES_TO_CODES  # the one table (app/state_names.py), re-exported
+
+
+
+def normalize_members(
+    members: list[dict], member_details: dict[str, dict] | None = None
+) -> list[dict]:
+    """Normalize Congress.gov member data into base senator records.
+
+    Args:
+        members: Raw member data from Congress.gov API.
+        member_details: Map of bioguideId -> detailed member info.
+
+    Returns:
+        List of base senator records.
+    """
+    if member_details is None:
+        member_details = {}
+
+    results = []
+    for m in members:
+        # Only current senators -- check member detail terms for Senate chamber
+        detail = member_details.get(m.get("bioguideId", ""), {})
+        detail_terms = detail.get("terms", [])
+        member_terms_obj = m.get("terms") or {}
+        member_terms = member_terms_obj.get("item", []) if isinstance(member_terms_obj, dict) else []
+        all_terms = detail_terms + member_terms
+        senate_term = any(t.get("chamber") == "Senate" for t in all_terms)
+        if not senate_term and m.get("chamber") != "Senate":
+            continue
+
+        raw_name = m.get("name") or f"{m.get('lastName', '')}, {m.get('firstName', '')}"
+        state = _extract_state_code(m, detail)
+        party = _normalize_party(m.get("partyName") or m.get("party"))
+        years_in_office = _calculate_years_in_office(m, detail)
+
+        last_name_for_match = _extract_last_name(raw_name)
+
+        # The slug; unique across both chambers once app.member_ids.
+        # assign_member_ids has settled it against the stored members.
+        senator_id = member_slug(raw_name, detail.get("lastName"))
+
+        # Clean name to "First Last" order for display and initials
+        name = _clean_name(raw_name)
+        initials = _initials(name, last_name_for_match)
+
+        official_url = (detail.get("officialWebsiteUrl") or "").rstrip("/")
+        addr_info = detail.get("addressInformation") or {}
+        office_address = (addr_info.get("officeAddress") or "").strip()
+        office_phone = (addr_info.get("phoneNumber") or "").strip()
+
+        contact_form = ""
+        if official_url:
+            contact_form = f"{official_url}/contact"
+
+        bioguide_id = m.get("bioguideId", "")
+        results.append({
+            "bioguideId": bioguide_id,
+            "id": senator_id,
+            "name": name,
+            "lastNameForVoteMatch": last_name_for_match,
+            "state": state,
+            "party": party,
+            "yearsInOffice": years_in_office,
+            "leadershipTitle": load_leadership_roles().get(bioguide_id),
+            "committees": load_committee_membership().get(bioguide_id, []),
+            "initials": initials,
+            "officialWebsiteUrl": official_url,
+            "officePhone": office_phone,
+            "officeAddress": office_address,
+            "contactFormUrl": contact_form,
+            "representationScore": dict(_NEUTRAL_REPRESENTATION_SCORE),
+            "funding": {
+                "totalRaised": 0,
+                "totalFromPACs": 0,
+                "smallDonorPercentage": 0,
+                "topDonors": [],
+                "industryBreakdown": [],
+            },
+            "votingRecord": {
+                "totalVotes": 0,
+                "keyVotes": [],
+            },
+            "lobbyingMatches": [],
+        })
+
+    return results
+
+
+def normalize_house_members(
+    members: list[dict], member_details: dict[str, dict] | None = None
+) -> list[dict]:
+    """Normalize Congress.gov member data into base representative records.
+
+    Same structure as normalize_members but filters for House chamber
+    and extracts the district number.
+    """
+    if member_details is None:
+        member_details = {}
+
+    results = []
+    for m in members:
+        detail = member_details.get(m.get("bioguideId", ""), {})
+        detail_terms_obj = detail.get("terms") or {}
+        detail_terms = detail_terms_obj.get("item", []) if isinstance(detail_terms_obj, dict) else (
+            detail_terms_obj if isinstance(detail_terms_obj, list) else []
+        )
+        member_terms_obj = m.get("terms") or {}
+        member_terms = member_terms_obj.get("item", []) if isinstance(member_terms_obj, dict) else []
+        all_terms = detail_terms + member_terms
+        if not all_terms:
+            continue
+        most_recent = max(all_terms, key=lambda t: t.get("startYear", 0))
+        if most_recent.get("chamber") != "House of Representatives":
+            continue
+
+        raw_name = m.get("name") or f"{m.get('lastName', '')}, {m.get('firstName', '')}"
+        state = _extract_state_code(m, detail)
+
+        # Skip non-voting delegates (DC, PR, GU, VI, AS, MP): only the
+        # states (those with Senate seats, from the Senate's own list) have
+        # voting House members.
+        if state not in federal_states():
+            continue
+
+        party = _normalize_party(m.get("partyName") or m.get("party"))
+
+        district = _extract_district(m, detail)
+        years_in_office = _calculate_house_years(m, detail)
+
+        last_name_for_match = _extract_last_name(raw_name)
+
+        rep_id = member_slug(raw_name, detail.get("lastName"))  # settled by app.member_ids.assign_member_ids
+
+        name = _clean_name(raw_name)
+        initials = _initials(name, last_name_for_match)
+
+        official_url = (detail.get("officialWebsiteUrl") or "").rstrip("/")
+        addr_info = detail.get("addressInformation") or {}
+        office_address = (addr_info.get("officeAddress") or "").strip()
+        office_phone = (addr_info.get("phoneNumber") or "").strip()
+
+        contact_form = ""
+        if official_url:
+            contact_form = f"{official_url}/contact"
+
+        bioguide_id = m.get("bioguideId", "")
+        results.append({
+            "bioguideId": bioguide_id,
+            "id": rep_id,
+            "name": name,
+            "lastNameForVoteMatch": last_name_for_match,
+            "state": state,
+            "district": district,
+            "party": party,
+            "yearsInOffice": years_in_office,
+            "leadershipTitle": load_leadership_roles().get(bioguide_id),
+            "committees": load_committee_membership().get(bioguide_id, []),
+            "initials": initials,
+            "officialWebsiteUrl": official_url,
+            "officePhone": office_phone,
+            "officeAddress": office_address,
+            "contactFormUrl": contact_form,
+            "representationScore": dict(_NEUTRAL_REPRESENTATION_SCORE),
+            "funding": {
+                "totalRaised": 0,
+                "totalFromPACs": 0,
+                "smallDonorPercentage": 0,
+                "topDonors": [],
+                "industryBreakdown": [],
+            },
+            "votingRecord": {
+                "totalVotes": 0,
+                "keyVotes": [],
+            },
+            "lobbyingMatches": [],
+        })
+
+    return results
+
+
+def _extract_terms(member: dict, detail: dict) -> list[dict]:
+    """Combine detail.terms and member.terms into one list (2026-08
+    cleanup: this Congress.gov term-list unwrapping was duplicated
+    verbatim in _extract_district, _calculate_house_years, and
+    _calculate_years_in_office). Both sources are needed — the
+    detail-endpoint terms are fuller, but the member-list response
+    sometimes carries a term the detail endpoint doesn't."""
+    detail_terms_obj = detail.get("terms") or {}
+    detail_terms = detail_terms_obj.get("item", []) if isinstance(detail_terms_obj, dict) else (
+        detail_terms_obj if isinstance(detail_terms_obj, list) else []
+    )
+    member_terms_obj = member.get("terms") or {}
+    member_terms = member_terms_obj.get("item", []) if isinstance(member_terms_obj, dict) else []
+    return detail_terms + member_terms
+
+
+def _years_since_first_term(
+    terms: list[dict], chamber: str, member: dict, warn_if_not_found: bool = False,
+) -> int:
+    """Years since the earliest `chamber` term's startYear, falling back
+    to a "since YYYY" year parsed from the member's depiction attribution
+    when no matching term has one. Shared by _calculate_house_years and
+    _calculate_years_in_office (2026-08 cleanup: identical logic, only
+    the chamber name — and whether the not-found case logs — differed).
+    `first_year` is only ever falsy here when truly absent (a real term
+    can't start in year 0), so the final `return 0` is an unambiguous
+    not-found sentinel, safe to gate a warning on."""
+    chamber_terms = [t for t in terms if t.get("chamber") == chamber]
+    if chamber_terms:
+        sorted_terms = sorted(chamber_terms, key=lambda t: t.get("startYear", 9999))
+        first_year = sorted_terms[0].get("startYear")
+        if first_year:
+            return utcnow().year - first_year
+
+    depiction = member.get("depiction") or {}
+    attribution = depiction.get("attribution", "")
+    if attribution:
+        match = re.search(r"since (\d{4})", attribution)
+        if match:
+            return utcnow().year - int(match.group(1))
+
+    if warn_if_not_found:
+        logger.warning(
+            "Could not determine years in office for %s",
+            member.get("name") or member.get("bioguideId"),
+        )
+    return 0
+
+
+def _extract_district(member: dict, detail: dict) -> int:
+    """Extract the congressional district number from member data."""
+    terms = _extract_terms(member, detail)
+    house_terms = [t for t in terms if t.get("chamber") == "House of Representatives"]
+    if house_terms:
+        sorted_terms = sorted(house_terms, key=lambda t: t.get("startYear", 0), reverse=True)
+        district = sorted_terms[0].get("district")
+        if district is not None:
+            try:
+                return int(district)
+            except (ValueError, TypeError):
+                pass
+    d = member.get("district")
+    if d is not None:
+        try:
+            return int(d)
+        except (ValueError, TypeError):
+            pass
+    return 0
+
+
+def _calculate_house_years(member: dict, detail: dict) -> int:
+    """Calculate years in office from House term data."""
+    return _years_since_first_term(_extract_terms(member, detail), "House of Representatives", member)
+
+
+def _extract_last_name(name: str) -> str:
+    """Extract the multi-word last name from Congress.gov name format.
+
+    Congress.gov returns "LastName, FirstName MiddleName" — the part
+    before the comma preserves multi-word last names like "De la Rosa",
+    "Van Doren", "Hale Morrow".  Accented characters are normalized
+    to ASCII for matching against Senate.gov roll call XML (which drops
+    accents, e.g. "Núñez" → "Nunez").
+    """
+    if "," in name:
+        last = name.split(",", 1)[0].strip()
+    else:
+        parts = name.split()
+        last = parts[-1] if parts else name
+
+    return strip_accents(last)
+
+
+def strip_accents(text: str) -> str:
+    """Remove diacritical marks (NFD decomposition, strip combining chars).
+
+    Shared by candidate_names.py and normalize_votes.py (2026-08 cleanup:
+    the same two-line NFKD idiom was duplicated in all three modules) —
+    lives here rather than a new module since this is where it already
+    existed with real callers.
+    """
+    nfkd = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def _clean_name(name: str) -> str:
+    """Congress.gov's "Last, First Middle[, Suffix]" in reading order,
+    "First Middle Last Suffix". Splitting at the first comma only put a
+    generational suffix inside the given names ("King, Angus S., Jr." read
+    "Angus S., Jr. King")."""
+    if "," not in name:
+        return name
+    last, first, *suffix = (part.strip() for part in name.split(","))
+    return " ".join(p for p in (first, last, *suffix) if p)
+
+
+def _initials(name: str, last_name: str) -> str:
+    """First letter of the first name and of the surname's last word, as
+    before suffixes were kept in order (never of a trailing "Jr.")."""
+    parts = name.split()
+    if not parts:
+        return ""
+    if len(parts) == 1 or not last_name.split():
+        return parts[0][0].upper()
+    return parts[0][0].upper() + last_name.split()[-1][0].upper()
+
+
+def _normalize_party(party_name: str | None) -> str:
+    """Normalize party name to single letter code."""
+    if not party_name:
+        return "I"
+    lower = party_name.lower()
+    if "republican" in lower:
+        return "R"
+    if "democrat" in lower:
+        return "D"
+    if "independent" in lower:
+        return "I"
+    # Single letter check
+    if party_name == "R":
+        return "R"
+    if party_name == "D":
+        return "D"
+    return "I"
+
+
+def _extract_state_code(member: dict, detail: dict) -> str:
+    """Extract the two-letter state code from member data."""
+    # First try stateCode from detail terms (most reliable)
+    detail_terms = detail.get("terms", [])
+    for term in detail_terms:
+        sc = term.get("stateCode")
+        if sc and len(sc) == 2:
+            return sc
+
+    # Try member terms
+    member_terms_obj = member.get("terms") or {}
+    member_terms = member_terms_obj.get("item", []) if isinstance(member_terms_obj, dict) else []
+    for term in member_terms:
+        sc = term.get("stateCode")
+        if sc and len(sc) == 2:
+            return sc
+
+    # Convert full state name to code
+    state_name = member.get("state") or detail.get("state")
+    if state_name:
+        if len(state_name) == 2:
+            return state_name  # Already a code
+        code = STATE_NAME_TO_CODE.get(state_name)
+        if code:
+            return code
+
+    logger.warning(
+        "Could not determine state code for %s",
+        member.get("name") or member.get("bioguideId"),
+    )
+    return "??"
+
+
+def _calculate_years_in_office(member: dict, detail: dict) -> int:
+    """Calculate years in office from Senate term data."""
+    return _years_since_first_term(
+        _extract_terms(member, detail), "Senate", member, warn_if_not_found=True,
+    )

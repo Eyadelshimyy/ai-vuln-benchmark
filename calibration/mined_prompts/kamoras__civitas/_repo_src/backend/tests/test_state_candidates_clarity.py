@@ -1,0 +1,354 @@
+"""Tests for the shared Clarity ENR adapter (state_candidates_clarity.py).
+
+The summary fixture is a real cut of Colorado's official 2026 primary feed
+(fetched live 2026-08-12), including the CO-01 Democratic contest whose
+real-world outcome — Melat Kiros unseating 15-term incumbent Diana DeGette
+— is the ground truth this adapter is verified against, plus a Governor
+contest as a control that must NOT be picked up as federal.
+"""
+
+import json
+import os
+
+import pytest
+
+from app.pipeline.fetch import state_candidates_clarity as cl
+from app.pipeline.fetch.state_candidates_common import surname
+
+_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures_co_clarity_summary.json")
+
+
+def _contests() -> list[dict]:
+    with open(_FIXTURE, encoding="utf-8") as fh:
+        return json.load(fh)["Contests"]
+
+
+def _contest(needle: str) -> dict:
+    return next(c for c in _contests() if needle in c["C"])
+
+
+class TestParseOffice:
+    @pytest.mark.parametrize("label, expected", [
+        pytest.param("United States Senator - Democratic Party", ("S", None), id="senate"),
+        pytest.param("Representative to the 120th United States Congress - District 7 - Democratic Party",
+                     ("H", 7), id="house_with_district"),
+        # AK/DE/MT/ND/SD/VT/WY print no district number; FEC models those
+        # as district 0, which _race_id_for already falls back to.
+        pytest.param("Representative to the 120th United States Congress - Republican Party",
+                     ("H", None), id="house_at_large_has_no_district"),
+        # The "120th" is not load-bearing — the same label in the next
+        # cycle must still parse, or the adapter silently dies every 2 years.
+        pytest.param("Representative to the 121st United States Congress - District 2 - Democratic Party",
+                     ("H", 2), id="ordinal_advances_between_congresses"),
+        # A non-federal contest is not guessed into a federal one.
+        pytest.param("Governor - Democratic Party", None, id="governor_is_not_federal"),
+        pytest.param("State Senate District 4 - Republican Party", None, id="state_senate_is_not_federal"),
+    ])
+    def test_parse_office(self, label, expected):
+        assert cl._parse_office(label) == expected
+
+
+class TestParseParty:
+    def test_maps_spelled_out_party_to_the_states_own_code(self):
+        assert cl._parse_party("United States Senator - Democratic Party") == "D"
+        assert cl._parse_party("... - Republican Party") == "R"
+        assert cl._parse_party("... - Libertarian Party") == "L"
+
+    def test_unrecognised_party_is_skipped_not_defaulted(self):
+        assert cl._parse_party("United States Senator - Nonpartisan") is None
+
+
+class TestSurname:
+    """The trailing token and a "Jr." are covered with surname() itself in
+    test_state_candidates_common.py; these are the cases only this file
+    checks."""
+
+    def test_drops_a_generational_suffix(self):
+        assert surname("Harold Ford III") == "Ford"
+
+    def test_blank_name_yields_none(self):
+        assert surname("   ") is None
+
+
+class TestNominee:
+    def test_picks_the_real_winner_from_the_live_co01_contest(self):
+        """Ground truth: Kiros beat DeGette on 2026-06-30."""
+        won = cl._nominee(_contest("District 1 - Democratic"), None)
+        assert won is not None and won[0] == "Melat Kiros"
+
+    def test_unopposed_candidate_wins(self):
+        won = cl._nominee(_contest("District 4 - Republican"), None)
+        assert won is not None and won[0] == "Lauren Boebert"
+
+    def test_runoff_state_withholds_a_sub_threshold_leader(self):
+        """A 53% plurality leader is the nominee in Colorado but is headed
+        to a runoff in a majority-required state — that must yield nothing
+        rather than mislabel them as the confirmed nominee."""
+        co01 = _contest("District 1 - Democratic")
+        assert cl._nominee(co01, None) is not None
+        assert cl._nominee(co01, 60.0) is None
+
+    def test_exact_tie_has_no_winner(self):
+        tied = {"CH": ["A", "B"], "V": [500, 500], "PCT": [50.0, 50.0]}
+        assert cl._nominee(tied, None) is None
+
+    def test_no_votes_cast_yet_yields_nothing(self):
+        assert cl._nominee({"CH": ["A"], "V": [0], "PCT": [0.0]}, None) is None
+
+    def test_malformed_contest_yields_nothing_rather_than_raising(self):
+        assert cl._nominee({"CH": ["A", "B"], "V": [1], "PCT": []}, None) is None
+        assert cl._nominee({}, None) is None
+
+
+class TestIsPrimary:
+    @pytest.mark.parametrize("name, date, expected", [
+        pytest.param("2026 Primary", "6/30/2026", True, id="the_cycles_regular_primary"),
+        pytest.param("2024 Primary", "6/25/2024", False, id="another_years_primary"),
+        pytest.param("2026 Presidential Primary", "3/3/2026", False, id="the_separate_presidential_primary"),
+        pytest.param("2026 General", "11/3/2026", False, id="a_general_election"),
+    ])
+    def test_is_primary(self, name, date, expected):
+        assert cl._is_primary({"ElectionName": name, "Date": f"{date} 12:00:00 AM"}, 2026) is expected
+
+
+class TestFetchConfirmedCandidates:
+    """End-to-end over the real fixture, with the three Clarity HTTP hops
+    stubbed — proves the whole parse produces exactly the federal nominees
+    and nothing else."""
+
+    @pytest.mark.asyncio
+    async def test_returns_only_federal_nominees(self, monkeypatch):
+        async def fake_get(client, url, label):
+            if url.endswith("elections.json"):
+                return _Resp(json_body=[
+                    {"EID": "126592", "ElectionName": "2026 Primary",
+                     "Date": "6/30/2026 12:00:00 AM"},
+                ])
+            if url.endswith("current_ver.txt"):
+                return _Resp(text="377440")
+            return _Resp(json_body={"Contests": _contests()})
+
+        monkeypatch.setattr(cl, "_get", fake_get)
+        records = await cl.fetch_confirmed_candidates(None, 2026, "CO", {})
+
+        assert {r["last_name"] for r in records} == {"Hickenlooper", "Kiros", "Boebert"}
+        # The Governor contest in the same feed must not appear.
+        assert all(r["office"] in ("S", "H") for r in records)
+        assert {"office": "H", "district": 1, "party": "D", "last_name": "Kiros", "display_name": "Melat Kiros"} in records
+
+    @pytest.mark.asyncio
+    async def test_missing_primary_returns_none_not_empty(self, monkeypatch):
+        """None means "couldn't check" and leaves the FEC list alone; [] would
+        mean "checked, nobody is confirmed" — a very different claim."""
+        async def fake_get(client, url, label):
+            if url.endswith("elections.json"):
+                return _Resp(json_body=[
+                    {"EID": "1", "ElectionName": "2024 Primary",
+                     "Date": "6/25/2024 12:00:00 AM"},
+                ])
+            return _Resp(text="x")
+
+        monkeypatch.setattr(cl, "_get", fake_get)
+        assert await cl.fetch_confirmed_candidates(None, 2026, "CO", {}) is None
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_returns_none(self, monkeypatch):
+        async def fake_get(client, url, label):
+            return None
+
+        monkeypatch.setattr(cl, "_get", fake_get)
+        assert await cl.fetch_confirmed_candidates(None, 2026, "CO", {}) is None
+
+    @pytest.mark.asyncio
+    async def test_garbage_version_is_rejected(self, monkeypatch):
+        """current_ver.txt must be a version id — an error page here would
+        otherwise be pasted straight into the results URL."""
+        async def fake_get(client, url, label):
+            if url.endswith("elections.json"):
+                return _Resp(json_body=[
+                    {"EID": "126592", "ElectionName": "2026 Primary",
+                     "Date": "6/30/2026 12:00:00 AM"},
+                ])
+            return _Resp(text="<html>Not Found</html>")
+
+        monkeypatch.setattr(cl, "_get", fake_get)
+        assert await cl.fetch_confirmed_candidates(None, 2026, "CO", {}) is None
+
+
+def _wv_contests() -> list[dict]:
+    path = os.path.join(os.path.dirname(__file__), "fixtures_wv_clarity_summary.json")
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)["Contests"]
+
+
+_WV_DISCOVERY = {
+    "mode": "landing_page",
+    "page_url": "https://sos.wv.gov/elections",
+    "link_regex": r"results\.enr\.clarityelections\.com/WV/(\d+)",
+}
+
+
+_ELECTIONS = {
+    "119000": ("2024 Primary", "5/14/2024"),
+    "126209": ("2026 Primary", "5/12/2026"),
+    "126300": ("2026 General", "11/3/2026"),
+}
+
+
+def _clarity(url):
+    """Clarity's per-election version and settings files, for the ids in
+    _ELECTIONS; None for anything else."""
+    for eid, (name, date) in _ELECTIONS.items():
+        if url.endswith(f"/WV/{eid}/current_ver.txt"):
+            return _Resp(text="1")
+        if url.endswith(f"/WV/{eid}/1/json/en/electionsettings.json"):
+            return _Resp(json_body={"settings": {"electiondetails": {"internalname": name, "electiondate": date}}})
+    return None
+
+
+def _links(*eids):
+    return "".join(f'<a href="https://results.enr.clarityelections.com/WV/{e}">{e}</a>' for e in eids)
+
+
+class TestDiscoverElectionId:
+    """West Virginia's own copy of elections.json is empty even though its
+    real results are live — verified 2026-09-03 — so it discovers its EID
+    off the link its own elections page keeps current instead."""
+
+    @pytest.mark.parametrize("eids, expected", [
+        pytest.param(["126209"], "126209", id="landing_page_mode_extracts_the_eid"),
+        # West Virginia's current page dropped its primary link before the
+        # general; the results archive still has it, beside every election
+        # back to 2016. Each id's own settings say which is this cycle's.
+        pytest.param(["119000", "126209", "126300"], "126209",
+                     id="an_archive_of_links_is_scoped_by_each_elections_own_date"),
+        pytest.param(["119000"], None, id="a_lone_stale_link_is_not_trusted"),
+        pytest.param(["126209", "126209"], "126209", id="same_link_repeated_is_not_treated_as_ambiguous"),
+    ])
+    @pytest.mark.asyncio
+    async def test_the_linked_election_for_this_cycle(self, monkeypatch, eids, expected):
+        async def fake_get(client, url, label):
+            if url == "https://sos.wv.gov/elections":
+                return _Resp(text=_links(*eids))
+            return _clarity(url)
+
+        monkeypatch.setattr(cl, "_get", fake_get)
+        assert await cl._discover_election_id(None, "WV", 2026, _WV_DISCOVERY) == expected
+
+    @pytest.mark.asyncio
+    async def test_missing_page_url_or_link_regex_returns_none_not_a_crash(self, monkeypatch):
+        # A future state's config with a typo'd/missing key must degrade
+        # gracefully, not raise a KeyError that takes down the whole sync.
+        async def fake_get(client, url, label):
+            raise AssertionError("should not fetch when config is incomplete")
+
+        monkeypatch.setattr(cl, "_get", fake_get)
+        assert await cl._discover_election_id(None, "WV", 2026, {"mode": "landing_page"}) is None
+        incomplete = {"mode": "landing_page", "page_url": "https://sos.wv.gov/elections"}
+        assert await cl._discover_election_id(None, "WV", 2026, incomplete) is None
+
+    @pytest.mark.asyncio
+    async def test_two_primaries_for_the_cycle_refuses_rather_than_guessing(self, monkeypatch):
+        async def fake_get(client, url, label):
+            if url == "https://sos.wv.gov/elections":
+                return _Resp(text=_links("126209", "126210"))
+            if "/126210/" in url:
+                return _clarity(url.replace("126210", "126209"))
+            return _clarity(url)
+
+        monkeypatch.setattr(cl, "_get", fake_get)
+        assert await cl._discover_election_id(None, "WV", 2026, _WV_DISCOVERY) is None
+
+    @pytest.mark.asyncio
+    async def test_a_challenge_gated_empty_page_is_retried_once(self, monkeypatch):
+        # Same symptom Minnesota's file host shows: a 200 with none of
+        # the page's real links on it, usually a bot-manager challenge
+        # rather than a genuinely empty page.
+        calls = []
+
+        async def fake_get(client, url, label):
+            if url != "https://sos.wv.gov/elections":
+                return _clarity(url)
+            calls.append(url)
+            if len(calls) == 1:
+                return _Resp(text="<html>challenge page, no links yet</html>")
+            return _Resp(text=_links("126209"))
+
+        monkeypatch.setattr(cl, "_get", fake_get)
+        eid = await cl._discover_election_id(None, "WV", 2026, _WV_DISCOVERY)
+        assert eid == "126209"
+        assert len(calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_empty_page_is_not_retried_forever(self, monkeypatch):
+        calls = []
+
+        async def fake_get(client, url, label):
+            calls.append(url)
+            return _Resp(text="<html>truly nothing here</html>")
+
+        monkeypatch.setattr(cl, "_get", fake_get)
+        # No matching link: nothing — after one retry, not an infinite loop.
+        assert await cl._discover_election_id(None, "WV", 2026, _WV_DISCOVERY) is None
+        assert len(calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_page_fetch_failure_returns_none(self, monkeypatch):
+        async def fake_get(client, url, label):
+            return None
+
+        monkeypatch.setattr(cl, "_get", fake_get)
+        assert await cl._discover_election_id(None, "WV", 2026, _WV_DISCOVERY) is None
+
+    @pytest.mark.asyncio
+    async def test_no_discovery_config_falls_back_to_elections_json_unchanged(self, monkeypatch):
+        # Regression guard: a state with no discovery block (every
+        # existing Clarity state) must keep using elections.json exactly
+        # as before this landing_page mode was added.
+        async def fake_get(client, url, label):
+            assert url.endswith("elections.json")
+            return _Resp(json_body=[
+                {"EID": "126592", "ElectionName": "2026 Primary",
+                 "Date": "6/30/2026 12:00:00 AM"},
+            ])
+
+        monkeypatch.setattr(cl, "_get", fake_get)
+        assert await cl._discover_election_id(None, "CO", 2026, {}) == "126592"
+
+
+class TestFetchConfirmedCandidatesLandingPageDiscovery:
+    """End-to-end over the real West Virginia fixture, discovered via the
+    landing_page mode rather than elections.json."""
+
+    @pytest.mark.asyncio
+    async def test_real_wv_field_resolves_real_winners(self, monkeypatch):
+        async def fake_get(client, url, label):
+            if url == "https://sos.wv.gov/elections":
+                return _Resp(text=_links("126209"))
+            if "electionsettings" in url:
+                return _clarity(url.replace("/375698/", "/1/"))
+            if url.endswith("current_ver.txt"):
+                return _Resp(text="375698")
+            return _Resp(json_body={"Contests": _wv_contests()})
+
+        monkeypatch.setattr(cl, "_get", fake_get)
+        source = {"runoff_threshold_pct": None, "discovery": _WV_DISCOVERY}
+        records = await cl.fetch_confirmed_candidates(None, 2026, "WV", source)
+
+        assert {"office": "S", "district": None, "party": "R", "last_name": "CAPITO", "display_name": "SHELLEY MOORE CAPITO"} in records
+        assert {"office": "S", "district": None, "party": "D", "last_name": "ANDERSON", "display_name": "RACHEL FETTY ANDERSON"} in records
+        assert {"office": "H", "district": 1, "party": "D", "last_name": "GEORGE", "display_name": "VINCE GEORGE"} in records
+        # A candidate with an Mc-surname (McKINNEY) is a real loser in this
+        # field and must not corrupt the winner pick.
+        assert not any(r["last_name"] == "McKINNEY" for r in records)
+        # The State Senator control contest must never appear.
+        assert all(r["office"] in ("S", "H") for r in records)
+
+
+class _Resp:
+    def __init__(self, json_body=None, text=""):
+        self._json = json_body
+        self.text = text
+
+    def json(self):
+        return self._json

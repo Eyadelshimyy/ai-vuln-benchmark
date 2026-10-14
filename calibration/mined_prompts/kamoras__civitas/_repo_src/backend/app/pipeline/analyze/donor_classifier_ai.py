@@ -1,0 +1,996 @@
+"""
+Hybrid donor classifier — tiered strategy for donor type and industry.
+
+Despite the "_ai" in the filename, no LLM runs anywhere in this module's
+live classification path — every tier below is deterministic (FEC
+metadata, embedding similarity, rule-based skip patterns, kNN). An
+earlier LLM-based approach was tried and replaced; see "Academic
+rationale" below for why.
+
+Classification tiers (donor TYPE):
+1. FEC committee type codes (structured data from the API itself)
+2. Semantic candidate-affiliated detection (embedding similarity)
+3. Minimal safety-net rules (payment processor skips only)
+4. Learning store lookup
+5. Nearest-neighbor embedding classifier for remaining unknowns
+
+Classification tiers (donor INDUSTRY):
+1. Learning store
+2. Embedding cosine similarity (from industry_classifier)
+3. Nearest-neighbor embedding classifier for remaining unknowns
+
+Academic rationale
+------------------
+The tiered strategy prioritizes structured metadata over learned
+representations, following the principle that the most informative
+features should be used first (Jurafsky & Martin 2023, Ch. 4). FEC
+committee type codes (committee_type, designation) are authoritative
+ground truth for donor classification — using them is faster and more
+accurate than re-deriving what the FEC already knows.
+
+Semantic candidate-affiliated detection uses embedding cosine similarity
+against category prototypes (Reimers & Gurevych 2019, Sentence-BERT),
+replacing ~200 lines of brittle hardcoded string patterns. This
+generalizes to unseen entities (new senator names, new PACs) without
+code changes — a key advantage of distributed representations over
+symbolic pattern matching (Bengio et al. 2003, "A Neural Probabilistic
+Language Model," JMLR 3).
+
+The kNN fallback (Cover & Hart 1967) handles the remaining ~5-10% of
+donors that lack FEC metadata and don't match embedding prototypes.
+It processes ~5,000 donors in under 5 seconds versus 40+ minutes for
+the LLM-based approach, with more consistent results (the LLM
+hallucinated invalid categories outside the valid taxonomy).
+
+The learning store implements a form of self-training (Yarowsky 1995,
+ACL): high-confidence classifications from prior runs become labeled
+examples for future runs, reducing both latency and error rate over
+time.
+
+References
+----------
+- Jurafsky, D. & Martin, J. H. (2023). Speech and Language
+  Processing. 3rd ed.
+- Reimers, N. & Gurevych, I. (2019). Sentence-BERT. EMNLP 2019.
+- Bengio, Y. et al. (2003). JMLR, 3, 1137-1155.
+- Cover, T. & Hart, P. (1967). IEEE Trans. Info Theory, 13(1), 21-27.
+- Yarowsky, D. (1995). ACL, 189-196.
+"""
+
+import asyncio
+import logging
+import re
+import time
+
+import numpy as np
+from sqlalchemy.orm import Session
+
+from app.models import LearnedClassification
+from app.pipeline.analyze.nn_classifier import (
+    classify_batch_nn,
+    normalize_learning_store,
+    cross_validate_donor_types,
+    normalize_donor_type,
+    DONOR_TYPE_PROTOTYPES,
+    KNN_SOURCE,
+)
+from app.pipeline.transform.industry_classifier import (
+    classify_industries_batch_scored,
+    INDUSTRY_DESCRIPTIONS,
+)
+from app.time_utils import utcnow
+
+logger = logging.getLogger(__name__)
+
+# FEC contributor entity_type codes → donor types.
+# "COM" (generic committee) is deliberately excluded: it is ambiguous and
+# defers to the embedding classifier which can distinguish corporate
+# employee PACs from purely political PACs (see classify_donor_type_from_fec).
+FEC_ENTITY_TYPE_MAP = {
+    "CCM": "CandidateAffiliated",
+    "CAN": "Self-Funded",
+    "PAC": "PAC",
+    "ORG": "Org/Employees",
+    "IND": "Org/Employees",
+    "PTY": "Party/Ideological",
+}
+
+AFFILIATED_RECEIPT_TYPES = {"18G", "18H", "18K", "18J", "22G", "22H"}
+
+# FEC filing-convention markers that mean "this name is a committee/fund
+# entity", never a person. A genuine self-funded contribution is FEC
+# entity_type IND or CAN and its contributor_name is the candidate's own
+# name as filed — it is never itself phrased as a fund or committee. A
+# 2026-08 audit found "<Surname> Victory Fund" committees classified
+# Self-Funded off the SequenceMatcher ratio below, purely because the
+# candidate's own surname dominates a short committee name — a joint
+# fundraising committee's money is split with party/PAC committees and is
+# categorically not personal money, no matter how the string compares.
+# Checked before the ratio test so this shape falls through to the
+# CandidateAffiliated check instead, whose own template already names
+# "victory fund committee" as exactly this pattern.
+_COMMITTEE_ENTITY_MARKERS = (
+    "VICTORY FUND", "VICTORY COMMITTEE", "JOINT FUNDRAISING",
+    "LEADERSHIP PAC", "FOR CONGRESS", "FOR SENATE", "COMMITTEE",
+)
+
+_PAYMENT_PROCESSOR_PROTOTYPE = (
+    "ActBlue is a Democratic fundraising payment processor. "
+    "WinRed is a Republican fundraising payment processor. "
+    "Anedot is an online donation processing platform. "
+    "These are financial technology intermediary conduit services "
+    "that process political contributions, not actual donors."
+)
+
+# Explicit names for well-known payment processors that the embedding model
+# may not score high enough due to uppercase / abbreviation mismatch.
+_KNOWN_PAYMENT_PROCESSOR_KEYWORDS = frozenset({
+    "WINRED", "ACTBLUE", "ANEDOT", "REVV", "DONORBOX",
+})
+
+_EMPLOYER_SKIP_PROTOTYPE = (
+    "self-employed self employed retired homemaker student unemployed "
+    "not employed disabled information requested none not applicable "
+    "requested per best efforts N/A"
+)
+
+_FUND_TRANSFER_PROTOTYPE = (
+    "transfer between committees redesignation reattribution refund "
+    "earmark conduit joint fundraising redistribution accounting "
+    "adjustment internal bookkeeping transfer from"
+)
+
+# Embedding prototypes for semantic donor-type classification.
+#
+# Each description defines a donor category via natural-language exemplars.
+# The embedding model (Sentence-BERT; Reimers & Gurevych 2019) maps both the
+# prototype and the query name into the same dense space; cosine similarity
+# then performs zero-shot classification (Yin, Hay & Roth 2019).
+#
+# Prototype design follows the "description-anchored" approach from Pushp &
+# Srivastava (2017, "Train Once, Test Anywhere"): mixing semantic descriptions
+# with exemplar entity names gives the embedding model both conceptual and
+# lexical anchors, improving generalization to unseen entities.
+_PARTY_PROTOTYPE = (
+    "national party committee democratic republican senatorial "
+    "congressional campaign committee DSCC NRSC DCCC NRCC "
+    "Emily's List Club for Growth Senate Majority PAC "
+    "ideological super PAC political action crossroads"
+)
+_ORG_EMPLOYEES_PROTOTYPE = (
+    "corporation company business employees organization firm enterprise "
+    "group LLC LLP LP inc corp bank hospital university hotel "
+    "airline insurance manufacturing construction properties enterprises "
+    "solutions services associates investments holdings development "
+    "industries international systems technologies "
+    "credit union savings bank federal credit union mutual savings "
+    "professional corporation medical group dental practice law firm "
+    "consulting firm engineering company real estate agency brokerage"
+)
+_PAC_PROTOTYPE = (
+    "political action committee PAC political fund league caucus "
+    "association political contributions campaign donations "
+    "good government committee voluntary political"
+)
+# Prototype for FEC data quality noise: individual names, occupation titles,
+# and employment status strings that leak through as "donor" names when the
+# FEC contributor_employer or contributor_name field contains non-organization
+# values. Embedding similarity naturally generalizes beyond exact string
+# matches to catch misspellings and variants (e.g. "SELF-EMPIOYED").
+_SELF_FUNDED_PROTOTYPE = (
+    "candidate personal loan self-funded personal contribution own money "
+    "candidate committee self-financing personal funds senator governor "
+    "candidate self-contribution individual candidate donor"
+)
+_SKIP_PROTOTYPE = (
+    "individual person self employed retired homemaker student unemployed "
+    "not employed disabled information requested none "
+    "director president attorney physician consultant manager executive "
+    "engineer lawyer owner partner farmer dentist surgeon realtor professor "
+    "accountant officer broker agent nurse teacher principal technician "
+    "administrator analyst clerk secretary receptionist operator supervisor "
+    "job title occupation profession employment status"
+)
+
+_SEMANTIC_PROTOTYPES = {
+    # CandidateAffiliated is intentionally excluded from the general prototype
+    # competition — it is only detected via the explicit dynamic template check
+    # in classify_donor_type_semantic (requires candidate_name + last-name
+    # substring match). Including it in the general loop causes false positives
+    # for any PAC/political name (e.g. "Goldman Sachs PAC" scores 0.81).
+    "Party/Ideological": _PARTY_PROTOTYPE,
+    "Org/Employees": _ORG_EMPLOYEES_PROTOTYPE,
+    "PAC": _PAC_PROTOTYPE,
+    "Self-Funded": _SELF_FUNDED_PROTOTYPE,
+    "SKIP": _SKIP_PROTOTYPE,
+}
+
+# Max wall-clock seconds any single SQLAlchemy transaction may span while
+# writing donor learning-store rows. SQLite allows exactly one writer at a
+# time; without a bound here, a full Senate run's ~18k donors (up to 2
+# _store_donor_learning writes each) all land in ONE transaction that stays
+# open for the entire classification pass (SQLAlchemy's default "begin on
+# first write, commit on session.commit()" — see
+# _classify_donors_hybrid_sync's final db_session.commit()). Every other
+# write anywhere in the app — including ordinary request traffic like
+# site-visit tracking — then either waits out the 30s SQLite busy_timeout
+# (database.py) or fails outright with "database is locked" (observed
+# live in production 2026-07-21, twice: a 500 on POST /api/track-visit,
+# followed by the container going unhealthy and getting killed — both
+# times while a donor classification run was in progress). This was
+# invisible before classify_donors_hybrid ran on the event loop (nothing
+# else could run concurrently with it anyway — see that function's
+# docstring for the unrelated bug that was); moving it to a worker thread
+# surfaced this separate, real one.
+#
+# This is a TIME bound, not a donor-count bound, and that distinction is
+# the fix: an earlier version of this constant capped the batch at 500
+# donors, reasoning that 500 plain DB writes take at most a few seconds.
+# That reasoning didn't hold — most donors in this loop also need a real
+# sentence-transformer encode() call (the semantic tier, or the
+# candidate-affiliated check), which is 10-100x slower than a DB write and
+# highly variable per name. Live-observed: contention hit again with the
+# count-based version, ~100 seconds and roughly ~100 donors into a run —
+# nowhere near the 500-donor mark, because per-donor cost was far higher
+# than assumed. A count threshold can only bound wall-clock duration if
+# per-item cost is roughly constant; it isn't here. Time is the actual
+# thing every other writer is waiting on, so bound that directly instead
+# of a proxy for it.
+_COMMIT_INTERVAL_SECONDS = 2.0
+
+_semantic_embeddings: dict[str, np.ndarray] | None = None
+
+
+def _get_semantic_type_embeddings() -> dict[str, np.ndarray]:
+    """Pre-compute embeddings for donor type prototype descriptions."""
+    global _semantic_embeddings
+    if _semantic_embeddings is not None:
+        return _semantic_embeddings
+
+    from app.pipeline.vector_store import get_embedding_model
+    model = get_embedding_model()
+
+    _semantic_embeddings = {}
+    for dtype, desc in _SEMANTIC_PROTOTYPES.items():
+        emb = model.encode([desc], show_progress_bar=False)[0]
+        _semantic_embeddings[dtype] = emb / np.linalg.norm(emb)
+
+    return _semantic_embeddings
+
+
+def classify_donor_type_semantic(
+    name: str,
+    candidate_name: str | None = None,
+    threshold: float = 0.60,
+    skip_threshold: float = 0.75,
+) -> str | None:
+    """Classify donor type using embedding cosine similarity against prototypes.
+
+    Uses description-anchored zero-shot classification (Pushp & Srivastava
+    2017): each donor category is represented by a natural-language prototype,
+    and the query name is classified to the most similar prototype above a
+    minimum similarity threshold.
+
+    The SKIP category (individual/occupation/FEC noise) requires a higher
+    similarity threshold to avoid false positives on ambiguous short names.
+
+    For candidate-affiliated detection, dynamically generates a personalized
+    template using the candidate's last name so the model can detect entities
+    like "Doe Victory" or "Roe for Senate" without hardcoded patterns.
+
+    2026-07 fix: threshold was 0.35, skip_threshold 0.45 — both far
+    below the real floor. Live-measured against 800 real, already-labeled
+    donors: when the embedding's own top-1 pick matches the stored label,
+    score mean=0.745/p10=0.699/min=0.614; when it doesn't, mean=0.737/
+    p90=0.796 — almost no separation (top-1 accuracy against stored labels
+    was only 360/800, barely better than chance among 5 categories). This
+    threshold was never going to be a precision lever on its own; 0.60
+    sits below the measured min for correct top-1 picks so it doesn't
+    reject known-good matches, while no longer being unconditionally true.
+    For skip_threshold: the SKIP prototype scored mean=0.692/p90=0.733
+    against real *non*-SKIP donor names — 0.75 sits above that p90,
+    actually raising the bar the SKIP category was supposed to have over
+    the others (its whole stated purpose), rather than sharing the same
+    dead floor as everything else.
+    """
+    if not name or len(name.strip()) < 3:
+        return None
+
+    # Tier 0: PAC suffix rule — FEC filing convention uses " PAC" as an
+    # unambiguous marker for political action committees (FEC Disclosure Guide
+    # 2023). This catches cases where the embedding model's compressed score
+    # space makes Party/Ideological win over PAC for explicitly-named PACs.
+    if re.search(r'\bPAC\b', name.upper()):
+        return "PAC"
+
+    from app.pipeline.vector_store import get_embedding_model
+    model = get_embedding_model()
+    type_embs = _get_semantic_type_embeddings()
+
+    query_emb = model.encode([name], show_progress_bar=False)[0]
+    query_emb = query_emb / np.linalg.norm(query_emb)
+
+    best_type: str | None = None
+    best_score = threshold
+
+    for dtype, emb in type_embs.items():
+        effective_threshold = skip_threshold if dtype == "SKIP" else threshold
+        score = float(np.dot(query_emb, emb))
+        if score > best_score and score >= effective_threshold:
+            best_score = score
+            best_type = dtype
+
+    # Dynamic candidate-affiliated / self-funded check using mathematical
+    # similarity metrics instead of hardcoded string comparisons.
+    #
+    # Self-funded: detected via SequenceMatcher ratio (Ratcliff & Obershelp
+    # 1988) between donor and candidate names — a normalised edit-distance
+    # metric in [0, 1] that handles spelling variations and middle names.
+    #
+    # CandidateAffiliated: detected via embedding cosine similarity between
+    # the donor name and a dynamically generated candidate campaign template.
+    if candidate_name and len(candidate_name.strip()) > 3:
+        from difflib import SequenceMatcher
+
+        cand_norm = candidate_name.upper().strip()
+        name_upper = name.upper().strip()
+
+        is_committee_entity = any(marker in name_upper for marker in _COMMITTEE_ENTITY_MARKERS)
+        name_sim = SequenceMatcher(None, name_upper, cand_norm).ratio()
+        if name_sim >= 0.60 and not is_committee_entity:
+            return "Self-Funded"
+
+        last_name = candidate_name.split(",")[0].strip().upper()
+        # Require the candidate's last name to appear in the donor name as a
+        # substring before running the embedding check — this prevents any
+        # generic PAC name (e.g. "Goldman Sachs PAC") from matching a
+        # candidate-specific template through superficial political language.
+        if len(last_name) > 2 and last_name in name_upper:
+            template = (
+                f"{last_name} senate campaign victory fund committee "
+                f"friends of {last_name} for senate reelect {last_name}"
+            )
+            template_emb = model.encode([template], show_progress_bar=False)[0]
+            template_emb = template_emb / np.linalg.norm(template_emb)
+            affil_score = float(np.dot(query_emb, template_emb))
+            if affil_score > 0.30:
+                return "CandidateAffiliated"
+
+    return best_type
+
+
+def classify_donor_type_from_fec(receipt: dict) -> str | None:
+    """Classify donor type using FEC structured metadata on the *contributor*.
+
+    Uses entity_type (contributor's entity kind) and receipt_type (transfer
+    category) — NOT committee.committee_type, which describes the *receiving*
+    campaign committee and would misclassify every donor.
+
+    For entity_type "COM" (generic committee), returns None to defer to the
+    semantic embedding classifier (tier 2). FEC "COM" is ambiguous — it
+    covers both purely political PACs and corporate employee PACs. The
+    embedding classifier distinguishes these based on the entity name's
+    semantic similarity to Org/Employees vs PAC prototypes.
+
+    Entity types with unambiguous mappings (PAC, ORG, IND, CCM, CAN, PTY)
+    are returned directly since they carry higher-confidence FEC metadata.
+    """
+    receipt_type = receipt.get("receipt_type") or ""
+    if receipt_type in AFFILIATED_RECEIPT_TYPES:
+        return "CandidateAffiliated"
+
+    entity_type = receipt.get("entity_type") or ""
+    if not entity_type:
+        return None
+
+    # "COM" is ambiguous — defer to embedding-based classification
+    if entity_type == "COM":
+        return None
+
+    if entity_type in FEC_ENTITY_TYPE_MAP:
+        return FEC_ENTITY_TYPE_MAP[entity_type]
+
+    return None
+
+
+_skip_emb_cache: dict[str, np.ndarray] = {}
+# is_skip_entity's verdicts, by (name, threshold). A pure function of the
+# name while the model is fixed, and a run asks about the same employers
+# and committees for the top donors and again for the industry breakdown;
+# skip_entities_batch fills it in one encode. ponytail: unbounded, holds
+# a few strings per distinct donor name seen in the process.
+_skip_memo: dict[tuple[str, float], bool] = {}
+
+
+def _get_skip_prototype_embedding(prototype_key: str, prototype_text: str) -> np.ndarray:
+    """Get or compute a cached embedding for a skip prototype."""
+    if prototype_key not in _skip_emb_cache:
+        from app.pipeline.vector_store import get_embedding_model
+        model = get_embedding_model()
+        emb = model.encode([prototype_text], show_progress_bar=False)[0]
+        _skip_emb_cache[prototype_key] = emb / np.linalg.norm(emb)
+    return _skip_emb_cache[prototype_key]
+
+
+def is_skip_entity(name_upper: str, threshold: float = 0.67) -> bool:
+    """Check if a donor is a payment processor via keyword or embedding similarity.
+
+    First checks against a list of known payment processor names (handles the
+    uppercase/case mismatch problem with the embedding model).  Falls back to
+    cosine similarity against the payment-processor semantic prototype.
+    """
+    if not name_upper or len(name_upper.strip()) < 2:
+        return False
+
+    # Keyword check: known payment processors the embedding model may mis-score
+    # due to ALL-CAPS FEC formatting vs mixed-case prototype.
+    for keyword in _KNOWN_PAYMENT_PROCESSOR_KEYWORDS:
+        if keyword in name_upper:
+            return True
+
+    key = (name_upper, threshold)
+    if key not in _skip_memo:
+        from app.pipeline.vector_store import get_embedding_model
+        model = get_embedding_model()
+        proto_emb = _get_skip_prototype_embedding("payment", _PAYMENT_PROCESSOR_PROTOTYPE)
+        query_emb = model.encode([name_upper], show_progress_bar=False)[0]
+        norm = np.linalg.norm(query_emb)
+        if norm > 0:
+            query_emb = query_emb / norm
+        _skip_memo[key] = float(np.dot(query_emb, proto_emb)) >= threshold
+    return _skip_memo[key]
+
+
+def skip_entities_batch(names_upper: list[str], threshold: float = 0.67) -> set[str]:
+    """is_skip_entity for many names in one encode: the same keyword check
+    and payment-processor prototype at the same threshold. A member's
+    contribution detail lists a few hundred employers and committees, and
+    one encode call per name cost ~0.1 s each (2026-10, ~40 s a member)."""
+    candidates = [n for n in dict.fromkeys(names_upper) if n and len(n.strip()) >= 2]
+    keyword_hits = {n for n in candidates if any(k in n for k in _KNOWN_PAYMENT_PROCESSOR_KEYWORDS)}
+    rest = [n for n in candidates if n not in keyword_hits and (n, threshold) not in _skip_memo]
+    if rest:
+        from app.pipeline.vector_store import encode_normalized, get_embedding_model
+        proto_emb = _get_skip_prototype_embedding("payment", _PAYMENT_PROCESSOR_PROTOTYPE)
+        scores = encode_normalized(get_embedding_model(), rest) @ proto_emb
+        _skip_memo.update(((n, threshold), float(score) >= threshold) for n, score in zip(rest, scores))
+    return keyword_hits | {n for n in candidates if _skip_memo.get((n, threshold))}
+
+
+def classify_skip_names_batch(
+    names: list[str],
+    prototype_key: str = "payment",
+    prototype_text: str | None = None,
+    threshold: float = 0.50,
+) -> set[str]:
+    """Batch-classify names against a skip prototype via embedding similarity.
+
+    Args:
+        names: List of names to check.
+        prototype_key: Cache key for the prototype embedding.
+        prototype_text: Natural-language prototype (defaults to payment processor).
+        threshold: Minimum cosine similarity to classify as skip. The 0.50
+            default here is NOT measured/safe on its own (2026-08 cleanup:
+            found generic company names scoring above it against the
+            payment-processor prototype) — both real callers
+            (classify_employer_skips_batch, classify_transfer_memos_batch)
+            always pass their own measured 0.78 explicitly. Always pass
+            threshold explicitly for a new caller; don't rely on this default.
+
+    Returns:
+        Set of names (uppercased) that should be skipped.
+    """
+    if not names:
+        return set()
+
+    if prototype_text is None:
+        prototype_text = _PAYMENT_PROCESSOR_PROTOTYPE
+
+    from app.pipeline.vector_store import encode_normalized, get_embedding_model
+    model = get_embedding_model()
+    proto_emb = _get_skip_prototype_embedding(prototype_key, prototype_text)
+
+    query_embs = encode_normalized(model, names)
+    scores = query_embs @ proto_emb
+    return {
+        names[i].upper().strip()
+        for i in range(len(names))
+        if scores[i] >= threshold
+    }
+
+
+def classify_employer_skips_batch(employer_names: list[str], threshold: float = 0.78) -> set[str]:
+    """Batch-classify employer names against employment-status skip prototype.
+
+    Detects FEC employer-field values that are not real organizations
+    (e.g. 'RETIRED', 'SELF-EMPLOYED', 'INFORMATION REQUESTED').
+    """
+    if not employer_names:
+        return set()
+    short_skips = {n.upper().strip() for n in employer_names if n and len(n.strip()) <= 3}
+    valid = [n for n in employer_names if n and len(n.strip()) > 3]
+    if not valid:
+        return short_skips
+    return short_skips | classify_skip_names_batch(
+        valid,
+        prototype_key="employer_skip",
+        prototype_text=_EMPLOYER_SKIP_PROTOTYPE,
+        threshold=threshold,
+    )
+
+
+def classify_transfer_memos_batch(memo_texts: list[str], threshold: float = 0.78) -> set[str]:
+    """Batch-classify memo texts against fund-transfer prototype.
+
+    Detects FEC memo_text values indicating internal fund transfers,
+    redesignations, or reattributions that should be excluded from
+    donor aggregation.
+    """
+    if not memo_texts:
+        return set()
+    valid = [m for m in memo_texts if m and len(m.strip()) >= 3]
+    if not valid:
+        return set()
+    return classify_skip_names_batch(
+        valid,
+        prototype_key="fund_transfer",
+        prototype_text=_FUND_TRANSFER_PROTOTYPE,
+        threshold=threshold,
+    )
+
+
+async def classify_donors_hybrid(
+    donors: list[dict],
+    db_session: Session | None = None,
+    on_progress=None,
+    candidate_name: str | None = None,
+) -> dict[str, dict]:
+    """Classify donors using the full tiered strategy.
+
+    Thin async wrapper around _classify_donors_hybrid_sync, run in a worker
+    thread via asyncio.to_thread. The sync function is 100% CPU-bound
+    (sentence-transformer embedding calls, no I/O) and previously ran
+    directly on the event loop despite the `async def` — for a full Senate
+    run's ~18k unique donors that blocked the event loop for minutes
+    straight, during which nothing else on the process (including the
+    /api/health endpoint Docker's healthcheck polls) could respond. Docker
+    then killed the "unhealthy" container mid-pipeline (observed 2026-07-21,
+    pipeline runs #90 and #91 both died here), which is a stronger failure
+    mode than merely blocking user traffic: it aborts the run entirely and,
+    since Swarm restarts a fresh container, silently loses all progress.
+    asyncio.to_thread doesn't parallelize the classification itself (the GIL
+    still serializes CPU-bound Python), but it lets the event loop's own
+    thread keep servicing the health check and other requests during the
+    (same total) time this takes to run.
+
+    Args:
+        donors: List of dicts with 'name' and optionally 'amount', 'fec_receipt'.
+        db_session: SQLAlchemy session for learning store access.
+        candidate_name: FEC candidate name ("LAST, FIRST M") for
+            semantic candidate-affiliated detection.
+
+    Returns:
+        Dict mapping UPPERCASE donor name -> {type, industry, skip}
+    """
+    return await asyncio.to_thread(
+        _classify_donors_hybrid_sync, donors, db_session, on_progress, candidate_name,
+    )
+
+
+def _classify_donors_hybrid_sync(
+    donors: list[dict],
+    db_session: Session | None = None,
+    on_progress=None,
+    candidate_name: str | None = None,
+) -> dict[str, dict]:
+    """Synchronous body of classify_donors_hybrid — see that function's
+    docstring for why it's called via a thread instead of directly."""
+    if not donors:
+        return {}
+
+    _reset_pending_learnings()
+    seen: set[str] = set()
+    unique_donors: list[dict] = []
+    for d in donors:
+        key = (d.get("name") or "").upper().strip()
+        if key and key != "UNKNOWN" and key not in seen:
+            seen.add(key)
+            unique_donors.append(d)
+
+    if not unique_donors:
+        return {}
+
+    results: dict[str, dict] = {}
+    needs_nn: list[dict] = []
+
+    known_from_db: dict[str, dict] = {}
+    if db_session is not None:
+        unique_names = [d["name"].upper().strip() for d in unique_donors]
+        _DB_BATCH = 500
+        for batch_start in range(0, len(unique_names), _DB_BATCH):
+            batch = unique_names[batch_start : batch_start + _DB_BATCH]
+            rows = (
+                db_session.query(LearnedClassification)
+                .filter(
+                    LearnedClassification.entity_name.in_(batch),
+                    LearnedClassification.entity_type.in_(["donor_type", "industry"]),
+                )
+                .all()
+            )
+            for r in rows:
+                if r.entity_name not in known_from_db:
+                    known_from_db[r.entity_name] = {}
+                known_from_db[r.entity_name][r.entity_type] = r.value
+
+    tier_stats = {
+        "fec": 0, "semantic": 0, "learned": 0, "embedding": 0,
+        "nn_needed": 0, "corrected": 0,
+    }
+
+    # Embed ALL donor names — used both for fresh classification and for
+    # cross-validating potentially stale learning store entries.
+    all_donor_names = [
+        d["name"] for d in unique_donors
+        if d.get("name") and len(d["name"].strip()) >= 2
+    ]
+    embedding_scored: dict[str, tuple[str, float]] = {}
+    if all_donor_names:
+        logger.info("Batch embedding %d donor names for industry classification...", len(all_donor_names))
+        embedding_scored = classify_industries_batch_scored(all_donor_names)
+
+    # Threshold for overriding a stale learning store entry.
+    #
+    # 2026-07 fix: this comment used to claim industry scores were "in
+    # centered embedding space (baseline ~0)" and set 0.25 as a "strong
+    # positive signal" bar on that assumption. classify_industries_batch_scored
+    # returns the raw cosine score, never centered — and it already only
+    # returns entries that clear its own SPREAD_THRESHOLD margin-over-mean
+    # gate (see industry_classifier.py), so every emb_score reaching this
+    # point was >= 0.25 anyway. The override fired on any top-1 disagreement,
+    # every run, including against FEC-metadata rows the pipeline itself
+    # trusts most. Live-measured (401 real donor names that pass the real
+    # spread gate): raw emb_score mean=0.565, p10=0.512, p50=0.562, max=0.712.
+    # 0.60 (just above the median of already-confident classifications)
+    # requires genuinely above-average confidence before overriding a stored
+    # label — matching the asymmetric risk _normalize_category's docstring
+    # describes: a missed correction just leaves a stale label for one
+    # more run, a wrong correction pollutes the learning store with a
+    # confident-looking mistake.
+    _CORRECTION_THRESHOLD = 0.60
+
+    last_commit = time.monotonic()
+    for donor in unique_donors:
+        if db_session is not None and time.monotonic() - last_commit > _COMMIT_INTERVAL_SECONDS:
+            db_session.commit()
+            last_commit = time.monotonic()
+
+        name = donor["name"]
+        name_upper = name.upper().strip()
+        fec_receipt = donor.get("fec_receipt", {})
+
+        donor_type = None
+        industry = None
+        source_type = None
+
+        if is_skip_entity(name_upper):
+            results[name_upper] = {"type": "SKIP", "industry": "OTHER", "skip": True}
+            continue
+
+        learned = known_from_db.get(name_upper, {})
+        if "donor_type" in learned and "industry" in learned:
+            donor_type = normalize_donor_type(learned["donor_type"])
+            industry = learned["industry"]
+            source_type = "learned"
+            tier_stats["learned"] += 1
+
+            # Cross-validate: if the embedding model strongly disagrees
+            # with a cached industry, the store entry is likely stale
+            # (e.g. descriptions were improved since it was written).
+            emb_hit = embedding_scored.get(name)
+            if emb_hit:
+                emb_industry, emb_score = emb_hit
+                if emb_industry != industry and emb_score >= _CORRECTION_THRESHOLD:
+                    logger.info(
+                        "Learning store correction: %s %s -> %s (score %.3f)",
+                        name_upper, industry, emb_industry, emb_score,
+                    )
+                    industry = emb_industry
+                    tier_stats["corrected"] += 1
+                    if db_session is not None:
+                        _store_donor_learning(
+                            db_session, name_upper, donor_type,
+                            industry, "embedding_correction",
+                        )
+        else:
+            # Tier 1: FEC structured metadata (highest confidence)
+            fec_type = classify_donor_type_from_fec(fec_receipt) if fec_receipt else None
+            if fec_type:
+                donor_type = fec_type
+                source_type = "fec"
+                tier_stats["fec"] += 1
+            else:
+                # Tier 2: Semantic classification (embedding similarity)
+                donor_cand = donor.get("candidate_name") or candidate_name
+                sem_type = classify_donor_type_semantic(
+                    name, candidate_name=donor_cand
+                )
+                if sem_type:
+                    donor_type = sem_type
+                    source_type = "semantic"
+                    tier_stats["semantic"] += 1
+
+            if industry is None:
+                emb_hit = embedding_scored.get(name)
+                industry = emb_hit[0] if emb_hit else "OTHER"
+                if industry != "OTHER":
+                    tier_stats["embedding"] += 1
+
+        # Handle SKIP from any tier (payment processors, semantic individual
+        # detection, or learned store)
+        if donor_type == "SKIP":
+            results[name_upper] = {"type": "SKIP", "industry": "OTHER", "skip": True}
+            continue
+
+        if donor_type and industry and industry != "OTHER":
+            results[name_upper] = {
+                "type": donor_type,
+                "industry": industry,
+                "skip": False,
+            }
+            if db_session is not None and source_type != "learned":
+                # The type's tier is not the industry's: an FEC entity type
+                # says nothing about industry, which came from the embedding.
+                _store_donor_learning(
+                    db_session, name_upper, donor_type, industry, source_type or "embedding",
+                    industry_source="embedding",
+                )
+        elif donor_type:
+            results[name_upper] = {
+                "type": donor_type,
+                "industry": industry or "OTHER",
+                "skip": False,
+            }
+            if industry == "OTHER":
+                needs_nn.append(donor)
+            if db_session is not None and source_type and source_type != "learned":
+                # Don't persist a placeholder "OTHER" industry here when
+                # kNN is about to re-resolve it below in this same run —
+                # doing so would set _seen_this_run's industry entry to
+                # this tier's (often high) confidence, and the kNN pass's
+                # own _store_donor_learning call ("nn", confidence 0.75)
+                # would then be silently skipped by the guard right above,
+                # permanently stranding the industry at "OTHER" even
+                # though kNN found a real answer (2026-08 audit, bug 1).
+                # donor_type is real here regardless, so it's still stored.
+                _store_donor_learning(
+                    db_session, name_upper, donor_type,
+                    None if industry == "OTHER" else industry,
+                    source_type, industry_source="embedding",
+                )
+        else:
+            needs_nn.append(donor)
+            tier_stats["nn_needed"] += 1
+
+    logger.info(
+        "Donor classification tiers: %d FEC, %d semantic, %d learned (%d corrected), "
+        "%d embedding, %d need kNN (of %d total)",
+        tier_stats["fec"], tier_stats["semantic"], tier_stats["learned"],
+        tier_stats["corrected"], tier_stats["embedding"],
+        tier_stats["nn_needed"], len(unique_donors),
+    )
+
+    if needs_nn and db_session is not None:
+        nn_results = _classify_remaining_via_nn(needs_nn, db_session, on_progress=on_progress)
+        for name_upper, classification in nn_results.items():
+            existing = results.get(name_upper, {})
+            merged = {**existing, **classification}
+            if existing.get("type"):
+                # donor_type was already established by a real tier
+                # (fec/semantic/learned) before this donor was queued for
+                # kNN to resolve just the industry — kNN independently
+                # re-guesses donor_type too, but its guess is weaker and
+                # must not silently replace the known-good value here
+                # (2026-08 audit, bug 2; the DB itself is already
+                # protected from this by _store_donor_learning's in-run
+                # confidence guard, this fixes the returned dict).
+                merged["type"] = existing["type"]
+            merged["skip"] = merged.get("type") == "SKIP"
+            results[name_upper] = merged
+
+    if db_session is not None:
+        db_session.commit()
+
+    return results
+
+
+_KNN_K = 7
+
+
+def _classify_remaining_via_nn(
+    donors: list[dict],
+    db_session: Session,
+    on_progress=None,
+) -> dict[str, dict]:
+    """Nearest-neighbor fallback for donors not classified by faster tiers.
+
+    Uses sentence-transformer embeddings to find the most similar
+    already-classified donors in the learning store.
+    """
+    if not donors:
+        return {}
+
+    dedup: dict[str, dict] = {}
+    for d in donors:
+        key = (d.get("name") or "").upper().strip()
+        if not key or key == "UNKNOWN":
+            continue
+        existing = dedup.get(key)
+        if existing is None or (d.get("amount") or 0) > (existing.get("amount") or 0):
+            dedup[key] = d
+    unique_donors = list(dedup.values())
+    query_names = [d["name"] for d in unique_donors]
+
+    logger.info("kNN classifying %d unique donors (deduped from %d)...", len(query_names), len(donors))
+
+    normalize_learning_store(db_session)
+    cross_validate_donor_types(db_session)
+
+    # An industry is taken from the neighbours only when all seven agree.
+    # Measured 2026-10-09 on 177 record-labelled PAC sponsors the prototype
+    # tier abstains on (labor organizations by FEC type, corporations by
+    # their SEC industry code; the names kNN is for): a plurality vote was
+    # right on 52 (29%), at every similarity floor from 0.20 to 0.80 — the
+    # names' cosines sit above any floor whatever their industry — and it
+    # put a credit-union trade group with unions and an investment firm
+    # with physicians' practices. Unanimous neighbours were right on 8 of
+    # 8; 6 of 7 on 10 of 14. The rest stay unclassified (OTHER), which no
+    # industry total counts, rather than wrong.
+    industry_results = classify_batch_nn(
+        query_names, db_session, entity_type="industry",
+        prototype_descriptions=INDUSTRY_DESCRIPTIONS, k=_KNN_K, min_agreement=_KNN_K,
+    )
+
+    # The donor type is the plurality of five neighbours, at the documented
+    # similarity floor (this call passed 0.25 over it until 2026-10).
+    # Measured 2026-10-09 on 300 record-labelled names (candidate, party and
+    # sponsored committees from the FEC's committee file; lobbying-registry
+    # clients as organizations), against 379 references mixed like the
+    # learning store: the plurality is right on 76%, identically at every
+    # floor from 0.25 to 0.75 (the nearest reference's cosine has p10 0.81).
+    # Unlike industry, a stricter rule doesn't help: a type kNN can't settle
+    # falls back to Org/Employees, a guess, and requiring 4 of 5 to agree
+    # cut the right answers from 76% to 57%.
+    type_results = classify_batch_nn(
+        query_names, db_session, entity_type="donor_type",
+        prototype_descriptions=DONOR_TYPE_PROTOTYPES, k=5,
+    )
+
+    all_results: dict[str, dict] = {}
+
+    last_commit = time.monotonic()
+    for donor in unique_donors:
+        if time.monotonic() - last_commit > _COMMIT_INTERVAL_SECONDS:
+            db_session.commit()
+            last_commit = time.monotonic()
+
+        name = donor["name"]
+        name_upper = name.upper().strip()
+        industry = industry_results.get(name, "OTHER")
+        dtype = normalize_donor_type(type_results.get(name, "Org/Employees"))
+
+        all_results[name_upper] = {"type": dtype, "industry": industry}
+
+        _store_donor_learning(db_session, name_upper, dtype, industry, KNN_SOURCE)
+
+    logger.info("kNN classification complete: %d donors classified", len(all_results))
+
+    if on_progress is not None:
+        try:
+            on_progress()
+        except Exception:
+            logger.debug("on_progress callback raised", exc_info=True)
+
+    return all_results
+
+
+_CONFIDENCE_MAP = {
+    "fec": 1.0, "embedding_correction": 0.92,
+    "semantic": 0.9, "embedding": 0.9, "nn": 0.75,
+}
+
+# Tracks writes this run to skip redundant SQL queries for the same entity
+_seen_this_run: dict[tuple[str, str], float] = {}
+
+
+def _store_donor_learning(
+    db_session: Session,
+    name_upper: str,
+    donor_type: str,
+    industry: str | None,
+    source: str,
+    match_metadata: dict | None = None,
+    industry_source: str | None = None,
+) -> None:
+    """Store type and/or industry classifications using SQL upsert.
+
+    `industry_source` is the tier the industry came from when it isn't
+    `source` (the type's): an industry stored under "fec" read as FEC
+    metadata at confidence 1.0, though the FEC gives no industry.
+
+    `industry=None` writes donor_type only, leaving industry untouched —
+    used when industry isn't actually known yet (see the 2026-08 audit
+    trace below) rather than persisting a placeholder value for it.
+
+    Uses INSERT ... ON CONFLICT DO UPDATE to handle races atomically.
+
+    2026-07: this always overwrites the persisted row — there is no
+    comparison against the existing DB row's confidence, despite an
+    earlier version of this docstring claiming one. That's the intended
+    design, not a bug: AGENTS.md Sec.2 documents that the learning store
+    deliberately has "no confidence guards" so the current run's
+    classifications take precedence, and that this is safe within a
+    single run because learning-store lookups already short-circuit
+    re-classification of anything already seen this run. `_seen_this_run`
+    below only dedupes multiple writes to the same key *within this run*
+    (keeping the highest-confidence one of those) — it is not a guard
+    against a prior run's persisted value.
+
+    2026-08 audit trace: this is also safe *across* runs for the case
+    that matters most (a lower-confidence tier clobbering a high-
+    confidence one, e.g. "fec" then "nn"). A donor with a full learned
+    entry (both donor_type and industry already stored) is short-
+    circuited at the top of _classify_donors_hybrid_sync — the FEC,
+    semantic, and kNN tiers never re-run for it, so this function isn't
+    even called for that donor except via the one path that does update
+    a learned entry: the embedding cross-validation a few lines above
+    that short-circuit, which only ever touches `industry` and only past
+    its own measured, conservative threshold (_CORRECTION_THRESHOLD =
+    0.60). `donor_type` is never touched once learned.
+    """
+    import json
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+    from app.pipeline.vector_store import get_model_version
+
+    meta_json = json.dumps(match_metadata) if match_metadata else None
+
+    for entity_type, value, tier in [
+        ("donor_type", donor_type, source),
+        ("industry", industry, industry_source or source),
+    ]:
+        if value is None:
+            continue
+        confidence = _CONFIDENCE_MAP.get(tier, 0.5)
+        model_ver = get_model_version() if tier in ("embedding", "nn", "semantic") else None
+        key = (name_upper, entity_type)
+
+        prev_confidence = _seen_this_run.get(key, -1.0)
+        if prev_confidence > confidence:
+            continue
+
+        stmt = sqlite_insert(LearnedClassification).values(
+            entity_name=name_upper,
+            entity_type=entity_type,
+            value=value,
+            confidence=confidence,
+            source=tier,
+            model_version=model_ver,
+            match_metadata=meta_json,
+            learned_at=utcnow(),
+        ).on_conflict_do_update(
+            index_elements=["entity_name", "entity_type"],
+            set_={
+                "value": value,
+                "confidence": confidence,
+                "source": tier,
+                "model_version": model_ver,
+                "match_metadata": meta_json,
+                "learned_at": utcnow(),
+            },
+        )
+        db_session.execute(stmt)
+        _seen_this_run[key] = confidence
+
+
+def _reset_pending_learnings() -> None:
+    """Clear per-run dedup tracker (call at start of each pipeline run)."""
+    _seen_this_run.clear()

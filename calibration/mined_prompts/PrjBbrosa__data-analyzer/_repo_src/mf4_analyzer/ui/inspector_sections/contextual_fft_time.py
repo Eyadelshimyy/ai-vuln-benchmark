@@ -1,0 +1,1053 @@
+"""FFTTimeContextual widget."""
+import math
+
+from ...colormaps import DEFAULT_HEATMAP_CMAP
+
+from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QFormLayout,
+    QFrame,
+    QGroupBox,
+    QPushButton,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
+
+from ...analysis_presets import (
+    get_builtin_preset,
+    list_builtin_presets,
+    resolve_builtin_preset_alias,
+)
+from ...signal.analysis_defaults import (
+    ANALYSIS_WINDOW_CANDIDATES,
+    DEFAULT_FFT_T_WIN_S,
+)
+from ...ui_kit.icons import Icons
+from ...ui_kit.motion import POLICY_LIGHT
+from ...ui_kit.qt_lifecycle import as_weak_callable
+from ...ui_kit.widgets.segmented_choice import SegmentedChoice
+from ...ui_kit.widgets.searchable_combo import SearchableComboBox
+from ..widgets.compact_spinbox import CompactDoubleSpinBox
+from .._axis_defaults import z_range_for
+from ._helpers import (
+    _HeatmapColorProjection,
+    BUILTIN_PRESET_DISPLAY,
+    CUSTOM_PRESET_SLOTS,
+    _LONG_FIELD_MAX_WIDTH,
+    _PRESET_KEY_TO_SLOT,
+    _SHORT_FIELD_MAX_WIDTH,
+    _configure_form,
+    _enforce_label_widths,
+    _fit_field,
+    _make_axis_settings_group,
+    _make_group_header,
+    _make_params_card,
+    _no_buttons,
+    apply_db_reference_partial,
+    apply_db_reference_preset,
+    db_reference_params,
+    make_db_reference_control,
+    recommend_preset_for_unit,
+)
+from ._effective_facts import attach_effective_facts_card
+from .collapsible import _CollapsibleParamSection
+from .presets import PresetBar
+
+
+_PRESERVE_CANDIDATE_SELECTION = object()
+
+
+class FFTTimeContextual(QWidget):
+    """FFT vs Time contextual: signal / time-frequency params / amplitude /
+    range-and-color / presets / actions.
+
+    Public surface consumed by ``Inspector`` and ``MainWindow``:
+
+    Signals
+    -------
+    - ``fft_time_requested`` — primary "compute" button click.
+
+    Widgets (referenced by name from MainWindow / tests)
+    ---------------------------------------------------
+    - ``combo_sig`` — analysis signal candidate (``(fid, ch)`` userData).
+    - ``spin_fs`` — sampling frequency (Hz).
+    - ``combo_nfft`` / ``combo_win`` / ``spin_overlap`` /
+    - ``spin_db_ref`` — dB reference (linear amplitude).
+    - 坐标轴设置 group (2026-04-29 B polish):
+      ``chk_x_auto`` / ``spin_x_min`` / ``spin_x_max`` — X time (s);
+      ``chk_y_auto`` / ``spin_y_min`` / ``spin_y_max`` — Y frequency (Hz);
+      ``chk_z_auto`` / ``spin_z_floor`` / ``spin_z_ceiling`` — Z (color
+      scale); ``combo_amp_unit`` — dB ↔ Linear (replaces the legacy
+      ``combo_amp_mode``). All four feed the spectrogram render.
+    - Backward-compat aliases for downstream MainWindow callers (Wave 5
+      will retire the legacy names): ``chk_freq_auto`` IS ``chk_y_auto``;
+      ``spin_freq_min`` IS ``spin_y_min``; ``spin_freq_max`` IS
+      ``spin_y_max``. ``spin_freq_max == 0.0`` still means "use Nyquist".
+    - ``btn_compute`` — primary action; disabled iff no candidate.
+
+    ``get_params()`` returns a dict whose compute fields match
+    ``MainWindow._fft_time_analysis_cache_key``: ``signal``, ``fs``,
+    ``nfft``, ``window``, ``overlap``, ``remove_mean``, ``amplitude_mode``,
+    ``db_reference``, ``freq_auto``, ``freq_min``, ``freq_max``,
+    ``dynamic``, ``cmap``. Wave 4 also adds the explicit axis keys
+    ``x_auto``/``x_min``/``x_max``, ``y_auto``/``y_min``/``y_max``,
+    ``z_auto``/``z_floor``/``z_ceiling`` alongside the legacy keys.
+    2026-07-12 dB-reference-defaults Task 4 adds ``db_reference_mode``
+    (``'auto'``/``'manual'``) alongside ``db_reference`` — both are
+    display-only (spec §5.3) and stay OUT of the primary analysis-cache key.
+
+    Built-in presets: ``torque``, ``vibration``, ``transient``. Legacy keys
+    (``diagnostic``, ``amplitude_accuracy``, ``high_frequency``) remain aliases
+    for old regression callers.
+    """
+
+    fft_time_requested = pyqtSignal()
+    signal_changed = pyqtSignal(object)  # emits (fid, ch) or None
+    compute_params_changed = pyqtSignal(object)
+    display_params_changed = pyqtSignal(object)
+    preset_committed = pyqtSignal(object)
+    _AUTO_NFFT_LABEL = "自动"
+    # 色图由图表选项管理；此值只为新建画布和旧参数消费者保留默认契约。
+    _FIXED_CMAP = DEFAULT_HEATMAP_CMAP
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("fftTimeContextual")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self._applying_preset = False
+        self._color_projection = _HeatmapColorProjection(self)
+        self._source_weighting_default = 'None'
+        self._t_win_s = DEFAULT_FFT_T_WIN_S
+        # Auto-NFFT preview data hook: a callable returning the available sample
+        # count for the current FFT-vs-Time signal (or None when no data is
+        # loaded). Set by the main window so the displayed 自动(N) mirrors the
+        # data-aware ``resolve_nfft`` the spectrogram compute path uses, instead
+        # of a data-blind ``ceil_pow2`` estimate pretending to be the actual NFFT.
+        self._auto_nfft_provider = None
+        self._auto_nfft_preview_is_target = False
+        root = QVBoxLayout(self)
+        # 2026-06-13 分析信号/谱参数 split: transparent host for two
+        # full-width cards (sig_card + params_card); spacing is the gutter.
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(8)
+
+        # ---- 分析信号 ----
+        # 2026-04-26 R3 紧凑化 fix-2: WA_StyledBackground intentionally OFF.
+        sig_card = QFrame(self)
+        sig_card.setObjectName("fftTimeSignalCard")
+        sig_lay = QVBoxLayout(sig_card)
+        # 2026-06-13 split: sig_card carries its own 10px inner padding.
+        sig_lay.setContentsMargins(10, 8, 10, 10)
+        sig_lay.setSpacing(4)
+        sig_lay.addWidget(_make_group_header("分析信号 + 时间"))
+        fl = QFormLayout()
+        _configure_form(fl)
+        self.combo_sig = SearchableComboBox()
+        fl.addRow("信号:", _fit_field(self.combo_sig, max_width=_LONG_FIELD_MAX_WIDTH))
+        self.spin_fs = _no_buttons(CompactDoubleSpinBox())
+        self.spin_fs.setRange(1, 1e6)
+        self.spin_fs.setValue(1000)
+        self.spin_fs.setSuffix(" Hz")
+        fl.addRow("Fs:", _fit_field(self.spin_fs, max_width=_SHORT_FIELD_MAX_WIDTH))
+        sig_lay.addLayout(fl)
+        self._time_range_slot = QVBoxLayout()
+        self._time_range_slot.setContentsMargins(0, 0, 0, 0)
+        self._time_range_slot.setSpacing(0)
+        sig_lay.addLayout(self._time_range_slot)
+        root.addWidget(sig_card)
+
+        # 2026-06-13 split: lower full-width tinted panel hosts 时频参数 +
+        # 幅值 + 坐标轴设置 + 预设 + 计算时频图（色图在图表选项中配置）.
+        params_card, params_lay = _make_params_card(self, "fftTimeParamsCard")
+
+        # ---- 时频参数 ----
+        # 2026-04-26 R3 紧凑化 fix-3: cap each short field.
+        g = QGroupBox("时频参数")
+        fl = QFormLayout(g)
+        _configure_form(fl)
+        self.combo_nfft = QComboBox()
+        self.combo_nfft.addItems([
+            self._AUTO_NFFT_LABEL, '512', '1024', '2048', '4096', '8192',
+        ])
+        self.combo_nfft.setCurrentText(self._AUTO_NFFT_LABEL)
+        self.combo_nfft.setToolTip(
+            '越大频率采样越密、计算量越高。\n'
+            '「自动」在普通采样率下优先 4096 点；低 Fs 按目标窗长适配，\n'
+            '且至少保留 4 个真实时间帧。不足则不可计算，不会零填充冒充分辨率。'
+        )
+        fl.addRow("FFT 点数:", _fit_field(self.combo_nfft, max_width=_SHORT_FIELD_MAX_WIDTH))
+        self.combo_win = QComboBox()
+        self.combo_win.addItems(list(ANALYSIS_WINDOW_CANDIDATES))
+        self.combo_win.setToolTip('抑制频谱泄漏：flattop 幅值最准、\nhanning 最均衡、blackman 旁瓣最低。')
+        fl.addRow("窗函数:", _fit_field(self.combo_win, max_width=_SHORT_FIELD_MAX_WIDTH))
+        self.spin_overlap = _no_buttons(QSpinBox())
+        # Requested first-open default: 80% overlap. Keep the 95% ceiling so
+        # existing high-overlap presets and user-tuned values remain valid.
+        self.spin_overlap.setRange(0, 95)
+        self.spin_overlap.setValue(80)
+        self.spin_overlap.setSuffix(" %")
+        self.spin_overlap.setToolTip('相邻时间帧的重叠：越高时频图越平滑、\n计算量越大。')
+        fl.addRow("重叠:", _fit_field(self.spin_overlap, max_width=_SHORT_FIELD_MAX_WIDTH))
+        self.combo_weighting = QComboBox()
+        self.combo_weighting.addItems(['None', 'A'])
+        self.combo_weighting.setCurrentText('None')
+        self.combo_weighting.setToolTip(
+            'A 计权（IEC 61672）：相对加权频谱，非绝对 dB SPL'
+        )
+        self.choice_weighting = SegmentedChoice()
+        self.choice_weighting.bind(self.combo_weighting)
+        self.choice_weighting.set_motion_policy(POLICY_LIGHT)
+        fl.addRow(
+            "频率加权:",
+            _fit_field(self.choice_weighting, max_width=_SHORT_FIELD_MAX_WIDTH),
+        )
+        self.db_reference_control = make_db_reference_control(self)
+        self.spin_db_ref = self.db_reference_control.editor
+        g.setTitle("")
+        # The section header already shows the title; drop the title band and
+        # let the body carry a hairline top divider (see style.qss
+        # #paramsSectionBody) so the expanded detail matches the mockup.
+        g.setObjectName("paramsSectionBody")
+        self._tf_section = _CollapsibleParamSection(
+            "时频参数",
+            "inspector/fft_time/params_expanded",
+            parent=self,
+        )
+        self._tf_section.set_body(g)
+        params_lay.addWidget(self._tf_section)
+
+        # ---- 坐标轴设置 (2026-04-29 B polish) ----
+        # The rendered FFT-vs-Time spectrogram is X = time, Y = frequency,
+        # Z/color = amplitude. The old Wave 4 labels had X=freq/Y=amp,
+        # which did not match the actual plot and is the user-reported bug.
+        # Default y_max=0.0 means "use Nyquist" — main_window's existing
+        # spin_freq_max==0.0 sentinel survives unchanged via Y aliases.
+        # Default z range is -70..-20 dB per the requested first-open UI state.
+        axis_g = _make_axis_settings_group(
+            self,
+            x_label="时间 (X):", x_unit='s',
+            x_default_min=0.0, x_default_max=0.0,
+            y_label="频率 (Y):", y_unit='Hz',
+            y_default_min=0.0, y_default_max=0.0,
+            z_default_floor=-70.0, z_default_ceiling=-20.0,
+            z_default_auto=False,
+            x_default_auto=True,
+            y_default_auto=True,
+            x_auto_summary="全时段",
+            y_auto_summary="0 → Nyquist",
+            z_auto_summary="自动色阶",
+            pre_header_rows=(("dB 参考:", self.db_reference_control),),
+            amplitude_unit_row_label="幅值单位:",
+            amplitude_unit_row_after_z=True,
+        )
+        params_lay.addWidget(axis_g)
+        # Tooltips for widgets created inside _make_axis_settings_group.
+        self.combo_amp_unit.setToolTip('dB 看宽动态，Linear 看绝对幅值。')
+        self.spin_z_floor.setToolTip('颜色映射区间(dB)：缩小区间增强弱信号对比。')
+        self.spin_z_ceiling.setToolTip('颜色映射区间(dB)：缩小区间增强弱信号对比。')
+        # Backward-compat aliases (per plan): downstream main_window callers
+        # still read chk_freq_auto / spin_freq_min / spin_freq_max.
+        # MUST be set inside __init__ so test_fft_time_contextual_has_axis_
+        # settings_group sees them at construction time.
+        self.chk_freq_auto = self.chk_y_auto
+        self.spin_freq_min = self.spin_y_min
+        self.spin_freq_max = self.spin_y_max
+        # Tighten the freq spin caps so the unit-suffixed Hz column matches
+        # the legacy A1 cap (the helper uses 72px which is plenty for 5
+        # digits + Hz suffix; no change needed here).
+
+        # ---- 色标 ----
+        # Inspector 不重复提供色图控件；图表选项负责实时配置。这里仍由
+        # _FIXED_CMAP 保留 ``cmap`` 键，兼容既有下游参数消费者。
+
+        # ---- 预设 (R3 C: builtin-aware PresetBar) ----
+        # The preset_bar is single-row, builtin-aware: each slot starts with
+        # its signal-type display name (频率 / 均衡 / 时间), plus a distinct
+        # 自定义 snapshot slot. Builtins left-click loads (override-or-builtin),
+        # while the empty custom slot saves current parameters. Slot order is the
+        # shared BUILTIN_PRESET_KEYS contract so unit recommendations line up.
+        builtin_defaults = {
+            preset.slot: {
+                'display_name': preset.display_name,
+                'params': preset.params_copy(),
+            }
+            for preset in list_builtin_presets('fft_time')
+        }
+        self.preset_bar = PresetBar(
+            'fft_time',
+            self._collect_preset,
+            self._apply_preset,
+            parent=self,
+            builtin_defaults=builtin_defaults,
+            default_params=self._collect_preset(),
+            custom_slots=CUSTOM_PRESET_SLOTS,
+            compare_fn=self._compare_preset,
+        )
+        self.preset_bar.preset_committed.connect(self.preset_committed)
+        self._tf_section.add_persistent(self.preset_bar)
+
+        # ---- 操作 ----
+        self.btn_compute = QPushButton("计算时频图")
+        self.btn_compute.setProperty("role", "primary")
+        # Disabled until a signal candidate is provided. The
+        # ``set_signal_candidates`` hook keeps this in sync with the
+        # candidate list.
+        self.btn_compute.setEnabled(False)
+        params_lay.addWidget(self.btn_compute)
+
+        root.addWidget(params_card)
+        attach_effective_facts_card(
+            self,
+            root,
+            prefix="fftTime",
+            placeholder="尚无计算结果；点击『计算时频图』后在此显示实际参数。",
+            summary_refresh=self._refresh_tf_summary,
+        )
+        root.addStretch()
+
+        # 2026-04-27 fix-4: unify label-column width across the sig_card
+        # form and every QGroupBox form so all field columns share the
+        # same width and right edge (see FFTContextual for rationale).
+        _enforce_label_widths(self, unify_columns=True)
+
+        # ---- wiring ----
+        self.btn_compute.clicked.connect(self.fft_time_requested)
+        # Wave 4/B polish: chk_freq_auto / spin_freq_min/max alias the
+        # Y-frequency row of the 坐标轴设置 group; their enabled state is
+        # driven by _sync_axis_enabled, which the helper wired to
+        # chk_y_auto.toggled.
+        # Seed the initial enabled state once at __init__ end (per the
+        # 2026-04-26 init-sync lesson).
+        self._connect_preset_param_signals()
+        self._refresh_tf_summary()
+        self._sync_axis_enabled()
+
+    # ---- helpers ----
+    def time_range_layout(self):
+        return self._time_range_slot
+
+    def is_tf_expanded(self):
+        return self._tf_section.is_expanded()
+
+    def _tf_summary_text(self):
+        nfft_text = self.combo_nfft.currentText()
+        if nfft_text == self._AUTO_NFFT_LABEL:
+            preview = self._nfft_preview()
+            if preview is None:
+                nfft_text = f"{self._AUTO_NFFT_LABEL}(待数据)"
+            elif getattr(self, "_auto_nfft_preview_is_target", False):
+                nfft_text = f"{self._AUTO_NFFT_LABEL}(目标 {preview})"
+            else:
+                nfft_text = f"{self._AUTO_NFFT_LABEL}({preview})"
+        suffix = " · 已缩短" if getattr(self, "_facts_shortened", False) else ""
+        return (
+            f"{nfft_text} · "
+            f"{self.combo_win.currentText()} · "
+            f"{self.spin_overlap.value()}%"
+            f"{suffix}"
+        )
+
+    def _refresh_tf_summary(self):
+        self._tf_section.set_summary(self._tf_summary_text())
+
+    def _on_preset_param_changed(self, *_):
+        if not self._applying_preset:
+            self._color_projection.note_edit(self.sender())
+            # Refresh baseline difference dots; do not reverse-match another slot.
+            self.preset_bar.sync_match(clear_recommendation=True)
+        self._refresh_tf_summary()
+        if self._applying_preset:
+            return
+        sender = self.sender()
+        if sender in self._display_param_widgets:
+            self.display_params_changed.emit(self.display_params())
+        else:
+            self.compute_params_changed.emit(self.compute_params())
+
+    def _connect_preset_param_signals(self):
+        self.combo_nfft.currentTextChanged.connect(self._on_preset_param_changed)
+        self.combo_win.currentTextChanged.connect(self._on_preset_param_changed)
+        self.combo_weighting.currentTextChanged.connect(self._on_preset_param_changed)
+        self.spin_overlap.valueChanged.connect(self._on_preset_param_changed)
+        self._display_param_widgets = (
+            self.combo_amp_unit,
+            self.chk_x_auto, self.spin_x_min, self.spin_x_max,
+            self.chk_y_auto, self.spin_y_min, self.spin_y_max,
+            self.chk_z_auto, self.spin_z_floor, self.spin_z_ceiling,
+        )
+        self.combo_amp_unit.currentTextChanged.connect(self._on_preset_param_changed)
+        for check in (self.chk_x_auto, self.chk_y_auto, self.chk_z_auto):
+            check.toggled.connect(self._on_preset_param_changed)
+        for spin in (
+            self.spin_x_min, self.spin_x_max,
+            self.spin_y_min, self.spin_y_max,
+            self.spin_z_floor, self.spin_z_ceiling,
+        ):
+            spin.valueChanged.connect(self._on_preset_param_changed)
+
+    def _apply_weighting_value(self, value):
+        target = 'A' if str(value).upper() == 'A' else 'None'
+        i = self.combo_weighting.findText(target)
+        if i >= 0:
+            self.combo_weighting.setCurrentIndex(i)
+
+    def set_weighting_default(self, mode):
+        if self._applying_preset:
+            return
+        self._source_weighting_default = (
+            'A' if str(mode).upper() == 'A' else 'None'
+        )
+        self._apply_weighting_value(self._source_weighting_default)
+
+    def _sync_axis_enabled(self):
+        """Toggle each axis row between auto summary and manual bounds.
+
+        Identical body to OrderContextual._sync_axis_enabled — kept as an
+        instance method per the Wave 4 plan note (helper wires the signal
+        but each class owns the slot so the implementation stays
+        overrideable / inspectable).
+        """
+        for key in ('x', 'y', 'z'):
+            parts = self._axis_row_parts[key]
+            auto = parts['checkbox'].isChecked()
+            parts['stack'].setCurrentWidget(
+                parts['summary_page'] if auto else parts['manual_page']
+            )
+            parts['summary_page'].setVisible(auto)
+            parts['manual_page'].setVisible(not auto)
+            parts['summary'].setVisible(auto)
+            for w in (parts['spin_min'], parts['arrow'], parts['spin_max']):
+                w.setVisible(not auto)
+            for s in (parts['spin_min'], parts['spin_max']):
+                s.setEnabled(not auto)
+
+    def _on_amp_unit_changed(self, text):
+        """Switching dB↔Linear forces z_auto on AND resets z_floor/z_ceiling
+        to the new unit's defaults so the previous unit's numeric range
+        cannot bleed into the new unit. Per the
+        2026-05-01-codex-review-fixes-design.md spec §1.4 contract.
+
+        Order matters: chk_z_auto must be set to True FIRST so that
+        ``_sync_axis_enabled`` (called at the end) sees the auto-on state
+        and disables both spinboxes.
+        """
+        self._color_projection.clear()
+        floor, ceiling = z_range_for(text)
+        widgets = (self.chk_z_auto, self.spin_z_floor, self.spin_z_ceiling)
+        blocked = [widget.blockSignals(True) for widget in widgets]
+        try:
+            self.chk_z_auto.setChecked(True)
+            self.spin_z_floor.setValue(floor)
+            self.spin_z_ceiling.setValue(ceiling)
+        finally:
+            for widget, previous in zip(widgets, blocked):
+                widget.blockSignals(previous)
+        # The amplitude combo publishes one complete display update after this
+        # slot. Intermediate bounds can cross and are never separate Z edits.
+        self._sync_axis_enabled()
+
+    def _on_sig_index_changed(self):
+        self.signal_changed.emit(self.combo_sig.currentData())
+
+    # ---- public API consumed by MainWindow / tests ----
+    def set_signal_candidates(
+        self, candidates, *, selected=_PRESERVE_CANDIDATE_SELECTION,
+    ):
+        """Repopulate the signal combo, preserving an existing selection
+        (matched by userData) when it remains in the new candidate list.
+
+        The compute button is enabled iff the combo ends with at least one
+        item — this hook is part of the contract verified by
+        ``test_fft_time_compute_button_tracks_signal_candidates``.
+        """
+        prev = (
+            self.combo_sig.currentData()
+            if selected is _PRESERVE_CANDIDATE_SELECTION else selected
+        )
+        old = self.combo_sig.blockSignals(True)
+        try:
+            self.combo_sig.replace_candidate_rows(candidates)
+            keep_idx = -1
+            for i in range(self.combo_sig.count()):
+                if prev is not None and self.combo_sig.itemData(i) == prev:
+                    keep_idx = i
+            # No prior selection to preserve -> leave unselected (-1) instead of
+            # sitting on the first signal; see FFTContextual.set_signal_candidates
+            # for the phantom-default rationale.
+            self.combo_sig.setCurrentIndex(keep_idx)
+        finally:
+            self.combo_sig.blockSignals(old)
+        # Re-attach signal_changed listener exactly once.
+        try:
+            self.combo_sig.currentIndexChanged.disconnect(
+                self._on_sig_index_changed
+            )
+        except TypeError:
+            pass
+        self.combo_sig.currentIndexChanged.connect(self._on_sig_index_changed)
+        # Compute is enabled iff there is a valid candidate. This is the
+        # T2 hook the mode-plumbing tests rely on — keep it as the LAST
+        # statement so it always reflects the final combo state.
+        self.btn_compute.setEnabled(self.combo_sig.count() > 0)
+
+    def current_signal(self):
+        return self.combo_sig.currentData()
+
+    def fs(self):
+        return self.spin_fs.value()
+
+    def set_fs(self, fs):
+        self.spin_fs.blockSignals(True)
+        self.spin_fs.setValue(float(fs))
+        self.spin_fs.blockSignals(False)
+        self._refresh_tf_summary()
+
+    def set_auto_nfft_provider(self, provider):
+        """Register the available-samples hook for the auto-NFFT preview.
+
+        ``provider`` is a zero-arg callable returning the sample count of the
+        current FFT-vs-Time signal (int) or ``None`` when no usable data is
+        loaded. Passing ``None`` clears the hook (reverts to the naive preview).
+        Refreshes the collapsed summary so the displayed 自动(N) updates at once.
+        Bound methods are held weakly so the contextual cannot keep MainWindow
+        alive past teardown.
+        """
+        self._auto_nfft_provider = as_weak_callable(provider)
+        self._refresh_tf_summary()
+
+    def _nfft_preview(self):
+        from ...signal import requested_auto_nfft, resolve_auto_nfft
+
+        self._auto_nfft_preview_is_target = False
+        fs = float(self.spin_fs.value())
+        t_win = float(self._t_win_s)
+        n_samples = None
+        if self._auto_nfft_provider is not None:
+            try:
+                n_samples = self._auto_nfft_provider()
+            except Exception:
+                n_samples = None
+        if n_samples is not None and int(n_samples) > 1:
+            overlap = float(self.spin_overlap.value()) / 100.0
+            try:
+                decision = resolve_auto_nfft(
+                    fs, int(n_samples), t_win, overlap, purpose="fft_time",
+                )
+            except ValueError:
+                return None
+            if decision.status == "blocked" or decision.effective_nfft is None:
+                return None
+            return int(decision.effective_nfft)
+        try:
+            self._auto_nfft_preview_is_target = True
+            return int(requested_auto_nfft(fs, t_win, purpose="fft_time"))
+        except ValueError:
+            return None
+
+    def compute_params(self):
+        nfft_text = self.combo_nfft.currentText()
+        if nfft_text == self._AUTO_NFFT_LABEL:
+            nfft = None
+            nfft_mode = 'auto'
+            nfft_effective = None
+            nfft_preview = self._nfft_preview()
+        else:
+            nfft = int(nfft_text)
+            nfft_mode = 'fixed'
+            nfft_effective = nfft
+            nfft_preview = nfft
+        return dict(
+            fs=self.spin_fs.value(),
+            nfft=nfft,
+            nfft_mode=nfft_mode,
+            t_win_s=float(self._t_win_s),
+            nfft_preview=nfft_preview,
+            nfft_effective=nfft_effective,
+            window=self.combo_win.currentText(),
+            overlap=self.spin_overlap.value() / 100.0,
+            weighting=self.combo_weighting.currentText(),
+            remove_mean=True,
+        )
+
+    def display_params(self):
+        # Wave 4: amplitude_mode now derives from combo_amp_unit (the dB↔
+        # Linear dropdown on the Z axis row). Stays lowercase
+        # ('amplitude_db' / 'amplitude') so main_window._render_fft_time →
+        # SpectrogramCanvas.plot_result keeps round-tripping unchanged
+        # (Wave 5 will retire the key entirely).
+        unit = self.combo_amp_unit.currentText()
+        amp_mode = 'amplitude_db' if unit == 'dB' else 'amplitude'
+        # Wave 4: combo_dynamic dropped; legacy ``dynamic`` string is
+        # synthesised from the explicit Z-row floor (the spectrogram canvas
+        # consumes this until Wave 5 wires it to z_floor / z_ceiling).
+        # When z_auto is on the canvas chooses its own range, hence 'Auto'.
+        if self.chk_z_auto.isChecked():
+            dynamic_legacy = 'Auto'
+        else:
+            span = abs(float(self.spin_z_floor.value()))
+            dynamic_legacy = f"{int(round(span))} dB"
+        params = dict(
+            signal=self.combo_sig.currentData(),
+            amplitude_mode=amp_mode,
+            **db_reference_params(self.db_reference_control),
+            # Legacy freq_* keys are aliases of the Y-frequency axis.
+            freq_auto=bool(self.chk_y_auto.isChecked()),
+            freq_min=float(self.spin_y_min.value()),
+            freq_max=float(self.spin_y_max.value()),
+            dynamic=dynamic_legacy,
+            cmap=self._FIXED_CMAP,
+        )
+        # Wave 4 (2026-04-28 plan): explicit X/Y/Z range + auto flags for
+        # the new 坐标轴设置 group. These coexist with the legacy keys
+        # above; Wave 5 will trim the duplicates once the canvas reads the
+        # explicit z_floor/ceiling directly.
+        params['x_auto'] = bool(self.chk_x_auto.isChecked())
+        params['x_min'] = float(self.spin_x_min.value())
+        params['x_max'] = float(self.spin_x_max.value())
+        params['y_auto'] = bool(self.chk_y_auto.isChecked())
+        params['y_min'] = float(self.spin_y_min.value())
+        params['y_max'] = float(self.spin_y_max.value())
+        params.update(self._color_projection.params())
+        return params
+
+    def current_params(self):
+        return {**self.compute_params(), **self.display_params()}
+
+    def get_params(self):
+        """Compatibility name for the complete, View-persistent payload."""
+        return self.current_params()
+
+    def project_color_levels(self, auto, lo, hi, *, requested=None):
+        """Show resolved levels, keeping the owner request for preset comparison."""
+        projected = self._color_projection.project(auto, lo, hi, requested=requested)
+        if projected:
+            self.preset_bar.sync_match()
+        return projected
+
+    def _compare_preset(self):
+        params = self._collect_preset()
+        requested = self._color_projection.comparison_request()
+        if requested is not None:
+            for key in ('z_auto', 'z_floor', 'z_ceiling'):
+                if key in requested:
+                    params[key] = requested[key]
+                else:
+                    params.pop(key, None)
+            # The legacy alias must not reinstate an effective Z window when
+            # the owning request has no explicit Z fields.
+            params.pop('dynamic', None)
+        return params
+
+    def color_policy_projection(self):
+        """Return the exact display projection, or None after a restore."""
+        return self._color_projection.projection()
+
+    def consume_color_policy_edit(self):
+        """Take the explicit Z edit once, preserving untouched precision."""
+        return self._color_projection.consume_edit()
+
+    def apply_params(self, d):
+        """Round-trip every key get_params emits back onto its control.
+
+        V5b: the per-section multiview bridge calls apply_params_from_state →
+        ctx.apply_params(...). Mirrors FFTContextual/OrderContextual.apply_params:
+        each key is fault-tolerant (`if 'k' in d:` so partial dicts are fine)
+        and `apply_params(get_params())` is idempotent.
+
+        Three get_params shapes need reverse mapping, not a naive setter:
+        - ``overlap`` is a FRACTION (0.75); spin_overlap holds the percent (75).
+        - ``amplitude_mode`` is the lowercase token 'amplitude_db' / 'amplitude';
+          combo_amp_unit shows 'dB' / 'Linear'. We match on ``'db' in lower``
+          (the legacy '_apply_preset' `'dB' in val` form would mis-read the
+          lowercase token). blockSignals so _on_amp_unit_changed does not force
+          z_auto on and stomp the explicit z_floor/z_ceiling arriving alongside.
+        - ``dynamic`` / ``freq_*`` are derived aliases of z_floor / the Y row;
+          they are skipped whenever the authoritative explicit key is present
+          (always true for get_params output) so they cannot break idempotency.
+
+        Programmatic restore is silent: widget writes are wrapped in
+        ``_applying_preset`` so they cannot emit ``display_params_changed``
+        and trigger a heatmap replot (a live colorbar drag echoes through
+        this method).
+        """
+        self._color_projection.prepare_restore(d)
+        self._applying_preset = True
+        try:
+            self._apply_params_unlocked(d)
+            self._color_projection.remember_restored(d)
+        finally:
+            self._applying_preset = False
+        self.preset_bar.sync_match()
+
+    def _apply_params_unlocked(self, d):
+        if 'signal' in d and d['signal'] is not None:
+            i = self.combo_sig.findData(d['signal'])
+            if i >= 0:
+                self.combo_sig.setCurrentIndex(i)
+        if 'fs' in d:
+            try:
+                self.spin_fs.setValue(float(d['fs']))
+            except (TypeError, ValueError):
+                pass
+        if 'window' in d:
+            i = self.combo_win.findText(str(d['window']))
+            if i >= 0:
+                self.combo_win.setCurrentIndex(i)
+        if 't_win_s' in d:
+            try:
+                self._t_win_s = float(d['t_win_s'])
+            except (TypeError, ValueError):
+                pass
+        if 'nfft' in d:
+            if d.get('nfft_mode') == 'auto' or d['nfft'] is None:
+                i = self.combo_nfft.findText(self._AUTO_NFFT_LABEL)
+            else:
+                i = self.combo_nfft.findText(str(d['nfft']))
+            if i >= 0:
+                self.combo_nfft.setCurrentIndex(i)
+        if 'overlap' in d:
+            try:
+                # get_params stores overlap as a fraction; the spin is percent.
+                self.spin_overlap.setValue(int(round(float(d['overlap']) * 100)))
+            except (TypeError, ValueError):
+                pass
+        apply_db_reference_partial(self.db_reference_control, d)
+        if 'weighting' in d:
+            self._apply_weighting_value(d['weighting'])
+        # Inspector 不应用预设里的 cmap；实时选择属于图表选项。
+
+        # amplitude_mode token → combo_amp_unit. Reverse-map on a
+        # case-insensitive 'db' substring so the lowercase 'amplitude_db'
+        # token from get_params lands on 'dB' (and the legacy 'Amplitude dB'
+        # preset string keeps working). blockSignals so _on_amp_unit_changed
+        # does not flip z_auto on and clobber the explicit z range below.
+        if 'amplitude_mode' in d:
+            val = str(d['amplitude_mode'])
+            target = 'dB' if 'db' in val.lower() else 'Linear'
+            i = self.combo_amp_unit.findText(target)
+            if i >= 0:
+                self.combo_amp_unit.blockSignals(True)
+                self.combo_amp_unit.setCurrentIndex(i)
+                self.combo_amp_unit.blockSignals(False)
+                self.choice_amp_unit.sync_from_bound_combo()
+
+        # Legacy ``dynamic`` only fires when no explicit z_floor accompanies
+        # it (get_params always emits z_floor, so this is a partial-dict
+        # safety net, never reached on a full round-trip).
+        if 'dynamic' in d and 'z_floor' not in d:
+            raw = str(d['dynamic'])
+            if raw == 'Auto':
+                self.chk_z_auto.setChecked(True)
+            else:
+                try:
+                    n = float(raw.replace('dB', '').strip())
+                    self.chk_z_auto.setChecked(False)
+                    self.spin_z_floor.setValue(-abs(n))
+                    self.spin_z_ceiling.setValue(0.0)
+                except ValueError:
+                    pass
+
+        # Legacy ``freq_*`` alias the Y-frequency row; only applied when the
+        # explicit ``y_*`` key is absent so they cannot fight the round-trip.
+        if 'freq_auto' in d and 'y_auto' not in d:
+            self.chk_y_auto.setChecked(bool(d['freq_auto']))
+        if 'freq_min' in d and 'y_min' not in d:
+            try:
+                self.spin_y_min.setValue(float(d['freq_min']))
+            except (TypeError, ValueError):
+                pass
+        if 'freq_max' in d and 'y_max' not in d:
+            try:
+                self.spin_y_max.setValue(float(d['freq_max']))
+            except (TypeError, ValueError):
+                pass
+
+        # Explicit axis keys (preferred path, authoritative).
+        for key, attr in (
+            ('x_auto', 'chk_x_auto'),
+            ('y_auto', 'chk_y_auto'),
+            ('z_auto', 'chk_z_auto'),
+        ):
+            if key in d:
+                getattr(self, attr).setChecked(bool(d[key]))
+        for key, attr in (
+            ('x_min', 'spin_x_min'), ('x_max', 'spin_x_max'),
+            ('y_min', 'spin_y_min'), ('y_max', 'spin_y_max'),
+            ('z_floor', 'spin_z_floor'), ('z_ceiling', 'spin_z_ceiling'),
+        ):
+            if key in d:
+                try:
+                    getattr(self, attr).setValue(float(d[key]))
+                except (TypeError, ValueError):
+                    pass
+
+        self._sync_axis_enabled()
+
+    def reset_to_defaults(self):
+        """Restore construction-time defaults for a blank analysis View."""
+        bar = getattr(self, 'preset_bar', None)
+        defaults = getattr(bar, '_default_params', None) if bar is not None else None
+        if isinstance(defaults, dict) and defaults:
+            self.apply_params(dict(defaults))
+
+    # ---- built-in presets (design §7) ----
+    #
+    # NEW-1 (Wave 4 audit): the 'amplitude_mode' / 'dynamic' /
+    # 'freq_auto/min/max' keys below are the LEGACY shape. After Wave 4
+    # the underlying widgets (combo_amp_mode + combo_dynamic + the freq
+    # QFormLayout block) are gone, so these dicts can no longer be applied
+    # naively. _apply_preset performs read-side migration (legacy keys are
+    # translated to the new chk_z_auto / spin_z_floor / spin_z_ceiling /
+    # combo_amp_unit + chk_y_auto / spin_y_min/max), so the literals here
+    # survive untouched. Wave 5 / 6 will rewrite them in the new shape.
+    # DEPRECATED key form; survives via _apply_preset legacy migration on load.
+    #
+    # Signal-type built-in presets. The compact shape
+    # (window/nfft/overlap/amplitude_mode/freq_auto/dynamic) is preserved;
+    # _builtin_preset_full_params spreads it to the full collect-preset shape.
+    # Builtins use auto color levels, with per-preset manual fallback spans for
+    # when the user unticks 色阶 auto.
+    #
+    # 不含 ``cmap``：预设从不决定色图。本面板恒定发 _FIXED_CMAP，_apply_preset
+    # 也显式跳过预设里的 cmap（实时选择归图表选项管），所以内建预设里再带一个
+    # 色图名只会是永不生效的误导数据，已从 analysis_presets 里删掉。
+    _BUILTIN_PRESETS = {
+        preset.key: {
+            key: preset.params[key]
+            for key in (
+                'window', 't_win_s', 'overlap', 'amplitude_mode',
+                'freq_auto', 'dynamic',
+            )
+        }
+        for preset in list_builtin_presets('fft_time')
+    }
+    _LEGACY_BUILTIN_PRESET_ALIASES = {
+        alias: preset.key
+        for preset in list_builtin_presets('fft_time')
+        for alias in preset.aliases
+    }
+
+    # User-facing display names for the three builtin slots — shared signal-type
+    # labels (频率 / 均衡 / 时间).
+    _BUILTIN_PRESET_DISPLAY = dict(BUILTIN_PRESET_DISPLAY)
+
+    def _resolve_builtin_preset_key(self, name):
+        return resolve_builtin_preset_alias('fft_time', name)
+
+    def _builtin_preset_full_params(self, name):
+        """Return a JSON-serializable param dict for a builtin preset.
+
+        Mirrors the keys we collect in ``_collect_preset`` so the
+        builtin-aware PresetBar can save / reset / load the same shape
+        round-trip.
+        """
+        try:
+            return get_builtin_preset('fft_time', name).params_copy()
+        except KeyError:
+            return {}
+
+    def _collect_preset(self):
+        """Snapshot the current time-frequency params for PresetBar save.
+
+        Weighting is live consumer state and is omitted, matching builtin
+        patches. Wave 4: combo_amp_mode + combo_dynamic dropped. ``amplitude_mode``
+        is now derived from ``combo_amp_unit`` (mirroring step 3.4 for
+        OrderContextual); ``dynamic`` is synthesised from
+        ``spin_z_floor`` so the persisted preset shape stays
+        backward-compatible with main_window's _render_fft_time consumer
+        (Wave 5 will retire both legacy keys).
+        """
+        unit = self.combo_amp_unit.currentText()
+        amp_mode = 'Amplitude dB' if unit == 'dB' else 'Amplitude'
+        if self.chk_z_auto.isChecked():
+            dynamic_legacy = 'Auto'
+        else:
+            span = abs(float(self.spin_z_floor.value()))
+            dynamic_legacy = f"{int(round(span))} dB"
+        return dict(
+            window=self.combo_win.currentText(),
+            nfft=self.combo_nfft.currentText(),
+            nfft_mode=(
+                'auto'
+                if self.combo_nfft.currentText() == self._AUTO_NFFT_LABEL
+                else 'fixed'
+            ),
+            t_win_s=float(self._t_win_s),
+            overlap=self.spin_overlap.value(),
+            amplitude_mode=amp_mode,
+            remove_mean=True,
+            **db_reference_params(self.db_reference_control),
+            freq_auto=bool(self.chk_y_auto.isChecked()),
+            freq_min=float(self.spin_y_min.value()),
+            freq_max=float(self.spin_y_max.value()),
+            dynamic=dynamic_legacy,
+            cmap=self._FIXED_CMAP,
+            x_auto=bool(self.chk_x_auto.isChecked()),
+            x_min=float(self.spin_x_min.value()),
+            x_max=float(self.spin_x_max.value()),
+            y_auto=bool(self.chk_y_auto.isChecked()),
+            y_min=float(self.spin_y_min.value()),
+            y_max=float(self.spin_y_max.value()),
+            **self._color_projection.params(),
+        )
+
+    def _apply_preset(self, d):
+        before_compute = self.compute_params()
+        before_display = self.display_params()
+        source_patch = self.preset_bar.applied_source_patch()
+        if source_patch is None:
+            source_patch = d
+        changes_z = any(
+            key in source_patch for key in ('z_auto', 'z_floor', 'z_ceiling', 'dynamic')
+        )
+        if changes_z:
+            self._color_projection.prepare_restore(d)
+        self._applying_preset = True
+        try:
+            self._apply_preset_values(d)
+            if changes_z:
+                self._color_projection.remember_restored(d)
+        finally:
+            self._applying_preset = False
+            self._refresh_tf_summary()
+        self.preset_bar.sync_match()
+        self._color_projection.note_preset(source_patch)
+        self._emit_param_deltas(before_compute, before_display)
+
+    def _emit_param_deltas(self, before_compute, before_display):
+        compute = self.compute_params()
+        display = self.display_params()
+        if compute != before_compute:
+            self.compute_params_changed.emit(compute)
+        if display != before_display:
+            self.display_params_changed.emit(display)
+
+    def _apply_preset_values(self, d):
+        """Restore previously-saved params from PresetBar load (R3 C).
+
+        Wave 4: legacy ``amplitude_mode`` / ``dynamic`` / ``freq_*`` keys
+        are migrated to the new chk_z_auto / spin_z_floor / spin_z_ceiling
+        / combo_amp_unit / chk_y_auto / spin_y_min/max widgets. New keys
+        (z_auto, z_floor, z_ceiling, x_auto, x_min, x_max, y_*) are
+        applied directly when present and override the legacy translation.
+        """
+        if 'window' in d:
+            i = self.combo_win.findText(str(d['window']))
+            if i >= 0:
+                self.combo_win.setCurrentIndex(i)
+        if 't_win_s' in d:
+            try:
+                self._t_win_s = float(d['t_win_s'])
+            except (TypeError, ValueError):
+                pass
+        if 'nfft' in d:
+            if d.get('nfft_mode') == 'auto' or d['nfft'] is None:
+                i = self.combo_nfft.findText(self._AUTO_NFFT_LABEL)
+            else:
+                i = self.combo_nfft.findText(str(d['nfft']))
+            if i >= 0:
+                self.combo_nfft.setCurrentIndex(i)
+        if 'overlap' in d:
+            try:
+                self.spin_overlap.setValue(int(d['overlap']))
+            except (TypeError, ValueError):
+                pass
+        apply_db_reference_preset(self.db_reference_control, d)
+        # Weighting is live consumer state. Inspector presets — builtin and
+        # custom — never apply it, including leftover keys in older snapshots.
+        # Inspector 不应用预设里的 cmap；实时选择属于图表选项。
+
+        # ---- Wave 4 axis-key migration (legacy + new) ----
+        # Legacy ``dynamic`` translates to z_floor / z_ceiling / z_auto.
+        # The explicit z_floor key (applied below) takes precedence when
+        # both are present in the same dict.
+        if 'dynamic' in d and 'z_floor' not in d:
+            raw = str(d['dynamic'])
+            if raw == 'Auto':
+                self.chk_z_auto.setChecked(True)
+            else:
+                try:
+                    n = float(raw.replace('dB', '').strip())
+                    self.chk_z_auto.setChecked(False)
+                    self.spin_z_floor.setValue(-abs(n))
+                    self.spin_z_ceiling.setValue(0.0)
+                except ValueError:
+                    pass
+        # Legacy 'amplitude_mode' → combo_amp_unit. blockSignals so
+        # _on_amp_unit_changed does not flip z_auto on and clobber the
+        # dynamic-derived floor/ceiling we just set (mirroring Wave 3
+        # OrderContextual step 3.4).
+        if 'amplitude_mode' in d:
+            val = str(d['amplitude_mode'])
+            target = 'dB' if 'dB' in val else 'Linear'
+            i = self.combo_amp_unit.findText(target)
+            if i >= 0:
+                self.combo_amp_unit.blockSignals(True)
+                self.combo_amp_unit.setCurrentIndex(i)
+                self.combo_amp_unit.blockSignals(False)
+                self.choice_amp_unit.sync_from_bound_combo()
+        # Legacy ``freq_auto/min/max`` map onto the Y-frequency row of the
+        # axis group (chk_y_auto / spin_y_min/max via the alias attributes).
+        if 'freq_auto' in d:
+            self.chk_y_auto.setChecked(bool(d['freq_auto']))
+        if 'freq_min' in d:
+            try:
+                self.spin_y_min.setValue(float(d['freq_min']))
+            except (TypeError, ValueError):
+                pass
+        if 'freq_max' in d:
+            try:
+                self.spin_y_max.setValue(float(d['freq_max']))
+            except (TypeError, ValueError):
+                pass
+
+        # New explicit axis keys (preferred path; override the legacy
+        # translation when both are present).
+        for key, attr in (
+            ('x_auto', 'chk_x_auto'),
+            ('y_auto', 'chk_y_auto'),
+            ('z_auto', 'chk_z_auto'),
+        ):
+            if key in d:
+                getattr(self, attr).setChecked(bool(d[key]))
+        for key, attr in (
+            ('x_min', 'spin_x_min'), ('x_max', 'spin_x_max'),
+            ('y_min', 'spin_y_min'), ('y_max', 'spin_y_max'),
+            ('z_floor', 'spin_z_floor'), ('z_ceiling', 'spin_z_ceiling'),
+        ):
+            if key in d:
+                try:
+                    getattr(self, attr).setValue(float(d[key]))
+                except (TypeError, ValueError):
+                    pass
+
+        self._sync_axis_enabled()
+
+    def apply_builtin_preset(self, name):
+        """Apply one of the built-in presets by key (``'torque'`` /
+        ``'vibration'`` / ``'transient'``).
+
+        Legacy keys (``'diagnostic'``, ``'amplitude_accuracy'``,
+        ``'high_frequency'``) are accepted as aliases for the closest new
+        signal-type preset so old regression paths do not silently no-op.
+        """
+        key = self._resolve_builtin_preset_key(name)
+        cfg = self._BUILTIN_PRESETS.get(key)
+        if not cfg:
+            return
+        self._apply_preset(self._builtin_preset_full_params(key))
+
+    def set_recommended_for_unit(self, unit):
+        """Highlight the preset slot recommended for ``unit`` (or clear).
+
+        Missing or unrecognized units clear the highlight rather than
+        picking a default slot.
+        """
+        key = recommend_preset_for_unit(unit)
+        if key is None:
+            self.preset_bar.set_recommended(None)
+            return
+        self.preset_bar.set_recommended(_PRESET_KEY_TO_SLOT[key], unit=unit)

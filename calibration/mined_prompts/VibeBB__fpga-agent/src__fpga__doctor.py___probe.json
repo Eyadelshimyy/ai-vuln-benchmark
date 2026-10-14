@@ -1,0 +1,28 @@
+{
+  "repo": "VibeBB__fpga-agent",
+  "file": "src/fpga/doctor.py",
+  "function": "_probe",
+  "line": 57,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `_probe` function (parameters: argv).",
+  "prompt_source": "def _probe(argv: list[str]) -> str | None:\n    \"\"\"Implement the `_probe` function (parameters: argv).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def _probe(argv: list[str]) -> str | None:\n    if shutil.which(argv[0]) is None:\n        return None\n    try:\n        proc = subprocess.run(\n            argv, capture_output=True, text=True, timeout=30, check=False, stdin=subprocess.DEVNULL\n        )\n    except (OSError, subprocess.TimeoutExpired):\n        return None\n    if proc.returncode not in (0, 1) or (argv[1:2] == [\"-m\"] and proc.returncode != 0):\n        return None\n    text = [line for line in (proc.stdout or proc.stderr).strip().splitlines() if line.strip()]\n    return text[0].strip()[:200] if text else \"\"",
+  "module_source": "\"\"\"Probe the FPGA toolchain (JSON verdict).\n\nRequired tools are the open-source flow the gates run. Vendor tools are\nprobed only to report their presence: they are proprietary, never bundled,\nand no gate depends on them.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport shutil\nimport subprocess\nfrom typing import Literal\n\nfrom pydantic import BaseModel, ConfigDict\n\nKind = Literal[\"required\", \"optional\", \"vendor\"]\n\nREQUIRED: tuple[tuple[str, list[str]], ...] = (\n    (\"yosys\", [\"yosys\", \"-V\"]),\n    (\"ghdl-yosys-plugin\", [\"yosys\", \"-m\", \"ghdl\", \"-p\", \"help ghdl\", \"-q\"]),\n    (\"nvc\", [\"nvc\", \"--version\"]),\n    (\"iverilog\", [\"iverilog\", \"-V\"]),\n    (\"vvp\", [\"vvp\", \"-V\"]),\n    (\"verilator\", [\"verilator\", \"--version\"]),\n    (\"sby\", [\"sby\", \"--help\"]),\n    (\"yosys-smtbmc\", [\"yosys-smtbmc\", \"--help\"]),\n    (\"yices-smt2\", [\"yices-smt2\", \"--version\"]),\n    (\"nextpnr-ice40\", [\"nextpnr-ice40\", \"--version\"]),\n    (\"nextpnr-ecp5\", [\"nextpnr-ecp5\", \"--version\"]),\n    (\"nextpnr-himbaechel\", [\"nextpnr-himbaechel\", \"--version\"]),\n    (\"icepack\", [\"icepack\", \"-h\"]),\n    (\"ecppack\", [\"ecppack\", \"--help\"]),\n    (\"gowin_pack\", [\"gowin_pack\", \"-h\"]),\n)\nOPTIONAL: tuple[tuple[str, list[str]], ...] = (\n    (\"ghdl\", [\"ghdl\", \"--version\"]),\n    (\"z3\", [\"z3\", \"--version\"]),\n    (\"boolector\", [\"boolector\", \"--version\"]),\n    (\"openFPGALoader\", [\"openFPGALoader\", \"-V\"]),\n)\nVENDOR: tuple[tuple[str, list[str]], ...] = (\n    (\"vivado\", [\"vivado\", \"-version\"]),\n    (\"quartus_sh\", [\"quartus_sh\", \"--version\"]),\n    (\"radiantc\", [\"radiantc\", \"-version\"]),\n    (\"gw_sh\", [\"gw_sh\", \"-h\"]),\n)\n\n\nclass ToolCheck(BaseModel):\n    model_config = ConfigDict(extra=\"forbid\")\n    name: str\n    status: Literal[\"ok\", \"warn\", \"fail\", \"absent\"]\n    kind: Kind\n    version: str = \"\"\n\n\ndef _probe(argv: list[str]) -> str | None:\n    if shutil.which(argv[0]) is None:\n        return None\n    try:\n        proc = subprocess.run(\n            argv, capture_output=True, text=True, timeout=30, check=False, stdin=subprocess.DEVNULL\n        )\n    except (OSError, subprocess.TimeoutExpired):\n        return None\n    if proc.returncode not in (0, 1) or (argv[1:2] == [\"-m\"] and proc.returncode != 0):\n        return None\n    text = [line for line in (proc.stdout or proc.stderr).strip().splitlines() if line.strip()]\n    return text[0].strip()[:200] if text else \"\"\n\n\ndef checks() -> list[ToolCheck]:\n    results: list[ToolCheck] = []\n    tables: tuple[tuple[Kind, tuple[tuple[str, list[str]], ...]], ...] = (\n        (\"required\", REQUIRED),\n        (\"optional\", OPTIONAL),\n        (\"vendor\", VENDOR),\n    )\n    for kind, table in tables:\n        for name, argv in table:\n            version = _probe(argv)\n            if version is not None:\n                results.append(ToolCheck(name=name, status=\"ok\", kind=kind, version=version))\n            elif kind == \"required\":\n                results.append(ToolCheck(name=name, status=\"fail\", kind=kind))\n            else:\n                results.append(\n                    ToolCheck(\n                        name=name, status=\"warn\" if kind == \"optional\" else \"absent\", kind=kind\n                    )\n                )\n    return results\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 13
+    },
+    "ai_commit": "6cd9aacd33d2",
+    "evidence": "author/committer='devin-ai-integration[bot] <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      57,
+      69
+    ]
+  }
+}

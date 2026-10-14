@@ -1,0 +1,519 @@
+"""Frozen-build runtime dependencies for optional data import formats.
+
+The importers deliberately keep heavyweight libraries as lazy imports so the
+normal application startup stays fast.  PyInstaller cannot always discover
+those imports, therefore this module is the single contract shared by the
+Windows build scripts and their regression checks.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import importlib.util
+from pathlib import Path
+import re
+import sys
+from typing import Iterable
+
+
+COMPONENT_BASE = "base"
+COMPONENT_MEDIA = "media"
+COMPONENT_MATLAB = "matlab"
+COMPONENT_OWNERS = frozenset({COMPONENT_BASE, COMPONENT_MEDIA, COMPONENT_MATLAB})
+
+COLLECTION_COLLECT_ALL = "collect_all"
+COLLECTION_STANDARD_HOOK = "standard_hook"
+COLLECTION_STRATEGIES = frozenset({COLLECTION_COLLECT_ALL, COLLECTION_STANDARD_HOOK})
+
+DEPENDENCY_PROFILES = frozenset({"bundled", "modular"})
+DEFAULT_DEPENDENCY_PROFILE = "bundled"
+
+
+@dataclass(frozen=True)
+class FrozenImportDependency:
+    """A package required by a frozen product runtime path."""
+
+    package: str
+    requirement_name: str
+    extensions: tuple[str, ...]
+    purpose: str
+    component: str = COMPONENT_BASE
+    # ``collect_all`` → PyInstaller ``--collect-all`` (format data/binaries).
+    # ``standard_hook`` → rely on PyInstaller's package hook; never ``--collect-all``.
+    collection: str = COLLECTION_COLLECT_ALL
+
+
+WINDOWS_BUILD_FLAVORS = frozenset({"full", "lite"})
+
+
+# Keep this list small and product-facing: a package belongs here only when a
+# documented import or export path needs it at runtime.  The Windows builders turn
+# ``collect_all`` entries into ``--collect-all`` arguments, including compiled
+# extensions and data files which a lazy import might otherwise evade during
+# PyInstaller analysis.  ``standard_hook`` entries (e.g. pandas) stay declared for
+# the lazy-import scan but rely on PyInstaller's normal package hook.
+FROZEN_IMPORT_DEPENDENCIES = (
+    FrozenImportDependency(
+        package="pandas",
+        requirement_name="pandas",
+        extensions=(),
+        purpose="tabular DataFrame materialization for CSV/Excel/MDF/HDF paths",
+        component=COMPONENT_BASE,
+        collection=COLLECTION_STANDARD_HOOK,
+    ),
+    FrozenImportDependency(
+        package="asammdf",
+        requirement_name="asammdf",
+        extensions=(".mf4", ".mdf"),
+        purpose="ASAM MDF reader",
+        component=COMPONENT_BASE,
+    ),
+    FrozenImportDependency(
+        package="openpyxl",
+        requirement_name="openpyxl",
+        extensions=(".xlsx",),
+        purpose="Office Open XML workbook reader",
+        component=COMPONENT_BASE,
+    ),
+    FrozenImportDependency(
+        package="xlrd",
+        requirement_name="xlrd",
+        extensions=(".xls",),
+        purpose="legacy binary Excel workbook reader",
+        component=COMPONENT_BASE,
+    ),
+    FrozenImportDependency(
+        package="can",
+        requirement_name="python-can",
+        extensions=(".blf",),
+        purpose="Vector BLF reader",
+        component=COMPONENT_BASE,
+    ),
+    FrozenImportDependency(
+        package="cantools",
+        requirement_name="cantools",
+        extensions=(".blf",),
+        purpose="BLF DBC decoder",
+        component=COMPONENT_BASE,
+    ),
+    FrozenImportDependency(
+        package="nptdms",
+        requirement_name="nptdms",
+        extensions=(".tdms",),
+        purpose="NI TDMS reader",
+        component=COMPONENT_BASE,
+    ),
+    FrozenImportDependency(
+        package="av",
+        requirement_name="av",
+        extensions=(
+            ".mp4", ".mov", ".mkv", ".m4v", ".mp3", ".m4a", ".aac",
+            ".wav", ".flac",
+        ),
+        purpose="audio/video reader",
+        component=COMPONENT_MEDIA,
+    ),
+    FrozenImportDependency(
+        package="scipy",
+        requirement_name="scipy",
+        extensions=(".mat",),
+        purpose="MATLAB v4-v7 reader (scipy.io.loadmat)",
+        component=COMPONENT_MATLAB,
+    ),
+    FrozenImportDependency(
+        package="h5py",
+        requirement_name="h5py",
+        extensions=(".mat",),
+        purpose="MATLAB v7.3 (HDF5) reader",
+        component=COMPONENT_MATLAB,
+    ),
+)
+
+# HEAD `.hdf` stays in-tree (`head_hdf.py`) and is not an h5py/HDF5 extension.
+
+LITE_SCIPY_EXCLUDED_MODULES = (
+    "scipy.optimize",
+    "scipy.special",
+    "scipy.linalg",
+    "scipy.spatial",
+    "scipy.interpolate",
+    "scipy.stats",
+    "scipy.signal",
+    "scipy.fft",
+    "scipy.integrate",
+    "scipy.ndimage",
+)
+
+# Modular base must not only omit --collect-all. PyInstaller Analysis follows
+# function-level ``import av`` / scipy / h5py, and asammdf's export path can
+# re-pull h5py, scipy.io.savemat, and hdf5storage into the PYZ. Directory
+# absence under ``_internal`` is not proof; these excludes are the contract.
+MODULAR_EXCLUDED_MODULES = (
+    "av",
+    "scipy",
+    "h5py",
+    "hdf5storage",
+)
+
+
+# These are deliberate build-flavor boundaries, not missing runtime packages.
+# Full builds vendor the native acquisition roots outside PyInstaller analysis;
+# lite builds omit the acquisition feature entirely.  Lite additionally prunes
+# only the SciPy submodules listed above after keeping ``scipy.io`` available.
+INTENTIONAL_EXCLUDED_ROOTS_BY_FLAVOR = {
+    "full": frozenset({"pyxcp", "pya2l"}),
+    "lite": frozenset(
+        {
+            "mf4_analyzer.acquisition",
+            "mf4_analyzer.acquisition_ui",
+            "mf4_analyzer.acquisition_capture",
+            "pyxcp",
+            "pya2l",
+        }
+    ),
+}
+INTENTIONAL_EXCLUDED_SUBMODULES_BY_FLAVOR = {
+    "full": frozenset(),
+    "lite": frozenset(LITE_SCIPY_EXCLUDED_MODULES),
+}
+REQUIRED_EXTERNAL_RUNTIME_ROOTS_BY_FLAVOR = {
+    flavor: frozenset(
+        dependency.package for dependency in FROZEN_IMPORT_DEPENDENCIES
+    )
+    for flavor in WINDOWS_BUILD_FLAVORS
+}
+
+
+def dependencies_for_extension(extension: str) -> tuple[FrozenImportDependency, ...]:
+    """Return the frozen runtime dependencies for a supported suffix."""
+    suffix = str(extension or "").lower()
+    if suffix and not suffix.startswith("."):
+        suffix = f".{suffix}"
+    return tuple(
+        dependency
+        for dependency in FROZEN_IMPORT_DEPENDENCIES
+        if suffix in dependency.extensions
+    )
+
+
+def dependencies_for_component(component: str) -> tuple[FrozenImportDependency, ...]:
+    """Return declared frozen dependencies owned by one delivery component."""
+    return tuple(
+        dependency
+        for dependency in FROZEN_IMPORT_DEPENDENCIES
+        if dependency.component == component
+    )
+
+
+def component_ownership() -> dict[str, str]:
+    """Map each declared package root to its base-or-extension owner."""
+    return {dependency.package: dependency.component for dependency in FROZEN_IMPORT_DEPENDENCIES}
+
+
+def frozen_dependencies_for_profile(profile: str) -> tuple[FrozenImportDependency, ...]:
+    """Return the unified list filtered to what a delivery profile collects.
+
+    The full declaration is never discarded: modular only omits extension-owned
+    packages from the *base* collection.  ``bundled`` still collects everything.
+    """
+    if profile not in DEPENDENCY_PROFILES:
+        raise ValueError(f"unknown dependency profile: {profile}")
+    if profile == "bundled":
+        return FROZEN_IMPORT_DEPENDENCIES
+    return tuple(
+        dependency
+        for dependency in FROZEN_IMPORT_DEPENDENCIES
+        if dependency.component == COMPONENT_BASE
+    )
+
+
+def pyinstaller_collection_args(
+    flavor: str = "full",
+    profile: str = DEFAULT_DEPENDENCY_PROFILE,
+) -> tuple[str, ...]:
+    """Return PyInstaller arguments for a supported Windows build flavor."""
+    if flavor not in WINDOWS_BUILD_FLAVORS:
+        raise ValueError(f"unknown frozen-build flavor: {flavor}")
+    if profile not in DEPENDENCY_PROFILES:
+        raise ValueError(f"unknown dependency profile: {profile}")
+
+    args: list[str] = []
+    for dependency in frozen_dependencies_for_profile(profile):
+        if dependency.collection not in COLLECTION_STRATEGIES:
+            raise ValueError(
+                f"unknown collection strategy for {dependency.package}: "
+                f"{dependency.collection!r}"
+            )
+        if dependency.collection == COLLECTION_STANDARD_HOOK:
+            # Base packages such as pandas: PyInstaller's standard hook collects
+            # them when analysis sees the function-level import. Do not expand
+            # the onedir with ``--collect-all pandas``.
+            continue
+        if flavor == "lite" and dependency.package == "scipy":
+            # Let PyInstaller trace the loadmat import graph instead of adding
+            # unrelated SciPy toolkits. Its standard SciPy hook still includes
+            # the native dependency closure required by the discovered modules.
+            args.extend(("--hidden-import", "scipy.io"))
+            args.extend(("--hidden-import", "scipy.io.matlab"))
+            continue
+        args.extend(("--collect-all", dependency.package))
+    if flavor == "lite" and profile == "bundled":
+        for module in LITE_SCIPY_EXCLUDED_MODULES:
+            args.extend(("--exclude-module", module))
+    if profile == "modular":
+        for module in MODULAR_EXCLUDED_MODULES:
+            args.extend(("--exclude-module", module))
+    return tuple(args)
+
+
+def validate_windows_packaging_contract(
+    requirements_path: Path,
+    build_scripts: Iterable[Path],
+    *,
+    require_installed: bool = False,
+) -> tuple[str, ...]:
+    """Return human-readable contract violations without mutating anything."""
+    installed = _requirements_packages(requirements_path)
+    failures = [
+        f"requirements.txt 缺少 {dependency.requirement_name}；"
+        f"{', '.join(dependency.extensions)} 导入需要它"
+        for dependency in FROZEN_IMPORT_DEPENDENCIES
+        if _normalize_package(dependency.requirement_name) not in installed
+    ]
+    if require_installed:
+        failures.extend(
+            f"构建虚拟环境缺少 {dependency.package}；不要在依赖未安装时使用 -SkipInstall"
+            for dependency in FROZEN_IMPORT_DEPENDENCIES
+            if importlib.util.find_spec(dependency.package) is None
+        )
+
+    for script in build_scripts:
+        try:
+            text = Path(script).read_text(encoding="utf-8")
+        except OSError as exc:
+            failures.append(f"无法读取 Windows 构建脚本 {script}: {exc}")
+            continue
+        label = Path(script).name
+        if "windows_runtime_dependencies.py" not in text:
+            failures.append(f"{label} 未调用统一的运行依赖清单")
+        flavor, profile = _build_script_delivery(text)
+        if flavor is None:
+            failures.append(f"{label} does not declare a frozen-build flavor")
+            continue
+        if profile is None:
+            failures.append(f"{label} does not declare a supported dependency profile")
+            continue
+        failures.extend(
+            _excluded_runtime_dependency_failures(
+                label, flavor, _script_excluded_modules(text), profile=profile
+            )
+        )
+        failures.extend(
+            _excluded_runtime_dependency_failures(
+                "shared frozen runtime arguments",
+                flavor,
+                _pyinstaller_excluded_modules(pyinstaller_collection_args(flavor, profile)),
+                profile=profile,
+            )
+        )
+
+    declared_modules = {
+        dependency.package.split(".", 1)[0]
+        for dependency in FROZEN_IMPORT_DEPENDENCIES
+    }
+    owners = {
+        dependency.package.split(".", 1)[0]: dependency.component
+        for dependency in FROZEN_IMPORT_DEPENDENCIES
+    }
+    for dependency in FROZEN_IMPORT_DEPENDENCIES:
+        if dependency.component not in COMPONENT_OWNERS:
+            failures.append(
+                f"{dependency.package} 缺少合法组件归属 "
+                f"(base/media/matlab)，当前为 {dependency.component!r}"
+            )
+        if dependency.collection not in COLLECTION_STRATEGIES:
+            failures.append(
+                f"{dependency.package} 缺少合法收集策略 "
+                f"(collect_all/standard_hook)，当前为 {dependency.collection!r}"
+            )
+    lazy_modules = lazy_import_dependency_roots(
+        Path(requirements_path).parent / "mf4_analyzer" / "io"
+    )
+    undeclared = sorted(lazy_modules - declared_modules)
+    if undeclared:
+        failures.append(
+            "io 懒导入未登记到冻结包运行依赖清单: "
+            + ", ".join(undeclared)
+        )
+    unowned = sorted(
+        root
+        for root in lazy_modules
+        if owners.get(root) not in COMPONENT_OWNERS
+    )
+    if unowned:
+        failures.append(
+            "io 懒导入没有 base 或扩展组件归属: " + ", ".join(unowned)
+        )
+    if not FROZEN_IMPORT_DEPENDENCIES:
+        failures.append("冻结包运行依赖清单不能为空")
+    modular_excludes = {
+        module.lower()
+        for module in _pyinstaller_excluded_modules(
+            pyinstaller_collection_args("full", "modular")
+        )
+    }
+    missing_modular = [
+        name for name in MODULAR_EXCLUDED_MODULES if name not in modular_excludes
+    ]
+    if missing_modular:
+        failures.append(
+            "modular profile must --exclude-module "
+            + ", ".join(missing_modular)
+            + "; Analysis follows function-level imports and asammdf re-pulls scipy/h5py"
+        )
+    if pyinstaller_collection_args("full", "modular") != pyinstaller_collection_args(
+        "lite", "modular"
+    ):
+        failures.append("modular collection args must not depend on full/lite flavor")
+    return tuple(failures)
+
+
+def _build_script_delivery(text: str) -> tuple[str | None, str | None]:
+    """Read literal options or typed string parameter defaults used by builders.
+
+    This is a source contract, not a PowerShell interpreter. Unresolved or
+    unsupported options fail closed rather than assuming a bundled build.
+    """
+    source = re.sub(r"(?m)^\s*#.*$", "", text)
+    match = re.search(
+        r"--pyinstaller-args-json\s+--flavor\s+([\w$]+)"
+        r"(?:\s+--profile\s+([\w$]+))?", source,
+    )
+    if not match:
+        return None, None
+
+    def resolve(token: str) -> str | None:
+        if token.startswith("$"):
+            default = re.search(
+                r'\[string\]\s*' + re.escape(token) + r'\s*=\s*["\']([^"\']+)["\']',
+                source, flags=re.IGNORECASE,
+            )
+            return default.group(1) if default else None
+        return token
+
+    flavor = resolve(match.group(1))
+    profile = resolve(match.group(2) or DEFAULT_DEPENDENCY_PROFILE)
+    return (
+        flavor if flavor in WINDOWS_BUILD_FLAVORS else None,
+        profile if profile in DEPENDENCY_PROFILES else None,
+    )
+
+
+def _script_excluded_modules(text: str) -> tuple[str, ...]:
+    return tuple(
+        re.findall(
+            r'["\']--exclude-module["\']\s*,\s*["\']([^"\']+)["\']',
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _pyinstaller_excluded_modules(args: Iterable[str]) -> tuple[str, ...]:
+    arguments = tuple(args)
+    return tuple(
+        value
+        for argument, value in zip(arguments, arguments[1:])
+        if argument == "--exclude-module"
+    )
+
+
+def _excluded_runtime_dependency_failures(
+    label: str, flavor: str, exclusions: Iterable[str], *,
+    profile: str = DEFAULT_DEPENDENCY_PROFILE,
+) -> list[str]:
+    """Check only declared product dependencies for this build flavor.
+
+    The PowerShell scripts intentionally exclude vendored acquisition roots and
+    lite-only SciPy submodules.  Do not turn this into a source-wide import
+    scan: development-only ``tools/`` imports and unrelated PyInstaller
+    pruning are outside the frozen product runtime contract.
+    """
+    required_roots = REQUIRED_EXTERNAL_RUNTIME_ROOTS_BY_FLAVOR[flavor].intersection(
+        dependency.package for dependency in frozen_dependencies_for_profile(profile)
+    )
+    intentional_roots = INTENTIONAL_EXCLUDED_ROOTS_BY_FLAVOR[flavor]
+    intentional_submodules = INTENTIONAL_EXCLUDED_SUBMODULES_BY_FLAVOR[flavor]
+    failures: list[str] = []
+    for module in exclusions:
+        normalized = module.lower()
+        root = normalized.split(".", 1)[0]
+        if normalized in intentional_roots or normalized in intentional_submodules:
+            continue
+        if normalized in required_roots:
+            failures.append(
+                f"{label} excludes required runtime dependency {normalized} for {flavor}"
+            )
+        elif root in required_roots and "." in normalized:
+            failures.append(
+                f"{label} excludes required runtime dependency submodule {normalized} for {flavor}"
+            )
+    return failures
+
+
+def _requirements_packages(path: Path) -> set[str]:
+    packages: set[str] = set()
+    for raw_line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or line.startswith(("-", ".")):
+            continue
+        match = re.match(r"([A-Za-z0-9_.-]+)", line)
+        if match:
+            packages.add(_normalize_package(match.group(1)))
+    return packages
+
+
+def _normalize_package(value: str) -> str:
+    return str(value).strip().lower().replace("_", "-")
+
+
+def lazy_import_dependency_roots(io_dir: Path) -> set[str]:
+    """Find third-party imports nested in importer functions.
+
+    Top-level dependencies are visible to PyInstaller's static graph.  Imports
+    nested in functions are intentionally lazy but need an explicit frozen
+    contract.  Scanning all ``io/*.py`` means a new format importer cannot add
+    a lazy package and accidentally ship without it.
+    """
+    import ast
+
+    stdlib = set(getattr(sys, "stdlib_module_names", set())) | {
+        "csv", "io", "typing", "collections", "contextlib", "dataclasses",
+        "functools", "itertools", "json", "math", "os", "pathlib", "re",
+        "statistics", "sys", "time", "warnings",
+    }
+    roots: set[str] = set()
+    for source in Path(io_dir).rglob("*.py"):
+        if source.name == "runtime_dependencies.py":
+            continue
+        try:
+            tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        except (OSError, SyntaxError):
+            continue
+        for function in (
+            node for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ):
+            for node in ast.walk(function):
+                modules: tuple[str, ...]
+                if isinstance(node, ast.Import):
+                    modules = tuple(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    modules = (node.module,)
+                else:
+                    continue
+                for module in modules:
+                    root = module.split(".", 1)[0]
+                    if root in stdlib or root == "mf4_analyzer":
+                        continue
+                    roots.add(root)
+    return roots

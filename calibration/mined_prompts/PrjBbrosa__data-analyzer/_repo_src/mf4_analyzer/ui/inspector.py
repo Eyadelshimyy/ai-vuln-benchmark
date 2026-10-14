@@ -1,0 +1,424 @@
+"""Right pane: persistent top + contextual bottom card.
+
+Owns the inspector_state_dict (per section 12.1 of the design spec):
+caches the user's last input on each mode's contextual widget so that
+switching modes preserves context.
+"""
+from PyQt5 import sip
+from PyQt5.QtCore import QSize, Qt, QTimer, pyqtSignal
+from PyQt5.QtWidgets import (
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLayout,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .inspector_sections import (
+    FFTContextual,
+    FFTTimeContextual,
+    FrfContextual,
+    OrderContextual,
+    PersistentTop,
+    TimeContextual,
+)
+from .inspector_sections.time_filter import FilterPanel
+
+
+# 2026-04-26 R3 紧凑化 fix-1: cap the Inspector's content width so
+# Expanding children (QSpinBox / QComboBox / QLineEdit) stop growing
+# unboundedly when the right splitter pane is dragged wider. The cap
+# should be just wide enough to host the longest legitimate content.
+# 2026-06-05 narrow-pane: the inspector was retuned from 360px → 288px so
+# its initial width matches the left file column (~250–288). The visible
+# right pane is 288px wide; the content body is 272px so the scroll area
+# has room for its scrollbar and 2px pane margins. The 坐标轴设置 group
+# was made fluid (range editors fill the remaining width, dB/Linear unit
+# wraps to its own right-aligned line) so it shrinks with the pane instead
+# of forcing a horizontal scrollbar — see _build_axis_row.
+_INSPECTOR_CONTENT_MAX_WIDTH = 272
+
+
+class _InspectorHelpLink(QPushButton):
+    """QPushButton ignores child-layout sizeHint when its own text is empty.
+
+    The '? 使用说明' labels live in an inner layout; without this override
+    the button sizes to an empty-text chip and the trailing CJK is clipped
+    by Inspector's 7px corner radius.
+    """
+
+    def sizeHint(self):  # noqa: N802 - Qt API
+        base = super().sizeHint()
+        layout = self.layout()
+        if layout is None:
+            return base
+        inner = layout.sizeHint()
+        return QSize(
+            max(base.width(), inner.width()),
+            max(base.height(), inner.height()),
+        )
+
+    def minimumSizeHint(self):  # noqa: N802 - Qt API
+        return self.sizeHint()
+
+
+class _ContextualStack(QStackedWidget):
+    """Elastic stack whose sizeHint follows the *current* analysis page.
+
+    The four contextual pages differ a lot in height (FRF is the tallest).
+    QStackedWidget's default sizeHint takes the maximum across pages, which
+    leaves dead white under a short page after switching away from FRF.
+    Mirror ``batch.input_panel._TargetStack``: hint from the current page and
+    invalidate on ``currentChanged``. Coexists with ``_settle_page`` (first-
+    show polish/layout heal) — that path refreshes field geometry; this one
+    shrinks the stack's allocated height.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.currentChanged.connect(self._refresh_current_page_geometry)
+
+    def _refresh_current_page_geometry(self, _index: int) -> None:
+        self.updateGeometry()
+        parent = self.parentWidget()
+        if parent is not None and parent.layout() is not None:
+            parent.layout().invalidate()
+
+    def sizeHint(self):  # noqa: N802 (Qt API)
+        hint = super().sizeHint()
+        current = self.currentWidget()
+        if current is None:
+            return hint
+        return QSize(hint.width(), current.sizeHint().height())
+
+    def minimumSizeHint(self):  # noqa: N802 (Qt API)
+        current = self.currentWidget()
+        height = current.minimumSizeHint().height() if current is not None else 0
+        return QSize(0, height)
+
+
+class Inspector(QWidget):
+    plot_time_requested = pyqtSignal()
+    fft_requested = pyqtSignal()
+    fft_time_requested = pyqtSignal()
+    frf_requested = pyqtSignal()
+    frf_view_in_time_requested = pyqtSignal()
+    order_time_requested = pyqtSignal()
+    xaxis_apply_requested = pyqtSignal()
+    xaxis_drop_hint_dismissed = pyqtSignal()
+    tick_density_changed = pyqtSignal(int, int)
+    remark_toggled = pyqtSignal(bool)
+    # Fs auto-sync: relayed from fft_ctx/order_ctx combo_sig change
+    signal_changed = pyqtSignal(str, object)  # (mode, (fid, ch) | None)
+    # FFT vs Time signal-change relay (T6 hand-off; reviewer Important #2).
+    # The fft_time panel needs its own signal-change channel for downstream
+    # listeners (Fs auto-sync, worker invalidation hooks). Kept separate
+    # from `signal_changed` so consumers can opt in without filtering on
+    # mode strings; the (fid, ch) payload mirrors what fft_time_ctx emits.
+    fft_time_signal_changed = pyqtSignal(object)  # (fid, ch) | None
+    # Preset save/load acknowledgement (level, message) — surfaced as toasts
+    preset_acknowledged = pyqtSignal(str, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # QSS (Inspector { border-radius:10px; background:#fff }) only paints on a
+        # plain QWidget subclass once WA_StyledBackground is set; without it Qt
+        # skips the styled fill/border and the rounded card never renders.
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
+        # 2026-04-26 fix: cap the inspector widget itself so the splitter cannot
+        # allocate more width than its capped content (_INSPECTOR_CONTENT_MAX_WIDTH).
+        # Surplus split-pane width was previously absorbed by host_lay.addStretch,
+        # producing a visible empty column on the right at large window sizes.
+        # +16 covers the QScrollArea vertical scrollbar + 2px-each-side margins.
+        self.setFixedWidth(_INSPECTOR_CONTENT_MAX_WIDTH + 16)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(3, 3, 3, 3)
+        lay.setSpacing(0)
+
+        self._scroll = QScrollArea(self)
+        self._scroll.setObjectName("inspectorScroll")
+        self._scroll.setAutoFillBackground(False)
+        self._scroll.viewport().setAutoFillBackground(False)
+        self._scroll.viewport().setAttribute(Qt.WA_TranslucentBackground, True)
+        self._scroll.viewport().setAttribute(Qt.WA_NoSystemBackground, True)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        lay.addWidget(self._scroll, 1)
+
+        # 2026-06-22 unify-help-link: one persistent '?  使用说明' link pinned
+        # to the Inspector's bottom-right, OUTSIDE the scroll area, so it sits
+        # at the same visual position in every mode regardless of how tall the
+        # current contextual content is — and never scrolls out of view. The
+        # per-contextual help rows that used to float just under each panel's
+        # last control (visibly mid-pane for the short Time mode) were removed
+        # in favour of this single link. Its target guide is rebound per mode
+        # in set_mode → _update_help_guide.
+        self._help_guide_name = 'time'
+        help_row = QFrame(self)
+        help_row.setObjectName("inspectorHelpRow")
+        help_row.setFrameShape(QFrame.NoFrame)
+        help_box = QHBoxLayout(help_row)
+        # Right inset must clear Inspector's 7px corner radius so 「说明」
+        # is not shaved by the card edge. Bottom inset keeps the 1px card
+        # stroke visible above the status-bar hairline.
+        help_box.setContentsMargins(0, 2, 10, 6)
+        help_box.setSpacing(0)
+        help_box.addStretch(1)
+        self._help_link = _InspectorHelpLink(help_row)
+        self._help_link.setObjectName("inspectorHelpLink")
+        self._help_link.setProperty("role", "link")
+        self._help_link.setCursor(Qt.PointingHandCursor)
+        self._help_link.setToolTip("打开本面板的使用说明")
+        self._help_link.setFlat(True)
+        self._help_link.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        self._help_link.clicked.connect(self._open_current_guide)
+        help_inner = QHBoxLayout(self._help_link)
+        help_inner.setContentsMargins(2, 0, 4, 0)
+        help_inner.setSpacing(3)
+        help_mark = QLabel("?", self._help_link)
+        help_mark.setObjectName("inspectorHelpMark")
+        help_mark.setAlignment(Qt.AlignCenter)
+        help_text = QLabel("使用说明", self._help_link)
+        help_text.setObjectName("inspectorHelpText")
+        help_text.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        help_text.setWordWrap(False)
+        help_text.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
+        help_inner.addWidget(help_mark, 0, Qt.AlignVCenter)
+        help_inner.addWidget(help_text, 0, Qt.AlignVCenter)
+        help_box.addWidget(self._help_link, 0)
+        lay.addWidget(help_row, 0)
+
+        # 2026-04-26 R3 紧凑化 fix-1:
+        # The scroll uses a *host* widget that fills the viewport horizontally,
+        # while ``_scroll_body`` (the actual form host) is capped at
+        # ``_INSPECTOR_CONTENT_MAX_WIDTH`` and pushed to the leading edge by a
+        # trailing addStretch. Without the cap, Expanding child controls
+        # (QSpinBox / QComboBox / QLineEdit) grow unboundedly whenever the
+        # splitter widens the right pane, producing the "toggle a checkbox →
+        # pane visually balloons" defect that the user reported.
+        host = QWidget(self._scroll)
+        host.setAutoFillBackground(False)
+        host.setAttribute(Qt.WA_TranslucentBackground, True)
+        host.setAttribute(Qt.WA_NoSystemBackground, True)
+        host_lay = QHBoxLayout(host)
+        host_lay.setContentsMargins(0, 0, 0, 0)
+        host_lay.setSpacing(0)
+
+        self._scroll_body = QWidget(host)
+        self._scroll_body.setObjectName("inspectorScrollBody")
+        self._scroll_body.setAttribute(Qt.WA_StyledBackground, True)
+        self._scroll_body.setFixedWidth(_INSPECTOR_CONTENT_MAX_WIDTH)
+        body_lay = QVBoxLayout(self._scroll_body)
+        body_lay.setContentsMargins(0, 0, 0, 0)
+        body_lay.setSpacing(6)
+
+        self._current_mode = 'time'
+        self._time_domain_card = QFrame(self._scroll_body)
+        self._time_domain_card.setObjectName("timeDomainSettingsCard")
+        self._time_domain_card.setAttribute(Qt.WA_StyledBackground, True)
+        time_card_lay = QVBoxLayout(self._time_domain_card)
+        time_card_lay.setContentsMargins(0, 0, 0, 0)
+        time_card_lay.setSpacing(0)
+        self.top = PersistentTop(self._time_domain_card)
+        time_card_lay.addWidget(self.top)
+        # 2026-06-22 卡片重组 (Task 4): the persistent top now exposes TWO
+        # independent white cards — ① 横坐标 (xaxis + 「应用」) and ② 时间范围·滤波.
+        # Expose them on the Inspector for structural assertions and downstream
+        # use. The FilterPanel is mounted INSIDE card ②, below the time-range
+        # group, and the single contextual 「绘图」 button is the card's bottom
+        # action so range + filter submit together. `filter_changed` is
+        # intentionally NOT wired to a replot — the filter is read on the next
+        # 「绘图」 submit (avoids recompute on every keystroke). Filtering is
+        # opt-in via the panel's 「滤波」 checkbox (default OFF), placed as the
+        # filter section title row.
+        self._xaxis_card = self.top.xaxis_card()
+        self._range_filter_card = self.top.range_card()
+        self.filter_panel = FilterPanel(self._range_filter_card)
+        self.top.range_card_layout().addWidget(self.filter_panel)
+        self.time_ctx = TimeContextual(self._range_filter_card)
+        self.top.range_card_layout().addWidget(self.time_ctx)
+        body_lay.addWidget(self._time_domain_card)
+
+        self.contextual_stack = _ContextualStack(self._scroll_body)
+        self.fft_ctx = FFTContextual(self._scroll_body)
+        self.fft_time_ctx = FFTTimeContextual(self._scroll_body)
+        self.frf_ctx = FrfContextual(self._scroll_body)
+        self.order_ctx = OrderContextual(self._scroll_body)
+        self.contextual_stack.addWidget(self.fft_ctx)
+        self.contextual_stack.addWidget(self.fft_time_ctx)
+        self.contextual_stack.addWidget(self.frf_ctx)
+        self.contextual_stack.addWidget(self.order_ctx)
+        self._analysis_target_titles = {}
+        for section, context in (
+            ('fft', self.fft_ctx), ('fft_time', self.fft_time_ctx),
+            ('frf', self.frf_ctx), ('order', self.order_ctx),
+        ):
+            title = context.findChild(QLabel, "inspectorGroupTitle")
+            self._analysis_target_titles[section] = (title, title.text())
+        body_lay.addWidget(self.contextual_stack)
+        self.contextual_stack.setVisible(False)
+
+        # Do not addStretch here. The host layout already pins this body to
+        # the top and absorbs leftover viewport height. An inner stretch
+        # steals ~10px from the time card, and QFormLayout spends that deficit
+        # by collapsing FilterPanel's ``_configure_form`` 4px row gaps.
+
+        # Anchor the capped body to the leading edge; the trailing stretch
+        # absorbs any extra width the splitter hands us.
+        host_lay.addWidget(self._scroll_body, 0, Qt.AlignTop | Qt.AlignLeft)
+        host_lay.addStretch(1)
+
+        self._scroll.setWidget(host)
+        self._range_group_owner_layout = self.top.range_group_layout()
+        # 分区页首开二次布局的「已 settle」集合（进程生命周期内每页一次），
+        # 见 _settle_page_after_first_show 的注释。
+        self._settled_pages = set()
+        self._wire()
+        self._place_range_group_for_mode('time')
+
+    def _wire(self):
+        self.top.xaxis_apply_requested.connect(self.xaxis_apply_requested)
+        self.top.xaxis_drop_hint_dismissed.connect(self.xaxis_drop_hint_dismissed)
+        self.top.tick_density_changed.connect(self.tick_density_changed)
+        self.time_ctx.plot_time_requested.connect(self.plot_time_requested)
+        self.fft_ctx.fft_requested.connect(self.fft_requested)
+        self.fft_ctx.remark_toggled.connect(self.remark_toggled)
+        self.fft_ctx.signal_changed.connect(self.signal_changed)
+        self.order_ctx.order_time_requested.connect(self.order_time_requested)
+        self.order_ctx.signal_changed.connect(self.signal_changed)
+        self.fft_ctx.preset_bar.acknowledged.connect(self.preset_acknowledged)
+        self.order_ctx.preset_bar.acknowledged.connect(self.preset_acknowledged)
+        # R3 C: FFTTimeContextual now also owns a (builtin-aware) PresetBar.
+        self.fft_time_ctx.preset_bar.acknowledged.connect(self.preset_acknowledged)
+        # FFT vs Time primary compute relay.
+        self.fft_time_ctx.fft_time_requested.connect(self.fft_time_requested)
+        self.fft_time_ctx.signal_changed.connect(self.fft_time_signal_changed)
+        self.frf_ctx.frf_requested.connect(self.frf_requested)
+        self.frf_ctx.view_in_time_requested.connect(
+            self.frf_view_in_time_requested
+        )
+        self.frf_ctx.preset_bar.acknowledged.connect(self.preset_acknowledged)
+
+    def set_analysis_target(self, section, view_name, pane_index):
+        """Name the projected View in the existing source-group heading."""
+        title, base = self._analysis_target_titles[section]
+        target = f"{view_name} · 窗格 {int(pane_index) + 1}"
+        # Reserve room for the FRF SISO badge; full names stay in the tooltip.
+        display = title.fontMetrics().elidedText(target, Qt.ElideMiddle, 190)
+        title.setText(f"{base}\n{display}")
+        title.setToolTip(target)
+        title.setAccessibleName(f"{base} · {target}")
+
+    def set_mode(self, mode):
+        if mode not in ('time', 'fft', 'fft_time', 'frf', 'order'):
+            mode = 'time'
+        self._current_mode = mode
+        if mode == 'time':
+            self._time_domain_card.setVisible(True)
+            self.contextual_stack.setVisible(False)
+        else:
+            idx = {
+                'fft': 0, 'fft_time': 1, 'frf': 2, 'order': 3,
+            }[mode]
+            self._time_domain_card.setVisible(False)
+            self.contextual_stack.setVisible(True)
+            self.contextual_stack.setCurrentIndex(idx)
+            self._schedule_first_show_settle(self.contextual_stack.widget(idx))
+        self._place_range_group_for_mode(mode)
+        self._update_help_guide(mode)
+
+    def _schedule_first_show_settle(self, page):
+        """Queue one post-show relayout for a stack page's first display.
+
+        The four contextual pages are built at startup inside a hidden
+        QStackedWidget, so their very first show interleaves QSS polish
+        with layout: the height budget handed down the layout chain is
+        computed from the pre-polish sizeHint chain and comes up short,
+        QFormLayout then starves its rows below the fields' Fixed-height
+        sizeHints and the fields overflow into the inter-row breathing
+        gaps. QSS polish does not call updateGeometry, so the stale
+        cached hints never self-heal — historically only switching away
+        and back (whose updateGeometry traffic refreshes every cache)
+        fixed it. This schedules that second layout pass mechanically;
+        the one compressed frame before the queued pass lands is an
+        accepted trade-off.
+        """
+        if page is None or id(page) in self._settled_pages:
+            return
+        self._settled_pages.add(id(page))
+        QTimer.singleShot(0, lambda: self._settle_page(page))
+
+    def _settle_page(self, page):
+        if sip.isdeleted(page):
+            return
+        # invalidate() only marks caches dirty; order does not matter
+        # because the recompute happens on the activate() below.
+        for layout in page.findChildren(QLayout):
+            layout.invalidate()
+        root = page.layout()
+        if root is not None:
+            root.invalidate()
+            root.activate()
+        # Bubble the refreshed hints up through the stack / scroll body so
+        # the page's own height allocation is recomputed too.
+        page.updateGeometry()
+
+    def _update_help_guide(self, mode):
+        # The persistent bottom-right help link targets the current mode's
+        # guide; mode strings map 1:1 to open_guide() names.
+        self._help_guide_name = mode if mode in (
+            'time', 'fft', 'fft_time', 'frf', 'order',
+        ) else 'time'
+
+    def _open_current_guide(self):
+        from ..help import open_guide
+        open_guide(self._help_guide_name)
+
+    def _place_range_group_for_mode(self, mode):
+        # Decouple the shared chk_range checked state per mode BEFORE the
+        # group is reparented, so an FFT time-window drag's force-check does
+        # not leak into Time-Domain (and vice versa). The checkbox INSTANCE is
+        # shared across modes; only its per-mode intent must be restored here.
+        self.top.checkout_range_for_mode(mode)
+        group = self.top.range_group()
+        old_layout = self._range_group_owner_layout
+        if old_layout is not None:
+            old_layout.removeWidget(group)
+        if mode == 'time':
+            target_layout = self.top.range_group_layout()
+            self.top.set_range_group_embedded(False)
+            self.top.set_xaxis_section_visible(True)
+            self.top.setVisible(True)
+            # The range card hosts [range_group, filter_panel]; re-insert the
+            # group ABOVE the filter panel (addWidget would append it below).
+            target_layout.insertWidget(0, group)
+            group.setVisible(True)
+            self._range_group_owner_layout = target_layout
+            return
+        ctx = {
+            'fft': self.fft_ctx,
+            'fft_time': self.fft_time_ctx,
+            'frf': self.frf_ctx,
+            'order': self.order_ctx,
+        }[mode]
+        target_layout = ctx.time_range_layout()
+        self.top.set_range_group_embedded(True)
+        self.top.setVisible(False)
+        target_layout.addWidget(group)
+        self._range_group_owner_layout = target_layout
+        group.setVisible(True)
+
+    def current_mode(self):
+        return self.contextual_widget_name()
+
+    def contextual_widget_name(self):
+        return self._current_mode

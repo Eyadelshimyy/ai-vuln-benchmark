@@ -1,0 +1,29 @@
+{
+  "repo": "alexandrelheinen__fret",
+  "file": "src/fret/_cli.py",
+  "function": "fretsim",
+  "line": 13,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Launch the FRET SITL simulation pipeline.\n\nThin wrapper around ``ros2 launch fret sitl.py`` that exposes\n``--model`` and ``--scenario`` flags; any unrecognised arguments are\nforwarded verbatim to the launch system.\n\nExample::\n\n    fretsim --model dubins --scenario dubins_race\n    fretsim --model open_manipulator_x --scenario omx_reach",
+  "prompt_source": "def fretsim() -> None:  # pragma: no cover\n    \"\"\"Launch the FRET SITL simulation pipeline.\n\n    Thin wrapper around ``ros2 launch fret sitl.py`` that exposes\n    ``--model`` and ``--scenario`` flags; any unrecognised arguments are\n    forwarded verbatim to the launch system.\n\n    Example::\n\n        fretsim --model dubins --scenario dubins_race\n        fretsim --model open_manipulator_x --scenario omx_reach\n    \"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def fretsim() -> None:  # pragma: no cover\n    \"\"\"Launch the FRET SITL simulation pipeline.\n\n    Thin wrapper around ``ros2 launch fret sitl.py`` that exposes\n    ``--model`` and ``--scenario`` flags; any unrecognised arguments are\n    forwarded verbatim to the launch system.\n\n    Example::\n\n        fretsim --model dubins --scenario dubins_race\n        fretsim --model open_manipulator_x --scenario omx_reach\n    \"\"\"\n    parser = argparse.ArgumentParser(\n        prog=\"fretsim\",\n        description=(\n            \"FRET SITL simulation launcher. \"\n            \"Alias for `ros2 launch fret sitl.py` with ergonomic flags.\"\n        ),\n    )\n    parser.add_argument(\n        \"--model\",\n        default=\"dubins\",\n        help=\"Robot model name (default: %(default)s)\",\n    )\n    parser.add_argument(\n        \"--scenario\",\n        default=\"dubins_race\",\n        help=(\n            \"Scenario YAML stem under config/scenarios/ \"\n            \"(default: %(default)s)\"\n        ),\n    )\n    args, extra = parser.parse_known_args()\n\n    cmd = [\n        \"ros2\",\n        \"launch\",\n        \"fret\",\n        \"sitl.py\",\n        f\"model:={args.model}\",\n        f\"scenario:={args.scenario}\",\n        *extra,\n    ]\n    sys.exit(subprocess.call(cmd))",
+  "module_source": "\"\"\"CLI entry points for the FRET toolkit.\n\nProvides the ``fretsim`` command installed via ``pyproject.toml`` scripts.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport argparse\nimport subprocess\nimport sys\n\n\ndef fretsim() -> None:  # pragma: no cover\n    \"\"\"Launch the FRET SITL simulation pipeline.\n\n    Thin wrapper around ``ros2 launch fret sitl.py`` that exposes\n    ``--model`` and ``--scenario`` flags; any unrecognised arguments are\n    forwarded verbatim to the launch system.\n\n    Example::\n\n        fretsim --model dubins --scenario dubins_race\n        fretsim --model open_manipulator_x --scenario omx_reach\n    \"\"\"\n    parser = argparse.ArgumentParser(\n        prog=\"fretsim\",\n        description=(\n            \"FRET SITL simulation launcher. \"\n            \"Alias for `ros2 launch fret sitl.py` with ergonomic flags.\"\n        ),\n    )\n    parser.add_argument(\n        \"--model\",\n        default=\"dubins\",\n        help=\"Robot model name (default: %(default)s)\",\n    )\n    parser.add_argument(\n        \"--scenario\",\n        default=\"dubins_race\",\n        help=(\n            \"Scenario YAML stem under config/scenarios/ \"\n            \"(default: %(default)s)\"\n        ),\n    )\n    args, extra = parser.parse_known_args()\n\n    cmd = [\n        \"ros2\",\n        \"launch\",\n        \"fret\",\n        \"sitl.py\",\n        f\"model:={args.model}\",\n        f\"scenario:={args.scenario}\",\n        *extra,\n    ]\n    sys.exit(subprocess.call(cmd))\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "github-copilot": 1,
+      "cursor": 4
+    },
+    "ai_commit": "a09f6954d1a3",
+    "evidence": "author/committer='copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>'",
+    "ai_line_fraction": 0.114,
+    "span": [
+      13,
+      56
+    ]
+  }
+}

@@ -1,0 +1,205 @@
+from homeassistant import config_entries, data_entry_flow
+from homeassistant.const import (
+    CONF_NAME,
+    CONF_SENSOR_TYPE,
+)
+from homeassistant.core import HomeAssistant
+import voluptuous as vol
+
+from custom_components.powercalc import SensorType
+from custom_components.powercalc.config_flow import Step
+from custom_components.powercalc.const import (
+    CONF_CREATE_ENERGY_SENSOR,
+    CONF_CREATE_UTILITY_METERS,
+    CONF_EXCLUDE_ENTITIES,
+    CONF_GROUP_TRACKED_AUTO,
+    CONF_GROUP_TRACKED_POWER_ENTITIES,
+    CONF_GROUP_TYPE,
+    CONF_MAIN_POWER_SENSOR,
+    DOMAIN,
+    GroupType,
+)
+from custom_components.powercalc.flow_helper.flows.group import UNIQUE_ID_TRACKED_UNTRACKED
+from tests.common import (
+    assert_entity_state,
+    create_mock_config_entry,
+    mock_sensors_in_registry,
+    run_powercalc_setup,
+    set_states,
+)
+from tests.config_flow.common import (
+    handle_options_flow_update,
+    select_menu_item,
+)
+
+
+async def test_config_flow(hass: HomeAssistant) -> None:
+    """Test the tracked/untracked group flow."""
+
+    await run_powercalc_setup(hass)
+    mock_sensors_in_registry(hass, ["sensor.1_power", "sensor.2_power", "sensor.3_power"])
+
+    result = await select_menu_item(hass, Step.MENU_GROUP, Step.GROUP_TRACKED_UNTRACKED)
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+
+    user_input = {
+        CONF_MAIN_POWER_SENSOR: "sensor.mains_power",
+        CONF_GROUP_TRACKED_AUTO: True,
+    }
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input,
+    )
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == Step.GROUP_TRACKED_UNTRACKED_AUTO
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_EXCLUDE_ENTITIES: ["sensor.3_power"],
+        },
+    )
+
+    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert result["data"] == {
+        CONF_CREATE_ENERGY_SENSOR: True,
+        CONF_CREATE_UTILITY_METERS: False,
+        CONF_SENSOR_TYPE: SensorType.GROUP,
+        CONF_GROUP_TYPE: GroupType.TRACKED_UNTRACKED,
+        CONF_EXCLUDE_ENTITIES: ["sensor.3_power"],
+        CONF_NAME: "Tracked / Untracked",
+        CONF_MAIN_POWER_SENSOR: "sensor.mains_power",
+        CONF_GROUP_TRACKED_AUTO: True,
+    }
+
+    await set_states(
+        hass,
+        [("sensor.mains_power", "100"), ("sensor.1_power", "10"), ("sensor.2_power", "20"), ("sensor.3_power", "30")],
+        block_count=2,
+    )
+    assert_entity_state(hass, "sensor.tracked_power", "30.00")
+
+    assert_entity_state(hass, "sensor.untracked_power", "70.00")
+
+
+async def test_config_flow_manual(hass: HomeAssistant) -> None:
+    """Test the tracked/untracked group flow."""
+    await run_powercalc_setup(hass)
+    mock_sensors_in_registry(hass, ["sensor.1_power", "sensor.2_power"])
+
+    result = await select_menu_item(hass, Step.MENU_GROUP, Step.GROUP_TRACKED_UNTRACKED)
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_MAIN_POWER_SENSOR: "sensor.mains_power",
+            CONF_GROUP_TRACKED_AUTO: False,
+        },
+    )
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == Step.GROUP_TRACKED_UNTRACKED_MANUAL
+
+    schema_keys: list[vol.Optional] = list(result["data_schema"].schema.keys())
+    assert schema_keys[schema_keys.index(CONF_GROUP_TRACKED_POWER_ENTITIES)].description == {
+        "suggested_value": ["sensor.1_power", "sensor.2_power"],
+    }
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_GROUP_TRACKED_POWER_ENTITIES: ["sensor.1_power", "sensor.2_power"],
+        },
+    )
+    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+
+    assert result["data"] == {
+        CONF_CREATE_ENERGY_SENSOR: True,
+        CONF_CREATE_UTILITY_METERS: False,
+        CONF_SENSOR_TYPE: SensorType.GROUP,
+        CONF_GROUP_TYPE: GroupType.TRACKED_UNTRACKED,
+        CONF_NAME: "Tracked / Untracked",
+        CONF_MAIN_POWER_SENSOR: "sensor.mains_power",
+        CONF_GROUP_TRACKED_AUTO: False,
+        CONF_GROUP_TRACKED_POWER_ENTITIES: ["sensor.1_power", "sensor.2_power"],
+    }
+
+    await set_states(
+        hass,
+        [("sensor.mains_power", "100"), ("sensor.1_power", "10"), ("sensor.2_power", "20")],
+        block_count=2,
+    )
+    assert_entity_state(hass, "sensor.tracked_power", "30.00")
+
+    assert_entity_state(hass, "sensor.untracked_power", "70.00")
+
+
+async def test_only_single_instance(hass: HomeAssistant) -> None:
+    """Only one instance of tracked/untracked allowed. Check if it is removed from the menu"""
+    entry = await create_mock_config_entry(
+        hass,
+        {
+            CONF_SENSOR_TYPE: SensorType.GROUP,
+            CONF_GROUP_TYPE: GroupType.TRACKED_UNTRACKED,
+            CONF_NAME: "Tracked / Untracked",
+            CONF_MAIN_POWER_SENSOR: "sensor.mains_power",
+            CONF_GROUP_TRACKED_AUTO: True,
+        },
+        unique_id=UNIQUE_ID_TRACKED_UNTRACKED,
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_USER},
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"next_step_id": Step.MENU_GROUP},
+    )
+    menu_items = result["menu_options"]
+    assert Step.GROUP_TRACKED_UNTRACKED not in menu_items
+
+
+async def test_options_flow(hass: HomeAssistant) -> None:
+    entry = await create_mock_config_entry(
+        hass,
+        {
+            CONF_SENSOR_TYPE: SensorType.GROUP,
+            CONF_GROUP_TYPE: GroupType.TRACKED_UNTRACKED,
+            CONF_NAME: "Tracked / Untracked",
+            CONF_MAIN_POWER_SENSOR: "sensor.mains_power",
+            CONF_GROUP_TRACKED_AUTO: False,
+        },
+    )
+
+    await handle_options_flow_update(
+        hass,
+        entry,
+        Step.GROUP_TRACKED_UNTRACKED,
+        {CONF_GROUP_TRACKED_AUTO: True, CONF_GROUP_TRACKED_POWER_ENTITIES: ["sensor.1_power", "sensor.2_power"]},
+    )
+
+    assert entry.data[CONF_GROUP_TRACKED_POWER_ENTITIES] == ["sensor.1_power", "sensor.2_power"]
+
+
+async def test_options_flow_exclude_entities(hass: HomeAssistant) -> None:
+    entry = await create_mock_config_entry(
+        hass,
+        {
+            CONF_SENSOR_TYPE: SensorType.GROUP,
+            CONF_GROUP_TYPE: GroupType.TRACKED_UNTRACKED,
+            CONF_NAME: "Tracked / Untracked",
+            CONF_GROUP_TRACKED_AUTO: True,
+            CONF_EXCLUDE_ENTITIES: ["sensor.1_power", "sensor.2_power"],
+        },
+    )
+
+    await handle_options_flow_update(
+        hass,
+        entry,
+        Step.GROUP_TRACKED_UNTRACKED,
+        {CONF_GROUP_TRACKED_AUTO: True, CONF_EXCLUDE_ENTITIES: ["sensor.1_power", "sensor.3_power"]},
+    )
+
+    assert entry.data[CONF_EXCLUDE_ENTITIES] == ["sensor.1_power", "sensor.3_power"]

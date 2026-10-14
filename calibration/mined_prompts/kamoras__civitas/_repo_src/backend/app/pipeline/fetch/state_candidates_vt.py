@@ -1,0 +1,429 @@
+"""Vermont's own official election-night results feed
+(electionresults.vermont.gov) — a single-state deployment (see
+state_candidates.py for why that earns a new module, not a config entry).
+
+THREE real hops, all plain unauthenticated GETs, found by reading the
+site's own Angular bundle for its literal API config object — NOT a
+WebSocket/SignalR feed, despite an earlier research pass concluding
+otherwise. The only non-REST traffic visible in a browser's network log
+was Azure Application Insights telemetry (a "signalR" string match on
+its SDK's own browser-link diagnostics, not real data) — the same class
+of overly-pessimistic first read Oregon's SharePoint discovery hit with
+its CSOM assumption, corrected the same way: by reading the page's own
+bundled JS for the literal endpoint it actually calls, not just watching
+the network tab.
+
+1. `<baseUrl>/elections/elections.json` — every election ever held on
+   this portal, flat, evergreen. Matched by `isStateWideElection: true`,
+   `electionTypeCode: "P"` (Primary — verified against the real 2026
+   "AUGUST PRIMARY" entry) and `electionYear == year`; requires exactly
+   ONE match, refuses otherwise (a future year adding a second statewide
+   primary, or this field's meaning drifting, should refuse rather than
+   guess which one is current).
+2. `<baseUrl>/elections/{electionGuid}.json` — that election's own report
+   manifest. Its `federal.path` field names the CURRENT federal-results
+   file, carrying a timestamp suffix that changes on every republish
+   (`elections\\{guid}-f-20260908222640.json`, backslash-separated) — read
+   fresh every run, never cached or reconstructed from a pattern, the
+   same "a blob name changes on republish, never hardcode it" rule this
+   system's Enhanced Voting adapters already follow for their own CDN
+   blobs. `federal.isEnable` gates whether this election publishes
+   federal results at all.
+3. `<baseUrl>/{federal.path}` — the real per-town results.
+
+The report's own shape (verified against the real 2026 file, 525KB, 3
+federal party blocks x 247 towns): a party block per REAL Vermont ballot
+party (`pn`/`pc` — DEMOCRATIC/REPUBLICAN/PROGRESSIVE all appear, since a
+Vermont candidate can file for more than one party's primary at once),
+each carrying one office block per real federal contest (`on` — Vermont's
+own real label is the bare "REPRESENTATIVE TO CONGRESS", no "U.S."/
+"United States" prefix and "to" not "in" — parse_office needed a new
+alternative for this, added to the shared _CHAMBER_HOUSE pattern rather
+than special-cased here, since a bare "Representative to Congress" is a
+real, non-Vermont-specific chamber label a future state could publish
+too). Vermont's single at-large House seat means every real office here
+resolves to `("H", None)` — no Senate seat was up in 2026 (both VT
+Senate terms run past this cycle), so nothing here needs to distinguish
+Senate from House.
+
+Within an office, `cs` is one entry per Vermont TOWN (not county — VT
+tabulates and reports at town granularity), each carrying `rc` (the
+town's real declared-ballot-line result, one entry, `isWriteIn: false`)
+and `wc` (every write-in tally recorded in that town, `isWriteIn: true`
+— genuine write-in noise: dozens of stray names each getting 1-2 votes
+statewide, real public figures included, since VT ballots let a voter
+write in anyone). A real candidate's TOTAL vote count is the sum of
+their own `cid` across every town's `rc` AND `wc` combined — a
+genuinely-elected write-in nominee is a real, documented possibility
+under Vermont law (17 V.S.A., a write-in must clear its own separate
+statutory minimum to qualify), which this module does not need to model
+specially: pick_nominee's own plurality logic already picks whoever has
+the real most votes, write-in or not, the same way it already does for
+New Mexico's real Republican Senate write-in nominee.
+
+Aggregation is keyed by each candidate's own numeric `cid`, NEVER by
+`cn` (display name) — the same "never aggregate by the final output's
+identifying field when a richer one exists" rule this system's
+Tennessee/Mississippi modules already learned the hard way, doubly
+necessary here since write-in noise routinely produces near-duplicate
+spellings of the same real name across different towns ("SUZANNE
+SEYMOUR" / "SUZ SEYMOUR" / "SUE SEYMOUR" all appear live). `cid` is only
+scoped to one (party, office) tally, not a single global identity — the
+SAME real candidate carries a DIFFERENT `cid` in each party/office
+block they appear under (verified live: one 2026 candidate carried three
+distinct `cid`s, for a party line and two write-in tallies), so
+aggregation must group by (office, district, party) FIRST and only key
+by `cid` within that group — confirmed live that no two same-named
+candidates ever share one group with different ids, or vice versa.
+
+Four real non-candidate placeholder `cn` values are excluded outright
+(verified against the full live 2026 report, not just this module's own
+trimmed test fixture): `cid: 0`'s "OTHER WRITE-IN" (a rolled-up count of
+every write-in not individually itemized), a SEPARATE "OTHER WRITE-INS"
+(plural) that instead carries its own real nonzero `cid` — a second,
+differently-scoped rollup bucket, not a typo of the first — and "BLANK"/
+"FLOWERY" (a blank or spoiled write-in line), each also with its own
+real nonzero `cid`. None of the four are real people.
+
+Vermont's Progressive Party primary carried NO real declared candidate
+in 2026 — every one of its own real vote totals was scattered write-in
+noise, none clearing any plausible threshold — so this module's own
+`normalize_party` correctly refuses "PROGRESSIVE" (matching its existing,
+deliberate refusal of "Unaffiliated"/"Independent" everywhere else) and
+that party's contest is silently skipped rather than confirming a
+write-in fusion nomination this module was never built to verify.
+
+Vermont nominates by PLURALITY — most votes wins outright, no runoff
+mechanism exists for a federal primary (Title 17 V.S.A.; confirmed via
+Vermont's own official statutes site and a secondary civic-reform
+summary, though the exact section number is not cited here since it
+wasn't directly confirmed) — so `runoff_threshold_pct` is null.
+
+No live "unofficial/preliminary" state needs guarding against with its
+own gate here: the fetched election detail already carries a real
+`isOfficial` flag (true for the live 2026 primary, "100% / 247 of 247
+towns reporting / OFFICIAL" on the page itself) — but per this system's
+own established "UT trap" precedent (a state's own official flag is not
+reliably flipped), `settle_days` stays the actual gate here too, not the
+flag. `isOfficial` is read only as a cross-check in tests, never trusted
+directly to decide when to confirm.
+
+STATEWIDE EXECUTIVE OFFICES (only when the entry sets statewide_offices).
+Vermont elects all six -- Governor, Lieutenant Governor, State Treasurer,
+Secretary of State, Auditor of Accounts, Attorney General -- every even
+year, to two-year terms. Each election manifest carries a `stateWide`
+report beside `federal`, in the same shape. Those nominees come from the
+GENERAL election's stateWide report (electionTypeCode "G" in the same
+elections list) once that ballot is final -- the federal UOCAVA mailing
+deadline, 45 days out -- because a Vermont primary winner is not reliably
+the November nominee: see _statewide_records for the 2026 case, where the
+primary alone would have named one man for four offices, three of whose
+ballot lines his party has since given to someone else.
+Before then, the primary's stateWide report is resolved exactly as the
+federal one is (plurality, per party block). Legislative seats are NOT
+read: the `senate`/`house` reports exist, but Vermont's House districts
+elect up to two members each and nothing here has been checked against
+them, so the page keeps saying it omits them. The federal contests are
+unchanged -- still primary winners.
+
+Verified live 2026-09-08 against the 2026 August Primary: both party
+nominees for the at-large House seat resolve, an incumbent unopposed on
+the party line and a plurality winner of a three-way field.
+"""
+
+import logging
+
+import httpx
+
+from app.pipeline.fetch.http_utils import fetch_json_with_retry
+from app.pipeline.fetch.state_candidates_common import (
+    ballot_final,
+    runoff_threshold,
+    SourceRecords,
+    DiscoveryFailed,
+    ballot_list_party,
+    clean_display_name,
+    normalize_party,
+    parse_office,
+    parse_statewide_office,
+    resolve_confirmed_nominees,
+    surname,
+)
+from app.pipeline.fetch.state_candidates_tabular import DEFAULT_SETTLE_DAYS, _settled
+from app.pipeline.rate_limiter import RateLimiter
+
+logger = logging.getLogger(__name__)
+
+_rate_limiter = RateLimiter(rps=1.0)
+
+_BASE_URL = "https://static.electionresults.vermont.gov"
+_ELECTIONS_URL = f"{_BASE_URL}/elections/elections.json"
+_NON_CANDIDATE_NAMES = {"BLANK", "FLOWERY", "OTHER WRITE-IN", "OTHER WRITE-INS"}
+
+async def _current_primary_guid(client: httpx.AsyncClient, state: str, year: int) -> str | None:
+    """The one statewide primary's guid for `year` -- see _current_election_guid."""
+    return await _current_election_guid(client, state, year, "P")
+
+
+async def _current_election_guid(
+    client: httpx.AsyncClient, state: str, year: int, type_code: str,
+) -> str | None:
+    """The one statewide election of `type_code` ("P" primary, "G"
+    general -- the portal's own electionTypeCode values, both read off
+    the real 2026 list) for `year`, or None
+    if this year has no such election yet (healthy — not every year runs
+    one on this portal's own history). Raises DiscoveryFailed if the
+    list itself couldn't be read, or if more than one election matches
+    (this module's own single-match safety floor — see module docstring)."""
+    elections = await fetch_json_with_retry(client, _rate_limiter, _ELECTIONS_URL, f"{state} elections list")
+    if not isinstance(elections, list):
+        raise DiscoveryFailed(f"{state} elections list fetch failed")
+    if not elections:
+        # The portal's own list "lists every election ever held" (see
+        # module docstring) -- a genuinely empty list is a broken response
+        # (an error page cached as `[]`, say), never a healthy state, so
+        # this must not read the same as "no match for this year" below.
+        raise DiscoveryFailed(f"{state} elections list came back empty")
+    matches = [
+        e for e in elections
+        if e.get("isStateWideElection") and e.get("electionTypeCode") == type_code and e.get("electionYear") == year
+    ]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise DiscoveryFailed(f"{state} elections list has {len(matches)} statewide {type_code} elections for {year}")
+    guid = matches[0].get("electionGuid")
+    if not guid:
+        raise DiscoveryFailed(f"{state} elections list's matched {year} {type_code} election has no electionGuid")
+    return guid
+
+
+async def _federal_report_url(client: httpx.AsyncClient, state: str, guid: str) -> tuple[str, str] | None:
+    """(report_url, election date) for the current federal report -- see
+    _report_url."""
+    return await _report_url(client, state, guid, "federal")
+
+
+async def _report_url(
+    client: httpx.AsyncClient, state: str, guid: str, report: str,
+) -> tuple[str, str] | None:
+    """(report_url, election date) for one of the election's reports --
+    "federal", or "stateWide" (the executive offices; the manifest's own
+    key, same {isEnable, path} shape, verified on the real 2026 primary
+    and general manifests) -- or None if this election doesn't publish
+    that report (healthy). Raises DiscoveryFailed on a genuine fetch/parse
+    failure."""
+    detail = await fetch_json_with_retry(client, _rate_limiter, f"{_BASE_URL}/elections/{guid}.json", f"{state} election detail")
+    if not isinstance(detail, dict):
+        raise DiscoveryFailed(f"{state} election detail fetch failed for {guid}")
+    section = detail.get(report) or {}
+    if not section.get("isEnable"):
+        return None
+    path = section.get("path")
+    if not path:
+        raise DiscoveryFailed(f"{state} election {guid} has {report}.isEnable but no path")
+    held = str((detail.get("electionDetails") or {}).get("electionDate") or "")[:10]
+    if not held:
+        # Every real election detail carries its own date -- a missing one
+        # would otherwise flow silently into _settled() (which treats an
+        # unparseable date as "not settled") and read forever as "waiting
+        # on settle_days" with no log line anywhere pointing at the real
+        # cause.
+        raise DiscoveryFailed(f"{state} election {guid} has no electionDate")
+    return f"{_BASE_URL}/{path.replace(chr(92), '/')}", held
+
+
+def _federal_contests(report: dict, parse=parse_office) -> list[tuple[str, int | None, str, int, str, int]]:
+    """(office, district, party, cid, cn, votes) for every real per-town
+    tally in the report -- cid is returned alongside cn because
+    _fetch_federal_choices must aggregate by id, not display name (see
+    module docstring); reducing to a bare surname happens only once, in
+    fetch_confirmed_candidates, after a single winner has been picked."""
+    results = []
+    for party_block in report.get("d") or []:
+        party = normalize_party(party_block.get("pn") or "")
+        if party is None:
+            continue
+        for office in party_block.get("o") or []:
+            office_district = parse(office.get("on") or "")
+            if office_district is None:
+                continue
+            off, district = office_district
+            for town in office.get("cs") or []:
+                for c in [*(town.get("rc") or []), *(town.get("wc") or [])]:
+                    cid = c.get("cid")
+                    cn = (c.get("cn") or "").strip()
+                    votes = c.get("vc")
+                    if cid in (None, 0) or not cn or cn.upper() in _NON_CANDIDATE_NAMES:
+                        continue
+                    if not isinstance(votes, int):
+                        continue
+                    results.append((off, district, party, cid, cn, votes))
+    return results
+
+
+def _fetch_federal_choices(
+    report: dict, parse=parse_office,
+) -> dict[tuple[str, int | None, str], list[tuple[str, int]]]:
+    """Per-(office, district, party) vote choices. `parse` is the label
+    gate: parse_office for the federal report, parse_statewide_office for
+    the stateWide one (same shape, verified on the real 2026 primary --
+    one party block per ballot party, one office block per contest)."""
+    by_group: dict[tuple[str, int | None, str], dict[int, tuple[str, int]]] = {}
+    for off, district, party, cid, cn, votes in _federal_contests(report, parse):
+        group = by_group.setdefault((off, district, party), {})
+        name, total = group.get(cid, (cn, 0))
+        if total and name != cn:
+            # cid is trusted to be a stable identity within one (office,
+            # district, party) group across every town (see module
+            # docstring) -- if a future report ever reuses one cid for two
+            # different display names within a single group, that's the
+            # assumption breaking, not a name variant to silently prefer.
+            logger.warning(
+                "VT results: cid %s in %s/%s/%s has two names (%r, %r) -- votes may be split across them",
+                cid, off, district, party, name, cn,
+            )
+        group[cid] = (name, total + votes)
+    return {key: list(candidates.values()) for key, candidates in by_group.items()}
+
+
+# Module-level so tests can pin it; the rule lives in state_candidates_common.
+_ballot_final = ballot_final
+
+
+def _general_ballot_statewide(report: dict) -> list[dict]:
+    """Every candidate the GENERAL election's stateWide report lists for a
+    statewide executive office -- the November ballot itself, not a count.
+
+    The general report has no party blocks (one block, `pn: null`); each
+    ballot line carries its own `pn` instead, as the state prints it:
+    "REPUBLICAN", "INDEPENDENT", "DEM/PROG" for a fusion nominee (the FIRST
+    party named is the line's party, which is how Vermont orders them --
+    Amanda Janoo won the Democratic primary and a Progressive write-in
+    nomination). Read as a ballot list, so an independent is an ordinary
+    entry (normalize_party's ballot_list), and so is every minor party:
+    Progressive has an FEC code (PRO), and a party with none -- Freedom
+    and Unity, Peace and Justice -- is kept under OTHER_PARTY with its
+    label as printed (ballot_list_party). The 2026 general report (read
+    2026-09-28) prints 17 statewide ballot lines; before this, four of
+    them were left off the page.
+
+    Write-in tallies (`wc`) are ignored: they are not ballot lines."""
+    found: dict[tuple[str, str | None, int], tuple[str, str]] = {}
+    for block in report.get("d") or []:
+        for office in block.get("o") or []:
+            parsed = parse_statewide_office(office.get("on") or "")
+            if parsed is None:
+                continue
+            code, seat = parsed
+            for town in office.get("cs") or []:
+                for c in town.get("rc") or []:
+                    cid = c.get("cid")
+                    cn = (c.get("cn") or "").strip()
+                    if c.get("isWriteIn") or cid in (None, 0) or not cn or cn.upper() in _NON_CANDIDATE_NAMES:
+                        continue
+                    found.setdefault((code, seat, cid), (cn, str(c.get("pn") or "")))
+    records = []
+    for (code, seat, _cid), (cn, party_label) in found.items():
+        party = ballot_list_party(party_label.split("/")[0])
+        if party is None:
+            # A ballot line printed with no party at all: nothing to key it
+            # under, and never seen on the real report.
+            logger.info("VT general ballot: %s %r prints no party -- not stored", code, cn)
+            continue
+        name = clean_display_name(cn)
+        if name:
+            record = {"office": code, "district": seat, "party": party[0], "last_name": name}
+            if party[1]:
+                record["party_label"] = party[1]
+            records.append(record)
+    return records
+
+
+async def _statewide_records(
+    client: httpx.AsyncClient, state: str, year: int, primary_guid: str, source: dict,
+) -> list[dict] | None:
+    """This cycle's statewide executive nominees: the printed GENERAL
+    ballot once it is final, the primary's winners until then. None on a
+    fetch failure, AND when neither yields a single statewide contest --
+    Vermont elects all six of its executive officers every even year
+    (two-year terms, Vt. Const. ch. II sec. 43), so an empty read is a
+    broken or unpublished report, never a true "none", and the
+    statewide_offices flag would otherwise publish it as one.
+
+    Why the general ballot wins: Vermont's primary winner is not always
+    its November nominee. H. Brooke Paige won the 2026 Republican primary
+    for Treasurer, Secretary of State, Auditor and Attorney General, and
+    the general report (read 2026-09-28) lists Lynn LaFleur, Ivar Kronick
+    and Edwin Howell Kemon in three of those four places -- the party
+    filled the lines he withdrew from. Primary results alone would have
+    published Paige four times."""
+    try:
+        general_guid = await _current_election_guid(client, state, year, "G")
+        general = await _report_url(client, state, general_guid, "stateWide") if general_guid else None
+    except DiscoveryFailed as exc:
+        logger.warning("VT results: general-ballot discovery failed: %s", exc)
+        return None
+    if general and _ballot_final(general[1]):
+        report = await fetch_json_with_retry(client, _rate_limiter, general[0], f"{state} general ballot {year}")
+        if not isinstance(report, dict):
+            return None
+        records = _general_ballot_statewide(report)
+        if records:
+            return SourceRecords(records, ballot_list=True)
+        logger.warning("VT results: final general ballot lists no statewide contest -- using primary winners")
+
+    try:
+        primary = await _report_url(client, state, primary_guid, "stateWide")
+    except DiscoveryFailed as exc:
+        logger.warning("VT results: statewide primary discovery failed: %s", exc)
+        return None
+    records: list[dict] = []
+    if primary is not None:
+        report = await fetch_json_with_retry(client, _rate_limiter, primary[0], f"{state} statewide results {year}")
+        if not isinstance(report, dict):
+            return None
+        by_group = _fetch_federal_choices(report, parse=parse_statewide_office)
+        records = resolve_confirmed_nominees(
+            by_group, runoff_threshold(source), name_transform=clean_display_name,
+        )
+    if not records:
+        logger.warning("VT results: no statewide contest in either the general ballot or the primary")
+        return None
+    return SourceRecords(records, ballot_list=False)
+
+
+async def fetch_confirmed_candidates(
+    client: httpx.AsyncClient, year: int, state: str, source: dict,
+) -> list[dict] | None:
+    try:
+        guid = await _current_primary_guid(client, state, year)
+        if guid is None:
+            return []
+        discovered = await _federal_report_url(client, state, guid)
+    except DiscoveryFailed as exc:
+        logger.warning("VT results: discovery failed: %s", exc)
+        return None
+    if discovered is None:
+        return []
+    report_url, held_on = discovered
+
+    settle_days = source.get("settle_days", DEFAULT_SETTLE_DAYS)
+    if not _settled(held_on, settle_days):
+        return []
+
+    report = await fetch_json_with_retry(client, _rate_limiter, report_url, f"{state} results {year}")
+    if not isinstance(report, dict):
+        return None
+
+    runoff_threshold_pct = runoff_threshold(source)
+    by_group = _fetch_federal_choices(report)
+    records = resolve_confirmed_nominees(by_group, runoff_threshold_pct, name_transform=surname)
+    if source.get("statewide_offices"):
+        statewide = await _statewide_records(client, state, year, guid, source)
+        if statewide is None:
+            return None
+        # Which document the state offices came from travels with them:
+        # the page says whether their names are the whole ballot.
+        return SourceRecords(records + statewide, ballot_list=statewide.ballot_list)
+    return records

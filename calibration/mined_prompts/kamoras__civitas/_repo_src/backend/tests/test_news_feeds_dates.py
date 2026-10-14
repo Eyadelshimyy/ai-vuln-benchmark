@@ -1,0 +1,597 @@
+"""Tests for news feed parsing: pubDate timezone robustness and the
+HTML stripping applied to feed descriptions."""
+
+import logging
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
+from xml.etree import ElementTree
+from xml.sax.saxutils import escape
+
+import pytest
+
+from app.pipeline.fetch.news_feeds import (
+    MAX_ARTICLE_AGE_HOURS,
+    MAX_FULL_TEXT_CHARS,
+    MAX_SUMMARY_CHARS,
+    _extract_body_text,
+    _is_multi_topic_digest,
+    _parse_pub_date,
+    _parse_rss_feed,
+    _strip_html,
+    fetch_news_articles,
+)
+
+_MRSS_HEADER = (
+    '<?xml version="1.0"?>'
+    '<rss xmlns:media="http://search.yahoo.com/mrss/" '
+    'xmlns:mi="http://schemas.ingestion.microsoft.com/common/">'
+    "<channel>"
+)
+
+
+def _recent_iso(hours_ago: float) -> str:
+    """An ISO timestamp relative to now — the parser drops anything older
+    than MAX_ARTICLE_AGE_HOURS, so fixtures cannot use a fixed date."""
+    stamp = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+    return stamp.replace(microsecond=0).isoformat()
+
+
+class TestParsePubDate:
+    def test_rfc2822_with_offset(self):
+        d = _parse_pub_date("Mon, 20 Jul 2026 12:00:00 +0000")
+        assert d is not None and d.tzinfo is not None
+
+    def test_minus_zero_zone_is_made_aware(self):
+        """parsedate_to_datetime returns a NAIVE datetime for '-0000'-style
+        zones; comparing that to the aware cutoff raised TypeError and the
+        caller's blanket except dropped the entire feed as 'failed to
+        fetch'. Naive results must be coerced to UTC."""
+        d = _parse_pub_date("Mon, 20 Jul 2026 12:00:00 -0000")
+        assert d is not None
+        assert d.tzinfo is not None
+        assert d.utcoffset() == timezone.utc.utcoffset(None)
+
+    def test_iso_date_only(self):
+        d = _parse_pub_date("2026-07-20")
+        assert d is not None and d.tzinfo is not None
+
+    def test_garbage_returns_none(self):
+        assert _parse_pub_date("not a date") is None
+        assert _parse_pub_date(None) is None
+        assert _parse_pub_date("") is None
+
+
+class TestStripHtml:
+    """WordPress-backed feeds (Roll Call, The Hill) put real markup in
+    <description>. It reached three consumers that all read the description
+    as prose: the policy-relevance embedding (which scores only the first
+    200 characters — for an image-led item, entirely markup), the LLM prompt
+    for issue generation, and the digest detector's entity extraction."""
+
+    @pytest.mark.parametrize("raw, expected", [
+        pytest.param("<p>The House passed the bill.</p>", "The House passed the bill.", id="tags_are_removed"),
+        # An <img> lead is the common WordPress shape, and "Varga-Rally.jpg"
+        # reads as a named entity that appears in no other sentence — which is
+        # exactly what the digest detector's disjointness test keys on.
+        pytest.param(
+            '<img src="https://thehill.com/wp-content/Varga-Rally.jpg"/><p>The Senate voted on Tuesday.</p>',
+            "The Senate voted on Tuesday.",
+            id="image_filename_is_not_left_behind_as_an_entity",
+        ),
+        # </p> and <li> are where one thought ends. Dropping them silently
+        # welds two sentences into one run-on with no item boundary left for
+        # the digest detector to split on.
+        pytest.param(
+            "<ul><li>Ukraine aid clears</li><li>Brandt signals a pause</li></ul>",
+            "Ukraine aid clears; Brandt signals a pause",
+            id="block_boundaries_survive_as_punctuation",
+        ),
+        pytest.param(
+            "Ways &amp; Means marks up the bill", "Ways & Means marks up the bill", id="entities_are_decoded",
+        ),
+        # The XML parser decodes one layer, so a feed that escaped its markup
+        # twice still holds "&lt;p&gt;" by the time this runs. Strip before
+        # unescape and that tag text lands in the summary verbatim.
+        pytest.param(
+            "&lt;p&gt;The Senate voted.&lt;/p&gt;", "The Senate voted.", id="double_escaped_markup_is_still_stripped",
+        ),
+        # A bare "<" is not markup. Matching "<[^>]*>" swallowed the middle of
+        # any sentence that used both comparison signs.
+        pytest.param(
+            "Turnout ran < 6 > the 2024 figure, analysts said.",
+            "Turnout ran < 6 > the 2024 figure, analysts said.",
+            id="comparison_operators_in_prose_are_not_tags",
+        ),
+        # Live ingestion strips before truncating to MAX_SUMMARY_CHARS, so this
+        # can't happen going forward — but rows stored before this function
+        # existed truncated the raw HTML first, freezing a dangling "</s"
+        # (missing its ">") into the summary forever. _HTML_TAG_RE requires a
+        # closing ">" and misses this; a bare trailing "<" that isn't a tag
+        # (the next case) must still survive.
+        pytest.param(
+            "(AP Photo/Chuck Burton)</s", "(AP Photo/Chuck Burton)",
+            id="a_tag_truncated_before_its_closing_bracket_is_still_removed",
+        ),
+        pytest.param(
+            "The gap narrowed to <", "The gap narrowed to <",
+            id="comparison_operator_at_the_very_end_of_the_string_survives",
+        ),
+    ])
+    def test_strip_html(self, raw, expected):
+        assert _strip_html(raw) == expected
+
+    def test_plain_text_is_returned_unchanged(self):
+        text = "The House passed the bill. It now goes to the Senate."
+        assert _strip_html(text) is text
+
+    def test_atom_entries_are_stripped_too(self):
+        """The Atom branch builds its NewsArticle separately from the RSS
+        one, so it is its own chance to forget the strip.
+
+        This also pins the ElementTree truthiness trap it uncovered:
+        `find(a) or find(b)` always took b, because a childless element is
+        falsy whatever its text, so every Atom summary was discarded."""
+        entry = _parse_rss_feed(
+            """<?xml version="1.0"?>
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <entry>
+                <title>Senate clears the measure</title>
+                <link rel="self" href="https://example.com/feed"/>
+                <link rel="alternate" href="https://example.com/a"/>
+                <summary>&lt;p&gt;The Senate voted Tuesday.&lt;/p&gt;</summary>
+              </entry>
+            </feed>""".encode(),
+            "Test",
+        )[0]
+        assert entry.summary == "The Senate voted Tuesday."
+        # The rel="alternate" preference never applied for the same reason.
+        assert entry.url == "https://example.com/a"
+
+    def test_atom_falls_back_to_bare_link_and_content(self):
+        """Not every Atom feed labels its link or names the body <summary>;
+        both fallbacks are real feed shapes and both are on the path the
+        truthiness fix rewrote."""
+        entry = _parse_rss_feed(
+            """<?xml version="1.0"?>
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <entry>
+                <title>House sends the bill onward</title>
+                <link href="https://example.com/b"/>
+                <content>&lt;p&gt;The House voted Wednesday.&lt;/p&gt;</content>
+              </entry>
+            </feed>""".encode(),
+            "Test",
+        )[0]
+        assert entry.url == "https://example.com/b"
+        assert entry.summary == "The House voted Wednesday."
+
+    def test_atom_xhtml_content_is_not_lost(self):
+        """<content type="xhtml"> holds real child elements, so .text is
+        empty — the same title-and-nothing-else outcome the truthiness trap
+        produced, and just as silent."""
+        entry = _parse_rss_feed(
+            """<?xml version="1.0"?>
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <entry>
+                <title>Committee advances the nomination</title>
+                <link href="https://example.com/c"/>
+                <content type="xhtml">
+                  <div xmlns="http://www.w3.org/1999/xhtml">
+                    <p>The committee voted Thursday.</p>
+                  </div>
+                </content>
+              </entry>
+            </feed>""".encode(),
+            "Test",
+        )[0]
+        assert entry.summary == "The committee voted Thursday."
+
+    def test_adjacent_blocks_are_not_welded_together(self):
+        """A plain "".join(itertext()) yields "Thursday.Grassley" — two
+        sentences fused into one token that no downstream stage can split,
+        since the action center's item splitter needs whitespace after the
+        period to see a boundary at all."""
+        entry = _parse_rss_feed(
+            """<?xml version="1.0"?>
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <entry>
+                <title>Committee advances the nomination</title>
+                <link href="https://example.com/f"/>
+                <content type="xhtml">
+                  <div xmlns="http://www.w3.org/1999/xhtml">
+                    <p>The committee voted Thursday.</p>
+                    <p>Grassley set the floor date.</p>
+                  </div>
+                </content>
+              </entry>
+            </feed>""".encode(),
+            "Test",
+        )[0]
+        assert entry.summary == (
+            "The committee voted Thursday. Grassley set the floor date."
+        )
+
+    def test_block_after_sentence_punctuation_does_not_double_the_boundary(self):
+        """"voted Thursday.; Grassley objected" states the break twice. Both
+        forms split identically downstream, so this is about the text that
+        reaches the embedding and the LLM prompt."""
+        assert _strip_html("<p>A vote was held.</p><p>B objected.</p>") == "A vote was held. B objected."
+        # A block that did NOT end a sentence still needs the separator.
+        assert _strip_html("<li>Ukraine aid clears</li><li>Brandt pauses</li>") == (
+            "Ukraine aid clears; Brandt pauses"
+        )
+
+    def test_semicolon_written_by_the_newsroom_is_left_alone(self):
+        """The redundant-boundary cleanup must only touch separators WE
+        inserted. Applied to source prose it rewrites the sentence:
+        "resumed in the U.S.; officials said" became "resumed in the U.S.
+        officials said", which reads as a different claim and reaches the
+        LLM prompt that way."""
+        article = _parse_rss_feed(
+            """<?xml version="1.0"?><rss><channel><item>
+              <title>Trade talks resume</title>
+              <link>https://example.com/t</link>
+              <description>Talks resumed in the U.S.; officials said a deal was near.</description>
+            </item></channel></rss>""".encode(),
+            "Test",
+        )[0]
+        assert article.summary == "Talks resumed in the U.S.; officials said a deal was near."
+
+    def test_malformed_xml_yields_no_articles(self):
+        """A feed serving garbage must not take the run down with it."""
+        assert _parse_rss_feed(b"<rss><channel><item>truncated", "Test") == []
+
+    def test_a_multi_topic_digest_item_is_dropped(self):
+        """Live 2026-08-25 incident: PBS's "News Wrap: Wildfire forces
+        evacuations near Reno" briefly covered the Reno wildfire, a
+        Supreme Court ruling, and a Pentagon strike in ONE description —
+        three unrelated stories reached the LLM as if they were one topic
+        (see _is_multi_topic_digest's docstring for the verbatim text),
+        producing an issue titled "Wildfire evacuations near Reno and
+        Indonesia" with Supreme Court and Pentagon facts mixed in."""
+        articles = _parse_rss_feed(
+            """<?xml version="1.0"?><rss><channel><item>
+              <title>News Wrap: Wildfire forces evacuations near Reno</title>
+              <link>https://www.pbs.org/newshour/show/news-wrap-wildfire-forces-evacuations-near-reno</link>
+              <description>Tens of thousands evacuate near Reno, the Supreme Court
+                cleared Varga's mail-in voting order, and the Pentagon struck a boat
+                in the eastern Pacific.</description>
+            </item></channel></rss>""".encode(),
+            "PBS NewsHour",
+        )
+        assert articles == []
+
+    def test_a_dedicated_single_topic_article_from_the_same_source_still_ingests(self):
+        # The filter targets the digest FORMAT (title prefix), not the
+        # source — PBS's own dedicated single-topic articles for the same
+        # stories must keep flowing normally.
+        articles = _parse_rss_feed(
+            """<?xml version="1.0"?><rss><channel><item>
+              <title>Supreme Court clears the way for Varga mail voting order</title>
+              <link>https://www.pbs.org/newshour/politics/supreme-court-clears-the-way</link>
+              <description>The Supreme Court ruled 6-3 on Monday.</description>
+            </item></channel></rss>""".encode(),
+            "PBS NewsHour",
+        )
+        assert len(articles) == 1
+
+    def test_is_multi_topic_digest_matches_common_prefix_variants(self):
+        assert _is_multi_topic_digest("News Wrap: Wildfire forces evacuations near Reno")
+        assert _is_multi_topic_digest("news wrap: lowercase variant")
+        assert _is_multi_topic_digest("News Wrap - dash variant")
+        assert not _is_multi_topic_digest("Supreme Court clears the way for Varga mail voting order")
+        assert not _is_multi_topic_digest("Wrapping up the day's news wrap-up")
+
+
+class TestRightsClearedImageUrl:
+    """Confirmed live against Roll Call's own feed — <mi:hasSyndicationRights>
+    is the only explicit, machine-readable redistribution-rights signal
+    among any of the configured sources; a bare media:content (attribution
+    metadata) elsewhere must never be treated as permission."""
+
+    def _item(
+        self, rights: str | None, url: str = "https://rollcall.com/img.jpg",
+        text: str | None = None, credit: str | None = None,
+    ) -> str:
+        rights_el = f"<mi:hasSyndicationRights>{rights}</mi:hasSyndicationRights>" if rights is not None else ""
+        text_el = f"<media:text>{text}</media:text>" if text is not None else ""
+        credit_el = f"<mi:licensorName>{credit}</mi:licensorName>" if credit is not None else ""
+        return (
+            _MRSS_HEADER + "<item>"
+            "<title>A story</title><link>https://rollcall.com/a-story</link>"
+            f'<media:content url="{url}" medium="image">{rights_el}{credit_el}{text_el}</media:content>'
+            "</item></channel></rss>"
+        )
+
+    @pytest.mark.parametrize("rights, expected_url", [
+        pytest.param("1", "https://rollcall.com/img.jpg", id="rights_granted_image_is_used"),
+        pytest.param("0", None, id="rights_denied_image_is_dropped"),
+        pytest.param(None, None, id="missing_rights_field_is_dropped"),
+    ])
+    def test_image_is_used_only_with_syndication_rights(self, rights, expected_url):
+        articles = _parse_rss_feed(self._item(rights).encode(), "Roll Call")
+        assert articles[0].image_url == expected_url
+
+    @pytest.mark.parametrize("url", [
+        "https://images.example.org/img.jpg",
+        "http://rollcall.com/img.jpg",
+        "https://rollcall.com:8443/img.jpg",
+    ])
+    def test_a_rights_cleared_image_off_the_allowed_hosts_is_dropped(self, url):
+        # The site's photo route fetches issue photos only from these hosts
+        # (app/photos.py), so a feed item can't point the server elsewhere.
+        articles = _parse_rss_feed(self._item("1", url=url).encode(), "Roll Call")
+        assert articles[0].image_url is None
+
+    def test_no_media_content_at_all_is_none(self):
+        articles = _parse_rss_feed(
+            """<?xml version="1.0"?><rss><channel><item>
+              <title>A story</title><link>https://apnews.com/a-story</link>
+            </item></channel></rss>""".encode(),
+            "AP News",
+        )
+        assert articles[0].image_url is None
+
+    def test_caption_and_credit_are_captured(self):
+        articles = _parse_rss_feed(
+            self._item("1", text="A member of Congress speaks.", credit="Tom Williams/CQ Roll Call").encode(),
+            "Roll Call",
+        )
+        assert articles[0].image_alt == "A member of Congress speaks."
+        assert articles[0].image_credit == "Tom Williams/CQ Roll Call"
+
+    def test_missing_caption_and_credit_default_to_empty_string(self):
+        articles = _parse_rss_feed(self._item("1").encode(), "Roll Call")
+        assert articles[0].image_alt == ""
+        assert articles[0].image_credit == ""
+
+    def test_comment_text_is_not_treated_as_content(self):
+        """This parser drops comments, but the extractor should not depend
+        on that to avoid quoting "<!-- tracking beacon -->" into an article."""
+        el = ElementTree.Element("description")
+        el.text = "The Senate voted."
+        comment = ElementTree.Comment("tracking beacon")
+        comment.tail = " It goes to the House."
+        el.append(comment)
+        assert _extract_body_text(el) == "The Senate voted. It goes to the House."
+
+    def test_atom_categories_are_read_from_the_term_attribute(self):
+        """Atom labels categories with @term, not element text. A field that
+        is silently always-empty for one feed format is how the first reader
+        of it gets a wrong answer with no error."""
+        entry = _parse_rss_feed(
+            """<?xml version="1.0"?>
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <entry>
+                <title>Committee advances the nomination</title>
+                <link href="https://example.com/g"/>
+                <summary>The committee voted.</summary>
+                <category term="Politics"/>
+                <category term="Senate"/>
+                <category/>
+              </entry>
+            </feed>""".encode(),
+            "Test",
+        )[0]
+        assert entry.categories == ["Politics", "Senate"]
+
+    def test_atom_prefers_published_over_updated(self):
+        """<updated> is when the entry was last touched; <published> is when
+        the story ran. Reading <updated> alone made a lightly-edited old
+        story look fresh."""
+        entry = _parse_rss_feed(
+            f"""<?xml version="1.0"?>
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <entry>
+                <title>Senate returns from recess</title>
+                <link href="https://example.com/d"/>
+                <summary>The Senate reconvened.</summary>
+                <published>{_recent_iso(hours_ago=3)}</published>
+                <updated>{_recent_iso(hours_ago=1)}</updated>
+              </entry>
+            </feed>""".encode(),
+            "Test",
+        )[0]
+        assert entry.published == datetime.fromisoformat(_recent_iso(hours_ago=3))
+
+    def test_atom_entry_with_only_published_is_still_dated(self):
+        """Many feeds emit <published> alone. Left undated, an entry skips
+        the MAX_ARTICLE_AGE_HOURS cutoff entirely and sorts last."""
+        stale = _recent_iso(hours_ago=MAX_ARTICLE_AGE_HOURS + 24)
+        entries = _parse_rss_feed(
+            f"""<?xml version="1.0"?>
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <entry>
+                <title>An article from last week</title>
+                <link href="https://example.com/e"/>
+                <summary>Old news.</summary>
+                <published>{stale}</published>
+              </entry>
+            </feed>""".encode(),
+            "Test",
+        )
+        assert entries == []
+
+    def test_summary_cap_is_applied_after_stripping(self):
+        """Truncating first spends the budget on markup. The cap has to
+        measure real prose, so the strip runs before the slice."""
+        prose = "Senators debated the measure for hours. " * 30
+        raw = f'<p><img src="https://example.com/a.jpg"/>{prose}</p>'
+        item = _parse_rss_feed(
+            f"""<?xml version="1.0"?><rss><channel><item>
+              <title>Senate debates the measure</title>
+              <link>https://example.com/a</link>
+              <description>{escape(raw)}</description>
+            </item></channel></rss>""".encode(),
+            "Test",
+        )[0]
+        assert len(item.summary) == MAX_SUMMARY_CHARS
+        assert "<" not in item.summary
+        assert item.summary.startswith("Senators debated")
+
+
+class TestFullTextPreferredOverTeaser:
+    """<content:encoded> / Atom <content> carry an item's complete body,
+    when a source populates them at all — used over the <description>/
+    <summary> teaser whenever present and non-empty (_resolve_summary)."""
+
+    def test_rss_item_prefers_content_encoded_over_description(self):
+        article = _parse_rss_feed(
+            """<?xml version="1.0"?>
+            <rss xmlns:content="http://purl.org/rss/1.0/modules/content/">
+              <channel><item>
+                <title>Senate passes the bill</title>
+                <link>https://example.com/a</link>
+                <description>Short teaser.</description>
+                <content:encoded><![CDATA[<p>The Senate voted 60-40 Tuesday
+                  after a week of floor debate over amendments.</p>]]></content:encoded>
+              </item></channel>
+            </rss>""".encode(),
+            "Test",
+        )[0]
+        assert article.summary == (
+            "The Senate voted 60-40 Tuesday after a week of floor debate "
+            "over amendments."
+        )
+        assert article.truncated is False
+
+    def test_rss_item_with_no_content_encoded_behaves_as_before(self):
+        article = _parse_rss_feed(
+            """<?xml version="1.0"?><rss><channel><item>
+              <title>House takes it up</title>
+              <link>https://example.com/b</link>
+              <description>The House will vote Wednesday.</description>
+            </item></channel></rss>""".encode(),
+            "Test",
+        )[0]
+        assert article.summary == "The House will vote Wednesday."
+        assert article.truncated is False
+
+    def test_rss_item_truncated_flag_reflects_the_full_text_cap(self):
+        prose = "Senators debated the measure for hours. " * 100
+        article = _parse_rss_feed(
+            f"""<?xml version="1.0"?>
+            <rss xmlns:content="http://purl.org/rss/1.0/modules/content/">
+              <channel><item>
+                <title>Senate debates the measure</title>
+                <link>https://example.com/c</link>
+                <content:encoded><![CDATA[<p>{prose}</p>]]></content:encoded>
+              </item></channel>
+            </rss>""".encode(),
+            "Test",
+        )[0]
+        assert len(article.summary) == MAX_FULL_TEXT_CHARS
+        assert article.truncated is True
+
+    def test_atom_entry_prefers_content_over_summary(self):
+        entry = _parse_rss_feed(
+            """<?xml version="1.0"?>
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <entry>
+                <title>Committee advances the nomination</title>
+                <link href="https://example.com/d"/>
+                <summary>Short teaser.</summary>
+                <content>The committee voted 12-8 Thursday to advance the
+                  nomination to the full chamber.</content>
+              </entry>
+            </feed>""".encode(),
+            "Test",
+        )[0]
+        assert entry.summary == (
+            "The committee voted 12-8 Thursday to advance the nomination "
+            "to the full chamber."
+        )
+
+    def test_rss_falls_back_to_description_when_content_encoded_is_markup_only(self):
+        """A source can populate content:encoded with only an image or embed
+        and no prose (e.g. a lead photo, a tracking pixel) — non-empty raw
+        text that strips to nothing. That must not discard a perfectly
+        usable teaser in <description>."""
+        article = _parse_rss_feed(
+            """<?xml version="1.0"?>
+            <rss xmlns:content="http://purl.org/rss/1.0/modules/content/">
+              <channel><item>
+                <title>Senate passes the bill</title>
+                <link>https://example.com/f</link>
+                <description>The Senate voted 60-40 Tuesday.</description>
+                <content:encoded><![CDATA[<img src="https://example.com/x.jpg"/>]]></content:encoded>
+              </item></channel>
+            </rss>""".encode(),
+            "Test",
+        )[0]
+        assert article.summary == "The Senate voted 60-40 Tuesday."
+
+    def test_atom_falls_back_to_summary_when_content_is_markup_only(self):
+        entry = _parse_rss_feed(
+            """<?xml version="1.0"?>
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <entry>
+                <title>Committee advances the nomination</title>
+                <link href="https://example.com/g"/>
+                <summary>The committee will vote Thursday.</summary>
+                <content type="html">&lt;img src="https://example.com/y.jpg"/&gt;</content>
+              </entry>
+            </feed>""".encode(),
+            "Test",
+        )[0]
+        assert entry.summary == "The committee will vote Thursday."
+
+
+def _feed_response(xml: bytes) -> MagicMock:
+    resp = MagicMock()
+    resp.content = xml
+    resp.raise_for_status = MagicMock()
+    return resp
+
+
+def _rss(*items: str) -> bytes:
+    body = "".join(items)
+    return f'<?xml version="1.0"?><rss><channel>{body}</channel></rss>'.encode()
+
+
+def _item(title: str, link: str, desc: str | None = None) -> str:
+    body = f"<description>{desc}</description>" if desc is not None else ""
+    return f"<item><title>{title}</title><link>{link}</link>{body}</item>"
+
+
+class TestMissingDescriptionIsAudible:
+    """The Atom truthiness bug survived because its failure mode was
+    invisible: the articles still existed, still clustered, still reached
+    the LLM prompt — with a headline and nothing else. A feed whose items
+    ALL arrive body-less is the signature of that class of parse mismatch,
+    so it gets a warning of its own rather than a silent degradation."""
+
+    def test_body_text_of_a_missing_element_is_empty(self):
+        assert _extract_body_text(None) == ""
+
+    def test_feed_with_no_descriptions_at_all_warns(self, caplog):
+        feed = _rss(
+            _item("Senate passes the bill", "https://example.com/a"),
+            _item("House takes it up", "https://example.com/b"),
+        )
+        with patch(
+            "app.pipeline.fetch.news_feeds.httpx.get",
+            return_value=_feed_response(feed),
+        ), caplog.at_level(logging.INFO):
+            articles = fetch_news_articles([{"name": "Test", "url": "https://x/f"}])
+
+        assert len(articles) == 2
+        assert "2 without a description" in caplog.text
+        assert "probably not being read" in caplog.text
+
+    def test_feed_with_some_descriptions_counts_but_does_not_warn(self, caplog):
+        feed = _rss(
+            _item("Senate passes the bill", "https://example.com/a", "It cleared 60-40."),
+            _item("House takes it up", "https://example.com/b"),
+        )
+        with patch(
+            "app.pipeline.fetch.news_feeds.httpx.get",
+            return_value=_feed_response(feed),
+        ), caplog.at_level(logging.INFO):
+            articles = fetch_news_articles([{"name": "Test", "url": "https://x/f"}])
+
+        assert len(articles) == 2
+        assert "1 without a description" in caplog.text
+        # A partly-bodyless feed is normal; only an all-or-nothing feed is
+        # evidence of a parse mismatch.
+        assert "probably not being read" not in caplog.text

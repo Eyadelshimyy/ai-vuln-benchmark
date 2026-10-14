@@ -1,0 +1,958 @@
+import re
+from pathlib import Path
+
+from PyQt5.QtCore import QSettings
+
+from mf4_analyzer.ui import hints
+from mf4_analyzer.ui.hints import HintState
+
+
+def test_persistent_hints_are_curated_universal_set():
+    assert hints.persistent_hints() == (
+        "Ctrl + 滚轮 缩放 X",
+        "Shift + 滚轮 缩放 Y",
+    )
+
+
+def test_hint_display_width_counts_full_width_glyphs_only():
+    # CJK ideographs and full-width punctuation count 1; narrow ASCII/Latin
+    # glyphs (letters, digits, spaces, "·", "→") count 0.
+    assert hints.hint_display_width("缩放") == 2
+    assert hints.hint_display_width("Ctrl + 滚轮 缩放 X / Y") == 4
+    assert hints.hint_display_width("右键图表 → 查看全部 · 轴范围 · 网格") == 13
+    assert hints.hint_display_width("，（）") == 3  # full-width punctuation counts
+
+
+def test_every_registry_hint_stays_within_length_budget():
+    # The footer's two edge-anchored slots only fit side by side when each hint
+    # is short; this guards the cap at definition time so new hints stay in
+    # budget instead of eliding on a normal-width bar.
+    too_long = [
+        (hint.id, hints.hint_display_width(hint.text), hint.text)
+        for hint in hints.all_hints()
+        if hints.hint_display_width(hint.text) > hints.HINT_MAX_WIDTH
+    ]
+    assert not too_long, too_long
+
+
+def test_context_hints_filter_by_mode_and_tier_priority():
+    overlay = HintState(mode="time", plot_mode="overlay")
+    # coaxis.gesture (tier A) shipped 2026-06-27 and trails the tier-S drag_y.
+    assert [hint.id for hint in hints.context_hints(overlay)] == [
+        "overlay.drag_y",
+        "coaxis.gesture",
+        "filter.view_scope",
+        "chart_options.view_scope",
+        "cursor.pin_off",
+    ]
+
+    subplot = HintState(mode="time", plot_mode="subplot")
+    # coaxis applies to subplot too (shared Y = compare amplitude); the tier-A
+    # gesture trails the subplot wheel/shift-Y tips.
+    assert [hint.id for hint in hints.context_hints(subplot)] == [
+        "subplot.wheel_target",
+        "subplot.shift_y",
+        "coaxis.gesture",
+        "filter.view_scope",
+        "chart_options.view_scope",
+        "cursor.pin_off",
+    ]
+
+    dual = HintState(mode="time", plot_mode="overlay", cursor_mode="dual")
+    assert [hint.id for hint in hints.context_hints(dual)][0] == "cursor.dual_ab"
+
+
+def test_context_hints_filter_special_chart_modes_and_requirements():
+    # FFT-vs-Time keeps the slice hint as its lead context hint; the redesign
+    # adds spectrogram colorbar/divider tips that also surface on this section.
+    fft_time = HintState(mode="fft_time", chart_kind="fft_time")
+    fft_time_ids = [hint.id for hint in hints.context_hints(fft_time)]
+    assert fft_time_ids[0] == "spectrogram.slice"
+    assert "spectrogram.colorbar_scale" in fft_time_ids
+    assert "spectrogram.divider" in fft_time_ids
+
+    order_without_annotation = HintState(mode="order", chart_kind="order")
+    assert "annotation.mode" not in {
+        hint.id for hint in hints.context_hints(order_without_annotation)
+    }
+
+    order_with_annotation = HintState(
+        mode="order",
+        chart_kind="order",
+        annotation_on=True,
+    )
+    # Annotation mode surfaces the add/delete hint; the redesign keeps it as the
+    # lead while also offering the order slice + spectrogram tips on this section.
+    order_annot_ids = [
+        hint.id for hint in hints.context_hints(order_with_annotation)
+    ]
+    assert order_annot_ids[0] == "annotation.mode"
+    assert "order.slice" in order_annot_ids
+
+
+def test_context_hints_suppress_recently_used_ids():
+    state = HintState(
+        mode="time",
+        plot_mode="subplot",
+        recently_used=frozenset({"subplot.wheel_target"}),
+    )
+    assert [hint.id for hint in hints.context_hints(state)] == [
+        "subplot.shift_y",
+        "coaxis.gesture",
+        "filter.view_scope",
+        "chart_options.view_scope",
+        "cursor.pin_off",
+    ]
+
+
+def test_discovery_hint_returns_priority_order_and_skips_discovered():
+    fresh = HintState()
+    assert hints.discovery_hint(fresh).id == "toolbar.shortcuts_exist"
+
+    after_shortcut = HintState(
+        discovered=frozenset({"toolbar.shortcuts_exist"})
+    )
+    assert hints.discovery_hint(after_shortcut).id == "chart.copy_image"
+
+    all_now = HintState(
+        discovered=frozenset(
+            hint.id
+            for hint in hints.all_hints()
+            if hint.surface == "discovery" and hint.ship == "now"
+        )
+    )
+    assert hints.discovery_hint(all_now) is None
+
+
+def test_batch_export_options_discovery_states_slice_and_folder_limits():
+    batch_hint = next(
+        hint for hint in hints.all_hints() if hint.id == "batch.export_options"
+    )
+    assert "≤4" in batch_hint.text
+    assert "FFT-时间" in batch_hint.text and "阶次" in batch_hint.text
+    assert "完成后" in batch_hint.text and "目录" in batch_hint.text
+    assert "记住" in batch_hint.text
+
+    seen = frozenset(
+        hint.id for hint in hints.all_hints()
+        if hint.surface == "discovery"
+        and hint.ship == "now"
+        and hint.id != batch_hint.id
+    )
+    assert hints.discovery_hint(HintState(discovered=seen)) == batch_hint
+
+
+def test_batch_method_first_discovery_hint_stays_short():
+    method_hint = next(
+        hint for hint in hints.all_hints() if hint.id == "batch.method_first"
+    )
+    assert "分析方法" in method_hint.text
+    assert hints.hint_display_width(method_hint.text) <= hints.HINT_MAX_WIDTH
+    assert method_hint.retire_on == "batch_open"
+
+
+def test_batch_control_applicability_discovery_hints_stay_short():
+    expected = {
+        "batch.layout_when_separate": ("每项单独", "图内布局"),
+        "batch.fft_single_frame": ("单帧", "窗长"),
+        "batch.data_only_preview": ("仅导出数据", "预览"),
+        "batch.count_pending": ("待确定", "来源"),
+        "batch.disabled_keeps_value": ("禁用", "原值"),
+    }
+    by_id = {hint.id: hint for hint in hints.all_hints()}
+    for hint_id, phrases in expected.items():
+        hint = by_id[hint_id]
+        for phrase in phrases:
+            assert phrase in hint.text
+        assert hints.hint_display_width(hint.text) <= hints.HINT_MAX_WIDTH
+        assert hint.retire_on == "batch_open"
+        assert hint.surface == "discovery"
+
+
+def test_hardening_interaction_discovery_hints_stay_short():
+    expected = {
+        "analysis.range_invalid_keep": ("非法范围", "全时段"),
+        "time.time_range_mode": ("全时段", "视窗"),
+        "preset.target_axis_dot": ("黄点", "目标"),
+        "preset.slot_source_note": ("再加载",),
+    }
+    by_id = {hint.id: hint for hint in hints.all_hints()}
+    for hint_id, phrases in expected.items():
+        hint = by_id[hint_id]
+        for phrase in phrases:
+            assert phrase in hint.text
+        assert hints.hint_display_width(hint.text) <= hints.HINT_MAX_WIDTH
+        assert hint.surface == "discovery"
+
+
+def test_frf_hints_cover_cursor_display_and_time_domain_limits():
+    frf_hints = {
+        hint.id: hint.text
+        for hint in hints.all_hints()
+        if hint.id.startswith("frf.")
+    }
+    assert set(frf_hints) == {
+        "frf.linked_cursor",
+        "frf.coherence_display_only",
+        "frf.custom_x_limit",
+        "frf.view_in_time_domain",
+        "frf.retry_compute",
+    }
+    joined = " ".join(frf_hints.values())
+    for phrase in (
+        "游标", "短标签", "双看", "仅A待B", "阈值", "显示", "自定义 X", "不是秒",
+        "时域查看", "新建或复用",
+    ):
+        assert phrase in joined
+
+    fft_hints = {hint.id: hint.text for hint in hints.all_hints() if hint.id.startswith("fft.")}
+    assert fft_hints["fft.frequency_cursor"] == "频谱游标：数值/完整，窄时+N，放大恢复"
+
+
+def test_time_hint_documents_cursor_display_settings_and_custom_x_single_values():
+    hint = next(item for item in hints.all_hints() if item.id == "time.custom_x_paths")
+    assert "显示设置" in hint.text
+    assert "极值点" in hint.text
+    assert "差值" in hint.text
+    assert "数值" in hint.text
+    assert "完整" in hint.text
+    assert "X↑/X↓" in hint.text
+
+
+def test_recent_menu_discovery_hint_stays_in_budget():
+    hint = next(h for h in hints.all_hints() if h.id == "toolbar.recent_menu")
+    assert hint.surface == "discovery"
+    assert hint.retire_on == "recent_open"
+    assert hint.priority == 40
+    assert hint.text == "打开旁箭头可搜索最近的项目和文件"
+    assert hints.hint_display_width(hint.text) <= hints.HINT_MAX_WIDTH
+
+
+def test_chart_toolbar_pan_hint_documents_horizontal_scroll():
+    hint = next(item for item in hints.all_hints() if item.id == "chart.toolbar_pan")
+    assert "箭头" in hint.text
+    assert "滚轮" in hint.text
+    assert hints.hint_display_width(hint.text) <= hints.HINT_MAX_WIDTH
+
+
+def test_mark_discovered_round_trips_through_qsettings():
+    temp_dir = Path(".pytmp") / "test_hints"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    settings_path = temp_dir / "hint-settings.ini"
+    if settings_path.exists():
+        settings_path.unlink()
+    settings = QSettings(str(settings_path), QSettings.IniFormat)
+
+    assert hints.load_discovered(settings) == frozenset()
+    hints.mark_discovered(settings, "toolbar.shortcuts_exist")
+    hints.mark_discovered(settings, "chart.copy_image")
+    settings.sync()
+
+    reloaded = QSettings(str(settings_path), QSettings.IniFormat)
+    assert hints.load_discovered(reloaded) == frozenset(
+        {"toolbar.shortcuts_exist", "chart.copy_image"}
+    )
+    state = HintState(discovered=hints.load_discovered(reloaded))
+    assert hints.discovery_hint(state).id == "chart.right_click_menu"
+
+
+def test_wwt_export_storage_is_a_shipped_discovery_hint():
+    hint = next(
+        h for h in hints.all_hints() if h.id == "channel.export_wwt_storage"
+    )
+    assert hint.surface == "discovery"
+    assert hint.ship == "now"
+    assert "WWT" in hint.text
+    assert "无损" in hint.text and "紧凑" in hint.text
+    assert hints.hint_display_width(hint.text) <= hints.HINT_MAX_WIDTH
+
+
+def test_range_tab_discovery_mentions_tab_and_stays_in_budget():
+    hint = next(h for h in hints.all_hints() if h.id == "chart.range_tab")
+    assert hint.surface == "discovery"
+    assert hint.ship == "now"
+    assert "Tab" in hint.text
+    assert "起止" in hint.text
+    assert hints.hint_display_width(hint.text) <= hints.HINT_MAX_WIDTH
+
+
+def test_custom_action_slot_discovery_surfaces_and_retires():
+    # After the higher-priority discoveries are seen, the custom-action-slot
+    # tip surfaces; rebinding (marking the id) retires it.
+    seen = {
+        "toolbar.shortcuts_exist",
+        "chart.copy_image",
+        "chart.right_click_menu",
+        "channel.right_click",
+        "file.scope_follow",
+        "file.attach_current_view",
+        # 58030e4d: landed WWT lossless/compact export; same default-mode
+        # discovery pool as custom_action_slot (priority 70 > 50).
+        "channel.export_wwt_storage",
+        "file.wwt_create_views",
+        "view.history",
+    }
+    state = HintState(discovered=frozenset(seen))
+    assert hints.discovery_hint(state).id == "chart.custom_action_slot"
+    after = HintState(discovered=frozenset(seen | {"chart.custom_action_slot"}))
+    nxt = hints.discovery_hint(after)
+    assert nxt is None or nxt.id != "chart.custom_action_slot"
+
+
+def test_view_fade_hint_covers_chart_modes_without_claiming_every_scene():
+    hint = next(item for item in hints.all_hints() if item.id == "time.view_fade")
+    assert hint.modes == frozenset({"time", "fft", "fft_time", "frf", "order"})
+    assert hint.surface == "discovery"
+    assert "单图" in hint.text
+    assert "淡入" in hint.text
+    assert "所有" not in hint.text
+    assert "五个" not in hint.text
+    assert hints.hint_display_width(hint.text) <= hints.HINT_MAX_WIDTH
+    for mode in hint.modes:
+        assert hints._matches_state(hint, HintState(mode=mode)), mode
+
+
+def test_view_history_hint_migrates_camera_off_ctrl_z():
+    hint = next(h for h in hints.all_hints() if h.id == "view.history")
+    back = hints.NAV_SHORTCUTS["back"]
+    assert hint.ship == "now"
+    assert "视角后退已改为" in hint.text
+    assert back in hint.text
+    assert "图表可后退" not in hint.text
+    assert hints.hint_display_width(hint.text) <= hints.HINT_MAX_WIDTH
+    assert back != "Ctrl+Z"
+    assert hints.NAV_SHORTCUTS["forward"] != "Ctrl+Shift+Z"
+
+
+def test_shortcut_tooltip_returns_exact_registered_key():
+    assert hints.shortcut_tooltip("pan") == "Ctrl+G"
+    assert hints.shortcut_tooltip("btn_overlay") == "Ctrl+2"
+    assert hints.shortcut_tooltip("pin_cursor") == "P"
+    assert hints.shortcut_tooltip("missing") is None
+
+
+def test_pinned_cursor_hints_are_mode_gated_and_not_global_p():
+    by_id = {hint.id: hint for hint in hints.all_hints()}
+    pin_ids = ("cursor.pin_single", "cursor.pin_dual", "cursor.pin_off")
+    pin_modes = frozenset({"time", "fft", "frf"})
+    for hint_id, cursor_mode, phrase in (
+        ("cursor.pin_single", "single", "P 固定；数值/完整；点 Pn 开合"),
+        ("cursor.pin_dual", "dual", "先放 A/B；P 固定；数值/完整"),
+        ("cursor.pin_off", "off", "不隐藏已固定"),
+    ):
+        hint = by_id[hint_id]
+        assert hint.surface == "context"
+        assert hint.modes == pin_modes
+        assert hint.cursor_modes == frozenset({cursor_mode})
+        assert phrase in hint.text
+        assert hints.hint_display_width(hint.text) <= hints.HINT_MAX_WIDTH
+        assert "工具栏" not in hint.text
+
+    assert "P 开画笔" in by_id["ultraview.existing_markup"].text
+    assert "pin_cursor" not in {
+        key for key, _label, _shortcut in hints.TIME_CARD_SHORTCUTS
+    }
+
+    for mode, plot_mode, cursor_mode, expected in (
+        ("time", "overlay", "single", "cursor.pin_single"),
+        ("fft", "", "single", "cursor.pin_single"),
+        ("frf", "", "single", "cursor.pin_single"),
+        ("time", "overlay", "dual", "cursor.pin_dual"),
+        ("fft", "", "dual", "cursor.pin_dual"),
+        ("frf", "", "dual", "cursor.pin_dual"),
+        ("time", "overlay", "off", "cursor.pin_off"),
+        ("fft", "", "off", "cursor.pin_off"),
+        ("frf", "", "off", "cursor.pin_off"),
+    ):
+        ids = [
+            hint.id
+            for hint in hints.context_hints(
+                HintState(mode=mode, plot_mode=plot_mode, cursor_mode=cursor_mode)
+            )
+        ]
+        assert expected in ids, (mode, cursor_mode, ids)
+        other = set(pin_ids) - {expected}
+        assert not other.intersection(ids), (mode, cursor_mode, ids)
+
+    dual_ids = [
+        hint.id
+        for hint in hints.context_hints(
+            HintState(mode="time", plot_mode="overlay", cursor_mode="dual")
+        )
+    ]
+    assert dual_ids[0] == "cursor.dual_ab"
+    assert dual_ids.index("cursor.dual_ab") < dual_ids.index("cursor.pin_dual")
+
+    for mode, plot_mode in (
+        ("fft_time", ""),
+        ("order", ""),
+        ("ultraview", ""),
+    ):
+        ids = {
+            hint.id
+            for hint in hints.context_hints(HintState(mode=mode, plot_mode=plot_mode))
+        }
+        assert not set(pin_ids).intersection(ids), (mode, ids)
+
+
+def test_registry_hints_quickref_shortcut_texts_agree():
+    """C5: every command's help projection is generated from the registry."""
+    from mf4_analyzer.ui import quickref
+    from mf4_analyzer.ui.command_registry import CommandId, native_text_for
+
+    for command_id in CommandId:
+        expected = native_text_for(command_id)
+        assert hints.command_shortcut_text(command_id) == expected
+        assert quickref.command_shortcut_text(command_id) == expected
+
+
+def test_hint_scope_defaults_to_chart():
+    assert all(
+        hint.scope == "chart"
+        for hint in hints.all_hints()
+        if hint.id != "markup.capabilities"
+    )
+
+
+def test_markup_capabilities_is_markup_scoped_ship_now_discovery():
+    hint = next(h for h in hints.all_hints() if h.id == "markup.capabilities")
+    assert hint.scope == "markup"
+    assert hint.surface == "discovery"
+    assert hint.ship == "now"
+    assert "箭头移动标注" in hint.text
+    assert "双击编辑文本" in hint.text
+
+
+def test_time_drop_hints_stay_in_budget_and_time_scoped():
+    ids = (
+        "time.drop_join_view",
+        "time.drop_set_xaxis",
+        "time.nav_reorder",
+    )
+    found = {hint.id: hint for hint in hints.all_hints() if hint.id in ids}
+    assert set(found) == set(ids)
+    for hint in found.values():
+        assert hint.modes == frozenset({"time"})
+        assert hint.surface == "discovery"
+        assert hints.hint_display_width(hint.text) <= hints.HINT_MAX_WIDTH
+        assert "拖" in hint.text
+    assert "通道树" in found["time.nav_reorder"].text
+    assert "画布内不能拖行" in found["time.nav_reorder"].text
+    assert "横坐标" in hints.XAXIS_DROP_PANEL_HINT
+    assert "拖" in hints.XAXIS_DROP_PANEL_HINT
+    assert hints.hint_text("time.drop_set_xaxis") == found["time.drop_set_xaxis"].text
+    assert hints.hint_text("missing.id") is None
+    assert "帮助提示" in hints.XAXIS_DROP_PANEL_DISMISSED_TOAST
+
+
+def test_chart_discovery_queue_excludes_markup_scope():
+    state = HintState()
+    ids = []
+    while (hint := hints.discovery_hint(state)) is not None:
+        ids.append(hint.id)
+        state = HintState(discovered=state.discovered | {hint.id})
+    assert "markup.capabilities" not in ids
+
+
+def test_markup_scope_discovery_returns_then_retires_capabilities():
+    fresh = HintState()
+    assert hints.discovery_hint(fresh, scope="markup").id == "markup.capabilities"
+    retired = HintState(discovered=frozenset({"markup.capabilities"}))
+    assert hints.discovery_hint(retired, scope="markup") is None
+
+
+def test_legacy_hints_dwell_defaults_derive_from_priority():
+    # No legacy hint sets dwell_ms/weight explicitly, so they must fall back to
+    # the priority-derived defaults (behavior-preserving for the original 15).
+    for hint in hints.all_hints():
+        if hint.id.startswith("anchor."):
+            continue  # anchors deliberately set explicit dwell/weight
+        if hint.dwell_ms is None:
+            expected = 4000 + max(0, hint.priority) * 80
+            expected = max(3500, min(13000, expected))
+            assert hint.effective_dwell_ms() == expected
+        if hint.weight is None:
+            assert hint.base_weight() == hint.priority
+
+
+def test_rotation_pool_anchor_leads_each_section():
+    # Line sections (time/fft) lead with the Ctrl/Shift wheel anchor; heatmap
+    # sections (fft_time/order) lead with the slice/colorbar anchor.
+    for mode, chart_kind, plot_mode, lead in [
+        ("time", "time", "subplot", "anchor.line_wheel"),
+        ("fft", "fft", "", "anchor.line_wheel"),
+        ("fft_time", "fft_time", "", "anchor.heatmap_gesture"),
+        ("order", "order", "", "anchor.heatmap_gesture"),
+    ]:
+        state = HintState(mode=mode, chart_kind=chart_kind, plot_mode=plot_mode)
+        rot = hints.rotation_hints(state)
+        assert rot, f"empty rotation pool for {mode}"
+        assert rot[0].id == lead, (mode, [h.id for h in rot])
+        # Anchor lingers longest in the lap.
+        assert hints.rotation_dwell_ms(rot[0]) >= max(
+            hints.rotation_dwell_ms(h) for h in rot
+        )
+
+
+def test_rotation_pool_section_gating_keeps_tips_off_other_pages():
+    time_ids = {h.id for h in hints.rotation_hints(
+        HintState(mode="time", chart_kind="time", plot_mode="subplot")
+    )}
+    assert "order.slice" not in time_ids
+    assert "spectrogram.colorbar_scale" not in time_ids
+    assert "fft.preview_pick_source" not in time_ids
+
+
+def test_rotation_used_tip_drops_but_anchor_only_demotes():
+    used = HintState(
+        mode="order", chart_kind="order",
+        recently_used=frozenset({"order.slice", "anchor.heatmap_gesture"}),
+    )
+    ids = [h.id for h in hints.rotation_hints(used)]
+    assert "order.slice" not in ids  # used tip leaves the lap
+    assert "anchor.heatmap_gesture" in ids  # base gesture stays reachable
+
+
+def test_rotation_discovered_echo_retires_tip_across_sessions():
+    disc = HintState(
+        mode="order", chart_kind="order",
+        discovered=frozenset({"spectrogram.colorbar"}),
+    )
+    ids = [h.id for h in hints.rotation_hints(disc)]
+    assert "spectrogram.colorbar_scale" not in ids
+
+
+def test_flash_tip_registry_has_section_gestures():
+    assert hints.flash_tip("preset.right_click")
+    assert hints.flash_tip("spectrogram.slice_pick")
+    assert hints.flash_tip("fft.preview_source")
+    assert hints.flash_tip("missing.id") is None
+
+
+def test_fft_preview_hints_match_overlay_wheel_contract():
+    by_id = {h.id: h for h in hints.all_hints()}
+    for hid in (
+        "fft.preview_wheel",
+        "fft.preview_axis_gutter",
+        "fft.preview_left_axis",
+        "fft.preview_dblclick",
+        "fft.time_range_manual",
+    ):
+        assert hid in by_id, hid
+        assert by_id[hid].modes == frozenset({"fft"})
+    wheel = by_id["fft.preview_wheel"].text
+    assert "平滚轮平移" in wheel
+    assert "Shift" in wheel and "Ctrl" in wheel
+    assert "平移 Y" in hints.flash_tip("fft.preview_source")
+    manual = by_id["fft.time_range_manual"].text
+    assert "预览" in manual and "查看" in manual
+    assert "计算" in manual
+    zoom = by_id["analysis.zoom_view_only"]
+    assert zoom.modes == frozenset({"fft_time", "order", "frf"})
+    assert "缩放" in zoom.text and "查看" in zoom.text
+    confirm = by_id["analysis.time_range_confirm"]
+    assert confirm.modes == frozenset({"fft", "fft_time", "order", "frf"})
+    assert "指定范围" in confirm.text
+    assert "计算" in confirm.text
+    assert "待启用" not in confirm.text
+    all_hint = by_id["analysis.time_range_all"]
+    assert all_hint.modes == frozenset({"fft", "fft_time", "order", "frf"})
+    assert "全时段" in all_hint.text and "指定范围" in all_hint.text
+    assert "未勾选" not in all_hint.text
+    assert "随视窗" not in all_hint.text
+
+
+def test_design_curated_ids_exist_in_registry():
+    spec = (
+        "docs/superpowers/specs/2026-06-01-chart-hint-system-design.md"
+    )
+    text = open(spec, encoding="utf-8").read()
+    curated_sections = re.findall(
+        r"### (?:Persistent|Discovery|Rotating context — Tier S|Rotating context — Tier A)"
+        r"(.*?)(?=\n### |\n## )",
+        text,
+        flags=re.S,
+    )
+    table_lines = "\n".join(
+        line
+        for section in curated_sections
+        for line in section.splitlines()
+        if line.startswith("|")
+    )
+    spec_ids = {
+        match
+        for match in re.findall(r"`([a-z0-9_.]+)`", table_lines)
+    }
+    registry_ids = {hint.id for hint in hints.all_hints()}
+    assert spec_ids <= registry_ids
+
+
+def test_zoom_guard_describes_all_channel_box_zoom():
+    # c87de0fb: overlay box-zoom now scales X and Y for ALL channels (no
+    # selection needed), retiring the stale "拖框优先于选择曲线" guard framing.
+    hint = next(h for h in hints.all_hints() if h.id == "zoom.guard")
+    assert "优先" not in hint.text  # old "拖框优先于选择曲线" framing is gone
+    assert "通道" in hint.text       # now describes the all-channels Y behavior
+
+
+def test_coaxis_hints_shipped_and_surface_in_overlay_and_subplot():
+    # 共轴组 (shared-axis groups) shipped 2026-06-27 (designed in the overlay
+    # shared-axis spec, landed + user-verified on-device). Both hints flip
+    # ship="now" and apply to overlay AND subplot (shared Y = compare amplitude).
+    coaxis = {h.id: h for h in hints.all_hints() if h.id.startswith("coaxis.")}
+    assert {"coaxis.merge", "coaxis.gesture"} <= set(coaxis)
+    assert all(h.ship == "now" for h in coaxis.values())
+    assert all(
+        h.plot_modes == frozenset({"overlay", "subplot"})
+        for h in coaxis.values()
+    )
+
+    for plot_mode in ("overlay", "subplot"):
+        state = HintState(mode="time", plot_mode=plot_mode)
+        # coaxis.merge now appears in the discovery queue (walk until exhausted).
+        seen, walked = set(), state
+        while (h := hints.discovery_hint(walked)) is not None and h.id not in seen:
+            seen.add(h.id)
+            walked = HintState(
+                mode="time", plot_mode=plot_mode, discovered=frozenset(seen)
+            )
+        assert "coaxis.merge" in seen, plot_mode
+        # coaxis.gesture now surfaces as a context + rotation tip.
+        assert "coaxis.gesture" in {h.id for h in hints.context_hints(state)}
+        assert "coaxis.gesture" in {h.id for h in hints.rotation_hints(state)}
+
+
+class _MultiChannelStub:
+    """Minimal FileData stand-in: two signal channels so the right-click menu
+    can offer 合并为共轴 (needs >=2 selected)."""
+
+    data = [1, 2, 3]
+
+    def get_signal_channels(self):
+        return ["speed", "torque"]
+
+    def get_color_palette(self):
+        return ["#1769e0", "#f43f5e"]
+
+
+def test_axis_group_menu_open_retires_coaxis_merge_discovery(qapp, qtbot, monkeypatch):
+    # Released coaxis.merge is surface="discovery" + retire_on="axis_group_menu",
+    # but nothing fired the retire event. Opening the channel-tree context menu
+    # with >=2 channels selected (the 合并为共轴 item present) must call
+    # mark_discovered("coaxis.merge") so the footer stops rotating it. Without
+    # this wiring the released hint rotates forever.
+    from PyQt5.QtCore import QCoreApplication
+    from mf4_analyzer.ui.widgets import MultiFileChannelWidget
+
+    recorded = []
+    monkeypatch.setattr(
+        "mf4_analyzer.ui.widgets.hints.mark_discovered",
+        lambda _settings, hint_id: recorded.append(hint_id),
+    )
+    # The menu is modal/blocking; stub exec_ so the test does not hang.
+    monkeypatch.setattr(
+        "mf4_analyzer.ui.widgets.QMenu.exec_",
+        lambda _menu, *a, **k: None,
+    )
+
+    widget = MultiFileChannelWidget()
+    qtbot.addWidget(widget)
+    widget.resize(320, 240)
+    widget.show()
+    qtbot.waitExposed(widget)
+    widget.add_file("file-a", _MultiChannelStub())
+    # Unattached rows are filtered out of the tree, so visualItemRect would be
+    # empty and the right-click would land on no item at all.
+    widget.set_attached_file_ids(["file-a"])
+    widget.tree.expandAll()
+    QCoreApplication.processEvents()
+
+    file_item = widget._file_items["file-a"]
+    first, second = file_item.child(0), file_item.child(1)
+    widget.tree.scrollToItem(first)
+    QCoreApplication.processEvents()
+    first.setSelected(True)
+    second.setSelected(True)
+
+    pos = widget.tree.visualItemRect(first).center()
+    assert widget.tree.itemAt(pos) is first  # menu opens on a channel row
+    widget._on_context_menu(pos)
+    assert "coaxis.merge" in recorded  # 合并为共轴 present → discovery retired
+
+    # Single-channel right-click (no 合并为共轴 item) must NOT retire it early.
+    recorded.clear()
+    widget.tree.clearSelection()
+    solo_pos = widget.tree.visualItemRect(second).center()
+    widget._on_context_menu(solo_pos)
+    assert "coaxis.merge" not in recorded
+
+
+def test_analysis_view_scope_surfaces_on_every_analysis_section():
+    """The View-scoped signal pickers need an explanation on all three pages.
+
+    The pickers offer only the active analysis View's attached files. When a
+    wanted channel is absent there is no error and no gesture to discover —
+    the list is simply short — so the footer carries the rule on the sections
+    where the pickers live, and nowhere else.
+    """
+    scope = next(h for h in hints.all_hints() if h.id == "analysis.view_scope")
+    assert "分析 View" in scope.text
+    assert "×" in scope.text
+    for mode in ("fft", "fft_time", "order", "frf"):
+        ids = [hint.id for hint in hints.context_hints(HintState(mode=mode))]
+        assert "analysis.view_scope" in ids, mode
+
+    time_ids = [
+        hint.id
+        for hint in hints.context_hints(
+            HintState(mode="time", plot_mode="overlay")
+        )
+    ]
+    assert "analysis.view_scope" not in time_ids, (
+        "time domain picks channels in the tree, not through the signal picker"
+    )
+
+
+def test_analysis_view_scope_trails_the_section_headline_gesture():
+    """Scope explanation must not displace a section's primary gesture."""
+    ids = [
+        hint.id
+        for hint in hints.context_hints(
+            HintState(mode="order", chart_kind="order")
+        )
+    ]
+    assert ids.index("order.slice") < ids.index("analysis.view_scope")
+
+
+def test_ultraview_hints_cover_add_menu_escape_presentation_and_export():
+    by_id = {hint.id: hint for hint in hints.all_hints() if hint.id.startswith("ultraview.")}
+    required = {
+        "ultraview.view_rail",
+        "ultraview.unplaced_badge",
+        "ultraview.add_from_tab",
+        "ultraview.card_menu",
+        "ultraview.sync",
+        "ultraview.sync_all",
+        "ultraview.escape",
+        "ultraview.presentation",
+        "ultraview.export",
+        "ultraview.tray",
+        "ultraview.statuses",
+        "ultraview.readonly",
+        "ultraview.empty_board",
+        "ultraview.direct_manip",
+        "ultraview.display",
+        "ultraview.idle",
+        "ultraview.filter",
+        "ultraview.library_fold",
+        "ultraview.library_pin",
+        "ultraview.library_toggle",
+        "ultraview.free_grid",
+        "ultraview.resize",
+        "ultraview.avoid",
+        "ultraview.replace_ring",
+        "ultraview.undo",
+        "ultraview.preset",
+        "ultraview.minimap",
+        "ultraview.zoom",
+        "ultraview.autofit",
+        "ultraview.inspect",
+        "ultraview.lod",
+        "ultraview.boards",
+        "ultraview.limits",
+        "ultraview.pan",
+        "ultraview.remove",
+        "ultraview.board_menu",
+        "ultraview.resolution",
+        "ultraview.sticky",
+        "ultraview.text",
+        "ultraview.shapes",
+        "ultraview.existing_markup",
+        "ultraview.oneshot",
+        "ultraview.pointer",
+        "ultraview.laser",
+        "ultraview.select_keys",
+        "ultraview.multiselect",
+    }
+    assert required <= set(by_id)
+    assert by_id["ultraview.pointer"].text == "整块单击指针，弹出鼠标/激光笔"
+    assert by_id["ultraview.laser"].text == "激光笔仅换光标；选择、移动、缩放不变"
+    assert by_id["ultraview.select_keys"].text == "V 保持光标样式进入选择，Esc 清选择"
+    source_modes = frozenset({"time", "fft", "fft_time", "frf", "order"})
+    rail_hint = by_id["ultraview.view_rail"]
+    assert rail_hint.surface == "discovery"
+    assert rail_hint.modes == source_modes
+    assert rail_hint.text == "View 栏右侧 UltraView 可打开只读总览"
+    add_hint = by_id["ultraview.add_from_tab"]
+    assert add_hint.surface == "discovery"
+    assert add_hint.modes == source_modes
+    assert "加入总览" in add_hint.text
+    uv_state = HintState(mode="ultraview")
+    uv_ids = {hint.id for hint in hints.context_hints(uv_state)}
+    assert {
+        "ultraview.card_menu",
+        "ultraview.sync",
+        "ultraview.sync_all",
+        "ultraview.escape",
+        "ultraview.presentation",
+        "ultraview.export",
+        "ultraview.tray",
+        "ultraview.statuses",
+        "ultraview.readonly",
+        "ultraview.empty_board",
+        "ultraview.display",
+        "ultraview.idle",
+        "ultraview.filter",
+        "ultraview.library_fold",
+        "ultraview.library_pin",
+        "ultraview.library_toggle",
+    } <= uv_ids
+    time_ids = {hint.id for hint in hints.context_hints(HintState(mode="time", plot_mode="overlay"))}
+    assert not any(hid.startswith("ultraview.") for hid in time_ids)
+    for mode in ("time", "fft", "fft_time", "frf", "order"):
+        state = HintState(mode=mode, plot_mode="overlay" if mode == "time" else "")
+        seen = set()
+        walked = state
+        found_rail = False
+        while (hint := hints.discovery_hint(walked)) is not None and hint.id not in seen:
+            if hint.id == "ultraview.view_rail":
+                found_rail = True
+                break
+            seen.add(hint.id)
+            walked = HintState(
+                mode=mode,
+                plot_mode=state.plot_mode,
+                discovered=frozenset(seen),
+            )
+        assert found_rail, mode
+    haystack = " ".join(hint.text for hint in by_id.values())
+    for banned in (
+        "PDF", "SVG", "sidecar", "live card", "后台补图", "实时", "直播", "Alt+拖",
+        "逻辑画布固定", "默认适应视口", "铺满视口", "12 列受控",
+        "尚未提供", "Coming Soon",
+    ):
+        assert banned not in haystack
+    assert "标尺" in by_id["ultraview.limits"].text
+    assert "24" in by_id["ultraview.limits"].text
+    assert "200" in by_id["ultraview.limits"].text
+    assert "切板" in by_id["ultraview.zoom"].text
+    assert "适应" in by_id["ultraview.zoom"].text
+    assert "300%" in by_id["ultraview.zoom"].text
+    assert "100%" in by_id["ultraview.zoom"].text
+    assert "300%" in by_id["ultraview.inspect"].text
+    assert "Esc" in by_id["ultraview.inspect"].text
+    assert "四向" in by_id["ultraview.pan"].text
+    assert "右键拖" in by_id["ultraview.pan"].text
+    assert "不删" in by_id["ultraview.remove"].text
+    assert "Ctrl/Cmd+Z" in by_id["ultraview.undo"].text
+    assert "当前编辑" in by_id["ultraview.undo"].text
+    assert "不退图表" in by_id["ultraview.undo"].text
+    assert "空白" in by_id["ultraview.board_menu"].text
+    assert "智能排版" in by_id["ultraview.board_menu"].text
+    assert "紧凑排列" in by_id["ultraview.board_menu"].text
+    assert "锁定" in by_id["ultraview.card_menu"].text
+    assert "源 View" in by_id["ultraview.resolution"].text
+    display_hint = by_id["ultraview.display"].text
+    assert "工程" in display_hint
+    assert "保存" in display_hint
+    assert "整框" in by_id["ultraview.text"].text
+    assert "画笔" in by_id["ultraview.existing_markup"].text
+    assert "V/Esc" in by_id["ultraview.existing_markup"].text
+    assert "回选择" in by_id["ultraview.oneshot"].text
+    assert "固定" in by_id["ultraview.oneshot"].text
+    assert "T " in by_id["ultraview.text"].text
+    assert "S " in by_id["ultraview.shapes"].text
+
+
+def test_zfd_timebase_hint_stays_in_budget():
+    hint = next(item for item in hints.all_hints() if item.id == "file.zfd_timebase")
+    assert "ZFD" in hint.text
+    assert "时基" in hint.text
+    assert "导入" in hint.text
+    assert hints.hint_display_width(hint.text) <= hints.HINT_MAX_WIDTH
+
+
+def test_mf4_shared_axis_hint_stays_in_budget():
+    hint = next(item for item in hints.all_hints() if item.id == "file.mf4_shared_axis")
+    assert "MF4" in hint.text
+    assert "时间范围" in hint.text
+    assert hints.hint_display_width(hint.text) <= hints.HINT_MAX_WIDTH
+
+
+def test_wwt_import_hint_mentions_ordinary_view_creation_only():
+    hint = next(
+        item for item in hints.all_hints() if item.id == "file.wwt_create_views"
+    )
+    joined = hint.text
+    for token in ("WWT", "WinWert", "View"):
+        assert token in joined
+    assert "时域" in joined
+    assert hints.hint_display_width(joined) <= hints.HINT_MAX_WIDTH
+    assert "Board" not in joined
+    assert "UltraView" not in joined
+    assert "原生" not in joined
+    assert "像素级一致" not in joined
+    assert "全部公式" not in joined
+
+
+def test_channel_filter_restore_discovery_stays_in_budget():
+    hint = next(
+        item for item in hints.all_hints() if item.id == "channel.filter_restore"
+    )
+    assert hint.surface == "discovery"
+    assert hint.ship == "now"
+    assert "清除筛选" in hint.text
+    assert "展开" in hint.text and "滚动" in hint.text
+    assert "勾选" in hint.text
+    assert "显隐" in hint.text
+    assert "恢复勾选" not in hint.text
+    assert hints.hint_display_width(hint.text) <= hints.HINT_MAX_WIDTH
+
+
+def test_batch_result_details_discovery_stays_in_budget():
+    hint = next(
+        item for item in hints.all_hints() if item.id == "batch.result_details"
+    )
+    assert hint.surface == "discovery"
+    assert hint.ship == "now"
+    assert hint.retire_on == "batch_open"
+    assert "查看详情" in hint.text
+    assert "Esc" in hint.text
+    assert "收起" in hint.text
+    assert "检查" in hint.text
+    assert "重试" not in hint.text
+    assert "导出" not in hint.text
+    assert hints.hint_display_width(hint.text) <= hints.HINT_MAX_WIDTH
+
+
+def test_side_panel_hover_hint_fits_and_quickref_states_peek_facts():
+    hint = next(item for item in hints.all_hints() if item.id == "panel.hover_peek")
+    assert hint.surface == "discovery"
+    assert hint.ship == "now"
+    assert not hint.modes
+    assert hint.text == "悬停边缘可操作，移开收起，点击固定"
+    assert hints.hint_display_width(hint.text) <= hints.HINT_MAX_WIDTH
+
+    from mf4_analyzer.ui import quickref
+
+    blob = "\n".join(
+        f"{row.desc}\n{row.sub}\n{row.gesture}"
+        for group in quickref.QUICKREF
+        for row in group.rows
+    )
+    assert "可操作" in blob
+    assert "离开收起" in blob
+    assert "点击固定" in blob
+    assert "悬停折叠带临时展开并可直接操作，移出后自动收起，点击折叠带或工具栏按钮才固定。" in blob
+
+
+def test_record_curve_eye_hint_points_at_owner_file_not_inspector():
+    hint = next(
+        item for item in hints.all_hints() if item.id == "time.record_curve_eye"
+    )
+    joined = hint.text
+    assert "所属文件" in joined
+    assert "眼睛" in joined
+    assert "Inspector" not in joined
+    assert hint.modes == frozenset({"time"})
+    assert hints.hint_display_width(joined) <= hints.HINT_MAX_WIDTH

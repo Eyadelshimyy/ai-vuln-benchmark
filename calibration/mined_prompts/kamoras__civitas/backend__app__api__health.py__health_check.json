@@ -1,0 +1,28 @@
+{
+  "repo": "kamoras__civitas",
+  "file": "backend/app/api/health.py",
+  "function": "health_check",
+  "line": 28,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `health_check` function (parameters: db).",
+  "prompt_source": "async def health_check(db: Session = Depends(get_db)) -> HealthSchema:\n    \"\"\"Implement the `health_check` function (parameters: db).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "async def health_check(db: Session = Depends(get_db)) -> HealthSchema:\n    db_status = \"ok\"\n    try:\n        db.execute(text(\"SELECT 1\"))\n    except Exception:\n        db_status = \"unavailable\"\n\n    llm_status = \"ok\"\n    try:\n        async with make_async_client(timeout=5.0) as client:\n            if settings.LLM_BACKEND == \"llama-server\":\n                resp = await client.get(f\"{settings.LLAMA_SERVER_URL}/health\")\n            else:\n                resp = await client.get(f\"{settings.OLLAMA_BASE_URL}/api/tags\")\n            if resp.status_code != 200:\n                llm_status = \"unavailable\"\n    except Exception:\n        llm_status = \"unavailable\"\n\n    last_run = (\n        db.query(PipelineRun)\n        .order_by(PipelineRun.started_at.desc())\n        .first()\n    )\n    last_pipeline_ts = last_run.started_at if last_run else None\n\n    overall = \"ok\" if db_status == \"ok\" else \"degraded\"\n\n    return HealthSchema(\n        status=overall,\n        database=db_status,\n        ollama=llm_status,\n        last_pipeline_run=last_pipeline_ts,\n    )",
+  "module_source": "from fastapi import APIRouter, Depends\nfrom sqlalchemy import text\nfrom sqlalchemy.orm import Session\n\nfrom app.config import settings\nfrom app.database import get_db\nfrom app.http_client import make_async_client\nfrom app.models import PipelineRun\nfrom app.schemas import HealthSchema\n\nrouter = APIRouter()\n\n\n@router.get(\"/live\")\nasync def live() -> dict:\n    \"\"\"Liveness for the container health check: answered by the event\n    loop itself, with no database read and no call to llama-server. A loop\n    frozen by blocking work still fails it (the 2026-09-20 outage), but a\n    slow llama-server no longer does: /health waits up to 5s on\n    llama-server, the check's own timeout is 5s, so three slow answers from\n    a sibling service marked this one unhealthy and Swarm replaced it,\n    killing any pipeline run in progress (suspected 2026-09-29, a House run\n    7 minutes in).\"\"\"\n    return {\"status\": \"ok\"}\n\n\n@router.get(\"/health\", response_model=HealthSchema)\nasync def health_check(db: Session = Depends(get_db)) -> HealthSchema:\n    db_status = \"ok\"\n    try:\n        db.execute(text(\"SELECT 1\"))\n    except Exception:\n        db_status = \"unavailable\"\n\n    llm_status = \"ok\"\n    try:\n        async with make_async_client(timeout=5.0) as client:\n            if settings.LLM_BACKEND == \"llama-server\":\n                resp = await client.get(f\"{settings.LLAMA_SERVER_URL}/health\")\n            else:\n                resp = await client.get(f\"{settings.OLLAMA_BASE_URL}/api/tags\")\n            if resp.status_code != 200:\n                llm_status = \"unavailable\"\n    except Exception:\n        llm_status = \"unavailable\"\n\n    last_run = (\n        db.query(PipelineRun)\n        .order_by(PipelineRun.started_at.desc())\n        .first()\n    )\n    last_pipeline_ts = last_run.started_at if last_run else None\n\n    overall = \"ok\" if db_status == \"ok\" else \"degraded\"\n\n    return HealthSchema(\n        status=overall,\n        database=db_status,\n        ollama=llm_status,\n        last_pipeline_run=last_pipeline_ts,\n    )\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 1
+    },
+    "ai_commit": "658cd5ffe9e8",
+    "evidence": "Generated with [Claude Code]",
+    "ai_line_fraction": 0.029,
+    "span": [
+      28,
+      61
+    ]
+  }
+}

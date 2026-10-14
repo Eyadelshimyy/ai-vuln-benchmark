@@ -1,0 +1,346 @@
+"""LED Matrix control app — live preview plus animation picker."""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs
+
+from matrix_deck import __version__
+from matrix_deck.anim import catalog_meta, catalog_revision, create_animation, factories
+from matrix_deck.canvas import Canvas
+from matrix_deck.engine import Deck
+from matrix_deck.theme import current_theme, theme_revision
+
+WEB_ROOT = Path(__file__).resolve().parent / "web"
+
+PREVIEW_FRAMES = 4
+PREVIEW_WARMUP_STEPS = 8
+PREVIEW_GAP_STEPS = 4
+PREVIEW_STEP = 0.06
+_PREVIEW_CACHE: dict[str, dict] = {}
+_PREVIEW_LOCK = threading.Lock()
+
+
+def render_preview(anim_id: str) -> dict | None:
+    """A few 9x34 frames of one animation, rendered offline and cached per id."""
+    anim_id = str(anim_id or "").strip()
+    if not anim_id:
+        return None
+    with _PREVIEW_LOCK:
+        cached = _PREVIEW_CACHE.get(anim_id)
+    if cached is not None:
+        return cached
+    table = factories()
+    if anim_id not in table:
+        return None
+    anim = create_animation(anim_id)
+    canvas = Canvas()
+    frames: list[list[int]] = []
+    for _ in range(PREVIEW_WARMUP_STEPS):
+        anim.step(PREVIEW_STEP, canvas)
+    for index in range(PREVIEW_FRAMES):
+        if index:
+            for _ in range(PREVIEW_GAP_STEPS):
+                anim.step(PREVIEW_STEP, canvas)
+        frames.append(canvas.snapshot())
+    payload = {"id": anim_id, "width": 9, "height": 34, "frames": frames}
+    with _PREVIEW_LOCK:
+        _PREVIEW_CACHE[anim_id] = payload
+    return payload
+
+
+class DeckHandler(SimpleHTTPRequestHandler):
+    deck: Deck
+    httpd = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=str(WEB_ROOT), **kwargs)
+
+    def end_headers(self) -> None:
+        path = self.path.split("?", 1)[0]
+        if not path.startswith("/api/"):
+            self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A003
+        if self.path.startswith("/api/"):
+            return
+        super().log_message(format, *args)
+
+    def do_GET(self) -> None:  # noqa: N802
+        path = self.path.split("?", 1)[0]
+        if path == "/api/frame":
+            snap = self.deck.snapshot()
+            snap["themeRev"] = theme_revision()
+            self._json(200, snap)
+            return
+        if path == "/api/animations":
+            self._json(200, {"animations": catalog_meta(), "rev": catalog_revision()})
+            return
+        if path == "/api/health":
+            self._json(
+                200,
+                {
+                    "ok": True,
+                    "version": __version__,
+                    "animations": len(catalog_meta()),
+                    "catalogRev": catalog_revision(),
+                },
+            )
+            return
+        if path == "/api/theme":
+            self._json(200, current_theme())
+            return
+        if path == "/api/preview":
+            query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            anim_id = (query.get("id") or [""])[0]
+            preview = render_preview(anim_id)
+            if preview is None:
+                self._json(404, {"ok": False, "error": "unknown animation"})
+                return
+            body = json.dumps(preview).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == "/api/library":
+            data = self.deck.library_data()
+            data["randomGroup"] = self.deck.random_group
+            self._json(200, data)
+            return
+        if path == "/api/scenes":
+            self._json(200, {"ok": True, **self.deck.scenes_data()})
+            return
+        if path == "/api/idle":
+            self._json(200, {"ok": True, "idle": self.deck.idle_info()})
+            return
+        if path == "/api/mirror":
+            self._json(200, {"ok": True, "mirror": dict(self.deck.mirror)})
+            return
+        super().do_GET()
+
+    def do_POST(self) -> None:  # noqa: N802
+        path = self.path.split("?", 1)[0]
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        raw = self.rfile.read(length) if length else b""
+        payload: dict = {}
+        if raw:
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._json(400, {"ok": False, "error": "invalid json"})
+                return
+        if path == "/api/animation":
+            side = str(payload.get("side", "left"))
+            anim_id = str(payload.get("id", "flappy"))
+            if side not in ("left", "right"):
+                self._json(400, {"ok": False, "error": "side must be left or right"})
+                return
+            self.deck.set_animation(side, anim_id)
+            self._json(200, {"ok": True, "side": side, "id": anim_id})
+            return
+        if path == "/api/click":
+            side = str(payload.get("side", "left"))
+            if side not in ("left", "right"):
+                self._json(400, {"ok": False, "error": "side must be left or right"})
+                return
+            try:
+                x = int(payload.get("x", 0))
+                y = int(payload.get("y", 0))
+            except (TypeError, ValueError):
+                self._json(400, {"ok": False, "error": "invalid coordinates"})
+                return
+            erase = bool(payload.get("erase", False))
+            self.deck.click(side, x, y, erase)
+            self._json(200, {"ok": True})
+            return
+        if path == "/api/stroke":
+            side = str(payload.get("side", "left"))
+            if side not in ("left", "right"):
+                self._json(400, {"ok": False, "error": "side must be left or right"})
+                return
+            points = payload.get("points") or []
+            if not isinstance(points, list) or len(points) > 128:
+                self._json(400, {"ok": False, "error": "points must be a list of at most 128 pairs"})
+                return
+            erase = bool(payload.get("erase", False))
+            self.deck.stroke(side, points, erase)
+            self._json(200, {"ok": True})
+            return
+        if path == "/api/key":
+            side = str(payload.get("side", "left"))
+            if side not in ("left", "right"):
+                self._json(400, {"ok": False, "error": "side must be left or right"})
+                return
+            code = str(payload.get("code", ""))
+            self.deck.key(side, code)
+            self._json(200, {"ok": True})
+            return
+        if path == "/api/flap":
+            self.deck.flap()
+            self._json(200, {"ok": True})
+            return
+        if path == "/api/brightness":
+            try:
+                self.deck.set_brightness(int(payload.get("value", self.deck.brightness)))
+            except (TypeError, ValueError):
+                self._json(400, {"ok": False, "error": "invalid brightness"})
+                return
+            self._json(200, {"ok": True, "brightness": self.deck.brightness})
+            return
+        if path == "/api/speed":
+            try:
+                self.deck.set_speed(float(payload.get("value", self.deck.speed)))
+            except (TypeError, ValueError):
+                self._json(400, {"ok": False, "error": "invalid speed"})
+                return
+            self._json(200, {"ok": True, "speed": self.deck.speed})
+            return
+        if path == "/api/random":
+            enabled = bool(payload.get("enabled", True))
+            self.deck.set_random(enabled)
+            self._json(200, {"ok": True, "random": self.deck.random_mode, "randomGroup": self.deck.random_group})
+            return
+        if path == "/api/library":
+            data = self.deck.replace_library(payload)
+            self._json(200, {"ok": True, **data, "randomGroup": self.deck.random_group})
+            return
+        if path == "/api/favorite":
+            anim_id = str(payload.get("id", ""))
+            if not anim_id.strip():
+                self._json(400, {"ok": False, "error": "id required"})
+                return
+            data = self.deck.set_favorite(anim_id, bool(payload.get("on", True)))
+            self._json(200, {"ok": True, **data})
+            return
+        if path == "/api/groups":
+            name = str(payload.get("name", "")).strip()
+            if not name:
+                self._json(400, {"ok": False, "error": "name required"})
+                return
+            data = self.deck.add_group(name)
+            self._json(200, {"ok": True, **data})
+            return
+        if path == "/api/groups/delete":
+            group_id = str(payload.get("id", "")).strip()
+            if not group_id:
+                self._json(400, {"ok": False, "error": "id required"})
+                return
+            data = self.deck.delete_group(group_id)
+            self._json(200, {"ok": True, **data})
+            return
+        if path == "/api/groups/item":
+            group_id = str(payload.get("groupId", "")).strip()
+            anim_id = str(payload.get("animId", "")).strip()
+            if not group_id or not anim_id:
+                self._json(400, {"ok": False, "error": "groupId and animId required"})
+                return
+            data = self.deck.set_group_item(group_id, anim_id, bool(payload.get("on", True)))
+            self._json(200, {"ok": True, **data})
+            return
+        if path == "/api/group-random":
+            group_id = str(payload.get("groupId", "")).strip()
+            if not group_id:
+                self._json(400, {"ok": False, "error": "groupId required"})
+                return
+            self.deck.set_group_random(group_id, bool(payload.get("enabled", True)))
+            self._json(200, {"ok": True, "random": self.deck.random_mode, "randomGroup": self.deck.random_group})
+            return
+        if path == "/api/text":
+            side = str(payload.get("side", "left"))
+            if side not in ("left", "right"):
+                self._json(400, {"ok": False, "error": "side must be left or right"})
+                return
+            self.deck.set_text(side, str(payload.get("text", "")))
+            self._json(200, {"ok": True, "side": side, "text": self.deck.text[side]})
+            return
+        if path == "/api/scenes":
+            name = str(payload.get("name", "")).strip()
+            if not name and not str(payload.get("id", "")).strip():
+                self._json(400, {"ok": False, "error": "name required"})
+                return
+            data = self.deck.save_scene(payload)
+            if data.get("scene") is None:
+                self._json(400, {"ok": False, "error": "invalid scene"})
+                return
+            self._json(200, {"ok": True, **data})
+            return
+        if path == "/api/scenes/delete":
+            scene_id = str(payload.get("id", "")).strip()
+            if not scene_id:
+                self._json(400, {"ok": False, "error": "id required"})
+                return
+            self._json(200, {"ok": True, **self.deck.delete_scene(scene_id)})
+            return
+        if path == "/api/scenes/apply":
+            scene_id = str(payload.get("id", "")).strip()
+            if not scene_id:
+                self._json(400, {"ok": False, "error": "id required"})
+                return
+            scene = self.deck.apply_scene(scene_id)
+            if scene is None:
+                self._json(404, {"ok": False, "error": "unknown scene"})
+                return
+            self._json(200, {"ok": True, "scene": scene, **self.deck.scenes_data()})
+            return
+        if path == "/api/idle":
+            enabled = payload.get("enabled")
+            minutes = payload.get("minutes")
+            try:
+                info = self.deck.set_idle(
+                    None if enabled is None else bool(enabled),
+                    None if minutes is None else int(minutes),
+                )
+            except (TypeError, ValueError):
+                self._json(400, {"ok": False, "error": "invalid idle settings"})
+                return
+            self._json(200, {"ok": True, "idle": info})
+            return
+        if path == "/api/mirror":
+            side = str(payload.get("side", "left"))
+            if side not in ("left", "right"):
+                self._json(400, {"ok": False, "error": "side must be left or right"})
+                return
+            mirror = self.deck.set_mirror(side, bool(payload.get("on", True)))
+            self._json(200, {"ok": True, "mirror": mirror})
+            return
+        if path == "/api/quit":
+            threading.Thread(target=self._quit, daemon=True).start()
+            self._json(200, {"ok": True})
+            return
+        self._json(404, {"ok": False, "error": "not found"})
+
+    def _json(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _quit(self) -> None:
+        time.sleep(0.05)
+        try:
+            self.deck.stop()
+        except Exception:
+            pass
+        if self.httpd is not None:
+            self.httpd.shutdown()
+
+
+def make_server(deck: Deck, host: str, port: int) -> ThreadingHTTPServer:
+    DeckHandler.deck = deck
+    handler = partial(DeckHandler)
+    httpd = ThreadingHTTPServer((host, port), handler)
+    httpd.daemon_threads = True
+    DeckHandler.httpd = httpd
+    return httpd

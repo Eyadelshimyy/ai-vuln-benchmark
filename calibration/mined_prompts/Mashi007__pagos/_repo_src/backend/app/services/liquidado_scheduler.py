@@ -1,0 +1,131 @@
+# -*- coding: utf-8 -*-
+"""
+Scheduler: actualizacion de estado a LIQUIDADO a las 00:40 (Caracas).
+
+El correo automatico por liquidacion (PDF estado de cuenta) fue retirado del scheduler.
+"""
+import logging
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from sqlalchemy import text, update
+
+from app.core.database import SessionLocal
+from app.models.prestamo import Prestamo
+from app.services.cuota_estado import hoy_negocio
+from app.services.prestamo_db_compat import prestamos_tiene_columna_fecha_liquidado
+
+logger = logging.getLogger(__name__)
+
+class LiquidadoScheduler:
+    def __init__(self):
+        self.scheduler = None
+    
+    def actualizar_prestamos_liquidado(self):
+        """Ejecuta la funcion que actualiza prestamos a LIQUIDADO y asigna fecha_liquidado (Caracas)."""
+        db = SessionLocal()
+        try:
+            logger.info('INICIANDO: Actualizacion de prestamos a LIQUIDADO')
+            
+            # Ejecutar funcion que actualiza estados
+            result = db.execute(text('''
+                SELECT actualizar_prestamos_a_liquidado_automatico()
+            ''')).fetchone()
+            
+            db.commit()
+
+            ids_liquidados = [
+                int(row[0])
+                for row in db.execute(text('''
+                    SELECT DISTINCT prestamo_id
+                    FROM auditoria_cambios_estado_prestamo
+                    WHERE DATE(fecha_cambio) = CURRENT_DATE
+                      AND estado_nuevo = 'LIQUIDADO'
+                ''')).fetchall()
+                if row[0] is not None
+            ]
+            logger.info(f'Se encontraron {len(ids_liquidados)} prestamos liquidados hoy para refrescar finiquito')
+
+            if ids_liquidados and prestamos_tiene_columna_fecha_liquidado(db):
+                fd = hoy_negocio()
+                db.execute(
+                    update(Prestamo)
+                    .where(Prestamo.id.in_(ids_liquidados))
+                    .values(fecha_liquidado=fd)
+                )
+                db.commit()
+                logger.info(
+                    "fecha_liquidado=%s asignada a %s prestamos",
+                    fd,
+                    len(ids_liquidados),
+                )
+            elif ids_liquidados:
+                logger.warning(
+                    "Omitido UPDATE fecha_liquidado: columna no existe (aplique migracion 023)."
+                )
+
+            if ids_liquidados:
+                try:
+                    from app.services.finiquito_refresh import (
+                        refrescar_finiquito_caso_prestamo_si_aplica,
+                    )
+
+                    for lid in ids_liquidados:
+                        refrescar_finiquito_caso_prestamo_si_aplica(db, int(lid))
+                    db.commit()
+                except Exception:
+                    logger.exception(
+                        "Error refrescando finiquito_casos tras batch LIQUIDADO (n=%s)",
+                        len(ids_liquidados),
+                    )
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+
+            # Consultar total de cambios registrados
+            cambios = db.execute(text('''
+                SELECT COUNT(*) FROM auditoria_cambios_estado_prestamo
+                WHERE DATE(fecha_cambio) = CURRENT_DATE
+            ''')).fetchone()
+            
+            logger.info(f'COMPLETADO: {cambios[0]} prestamos actualizados a LIQUIDADO')
+            
+        except Exception as e:
+            logger.error(f'ERROR en actualizar_prestamos_liquidado: {e}', exc_info=True)
+            try:
+                db.rollback()
+            except:
+                pass
+        finally:
+            db.close()
+    
+    def iniciar_scheduler(self):
+        """Inicia el scheduler (idempotente por proceso)."""
+        if self.scheduler is not None:
+            logger.info("Scheduler LIQUIDADO ya estaba iniciado en este proceso; omitiendo.")
+            return
+        self.scheduler = BackgroundScheduler(timezone='America/Caracas')
+        
+        # Configurar job a las 00:40 todos los dias (madrugada Caracas)
+        self.scheduler.add_job(
+            self.actualizar_prestamos_liquidado,
+            'cron',
+            hour=0,
+            minute=40,
+            id='actualizar_liquidado_diario',
+            name='Actualizacion diaria de prestamos a LIQUIDADO',
+            misfire_grace_time=60
+        )
+        
+        self.scheduler.start()
+        logger.info('Scheduler iniciado. Job programado para las 00:40 diariamente (Caracas)')
+    
+    def detener_scheduler(self):
+        """Detiene el scheduler"""
+        if self.scheduler:
+            self.scheduler.shutdown()
+            logger.info('Scheduler detenido')
+
+
+# Instancia global del scheduler
+liquidado_scheduler = LiquidadoScheduler()

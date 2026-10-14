@@ -1,0 +1,533 @@
+"""
+LLM client -- supports llama-server (default, Docker) and Ollama fallback.
+
+Backend selection via settings.LLM_BACKEND: "llama-server" or "ollama".
+"""
+
+import hashlib
+import json
+import logging
+import re
+import time
+import urllib.error
+import urllib.request
+from collections.abc import AsyncIterator
+from typing import Any
+
+from sqlalchemy.orm import Session
+
+from app.config import settings
+from app.http_client import make_async_client
+from app.pipeline.cache import analysis_cache_get, analysis_cache_set
+from app.database import SessionLocal
+
+logger = logging.getLogger(__name__)
+
+_max_retries = 3
+
+# HTTP timeout scales with requested output length so a long generation
+# (a high max_tokens) doesn't get killed mid-response
+# by a timeout sized for a short one, while a short call doesn't wait the
+# full ceiling on a hung connection. ~6 tokens/sec is a conservative
+# generation-rate estimate for the Pi's CPU inference; 60s covers fixed
+# overhead (model load/prompt processing) independent of output length.
+_HTTP_TIMEOUT_TOKENS_PER_SECOND = 6
+_HTTP_TIMEOUT_BASE_OVERHEAD_S = 60
+_HTTP_TIMEOUT_MIN_S = 120
+_HTTP_TIMEOUT_MAX_S = 600
+
+
+class LLMCallStats:
+    """Tracks call_llm()'s cache hit/miss counters, overall and per prompt
+    version — was 4 separate module-level globals mutated via `global`
+    statements, the same shape as the already-fixed PipelineRunTracker.
+    """
+
+    def __init__(self) -> None:
+        self.total_calls = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.per_prompt: dict[str, dict[str, int]] = {}
+
+    def _bucket(self, prompt_version: str) -> dict[str, int]:
+        return self.per_prompt.setdefault(prompt_version, {"hits": 0, "misses": 0})
+
+    def record_call(self) -> None:
+        self.total_calls += 1
+
+    def record_hit(self, prompt_version: str) -> None:
+        self.cache_hits += 1
+        self._bucket(prompt_version)["hits"] += 1
+
+    def record_miss(self, prompt_version: str) -> None:
+        self.cache_misses += 1
+        self._bucket(prompt_version)["misses"] += 1
+
+    def snapshot(self) -> dict:
+        total = self.cache_hits + self.cache_misses
+        hit_rate = round(self.cache_hits / total, 3) if total > 0 else None
+        per_prompt = {
+            v: {
+                **s,
+                "hit_rate": round(s["hits"] / (s["hits"] + s["misses"]), 3)
+                if (s["hits"] + s["misses"]) > 0 else None,
+            }
+            for v, s in self.per_prompt.items()
+        }
+        return {
+            "total_calls": self.total_calls,
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "cache_hit_rate": hit_rate,
+            "per_prompt": per_prompt,
+            "estimated_cost": "free (local LLM)",
+        }
+
+    def reset(self) -> None:
+        self.total_calls = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.per_prompt = {}
+
+
+_stats = LLMCallStats()
+
+
+def _make_input_hash(prompt_version: str, input_data: Any, model: str = "") -> str:
+    raw = prompt_version + "|" + model + "|" + json.dumps(input_data, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _strip_thinking_tokens(text: str) -> str:
+    """Strip <think>...</think> chain-of-thought blocks emitted by reasoning models.
+
+    Reasoning models (e.g. DeepSeek-R1, used previously — see config.py's
+    OLLAMA_MODEL history) emit a reasoning trace before the final answer.
+    If not removed, the greedy JSON-extraction regex matches from the
+    first { inside the think block to the last } in the output, producing
+    an unparseable span. A no-op safeguard for non-reasoning models (the
+    current default, LFM2.5-1.2B-Instruct, doesn't emit these — unlike its
+    sibling LFM2.5-1.2B-Thinking, deliberately not used here; see the
+    2026-07 model evaluation for why).
+    """
+    # Strip closed <think>...</think> blocks, then also drop an UNTERMINATED
+    # trailing <think> (a length-truncated reasoning trace never emits its
+    # closing tag, and would otherwise poison the JSON extraction below).
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<think>[\s\S]*$", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def extract_json(text: str) -> Any | None:
+    text = _strip_thinking_tokens(text)
+
+    try:
+        return json.loads(text.strip())
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    code_block_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    if code_block_match:
+        try:
+            return json.loads(code_block_match.group(1).strip())
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Try the object span and the array span INDEPENDENTLY, each first-to-
+    # last of its own bracket type. A single greedy alternation matched
+    # leftmost-first, so a stray "[Note]" before a real JSON object made
+    # the match run from that "[" to the last "]" (inside the object) and
+    # fail with no second chance. Prefer whichever span parses; try the
+    # object first since these prompts return objects.
+    for pattern in (r"\{[\s\S]*\}", r"\[[\s\S]*\]"):
+        m = re.search(pattern, text)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+    return None
+
+
+def _cache_get_with_own_session(version: str, input_hash: str, *, raise_errors: bool = False) -> Any | None:
+    db = SessionLocal()
+    try:
+        return analysis_cache_get(db, version, input_hash, raise_db_errors=raise_errors)
+    finally:
+        db.close()
+
+
+def _cache_set_with_own_session(version: str, input_hash: str, data: dict) -> None:
+    db = SessionLocal()
+    try:
+        analysis_cache_set(db, version, input_hash, data)
+    finally:
+        db.close()
+
+
+def _call_llama_server(
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int,
+    num_ctx: int,
+    http_timeout: int,
+) -> str | None:
+    """Call llama-server via OpenAI-compatible /v1/chat/completions."""
+    url = f"{settings.LLAMA_SERVER_URL}/v1/chat/completions"
+    body = json.dumps({
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "response_format": {"type": "json_object"},
+    }).encode()
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=http_timeout) as resp:
+        raw = resp.read()
+    data = json.loads(raw)
+    choice = data["choices"][0]
+    finish = choice.get("finish_reason", "")
+    if finish == "length":
+        logger.warning("llama-server output truncated (finish_reason=length)")
+    return choice["message"]["content"]
+
+
+def _call_ollama(
+    system_prompt: str,
+    user_prompt: str,
+    model: str,
+    max_tokens: int,
+    num_ctx: int,
+    http_timeout: int,
+) -> str | None:
+    """Call Ollama via /api/generate."""
+    url = f"{settings.OLLAMA_BASE_URL}/api/generate"
+    body = json.dumps({
+        "model": model,
+        "prompt": user_prompt,
+        "system": system_prompt,
+        "format": "json",
+        "stream": False,
+        "options": {
+            "num_predict": max_tokens,
+            "num_ctx": num_ctx,
+            "temperature": 0.0,
+        },
+    }).encode()
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=http_timeout) as resp:
+        raw = resp.read()
+    data = json.loads(raw)
+    if data.get("done_reason") == "length":
+        logger.warning("Ollama output truncated (done_reason=length) for model %s", model)
+    return data.get("response", "")
+
+
+class StreamCutOff(Exception):
+    """Raised by stream_llm after the last delta when the generation stopped
+    at its token limit rather than finishing: the text so far ends
+    mid-sentence."""
+
+
+async def _stream_llama_server(
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int,
+    num_ctx: int,
+    http_timeout: int,
+) -> AsyncIterator[str]:
+    """Stream llama-server via OpenAI-compatible /v1/chat/completions.
+
+    Same endpoint as _call_llama_server, minus response_format (streamed
+    text isn't valid JSON mid-response anyway — see prompts.py's
+    SUMMARY_KEY_POINTS_MARKER note) and with stream=True, which switches
+    the response body to SSE: lines of `data: {...}` carrying incremental
+    `choices[0].delta.content`, terminated by a literal `data: [DONE]`.
+    """
+    url = f"{settings.LLAMA_SERVER_URL}/v1/chat/completions"
+    body = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "stream": True,
+    }
+    async with make_async_client(timeout=http_timeout) as client:
+        async with client.stream("POST", url, json=body) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                payload = line[len("data:"):].strip()
+                if payload == "[DONE]":
+                    break
+                chunk = json.loads(payload)
+                choice = chunk["choices"][0]
+                delta = choice.get("delta", {}).get("content")
+                if delta:
+                    yield delta
+                if choice.get("finish_reason") == "length":
+                    raise StreamCutOff()
+
+
+async def _stream_ollama(
+    system_prompt: str,
+    user_prompt: str,
+    model: str,
+    max_tokens: int,
+    num_ctx: int,
+    http_timeout: int,
+) -> AsyncIterator[str]:
+    """Stream Ollama via /api/generate: one JSON object per line
+    (`{"response": "...", "done": false}`), no `data:` prefix, no [DONE]
+    sentinel — the final line just carries `"done": true` instead."""
+    url = f"{settings.OLLAMA_BASE_URL}/api/generate"
+    body = {
+        "model": model,
+        "prompt": user_prompt,
+        "system": system_prompt,
+        "stream": True,
+        "options": {
+            "num_predict": max_tokens,
+            "num_ctx": num_ctx,
+            "temperature": 0.0,
+        },
+    }
+    async with make_async_client(timeout=http_timeout) as client:
+        async with client.stream("POST", url, json=body) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.strip():
+                    continue
+                chunk = json.loads(line)
+                delta = chunk.get("response")
+                if delta:
+                    yield delta
+                if chunk.get("done"):
+                    if chunk.get("done_reason") == "length":
+                        logger.warning("Ollama output truncated (done_reason=length) for model %s", model)
+                        raise StreamCutOff()
+                    break
+
+
+def get_cached_llm_result(
+    prompt_version: str, cache_key: Any, model: str | None = None, *, raise_errors: bool = False,
+) -> Any | None:
+    """Public read side of call_llm's cache, for callers (stream_llm's
+    users) that need to check/write the same cache rows without going
+    through call_llm's own retry/JSON-extraction loop — streaming callers
+    parse their own output and handle retries differently, since a retry
+    after partial output is already visible to the user isn't a silent
+    do-over the way it is for a one-shot JSON call.
+
+    A read that fails is None ("not cached") unless `raise_errors`: for a
+    caller that would otherwise make again what may well be stored."""
+    use_model = model or settings.OLLAMA_MODEL
+    input_hash = _make_input_hash(prompt_version, cache_key, use_model)
+    try:
+        return _cache_get_with_own_session(prompt_version, input_hash, raise_errors=raise_errors)
+    except Exception:
+        if raise_errors:
+            raise
+        logger.debug("LLM cache lookup failed", exc_info=True)
+        return None
+
+
+def set_cached_llm_result(prompt_version: str, cache_key: Any, data: dict, model: str | None = None) -> None:
+    use_model = model or settings.OLLAMA_MODEL
+    input_hash = _make_input_hash(prompt_version, cache_key, use_model)
+    try:
+        _cache_set_with_own_session(prompt_version, input_hash, data)
+    except Exception:
+        logger.debug("LLM cache write failed", exc_info=True)
+
+
+async def stream_llm(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    model: str | None = None,
+    max_tokens: int = 512,
+    num_ctx: int = 4096,
+) -> AsyncIterator[str]:
+    """Stream the configured LLM backend's response as plain-text deltas.
+
+    No retry, no JSON extraction, no cache — this is the raw generation
+    primitive for callers that render progressively as text arrives (see
+    explore.py's summary endpoint) and handle caching/retries themselves
+    at the call site, since "retry" means something different once a
+    partial response may already be visible to the user. call_llm above
+    remains the right choice for every other caller — one-shot JSON
+    output, cached, retried transparently.
+
+    Raises StreamCutOff after the last delta when the output stopped at
+    `max_tokens`.
+    """
+    use_model = model or settings.OLLAMA_MODEL
+    http_timeout = min(
+        max(
+            max_tokens // _HTTP_TIMEOUT_TOKENS_PER_SECOND + _HTTP_TIMEOUT_BASE_OVERHEAD_S,
+            _HTTP_TIMEOUT_MIN_S,
+        ),
+        _HTTP_TIMEOUT_MAX_S,
+    )
+    if settings.LLM_BACKEND == "llama-server":
+        async for delta in _stream_llama_server(system_prompt, user_prompt, max_tokens, num_ctx, http_timeout):
+            yield delta
+    else:
+        async for delta in _stream_ollama(system_prompt, user_prompt, use_model, max_tokens, num_ctx, http_timeout):
+            yield delta
+
+
+def call_llm(
+    *,
+    prompt_version: str,
+    system_prompt: str,
+    user_prompt: str,
+    cache_key: Any,
+    db_session: Session | None = None,
+    model: str | None = None,
+    max_tokens: int = 2048,
+    num_ctx: int = 4096,
+) -> Any | None:
+    """
+    Call the configured LLM backend with structured JSON output.
+    Results are cached by prompt version + input hash in the database.
+
+    ``cache_key=None`` disables caching entirely for this call (both the
+    lookup and the write-back) — several callers pass it explicitly for
+    time-sensitive or always-fresh generations (role-reversal re-checks,
+    Bluesky post text, spotlight highlights). Caching used to be keyed off
+    ``_make_input_hash(prompt_version, None, model)``, which JSON-serializes
+    ``None`` to the constant string ``"null"`` — every call sharing a
+    prompt_version and model then collided on the *same* cache row
+    regardless of actual content. Confirmed live 2026-07-15: a single
+    stale/wrong role-check verdict about an unrelated story got cached
+    under that shared slot and was then returned for every subsequent
+    role-check regardless of topic, silently rejecting every generated
+    action-center summary for 26+ hours (zero new issues, zero Bluesky
+    posts) since the check never reflected what was actually being
+    verified.
+    """
+    use_model = model or settings.OLLAMA_MODEL
+    use_backend = settings.LLM_BACKEND
+
+    use_cache = cache_key is not None and db_session is not None
+    input_hash = _make_input_hash(prompt_version, cache_key, use_model) if use_cache else None
+    if use_cache:
+        try:
+            cached = _cache_get_with_own_session(prompt_version, input_hash)
+            if cached is not None:
+                _stats.record_hit(prompt_version)
+                return cached
+        except Exception:
+            logger.debug("LLM cache lookup failed", exc_info=True)
+        _stats.record_miss(prompt_version)
+
+    estimated_prompt_tokens = (len(system_prompt) + len(user_prompt)) // 3
+    required = estimated_prompt_tokens + max_tokens
+    if required > num_ctx * 0.95:
+        old_ctx = num_ctx
+        num_ctx = min(required + 512, 8192)
+        logger.warning(
+            "Prompt for %s estimated at %d tokens (need %d), bumping num_ctx %d -> %d",
+            prompt_version, estimated_prompt_tokens, required, old_ctx, num_ctx,
+        )
+
+    http_timeout = min(
+        max(
+            max_tokens // _HTTP_TIMEOUT_TOKENS_PER_SECOND + _HTTP_TIMEOUT_BASE_OVERHEAD_S,
+            _HTTP_TIMEOUT_MIN_S,
+        ),
+        _HTTP_TIMEOUT_MAX_S,
+    )
+
+    for attempt in range(1, _max_retries + 1):
+        try:
+            if use_backend == "llama-server":
+                text = _call_llama_server(
+                    system_prompt, user_prompt, max_tokens, num_ctx, http_timeout,
+                )
+            else:
+                text = _call_ollama(
+                    system_prompt, user_prompt, use_model, max_tokens, num_ctx, http_timeout,
+                )
+
+            _stats.record_call()
+
+            parsed = extract_json(text)
+            if parsed is None:
+                logger.warning(
+                    "LLM returned non-JSON for %s, attempt %d (len=%d). Raw (500 chars): %.500s",
+                    prompt_version, attempt, len(text) if text else 0, text,
+                )
+                if attempt < _max_retries:
+                    time.sleep(1.0)
+                    continue
+                logger.error(
+                    "LLM JSON parse failed for %s after %d attempts",
+                    prompt_version, _max_retries,
+                )
+                return None
+
+            if use_cache:
+                try:
+                    _cache_set_with_own_session(prompt_version, input_hash, parsed)
+                except Exception:
+                    logger.debug("LLM cache write failed", exc_info=True)
+
+            return parsed
+
+        except urllib.error.HTTPError as e:
+            # 2026-08 audit (live SSH investigation of "check back later"
+            # full-story generation): %s on an HTTPError only prints the
+            # generic reason phrase ("HTTP Error 500: Internal Server
+            # Error"), discarding the actual response body — which is
+            # where the real cause lives. Live example found this way:
+            # llama-server's body was {"error": "Invalid input batch."}
+            # (a server-side prompt-cache bug, not anything this app
+            # sent wrong), completely invisible from the reason phrase
+            # alone. Bounded read: an error body is normally a small
+            # JSON object, not worth risking an unbounded read for.
+            try:
+                error_body = e.read(2048).decode("utf-8", errors="replace")
+            except Exception:
+                error_body = "<could not read response body>"
+            logger.warning(
+                "LLM HTTP error for %s (attempt %d): %s | body: %s",
+                prompt_version, attempt, e, error_body,
+            )
+            if attempt == _max_retries:
+                return None
+            time.sleep(1.0)
+
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            logger.warning("LLM request error for %s (attempt %d): %s", prompt_version, attempt, e)
+            if attempt == _max_retries:
+                return None
+            time.sleep(attempt * 2.0)
+
+        except Exception:
+            logger.exception("Unexpected error in call_llm for %s (attempt %d)", prompt_version, attempt)
+            if attempt == _max_retries:
+                return None
+            time.sleep(attempt * 2.0)
+
+    return None
+
+
+def get_llm_stats() -> dict:
+    return _stats.snapshot()
+
+
+def reset_client() -> None:
+    pass
+
+
+def reset_stats() -> None:
+    _stats.reset()

@@ -1,0 +1,151 @@
+"""Shared response helpers for the read-only politician/entity API routers.
+
+cached_json was copy-pasted into six router modules (senators, representatives,
+presidents, justices, bills, politicians) rather than written once — not a
+deliberate per-router choice, just accretion as each entity type's routes
+were added over time.
+"""
+
+from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
+
+from app.services.score_trends import change_on_current_method
+
+# Cache-Control max-age tiers shared across the read-only API routers —
+# previously each router repeated its own bare-number max_age= literal
+# (120, 300, 600, 3600...) with no indication of why that particular
+# tier applied to that particular endpoint.
+CACHE_TTL_SEARCH_S = 60          # rate-limited, CPU-intensive search endpoints
+CACHE_TTL_DETAIL_S = 120         # single-entity detail/breakdown/history
+CACHE_TTL_LIST_S = 300           # leaderboards and other paginated/aggregate lists
+CACHE_TTL_REFERENCE_S = 600      # rarely-changing reference lists (e.g. states index)
+CACHE_TTL_CONFIG_S = 3600        # config/weights — changes only on a deploy
+
+# Party-filter query param validation, shared across every router that
+# exposes a ?party= filter — previously each repeated the same regex
+# literal independently.
+PARTY_QUERY_PATTERN = r"^[DRI]$"
+
+# Canonical chamber metadata values as written by explore_pipeline, keyed by
+# the lowercase form callers send (Explore and the public API's search). The
+# sqlite-vec metadata filter is an exact string comparison, so a lowercase
+# "senate" matched nothing — user input is mapped through this before
+# querying. None of the four non-legislative chambers was reachable at all
+# before this map existed.
+EXPLORE_CHAMBERS: dict[str, str] = {
+    "senate": "Senate", "house": "House", "executive": "Executive",
+    "judicial": "Judicial", "regulatory": "Regulatory",
+}
+
+# Real doc_type values in the index (explore_pipeline). An unknown value is
+# an exact-match miss that returns zero results for a reason the caller
+# can't see, so both APIs reject it with 422 instead.
+EXPLORE_DOC_TYPES: tuple[str, ...] = (
+    "Senate Floor Speech", "House Floor Speech", "Executive Order",
+    "Proclamation", "Presidential Memorandum", "Supreme Court Opinion",
+    "Final Rule", "Proposed Rule", "Notice",
+)
+
+
+def cached_json(data, max_age: int = CACHE_TTL_LIST_S) -> JSONResponse:
+    """Wrap data in a JSONResponse with Cache-Control headers."""
+    return JSONResponse(
+        content=data,
+        headers={"Cache-Control": f"public, max-age={max_age}, stale-while-revalidate={max_age}"},
+    )
+
+
+# How long a failed live fetch may be reused. Short, because the failure is
+# this moment's, not the resource's; shared rather than no-store, because
+# during an outage every reader's refresh would otherwise reach the upstream
+# again — this bounds that to one request per URL per period, across all
+# visitors. nginx caches it, and once it expires the next request refreshes
+# it while the others wait on that one (proxy_cache_lock): no
+# stale-while-revalidate is sent, so neither nginx nor a browser nor any
+# other cache serves it past this.
+FAILURE_RETRY_S = 30
+
+
+# The Cache-Control of an answer that is only good until the next try: a
+# failed live fetch, or a partial answer (Explore search without its vector
+# index).
+RETRY_SOON_CACHE_CONTROL = f"public, max-age={FAILURE_RETRY_S}"
+
+
+def retry_soon_json(data) -> JSONResponse:
+    """A response that reports a failed live fetch — part of an upstream
+    record missing, a ballot that couldn't be read, news feeds down: cached
+    for FAILURE_RETRY_S only, never for a success's lifetime."""
+    return JSONResponse(content=data, headers={"Cache-Control": RETRY_SOON_CACHE_CONTROL})
+
+
+# Default score_1..score_5 -> dimension-name mapping (senators/reps share
+# this shape). Presidents use a different set of dimensions on the same
+# generic score_1..score_5 slots (see PRESIDENT_DIMENSION_LABELS below) —
+# score_history_json takes a labels map instead of hardcoding one, so it
+# stays the single shared implementation rather than forking a near-
+# identical copy per entity type.
+SENATOR_DIMENSION_LABELS = {
+    "score_1": "fundingIndependence",
+    # score_2 (Promise Persistence) is retired: campaign-promise tracking
+    # was removed in 2026-07 and every value since is a constant, so it is
+    # not drawn (as the presidents' score_3 below).
+    "score_3": "constituentAlignment",
+    "score_4": "fundingDiversity",
+    "score_5": "legislativeEffectiveness",
+}
+
+# score_5 = Historical Legacy (added 2026-07) — see
+# president_pipeline._record_president_snapshots. score_3 (Competence) is
+# retired (2026-07, same place) — omitted here so trend charts simply
+# don't render a flat, always-0.0 line for it; old snapshot rows still
+# have real historical values in that column, just no longer surfaced.
+PRESIDENT_DIMENSION_LABELS = {
+    "score_1": "publicMandate",
+    "score_2": "effectiveness",
+    "score_5": "historicalLegacy",
+}
+
+
+def score_history_json(
+    db: Session,
+    entity_type: str,
+    entity_id: str,
+    max_age: int = CACHE_TTL_CONFIG_S,
+    dimension_labels: dict[str, str] = SENATOR_DIMENSION_LABELS,
+) -> JSONResponse:
+    """Historical score snapshots for any entity type backed by the
+    generic ScoreSnapshot table (senator/representative/president).
+
+    Was byte-identical between GET /senators/{id}/history and
+    GET /representatives/{id}/history apart from the entity_type filter;
+    generalized (2026-07) to take a dimension_labels map so
+    GET /presidents/{id}/history — a different set of dimension names on
+    the same score_1..score_5 slots — reuses this instead of forking a
+    near-identical copy.
+    """
+    from app.models import ScoreSnapshot
+
+    snapshots = (
+        db.query(ScoreSnapshot)
+        .filter(ScoreSnapshot.entity_type == entity_type, ScoreSnapshot.entity_id == entity_id)
+        .order_by(ScoreSnapshot.date)
+        .all()
+    )
+    return cached_json({
+        # The change the history's headline states: on the current method
+        # (and, for a member, within the current Congress) only.
+        "change": change_on_current_method(snapshots, by_congress=entity_type != "president"),
+        "snapshots": [
+            {
+                "date": s.date,
+                "overallScore": round(s.overall_score, 1),
+                "algorithmVersion": s.algorithm_version,
+                "scores": {
+                    label: round(getattr(s, slot), 1)
+                    for slot, label in dimension_labels.items()
+                },
+            }
+            for s in snapshots
+        ]
+    }, max_age=max_age)

@@ -1,0 +1,3706 @@
+"""
+Score calculator — computes the representation sub-scores from real data:
+three weighted into the overall (SCORE_WEIGHTS), two informational.
+
+Higher score = better representation of constituents.
+All scores are 0-100 where 100 = ideal representative, 0 = fully captured.
+
+The scored dimensions (SCORE_WEIGHTS) — Promise Persistence (removed
+v6.0) and Funding Diversity (folded into Funding Independence, v6.5)
+still run and still store their score_* columns, just excluded from
+the weighted sum below:
+  1. Funding Independence       — PAC share, small-donor share, top-donor
+                                  concentration, industry concentration (v6.13;
+                                  v6.5 folded in the former Funding Diversity)
+  2. Constituent Alignment      — break rate vs same-party members of
+                                  similarly-leaning seats, in standard
+                                  deviations per vote, plus roll-call position
+                                  vs the seat's norm (v6.16)
+  3. Legislative Effectiveness  — stage-normalized Volden & Wiseman LES
+                                  (v6.14), cosponsorship leadership,
+                                  bipartisan coalition attraction
+
+North star (owner, 2026-07): scores measure how well members REPRESENT
+their constituents — not independence as an intrinsic virtue. Party-line
+voting in a seat that elected that platform is representation.
+
+Design principles
+-----------------
+- Each sub-score measures a *distinct* dimension of representation.
+- Formulas are transparent and auditable — no black-box LLM scoring.
+- Missing data yields a neutral 50, never a perfect 100 or 0.
+- Seniority alone is never penalized; only *behavioral* signals matter.
+
+Academic rationale
+------------------
+Funding Independence: donor-influence framing follows Bonica (2014,
+"Mapping the Ideological Marketplace," AJPS 58:2) and Barber (2016,
+"Representing the Preferences of Donors, Partisans, and Voters in the
+U.S. Senate," POQ 80(S1)) — both papers are about donor/candidate
+ideological positioning, not donor-concentration statistics by rank
+(verified by full-text search, 2026-07: neither paper contains a PAC-
+ratio or top-N-donor-concentration table). The specific calibration
+targets below are this platform's own live empirical audits, not
+numbers reproduced from either paper — see _calc_funding_independence's
+own "Academic rationale" note for the fuller account. The PAC share is
+scored against what the seat predicts (v6.26, _pac_expectation: a
+senator's state population, the House median), in share points on the
+chamber's measured spread. Top-donor concentration (the top 10 donors'
+share of all outside contributions) and industry concentration (the HHI of
+the industry money's mix) are ranked within the chamber (v6.26,
+_rank_score), industry concentration within the member's party. Parmigiani (2025, "Campaign contributions and legislative
+behavior," Journal of Public Economics 243) computes industry HHI per
+legislator as the industry component does; its top-donor share is taken
+over itemized donors, a narrower base than the all-contributions share
+used here since v6.26 (the itemized base read a campaign of small gifts as
+unmeasurable).
+
+Promise Persistence: follows Naurin (2011, "Election Promises, Party
+Behaviour and Voter Perceptions," Palgrave) who showed that promise
+fulfillment is measurable and varies meaningfully across legislators.
+The confidence penalty (blending toward 50 when few promises are
+evaluable) is linear shrinkage toward 50 at a fixed rate, min(n/k, 1).
+It borrows the idea of Stein-type shrinkage (Efron & Morris 1975, "Data
+Analysis Using Stein's Estimator," JASA 70:350) but is not their
+estimator: the rate comes from a count threshold, not from the
+population's measured variance, and it stops shrinking at n >= k.
+Floor advocacy uses Martin (2011, "Using Parliamentary Questions to
+Measure Constituency Focus," Political Studies 59:2) as precedent for floor speech as a proxy for legislative
+effort.
+
+Constituent Alignment: raw party-line break rates are misleading without
+context. Following Carson et al. (2010, "The Electoral Costs of Party
+Loyalty," AJPS 54:3), we use Cook PVI as a proxy for constituent
+preferences and score each member against the break rate same-party
+members of their chamber show at the same seat lean — a senator in a safe
+R+20 state voting with their party is representing constituents, not
+failing at independence, while the same loyalty in a swing state diverges
+from the median voter. Roll-call position is scored against a
+seat-conditional norm too (Canes-Wrone, Brady & Cogan 2002, "Out of Step,
+Out of Office," APSR 96:1), linearly: 50 at the norm, rising toward the
+seat's center, a shape tested in v6.27. This is the delegate model of
+representation (Miller & Stokes 1963, "Constituency Influence in
+Congress," APSR 57:1), with seat partisan lean standing in for issue-level
+constituent opinion. Both studies validate their measures by the
+incumbent's vote share; v6.13 used that same test to choose this
+dimension's design (docs/research/constituent-alignment.md). Because the
+member was elected under a party label as well as by a seat (Fenno 1978's
+concentric constituencies), the vote score is highest where a member
+breaks about as often as same-party members of similarly-leaning seats and
+falls both ways (v6.16) — the shape the member's own party's primary
+voters reward; the general electorate rewards breaking more, and the
+research note says so. Donor independence via lobbying matches follows
+Stratmann (2005) with the methodological caution from Ansolabehere, de
+Figueiredo & Snyder (2003, "Why Is There So Little Money in U.S.
+Politics?" JEP 17:1) that donation-vote correlations are not causal
+evidence of influence.
+
+Funding Diversity: the inverse Herfindahl-Hirschman Index (HHI) applied
+to industry-level donation shares — concentrated funding from a single
+industry suggests potential regulatory capture, while broad funding
+suggests diverse constituent support — has real, on-topic precedent in
+the campaign-finance literature: Parmigiani (2025, "Campaign
+contributions and legislative behavior," Journal of Public Economics
+243) computes an HHI of contribution concentration per legislator per
+cycle as a robustness measure, the same statistic this component
+computes, just bucketed by donor industry rather than by individual
+donor. Rhoades (1993, "The Herfindahl-Hirschman Index," Fed Reserve
+Bulletin 79) is kept as a secondary reference for HHI's general
+mechanics — it is a banking/antitrust note with no campaign-finance
+content of its own, so it explains the statistic but not why it applies
+here; Parmigiani does. Resolved, not disclosed-and-deferred: Parmigiani's
+own discussion argues top-share measures are better suited than HHI/Gini
+to the long-tailed distributions donor data actually has — the same
+reason income-inequality research prefers top-1%-share over Gini — which
+raised a real question of whether Funding Diversity should move from
+inverse-HHI to a top-share-based measure. Tested directly (2026-07)
+against every scorecarded member's live industry breakdown (n=413 with
+>=5% industry-classified funding, the same usability floor this
+function's own fallback branch below uses): HHI and top-1-industry-share
+are rank-correlated at rho=0.942 (Spearman, p<1e-190) — the two measures
+agree on all but a handful of members. This isn't a coincidence to
+distrust; it has a structural reason. Parmigiani's argument is about raw
+per-DONOR amounts, which really are long-tailed like personal income —
+but this component buckets by industry first (the adaptation this file's
+docstring already names), and that aggregation step is exactly what
+smooths away the extreme tail a top-share measure is built to handle.
+Bucketing several thousand individual donors into one "Finance" row
+caps how dominant any single row can get long before HHI or top-share
+ever see the data — the two statistics converge because the input they
+share has already had its long tail removed. The real disagreements that
+remain (e.g. a member with several moderately-large industries vs. one
+genuinely dominant one, as for two House members in the live 2026-07
+data) are the exact case the theory predicts, but they affect roughly a
+dozen members, not the population — not enough to justify moving every
+member's score for a measure that would rank them almost identically.
+Kept as inverse-HHI on that basis.
+
+References
+----------
+- Bonica, A. (2014). AJPS, 58(2), 367-386.
+- Barber, M.J. (2016). Public Opinion Quarterly, 80(S1), 225-249.
+- Stratmann, T. (2005). Public Choice, 124(1-2), 135-156.
+- Naurin, E. (2011). Election Promises. Palgrave Macmillan.
+- Efron, B. & Morris, C. (1975). JASA, 70(350), 311-319.
+- Martin, S. (2011). Political Studies, 59(2), 472-488.
+- Carson, J. et al. (2010). AJPS, 54(3), 598-616.
+- Ansolabehere, S. et al. (2003). JEP, 17(1), 105-130.
+- Rhoades, S. (1993). Fed Reserve Bulletin, 79, 188-189.
+- Parmigiani, A. (2025). Journal of Public Economics, 243, 105319.
+- Canes-Wrone, B., Brady, D.W. & Cogan, J.F. (2002). APSR, 96(1), 127-140.
+- Harbridge, L. & Malhotra, N. (2011). AJPS, 55(3), 494-510.
+- Harbridge-Yong, L., Volden, C. & Wiseman, A.E. (2023). J. Politics, 85(3).
+- Lewis, J.B. et al. Voteview: Congressional Roll-Call Votes Database
+  (voteview.com) — Nokken-Poole and DW-NOMINATE member estimates.
+
+Version history
+---------------
+Why each formula changed, version by version, is recorded in
+docs/methodology/member-score/ (one decision record per version; the public
+summary is frontend/src/lib/scoreVersions.ts). This docstring and the code
+comments state the current rule only.
+"""
+
+import json
+import logging
+import math
+import pathlib
+import statistics
+from datetime import date
+
+from app.atomic_write import update_json_file
+from app.config import settings
+from app.file_cache import Stamp, new_reload_lock
+from app.config_definitions import (
+    CONSTITUENT_FULL_CONFIDENCE_VOTES,
+    CONSTITUENT_MIN_VOTES,
+    CONSTITUENT_REFERENCE_STATISTIC,
+    SATURATION_QUANTILE,
+)
+from app.models import PromiseAlignment
+from app.ordinals import ordinal
+from app.pipeline.analyze.constituent_approval import senate_approval
+from app.pipeline.analyze.population_reference import (
+    CONSTITUENT_REFERENCE,
+    FUNDING_REFERENCE,
+    LES_REFERENCE,
+)
+from app.pipeline.analyze.score_bounds import clamp
+from app.time_utils import utcnow
+
+logger = logging.getLogger(__name__)
+
+# Bump when scoring formulas or their data inputs change in a way that
+# shifts scores. Recorded on every ScoreSnapshot so trend charts can
+# annotate methodology changes. Keep frontend/src/lib/scoreVersions.ts (the
+# public changelog) in sync, and add a decision record for the new version
+# under docs/methodology/member-score/ — that is where the reasons go, not
+# here.
+ALGORITHM_VERSION = "v6.34"
+
+# weight-key -> Senator/Representative score_* attribute name. Both models
+# use identical score_* column names, so one map covers both entity types.
+_SCORE_FIELD_MAP: dict[str, str] = {
+    "fundingIndependence": "score_funding_independence",
+    "promisePersistence": "score_promise_persistence",
+    "constituentAlignment": "score_constituent_alignment",
+    "fundingDiversity": "score_funding_diversity",
+    "legislativeEffectiveness": "score_legislative_effectiveness",
+}
+
+
+def compute_overall_score(entity) -> float:
+    """Weighted overall score from a scored Senator/Representative row, or
+    from a plain representationScore-shaped dict (camelCase keys matching
+    SCORE_WEIGHTS directly — api/public.py's serialized API responses).
+
+    Shared by senate_pipeline.py's and house_pipeline.py's daily
+    ScoreSnapshot recorders and api/public.py's response builders — all
+    weight the same score_* fields by the same config_definitions.
+    SCORE_WEIGHTS, previously copy-pasted in each. Sums dynamically over
+    SCORE_WEIGHTS.items() rather than naming each dimension, so a weight-
+    table change (e.g. removing a dimension) can't silently desync this
+    formula from the config again — that gap was exactly what made the
+    promisePersistence removal above require an audit of 7 independently
+    hardcoded copies instead of touching one file.
+    """
+    from app.config_definitions import SCORE_WEIGHTS
+
+    if isinstance(entity, dict):
+        overall = sum(entity.get(key, 0) * weight for key, weight in SCORE_WEIGHTS.items())
+    else:
+        overall = sum(
+            getattr(entity, _SCORE_FIELD_MAP[key], 0) * weight
+            for key, weight in SCORE_WEIGHTS.items()
+        )
+    return round(overall, 2)
+
+
+NON_INDUSTRY_CODES = {"OTHER", "SMALL_DONORS", "LARGE_INDIVIDUAL", "POLITICAL", "UNCLASSIFIED", "CANDIDATE_FUNDS"}
+
+# Substantive legislation only — excludes simple/concurrent resolutions
+# (sres/hres/sconres/hconres), which are routinely ceremonial ("National
+# Mushroom Day", a sorority-anniversary resolution) and agreed to without
+# debate. Used wherever "did this member do real legislative work" needs
+# to exclude commemorative content: Legislative Effectiveness (both
+# advancement and volume) and, via cross_reference.py, promise derivation
+# from a member's own sponsored bills.
+SUBSTANTIVE_BILL_TYPES = {"s", "hr", "sjres", "hjres"}
+
+# A bill's latestAction text is free-form Congress.gov prose, not a
+# controlled vocabulary — these substrings are the ones that reliably
+# appear across "passed the chamber," "agreed to" (resolutions/unanimous
+# consent), and "ordered to be reported" (cleared committee) language.
+# Shared with sponsorship_analysis.py's cosponsorship-edge weighting, so
+# "did this bill advance" means the same thing in both Legislative
+# Effectiveness and Legislative Leadership.
+#
+# 2026-07 (a disclosed exception): this only runs for bills where isLaw
+# is already false (the strongest, non-keyword "did this advance" signal
+# — becoming law — is checked first and short-circuits before this ever
+# runs; see _cosponsorship_edge_weight). Live-measured against 1366 real
+# distinct latestAction strings from production: 352 matched these
+# keywords, and only 1 (0.28%) contained a plausible false-positive
+# pattern — a double-clause sentence where an unrelated procedural
+# sub-motion ("agreed to") was matched instead of the bill's own outcome
+# ("...failed of passage... agreed to [the motion to table
+# reconsideration]"). An embedding check against short institutional
+# procedural phrases wouldn't obviously do better on a case this specific
+# and rare; the keyword match's transparency and determinism are worth
+# more here than chasing one edge case in 352.
+_ADVANCEMENT_ACTION_KEYWORDS = ("passed", "agreed to", "ordered to be reported")
+
+# Tenure (years) at which a member's raw cosponsorship-PageRank leadership
+# score is trusted at full face value. Below it, the score is shrunk toward
+# neutral because PageRank centrality is structurally a function of network
+# size, which takes years to build — a freshman's near-zero percentile
+# reflects time in office, not ineffectiveness (2026-07 audit; see the
+# decision record docs/methodology/member-score/v5.12.md). Scaled to a full 6-year Senate term: long enough to
+# plausibly build a real network, short enough that a second-term member
+# isn't still getting a pass. Shared by Legislative Effectiveness's
+# leadership component (_legislative_effectiveness_core) and the displayed
+# leader/follower label (sponsorship_analysis.describe_senator_position), so
+# the same "seniority alone is never penalized" correction applies to both.
+LEADERSHIP_TENURE_FULL_CREDIT_YEARS = 6.0
+
+# Per-state Cook PVI (positive = R lean, negative = D lean) — the seat
+# expectation for SENATORS, the state-level analog of the per-district
+# district_pvi.json used for House members (_district_pvi below).
+#
+# COMPUTED from real presidential returns, not a hand-typed table: the
+# checked-in app/data/state_pvi.json is generated by
+# scripts/fetch_state_pvi.py, which derives each state's PVI from MEDSL's
+# official 2020 & 2024 vote counts via Cook's formula (the state's two-
+# party Democratic vote share minus the national two-party Democratic
+# share, weighted 75% to the recent election and 25% to the earlier,
+# negated so positive = R lean). It reproduces all 51 of Cook Political
+# Report's 2025 published state PVIs (v6.33; the equal-weight mean before
+# it was a point off in 18). Refresh it the same way
+# district_pvi.json / state_population.json are refreshed — rerun the
+# script and commit the regenerated JSON — after a new presidential
+# election shifts the two-cycle window.
+
+_state_pvi_cache: dict[str, int] | None = None
+
+
+_PVI_PERSISTENT_DIR = "/data"
+
+
+def _read_pvi_json(filename: str, *, report_unreadable: bool = False) -> dict:
+    """Read a PVI JSON file, preferring the persistent volume's
+    auto-refreshed copy (/data/, written by an automated fetch module) over
+    the bundled git-tracked fallback (app/data/, updated only by manually
+    running a scripts/fetch_*.py script). Same override pattern as
+    transform/committee_data.py's loader.
+
+    report_unreadable: a persistent copy that exists but can't be read right
+    now raises file_cache.Uncached with the fallback, so a stamped cache
+    retries instead of keeping the fallback until the file next changes."""
+
+    from app.file_cache import Uncached, read_json_preferring
+
+    bundled_dir = pathlib.Path(__file__).resolve().parent.parent.parent / "data"
+    try:
+        data = read_json_preferring(pathlib.Path(_PVI_PERSISTENT_DIR) / filename, bundled_dir / filename, default={})
+    except Uncached as unreadable:
+        if report_unreadable:
+            raise
+        data = unreadable.value
+    return data if isinstance(data, dict) else {}
+
+
+def _state_pvi() -> dict[str, int]:
+    """Per-state Cook PVI ("ST" -> signed int, positive = R lean).
+
+    Ingested from state_pvi.json (generated by scripts/fetch_state_pvi.py
+    — see the comment above; unlike district_pvi.json this is NOT
+    refreshed automatically — see ops_alerts.check_state_pvi_staleness for
+    why). Falls back to an empty map if the file is unavailable, exactly
+    like _district_pvi(): an unresolved state then reads as lean 0 (a
+    neutral swing seat) via the .get(state, 0) call sites, rather than
+    crashing scoring or silently substituting stale hand-entered numbers.
+    Missing data is never punitive — the same degrade-gracefully
+    convention as every other loader in this file.
+    """
+    from app.file_cache import Uncached
+
+    global _state_pvi_cache
+    if _state_pvi_cache is None:
+        try:
+            raw = _read_pvi_json("state_pvi.json", report_unreadable=True)
+        except Uncached as unreadable:
+            # A volume copy that exists but can't be read right now: its
+            # fallback serves this once, not for the life of the process.
+            raw = unreadable.value
+            return {k: int(v) for k, v in (raw.get("states") or {}).items()}
+        if raw.get("states"):
+            _state_pvi_cache = {k: int(v) for k, v in raw["states"].items()}
+        else:
+            logger.error(
+                "state_pvi.json unavailable — every senator's seat lean will "
+                "default to neutral (0); regenerate with scripts/fetch_state_pvi.py"
+            )
+            _state_pvi_cache = {}
+    return _state_pvi_cache
+
+_member_ideal_points_cache: dict | None = None
+_member_ideal_points_stamp: Stamp = None
+_member_ideal_points_lock = new_reload_lock()
+
+
+_MEMBER_IDEAL_POINTS_PATH = "/data/member_ideal_points.json"
+
+
+def _member_ideal_points(chamber: str) -> dict:
+    """Roll-call ideal-point data for one chamber ("senate" or "house"):
+    {"members": {bioguideId: dim1}, "votes": {bioguideId: scaled roll calls},
+    "fit": {party: {"a", "b"}}, "extremity_p90": float, "measure",
+    "congress", "seats", "seated", "reliability", "scale_congress", "prior",
+    "parties", "switched"} (votes, congress, seats, seated, reliability,
+    scale_congress, prior, parties and switched since v6.27; parties and
+    switched are read only by the flank rule; prior, the last Congress's
+    positions, is read only by party_line_record's flank rule, never
+    scored). Used by _constituent_alignment_core's position-congruence
+    component (v6.11): the member's congress-specific Nokken-Poole
+    first-dimension position (DW-NOMINATE only as a whole-chamber fallback)
+    scored against a seat-conditional expectation.
+
+    Ingested from /data/member_ideal_points.json (the persistent
+    writable volume — same one party_ideology_bounds.json lives on, and
+    for the same reason: this is generated by the running app itself,
+    not an offline artifact). Each chamber's pipeline refreshes its own
+    section EVERY RUN from Voteview's published Nokken-Poole estimates
+    (DW-NOMINATE only as a whole-chamber fallback; Lewis et al.,
+    voteview.com) joined against the seat-lean tables
+    (fetch/voteview.py — fetch, per-party OLS fit, ingestion gates,
+    then write_member_ideal_points below). Fully automated: no manual
+    generation step exists. Every number the scoring formula consumes
+    (positions, regression coefficients, saturation scale) is computed
+    from real data by that ingest, never hand-typed here.
+
+    Falls back to an empty dict if the file or the chamber's key is
+    missing — the position-congruence component is then skipped entirely
+    for every member (a whole chamber with no data is not scored neutral,
+    exactly like coalition breadth's old missing-data handling; one member
+    without a position in a current v6.27 section is, at 50), and
+    constituent alignment runs on the seat-relative vote component alone.
+    So the component is inert only until the FIRST successful ingest; a
+    later fetch/gate failure keeps the last good data (stale beats
+    punitive, and positions move slowly week to week). Since v6.27 that
+    holds within a Congress: a section records its Congress, and
+    _ideal_points_current reads it only for roll calls of that Congress, so
+    once the new Congress's roll calls are being scored the component is
+    left out until its Voteview export passes the gates. Missing data is never
+    punitive — same convention as every other loader in this file.
+    """
+
+    from app.file_cache import Uncached, read_json, reload_if_moved
+
+    global _member_ideal_points_cache, _member_ideal_points_stamp
+    path = pathlib.Path(_MEMBER_IDEAL_POINTS_PATH)
+
+    def read() -> dict:
+        try:
+            data = read_json(path)
+        except OSError:
+            logger.warning("member_ideal_points.json unreadable — retrying on next use", exc_info=True)
+            raise Uncached({}) from None
+        if isinstance(data, dict):
+            return data
+        logger.warning(
+            "member_ideal_points.json unavailable — position-congruence "
+            "component will be skipped for every member until the first "
+            "successful Voteview ingest (fetch/voteview.py, runs "
+            "automatically each pipeline run)"
+        )
+        return {}
+
+    # Rewritten each run in the pipeline process; read by the API processes'
+    # score breakdowns (explain_scores), which reload when it moves.
+    with _member_ideal_points_lock:
+        _member_ideal_points_cache, _member_ideal_points_stamp = reload_if_moved(
+            [path], _member_ideal_points_cache, _member_ideal_points_stamp, read,
+        )
+        points = _member_ideal_points_cache
+    chamber_data = points.get(chamber)
+    return chamber_data if isinstance(chamber_data, dict) else {}
+
+
+def _ideal_points_current(section: dict, congress: int | None = None) -> bool:
+    """Whether a member_ideal_points section describes `congress`: the
+    Congress of the roll calls being scored (a party-line record's own
+    "congress"), else the sitting one. A section records its Congress since
+    v6.27; one that predates that is taken as current, as it always was.
+    Another Congress's section (a refresh that failed its gates after Jan 3
+    keeps the last one on disk) is not read: its positions are not this
+    term's record (AGENTS.md principle 6). Matching the record's Congress
+    rather than the clock keeps a stored score's "show the math" on the
+    positions it was scored on across Jan 3, while that Congress's section
+    is on disk, until the next run rescores it. A member with no
+    party-line record (matched to no roll call) is judged against the
+    sitting Congress."""
+
+    have = section.get("congress")
+    want = congress if congress is not None else settings.CURRENT_CONGRESS
+    return have is None or int(have) == int(want)
+
+
+def write_member_ideal_points(chamber: str, data: dict) -> None:
+    """Persist one chamber's gated ideal-point section (fetch/voteview.py's
+    build output) to /data/member_ideal_points.json. Read-merge-write, not
+    overwrite — the two chamber pipelines run independently and each owns
+    only its own section — under the file's lock (update_json_file), so two
+    chambers writing at once can't drop each other's.
+    Callers gate BEFORE calling (refresh_member_ideal_points): this
+    function persists what it's given.
+
+    Never raises: best-effort side artifact, a write failure must not
+    abort an otherwise-successful pipeline run (the loader then serves
+    the previous file, or skips the component).
+    """
+    global _member_ideal_points_cache
+    path = pathlib.Path(_MEMBER_IDEAL_POINTS_PATH)
+    try:
+        from app.pipeline.fetch.voteview import METHOD_DESC, SOURCE_DESC
+
+        def merge(existing: dict) -> dict:
+            existing["_source"] = SOURCE_DESC
+            existing["_method"] = METHOD_DESC
+            existing[chamber] = data
+            return existing
+
+        update_json_file(path, merge, indent=1, sort_keys=True, end="\n")
+        _member_ideal_points_cache = None  # force reload next _member_ideal_points() call
+    except Exception:
+        logger.warning(
+            "Failed to write member_ideal_points.json for %s — position-"
+            "congruence will use stale or empty data until the next "
+            "successful write; pipeline run continues.",
+            chamber, exc_info=True,
+        )
+
+
+_state_population_cache: dict[str, float] | None = None
+
+
+def _state_population() -> dict[str, float]:
+    """State population in millions, 2020 Census (state abbreviation ->
+    float). Used only by _state_small_donor_baseline (Funding
+    Independence's small-donor component, Senate only — see that
+    function's docstring); DC/territories have no voting senators and are
+    intentionally omitted, falling back to the national mean baseline.
+
+    Ingested from Wikipedia into app/data/state_population.json;
+    regenerate with scripts/fetch_state_population.py (also the single
+    source scripts/fetch_state_small_donor_baseline.py's regression audit
+    reads, so the two can't silently drift apart the way a second
+    hardcoded copy could). Population, unlike Cook PVI, doesn't shift
+    enough between censuses to need per-cycle regeneration — rerun after
+    the 2030 census.
+    """
+    global _state_population_cache
+    if _state_population_cache is None:
+        path = pathlib.Path(__file__).resolve().parent.parent.parent / "data" / "state_population.json"
+        try:
+            _state_population_cache = {
+                k: float(v) for k, v in json.loads(path.read_text())["states"].items()
+            }
+        except Exception:
+            logger.warning("state_population.json unavailable — small-donor baseline will use the national mean for every state")
+            _state_population_cache = {}
+    return _state_population_cache
+
+
+_position_reliability_cache: dict | None = None
+
+
+def _position_reliability(chamber: str) -> dict:
+    """{"n0", "reference_votes", "half_weight_votes", "uncounted_weight",
+    "prior_until_votes"} (the last for party_line_record's flank rule): the
+    reliability weight a congress-specific (Nokken-Poole) position in
+    `chamber` gets (v6.27, position_confidence). Measured by
+    scripts/calibrate_position_confidence.py on Voteview's own positions:
+    members with a thin record in one Congress and a full one in the next
+    (or the reverse), against full records' drift over the same transition
+    (research note section 14). As calibrated now, one curve for both
+    chambers over every Congress: the calibration chooses among one curve,
+    one per chamber, the latest era's (since a fixed Congress) and a window
+    of recent transitions by how well each predicts the next Congress from
+    the earlier ones, keeping the simplest within one standard error of the
+    best (a party-line term was tested and found no support). Nothing in it
+    follows the sitting Congress.
+
+    Read from app/data/position_confidence.json, and stored in each
+    member_ideal_points section at ingest: the score reads the section's
+    copy. {} (no weighting, the pre-v6.27 behaviour) if the file or the
+    chamber is unavailable: missing data is never punitive.
+    """
+    global _position_reliability_cache
+    if _position_reliability_cache is None:
+        path = pathlib.Path(__file__).resolve().parent.parent.parent / "data" / "position_confidence.json"
+        try:
+            raw = json.loads(path.read_text())
+            _position_reliability_cache = {
+                name: {"n0": float(c["n0"]), "half_weight_votes": float(c["half_weight_votes"]),
+                       "reference_votes": float(raw["reference_votes"]),
+                       "uncounted_weight": float(raw["uncounted_weight"]),
+                       "prior_until_votes": float(raw["prior_until_votes"])}
+                for name, c in raw["chambers"].items()
+            }
+        except Exception:
+            logger.warning(
+                "position_confidence.json unavailable: position congruence will not weight "
+                "thin records; regenerate with scripts/calibrate_position_confidence.py"
+            )
+            _position_reliability_cache = {}
+    return dict(_position_reliability_cache.get(chamber) or {})
+
+
+# A fetch/district_pvi.SeatLines (a dict of the sitting table that also
+# carries its Congress and every pinned table, from one read) — never a plain
+# dict outside tests, or district_pvi.lines_of/current_lines couldn't steer it.
+_district_pvi_cache: dict[str, int] | None = None
+# The stamp (file_cache.files_stamp) of the live file when _district_pvi_cache
+# was loaded. The Supplementary and House runs rewrite /data/district_pvi.json
+# (new pins, the sitting-Congress switch) in the pipeline process, and the
+# API processes read it for breakdowns and elections (settings.PROCESS_ROLE)
+# — the writer's reload only reaches its own process, so the readers notice
+# the new file by its stamp.
+_district_pvi_stamp: Stamp = None
+_district_pvi_lock = new_reload_lock()
+
+
+def _district_pvi() -> dict[str, int]:
+    """Per-district Cook PVI ("ST-N" -> signed int, positive = R lean).
+
+    The SITTING Congress's lines — the districts members were elected on,
+    not whatever map the next election uses. Ingested from a pinned
+    per-Congress source (app/data/district_pvi_sources.json) by
+    app/pipeline/fetch/district_pvi.py to /data/district_pvi.json, which
+    puts the sitting Congress's table in "districts" (settings.
+    CURRENT_CONGRESS, the Congress the scored windows read too — advanced to
+    the one in office, from noon ET on Jan 3 of an odd year, at the start of
+    each pipeline job unless an operator pins it (app.config.
+    scoring_congress); with no pinned table for it, the newest one before
+    it — switched before each House run scores); the bundled
+    app/data/district_pvi.json is only the pre-first-ingest fallback (all
+    435 seats incl. vacancies; ingestion gates documented in the fetch
+    module). State PVI is the wrong seat expectation for House
+    members in split states — a D+19 urban district in a red state was
+    scored as an "opposed seat" whose member should cross party lines
+    ~20% of the time, when the seat actually elected exactly that
+    platform.
+    """
+
+    from app.file_cache import Uncached, reload_if_moved
+    from app.pipeline.fetch.district_pvi import seat_lines
+
+    global _district_pvi_cache, _district_pvi_stamp
+
+    def read() -> dict[str, int]:
+        try:
+            return seat_lines(_read_pvi_json("district_pvi.json", report_unreadable=True))
+        except Uncached as unreadable:
+            raise Uncached(seat_lines(unreadable.value)) from None
+
+    with _district_pvi_lock:
+        _district_pvi_cache, _district_pvi_stamp = reload_if_moved(
+            [pathlib.Path(_PVI_PERSISTENT_DIR) / "district_pvi.json"], _district_pvi_cache, _district_pvi_stamp, read,
+        )
+        return _district_pvi_cache
+
+
+def _reload_district_pvi() -> dict[str, int]:
+    """_district_pvi() read from the file now, whatever the stamp says — for
+    a House run about to score, which must score on what the file holds as
+    it starts. Under the cache's lock, so no reader sees the gap."""
+    global _district_pvi_cache
+    with _district_pvi_lock:
+        _district_pvi_cache = None
+        return _district_pvi()
+
+
+def get_state_pvi_map() -> dict[str, int]:
+    """Public read-only accessor for _state_pvi() (2026-07, midterm-elections
+    feature): api/elections.py exposes this data publicly for the first
+    time (previously internal-only, scoring-only). A thin wrapper rather
+    than importing the underscore-prefixed cache function directly keeps
+    the "this file's own scoring internals" vs. "what's safe to expose
+    externally" boundary explicit."""
+    return dict(_state_pvi())
+
+
+def get_district_pvi_map() -> dict[str, int]:
+    """Public read-only accessor for _district_pvi() — see get_state_pvi_map."""
+    return dict(_district_pvi())
+
+
+_pvi_meta_cache: dict | None = None
+# The persistent copies' stamp when _pvi_meta_cache was built: the elections
+# API serves it on every /pvi request, and the pipeline process rewrites
+# /data/district_pvi.json (see _district_pvi_stamp).
+_pvi_meta_stamp: Stamp = None
+_pvi_meta_lock = new_reload_lock()
+
+
+def get_pvi_meta() -> dict:
+    """Provenance metadata from the two PVI data files (their _source/
+    _method/_window/_as_of keys), for public labeling (2026-07 review F7:
+    publishing the bare numbers with no source, election window, or
+    lean-is-not-a-forecast caveat over-claims what PVI measures — the
+    files carry this metadata precisely so an exposure surface can show
+    it). Values are None when a file lacks a key or is unavailable; the
+    API/frontend degrade to generic wording rather than invent provenance.
+
+    Built once per version of the two files (file_cache.reload_if_moved);
+    each call gets its own top-level dict, since callers replace entries."""
+
+    from app.file_cache import reload_if_moved
+
+    global _pvi_meta_cache, _pvi_meta_stamp
+    with _pvi_meta_lock:
+        _pvi_meta_cache, _pvi_meta_stamp = reload_if_moved(
+            [pathlib.Path(_PVI_PERSISTENT_DIR) / name for name in ("state_pvi.json", "district_pvi.json")],
+            _pvi_meta_cache, _pvi_meta_stamp, _load_pvi_meta,
+        )
+        return dict(_pvi_meta_cache)
+
+
+def _load_pvi_meta() -> dict:
+    from app.file_cache import Uncached
+
+    meta: dict = {}
+    unreadable = False
+    for key, fname in (("states", "state_pvi.json"), ("districts", "district_pvi.json")):
+        try:
+            raw = _read_pvi_json(fname, report_unreadable=True)
+        except Uncached as fallback:
+            raw, unreadable = fallback.value, True
+        meta[key] = {
+            "source": raw.get("_source"),
+            "method": raw.get("_method"),
+            "window": raw.get("_window"),
+            "asOf": raw.get("_as_of"),
+        } if raw else None
+    meta["note"] = (
+        "Cook-PVI-style partisan lean relative to the national presidential "
+        "vote. Measures how a state or district leans, not who will win a "
+        "specific race: incumbency, candidate quality, and open seats are "
+        "not part of this number."
+    )
+    if unreadable:
+        raise Uncached(meta)
+    return meta
+
+
+def calculate_scores(senator: dict) -> dict:
+    """
+    Calculate the representation sub-scores from real data — the three in
+    SCORE_WEIGHTS plus the informational Promise Persistence and Funding
+    Diversity.
+
+    Returns:
+        Dict with those five representationScore sub-fields.
+    """
+    voting_record = senator.get("votingRecord", {})
+    funding = senator.get("funding", {})
+    lobbying_matches = senator.get("lobbyingMatches", [])
+
+    return {
+        "fundingIndependence": _calc_funding_independence(
+            funding, senator.get("state", ""), senator.get("district"),
+            senator.get("fundingReference"), senator.get("party"),
+        ),
+        "promisePersistence": _calc_promise_persistence(
+            voting_record,
+            senator.get("party", "I"),
+            senator.get("campaignPromises", []),
+        ),
+        "constituentAlignment": _calc_constituent_alignment(
+            voting_record,
+            lobbying_matches,
+            funding,
+            senator.get("state", ""),
+            senator.get("party", "I"),
+            district=senator.get("district"),
+            bioguide_id=senator.get("bioguideId"),
+            reference=senator.get("constituentReference"),
+            name=senator.get("name") or "",
+            years_in_office=senator.get("yearsInOffice") or 0,
+        ),
+        "fundingDiversity": _calc_funding_diversity(funding),
+        "legislativeEffectiveness": _calc_legislative_effectiveness(
+            senator.get("sponsoredBills", []),
+            senator.get("leadershipScore"),
+            party=voting_record.get("effectiveParty") or senator.get("party", "I"),
+            years_in_office=senator.get("yearsInOffice"),
+            attracted_bipartisanship=senator.get("attractedBipartisanshipScore"),
+            les_reference=senator.get("lesReference"),
+            chamber="house" if senator.get("district") is not None else "senate",
+            bills_known=not senator.get("sponsoredBillsUnavailable"),
+            sworn_date=senator.get("swornDate"),
+        ),
+    }
+
+
+def explain_scores(senator: dict) -> dict:
+    """Full derivation for each currently-scored dimension — mirrors
+    calculate_scores() but returns the component-level breakdown each
+    _x_core() function already computes, instead of just the final int.
+
+    On-demand only (called from a dedicated API endpoint when a user
+    expands a score's "show the math" panel); never called from the
+    nightly pipeline. Promise Persistence is omitted — it was removed as
+    a scored dimension in v6.0 and has no score bar to attach a
+    breakdown to.
+
+    Shared by both senators and representatives, same as calculate_scores
+    above — both entity types assemble the same dict shape.
+    """
+    voting_record = senator.get("votingRecord", {})
+    funding = senator.get("funding", {})
+    lobbying_matches = senator.get("lobbyingMatches", [])
+    constituent = _constituent_alignment_core(
+        voting_record,
+        lobbying_matches,
+        funding,
+        senator.get("state", ""),
+        senator.get("party", "I"),
+        district=senator.get("district"),
+        bioguide_id=senator.get("bioguideId"),
+        reference=senator.get("constituentReference"),
+        name=senator.get("name") or "",
+        years_in_office=senator.get("yearsInOffice") or 0,
+    )
+    # The vote-part status is served with the stored confidence grades
+    # (calculate_confidence), not in the breakdown payload.
+    constituent.pop("vote_part_status", None)
+
+    return {
+        "fundingIndependence": _funding_independence_core(
+            funding, senator.get("state", ""), senator.get("district"),
+            senator.get("fundingReference"), senator.get("party"),
+        ),
+        "constituentAlignment": constituent,
+        "fundingDiversity": _funding_diversity_core(funding),
+        "legislativeEffectiveness": _legislative_effectiveness_core(
+            senator.get("sponsoredBills", []),
+            senator.get("leadershipScore"),
+            party=voting_record.get("effectiveParty") or senator.get("party", "I"),
+            years_in_office=senator.get("yearsInOffice"),
+            attracted_bipartisanship=senator.get("attractedBipartisanshipScore"),
+            les_reference=senator.get("lesReference"),
+            chamber="house" if senator.get("district") is not None else "senate",
+            bills_known=not senator.get("sponsoredBillsUnavailable"),
+            sworn_date=senator.get("swornDate"),
+        ),
+    }
+
+
+# CONSTITUENT_FULL_CONFIDENCE_VOTES, SATURATION_QUANTILE and
+# CONSTITUENT_REFERENCE_STATISTIC live in config_definitions (imported at
+# the top of this module) so population_reference can stamp at construction.
+
+
+def calculate_confidence(senator: dict) -> dict[str, str]:
+    """Data-sufficiency confidence per dimension: "high" | "medium" | "low".
+
+    Derived ONLY from how much source data backs each dimension — never
+    from who the member is or what they scored. Published alongside the
+    scores so sparse-data results aren't read with false precision: a
+    Promise Persistence of 58 backed by two evaluable promises is a
+    shrunk-to-prior guess, while the same number over twenty promises is
+    a measurement. Thresholds are volume counts, identical for every
+    member and both parties.
+    """
+    funding = senator.get("funding", {})
+    voting_record = senator.get("votingRecord", {})
+    promises = senator.get("campaignPromises") or []
+    bills = senator.get("sponsoredBills") or []
+
+    def grade(n: int, medium_at: int, high_at: int) -> str:
+        if n >= high_at:
+            return "high"
+        if n >= medium_at:
+            return "medium"
+        return "low"
+
+    has_funding = funding_share_base(funding) > 0
+    n_donors = len(funding.get("topDonors") or [])
+    n_industries = len(funding.get("industryBreakdown") or [])
+    # The same deduplicated count the score's shrinkage reads, so the
+    # confidence grade and the breakdown's "only n votes" can't disagree.
+    _, n_party_votes = party_break_rate(voting_record)
+    n_evaluable = sum(
+        1 for p in promises
+        if isinstance(p, dict) and p.get("alignment") in (PromiseAlignment.KEPT, PromiseAlignment.PARTIAL, PromiseAlignment.BROKEN)
+    )
+
+    # constituentAlignment/legislativeEffectiveness thresholds are halved from
+    # their original 10/40 and 3/10: both dimensions' underlying windows
+    # were cut from ~2-3 congresses to the current congress only (see
+    # AGENTS.md "current term"), so the old volume thresholds would grade
+    # most members down for less data purely as an artifact of the window
+    # change, not because they're actually under-covered. Funding's window
+    # only narrowed from 2 elections to 1 (much smaller cut), so its
+    # thresholds are unchanged.
+    return {
+        "fundingIndependence": grade(n_donors, 3, 10) if has_funding else "low",
+        "promisePersistence": grade(n_evaluable, 3, 8),
+        "constituentAlignment": grade(n_party_votes, 5, CONSTITUENT_FULL_CONFIDENCE_VOTES),
+        "fundingDiversity": grade(n_industries, 3, 6) if has_funding else "low",
+        "legislativeEffectiveness": grade(len(bills), 2, 5),
+        "constituentAlignmentVotePart": _constituent_vote_part_status(senator),
+    }
+
+
+def _constituent_vote_part_status(senator: dict) -> str:
+    """How Constituent Alignment's vote part was scored, for the scorecard to
+    state rather than re-derive: "typical:few-votes" (under
+    CONSTITUENT_MIN_VOTES, scored at the party's measured typical score),
+    "neutral:few-votes" (under CONSTITUENT_MIN_VOTES with no measured
+    typical — the bundled prior, or no reference for the party: neutral
+    50), "neutral:no-party" (caucuses with neither party: no party line
+    to break from, neutral 50), "neutral:no-expectation" (no usable reference
+    for the member's party), "shrunk:<share kept>" (under
+    CONSTITUENT_FULL_CONFIDENCE_VOTES, pulled toward the party's typical
+    score), "shrunk-neutral:<share kept>" (the same, pulled toward a neutral
+    50 — no measured typical) or "full". Read from the scoring
+    function itself (_constituent_alignment_core), so the branch that
+    scored the vote is the one that labels it — given the same member dict,
+    reference included, that calculate_scores received."""
+    return _constituent_alignment_core(
+        senator.get("votingRecord") or {}, [], {},
+        state=senator.get("state", ""), party=senator.get("party", "I"),
+        district=senator.get("district"), bioguide_id=senator.get("bioguideId"),
+        reference=senator.get("constituentReference"),
+        name=senator.get("name") or "", years_in_office=senator.get("yearsInOffice") or 0,
+    )["vote_part_status"]
+
+
+# Small-donor share (Funding Independence component 2) baseline.
+#
+# WHY a state-population-relative baseline at all: a population-tercile
+# audit found the old flat 40%-cap version of this component penalized
+# small-state senators for a structural fact about their state (small
+# states average 10.4% small-donor share vs 23.4% in large states —
+# bigger states have larger natural donor pools and more national media
+# exposure driving grassroots giving) rather than their own funding
+# choices, while PAC dollar *amounts* were flat-to-higher in small states
+# (PACs pay for committee power, not local media costs) — i.e. only the
+# small-donor signal needed a state-relative fix, not PAC dependency.
+# Same "expected vs. actual for this seat" pattern as
+# _signed_state_alignment/_calc_constituent_alignment (Independent
+# Voting's v4.2 redesign), minus IV's credit-shrinking multiplier: unlike
+# vote-crossing, there's no directional ambiguity in raising more small-
+# dollar money than your state predicts, so surplus is credited at full
+# weight.
+#
+# WHERE these specific numbers come from: an ordinary-least-squares
+# regression of the Senate's smallDonorPercentage against ln(state
+# population) — expected_pct = A + B*ln(population_millions) — fitted every
+# run over the senators being scored (small_donor_baseline_fit, v6.24) and
+# stored in the Senate's funding reference. A fit made once drifts from the
+# Senate it scores (it did: 18.6% mean when fitted, 23.2% by 2026-09-29), so
+# per AGENTS.md §3a it is measured in the run. _small_donor_baseline_fit()
+# below reads app/data/small_donor_baseline.json
+# (scripts/fetch_state_small_donor_baseline.py) only as the fallback before
+# a deployment's first run.
+
+
+_small_donor_baseline_fit_cache: dict[str, float] | None = None
+
+
+def _small_donor_baseline_fit() -> dict[str, float]:
+    """Load the small-donor baseline regression fit: {A, B,
+    national_mean_pct, min_expected_pct, max_expected_pct, saturation_pt}.
+
+    Ingested from app/data/small_donor_baseline.json (written by
+    scripts/fetch_state_small_donor_baseline.py). The file ships in the
+    image; if it is ever unreadable the fit is empty and the small-donor
+    component scores neutral (_small_donor_capacity_score) rather than
+    falling back to a second hand-typed copy of the same numbers, which is
+    what used to live here (AGENTS.md §3a, point 3).
+    """
+    global _small_donor_baseline_fit_cache
+    if _small_donor_baseline_fit_cache is None:
+        path = pathlib.Path(__file__).resolve().parent.parent.parent / "data" / "small_donor_baseline.json"
+        try:
+            data = json.loads(path.read_text())
+            _small_donor_baseline_fit_cache = {
+                "A": float(data["A"]),
+                "B": float(data["B"]),
+                "national_mean_pct": float(data["national_mean_pct"]),
+                "min_expected_pct": float(data["min_expected_pct"]),
+                "max_expected_pct": float(data["max_expected_pct"]),
+                "saturation_pt": float(data["saturation_pt"]),
+            }
+        except Exception:
+            logger.error(
+                "small_donor_baseline.json unreadable — the small-donor component "
+                "scores neutral until it is restored (scripts/fetch_state_small_donor_baseline.py)"
+            )
+            _small_donor_baseline_fit_cache = {}
+    return _small_donor_baseline_fit_cache
+
+
+def small_donor_baseline_fit(pairs: list[tuple[float, float]]) -> dict | None:
+    """The Senate's small-donor baseline, fitted from this run's senators:
+    `pairs` are (state population in millions, smallDonorPercentage).
+    smallDonorPercentage = A + B*ln(population) by least squares; the
+    saturation point is 1.5 residual standard deviations; the clamp is the
+    fitted range across the senators' states, padded 2 points each way.
+    The same method scripts/fetch_state_small_donor_baseline.py used to
+    produce the bundled fallback, now measured each run on the members being
+    scored, so it tracks the Senate as it is (AGENTS.md §3a). None below
+    _MIN_FUNDING_REFERENCE_MEMBERS usable senators."""
+    points = [(math.log(pop), pct) for pop, pct in pairs if pop and pop > 0]
+    if len(points) < _MIN_FUNDING_REFERENCE_MEMBERS:
+        return None
+    xs, ys = [x for x, _ in points], [y for _, y in points]
+    mx, my = statistics.mean(xs), statistics.mean(ys)
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx == 0:
+        return None
+    b = sum((x - mx) * (y - my) for x, y in points) / sxx
+    a = my - b * mx
+    resid_sd = statistics.pstdev([y - (a + b * x) for x, y in points])
+    if resid_sd <= 0:
+        return None
+    fitted = [a + b * x for x in xs]
+    return {
+        "n": len(points),
+        "A": round(a, 4),
+        "B": round(b, 4),
+        "national_mean_pct": round(my, 4),
+        "min_expected_pct": round(max(0.0, min(fitted) - 2), 4),
+        "max_expected_pct": round(max(fitted) + 2, 4),
+        "saturation_pt": round(1.5 * resid_sd, 4),
+    }
+
+
+def _state_small_donor_baseline(state: str, fit: dict | None = None) -> float:
+    """Expected small-donor % for a state's population. Unresolved states
+    (unknown code, DC, territories) fall back to the national mean so an
+    unresolvable state is never itself a penalty or a windfall. `fit`: the
+    run's (small_donor_baseline_fit), else the bundled fallback."""
+    fit = fit or _small_donor_baseline_fit()
+    if not fit:
+        return 0.0
+    pop = _state_population().get(state)
+    if not pop:
+        return fit["national_mean_pct"]
+    expected = fit["A"] + fit["B"] * math.log(pop)
+    return max(fit["min_expected_pct"], min(fit["max_expected_pct"], expected))
+
+
+def _small_donor_capacity_score(
+    small_pct: float, state: str, district: int | None, chamber_ref: dict | None = None,
+) -> tuple[float, float]:
+    """Small-donor credit relative to what's expected for the seat, not a
+    flat absolute cap. Returns (score, expected_pct).
+
+    Senate: expected from the state's population (the run's regression,
+    small_donor_baseline_fit — bigger states have bigger natural donor
+    pools), saturating at the fit's saturation point.
+
+    House: districts are apportioned to ~760k people each, so population
+    doesn't differentiate them; expected is the House's own median
+    small-donor share, saturating at one p10-p90 spread — both measured
+    each run (compute_funding_reference). This replaced a flat 40% cap
+    (v6.13) that was hand-set and put the typical House member near 45
+    rather than 50, unlike every other chamber-relative component.
+    """
+    if district is not None:
+        ref = chamber_ref or {}
+        median = ref.get("small_donor_median")
+        spread = (ref.get("small_donor_p90") or 0) - (ref.get("small_donor_p10") or 0)
+        if median is None or spread <= 0:
+            return 50.0, median or 0.0
+        return max(0.0, min(100.0, 50.0 + 50.0 * (small_pct - median) / spread)), median
+
+    fit = (chamber_ref or {}).get("small_donor_fit") or _small_donor_baseline_fit()
+    if not fit:
+        return 50.0, 0.0
+    expected = _state_small_donor_baseline(state, fit)
+    saturation = fit["saturation_pt"]
+    if small_pct >= expected:
+        surplus = small_pct - expected
+        score = 50.0 + 50.0 * min(surplus / saturation, 1.0)
+    else:
+        deficit = expected - small_pct
+        score = 50.0 - 50.0 * min(deficit / saturation, 1.0)
+    return score, expected
+
+
+def _calc_funding_independence(
+    funding: dict, state: str = "", district: int | None = None, reference: dict | None = None,
+    party: str | None = None,
+) -> int:
+    """
+    Funding Independence Score (0-100, higher = better).
+
+    Measured on the member's most recent completed election, with every
+    share taken over contributions (fetch/fec.select_recent_elections,
+    normalize_finance.summarize_election_totals). Four components; the
+    chamber references each is scored against are measured every run
+    (compute_funding_reference — AGENTS.md §3a):
+
+      1. PAC dependency (20/53): the PAC share of contributions against
+         what the seat predicts (_pac_expectation): for a senator, the
+         share senators from states that size take (pac_population_fit,
+         small states have small donor pools); for a representative, the
+         House median, every district holding the same population. The
+         expectation scores 50, and one chamber p10-p90 spread above or
+         below it 0 or 100, in share points. Per chamber because House
+         members rely on PAC money far more than senators, a structural
+         difference. v6.22 compared the share with campaigns of the same
+         size, in proportion: campaign size is the share's denominator and
+         PAC dollars barely vary with it (r=0.17, Senate 2026-10-01), so the
+         fit measured PAC dollars, and a 3% expectation scored 6% as zero.
+         The share still falls with campaign size (r=-0.49 House), because
+         a larger campaign raised more of its money elsewhere: that is
+         lower dependence, not a distortion. It rises a little with seat
+         safety (r=+0.14 House; medians 27% within 3 points of even, 44%
+         beyond 15), money the campaign itself takes, unlike the outside
+         spending v6.13 removed for tracking competitiveness.
+      2. Small-donor share (10/53): unitemized (<$200) contributions,
+         against what the state's size predicts for senators (fitted each
+         run, small_donor_baseline_fit) and against the House median for
+         representatives (_small_donor_capacity_score).
+      3. Top-donor concentration (10/53): the top 10 outside donors' share
+         of all outside contributions (self-funding and affiliated transfers
+         excluded), ranked within the chamber (_rank_score, v6.26).
+      4. Industry concentration (13/53): the HHI of the industry-classified
+         money's mix (_industry_concentration), ranked within the chamber;
+         neutral 50 when too little is classified to measure it.
+
+    The donor list and industry breakdown come from the FEC's complete
+    detail since v6.26 (normalize_finance: every committee contribution
+    from the bulk file, itemized individual money by occupation through
+    transform/occupation_industry). Before, from 100 sampled receipts each,
+    under 1% of a large campaign's money was ever industry-classified.
+
+    Removed in v6.13, each on measured evidence (FEC bulk data, 2020-2024
+    incumbents with >$100K raised: 415 House / 86 Senate with seat lean;
+    1,276 total; reproduce with scripts/audit_funding_components.py):
+
+      - Outside spending in the PAC share. Independent expenditures
+        supporting the member were added at half weight as "aligned-
+        industry investment". They are by law not coordinated with the
+        candidate (52 U.S.C. §30101(17)), 86% came from super PACs and
+        hybrid PACs rather than industry PACs, and they track race
+        competitiveness, not dependency: the term averaged 0.069 in House
+        seats within 3 points of even vs 0.010 beyond 8 (Spearman with
+        |PVI| -0.37 House, -0.39 Senate), and ran OPPOSITE to PAC share
+        (-0.28 / -0.32). It penalized swing-seat members for money they
+        cannot solicit or direct — about 28 points off the PAC component
+        for the average senator in a seat within 3 points of even (8 in
+        the House), against 8 and 1 in seats beyond 15. Super PACs
+        concentrating in competitive races is also documented directly
+        (Scala 2021, "Are Super PACs Super-Efficient?", State of the
+        Parties).
+      - Source breadth (13/66). It scored small-donor money at 1.0,
+        industry money 0.6-0.5 and "opaque" money (party, the candidate's
+        own) 0.2, so it was a second copy of the small-donor share: R^2
+        0.79-0.86 against it across plausible classification rates. Its
+        remaining signal penalized self-funding, the one money source no
+        donor can influence.
+      - The industry-concentration fallback toward "50 + 50 x small-donor
+        share" when little money is classified — a third copy of the
+        small-donor share. Unmeasurable concentration is now neutral 50,
+        like every other missing input in this file.
+
+    The remaining weights keep their pre-v6.13 proportions (20:10:10:13),
+    renormalized over the four components — no new weighting judgment.
+
+    Academic rationale
+    ------------------
+    Stratmann (2005, Public Choice 124(1-2), 135-156) finds a linear
+    PAC-contribution-to-vote relationship — support for a linear (not
+    step or logarithmic) PAC-dependency curve. Neither Barber (2016, POQ
+    80(S1)) nor Bonica (2014, AJPS 58(2)) calibrates a PAC or concentration
+    figure (verified by full-text search, 2026-07); every anchor here is
+    measured from the chamber itself. Industry concentration follows
+    Parmigiani (2025, J. Public Econ. 243), which computes the same HHI per
+    legislator.
+    """
+    return _funding_independence_core(funding, state, district, reference, party)["score"]
+
+
+def funding_share_base(funding: dict) -> float:
+    """The denominator every funding share is taken over: contributions
+    (from contributors or the candidate), falling back to total receipts
+    for records that predate the field. See normalize_finance.
+    summarize_election_totals for why receipts overstate it."""
+    return funding.get("totalContributions") or funding.get("totalRaised", 0) or 0
+
+
+# Fewest funded members that still describe a chamber's PAC-share
+# distribution; below it the last persisted reference is kept.
+_MIN_FUNDING_REFERENCE_MEMBERS = 30
+
+# How a Funding Independence component that can't be measured says so.
+_NOT_MEASURED = "not measured, so the score is weighed over the other components"
+
+# A party needs this many measured members for its own industry-mix
+# deciles; fewer (an independent) is ranked against the chamber. The same
+# floor as Legislative Effectiveness's within-party comparison (v6.25).
+_MIN_PARTY_COHORT = 10
+
+
+# Industry money below this is too little to measure a mix from: the
+# least a member with any real itemized or PAC money has classified (the
+# same floor the top-donor pool used to need, v6.26).
+_INDUSTRY_MIN_CLASSIFIED = 250_000
+
+
+def _rank_score(value: float, deciles: list[float]) -> float:
+    """100 minus the chamber percentile of a share in [0, 1], interpolated
+    linearly through the chamber's nine measured deciles with 0 and 1 as
+    the ends: no concentration scores 100, the median member 50, total
+    concentration 0.
+
+    For the concentration components (v6.26). Both are shares bounded at
+    zero and skewed right, and on the median-and-spread scale they used
+    before, the best a member could reach was 50 + 50 x median / spread:
+    about 65 for a campaign with no big donors at all. A rank needs no
+    shape assumed."""
+    knots = [(0.0, 0.0)] + [(d, 10.0 * (i + 1)) for i, d in enumerate(deciles)] + [(1.0, 100.0)]
+    value = min(max(value, 0.0), 1.0)
+    for (x0, p0), (x1, p1) in zip(knots, knots[1:]):
+        if value <= x1:
+            percentile = p0 if x1 == x0 else p0 + (p1 - p0) * (value - x0) / (x1 - x0)
+            return round(100.0 - percentile, 1)
+    return 0.0
+
+
+def _deciles(values: list[float]) -> list[float]:
+    """Nine cut points, increasing (ties nudged apart so the interpolation
+    in _rank_score never divides by zero)."""
+    cuts = statistics.quantiles(values, n=10)
+    for i in range(1, len(cuts)):
+        cuts[i] = max(cuts[i], cuts[i - 1] + 1e-9)
+    return [round(c, 6) for c in cuts]
+
+
+def _top_donor_concentration(funding: dict) -> tuple[float | None, int, float]:
+    """(the top 10 external donors' share of all external contributions,
+    #external donors listed, those contributions $). Shared by the score
+    and its population reference. None without a donor list or money.
+
+    A concentration ratio is taken over the whole market, fringe included:
+    the top ten's share of everything the campaign received, less the
+    candidate's own money and transfers from its own committees. Until
+    v6.26 the denominator was the itemized donors listed, a pool the
+    sampled receipts capped near 100 donors, so a campaign of small gifts
+    (a Senate campaign raising tens of millions in small gifts, 2026-10) read as too few donors
+    to measure and was scored a neutral 50 for needing almost no big
+    donors at all."""
+    donors = funding.get("topDonors") or []
+    external = sorted(
+        (d for d in donors if d.get("type") not in ("CandidateAffiliated", "Self-Funded")),
+        key=lambda d: d.get("total", 0),
+        reverse=True,
+    )
+    # The candidate's own money: the FEC totals' loans and contributions
+    # from the candidate (the breakdown's CANDIDATE_FUNDS row), or failing
+    # that the itemized self-funded donor rows. Until v6.32 only the donor
+    # rows were taken out, so a campaign funded 85% by its candidate's loans
+    # had them counted as outside money and its top ten read as 1.3%.
+    listed = sum(d.get("total", 0) for d in donors if d.get("type") == "Self-Funded")
+    stated = sum(i.get("total", 0) for i in funding.get("industryBreakdown") or [] if i.get("industry") == "CANDIDATE_FUNDS")
+    own = max(listed, stated)
+    pool = max(0.0, funding_share_base(funding) - own)
+    if not external or pool <= 0:
+        return None, len(external), pool
+    return min(1.0, sum(d.get("total", 0) for d in external[:10]) / pool), len(external), pool
+
+
+def pac_population_fit(pairs: list[tuple[float, float]]) -> dict | None:
+    """The PAC share senators from a state of a given size typically take,
+    fitted from this run's senators: `pairs` are (state population in
+    millions, PAC share of contributions). share = intercept + slope *
+    ln(population) by least squares, with the residuals' p10 and p90 as the
+    scale. None below _MIN_FUNDING_REFERENCE_MEMBERS senators.
+
+    Why population (v6.26). Small states have small donor pools, so their
+    senators take more of their money from PACs, a difference in the seat
+    rather than in the senator: on 2026-10-01, r = -0.49 between PAC share
+    and ln(state population). Population is fixed by the seat; campaign
+    size, which v6.22 fitted against, is not. It is the share's own
+    denominator, and PAC dollars barely vary with it (r = 0.17), so the
+    size fit (slope -0.98 in log-log) turned "share of the campaign from
+    PACs" back into "PAC dollars against the typical senator's", and with
+    the gap taken in proportion, 5% of a large campaign scored 17 for being
+    1.7 times a fitted 3% (Pearson 1897 and Kronmal 1993 on regressing a
+    ratio on its own denominator)."""
+    points = [(math.log(pop), share) for pop, share in pairs if pop and pop > 0]
+    if len(points) < _MIN_FUNDING_REFERENCE_MEMBERS:
+        return None
+    xs = [x for x, _ in points]
+    mx, my = statistics.mean(xs), statistics.mean(y for _, y in points)
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx == 0:
+        return None
+    slope = sum((x - mx) * (y - my) for x, y in points) / sxx
+    intercept = my - slope * mx
+    deciles = statistics.quantiles([y - (intercept + slope * x) for x, y in points], n=10)
+    return {
+        "n": len(points),
+        "intercept": round(intercept, 6),
+        "slope": round(slope, 6),
+        "resid_p10": round(deciles[0], 6),
+        "resid_p90": round(deciles[8], 6),
+    }
+
+
+def _pac_expectation(state: str, chamber: str, ref: dict) -> tuple[float, float, str] | None:
+    """(expected PAC share, scale, how it was set) for one member, or None
+    without a chamber reference. Senators: what their state's size predicts
+    (pac_population_fit). Representatives: the House median, since every
+    district is apportioned the same population. The scale is the
+    chamber's p10-p90 spread around that expectation, in share points."""
+    fit = ref.get("pac_population_fit")
+    pop = _state_population().get(state) if chamber == "senate" and fit else None
+    if pop:
+        expected = max(0.0, fit["intercept"] + fit["slope"] * math.log(pop))
+        return expected, fit["resid_p90"] - fit["resid_p10"], f"senators from states this size typically take {expected:.0%}"
+    median, p10, p90 = ref.get("pac_ratio_median"), ref.get("pac_ratio_p10"), ref.get("pac_ratio_p90")
+    if median is not None and p10 is not None and p90 is not None:
+        return median, p90 - p10, f"the chamber's median member takes {median:.0%}"
+    return None
+
+
+def compute_funding_reference(
+    fundings: list[dict], states: list[str] | None = None, parties: list[str] | None = None,
+) -> dict | None:
+    """One chamber's Funding Independence reference from this run's
+    members' funding dicts:
+
+    - pac_ratio_median: median PAC share of contributions (the raw ratio,
+      before the outside-spending adjustment — what scripts/audit_pac_ratio.py
+      measured when the multipliers were hand-typed);
+    - pac_ratio_p10 / _p90: the spread of PAC shares, the House's scale;
+    - pac_population_fit: the PAC share a state's size predicts for its
+      senators (pac_population_fit), when `states` is given;
+    - top10_share_deciles / _median (v6.26; concentration_* before, on a
+      different scale, so an older reference is never read as one): the
+      top 10 donors' share of outside contributions
+      (_top_donor_concentration), ranked by _rank_score;
+    - industry_hhi_deciles / _median: the HHI of the industry money's mix
+      among members with enough of it classified (industry_hhi);
+    - industry_hhi_by_party: the same per party, when `parties` is given,
+      for each party with at least _MIN_PARTY_COHORT measured members;
+    - small_donor_fit: the Senate's small-donor share by state population
+      (small_donor_baseline_fit), when `states` — each member's, aligned
+      with `fundings` — is given. The House is compared with its own
+      median instead (_small_donor_capacity_score).
+
+    None when too few members have funding to measure the PAC share; the
+    concentration stats are omitted (keep the last persisted ones) when too
+    few members have a measurable pool."""
+    ratios, concentrations, small, by_population, pac_by_population, hhis = [], [], [], [], [], []
+    hhis_by_party: dict[str, list[float]] = {}
+    population = _state_population() if states is not None else {}
+    for i, f in enumerate(fundings):
+        f = f or {}
+        base = funding_share_base(f)
+        if base > 0:
+            pac = f.get("totalFromPACs") or 0
+            ratios.append(min(pac / base, 1.0))
+            small_pct = f.get("smallDonorPercentage")  # None: not measurable, left out
+            if small_pct is not None:
+                small.append(small_pct)
+            pop = population.get(states[i]) if states is not None and i < len(states) else None
+            if pop:
+                if small_pct is not None:
+                    by_population.append((pop, small_pct))
+                pac_by_population.append((pop, min(pac / base, 1.0)))
+        c, _, _ = _top_donor_concentration(f)
+        if c is not None:
+            concentrations.append(c)
+        h, _, _ = industry_hhi(f)
+        if h is not None:
+            hhis.append(h)
+            if parties is not None and i < len(parties) and parties[i]:
+                hhis_by_party.setdefault(parties[i], []).append(h)
+    if len(ratios) < _MIN_FUNDING_REFERENCE_MEMBERS:
+        return None
+    ref = {
+        "n": len(ratios),
+        "pac_ratio_median": round(statistics.median(ratios), 6),
+        "pac_ratio_mean": round(statistics.mean(ratios), 6),
+        "pac_ratio_p10": round(statistics.quantiles(ratios, n=10)[0], 6),
+        "pac_ratio_p90": round(statistics.quantiles(ratios, n=10)[8], 6),
+    }
+    # Over the campaigns whose share the filings can say (not those that
+    # itemize every gift).
+    if len(small) >= _MIN_FUNDING_REFERENCE_MEMBERS:
+        ref.update({
+            "small_donor_p10": round(statistics.quantiles(small, n=10)[0], 4),
+            "small_donor_median": round(statistics.median(small), 4),
+            "small_donor_p90": round(statistics.quantiles(small, n=10)[8], 4),
+        })
+    if states is not None and (fit := small_donor_baseline_fit(by_population)):
+        ref["small_donor_fit"] = fit
+    if states is not None and (fit := pac_population_fit(pac_by_population)):
+        ref["pac_population_fit"] = fit
+    by_party = {
+        party: {"deciles": _deciles(values), "median": round(statistics.median(values), 6), "n": len(values)}
+        for party, values in sorted(hhis_by_party.items()) if len(values) >= _MIN_PARTY_COHORT
+    }
+    if by_party:
+        ref["industry_hhi_by_party"] = by_party
+    for key, values in (("top10_share", concentrations), ("industry_hhi", hhis)):
+        if len(values) >= _MIN_FUNDING_REFERENCE_MEMBERS:
+            ref.update({
+                f"{key}_n": len(values),
+                f"{key}_deciles": _deciles(values),
+                f"{key}_median": round(statistics.median(values), 6),
+            })
+    return ref
+
+
+def _funding_independence_core(
+    funding: dict, state: str = "", district: int | None = None, reference: dict | None = None,
+    party: str | None = None,
+) -> dict:
+    """Same math as _calc_funding_independence, returning every intermediate
+    value alongside the final score. Single implementation — _calc_funding_
+    independence and the on-demand explain_scores() breakdown both call this;
+    neither reimplements the formula separately."""
+    total_raised = funding_share_base(funding)
+    if not total_raised or total_raised == 0:
+        return {"score": 50, "components": [], "note": "No funding data, so a neutral 50."}
+
+    # Component 1: PAC dependency. Outside spending is deliberately not in
+    # it (removed v6.13 — see the docstring's measured account).
+    pac_total = funding.get("totalFromPACs", 0)
+    pac_ratio = pac_total / total_raised
+
+    # Scored against what the seat predicts (v6.26, _pac_expectation): the
+    # expected share scores 50 and one chamber p10-p90 spread above or below
+    # it saturates at 0 or 100, in plain share points. v6.22 compared the
+    # share with campaigns of the same size, in proportion (twice the
+    # expectation scored 0), which a 3% expectation turned into 0 at 6%.
+    chamber = _chamber_of(district)
+    ref = {
+        **(FUNDING_REFERENCE.load().get(chamber) or {}),
+        **((reference or {}).get(chamber) or {}),
+    }
+    expectation = _pac_expectation(state, chamber, ref)
+    if expectation and expectation[1] > 0:
+        expected, spread, reference_detail = expectation
+        ratio_score = max(0.0, min(100.0, 50.0 - 50.0 * (pac_ratio - expected) / spread))
+    elif ref.get("pac_ratio_median"):
+        ratio_score = max(0.0, (1.0 - pac_ratio * (0.5 / ref["pac_ratio_median"]))) * 100
+        reference_detail = f"chamber median {ref['pac_ratio_median']:.0%}"
+    else:
+        ratio_score = 50.0
+        reference_detail = "no chamber reference yet, neutral 50"
+    pac_score = ratio_score
+
+    # Component 2: small-donor share (10/53 of the weight), state-relative for
+    # senators — see _small_donor_capacity_score.
+    small_pct = funding.get("smallDonorPercentage", 0)
+    if small_pct is None:
+        # Every gift itemized: the filings can't say how much was small.
+        small_score, small_expected_pct = None, None
+    else:
+        small_score, small_expected_pct = _small_donor_capacity_score(small_pct, state, district, ref)
+
+    # Component 3: relative top-donor concentration (10/53 of the weight)
+    concentration, n_external, pool = _top_donor_concentration(funding)
+    c_deciles, c_median = ref.get("top10_share_deciles"), ref.get("top10_share_median")
+    if concentration is not None and c_deciles:
+        # Ranked within the chamber (_rank_score): no big donors scores
+        # 100, the median member 50.
+        concentration_score = _rank_score(concentration, c_deciles)
+        concentration_detail = (
+            f"the top 10 donors gave {concentration:.1%} of ${pool:,.0f} in outside contributions "
+            f"(chamber median {c_median:.1%})"
+        )
+    else:
+        # No donor list, or no chamber reference yet.
+        concentration_score = None
+        concentration_detail = f"no donor list or chamber reference to compare with; {_NOT_MEASURED}"
+
+    # Component 4: industry concentration (folded in from the former
+    # Funding Diversity dimension, v6.5).
+    industry_concentration_score, industry_concentration_detail = _industry_concentration(
+        funding, total_raised, reference=ref, party=party,
+    )
+
+    # A component that can't be measured is left out and the others carry
+    # its weight. Counting it as a neutral 50 pulled every member toward 50
+    # by its weight for a gap in our data: a campaign scoring 100 on
+    # everything measured lost 12.3 points for an unmeasurable industry mix
+    # alone (13/53 of 50).
+    weighted = [
+        (w, c) for w, c in (
+            (20 / 53, pac_score), (10 / 53, small_score),
+            (10 / 53, concentration_score), (13 / 53, industry_concentration_score),
+        ) if c is not None
+    ]
+    score = clamp(sum(w * c for w, c in weighted) / sum(w for w, _ in weighted))
+    return {
+        "score": score,
+        # The numbers the scorecard's sentence states, as numbers: the page
+        # writes "11% of $1.21M in contributions came from PACs" from these,
+        # never re-deriving a share itself.
+        "facts": {
+            "contributions": round(total_raised),
+            "pacShare": round(pac_ratio, 4),
+            "smallDonorShare": None if small_pct is None else round(small_pct / 100, 4),
+            "smallDonorExpectedShare": (
+                round(small_expected_pct / 100, 4) if small_expected_pct is not None else None
+            ),
+            # The House compares with the chamber median; a senator with what
+            # a state of that size is expected to raise in small gifts.
+            "smallDonorComparison": "house-median" if district is not None else "state-size",
+        },
+        "components": [
+            {
+                "label": "PAC dependency",
+                "weight": round(20 / 53, 4),
+                "score": round(pac_score, 1),
+                "detail": (
+                    f"{pac_ratio:.0%} of ${total_raised:,.0f} in contributions came from PACs;"
+                    f" {reference_detail}"
+                ),
+            },
+            {
+                "label": "Small-donor share",
+                "weight": round(10 / 53, 4),
+                "score": None if small_score is None else round(small_score, 1),
+                "detail": (
+                    "the campaign itemizes every gift, so its filings report no unitemized "
+                    f"money to read a small-donor share from; {_NOT_MEASURED}"
+                ) if small_pct is None else (
+                    f"{small_pct:.0f}% of contributions unitemized (donors who gave $200 or less)"
+                    + (
+                        f" vs. an expected ~{small_expected_pct:.0f}% for a state this size"
+                        if district is None
+                        else f" vs. the House median of {small_expected_pct:.0f}%"
+                    )
+                ),
+            },
+            {
+                "label": "Top-donor concentration",
+                "weight": round(10 / 53, 4),
+                "score": None if concentration_score is None else round(concentration_score, 1),
+                "detail": concentration_detail,
+            },
+            {
+                "label": "Industry concentration",
+                "weight": round(13 / 53, 4),
+                "score": None if industry_concentration_score is None else round(industry_concentration_score, 1),
+                "detail": industry_concentration_detail,
+            },
+        ],
+    }
+
+
+PARTICIPATION_WEIGHT = 0.10
+
+
+def _calc_promise_persistence(
+    voting_record: dict,
+    party: str,
+    campaign_promises: list[dict] | None = None,
+) -> int:
+    """
+    Promise Persistence Score (0-100, higher = better). Unweighted in
+    SCORE_WEIGHTS since v6.0 (see that dict's docstring) and, since
+    campaign-promise tracking was removed entirely (2026-07 — see
+    policy_alignment.py's module docstring), campaign_promises is
+    always empty, so this always falls through to the neutral-prior
+    branch below. Still computed and stored (score_promise_persistence)
+    for now rather than deleted outright, matching how the scored-
+    dimension removal was handled.
+
+    Two components:
+
+    1. **Vote alignment** (90%): ratio of kept/partial promises to total.
+       Applies a confidence penalty when most promises are "unclear" —
+       if only 1/10 was evaluable, the score trends toward 50 (neutral)
+       instead of being inflated by the single kept promise.
+
+    2. **Vote participation** (10%): senators who don't show up can't
+       keep promises.  Folded in from the old standalone Accessibility
+       metric.
+
+    Vote alignment scoring:
+      kept    = 1.0 point
+      partial = 0.5 point
+      broken  = 0.0 point
+      unclear = excluded from score but penalizes confidence
+
+    A former third component, floor advocacy (whether the senator raises
+    promised issues in Congressional Record floor remarks), was removed
+    entirely (2026-07): with campaign_promises always empty, its
+    "advocacyCoverage" input was permanently 0, so the whole
+    floor-remarks fetch (Congressional Record, ~60 days back) and its
+    advocacy-classification pass ran every night to feed a boost that
+    could never do anything — see floor_speech_analyzer.py's removal.
+    """
+    # ── Base score from vote alignment ──
+    base_score: float | None = None
+
+    if campaign_promises:
+        scoreable = [
+            p for p in campaign_promises
+            if p.get("alignment") in (PromiseAlignment.KEPT, PromiseAlignment.BROKEN, PromiseAlignment.PARTIAL)
+        ]
+        n_scoreable = len(scoreable)
+        if scoreable:
+            raw_score = sum(
+                1.0 if p["alignment"] == PromiseAlignment.KEPT
+                else 0.5 if p["alignment"] == PromiseAlignment.PARTIAL
+                else 0.0
+                for p in scoreable
+            )
+            # Beta-Binomial posterior mean with Beta(α, α) prior where
+            # α = PRIOR_PSEUDOCOUNT / 2.  The posterior mean is:
+            #
+            #   E[θ | data] = (raw_score + α) / (n_scoreable + 2α)
+            #               = (raw_score + α) / (n_scoreable + PRIOR_PSEUDOCOUNT)
+            #
+            # where α represents a neutral prior (50% kept/broken).
+            # PRIOR_PSEUDOCOUNT = 10 implements Beta(5, 5), equivalent to
+            # observing 5 kept and 5 broken promises before any data —
+            # a prior that requires ~10 genuine observations to shift
+            # materially from neutral.  This is the conjugate prior for
+            # a proportion (Gelman et al. 2013, BDA3 §2.1) and corresponds
+            # to the Morris (1983) parametric empirical Bayes estimator
+            # for bounded parameters.  It prevents extreme scores from
+            # sparse data while converging to the observed rate with
+            # sufficient evidence.
+            #
+            # References:
+            #   Morris, C.N. (1983). JASA 78(381), 47–55.
+            #   Gelman et al. (2013). BDA3, Ch. 2.
+            #
+            # PRIOR_PSEUDOCOUNT = 10 (Beta(5,5)) was sized when the evidence
+            # thresholds in compute_promise_vote_alignment were 0.28/0.40 —
+            # noise-floor thresholds that passed ~90% of promises as
+            # evaluable, averaging ~4.8 real observations per member
+            # (real-data weight n/(n+10) ≈ 0.32). The 2026-07-09 threshold
+            # recalibration to 0.80/0.82 fixed a genuine false-positive
+            # problem (the old thresholds matched whatever ranked highest
+            # among unrelated votes as "evidence"), but it also roughly
+            # halved evaluable promises per member (~2.7 avg) — with the
+            # pseudocount unchanged, the prior came to dominate almost
+            # everyone's score, collapsing Promise Persistence's stdev
+            # (7.2→3.4 shadow-tested on live Senate data, 2026-07-10 audit) and
+            # flattening the dimension to near-uninformative. 6 restored
+            # roughly the original real-data weight (2.7/(2.7+6) ≈ 0.31)
+            # for the new, higher-precision evidence pool — but that 2.7avg
+            # estimate didn't hold up once the threshold change actually ran
+            # against real data: the ground-truth stdev floor (8.0) has
+            # failed every night since 2026-07-11, and a 2026-07-13 audit
+            # found the real average is 0.54 evaluable promises/senator
+            # (59/100 have ZERO — a genuine "no matching legislative
+            # activity exists for this promise in the search window"
+            # reality, not a threshold bug; see cross_reference.py's
+            # ceremonial-resolution fix for the one real bug found in this
+            # pass, which only recovered ~9% of the "unclear" mass). At
+            # n≈0.5, no pseudocount preserves both floor-clearing spread
+            # and real-data weight simultaneously — 6 gives everyone with
+            # zero evaluable promises (the majority) an identical 50, which
+            # is correct, but leaves too little room for the minority with
+            # 1-2 real observations to move the population stdev above 8.0.
+            # Resized to 3 (Beta(1.5, 1.5)): real-data weight at n=1 goes
+            # from 1/7≈14% to 1/4=25% — still meaningfully shrunk (a single
+            # promise can't swing a senator to an extreme), but enough to
+            # restore population stdev to ~9.2 (shadow-tested with the
+            # ceremonial-resolution fix applied). This is a stopgap for
+            # today's evidence volume, not a fix for why it's so low — that
+            # needs its own investigation (is the LLM gray-zone gate
+            # under-matching, or is 0.5 evaluable/senator just the honest
+            # ceiling given how few promises name a bill that actually gets
+            # a floor vote within one congress).
+            PRIOR_PSEUDOCOUNT = 3  # Beta(1.5, 1.5) — resized 2026-07 for the real ~0.5avg evidence volume
+            posterior_num = raw_score + PRIOR_PSEUDOCOUNT * 0.5
+            posterior_den = n_scoreable + PRIOR_PSEUDOCOUNT
+            base_score = (posterior_num / posterior_den) * 100
+
+    if base_score is None:
+        # No evaluable campaign promises — use a neutral prior of 50.
+        # Previously derived from voting behavior, but that created an
+        # undesirable correlation between Promise Persistence and Independent
+        # Voting: a senator with no platform data but high party-break rate
+        # would score high on both subscores from the same underlying votes,
+        # violating the design principle that each dimension is distinct.
+        # A neutral 50 honestly signals "we don't know" without inflating
+        # the score or creating spurious inter-dimension correlations.
+        base_score = 50
+
+    # ── Vote participation component ──
+    all_votes = (voting_record.get("keyVotes") or []) + (
+        voting_record.get("recentVotes") or []
+    )
+    if all_votes:
+        not_voting = sum(
+            1 for v in all_votes
+            if (v.get("vote") if isinstance(v, dict)
+                else getattr(v, "vote", None)) == "Not Voting"
+        )
+        participation = (len(all_votes) - not_voting) / len(all_votes)
+    else:
+        participation = 1.0  # no data → don't penalize
+
+    participation_score = min(participation / 0.90, 1.0) * 100
+
+    # ── Blend ──
+    final = base_score * (1 - PARTICIPATION_WEIGHT) + participation_score * PARTICIPATION_WEIGHT
+
+    return clamp(final)
+
+
+def _signed_state_alignment(
+    state: str,
+    party: str,
+    effective_party: str | None = None,
+    district: int | None = None,
+) -> float:
+    """How the member's party aligns with their seat's partisan lean.
+
+    Returns -1.0 to +1.0, normalized at ±15 PVI points:
+      +1.0 = deep safe seat for the member's party,
+       0.0 = swing seat (or unknown party/state),
+      -1.0 = seat strongly leans toward the opposing party.
+
+    House members are measured against their DISTRICT's lean when the
+    per-district table has it; state lean is the senator measure and the
+    House fallback. For Independents, uses effective_party (inferred
+    caucus) to determine alignment: an Independent who caucuses with
+    the Democrats is measured against the D lean.
+    """
+    pvi = _seat_pvi(state, district)
+    eval_party = effective_party or party
+    if eval_party == "R":
+        lean = pvi
+    elif eval_party == "D":
+        lean = -pvi
+    else:
+        return 0.0
+    return max(-1.0, min(lean / 15.0, 1.0))
+
+
+def _seat_pvi(state: str, district: int | None = None) -> int:
+    """Raw signed Cook PVI for a seat (positive = R lean): the district's
+    when a district is given and the table has it, else the state's, else
+    0 (neutral swing). The un-normalized value both _signed_state_alignment
+    (party-signed, /15-scaled) and the position-congruence component's
+    seat-conditional regression (which fetch/voteview.py FIT on this same
+    raw scale at ingest time) are derived from — one lookup,
+    so the two consumers can't disagree about which seat a member has."""
+    pvi = _state_pvi().get(state, 0)
+    if district is not None:
+        pvi = _district_pvi().get(f"{state}-{district}", pvi)
+    return pvi
+
+
+# Constituent Alignment's seat expectation is measured, not hand-set
+# (v6.13). Each run fits, per chamber and per party, the chamber's own
+# break rate on seat alignment (compute_constituent_reference); the members
+# it is about to score are the population. A party needs this many members
+# for its fit, and the fit only bends at a swing seat (the kink term) when
+# at least _MIN_OPPOSED_SEATS_FOR_KINK of them hold seats that lean to the
+# other party — otherwise a line through a handful of points decides every
+# opposed-seat member's expectation.
+_MIN_CONSTITUENT_REFERENCE_PARTY = 20
+_MIN_OPPOSED_SEATS_FOR_KINK = 5
+
+
+
+def party_break_rate(voting_record: dict) -> tuple[float | None, int]:
+    """(share of party-labeled votes cast against the member's party, count
+    of those votes). None when fewer than CONSTITUENT_MIN_VOTES are usable. The one definition
+    both the per-run reference and the member's score read, so the
+    expectation is measured on exactly the statistic it is compared with.
+    Each roll call counts once (dedupe_votes), matching what the scorecard
+    shows.
+
+    Unweighted since v6.15: a vote is party-labeled by how the parties
+    actually split on it (refine_with_vote_data), and each such roll call
+    is one observation of whether the member broke — the statistic the
+    research note validated (party-unity votes, unweighted). It used to be
+    weighted by partyAlignmentWeight, the bill's CONTENT lean, with 0.0
+    read as 1.0; a content-bipartisan bill that split on party lines then
+    counted a hundred times more than one with a 0.01 lean.
+
+    Since v6.20 the rate is the member's party-line record over the whole
+    Congress when the pipeline has measured it (partyLineRecord,
+    party_line_record.py): breaks toward the other party only, each measure
+    once. The stored votes are read only when it hasn't."""
+    breaks, n = party_line_tally(voting_record)
+    if n < CONSTITUENT_MIN_VOTES:
+        return None, n
+    return breaks / n, n
+
+
+def party_line_tally(voting_record: dict) -> tuple[int, int]:
+    """(breaks, party-line votes) that party_break_rate reads: the member's
+    party-line record over the whole Congress when it has been measured,
+    otherwise the stored votes, each roll call once. The profile's voting
+    record states these same counts, so its "broke party line" figure can't
+    disagree with the Constituent Alignment column beside it (it once read
+    the stored sample's every vote against the party instead, and showed no
+    breaks for 149 of 532 members whose score counted some)."""
+    from app.pipeline.transform.normalize_votes import dedupe_votes
+
+    record = voting_record.get("partyLineRecord")
+    if isinstance(record, dict) and isinstance(record.get("votes"), int):
+        return len(record.get("breaks") or []), record["votes"]
+
+    votes = dedupe_votes([
+        v for v in (voting_record.get("keyVotes") or []) + (voting_record.get("recentVotes") or [])
+        if isinstance(v, dict)
+    ])
+    labeled = [v["votedWithParty"] for v in votes if v.get("votedWithParty") is not None]
+    return sum(1 for wp in labeled if wp is not True), len(labeled)
+
+def _expected_break_rate(fit: dict, alignment: float) -> float:
+    """The seat's expected break rate from a per-party fit. Measured fits
+    (v6.16) are fractional logit — link "logit", so the rate stays inside
+    (0, 1) at any seat lean; a linear fit (the bundled hand-set prior) is
+    clipped to [0, 1]."""
+    x = (
+        float(fit["a"])
+        + float(fit["b"]) * alignment
+        + float(fit.get("b_opposed") or 0.0) * min(alignment, 0.0)
+    )
+    if fit.get("link") == "logit":
+        return 0.5 * (1.0 + math.tanh(0.5 * x))  # inverse logit, overflow-safe
+    return min(max(x, 0.0), 1.0)
+
+
+def seat_residual(break_rate: float, expected: float, n_votes: int) -> float:
+    """How far a member's break rate sits from their seat's expected rate,
+    in standard deviations per vote: the Pearson residual
+    (rate - p) / sqrt(p (1 - p)) (v6.16).
+
+    A percentage-point gap reads the same whether the seat expects 1.5% or
+    7%; it shouldn't — four extra points on an expected 1.5% is breaking
+    three times as often as the seat's norm, on 7% about half again. Scaling
+    by the binomial spread at the expectation makes a gap count for more
+    where members of that seat rarely break. Per vote (not the z-score
+    itself, which grows with the square root of the vote count), so the same
+    behavior reads the same in March as in December. It is also naturally
+    lopsided the way the evidence is: nobody breaks fewer than zero times,
+    so the loyal side is bounded near -sqrt(p / (1 - p)) while breaking can
+    run many standard deviations high.
+
+    p is kept at least half a vote of the member's own record away from 0
+    and 1 (the usual continuity correction), so an expectation near zero
+    can't turn a single break into an extreme."""
+    edge = 0.5 / max(n_votes, 1)
+    p = min(max(expected, edge), 1.0 - edge)
+    return (break_rate - p) / math.sqrt(p * (1.0 - p))
+
+
+# A logit coefficient past this, per unit of seat alignment (which spans
+# -1..1), multiplies the odds of breaking by more than e^50 across one seat
+# lean: not an estimate but a fit running off to infinity. That happens when
+# the rates are separable — every member on one side of a lean breaks zero
+# times (common early in a Congress), so no finite coefficient maximizes the
+# likelihood. A numerical sanity bound, not a calibrated value.
+_MAX_LOGIT_COEFFICIENT = 50.0
+
+
+def _fractional_logit(X, y):
+    """Fractional-response logit (Papke & Wooldridge 1996): the Bernoulli
+    quasi-likelihood of proportions under a logit link, maximized by Newton's
+    method with step-halving. The objective is convex, so halving each step
+    until it improves always improves it — plain iteratively reweighted least
+    squares does not: it overshot to coefficients in the billions on the
+    118th Senate's Democrats (research note section 10). Coefficients, or
+    None when no finite fit exists: the rates carry no variation (all zero
+    or all one), or they are separable and the coefficients run off
+    (_MAX_LOGIT_COEFFICIENT, or no convergence within the iteration cap)."""
+    import numpy as np
+
+    mean = float(y.mean())
+    if mean <= 0.0 or mean >= 1.0:
+        return None
+
+    def loss(beta):
+        eta = X @ beta
+        # -sum(y*eta - log(1 + e^eta)), with log(1 + e^eta) overflow-safe.
+        return float(np.sum(np.logaddexp(0.0, eta) - y * eta))
+
+    beta = np.zeros(X.shape[1])
+    beta[0] = math.log(mean / (1.0 - mean))
+    current = loss(beta)
+    converged = False
+    for _ in range(200):
+        mu = 0.5 * (1.0 + np.tanh(0.5 * (X @ beta)))  # expit, overflow-safe
+        grad = X.T @ (mu - y)
+        hess = X.T @ (X * np.clip(mu * (1.0 - mu), 1e-12, None)[:, None])
+        step = np.linalg.lstsq(hess, grad, rcond=None)[0]
+        t = 1.0
+        while t > 1e-10:
+            candidate = beta - t * step
+            value = loss(candidate)
+            if value <= current:
+                break
+            t /= 2.0
+        else:
+            # No step improves the objective: at its minimum to precision.
+            converged = True
+            break
+        converged = abs(current - value) < 1e-12 * max(1.0, abs(current))
+        beta, current = candidate, value
+        if converged:
+            break
+    if not converged or float(np.max(np.abs(beta))) > _MAX_LOGIT_COEFFICIENT:
+        return None
+    return beta
+
+
+def compute_constituent_reference(members: list[tuple[str, float, float, int]]) -> dict | None:
+    """Measure the seat expectation Constituent Alignment scores against.
+
+    `members` is (party, seat alignment, break rate, party-labeled votes)
+    for every D/R member of one chamber with a full-confidence record
+    (constituent_reference_inputs). Per party, fractional logit (v6.16):
+
+        logit(break_rate) = a + b * alignment + b_opposed * min(alignment, 0)
+
+    alignment is the party-signed seat lean (_signed_state_alignment), so
+    the kink lets the slope differ between seats that lean to the member's
+    party and seats that lean away. Per-party because the two parties'
+    break rates differ at the same seat lean (majority status, whip
+    strength — measured 2026-09 on the 108th House: D intercept 0.128, R
+    0.076), and a per-party expectation predicted re-election vote share
+    better than a pooled one (see the research note in
+    docs/research/constituent-alignment.md). Logit rather than a straight
+    line because a break rate is a proportion: the line it replaced (v6.13-
+    v6.15) predicted 0% for the safest seats, where no residual can be
+    measured, while the logit fit stays inside (0, 1) and keeps the party's
+    average rate (its score equations match the fitted to the observed sum).
+
+    Each party's "scale" is the SATURATION_QUANTILE of its own members'
+    |seat_residual|: the yardstick its members' departures are read on. The
+    vote score is 100 at the expectation and reaches 0 CROSSING_ZERO_GAPS
+    scales above it or LOYAL_ZERO_GAPS below. Per party, like the
+    expectation: one scale pooled across both parties let whichever party
+    was more cohesive that Congress score higher simply for sitting closer
+    to its own norm — on Voteview's 101st-119th Senates the two parties'
+    averages differed by 7.9 points on a pooled scale (up to 22 in one
+    Congress, the sign flipping with which party was more unified) and by
+    1.8 on per-party ones (research note section 10). Returns None unless
+    BOTH parties have enough members with rates to fit — one party scored
+    against a measured expectation and the other against a fallback would
+    not be comparable (the same both-or-neither rule as fetch/voteview.py's
+    ingestion gates).
+    """
+    import numpy as np
+
+    fits: dict[str, dict] = {}
+    for party in ("D", "R"):
+        rows = [(al, br, n) for p, al, br, n in members if p == party and br is not None]
+        if len(rows) < _MIN_CONSTITUENT_REFERENCE_PARTY:
+            return None
+        al = np.array([r[0] for r in rows])
+        br = np.array([r[1] for r in rows])
+        kinked = int((al < 0).sum()) >= _MIN_OPPOSED_SEATS_FOR_KINK
+        coef = None
+        # The kinked fit first; if it has no finite solution (every
+        # opposed-seat member at zero breaks, say), a single slope; if that
+        # has none either, no measured reference this run.
+        for bend in ((True, False) if kinked else (False,)):
+            cols = [np.ones_like(al), al] + ([np.minimum(al, 0.0)] if bend else [])
+            coef = _fractional_logit(np.column_stack(cols), br)
+            if coef is not None:
+                kinked = bend
+                break
+        if coef is None:
+            return None
+        fit = {
+            "link": "logit",
+            "a": round(float(coef[0]), 5),
+            "b": round(float(coef[1]), 5),
+            "b_opposed": round(float(coef[2]), 5) if kinked else 0.0,
+            "n": len(rows),
+        }
+        residuals = [seat_residual(r, _expected_break_rate(fit, a), n) for a, r, n in rows]
+        scale = round(float(np.quantile(np.abs(residuals), SATURATION_QUANTILE)), 5)
+        if scale <= 0:
+            return None
+        # What a typical member of this party scores on the vote shape: the
+        # score a record too thin to read is pulled toward (see
+        # seat_relative_vote_score). Measured with the scale as stored.
+        typical = float(np.median([_vote_shape(r, scale) for r in residuals]))
+        fits[party] = {**fit, "scale": scale, "typical": round(typical, 2)}
+    return {
+        "expected": fits, "n": sum(f["n"] for f in fits.values()),
+        "statistic": CONSTITUENT_REFERENCE_STATISTIC,
+    }
+
+
+def constituent_reference_inputs(members: list[dict]) -> list[tuple[str, float, float, int]]:
+    """(party, seat alignment, break rate, party-labeled votes) for each
+    member dict (the shape
+    calculate_scores consumes: state, party, district, votingRecord) whose
+    break rate rests on a full-confidence count of votes — exactly the values
+    _constituent_alignment_core compares, so the reference and the scores
+    can't disagree. Thinner records are left out: the score itself pulls
+    them toward the party's typical score (50 under the bundled prior) as
+    too noisy to read at full scale, and their 0/33/67%
+    rates would otherwise set the saturation point everyone else is scored
+    against."""
+    out = []
+    for m in members:
+        record = m.get("votingRecord") or {}
+        party = record.get("effectiveParty") or m.get("party")
+        rate, n = party_break_rate(record)
+        if party not in ("D", "R") or rate is None or n < CONSTITUENT_FULL_CONFIDENCE_VOTES:
+            continue
+        alignment = _signed_state_alignment(
+            m.get("state", ""), m.get("party", "I"),
+            effective_party=record.get("effectiveParty"), district=m.get("district"),
+        )
+        out.append((party, alignment, rate, n))
+    return out
+
+
+
+
+def _constituent_reference(chamber: str, reference: dict | None) -> dict:
+    """The chamber's reference: the one passed in if it was measured on the
+    current statistic, else the stored one CONSTITUENT_REFERENCE.load()
+    resolves (persisted, then bundled, skipping stale entries). {} when
+    none is usable."""
+    passed = (reference or {}).get(chamber)
+    if CONSTITUENT_REFERENCE.usable(passed):
+        return passed
+    return CONSTITUENT_REFERENCE.load().get(chamber) or {}
+
+
+# Where the seat-relative vote score reaches 0, in multiples of the
+# member's party's scale (the 90th-percentile |residual|): breaking
+# more than the seat's expectation reaches 0 at CROSSING_ZERO_GAPS, loyalty
+# beyond it at LOYAL_ZERO_GAPS (v6.16). The score is 100 at the expectation
+# itself — a member doing what their seat's same-party members do is doing
+# what the seat elected them to do — and falls linearly both ways. Design
+# weights, not fitted ones; section 10 of the research note has the tests.
+# Loyalty is the gentler side, twice as far to 0, because that is where the
+# evidence points: Senate general elections 1990-2024 showed no vote-share
+# cost for loyalty beyond the seat's norm, and own-party primary voters
+# punished excess disloyalty (House 1990-2010, -3.0 pts/SD), not loyalty.
+# The residual is lopsided the same way on its own (no member breaks fewer
+# than zero times), so in practice few members come near the loyal zero.
+CROSSING_ZERO_GAPS = 1.5
+LOYAL_ZERO_GAPS = 3.0
+
+
+def _vote_shape(
+    residual: float, scale: float,
+    crossing_zero: float | None = None, loyal_zero: float | None = None,
+) -> float:
+    """100 at the seat's expected break rate, falling linearly to 0 at
+    crossing_zero (default CROSSING_ZERO_GAPS) scales above it and
+    loyal_zero (default LOYAL_ZERO_GAPS) below it. The overrides exist for
+    the research note's sweeps only."""
+    gaps = residual / scale
+    if gaps >= 0:
+        reach = CROSSING_ZERO_GAPS if crossing_zero is None else crossing_zero
+    else:
+        reach = LOYAL_ZERO_GAPS if loyal_zero is None else loyal_zero
+    return max(0.0, 100.0 * (1.0 - abs(gaps) / reach))
+
+
+def beyond_saturation(residual: float, scale: float) -> bool:
+    """Whether a member's break rate is more than their party's scale from
+    their seat's expectation on either side — the two-sided count the
+    reference's quantile (over |residual|) describes, and so the one the
+    ground-truth gate's share probe checks against it."""
+    return abs(residual) > scale
+
+
+def seat_relative_vote_score(residual: float, scale: float, n_votes: int, typical: float | None = None) -> float:
+    """Constituent Alignment's seat-relative vote component: the peaked
+    shape (_vote_shape), shrunk linearly toward `typical` until the member
+    has CONSTITUENT_FULL_CONFIDENCE_VOTES party-labeled votes (AGENTS.md
+    principle 3) — with a handful of votes one break moves the rate far
+    enough to reach either end. `typical` is what a full-confidence member
+    of the party scores (the reference's per-party "typical", measured each
+    run): since v6.16 the shape tops out at the expectation, so 50 is a
+    below-average score, and shrinking a thin record toward it ranked every
+    newcomer under their peers for having few votes. None (the bundled
+    prior, which has no population to measure) shrinks toward a neutral 50.
+    The one implementation the score and the ground-truth gate both call."""
+    if typical is None:
+        typical = 50.0
+    confidence = min(n_votes / CONSTITUENT_FULL_CONFIDENCE_VOTES, 1.0)
+    return typical + (_vote_shape(residual, scale) - typical) * confidence
+
+
+def _chamber_of(district: int | None) -> str:
+    """A member's chamber from the scoring inputs: House members carry a
+    district (0 for at-large), senators none."""
+    return "house" if district is not None else "senate"
+
+
+def _seat_vote_expectation(
+    state: str,
+    party: str,
+    effective_party: str | None,
+    district: int | None,
+    reference: dict | None,
+) -> tuple[float, float | None, float | None, bool, float | None]:
+    """(seat alignment, expected break rate, the member's party's residual
+    scale, whether the reference was measured, the party's typical vote
+    score) for a member; expected, scale and typical are
+    None when the chamber has no usable expectation for their party, and
+    'measured' is False for the bundled preset prior (no member count).
+    The single derivation both the score (_constituent_alignment_core) and
+    the gate (seat_break_residual) read, from one resolution of the
+    reference, so they can't disagree about who is beyond saturation."""
+    alignment = _signed_state_alignment(state, party, effective_party=effective_party, district=district)
+    ref = _constituent_reference(_chamber_of(district), reference)
+    fit = (ref.get("expected") or {}).get(effective_party or party)
+    # A measured fit carries its party's own scale; the bundled prior has one
+    # chamber-wide deviation_p90.
+    scale = (fit or {}).get("scale") or ref.get("deviation_p90")
+    measured = ref.get("n") is not None
+    if fit is None or not scale:
+        return alignment, None, None, measured, None
+    # Only a measured reference has a population to take "typical" from;
+    # the bundled prior's thin records shrink toward a neutral 50 instead.
+    typical = float(fit["typical"]) if measured and fit.get("typical") is not None else None
+    return alignment, _expected_break_rate(fit, alignment), float(scale), measured, typical
+
+
+def seat_break_residual(
+    break_rate: float,
+    n_votes: int,
+    state: str,
+    party: str,
+    effective_party: str | None = None,
+    district: int | None = None,
+    reference: dict | None = None,
+) -> tuple[float, float, float | None] | None:
+    """(the member's seat_residual, their party's scale, their party's
+    typical vote score), or None without a measured expectation for the
+    member's party — the numbers the seat-relative vote score is a function
+    of, with the vote count. The ground-truth gate reads them through here
+    so it judges members on exactly the expectation the score used."""
+    _, expected, scale, _, typical = _seat_vote_expectation(state, party, effective_party, district, reference)
+    if expected is None:
+        return None
+    return seat_residual(break_rate, expected, n_votes), scale, typical
+
+
+# Weight of position congruence when the chamber has a current Voteview
+# section (a member with no position in it scores 50 on this part, v6.27);
+# the seat-relative vote component carries the rest. A design weight, not a
+# calibrated one — see the research note: the one election where both
+# could be tested (2004 House) gave the vote component the larger
+# independent association with re-election vote share, so the vote
+# component keeps the majority weight, but no multi-election estimate of
+# the ratio exists to fit this from.
+POSITION_CONGRUENCE_WEIGHT = 0.30
+
+# A senator's approval among the state's other-party voters and independents
+# (constituent_approval.py, v6.29) moves the score as much as position
+# congruence does: its weight is POSITION_CONGRUENCE_WEIGHT, applied to its
+# distance from the typical senator (a score of 50), and added to the 70:30
+# vote and position parts. Equal to position because the two were measured
+# equally: each part's independent association with how far senators ran
+# ahead of their party (2022 and 2024, each measured before its election)
+# was +1.27 and +0.77 points per standard deviation, confidence intervals
+# +0.24 to +2.00 and +0.22 to +1.52, too close to tell apart. Added around
+# the typical senator rather than given a share of the score, because a
+# share would pull every rated senator toward 50 (the composite's typical
+# value is 85), scoring a rated senator about 8 points below an unrated one
+# or a House member for being rated at all; an unrated senator is read as
+# typical, as a member with no position yet sits at 50
+# (docs/methodology/member-score/v6.29.md).
+APPROVAL_WEIGHT = POSITION_CONGRUENCE_WEIGHT
+# Standard deviations of the approval index at which its score approaches
+# 0 or 100 (tanh), the same saturation the president scorer and Legislative
+# Effectiveness use for a population z-score.
+APPROVAL_SATURATION_SD = 1.5
+
+
+def position_confidence(votes: int | None, reliability: dict | None) -> float:
+    """Reliability weight of a congress-specific position (v6.27), from the
+    section's `reliability` (written at ingest from
+    app/data/position_confidence.json): min(1, w(votes) /
+    w(reference_votes)), w(n) = n / (n + n0), for a position resting on
+    `votes` scaled roll calls. A full record (reference_votes or more)
+    counts in full; the calibration measures how much less a thin one says.
+    A position Voteview published with no count (None: a member it has
+    barely scaled who has a career DW-NOMINATE position; one with neither is
+    stored as 0 votes at ingest) gets the weight measured for such
+    positions, uncounted_weight. Always in [0, 1]; 1 without a usable
+    reliability (a section written before v6.27, or no calibration
+    available)."""
+    rel = reliability or {}
+    n0 = float(rel.get("n0") or 0)
+    if n0 <= 0:
+        return 1.0
+    if votes is None:
+        return min(max(float(rel.get("uncounted_weight") or 0.0), 0.0), 1.0)
+    votes = max(votes, 0)
+    reference = float(rel.get("reference_votes") or 0)
+    scale = reference / (reference + n0) if reference > 0 else 1.0
+    return min(max(votes / (votes + n0) / scale, 0.0), 1.0)
+
+
+def _shown_percent(weight: float) -> int:
+    """A weight below 1 as a whole percentage, rounded down so it never
+    reads 100% while still pulled toward 50 (the 1e-9 keeps float error
+    from reading 0.57 as 56%)."""
+    return math.floor(weight * 100 + 1e-9)
+
+
+def position_congruence_score(extremity: float, saturation: float, weight: float = 1.0) -> float:
+    """Constituent Alignment's position-congruence component: 50 at the
+    position a same-party member of this seat is expected to hold, falling
+    to 0 at `saturation` (the 90th-percentile extremity of the chamber's
+    full records, or its last scale carried early in a Congress) toward the
+    party flank and rising to 100 as far toward the seat's center —
+    symmetric, as the 2004 House test found (docstring below). `extremity`
+    is signed toward the flank. It is first scaled by the position's
+    reliability `weight` (position_confidence, v6.27): the measured slope of
+    a member's full-record position on one resting on that many votes,
+    relative to a full record, so the score is read at the best linear
+    estimate of where the member sits. The one implementation the score and
+    scripts/benchmark_validation.py both call.
+
+    Linear and 50 at the expectation, not 100 there like the vote part:
+    across House generals 1994-2010 and Senate generals 1990-2024 this
+    shape predicted the incumbent's vote share and the peaked one did not
+    (research note section 14)."""
+    return 50.0 - 50.0 * max(-1.0, min(weight * extremity / saturation, 1.0))
+
+
+def _pvi_label(pvi: int) -> str:
+    """Cook's spelling of a signed PVI (positive = R lean): R+9, D+4, EVEN."""
+    return "EVEN" if pvi == 0 else f"{'R' if pvi > 0 else 'D'}+{abs(pvi)}"
+
+
+def _congruence_scale_note(weighted_extremity: float, saturation: float,
+                           scale_congress: int | None, congress: int | None) -> str:
+    """Where position congruence's 0 and 100 come from, for the breakdown:
+    without it a 0 or 100 beside two dim1 numbers reads as arbitrary. The
+    scale is one distance on Voteview's scale for both parties (pooled, a
+    stated choice, research note section 14)."""
+    carried = (
+        f", carried from the {ordinal(int(scale_congress))} Congress until this one has enough full records"
+        if scale_congress and congress and int(scale_congress) != int(congress) else ""
+    )
+    note = (
+        f". 50 at the expectation, 0 at {saturation:.2f} toward the flank and 100 at {saturation:.2f} "
+        "toward the seat's center: the distance beyond which the most out-of-step tenth of this "
+        f"chamber's members with a full record sit, the same for both parties{carried}"
+    )
+    if abs(weighted_extremity) >= saturation:
+        note += f"; this position is at or past it, so the part is at {0 if weighted_extremity > 0 else 100}"
+    return note
+
+
+def _calc_constituent_alignment(
+    voting_record: dict,
+    lobbying_matches: list[dict],
+    funding: dict,
+    state: str = "",
+    party: str = "I",
+    district: int | None = None,
+    bioguide_id: str | None = None,
+    reference: dict | None = None,
+    name: str = "",
+    years_in_office: int = 0,
+) -> int:
+    """
+    Constituent Alignment Score (0-100, higher = better). Keyed
+    "constituentAlignment" (it was "independentVoting" until 2026-09).
+
+    How far a member's voting sits from what members of their party in
+    comparably-leaning seats do, in the direction their seat leans. v6.13
+    rebuilt it on evidence rather than argument: every design choice below
+    was tested against U.S. House re-election results (1994-2010, 2,545
+    incumbent-elections) — whether the measure predicts the incumbent's
+    vote share once district partisanship, the national tide and seniority
+    are controlled, the test Canes-Wrone, Brady & Cogan (2002) and Carson,
+    Koger, Lebo & Young (2010) use to show constituents judge these things.
+    Full method, numbers and caveats: docs/research/constituent-alignment.md
+    (reproduce with scripts/research_constituent_alignment.py).
+
+    Components:
+      1. Seat-relative vote alignment (70%, or 100% without a current
+         Voteview section): how far the member's break rate on party-labeled
+         votes sits from the rate their chamber's same-party members show at
+         the same seat lean (compute_constituent_reference, measured each
+         run), in standard deviations per vote (seat_residual, v6.16). 100
+         at the expectation, falling linearly to 0 at CROSSING_ZERO_GAPS
+         times the 90th-percentile |residual| of the member's party in the
+         chamber above it and LOYAL_ZERO_GAPS times it below.
+           - Measured in standard deviations, not percentage points (v6.16):
+             four extra points on a seat whose members break 1.5% of the time
+             is far more out of pattern than on one whose members break 7%.
+           - Peaked at the expectation (v6.16): the score measures whether
+             a member does what their seat elected them to do, so doing
+             about what comparable same-party members do is the top of the
+             scale, and departing from it either way costs.
+           - Loyalty below expectation is scored, not held neutral. In the
+             2004 House test the below-expectation side carried the
+             strongest association with vote share (2.3 pts per SD, t=3.4),
+             consistent with Carson et al. 2010. It is scored twice as
+             gently as excess disloyalty (LOYAL_ZERO_GAPS): Senate elections
+             show no cost for it, and own-party primary voters punish
+             breaking too often, not loyalty.
+           - No seat-safety discount on either side: the association was
+             the same in safe and competitive seats (1.5 vs 1.4 pts/SD).
+           - No discount for flank-side defectors (Kirkland & Slapin 2017's
+             concern): members breaking from the flank did not fare worse
+             for it — if anything better (difference +2.2, t=1.9), the
+             wrong sign for a discount.
+           - Breaking far past expectation costs. The whole seat stops
+             rewarding it at saturation (Senate 1990-2024, N=461: slope past
+             it 0.21, t=0.2) and the member's own party's primary voters
+             take share away past it (House primaries, -3.0 pts/SD, t=-2.0)
+             — research note section 8. The score represents both: the seat
+             that elected the member and the party label it elected them
+             under.
+      2. Position congruence (30%, when the chamber has a current Voteview
+         section; 50 for a member without a position in it): the
+         member's congress-specific Nokken-Poole first-dimension position
+         minus what a same-party member of a seat with this lean holds
+         (per-party OLS on seat PVI, fit each run by fetch/voteview.py).
+         Symmetric, saturating at the 90th-percentile extremity of the
+         chamber's full records.
+           - 1 SD toward the party flank cost 0.8-1.0 pts of vote share,
+             robust to flexible partisanship controls; the center-ward side
+             earned the same slope (equal-slopes p=0.92), so it is credited
+             symmetrically — the pre-v6.13 0.25 credit floor in safe seats
+             had no support.
+           - No safe-seat scaling (interaction t=0.1; the pre-v6.13 severity
+             weighting predicted worse than none).
+           - Per-party residual predicted best of the three designs tried
+             (per-party, pooled slope, raw position), marginally.
+           - Congress-specific (Nokken & Poole 2004) positions predicted the
+             2004 result better than career-constrained DW-NOMINATE and
+             dominated it when both were entered — and "current term, not
+             career" (AGENTS.md principle 6) wants the congress-specific one
+             anyway.
+           - Weighted by reliability (v6.27): the extremity is scaled by
+             how well a position from n scaled roll calls this Congress
+             predicts a full record's (position_confidence, from the curve
+             scripts/calibrate_position_confidence.py measures and
+             _position_reliability reads; a full record counts in full). A
+             member with no position in a current v6.27 section sits at
+             50; a section from another Congress is not read (principle
+             6); a section written before v6.27 (no counts) is read as
+             before, unweighted, until the next ingest rewrites it.
+           - The shape, 50 at the expectation, and the scale, pooled across
+             both parties, were tested against the alternatives in section 14
+             and kept.
+    """
+    return _constituent_alignment_core(
+        voting_record, lobbying_matches, funding, state, party,
+        district, bioguide_id, reference, name, years_in_office,
+    )["score"]
+
+
+def _constituent_alignment_core(
+    voting_record: dict,
+    lobbying_matches: list[dict],
+    funding: dict,
+    state: str = "",
+    party: str = "I",
+    district: int | None = None,
+    bioguide_id: str | None = None,
+    reference: dict | None = None,
+    name: str = "",
+    years_in_office: int = 0,
+) -> dict:
+    """Same math as _calc_constituent_alignment, returning every intermediate
+    value alongside the final score. Single implementation, same reuse
+    contract as _funding_independence_core above."""
+    effective_party = voting_record.get("effectiveParty", party)
+    eval_party = effective_party or party
+    alignment, expected, scale, measured, typical = _seat_vote_expectation(
+        state, party, effective_party, district, reference,
+    )
+    chamber = _chamber_of(district)
+
+    ideal = _member_ideal_points(chamber)
+    # Judged against the Congress of the roll calls the vote part read, or
+    # the sitting one for a member matched to no roll call.
+    record_congress = (voting_record.get("partyLineRecord") or {}).get("congress")
+    if not _ideal_points_current(ideal, record_congress):
+        ideal = {}  # another Congress's positions: not this term's record (principle 6)
+    dim1 = (ideal.get("members") or {}).get(bioguide_id) if bioguide_id else None
+    position_fit = (ideal.get("fit") or {}).get(eval_party)
+    congruence_sat = ideal.get("extremity_p90")
+    reliability = ideal.get("reliability") if isinstance(ideal.get("reliability"), dict) else None
+    congruence_score = None
+    congruence_detail = ""
+    if dim1 is not None and position_fit is not None and congruence_sat:
+        seat_pvi = _seat_pvi(state, district)
+        expected_dim1 = float(position_fit["a"]) + float(position_fit["b"]) * seat_pvi
+        residual = float(dim1) - expected_dim1
+        extremity = -residual if eval_party == "D" else residual
+        # None: Voteview reported no count of the roll calls behind the
+        # position (a member it has barely scaled, with a career position),
+        # weighted on its own; 0 when it had neither (voteview.py).
+        position_votes = (ideal.get("votes") or {}).get(bioguide_id)
+        weight = position_confidence(position_votes, reliability)
+        congruence_score = position_congruence_score(extremity, float(congruence_sat), weight)
+        congruence_detail = (
+            f"{ideal.get('measure', 'NOMINATE')} dim1 {float(dim1):+.2f} vs "
+            f"{expected_dim1:+.2f} expected for a {eval_party} member of a seat at {_pvi_label(seat_pvi)}, "
+            f"{abs(extremity):.2f} "
+            + ("toward the party flank" if extremity > 0 else "toward the seat's center")
+        )
+        if position_votes is None and weight < 1.0:
+            congruence_detail += (
+                f"; Voteview reports no count of the roll calls behind this position, so it counts "
+                f"at {_shown_percent(weight)}% strength, the measured weight of such positions, pulled toward 50"
+            )
+        elif position_votes == 0 and weight == 0.0:
+            congruence_detail += (
+                "; Voteview reports no count of the roll calls behind this position and the member "
+                "has no career position yet, so it doesn't count and this part sits at 50"
+            )
+        elif weight < 1.0:
+            half = (reliability or {}).get("half_weight_votes")
+            congruence_detail += (
+                f"; rests on {position_votes} roll calls, so it counts at {_shown_percent(weight)}% strength"
+                + (f" (half strength at about {half:.0f} roll calls)" if half else "")
+                + ", pulled toward 50"
+            )
+        congruence_detail += _congruence_scale_note(
+            weight * extremity, float(congruence_sat), ideal.get("scale_congress"), ideal.get("congress"),
+        )
+    elif reliability and position_fit is not None and congruence_sat and bioguide_id:
+        # A current section with no usable position for this member (Voteview
+        # hasn't placed them, or gave its 0, 0 placeholder): neutral, as a
+        # position resting on no votes would be, not a dropped component.
+        congruence_score = 50.0
+        congruence_detail = (
+            "Voteview has no position for this member this Congress yet, so this part sits at a neutral 50"
+        )
+
+    break_rate, n_party = party_break_rate(voting_record)
+    if eval_party not in ("D", "R"):
+        # A member who caucuses with neither party has no party line to
+        # break from. The record isn't thin; it measures nothing here. Said
+        # as "few votes" before, beside 676 recorded votes (2026-10-08).
+        party_score = 50.0
+        vote_part_status = "neutral:no-party"
+        party_alignment_detail = "caucuses with neither party, so there is no party line to break from: a neutral 50"
+    elif break_rate is None:
+        if typical is not None:
+            vote_part_status = "typical:few-votes"
+            # No record to read: the party's typical score, not 50, which
+            # since v6.16 sits below nearly every member (see
+            # seat_relative_vote_score).
+            party_score = typical
+            party_alignment_detail = (
+                f"fewer than {CONSTITUENT_MIN_VOTES} party-labeled votes available, so "
+                f"the typical score for a {eval_party} member of this chamber, {typical:.0f}"
+            )
+        else:
+            party_score = 50.0
+            vote_part_status = "neutral:few-votes"
+            party_alignment_detail = f"fewer than {CONSTITUENT_MIN_VOTES} party-labeled votes available, so a neutral 50"
+    elif expected is None:
+        party_score = 50.0
+        vote_part_status = "neutral:no-expectation"
+        party_alignment_detail = (
+            f"break rate {break_rate:.1%}; no measured expectation for a "
+            f"{eval_party or 'non-caucusing'} member of this chamber, so a neutral 50"
+        )
+    else:
+        residual = seat_residual(break_rate, expected, n_party)
+        party_score = seat_relative_vote_score(residual, scale, n_party, typical)
+        # Which target a thin record is pulled toward, so the scorecard can
+        # name it: the party's measured typical score, or a neutral 50.
+        shrink = "shrunk" if typical is not None else "shrunk-neutral"
+        vote_part_status = (
+            f"{shrink}:{n_party / CONSTITUENT_FULL_CONFIDENCE_VOTES:.2f}"
+            if n_party < CONSTITUENT_FULL_CONFIDENCE_VOTES else "full"
+        )
+        # measured is False for the bundled hand-set prior, used before a
+        # chamber's first measured run.
+        norm = (
+            f"{eval_party} members of this chamber in seats with this lean "
+            f"(signal {alignment:+.2f}) break on {expected:.1%}"
+            if measured else
+            f"a {eval_party} member of a seat with this lean (signal {alignment:+.2f}) is "
+            f"expected to break on {expected:.1%} (a preset expectation until this chamber "
+            "has been measured)"
+        )
+        # seat_residual keeps p half a vote of this record from 0 and 1; say
+        # so when it moved, or the printed numbers don't reproduce the gap.
+        edge = 0.5 / max(n_party, 1)
+        used = min(max(expected, edge), 1.0 - edge)
+        if used != expected:
+            norm += f" (read as {used:.1%}, half a vote of this record)"
+        if residual == 0:
+            gap = "exactly that"
+        else:
+            side, reach = (
+                ("more loyal", LOYAL_ZERO_GAPS) if residual < 0 else ("more independent", CROSSING_ZERO_GAPS)
+            )
+            # Name where the zero comes from: a multiple of the party's own
+            # 90th-percentile gap, not a number from nowhere.
+            basis = (
+                f"the gap beyond which the most out-of-pattern tenth of {eval_party} members "
+                "of this chamber sit"
+                if measured else "the preset scale"
+            )
+            gap = (
+                f"{abs(residual):.2f} standard deviations per vote {side} than that "
+                f"(100 at the expectation, 0 at {reach * scale:.2f} {side}: "
+                f"{reach:g} × {scale:.2f}, {basis})"
+            )
+        party_alignment_detail = (
+            f"broke with party on {break_rate:.1%} of {n_party} party-labeled votes; {norm}: {gap}"
+        )
+        if n_party < CONSTITUENT_FULL_CONFIDENCE_VOTES:
+            target = (
+                f"{typical:.0f}, the typical score for a {eval_party} member of this chamber"
+                if typical is not None else "a neutral 50"
+            )
+            party_alignment_detail += (
+                f"; only {n_party} votes, so the score is pulled toward {target}, "
+                f"until {CONSTITUENT_FULL_CONFIDENCE_VOTES}"
+            )
+
+    # Senators: approval among the state's other-party voters and
+    # independents (v6.29). The House is not scored on it (constituent_approval).
+    approval = (
+        senate_approval(state, name, eval_party, years_in_office, _state_pvi())
+        if chamber == "senate" else None
+    )
+    approval_score = (
+        50.0 + 50.0 * math.tanh(approval["z"] / APPROVAL_SATURATION_SD) if approval else None
+    )
+    congruence_weight = POSITION_CONGRUENCE_WEIGHT if congruence_score is not None else 0.0
+    party_weight = 1.0 - congruence_weight
+    # Points the approval part adds or takes away around the typical senator.
+    approval_points = APPROVAL_WEIGHT * (approval_score - 50.0) if approval_score is not None else 0.0
+    score = clamp(
+        party_score * party_weight + (congruence_score or 0.0) * congruence_weight + approval_points
+    )
+
+    components = [
+        {
+            "label": "Seat-relative vote alignment",
+            "weight": round(party_weight, 2),
+            "score": round(party_score, 1),
+            "detail": party_alignment_detail,
+        },
+    ]
+    if congruence_weight > 0:
+        components.append({
+            "label": "Position congruence",
+            "weight": round(congruence_weight, 2),
+            "score": round(congruence_score, 1),
+            "detail": congruence_detail,
+        })
+    approval_facts = None
+    if approval is not None:
+        names = {"D": "Democrats", "R": "Republicans", "I": "independents"}
+        approval_facts = {
+            "groups": [
+                {"group": g, "approve": round(a, 3), "typical": round(t, 3)} for g, a, t in approval["groups"]
+            ],
+            "z": round(approval["z"], 2),
+            "survey": approval["survey"],
+        }
+        components.append({
+            "label": "Constituent approval",
+            "weight": APPROVAL_WEIGHT,
+            "score": round(approval_score, 1),
+            "detail": (
+                "; ".join(
+                    f"{a:.0%} of the state's {names[g]} approve, against {t:.0%} for a typical "
+                    f"{eval_party} senator"
+                    for g, a, t in approval["groups"]
+                )
+                + f" ({approval['survey']}); {approval['z']:+.2f} standard deviations from the "
+                f"typical senator once the state's lean is allowed for, which "
+                f"{'adds' if approval_points >= 0 else 'takes'} {abs(approval_points):.1f} points "
+                f"{'to' if approval_points >= 0 else 'from'} the score (as much as position congruence "
+                "can move it; a typical senator's approval adds nothing)"
+            ),
+        })
+    elif chamber == "senate":
+        components.append({
+            "label": "Constituent approval",
+            "weight": 0.0,
+            "score": None,
+            "detail": (
+                "the Cooperative Election Study has no rating for this senator (first seated "
+                "after it was fielded), so this part is not measured and adds nothing either way, "
+                "as for a typical senator"
+            ),
+        })
+    record = voting_record.get("partyLineRecord")
+    return {
+        "score": score,
+        "components": components,
+        "vote_part_status": vote_part_status,
+        # The scorecard's sentence and scale, as numbers: how many
+        # party-labeled votes, how many were breaks, and the rate same-party
+        # members of seats like this one break at (None where not measured).
+        "facts": {
+            "party": eval_party,
+            "partyVotes": n_party,
+            "breaks": round(break_rate * n_party) if break_rate is not None else None,
+            "breakRate": round(break_rate, 4) if break_rate is not None else None,
+            "expectedBreakRate": round(expected, 4) if expected is not None else None,
+            # Votes against the party from its flank (party_line_record):
+            # shown beside the breaks, not counted. None without a record.
+            "flankBreaks": len(record.get("flankBreaks") or []) if record else None,
+            # Senators: the state's other-party and independent approval
+            # the approval component read, against the typical senator.
+            "approval": approval_facts,
+        },
+    }
+
+
+def _calc_funding_diversity(funding: dict) -> int:
+    """
+    Funding Diversity Score (0-100, higher = better).
+
+    v6.5 (2026-07): no longer its own SCORE_WEIGHTS entry or top-level
+    scorecard panel — folded into Funding Independence as two additional
+    components (_funding_independence_core calls _funding_diversity_core
+    directly and reuses these two signals). Kept running and stored to
+    score_funding_diversity exactly as before (same "still real, still
+    computed, just excluded from the weighted sum" pattern as
+    promisePersistence's v6.0 removal) since other consumers (action
+    center, Bluesky spotlight text, the funding-diversity DB column
+    itself) still read it independently. See config_definitions.
+    SCORE_WEIGHTS's docstring for the r=0.72 fold-in rationale.
+
+    Measures how broad and distributed a senator's funding base is.
+    Higher = funding comes from many independent sources (harder to
+    capture); lower = funding concentrated in few large donors/industries.
+
+    Two signals:
+
+      1. Source breadth (50%): rewards broad donor bases. Small donor
+         funding (<$200) represents the widest possible base — hundreds
+         of thousands of individual contributors, none with outsized
+         influence. Large itemized donors with classified industries
+         add breadth only when spread across sectors. UNCLASSIFIED money
+         (see note below — a residual we cannot attribute at all, not
+         evidence of concentration) is weighted neutrally rather than
+         penalized. Only OTHER/POLITICAL/large-individual-unclassified-
+         by-employer money — donors we *attempted* to classify by name
+         and came up empty — keeps the "least diverse" weighting, since
+         that at least carries a weak opacity signal UNCLASSIFIED does
+         not.
+
+      2. Industry concentration (50%): inverse HHI among ALL funding
+         source categories (including SMALL_DONORS as its own category).
+         Funding concentrated in a single industry suggests potential
+         capture; broad funding suggests diverse constituent support.
+
+    Academic note: the FEC does not itemize sub-$200 donors, so we
+    cannot measure their individual diversity — but aggregate small-
+    dollar fundraising is a well-established proxy for broad grassroots
+    support (Bonica 2014; Malbin 2009). Treating small donors as
+    "opaque" conflates traceability with diversity; this score measures
+    the latter.
+
+    Uses each entry's dollar ``total``, not its stored ``percentage`` —
+    that field is rounded to the nearest integer point for display
+    (normalize_finance.py), which silently zeroes out any industry
+    under ~0.5% of total raised. A 2026-07 audit found 86.5% of
+    industry rows had percentage=0 despite a nonzero dollar total, and
+    UNCLASSIFIED (donations the classifier couldn't attribute to any
+    industry — semantically "unknown," the same as OTHER/POLITICAL, not
+    itself an industry) was left out of NON_INDUSTRY_CODES. Together
+    these collapsed the HHI calculation to near-total "concentration" in
+    UNCLASSIFIED for 95/100 senators regardless of their actual spread
+    across real industries, dragging the population mean to 37 against
+    every other dimension's ~50 neutral calibration.
+
+    UNCLASSIFIED-as-neutral (2026-07): UNCLASSIFIED is a pure residual —
+    ``total_raised`` minus everything else we *could* categorize
+    (normalize_finance.py) — not donors the classifier examined and
+    failed to place. It swallows committee transfers, joint-fundraising
+    splits, and donations lacking employer data: money with no
+    attribution path at all, which says nothing about whether it's
+    concentrated in one source or spread across thousands. A live audit
+    found a 32% median UNCLASSIFIED share (56% at p90) driving a strong
+    negative correlation with this score (r=-0.66) purely from missing
+    attribution, not measured concentration — directly contradicting
+    this project's own "missing data defaults to neutral, never
+    punitive" principle applied everywhere else. Weighted neutrally here
+    (0.5, matching the population's ~50 baseline) rather than folded
+    into the "least diverse" bucket with OTHER/POLITICAL/unclassified-
+    large-individual money, which at least represents a real (if failed)
+    classification attempt.
+    """
+    return _funding_diversity_core(funding)["score"]
+
+
+def industry_hhi(funding: dict) -> tuple[float | None, int, float]:
+    """(HHI of the industry-classified money's mix, #industries, classified $)
+    — None below _INDUSTRY_MIN_CLASSIFIED. Shared by the score and its
+    population reference."""
+    industries = [
+        ind for ind in funding.get("industryBreakdown") or []
+        if ind.get("industry") not in NON_INDUSTRY_CODES and (ind.get("total") or 0) > 0
+    ]
+    known = sum(ind["total"] for ind in industries)
+    if known < _INDUSTRY_MIN_CLASSIFIED:
+        return None, len(industries), known
+    return sum((ind["total"] / known) ** 2 for ind in industries), len(industries), known
+
+
+def _industry_concentration(
+    funding: dict, total_raised: float, reference: dict | None = None, party: str | None = None,
+) -> tuple[float | None, str]:
+    """(score, detail) for industry concentration: how evenly the member's
+    industry money spreads across industries, by the HHI of its mix
+    (Parmigiani 2025 computes the same HHI per legislator). Small donors,
+    unattributed individuals and party money are not industry money and
+    are left out of the mix.
+
+    Ranked within the member's party in the chamber (_rank_score over the
+    party's deciles compute_funding_reference measures each run,
+    industry_hhi_by_party): the party's median member scores 50. One
+    party's donors' occupations fall in fewer, broader industries than the
+    other's, so a chamber-wide rank scored the party's donor base (Senate
+    means 27.6 D, 69.7 R, 2026-10-01); within party both average 50, as
+    Legislative Effectiveness's coalition component compares (v6.25). A
+    party with fewer than _MIN_PARTY_COHORT measured members is ranked
+    against the chamber. Unmeasurable (too little classified money, or no
+    reference yet) is None: Funding Independence is then weighed over its
+    other components (_funding_independence_core).
+
+    The shares are of the classified money, not of everything raised.
+    Taken over everything raised (as top-donor concentration's are), the
+    HHI tracked how much of a member's money the classifier could place
+    (r = -0.91 with the classified share, Senate, 2026-10-01), and that is
+    mostly how many itemized donors' stated occupations resolve to an
+    industry: a median 24% of a senator's itemized individual money, 11%
+    to 39% p10 to p90. The mix of the money that is placed estimates the
+    composition whatever the coverage; how much money is industry money is
+    the PAC and small-donor components' question.
+
+    Unmeasurable below _INDUSTRY_MIN_CLASSIFIED of classified money (score
+    `missing_score`). Until v6.26 the score was also pulled toward
+    `missing_score` in proportion to the share of ALL funding classified:
+    that read a campaign of small gifts, whose industry money is a small
+    share of the total however much of it there is, as an unreliable
+    estimate, and the small-donor share it reflects is scored by its own
+    component. How far to trust an HHI depends on the evidence behind it,
+    which is the classified money itself."""
+    hhi, n, known = industry_hhi(funding)
+    if hhi is None:
+        return None, (
+            f"${known:,.0f} of industry-classified money, too little to measure its mix; "
+            f"{_NOT_MEASURED}"
+        )
+    share = known / total_raised if total_raised else 0.0
+    ref = reference or {}
+    cohort = (ref.get("industry_hhi_by_party") or {}).get(party or "")
+    if cohort:
+        score = _rank_score(hhi, cohort["deciles"])
+        versus = f"{party} median {cohort['median']:.3f}"
+    elif ref.get("industry_hhi_deciles"):
+        score = _rank_score(hhi, ref["industry_hhi_deciles"])
+        versus = f"chamber median {ref['industry_hhi_median']:.3f}"
+    else:
+        return None, f"HHI {hhi:.3f}, no chamber reference to compare with yet; {_NOT_MEASURED}"
+    return score, (
+        f"HHI {hhi:.3f} across {n} industries ({versus}); ${known:,.0f} classified, "
+        f"{share:.0%} of contributions"
+    )
+
+
+def _industry_mix_diversity(
+    funding: dict, total_raised: float, missing_score: float, missing_label: str = "neutral",
+) -> tuple[float, str]:
+    """(score, detail) for industry concentration: inverse HHI across
+    classified industries — a member whose PAC and itemized money all comes
+    from one industry is more captured than one whose money spans eight
+    (Parmigiani 2025 computes the same HHI per legislator). Small donors
+    and unclassified large individuals are excluded; they are not
+    industry-specific money.
+
+    When less than 5% of the money is industry-classified, HHI on that
+    slice is noise, so the score is `missing_score`; between 5% and 40% it
+    is shrunk toward `missing_score` in proportion to the classified
+    share. Funding Independence passes a neutral 50; Funding Diversity
+    passes its grassroots-scaled neutral (see _funding_diversity_core)."""
+    industries = [
+        ind for ind in funding.get("industryBreakdown") or []
+        if ind.get("industry") not in NON_INDUSTRY_CODES
+    ]
+    if not industries or not total_raised:
+        return missing_score, f"no industry breakdown available, so {missing_label} {missing_score:.0f}"
+    total_known = sum(ind.get("total", 0) for ind in industries)
+    total_known_pct = total_known / total_raised * 100
+    if total_known_pct < 5 or total_known <= 0:
+        return missing_score, (
+            f"only {total_known_pct:.1f}% of funding is industry-classified, "
+            f"too little to measure HHI, so {missing_label} {missing_score:.0f}"
+        )
+    hhi = sum((ind.get("total", 0) / total_known) ** 2 for ind in industries)
+    raw = (1 - max(0, min((hhi - 0.10) / 0.90, 1.0))) * 100
+    relevance = min(total_known_pct / 40, 1.0)
+    score = raw * relevance + missing_score * (1 - relevance)
+    return score, (
+        f"HHI {hhi:.3f} across {len(industries)} industries → raw {raw:.1f}, "
+        f"blended {relevance:.0%} with {missing_label} {missing_score:.0f} "
+        f"({total_known_pct:.0f}% of funding industry-classified)"
+    )
+
+
+def _funding_diversity_core(funding: dict) -> dict:
+    """Same math as _calc_funding_diversity, returning every intermediate
+    value alongside the final score. Single implementation, same reuse
+    contract as _funding_independence_core above."""
+    industry_breakdown = funding.get("industryBreakdown", [])
+    # Not measurable (every gift itemized) counts as no small-donor money
+    # here; Funding Diversity is informational.
+    small_donor_pct = funding.get("smallDonorPercentage", 0) or 0
+    total_raised = funding_share_base(funding)
+
+    if not industry_breakdown or not total_raised:
+        return {"score": 50, "components": [], "note": "No funding data, so a neutral 50."}
+
+    # Signal 1: source breadth
+    # Small donors = broadest possible base (many independent contributors).
+    # Classified industry donors = moderate breadth (we know the sector).
+    # Unclassified large donors = narrowest (few large, opaque sources).
+    small_frac = small_donor_pct / 100.0
+
+    classified_industry_total = sum(
+        ind.get("total", 0) for ind in industry_breakdown
+        if ind.get("industry") not in NON_INDUSTRY_CODES
+    )
+    classified_frac = classified_industry_total / total_raised
+
+    unclassified_total = sum(
+        ind.get("total", 0) for ind in industry_breakdown
+        if ind.get("industry") == "UNCLASSIFIED"
+    )
+    unclassified_frac = unclassified_total / total_raised
+
+    # Small donors are the most diverse source; classified industry
+    # money is moderately diverse; UNCLASSIFIED (unattributable, not
+    # evidence of concentration — see docstring) is neutral; the true
+    # remainder (OTHER, POLITICAL, large individuals whose employer
+    # didn't match any industry) is least diverse.
+    other_frac = max(0, 1 - small_frac - classified_frac - unclassified_frac)
+    breadth = (
+        small_frac * 1.0
+        + classified_frac * 0.6
+        + unclassified_frac * 0.5
+        + other_frac * 0.2
+    )
+    breadth_score = min(breadth, 1.0) * 100
+
+    # Fallback/blend target for when classified industry money is too
+    # thin a slice to measure HHI on. Previously a flat step (65 if
+    # small_frac > 0.3 else 50) regardless of how far past 0.3 small_frac
+    # actually was — so a senator overwhelmingly funded by small donors
+    # (one 2026-07 senator: 63% small-donor, 0.28% classified-industry money)
+    # got exactly the same 65 as one just barely over the threshold.
+    # That silently capped Funding Diversity's population-wide maximum at
+    # 69 (2026-07 audit: 0/100 senators break 69, the ceiling this flat
+    # 65 mechanically imposes), even though near-total small-dollar
+    # reliance IS itself close to maximal diversification — it's spread
+    # across an unbounded number of individual donors, not a handful of
+    # institutional ones. Scaling continuously with small_frac instead
+    # (still 50 at small_frac=0, still 65 at exactly 0.3 — the old
+    # threshold's value, so this is continuous with the prior behavior
+    # at that point, not a discontinuous jump) lets that reward grow all
+    # the way to 100 for a hypothetical fully-small-dollar campaign.
+    grassroots_neutral = 50 + small_frac * 50
+    concentration_score, concentration_detail = _industry_mix_diversity(
+        funding, total_raised, missing_score=grassroots_neutral,
+        missing_label=f"grassroots-scaled neutral ({small_frac:.0%} small-donor share)",
+    )
+
+    score = clamp(breadth_score * 0.5 + concentration_score * 0.5)
+    return {
+        "score": score,
+        "components": [
+            {
+                "label": "Source breadth",
+                "weight": 0.5,
+                "score": round(breadth_score, 1),
+                "detail": (
+                    f"{small_frac:.0%} small-donor + {classified_frac:.0%} "
+                    f"classified-industry + {unclassified_frac:.0%} unclassified "
+                    f"(neutral) + {other_frac:.0%} opaque"
+                ),
+            },
+            {
+                "label": "Industry concentration",
+                "weight": 0.5,
+                "score": round(concentration_score, 1),
+                "detail": concentration_detail,
+            },
+        ],
+    }
+
+
+# Chamber majority party by congress (public record; applied symmetrically).
+# Used to benchmark bill advancement against what a sponsor's majority/
+# minority status makes achievable — Volden & Wiseman (2014) show minority
+# sponsors advance bills at a fraction of the majority rate, and scoring
+# against a single absolute threshold silently penalizes whichever party
+# is out of power. The majority/minority advancement rates themselves are
+# measured each run from the chamber's own bills (_measure_advancement_rates).
+_SENATE_MAJORITY: dict[int, str] = {
+    104: "R", 105: "R", 106: "R", 107: "D", 108: "R", 109: "R", 110: "D",
+    111: "D", 112: "D", 113: "D", 114: "R", 115: "R", 116: "R", 117: "D",
+    118: "D", 119: "R",
+}
+_HOUSE_MAJORITY: dict[int, str] = {
+    104: "R", 105: "R", 106: "R", 107: "R", 108: "R", 109: "R", 110: "D",
+    111: "D", 112: "R", 113: "R", 114: "R", 115: "R", 116: "D", 117: "D",
+    118: "R", 119: "R",
+}
+# The table above is historical record only. The CURRENT congress's
+# majority comes from the live roster each pipeline run (derive_chamber_
+# majority, carried on the LES reference) — a hand-maintained table has
+# no entry for a congress until someone adds one, and the moment a new
+# congress convened every member silently fell back to the flat
+# unknowable-status rate, dropping the majority/minority adjustment.
+
+
+# House bill types (substantive + commemorative) — used for chamber
+# detection wherever a bill's own billType is the only chamber signal
+# available (no explicit chamber field on sponsored-bill records).
+_LES_HOUSE_TYPES = {"hr", "hjres", "hres", "hconres"}
+
+
+def derive_chamber_majority(
+    parties: list[str | None], chamber: str, tie_breaker: str | None = None,
+) -> str | None:
+    """The majority party of a chamber from its current roster.
+
+    `parties` holds each member's caucus party (Independents already
+    resolved to the party they caucus with — pass effectiveParty, not the
+    raw "I"). Counted over D and R only; anything unresolved is ignored.
+    A Senate tie goes to `tie_breaker` (the sitting Vice President's party,
+    i.e. the president's — the 117th Congress's 50-50 Senate was a
+    Democratic majority this way). A House tie, or a Senate tie with no
+    tie_breaker, is unknowable and returns None.
+    """
+    d = sum(1 for p in parties if p == "D")
+    r = sum(1 for p in parties if p == "R")
+    if d > r:
+        return "D"
+    if r > d:
+        return "R"
+    if chamber == "senate" and tie_breaker in ("D", "R"):
+        return tie_breaker
+    return None
+
+
+def _bill_majority(bill_type: str, congress: int | None, current: tuple[int, str] | None) -> str | None:
+    """The majority party of the chamber a bill was introduced in, for its
+    congress. `current` = (congress, majority) derived from the live roster;
+    it wins for the congress it describes, the table covers the past."""
+    is_house = bill_type in _LES_HOUSE_TYPES
+    if current is not None and congress == current[0]:
+        return current[1]
+    return (_HOUSE_MAJORITY if is_house else _SENATE_MAJORITY).get(congress or 0)
+
+
+def _advancement_baseline(
+    bill_type: str,
+    congress: int | None,
+    party: str | None,
+    current: tuple[int, str] | None = None,
+    rates: dict | None = None,
+) -> float:
+    """Expected bill advancement rate for a sponsor, by chamber/congress/
+    party. Chamber detection must cover every House bill type (including
+    commemorative hres/hconres), not just substantive ones — this is
+    averaged over a member's full sponsored-bill list (_les_component_
+    score), not pre-filtered to substantive bills the way the old
+    advancement-rate formula filtered it.
+
+    `rates` = {"majority", "minority", "pooled"} for the bill's chamber,
+    measured each run (_measure_advancement_rates); None reads the persisted
+    reference. Only their RATIO affects a score — member baselines are
+    divided by the chamber average — so these used to be the hand-typed
+    2026-07 corpus rates (Senate 3.6% / 2.4%, House 6.4% / 2.4%)."""
+    if rates is None:
+        chamber = "house" if bill_type in _LES_HOUSE_TYPES else "senate"
+        rates = (LES_REFERENCE.load().get(chamber) or {}).get("advancement_rates") or {}
+    majority = _bill_majority(bill_type, congress, current)
+    if not majority or party not in ("D", "R") or not rates:
+        return rates.get("pooled", 1.0)  # status unknowable: no tilt either way
+    return rates["majority"] if party == majority else rates["minority"]
+
+
+# Below this tenure, zero substantive bills is indistinguishable from a
+# member who has not had a chance to sponsor any yet, and scores neutral.
+# At or above it, zero is a record: a credit of 0 on the same scale as
+# everyone else (see _les_component_score). Roughly one legislative session.
+_MIN_TENURE_FOR_ZERO_SIGNAL_YEARS = 0.5
+
+
+# Legislative Effectiveness: Volden & Wiseman's (2014, "Legislative
+# Effectiveness in the United States Congress," Cambridge UP; data and
+# methodology at thelawmakers.org) Legislative Effectiveness Score. Each
+# sponsored bill counts, by significance weight, at every stage it reaches
+# (a law counts at all four); at each stage the member's weighted count is
+# divided by the chamber's weighted total there, and the stage shares are
+# summed and scaled so the chamber averages 1.0 (_les_normalized_credit).
+# The per-stage division is the heart of the measure: few bills reach the
+# later stages, so advancing one earns far more than introducing one.
+#
+# v6.14 restored it. v6.4-v6.13 credited weight x stages reached with no
+# division, which made a law worth four introductions and turned the score
+# into a count of bills introduced: against V&W's published LES for the
+# 110th-118th Congresses it ranked members at Spearman 0.76 (House) and
+# 0.79 (Senate), against 0.93 and 0.97 with the division
+# (scripts/research_les_stage_weighting.py, docs/research/
+# les-stage-weighting.md).
+#
+# Disclosed departures from V&W, each measured by that script:
+#   - Four stages, not five: Congress.gov's action codes give committee
+#     action and reporting as one stage here (IN_COMMITTEE), where V&W
+#     separate "action in committee" from "action beyond committee".
+#   - Significance: bills and joint resolutions 5x, simple and concurrent
+#     resolutions 1x, and a bill whose content is commemorative (a post-
+#     office naming, a Gold Medal) 1x — detected from its title by an
+#     embedding classifier calibrated against V&W's own commemorative
+#     counts (analyze/commemorative.py, scripts/calibrate_commemorative.py).
+#     V&W's third tier, "substantive and significant" (10x), comes from CQ
+#     Almanac coverage, which has no source here.
+#   - The score compares each member with the median of their own
+#     majority/minority status in the chamber, measured each run, rather
+#     than reporting the raw ratio to the chamber mean.
+# Legislative leadership (PageRank cosponsorship centrality, Brin & Page
+# 1998) has no basis in Volden & Wiseman's work — it is kept as an
+# explicitly separate component (25%, or 30% without cosponsorship data),
+# not blended into the V&W-based one (60%, or 70%).
+
+_LES_STAGE_ORDER: dict[str, int] = {
+    # Volden & Wiseman's five stages (v6.17): introduced, action in
+    # committee, action beyond committee, passed the chamber, became law.
+    "INTRODUCED": 1,
+    # 2026-07 fix: REFERRED (bill_stage.py) is the automatic, universal
+    # first step every bill gets within days of introduction — same credit
+    # as bare introduction. The old scheme gave every bill that had merely
+    # been referred the same credit as one that actually got a hearing,
+    # markup, or was reported out (one senator's sponsored-bills summary
+    # read "135 bills, 123 advancing").
+    "REFERRED": 1,
+    "IN_COMMITTEE": 2,  # a hearing or markup: action in committee
+    # Action beyond committee: reported out, discharged, on a calendar, or
+    # taken up on the floor. Its own stage from v6.17; it folded into
+    # committee action before, and crediting it separately raised rank
+    # agreement with V&W's published LES from 0.981 to 0.985 (House) and
+    # 0.984 to 0.992 (Senate), docs/research/les-stage-weighting.md.
+    "REPORTED": 3,
+    "ON_FLOOR": 3,
+    "PASSED_CHAMBER": 4,
+    "IN_OTHER_CHAMBER": 4,  # already passed its own chamber; no separate V&W stage for this
+    "PASSED_BOTH": 4,       # V&W's PASS is its own chamber's passage; the second is no further stage
+    "TO_PRESIDENT": 4,      # same — passed both chambers, not yet a new milestone
+    "ENACTED": 5,
+    "VETOED": 4,            # passed Congress, never became law
+}
+_LES_MAX_STAGE = 5
+
+
+def _les_bill_stage(bill: dict) -> int:
+    """This bill's cumulative-stage position (1-5, _LES_MAX_STAGE), V&W-style.
+
+    Prefers the real `stage` classification (classify_bill_stage_from_
+    actions, bill_stage.py — built from Congress.gov's own structured
+    action codes) when present. Falls back to is_law / latestAction
+    keyword inference when `stage` is unset: it's a brand-new field with
+    no historical backfill yet (2026-07), and without this fallback every
+    existing sponsored bill would default to stage 1 until a pipeline run
+    repopulates it, silently collapsing this entire component to a flat
+    bill count. The fallback never invents progress beyond what a hard
+    fact (is_law) or the same advancement keywords the old formula used
+    supports — "ordered to be reported" clears committee (stage 2, per
+    bill_stage.py's own actionCode table), "passed"/"agreed to" clears
+    the chamber (stage 3)."""
+    stage = _LES_STAGE_ORDER.get(bill.get("stage"))
+    if stage is not None:
+        return stage
+    if bill.get("isLaw"):
+        return _LES_MAX_STAGE
+    action = (bill.get("latestAction") or "").lower()
+    # "Motion to proceed ... not agreed to" and "failed of passage" record
+    # a chamber declining the bill, which the bare phrases would credit as
+    # passing it.
+    if ("passed" in action or "agreed to" in action) and "not agreed to" not in action and "failed" not in action:
+        return _LES_STAGE_ORDER["PASSED_CHAMBER"]
+    if "ordered to be reported" in action:
+        return _LES_STAGE_ORDER["IN_COMMITTEE"]
+    return 1
+
+
+def _les_significance_weight(bill_type: str, commemorative: bool = False) -> float:
+    """V&W's tiers as far as they can be observed here: a bill or joint
+    resolution 5x, unless its content is commemorative (analyze/
+    commemorative.py) — then 1x, like a simple or concurrent resolution."""
+    if commemorative:
+        return 1.0
+    return 5.0 if bill_type in SUBSTANTIVE_BILL_TYPES else 1.0
+
+
+def _les_stage_counts(sponsored_bills: list[dict]) -> list[float]:
+    """Significance-weighted count of these bills reaching each stage;
+    index 0 is stage 1 (introduced). Cumulative, as in V&W: a bill that
+    became law counts at all four stages."""
+    counts = [0.0] * _LES_MAX_STAGE
+    for b in sponsored_bills:
+        w = _les_significance_weight((b.get("billType") or "").lower(), bool(b.get("commemorative")))
+        for k in range(_les_bill_stage(b)):
+            counts[k] += w
+    return counts
+
+
+def _les_normalized_credit(
+    stage_counts: list[float], stage_totals: list[float], n_members: int,
+) -> float:
+    """Volden & Wiseman's LES arithmetic: at each stage, the member's
+    weighted count over the chamber's weighted total at that stage, summed
+    over stages and scaled by N/stages so the chamber averages 1.0.
+
+    Dividing by each stage's total is what makes advancement count: a
+    stage few bills reach has a small total, so one bill there is a large
+    share of it. Crediting weight x stages-reached instead (v6.4-v6.13)
+    made an enacted bill worth four introductions where V&W's arithmetic
+    makes it worth ~47 (House) to ~67 (Senate), and ranked members by bill
+    volume (Spearman 0.95-0.98 with introductions, 0.76-0.79 with V&W's
+    published LES) — scripts/research_les_stage_weighting.py,
+    docs/research/les-stage-weighting.md.
+    """
+    total = sum(c / t for c, t in zip(stage_counts, stage_totals) if t > 0)
+    return total * n_members / len(stage_totals)
+
+
+# ── LES population reference ────────────────────────────────────────────
+#
+# A member's per-congress credit is scored against their chamber's
+# population: the MEDIAN member's credit is the neutral bar (v6.10 — the
+# distribution is right-skewed, so a mean bar puts >50% of every chamber
+# below neutral by construction), tilted by the member's own majority/
+# minority bill mix relative to the chamber-average baseline (v6.9), and
+# the gap saturates at 1.5 population standard deviations.
+#
+# COMPUTED EACH PIPELINE RUN from the chamber being scored (v6.13,
+# compute_les_reference), not hand-copied from a calibration script's
+# output. Two reasons it had to move:
+#   - Credit only accumulates as a congress goes on, and scoring is limited
+#     to the current congress. A median frozen on one date drifted: every
+#     member's score crept upward through the congress against a fixed bar,
+#     then collapsed at the next congress when everyone restarted near zero
+#     against a bar measured mid-congress.
+#   - AGENTS.md §3a: calibrated values are generated data, never Python
+#     literals pasted from a script's printout.
+#
+# Saturation is now each chamber's OWN spread (v6.13). It used to be one
+# pooled constant (1.5 x the mean of the two chambers' stdevs), which over-
+# counted a House member's gap relative to House spread and under-counted a
+# Senate member's (live stdevs 88 vs 178) — the same cross-chamber mixing
+# v6.9 removed from the medians and baselines. Pooling would also mix
+# congresses at a rollover, when one chamber has run under the new congress
+# and the other hasn't yet.
+#
+# Where the numbers come from, in order:
+#   1. the reference the pipeline passes in for this run;
+#   2. /data/les_reference.json — the last run's reference, which is what
+#      the API's on-demand "show the math" breakdown and scripts/rescore.py
+#      read, so they reproduce the pipeline's own numbers;
+#   3. app/data/les_reference.json — the bundled pre-first-run fallback,
+#      regenerated by scripts/calibrate_les_credit_scale.py.
+# (File handling: population_reference.LES_REFERENCE.)
+_LES_SATURATION_STDEVS = 1.5
+
+
+def congress_exposure(sworn_date: str | None, congress: int | None, as_of: str | None = None) -> float:
+    """The share of `congress` so far, up to `as_of` (ISO date; today when
+    absent), that a member sworn in on `sworn_date` has served: 1.0 for a
+    member seated when it convened (January 3 of its first year, 20th
+    Amendment §2), and whenever either date is unknown or unparseable."""
+    if not sworn_date or not congress:
+        return 1.0
+    try:
+        sworn = date.fromisoformat(sworn_date[:10])
+        now = date.fromisoformat(as_of[:10]) if as_of else utcnow().date()
+    except (TypeError, ValueError):
+        return 1.0
+    start = date(1789 + (congress - 1) * 2, 1, 3)
+    now = min(now, date(start.year + 2, 1, 3))
+    elapsed = (now - start).days
+    if elapsed <= 0 or sworn <= start:
+        return 1.0
+    return min(max((now - sworn).days / elapsed, 0.0), 1.0)
+
+
+def _les_member_inputs(
+    sponsored_bills: list[dict],
+    party: str | None,
+    stage_totals: list[float] | None = None,
+    n_members: int | None = None,
+) -> dict | None:
+    """Per-member quantities the LES component and its population reference
+    share — one definition, so the reference is always measured with the
+    exact formula members are scored with. None when the member has no
+    substantive bills (not part of the credit distribution).
+
+    `raw_per_congress` needs the chamber's stage totals (compute_les_
+    reference measures them); without them it is None."""
+    n_sub = sum(
+        1 for b in sponsored_bills
+        if (b.get("billType") or "").lower() in SUBSTANTIVE_BILL_TYPES
+    )
+    if n_sub == 0:
+        return None
+    congresses = {b.get("congress") for b in sponsored_bills if b.get("congress")}
+    house_n = sum(
+        1 for b in sponsored_bills
+        if (b.get("billType") or "").lower() in _LES_HOUSE_TYPES
+    )
+    raw = None
+    if stage_totals and n_members:
+        raw = _les_normalized_credit(
+            _les_stage_counts(sponsored_bills), stage_totals, n_members,
+        ) / max(len(congresses), 1)
+    return {
+        "n_sub": n_sub,
+        "raw_per_congress": raw,
+        "is_house": house_n > (len(sponsored_bills) - house_n),
+    }
+
+
+def _les_member_baseline(
+    sponsored_bills: list[dict],
+    party: str | None,
+    current: tuple[int, str] | None,
+    rates: dict | None = None,
+) -> float:
+    return sum(
+        _advancement_baseline((b.get("billType") or "").lower(), b.get("congress"), party, current, rates)
+        for b in sponsored_bills
+    ) / len(sponsored_bills)
+
+
+# Fewest advanced bills in EACH of the majority and minority groups before
+# their rates are trusted; early in a congress there are few, and the
+# previous rates are kept instead.
+_MIN_ADVANCED_BILLS_PER_STATUS = 20
+
+
+def _measure_advancement_rates(
+    members: list[tuple[list[dict], str | None]], current: tuple[int, str] | None,
+) -> dict | None:
+    """Share of sponsored bills that advanced past referral (stage >= 2:
+    committee action or further) for majority- vs minority-party sponsors
+    in this chamber, plus the pooled rate. None when either group has too
+    few advanced bills to measure."""
+    counts = {"majority": [0, 0], "minority": [0, 0]}  # [advanced, total]
+    for bills, party in members:
+        if party not in ("D", "R"):
+            continue
+        for b in bills:
+            majority = _bill_majority((b.get("billType") or "").lower(), b.get("congress"), current)
+            if not majority:
+                continue
+            c = counts["majority" if party == majority else "minority"]
+            c[1] += 1
+            if _les_bill_stage(b) >= 2:
+                c[0] += 1
+    if any(adv < _MIN_ADVANCED_BILLS_PER_STATUS for adv, _ in counts.values()):
+        return None
+    adv = sum(a for a, _ in counts.values())
+    total = sum(t for _, t in counts.values())
+    return {
+        "majority": round(counts["majority"][0] / counts["majority"][1], 6),
+        "minority": round(counts["minority"][0] / counts["minority"][1], 6),
+        "pooled": round(adv / total, 6),
+        "n_bills": total,
+    }
+
+
+def compute_les_reference(
+    members: list[tuple[list[dict], str | None]],
+    congress: int,
+    majority: str | None,
+    previous_rates: dict | None = None,
+) -> dict | None:
+    """One chamber's LES population reference from this run's members.
+
+    `members` is (sponsored_bills, caucus party) per member of the chamber
+    being scored; `majority` is derive_chamber_majority's answer for
+    `congress`. Returns None when too few members have substantive bills
+    to describe a distribution — the caller then keeps the last good
+    reference rather than scoring against noise.
+    """
+    current = (congress, majority) if majority else None
+    rates = _measure_advancement_rates(members, current) or previous_rates
+    # The chamber's weighted total at each stage, over every member's bills
+    # (V&W's denominators). N is the whole chamber, not only members with
+    # substantive bills, so the chamber — not its sponsors — averages 1.0.
+    stage_totals = [0.0] * _LES_MAX_STAGE
+    for bills, _ in members:
+        for k, c in enumerate(_les_stage_counts(bills)):
+            stage_totals[k] += c
+    n_members = len(members)
+    credits: list[float] = []
+    baselines: list[float] = []
+    by_status: dict[str, list[float]] = {"majority": [], "minority": []}
+    for bills, party in members:
+        inputs = _les_member_inputs(bills, party, stage_totals, n_members)
+        if inputs is None or inputs["raw_per_congress"] is None:
+            continue
+        credits.append(inputs["raw_per_congress"])
+        baselines.append(_les_member_baseline(bills, party, current, rates))
+        status = _les_status(party, majority)
+        if status:
+            by_status[status].append(inputs["raw_per_congress"])
+    if len(credits) < _MIN_LES_REFERENCE_MEMBERS:
+        return None
+    ref = {
+        "congress": congress,
+        "majority": majority,
+        # The date the credits were counted up to, which a mid-Congress
+        # arrival's share of the Congress is taken against (congress_exposure).
+        "measured_on": utcnow().date().isoformat(),
+        "n": len(credits),
+        "median_credit": round(statistics.median(credits), 4),
+        "mean_credit": round(statistics.mean(credits), 4),
+        "stdev_credit": round(statistics.pstdev(credits), 4),
+        "avg_baseline": round(statistics.mean(baselines), 6),
+        "advancement_rates": rates,
+        "stage_totals": [round(t, 4) for t in stage_totals],
+        "n_members": n_members,
+    }
+    if all(len(v) >= _MIN_LES_STATUS_MEMBERS for v in by_status.values()):
+        ref["status_median"] = {k: round(statistics.median(v), 4) for k, v in by_status.items()}
+    return ref
+
+
+def _les_status(party: str | None, majority: str | None) -> str | None:
+    """'majority' / 'minority' for a D/R sponsor in a chamber whose majority
+    is known; None otherwise (no status benchmark applies)."""
+    if not majority or party not in ("D", "R"):
+        return None
+    return "majority" if party == majority else "minority"
+
+
+# Fewest members of EACH status needed to measure that status's median
+# credit. Below it the advancement-rate tilt (status_ratio) stands in.
+_MIN_LES_STATUS_MEMBERS = 15
+
+
+# Fewest members with substantive bills that still describe a chamber's
+# distribution. Early in a congress few members have introduced anything;
+# below this, the previous reference is kept (see compute_les_reference).
+_MIN_LES_REFERENCE_MEMBERS = 30
+
+
+def load_les_reference() -> dict:
+    """{"senate": {...}, "house": {...}} — see population_reference."""
+    return LES_REFERENCE.load()
+
+
+def _les_component_score(
+    sponsored_bills: list[dict],
+    party: str | None,
+    years_in_office: float | None,
+    reference: dict | None = None,
+    chamber: str | None = None,
+    bills_known: bool = True,
+    sworn_date: str | None = None,
+) -> tuple[float, str]:
+    """The V&W-based component: stage-normalized credit per congress
+    served (_les_normalized_credit), scored against the median member of
+    the same majority/minority status in the chamber.
+
+    No substantive bills scores neutral below _MIN_TENURE_FOR_ZERO_SIGNAL_
+    YEARS or when the chamber is unknown, and otherwise as a credit of 0 —
+    so inaction never beats an attempt. `bills_known=False` (the fetch
+    failed) is neutral: an empty list there is not a record.
+
+    `sworn_date` (ISO date) is when a member who arrived mid-Congress took
+    the seat: the bar is prorated by the share of the Congress so far they
+    have served (congress_exposure, v6.23), since credit accumulates over
+    the time a member has had to sponsor and advance bills.
+
+    `reference` is {"senate": {...}, "house": {...}} (compute_les_reference
+    per chamber); None reads load_les_reference(). See the LES population
+    reference comment above for where each number comes from."""
+    if not bills_known:
+        # The member's sponsored legislation could not be fetched this run.
+        # An empty list here is a failed request, not a record of zero bills.
+        return 50.0, "sponsored legislation could not be fetched this run, so a neutral 50"
+    inputs = _les_member_inputs(sponsored_bills, party)
+    if inputs is None:
+        if (years_in_office or 0) < _MIN_TENURE_FOR_ZERO_SIGNAL_YEARS:
+            return 50.0, "no substantive bills on record yet, so a neutral 50"
+        if chamber is None:
+            return 50.0, "no substantive bills and no chamber to compare against, so a neutral 50"
+        n_sub = 0
+    else:
+        n_sub = inputs["n_sub"]
+        chamber = "house" if inputs["is_house"] else "senate"
+
+    ref = (reference or load_les_reference()).get(chamber)
+    if not ref:
+        return 50.0, "no population reference available for this chamber, so a neutral 50"
+    if (not ref.get("stage_totals") or not ref.get("n_members")
+            or len(ref["stage_totals"]) != _LES_MAX_STAGE):
+        # A reference measured before v6.14 is on the old weight x stages
+        # scale; comparing a stage-normalized credit with it would be
+        # meaningless. The next pipeline run replaces it.
+        return 50.0, (
+            f"the stored {chamber} reference predates stage-normalized credit, "
+            "so a neutral 50 until the next pipeline run measures a new one"
+        )
+    if inputs is None:
+        # No substantive bills after real tenure: a credit of 0, compared
+        # on the same scale as everyone else — V&W's LES is 0 for a member
+        # who sponsored nothing. That keeps "inaction never beats an
+        # attempt" true by construction (credit is monotone in bills),
+        # which the fixed near-neutral score it replaces could only keep by
+        # shrinking every low-volume sponsor toward 50.
+        raw_per_congress = 0.0
+    else:
+        raw_per_congress = _les_member_inputs(
+            sponsored_bills, party, ref["stage_totals"], ref["n_members"],
+        )["raw_per_congress"]
+    member_congress = max((b.get("congress") or 0 for b in sponsored_bills), default=0)
+    if member_congress and ref.get("congress") and member_congress != ref["congress"]:
+        # First days of a new congress, before enough members have
+        # introduced bills to measure its reference: comparing against the
+        # previous congress's full-term median would score everyone as if
+        # they'd done almost nothing.
+        return 50.0, (
+            f"no {chamber} reference measured for the {member_congress}th Congress yet, "
+            "so a neutral 50 until enough members have sponsored bills to measure one"
+        )
+    current = (ref["congress"], ref["majority"]) if ref.get("majority") else None
+    population_median = ref["median_credit"]
+    avg_baseline = ref["avg_baseline"]
+    saturation = _LES_SATURATION_STDEVS * ref["stdev_credit"]
+
+    status = _les_status(party, ref.get("majority"))
+    status_median = (ref.get("status_median") or {}).get(status) if status else None
+    if status_median is not None:
+        # Volden & Wiseman's benchmark: a member is compared with members of
+        # the same majority/minority status — here that status's median
+        # credit, measured this run. The advancement-rate ratio below used
+        # to set this bar, but it scaled ALL credit (introduction included,
+        # which status doesn't affect) by an advancement-rate ratio, which
+        # over-corrected: sponsors performing exactly at their status's
+        # rate scored a median 7.5 (majority) vs 97 (minority) in
+        # scripts/research_les_status_benchmark.py, and the House's
+        # measured D-R gap on production data was 18.5 points.
+        expected_per_congress = status_median
+    else:
+        rates = ref.get("advancement_rates")
+        if rates and avg_baseline and sponsored_bills:
+            member_baseline = _les_member_baseline(sponsored_bills, party, current, rates)
+            status_ratio = member_baseline / avg_baseline
+        else:
+            # No measured rates yet: no majority/minority tilt, rather than a
+            # member baseline on a different scale from the chamber average.
+            status_ratio = 1.0
+        # Fallback when a status group is too small to measure (or the
+        # sponsor's status is unknown): the chamber MEDIAN, tilted by the
+        # member's bill mix. Median, not V&W's mean, so the typical member
+        # scores ~50 despite the right-skewed credit distribution.
+        expected_per_congress = population_median * status_ratio
+
+    # A member sworn in mid-Congress (a special election) has had only part
+    # of it to sponsor and advance bills, while the bar is measured on
+    # members who have served all of it so far: compare them with that
+    # share of it (v6.23). 1.0 for everyone who took the seat when the
+    # Congress convened, or whose date is unknown.
+    exposure = congress_exposure(sworn_date, ref.get("congress"), ref.get("measured_on"))
+    full_bar = expected_per_congress
+    expected_per_congress *= exposure
+
+    diff = raw_per_congress - expected_per_congress
+    normalized_diff = max(-1.0, min(diff / saturation, 1.0)) if saturation else 0.0
+    # No shrinkage toward 50 by bill count (v6.14). Credit is a total over
+    # every bill the member sponsored — all of them observed, nothing
+    # estimated — and already grows with volume, so shrinking a low-volume
+    # sponsor toward the middle penalised volume a second time: it pulled a
+    # member with two bills, one enacted, down toward members with dozens
+    # introduced. Against V&W's published LES it cost 0.06 of rank agreement
+    # in the House (scripts/research_les_stage_weighting.py). The published
+    # confidence grade still says how many bills stand behind the number.
+    score = 50.0 + 50.0 * normalized_diff
+
+    # Stage-count breakdown (2026-07, per user request): the raw credit
+    # figure above is one opaque number that a bill-mill sponsor (many
+    # bills, all stuck at "introduced") and a genuine passage-heavy
+    # sponsor could both reach — Volden & Wiseman's real methodology
+    # credits introduction itself, not just advancement (see this file's
+    # v6.4->v6.5-era LES module comment above _LES_STAGE_ORDER). Showing
+    # the actual stage counts makes that visible instead of implied.
+    substantive_bills = [
+        b for b in sponsored_bills
+        if (b.get("billType") or "").lower() in SUBSTANTIVE_BILL_TYPES
+    ]
+    introduced_only = sum(1 for b in substantive_bills if _les_bill_stage(b) == 1)
+    advanced_short_of_law = sum(
+        1 for b in substantive_bills if 1 < _les_bill_stage(b) < _LES_MAX_STAGE
+    )
+    enacted = sum(1 for b in substantive_bills if _les_bill_stage(b) >= _LES_MAX_STAGE)
+
+    bar = f"median {status}-party sponsor" if status_median is not None else "for this sponsor's status"
+    if exposure < 1.0:
+        bar += f"; {full_bar:.2f} prorated to the {exposure:.0%} of this Congress served since {sworn_date}"
+    if inputs is None:
+        return score, (
+            f"0 substantive bills over {years_in_office:.1f} years in office: "
+            f"a credit of 0 vs. {expected_per_congress:.2f} expected ({bar})"
+        )
+    commemorative = sum(1 for b in substantive_bills if b.get("commemorative"))
+    detail = (
+        f"stage-normalized credit {raw_per_congress:.2f}/congress (chamber average 1.00) vs. "
+        f"{expected_per_congress:.2f} expected ({bar}); "
+        f"{n_sub} bills: {introduced_only} introduced only, "
+        f"{advanced_short_of_law} advanced further, {enacted} became law"
+    )
+    if commemorative:
+        detail += f"; {commemorative} commemorative (weighted 1x, not 5x)"
+    return score, detail
+
+
+def _calc_legislative_effectiveness(
+    sponsored_bills: list[dict],
+    leadership_score: float | None = None,
+    party: str | None = None,
+    years_in_office: float | None = None,
+    attracted_bipartisanship: float | None = None,
+    les_reference: dict | None = None,
+    chamber: str | None = None,
+    bills_known: bool = True,
+    sworn_date: str | None = None,
+) -> int:
+    """
+    Legislative Effectiveness Score (0-100, higher = better).
+
+    Three components (two when bipartisan-attraction data is missing —
+    weights then revert to exactly the pre-v6.11 70/30 split):
+
+      1. Bill significance & advancement (60%): Volden & Wiseman's (2014)
+         Legislative Effectiveness Score — see the module comment above
+         _LES_STAGE_ORDER for the method and its disclosed departures.
+
+      2. Legislative leadership (25%): PageRank score from the
+         cosponsorship network (Brin & Page 1998, computed in
+         sponsorship_analysis.py) — no basis in Volden & Wiseman, kept as
+         an explicitly separate signal. Senators whose bills attract
+         cosponsors from influential colleagues score higher. Shrunk
+         toward neutral 50 for freshmen (PageRank centrality takes years
+         to build; a near-zero raw percentile in year one reflects network
+         age, not effectiveness — 2026-07 fix, see leadership_conf below).
+
+      3. Bipartisan coalition attraction (15%, when cosponsorship data
+         exists — v6.11, moved here from Constituent Alignment): the
+         share of cosponsors a member attracts to their OWN bills from
+         the other party, against the median of the member's own party
+         (compute_bipartisanship_scores(direction="receive"), v6.25).
+         Harbridge-Yong, Volden & Wiseman (2023, "The Bipartisan Path to
+         Effective Lawmaking," J. Politics 85:3, 93rd-114th Congresses)
+         show attracting cross-party cosponsors robustly predicts
+         lawmaking success for BOTH majority- and minority-party members
+         — and specifically that it is the ATTRACTION of bipartisan
+         cosponsors, not the offer of cosponsorships across the aisle,
+         that carries the effect, which is why this component consumes
+         the receive-only rate rather than the Lugar-style give+receive
+         blend the profile display uses. Two disclosed limits keep the
+         weight modest: HVW's evidence is a robust association, not a
+         clean causal identification (their own framing), and the signal
+         is an ANTECEDENT of effectiveness rather than realized output —
+         realized advancement is already component 1's job. No
+         seat-safety scaling here, unlike the old Constituent Alignment
+         breadth component: in an effectiveness dimension, low bipartisan
+         attraction predicts lower lawmaking success regardless of how
+         safe the member's seat is. Note components 2 and 3 are both
+         cosponsorship-network-derived (centrality vs. cross-party
+         share) — kept at a combined 40% for that reason; re-check their
+         live correlation after the first full run, same standing check
+         as the v6.8 r=-0.76 finding.
+
+    The leadership component is shrunk toward 50 for short tenure. The
+    V&W-based component is not shrunk by bill count (v6.14, see
+    _les_component_score); a member with no substantive bills after real
+    tenure scores a credit of 0 on the same scale when `chamber` is known,
+    and neutral when their bills could not be fetched (`bills_known`).
+    """
+    return _legislative_effectiveness_core(
+        sponsored_bills, leadership_score, party, years_in_office,
+        attracted_bipartisanship, les_reference, chamber, bills_known, sworn_date,
+    )["score"]
+
+
+def _bills_facts(sponsored_bills: list[dict] | None) -> dict:
+    """The Legislative Effectiveness column's figures: how many of a
+    member's bills and joint resolutions got furthest to each of the five
+    V&W stages (introduced, action in committee, action beyond committee,
+    passed a chamber, became law), by the same stage mapping the score uses
+    (_les_bill_stage), and how many simple and concurrent resolutions they
+    sponsored besides.
+
+    Bills only, the population the component's own sentence counts ("40
+    bills: 39 introduced only, ..."). Counting every resolution too made
+    the column say a member had "3 passed the House" beside "1 advanced
+    further", when two of the three were simple resolutions the House
+    agreed to (electing a member to a committee, say), which the score
+    weights as V&W do, a fifth of a bill."""
+    counts = [0] * _LES_MAX_STAGE
+    resolutions = 0
+    for bill in sponsored_bills or []:
+        if (bill.get("billType") or "").lower() in SUBSTANTIVE_BILL_TYPES:
+            counts[_les_bill_stage(bill) - 1] += 1
+        else:
+            resolutions += 1
+    return {"billsByStage": counts, "bills": sum(counts), "resolutions": resolutions}
+
+
+def _legislative_effectiveness_core(
+    sponsored_bills: list[dict],
+    leadership_score: float | None = None,
+    party: str | None = None,
+    years_in_office: float | None = None,
+    attracted_bipartisanship: float | None = None,
+    les_reference: dict | None = None,
+    chamber: str | None = None,
+    bills_known: bool = True,
+    sworn_date: str | None = None,
+) -> dict:
+    """Same math as _calc_legislative_effectiveness, returning every
+    intermediate value alongside the final score. Single implementation,
+    same reuse contract as _funding_independence_core above."""
+    les_score, les_detail = _les_component_score(
+        sponsored_bills or [], party, years_in_office, les_reference,
+        chamber=chamber, bills_known=bills_known, sworn_date=sworn_date,
+    )
+
+    # Component: leadership score from cosponsorship PageRank
+    #
+    # PageRank centrality is structurally a function of network size,
+    # which takes time to build — a freshman senator's raw percentile is
+    # near-zero not because they're ineffective but because they haven't
+    # had years to accumulate cosponsorship connections yet. A 2026-07
+    # audit found this the dominant driver of a real tenure-vs-LE
+    # correlation (r=+0.24 across the population; freshmen (<=2yrs)
+    # averaged LE=29.5 vs veterans (>=10yrs) at 54.1), directly
+    # contradicting this project's own "seniority alone is never
+    # penalized" design principle (AGENTS.md). Shrink the raw percentile
+    # toward neutral 50 with the same confidence-scaling pattern already
+    # used for the V&W-based component, scaled to a full 6-year Senate
+    # term (long enough to plausibly build a real network; short enough
+    # that a second-term member isn't still getting a pass).
+    # 0.0 is a real score, not missing data: compute_leadership_scores
+    # rescales the chamber's PageRank to [0, 1], so exactly one member —
+    # the chamber's lowest — gets 0.0. Treating that as "no data" gave the
+    # bottom member a neutral 50 while the next one up scored ~0. Only None
+    # (no cosponsorship-network data) is missing.
+    if leadership_score is not None:
+        # Rescaled within the chamber (log scale, median ≈ 0.5) — a
+        # position in the chamber, not a percentile.
+        leadership_raw = min(max(leadership_score, 0.0), 1.0) * 100
+        leadership_head = f"PageRank leadership {leadership_raw:.0f}/100 within the chamber (median ≈ 50)"
+    else:
+        # No data yet — neutral prior, never a punitive below-50 default
+        # (this repo's design principle: missing data is never "bad").
+        leadership_raw = 50.0
+        leadership_head = "no cosponsorship-network data, so a neutral 50"
+
+    leadership_conf = min((years_in_office or 0) / LEADERSHIP_TENURE_FULL_CREDIT_YEARS, 1.0)
+    leadership_pct = leadership_raw * leadership_conf + 50 * (1 - leadership_conf)
+    # Tenure weight: a newer member's network position is pulled toward
+    # 50; LEADERSHIP_TENURE_FULL_CREDIT_YEARS in office gives it full weight.
+    leadership_detail = (
+        f"{leadership_head}; weighted {leadership_conf:.0%} for tenure "
+        f"({years_in_office or 0:.1f} years in office; full weight from "
+        f"{LEADERSHIP_TENURE_FULL_CREDIT_YEARS:g})"
+    )
+
+    if (
+        not sponsored_bills
+        and leadership_score is None
+        and attracted_bipartisanship is None
+        and les_score == 50.0
+    ):
+        return {"score": 50, "components": [], "note": "No sponsored-bill or leadership data, so a neutral 50."}
+
+    # Bipartisan coalition attraction (v6.11 — see the docstring above for
+    # the HVW 2023 rationale and disclosed limits). The median attractor
+    # of cross-party cosponsors in the member's own party scores 50
+    # (v6.25, compute_bipartisanship_scores: the parties are not equally
+    # willing to cosponsor across the aisle, so a chamber median scored
+    # the other party's habits). Missing data skips
+    # the component and reverts to the exact pre-v6.11 70/30 split —
+    # never scored neutral, matching how this dimension's own
+    # missing-data note above treats absent signals.
+    if attracted_bipartisanship is not None:
+        coalition_pct = min(max(attracted_bipartisanship, 0.0), 1.0) * 100
+        les_weight, leadership_weight, coalition_weight = 0.60, 0.25, 0.15
+    else:
+        coalition_pct = 0.0
+        les_weight, leadership_weight, coalition_weight = 0.70, 0.30, 0.0
+
+    score = clamp(
+        les_score * les_weight
+        + leadership_pct * leadership_weight
+        + coalition_pct * coalition_weight
+    )
+    components = [
+        {"label": "Bill significance & advancement (V&W-based)", "weight": les_weight,
+         "score": round(les_score, 1), "detail": les_detail},
+        {"label": "Legislative leadership", "weight": leadership_weight,
+         "score": round(leadership_pct, 1), "detail": leadership_detail},
+    ]
+    if coalition_weight > 0:
+        components.append({
+            "label": "Bipartisan coalition attraction",
+            "weight": coalition_weight,
+            "score": round(coalition_pct, 1),
+            "detail": (
+                "cross-party share of cosponsors attracted to own bills, "
+                "against the median member of the same party (that median scores 50)"
+            ),
+        })
+    return {"score": score, "components": components, "facts": _bills_facts(sponsored_bills)}

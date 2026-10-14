@@ -1,0 +1,23 @@
+{
+  "repo_url": "https://github.com/alexandrelheinen/fret.git",
+  "commit": "",
+  "file": "src/fret/ros/perception_bridge.py",
+  "function": "_load_config",
+  "cwe": "CWE-22",
+  "param": "config_path",
+  "payload": "/tmp/tier2_proof_cuvp3b31/secret_0df9d081b847.txt",
+  "verdict": "NEEDS_MANUAL",
+  "detail": "target '_load_config' is internal (underscore-prefixed or under a private module). An external attacker reaches it only via a public caller / CLI / HTTP entry -- trace that path by hand before disclosing.",
+  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_cuvp3b31/secret_0df9d081b847.txt (proven by live execution trace; read-traversal, no output echo required)",
+  "tier2_sink": "open",
+  "reachable": true,
+  "entry_kind": "main",
+  "call_path": [
+    "main",
+    "__init__",
+    "_load_config"
+  ],
+  "reproduce_verdict": "NEEDS_MANUAL",
+  "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
+  "repo_full": "alexandrelheinen/fret"
+}

@@ -1,0 +1,11 @@
+.
+fixtures/synthetic
+src
+src/womblex/cli
+src/womblex/cloud
+src/womblex/ingest
+src/womblex/ingest/pdf
+src/womblex/process
+src/womblex/store
+src/womblex/ui
+src/womblex/utils

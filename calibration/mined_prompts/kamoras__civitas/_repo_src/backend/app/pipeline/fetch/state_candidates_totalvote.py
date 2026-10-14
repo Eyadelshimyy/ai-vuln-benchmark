@@ -1,0 +1,514 @@
+"""The "TotalVote" election-night-reporting platform (SOE Software /
+KNOWiNK family) — confirmed live 2026-09 running BOTH Montana's
+(electionresults.mt.gov) and Nebraska's (electionresults.nebraska.gov)
+own state results sites: identical `resultsSW.aspx?type=X&map=Y` URLs,
+identical `wrapper-inside wrapper-border` block-per-contest markup, and
+the literal string "totalvote" in Nebraska's page source. One vendor
+module shared by every state on it, matching this system's existing
+multi-state-vendor precedent (state_candidates_tabular.py,
+state_candidates_canvass_xml.py) rather than a per-state file — the
+whole reason this file was renamed off of `state_candidates_mt.py` the
+moment a second state on the same platform turned up.
+
+ONE call per configured query, no discovery step needed: a `map`/`type`
+pair with NO `?eid=` param always serves the CURRENT election. An
+explicit `eid` can point at a STALE past one instead — verified live
+2026-09-06 on Montana: `eid=450002785`, found in the site's own "County
+by County" results-archive link, actually returned 2024 General data,
+not the 2026 Primary. Because of that, every fetched page's own election
+title is parsed and cross-checked against the requested `year` before
+anything on it is trusted — a page that hasn't rolled over to the
+requested cycle yet is a real "not published yet" miss, not a stale
+confirm.
+
+Montana bundles Senate and House under one "FED" query (`queries: [{type:
+FED, map: CTY}]`); Nebraska splits them across two — Senate lives on the
+"SW" (statewide) query alongside non-federal offices like Governor, and
+House lives on its own "CG" (congressional-district) query — so `queries`
+is a list, fetched and merged together. state_candidates_common.parse_office
+already returns None for the non-federal offices mixed into Nebraska's SW
+page ("For Governor", "For Secretary of State"), so no extra filtering is
+needed to ignore them.
+
+Clean server-rendered HTML: one `<div class="wrapper-inside
+wrapper-border">` block per (office, party) contest on every state seen
+so far. Both states run ordinary single-party primaries, so a race with N
+parties on the ballot is N separate blocks, never a mixed-party block —
+confirmed live (MT 2026 Senate: 3 blocks R/D/L; NE 2026 Senate: 3 blocks
+R/D/Legal-Marijuana-Now). Each candidate's own row still carries its own
+party label rather than trusting the block, in case that ever isn't true.
+Office labels ("UNITED STATES SENATOR" / "For United States Senator - 6
+Year Term", "UNITED STATES REPRESENTATIVE 1ST CONGRESSIONAL DISTRICT" /
+"For Representative in Congress - 2 Year Term - District 01") already
+match state_candidates_common.parse_office, and party labels
+("Republican"/"Democrat"/"Libertarian"/"Green") already match
+normalize_party, on both states — zero new parsing needed in the shared
+module. A party normalize_party doesn't recognise (Nebraska's real 2026
+ballot carried "Legal Marijuana Now" candidates in three federal
+contests) is silently dropped, matching every other vendor module in
+this system — not a gap specific to this one.
+
+Both states nominate by plurality — no federal-primary runoff in either
+state's law — so `runoff_threshold_pct` is null for both.
+
+Neither state's results page publishes a certification flag: both keep
+showing a static "Unofficial Results" heading indefinitely — confirmed
+live on Nebraska, which was STILL labelled "Unofficial Results" on
+2026-09-07, almost four months after its May 12 primary — so that text
+is boilerplate, not a real signal, and `settle_days` is the only
+freshness gate (same shape as AR/CT/TN/FL in this system). Set to 45 in
+state_candidate_sources.json for both — not this system's
+DEFAULT_SETTLE_DAYS (30), and wider than AR/CT's 21 — because Montana's
+own 2026 Primary Reconciliation Report (sosmt.gov/elections/results/) was
+still being updated as late as 7/17/2026, exactly 45 days after the June
+2 primary: real, observed evidence of how long this vendor's count kept
+moving on at least one of its states, not a cited statutory deadline.
+
+Verified live 2026-09-06/07 against Montana's and Nebraska's certified 2026
+primaries: every federal contest resolved to its certified winner,
+including plurality winners of fields of two to seven, unopposed
+nominees and Libertarian nominees.
+
+STATE OFFICES. This vendor's pages mix them in with the federal races --
+the module already noted that Nebraska's "SW" query carries Governor and
+the rest -- so a state whose entry opts in reads them through the same
+two gates every other adapter uses. Names come back raw from _contests
+and are reduced by the caller, because a federal nominee is cut to a
+surname for FEC matching while a state-office nominee keeps what the
+state printed.
+
+Surveyed live 2026-09-21 across all three states on this vendor, and
+only NEBRASKA is opted in:
+
+  NE   LIVE, all five statewide offices -- Governor, Attorney General,
+       Secretary of State, Treasurer and the Auditor of Public Accounts,
+       which is Nebraska's own name for the office and needed its own
+       arm. Its Legislature is unicameral AND officially non-partisan,
+       so no legislative contests reach these gates at all and the
+       "State legislative districts" omission correctly stays on its
+       page. That is the honest outcome, not a gap to paper over.
+  MT   NOT opted in. Its configured queries return three contests, all
+       federal, so there is nothing to check a statewide claim against
+       -- "no state offices" would be an artefact of the query, not a
+       fact about the ballot.
+  SD   NOT opted in, and this one is the trap: its page yields exactly
+       one contest, Governor, with nothing unmatched. Coverage would
+       therefore look complete while omitting the Attorney General,
+       Secretary of State, Auditor and Treasurer that South Dakota also
+       elects in a midterm. A clean unmatched list means nothing when
+       the page itself is scoped.
+"""
+
+import logging
+import re
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+import httpx
+from lxml import html as lxml_html
+
+from app.pipeline.fetch.http_utils import fetch_text_with_retry
+from app.pipeline.fetch.state_candidates_common import (
+    runoff_threshold,
+    clean_display_name,
+    is_not_a_person,
+    normalize_party,
+    parse_office,
+    parse_state_leg_office,
+    parse_statewide_office,
+    resolve_confirmed_nominees,
+    surname,
+)
+from app.pipeline.fetch.state_candidates_tabular import DEFAULT_SETTLE_DAYS, _settled
+from app.pipeline.fetch.election_results import ContestCount, StateCount, UntrustedCount, is_special_contest
+from app.pipeline.rate_limiter import RateLimiter
+
+logger = logging.getLogger(__name__)
+
+_rate_limiter = RateLimiter(rps=1.0)
+
+# "Primary Election - June 2, 2026" (Montana) / "Primary Election May 12,
+# 2026" (Nebraska, no hyphen) -- each site's own page title, read fresh
+# every call rather than trusted from a static date registry, so this is
+# also what _settled gates freshness on. The year comes from the date
+# itself, not a separate "2026" heading the same title box also carries
+# (a sibling <h1>, not part of this string) -- one source, not two that
+# could disagree.
+_TITLE_RE = re.compile(
+    r"Primary\s+Election\s*(?:-\s*)?([A-Za-z]+\s+\d{1,2},\s+\d{4})",
+)
+
+# The same no-eid URL this module reads also serves the November general
+# once a state's site rolls over to it -- a well-formed page, not a
+# redesign. Recognised explicitly so that transition reads as "nothing to
+# confirm from this stage" (like a primary not yet published) rather than
+# a fetch failure that would otherwise fire on every run indefinitely,
+# forever re-warning about a page that is working exactly as intended.
+_GENERAL_RE = re.compile(r"General\s+Election", re.IGNORECASE)
+
+# ENR platforms commonly render a "Write-In" tally as its own row with
+# the same markup as a real candidate -- confirmed elsewhere in this
+# system as a real shape to guard against (state_candidates_tn.py,
+# state_candidates_canvass_xml.py). Not seen on either state's real 2026
+# federal contests (no write-in drew enough votes to appear), so this is
+# a defensive guard against an untested-but-plausible shape, not a
+# fixture-driven fix.
+_WRITE_IN_RE = re.compile(r"write.?in", re.IGNORECASE)
+# The marker on a named write-in's row ("Write-in: Jane Doe", "Jane Doe
+# (Write-in)"), a printing convention, not part of the name.
+_WRITE_IN_MARK_RE = re.compile(r"^\s*write[\s-]?in\s*:\s*|\s*\(\s*write[\s-]?in\s*\)\s*$", re.IGNORECASE)
+
+
+def _xpath_class(name: str) -> str:
+    """Whole-token class-match XPath predicate for `name` -- bare
+    `contains(@class, "foo")` would also match a future sibling class
+    like "foo-detail", silently grabbing the wrong element. Applied to
+    every class check in this module, not just the outer wrapper query
+    (which needed this from the start since "wrapper-inside" is itself
+    a substring of nothing else today, but a vendor CSS change adding
+    e.g. "wrapper-inside-mobile" would otherwise silently double-match),
+    so a future vendor CSS change can't reintroduce the gap in just one
+    of them."""
+    return f'contains(concat(" ", normalize-space(@class), " "), " {name} ")'
+
+
+def _page_election(html: str) -> tuple[int, str] | None:
+    """(year, ISO held-date) from the page's own title, or None if the
+    title isn't in the expected shape at all (a real site redesign, not
+    a wrong-cycle miss -- that case is handled by the caller comparing
+    the returned year against what it asked for)."""
+    m = _TITLE_RE.search(html)
+    if not m:
+        return None
+    try:
+        held = datetime.strptime(m.group(1), "%B %d, %Y").date()
+    except ValueError:
+        return None
+    return held.year, held.isoformat()
+
+
+def _contests(
+    html: str, state_offices: bool = False,
+) -> list[tuple[str, str | int | None, str | None, list[tuple[str, str, int]]]]:
+    """(office, district, seat, [(raw name, party_code, votes), ...]) for
+    every contest block on the page this adapter understands.
+
+    Nebraska's "SW" query carries Governor and the other state offices on
+    the very same page as the federal races, and they were dropped here
+    by parse_office returning None. With `state_offices` they go through
+    the same two conservative gates the other adapters use instead.
+
+    Names come back RAW: a federal nominee is reduced to a surname to be
+    matched against an FEC row, while a state-office nominee has no FEC
+    row and keeps the name the state printed, so the caller decides which
+    reduction applies once it knows what kind of contest this is.
+    """
+    tree = lxml_html.fromstring(html)
+    contests = []
+    for wrapper in tree.xpath(f"//div[{_xpath_class('wrapper-inside')}]"):
+        headers = wrapper.xpath(f'.//div[{_xpath_class("display-results-box-a")}]/h1')
+        if not headers:
+            continue
+        label = headers[0].text_content().strip()
+        office_district = parse_office(label)
+        seat = None
+        if office_district is not None:
+            office, district = office_district
+        elif not state_offices:
+            continue
+        else:
+            statewide = parse_statewide_office(label)
+            if statewide is not None:
+                office, district = statewide
+            else:
+                parsed_seat = parse_state_leg_office(label)
+                if parsed_seat is None:
+                    continue
+                office, district, seat = parsed_seat
+
+        candidates = [(n, p, v) for n, p, v in _candidate_rows(wrapper) if p is not None]
+        if candidates:
+            contests.append((office, district, seat, candidates))
+    return contests
+
+
+def _candidate_rows(wrapper, keep_write_ins: bool = False) -> list[tuple[str, str | None, int]]:
+    """(raw name, party code or None, votes) for each candidate row in one
+    contest block. A party normalize_party doesn't know comes back None:
+    a primary drops that row, a general-election count keeps its votes.
+
+    A write-in is never a nominee, so a primary drops every row that says
+    write-in. A general-election count keeps a NAMED write-in's votes
+    (`keep_write_ins`), with the marker taken off the name; the caller
+    still drops the aggregate "Write-ins" line (is_not_a_person)."""
+    rows = []
+    for section in wrapper.xpath(f'.//div[{_xpath_class("section")} and {_xpath_class("group")}]'):
+        name_el = section.xpath(f'.//div[{_xpath_class("display-results-box-d")}]/h1')
+        party_el = section.xpath(f'.//div[{_xpath_class("display-results-box-d")}]/h2')
+        votes_el = section.xpath(f'.//div[{_xpath_class("display-results-box-f")}]/h1')
+        if not (name_el and party_el and votes_el):
+            continue  # the "total votes" row has no display-results-box-d at all
+        raw_name = name_el[0].text_content().strip()
+        if _WRITE_IN_RE.search(raw_name):
+            if not keep_write_ins:
+                continue
+            raw_name = _WRITE_IN_MARK_RE.sub("", raw_name).strip() or raw_name
+        votes_text = votes_el[0].text_content().strip().replace(",", "")
+        if not raw_name or not votes_text.isdigit():
+            continue
+        rows.append((raw_name, normalize_party(party_el[0].text_content().strip()), int(votes_text)))
+    return rows
+
+
+async def fetch_confirmed_candidates(
+    client: httpx.AsyncClient, year: int, state: str, source: dict,
+) -> list[dict] | None:
+    base_url = source.get("base_url")
+    queries = source.get("queries")
+    if not base_url or not queries:
+        logger.warning("%s totalvote config is missing base_url/queries", state)
+        return None
+
+    # Nebraska's SW and CG queries are two independent HTTP calls, not two
+    # views onto one already-fetched page -- each one's OWN title is
+    # checked as it comes in, not just the first query's. Trusting only
+    # pages[0] would let a second query that rolled over to the general
+    # (or is still serving a stale cycle) on a different schedule than the
+    # first get merged in silently; disagreement between queries is a real
+    # site anomaly, so it fails closed (None, a genuine fetch_failed)
+    # rather than picking one page's story over the other's.
+    pages = []
+    election = None
+    for query in queries:
+        url = f"{base_url}/resultsSW.aspx?type={query['type']}&map={query['map']}"
+        html = await fetch_text_with_retry(client, _rate_limiter, url, f"{state} results {query['type']} {year}")
+        if html is None:
+            return None
+
+        page_election = _page_election(html)
+        if page_election is None:
+            if _GENERAL_RE.search(html):
+                # The site rolled over to the general on this same no-eid
+                # URL, exactly as this module's own docstring says it
+                # will -- a healthy "nothing to confirm from this stage"
+                # outcome, not a failure. Without this branch, every run
+                # after rollover would log a fetch-failed warning forever
+                # for a page that is working exactly as intended.
+                logger.info(
+                    "%s results page has moved on to the general election -- nothing to confirm here", state,
+                )
+                return []
+            logger.warning("%s results page title didn't match the expected shape", state)
+            return None
+        if election is None:
+            election = page_election
+        elif page_election != election:
+            logger.warning(
+                "%s totalvote queries disagree on the election date (%s vs %s) -- treating as unreliable",
+                state, election, page_election,
+            )
+            return None
+
+        pages.append(html)
+
+    page_year, held_on = election
+    if page_year != year:
+        logger.info("%s results page is for %d, not the requested %d -- not yet rolled over", state, page_year, year)
+        return []
+
+    settle_days = source.get("settle_days", DEFAULT_SETTLE_DAYS)
+    if not _settled(held_on, settle_days):
+        return []
+
+    state_offices = bool(source.get("statewide_offices"))
+    federal: dict[tuple, list[tuple[str, int]]] = {}
+    non_federal: dict[tuple, list[tuple[str, int]]] = {}
+    for html in pages:
+        for office, district, seat, candidates in _contests(html, state_offices):
+            bucket = federal if office in ("S", "H") else non_federal
+            key = (office, district, seat) if seat else (office, district)
+            for name, party, votes in candidates:
+                bucket.setdefault((*key[:2], party, *key[2:]), []).append((name, votes))
+
+    runoff_threshold_pct = runoff_threshold(source)
+    # Two reductions, same tie-safe machinery: a surname for the federal
+    # records that get matched against FEC rows, the whole printed name
+    # for a state office that has no FEC row to match or render from.
+    return resolve_confirmed_nominees(
+        federal, runoff_threshold_pct, name_transform=surname,
+    ) + resolve_confirmed_nominees(
+        non_federal, runoff_threshold_pct, name_transform=clean_display_name,
+    )
+
+
+# --- Live general-election counts (fetch/election_results.py) -------------
+
+# "General Election - November 5, 2024", the page's own title once the site
+# serves the general (verified on Montana's 2024 archive page).
+_GENERAL_TITLE_RE = re.compile(
+    r"General\s+Election\s*(?:-\s*)?([A-Za-z]+\s+\d{1,2},\s+\d{4})",
+)
+# The page's own "Results last updated" stamp, in the state's zone
+# abbreviation. Two markups, both real: Montana's 2024 archive prints it as
+# one run of text with seconds ("last updated: 12/19/2024 1:25:20 PM MT"),
+# while Nebraska's and New Mexico's current pages split label and value
+# into two spans and stop at the minute
+# ("<span>Results last updated:</span><span>9/24/2026 2:59 PM MT</span>",
+# verified live 2026-09-28). A pattern that only knew the first read no
+# stamp at all on either state's election night.
+_UPDATED_RE = re.compile(
+    r"last\s+updated:?\s*(?:<[^>]*>\s*)*"
+    r"(\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?\s*[AP]M)\s*([A-Z]{1,3}T)\b",
+    re.IGNORECASE,
+)
+_ZONES = {"ET": "America/New_York", "CT": "America/Chicago", "MT": "America/Denver", "PT": "America/Los_Angeles"}
+# "Precincts Fully: 727 / 727", per contest block.
+_PRECINCTS_RE = re.compile(r"Precincts\s+Fully:\s*([\d,]+)\s*/\s*([\d,]+)", re.IGNORECASE)
+
+
+# Every TotalVote page carries its election's type and date as hidden form
+# fields — "General" / "11/3/2026" on New Mexico's staged 2026 general,
+# "Primary" / "6/2/2026 11:59:00 PM" on Montana's primary (all verified
+# 2026-09-28). The visible title is NOT one format: Montana's 2024 archive
+# reads "General Election - November 5, 2024", New Mexico's live 2026
+# page "GENERAL 2026<br />November 3, 2026" — a reader built on the first
+# would have read nothing all election night. The fields come first; the
+# title is only the fallback.
+_HIDDEN_RE = re.compile(r'id="hidElection(Type|Date)"[^>]*value="([^"]*)"', re.IGNORECASE)
+# The vendor's site-wide message panel. It printed "Testing in Progress" on
+# New Mexico's real 2024 general page four weeks out (Internet Archive,
+# 2024-10-08), over a count with votes in it -- 162 of 2,169 precincts
+# fully in, every candidate at a round 13,1xx or 26,2xx -- under the
+# general's own type and date, so the date check passes it. This vendor
+# carries no machine-readable test flag; the panel is its only mark, and it
+# is absent on every election-night and final capture of NM, MT and NE.
+_SITE_MESSAGE_RE = re.compile(r'<div[^>]*id="pnlSiteMessage"[^>]*>(.*?)</div>', re.IGNORECASE | re.DOTALL)
+_TEST_RE = re.compile(r"\btest", re.IGNORECASE)
+
+
+def _testing_message(html: str) -> str | None:
+    """The site message, when it says the page is a test."""
+    m = _SITE_MESSAGE_RE.search(html)
+    text = re.sub(r"<[^>]+>|\s+", " ", m.group(1)).strip() if m else ""
+    return text if _TEST_RE.search(text) else None
+
+
+def _general_held_on(html: str) -> str | None:
+    """ISO date of the general election this page serves, or None when it
+    serves anything else (a primary, a page not rolled over yet)."""
+    fields = {k.lower(): v.strip() for k, v in _HIDDEN_RE.findall(html)}
+    if "type" in fields or "date" in fields:
+        if fields.get("type", "").lower() != "general":
+            return None
+        m = re.match(r"(\d{1,2})/(\d{1,2})/(\d{4})", fields.get("date", ""))
+        if not m:
+            return None
+        month, day, year = (int(g) for g in m.groups())
+        return f"{year:04d}-{month:02d}-{day:02d}"
+    m = _GENERAL_TITLE_RE.search(html)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%B %d, %Y").date().isoformat()
+    except ValueError:
+        return None
+
+
+def _updated_at(html: str) -> datetime | None:
+    m = _UPDATED_RE.search(html)
+    if not m:
+        return None
+    abbr = m.group(2).upper()
+    zone = _ZONES.get(abbr[0] + "T")
+    if zone is None:
+        return None
+    stamp = re.sub(r"\s+", " ", m.group(1)).upper()
+    try:
+        local = datetime.strptime(stamp, "%m/%d/%Y %I:%M:%S %p" if stamp.count(":") == 2 else "%m/%d/%Y %I:%M %p")
+    except ValueError:
+        return None
+    return local.replace(tzinfo=ZoneInfo(zone)).astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def general_contests(html: str) -> list[ContestCount]:
+    tree = lxml_html.fromstring(html)
+    out = []
+    for wrapper in tree.xpath(f"//div[{_xpath_class('wrapper-inside')}]"):
+        headers = wrapper.xpath(f'.//div[{_xpath_class("display-results-box-a")}]/h1')
+        if not headers:
+            continue
+        label = headers[0].text_content().strip()
+        parsed = parse_office(label)
+        if parsed is None:
+            continue
+        candidates = [
+            (clean_display_name(n), p, v) for n, p, v in _candidate_rows(wrapper, keep_write_ins=True) if not is_not_a_person(n)
+        ]
+        m = _PRECINCTS_RE.search(wrapper.text_content())
+        reporting = total = None
+        if m:
+            reporting, total = (int(g.replace(",", "")) for g in m.groups())
+        out.append(ContestCount(
+            office=parsed[0], district=parsed[1], candidates=candidates,
+            reporting_units=reporting, total_units=total or None,
+            is_special=is_special_contest(label),
+        ))
+    return out
+
+
+async def fetch_general_results(
+    client: httpx.AsyncClient, election_day, state: str, source: dict,
+) -> StateCount | None:
+    """The same no-eid pages the primary reader uses, which serve the
+    general once the site rolls over to it; a page still showing another
+    election is "not published yet" (None), never read as this one.
+
+    FRESHNESS. This vendor publishes no version id and no machine-readable
+    update time -- there is no lastUpdated field, as Tally and Enhanced
+    Voting carry -- so the guards are what the page itself prints:
+
+    - Which election: the hidden hidElectionType/hidElectionDate fields
+      (title as fallback) must name THIS general's date, or nothing on the
+      page is read. That is what stops a cached or not-yet-rolled-over
+      page (the primary, or 2024's general) from being taken as tonight's.
+    - How fresh: the visible "Results last updated" stamp, in the state's
+      zone, becomes source_updated, and the sync refuses a page whose stamp
+      goes BACKWARDS. Both Nebraska's and New Mexico's live pages print it
+      (verified 2026-09-28, New Mexico's even on its staged, uncounted
+      2026 general), but only to the MINUTE, so two republishes inside one
+      minute are indistinguishable -- neither is refused, since they are
+      the same age. A page that prints no stamp yields source_updated None,
+      which leaves only the election-date guard: the count is still this
+      election's, but a stale copy of it could not be told from a fresh
+      one. That is the residual gap for this vendor, and there is nothing
+      else on the page to close it with.
+    - With several queries (Nebraska's SW + CG) the OLDEST page's stamp is
+      taken, and a missing stamp on any page makes the whole read undated
+      rather than borrowing another page's."""
+    base_url, queries = source.get("base_url"), source.get("queries")
+    if not base_url or not queries:
+        return None
+    contests: list[ContestCount] = []
+    urls = []
+    stamps = []
+    for query in queries:
+        url = f"{base_url}/resultsSW.aspx?type={query['type']}&map={query['map']}"
+        html = await fetch_text_with_retry(client, _rate_limiter, url, f"{state} general results {query['type']}")
+        if html is None or _general_held_on(html) != election_day.isoformat():
+            return None
+        if (message := _testing_message(html)) is not None:
+            raise UntrustedCount(f"{state} results page says {message!r}")
+        urls.append(url)
+        stamps.append(_updated_at(html))
+        contests.extend(general_contests(html))
+    return StateCount(
+        source_name=source.get("source_name") or f"{state} election results",
+        page_url=urls[0],
+        # Both states' pages say "Unofficial Results" indefinitely (see
+        # the module docstring) — boilerplate, not a status to relay.
+        official=False,
+        contests=contests,
+        # The oldest page's stamp: the count is only as fresh as its
+        # stalest part.
+        source_updated=min(stamps) if stamps and all(stamps) else None,
+    )

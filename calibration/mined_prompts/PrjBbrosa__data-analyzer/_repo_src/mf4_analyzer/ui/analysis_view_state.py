@@ -1,0 +1,634 @@
+"""Analysis-section view state: Section → View → Pane → Source.
+
+Per-section ``ViewManager(state_factory=AnalysisViewState)`` instances
+manage these. Unlike the time-domain ``ViewState``, split lives INSIDE
+the view as ``panes`` (spec §3) — the time-domain ``_split_pairs``
+pairing is not used for analysis sections.
+
+Serialization mirrors view_state.py conventions (JSON-safe dicts,
+``(fid, ch)`` keys as 2-lists) so project_io can persist both shapes
+with one code path.
+"""
+from __future__ import annotations
+
+import copy
+import logging
+import math
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Mapping, Sequence
+from uuid import uuid4
+
+from ..db_reference import migrate_legacy_reference_params
+from ..heatmap_color_policy import normalize_heatmap_color_basis
+from .pinned_cursor_state import (
+    PinnedCursorCollection,
+    collection_from_dict,
+    collection_to_dict,
+    empty_collection,
+)
+from .analysis_result_state import AnalysisResultBinding
+from .view_overlay_state import (
+    normalize_cursor_placement,
+    normalize_remarks,
+)
+
+logger = logging.getLogger(__name__)
+
+ChannelKey = tuple[str, str]
+MAX_PANES = 2  # spec §2: v1 caps split at 2; the model is list-shaped for later N
+# dB reference defaults (Task 8, spec §13 S3) introduced nested schema 2;
+# FRF role state adds schema 3, including separate requested/effective ranges;
+# schema 4 added the pane-local FRF cursor flag; schema 5 replaces it with the
+# shared frequency-domain off/single/dual cursor mode for FFT and FRF panes;
+# schema 6 removes the obsolete FRF Time-View link from persisted output;
+# schema 7 adds per-analysis-View ``attached_file_ids`` (Stage 1 source isolation).
+# schema 8 adds per-pane point remarks and frequency dual-cursor placement.
+# schema 10 adds per-axis viewport origin (auto/user/home/legacy).
+# schema 9 adds optional per-View ``preset_baseline`` (preset source snapshot).
+# Nested baseline version 2 adds ``source_payload``; the outer view schema
+# stays 9. The additions are field-presence tolerant -- from_dict() keys the
+# migration off "params has db_reference and no db_reference_mode", NOT this
+# number, so schema-2 through schema-6 projects all apply the
+# saved snapshot value manual-style instead of erroring or dropping it.
+# schema 11 adds optional per-pane ``pinned_cursors`` (P-key pin intent).
+# schema 12 adds optional pane-owned manual heatmap color reference intent.
+_SCHEMA = 12
+_PRESET_BASELINE_VERSION = 2
+_PRESET_BASELINE_SUPPORTED_VERSIONS = frozenset({1, 2})
+_PRESET_BASELINE_KINDS = frozenset({"fft", "fft_time", "order", "frf"})
+
+
+def _viewport_origins(data):
+    origins = data.get("viewport_origin")
+    result = {}
+    for axis in ("x", "y"):
+        if origins is None:
+            value = data.get(axis + "lim")
+            try:
+                valid = len(value) == 2 and all(math.isfinite(float(v)) for v in value) and float(value[0]) < float(value[1])
+            except (TypeError, ValueError, IndexError):
+                valid = False
+            result[axis] = "legacy" if valid else "auto"
+        else:
+            value = origins.get(axis, "auto") if isinstance(origins, dict) else None
+            if not isinstance(value, str) or value not in {"auto", "user", "home", "legacy"}:
+                logger.warning("Invalid viewport_origin for %s: %r; using auto", axis, value)
+                value = "auto"
+            result[axis] = value
+    return result
+
+
+def _coerce_key(value: Any) -> ChannelKey:
+    fid, ch = value
+    return (str(fid), str(ch))
+
+
+def _coerce_enabled_time_range(value: Any) -> tuple[float, float] | None:
+    """Restore an enabled span without collapsing invalid data to full/None."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)) and len(value) == 0:
+        return None
+    try:
+        lo = float(value[0])
+        hi = float(value[1])
+    except (TypeError, ValueError, IndexError):
+        return (0.0, 0.0)
+    return (lo, hi)
+
+
+def _cursor_mode_from_data(data: dict[str, Any]) -> str:
+    """Read schema-5 mode, migrating the short-lived schema-4 FRF flag."""
+    mode = str(data.get("cursor_mode") or "")
+    if mode in {"off", "single", "dual"}:
+        return mode
+    return "single" if data.get("frf_cursor_enabled") else "off"
+
+
+def normalize_analysis_attachments(values: Iterable[Any] | None) -> list[str]:
+    """Deduplicate fids while preserving first-seen order."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values or ():
+        fid = str(value)
+        if not fid or fid in seen:
+            continue
+        seen.add(fid)
+        out.append(fid)
+    return out
+
+
+def _coerce_preset_baseline(value: Any) -> dict[str, Any] | None:
+    """Validate a persisted preset baseline; missing/corrupt → None.
+
+    Structural only: this layer must not import inspector_sections or
+    preset_state. Old or damaged project files log a warning and continue
+    as "no baseline" rather than failing to open.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        logger.warning(
+            "dropping corrupt preset_baseline: expected dict, got %s",
+            type(value).__name__,
+        )
+        return None
+    version = value.get("version")
+    kind = value.get("kind")
+    slot = value.get("slot")
+    display_name = value.get("display_name")
+    params = value.get("params")
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version not in _PRESET_BASELINE_SUPPORTED_VERSIONS
+    ):
+        logger.warning(
+            "dropping corrupt preset_baseline: invalid version %r", version
+        )
+        return None
+    if kind not in _PRESET_BASELINE_KINDS:
+        logger.warning(
+            "dropping corrupt preset_baseline: unknown kind %r", kind
+        )
+        return None
+    if (
+        not isinstance(slot, int)
+        or isinstance(slot, bool)
+        or not 1 <= slot <= 4
+    ):
+        logger.warning(
+            "dropping corrupt preset_baseline: illegal slot %r", slot
+        )
+        return None
+    if not isinstance(display_name, str):
+        logger.warning(
+            "dropping corrupt preset_baseline: display_name must be str, got %s",
+            type(display_name).__name__,
+        )
+        return None
+    if not isinstance(params, dict):
+        logger.warning(
+            "dropping corrupt preset_baseline: params must be dict, got %s",
+            type(params).__name__,
+        )
+        return None
+    if version == 1:
+        # Keep the historical snapshot. Do not invent source_payload.
+        return {
+            "version": 1,
+            "kind": kind,
+            "slot": slot,
+            "display_name": display_name,
+            "params": copy.deepcopy(params),
+        }
+    source_payload = value.get("source_payload")
+    if not isinstance(source_payload, dict):
+        logger.warning(
+            "dropping corrupt preset_baseline: v2 source_payload must be dict, got %s",
+            type(source_payload).__name__,
+        )
+        return None
+    return {
+        "version": 2,
+        "kind": kind,
+        "slot": slot,
+        "display_name": display_name,
+        "params": copy.deepcopy(params),
+        "source_payload": copy.deepcopy(source_payload),
+    }
+
+
+CHART_APPEARANCE_ROLES = ("spectrum", "preview", "heatmap")
+_CHART_APPEARANCE_COMMON = frozenset({
+    "title", "x_label", "y_label", "grid", "line_colors",
+})
+# Spectrum and preview persist axis scale. A missing key means linear, so
+# older projects stay linear without a migration.
+_CHART_APPEARANCE_LINE = _CHART_APPEARANCE_COMMON | frozenset({
+    "x_scale", "y_scale",
+})
+_CHART_APPEARANCE_HEATMAP = _CHART_APPEARANCE_COMMON | frozenset({
+    "cmap", "z_auto", "z_min", "z_max",
+})
+
+
+def _appearance_text(value: Any) -> str | None:
+    """Keep "" (explicit delete). None / non-text means the key is absent."""
+    if value is None or isinstance(value, bool):
+        return None
+    if not isinstance(value, str):
+        return None
+    return value
+
+
+def _appearance_color_key(value: Any) -> str:
+    from .chart_appearance_model import appearance_channel_key
+
+    if isinstance(value, str) and value.strip():
+        return value
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        fid = str(value[0] or "").strip()
+        channel = str(value[1] or "").strip()
+        if fid and channel:
+            return appearance_channel_key(fid, channel)
+    return ""
+
+
+def _finite_appearance_number(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _normalize_appearance_spec(role: str, spec: Any) -> dict[str, Any]:
+    if role not in CHART_APPEARANCE_ROLES or not isinstance(spec, dict):
+        return {}
+    allowed = (
+        _CHART_APPEARANCE_HEATMAP if role == "heatmap" else _CHART_APPEARANCE_LINE
+    )
+    cleaned: dict[str, Any] = {}
+    for key in ("title", "x_label", "y_label"):
+        if key not in spec or key not in allowed:
+            continue
+        text = _appearance_text(spec.get(key))
+        if text is not None:
+            cleaned[key] = text
+    if "grid" in spec and "grid" in allowed and isinstance(spec.get("grid"), bool):
+        cleaned["grid"] = spec["grid"]
+    if role != "heatmap":
+        for key in ("x_scale", "y_scale"):
+            # Only "log" is stored. Absent and "linear" both mean linear.
+            if key in allowed and spec.get(key) == "log":
+                cleaned[key] = "log"
+    if role == "heatmap" and "cmap" in spec:
+        cmap = spec.get("cmap")
+        if isinstance(cmap, str) and cmap.strip():
+            cleaned["cmap"] = cmap.strip()
+    colors = spec.get("line_colors")
+    if isinstance(colors, dict) and "line_colors" in allowed:
+        line_colors: dict[str, str] = {}
+        for raw_key, raw_color in colors.items():
+            identity = _appearance_color_key(raw_key)
+            color = raw_color if isinstance(raw_color, str) else ""
+            if identity and color.strip():
+                line_colors[identity] = color.strip()
+        if line_colors:
+            cleaned["line_colors"] = line_colors
+    if role == "heatmap" and isinstance(spec.get("z_auto"), bool):
+        cleaned["z_auto"] = spec["z_auto"]
+        lo = _finite_appearance_number(spec.get("z_min"))
+        hi = _finite_appearance_number(spec.get("z_max"))
+        if lo is not None and hi is not None and lo < hi:
+            cleaned["z_min"] = lo
+            cleaned["z_max"] = hi
+    return cleaned
+
+
+def normalize_pane_chart_appearances(value: Any) -> dict[str, dict[str, Any]]:
+    """Drop unknown roles/keys. An empty result means "follow system defaults"."""
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for role, spec in value.items():
+        cleaned = _normalize_appearance_spec(str(role), spec)
+        if cleaned:
+            out[str(role)] = cleaned
+    return out
+
+
+def remap_pane_chart_appearances(
+    value: Any, fid_map: Mapping[str, str],
+) -> dict[str, dict[str, Any]]:
+    """Rewrite file ids inside pane line-color overrides.
+
+    Title, labels, grid, colormap, and color-scale policy have no file id.
+    A line color whose file is missing from ``fid_map`` is dropped. Other
+    overrides on that role stay.
+    """
+    from .chart_appearance_model import (
+        appearance_channel_key,
+        parse_appearance_axis_key,
+    )
+
+    appearances = normalize_pane_chart_appearances(value)
+    remapped: dict[str, dict[str, Any]] = {}
+    for role, spec in appearances.items():
+        cleaned = dict(spec)
+        colors = spec.get("line_colors")
+        if isinstance(colors, dict):
+            mapped_colors: dict[str, str] = {}
+            for raw_key, color in colors.items():
+                parsed = parse_appearance_axis_key(raw_key)
+                if (
+                    parsed is None
+                    or parsed[0] != "ch"
+                    or len(parsed) < 3
+                    or parsed[1] not in fid_map
+                ):
+                    continue
+                mapped_colors[appearance_channel_key(fid_map[parsed[1]], parsed[2])] = color
+            if mapped_colors:
+                cleaned["line_colors"] = mapped_colors
+            else:
+                cleaned.pop("line_colors", None)
+        if cleaned:
+            remapped[role] = cleaned
+    return remapped
+
+
+def analysis_view_source_fids(
+    state_or_payload: "AnalysisViewState | Mapping[str, Any] | None",
+) -> list[str]:
+    """First-seen union of pane role fids (sources / rpm / input / output)."""
+    if state_or_payload is None:
+        return []
+    if isinstance(state_or_payload, AnalysisViewState):
+        panes: Sequence[Any] = state_or_payload.panes
+        role_fids: list[str] = []
+        for pane in panes:
+            for key in pane.sources:
+                role_fids.append(str(key[0]))
+            if pane.rpm_source is not None:
+                role_fids.append(str(pane.rpm_source[0]))
+            if pane.input_source is not None:
+                role_fids.append(str(pane.input_source[0]))
+            if pane.output_source is not None:
+                role_fids.append(str(pane.output_source[0]))
+        return normalize_analysis_attachments(role_fids)
+
+    role_fids = []
+    for pane in (state_or_payload.get("panes") or []):
+        if not isinstance(pane, Mapping):
+            continue
+        for source in pane.get("sources") or []:
+            if isinstance(source, (list, tuple)) and source:
+                role_fids.append(str(source[0]))
+        for role in ("rpm_source", "input_source", "output_source"):
+            source = pane.get(role)
+            if isinstance(source, (list, tuple)) and source:
+                role_fids.append(str(source[0]))
+    return normalize_analysis_attachments(role_fids)
+
+
+@dataclass
+class PaneState:
+    sources: list[ChannelKey] = field(default_factory=list)
+    rpm_source: ChannelKey | None = None     # Order only
+    input_source: ChannelKey | None = None   # FRF only
+    output_source: ChannelKey | None = None  # FRF only
+    time_range: tuple[float, float] | None = None
+    # Primary analysis X/Y viewport (FFT spectrum, FFT-vs-Time / Order heatmap).
+    # FRF still stores per-panel ranges in ``ylims`` and copies magnitude into
+    # ``ylim``. Capture/restore never mix Z levels or the FFT time preview.
+    xlim: tuple[float, float] | None = None
+    ylim: tuple[float, float] | None = None
+    viewport_origin: dict[str, str] = field(default_factory=lambda: {"x": "auto", "y": "auto"})
+    ylims: dict[str, tuple[float, float]] = field(default_factory=dict)
+    source_time_view_id: str | None = None
+    # FRF only: actual first/last selected sample. ``time_range`` remains the
+    # user's manual/current-Time-View snapshot and must not be overwritten by
+    # sample-grid rounding during candidate construction.
+    effective_time_range: tuple[float, float] | None = None
+    # FFT and FRF only.  ``frf_cursor_enabled`` was the schema-4 predecessor;
+    # old project payloads migrate its true value to the single-cursor mode.
+    cursor_mode: str = "off"
+    # Point remarks and frequency A/B placement. Same Qt-free shapes as
+    # time-domain ViewState; analysis canvases reproject after recompute.
+    remarks: list[dict[str, Any]] = field(default_factory=list)
+    cursor_placement: dict[str, Any] | None = None
+    pinned_cursors: PinnedCursorCollection = field(default_factory=empty_collection)
+    # User chart-option overrides only. A missing role follows the system
+    # default; an explicit "" title is a user delete. The two are not the
+    # same state. Roles: spectrum, preview, heatmap.
+    chart_appearances: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    # Request reference intent only; never stores a canvas's effective levels.
+    heatmap_color_basis: dict[str, Any] | None = None
+
+    # Appended for positional compatibility; deliberately absent from to_dict.
+    result_binding: AnalysisResultBinding | None = field(default=None, repr=False, compare=False)
+    request_revision: int = field(default=0, repr=False, compare=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sources": [list(k) for k in self.sources],
+            "rpm_source": list(self.rpm_source) if self.rpm_source else None,
+            "input_source": (
+                list(self.input_source) if self.input_source else None
+            ),
+            "output_source": (
+                list(self.output_source) if self.output_source else None
+            ),
+            "time_range": (
+                list(self.time_range) if self.time_range is not None else None
+            ),
+            "xlim": list(self.xlim) if self.xlim else None,
+            "ylim": list(self.ylim) if self.ylim else None,
+            "viewport_origin": _viewport_origins({"viewport_origin": self.viewport_origin}),
+            "ylims": {key: list(value) for key, value in self.ylims.items()},
+            "effective_time_range": (
+                list(self.effective_time_range)
+                if self.effective_time_range else None
+            ),
+            "cursor_mode": self.cursor_mode,
+            "remarks": normalize_remarks(self.remarks),
+            "cursor_placement": normalize_cursor_placement(
+                self.cursor_placement, cursor_mode=self.cursor_mode,
+            ),
+            "pinned_cursors": collection_to_dict(self.pinned_cursors),
+        } | (
+            {"chart_appearances": copy.deepcopy(appearances)}
+            if (appearances := normalize_pane_chart_appearances(self.chart_appearances))
+            else {}
+        ) | (
+            {"heatmap_color_basis": basis}
+            if (basis := normalize_heatmap_color_basis(self.heatmap_color_basis)) is not None
+            else {}
+        )
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PaneState":
+        def pair(v):
+            if v is None:
+                return None
+            try:
+                return (float(v[0]), float(v[1])) if len(v) == 2 else None
+            except (TypeError, ValueError, IndexError):
+                return None
+        basis = normalize_heatmap_color_basis(data.get("heatmap_color_basis"))
+        if data.get("heatmap_color_basis") is not None and basis is None:
+            logger.warning("dropping corrupt heatmap_color_basis; preserving pane request")
+        return cls(
+            heatmap_color_basis=basis,
+            sources=[_coerce_key(k) for k in data.get("sources", [])],
+            rpm_source=(_coerce_key(data["rpm_source"])
+                        if data.get("rpm_source") else None),
+            input_source=(_coerce_key(data["input_source"])
+                          if data.get("input_source") else None),
+            output_source=(_coerce_key(data["output_source"])
+                           if data.get("output_source") else None),
+            time_range=_coerce_enabled_time_range(data.get("time_range")),
+            xlim=pair(data.get("xlim")),
+            ylim=pair(data.get("ylim")),
+            viewport_origin=_viewport_origins(data),
+            ylims={
+                str(key): pair(value)
+                for key, value in (data.get("ylims") or {}).items()
+                if pair(value) is not None
+            },
+            source_time_view_id=(
+                str(data["source_time_view_id"])
+                if data.get("source_time_view_id") else None
+            ),
+            effective_time_range=pair(data.get("effective_time_range")),
+            cursor_mode=_cursor_mode_from_data(data),
+            remarks=normalize_remarks(data.get("remarks")),
+            cursor_placement=normalize_cursor_placement(
+                data.get("cursor_placement"),
+                cursor_mode=_cursor_mode_from_data(data),
+            ),
+            pinned_cursors=collection_from_dict(data.get("pinned_cursors")),
+            chart_appearances=normalize_pane_chart_appearances(
+                data.get("chart_appearances")
+            ),
+        )
+
+
+@dataclass
+class AnalysisViewState:
+    name: str
+    tab_color: str
+    panes: list[PaneState] = field(default_factory=lambda: [PaneState()])
+    params: dict[str, Any] = field(default_factory=dict)
+    compare: dict[str, bool] = field(
+        default_factory=lambda: {"x_linked": True, "levels_locked": True})
+    # Appended so the pre-FRF positional constructor stays compatible.
+    view_id: str = field(default_factory=lambda: str(uuid4()))
+    # Stage 1 source isolation: per-analysis-View file membership. Kept after
+    # ``view_id`` so older positional callers remain valid.
+    attached_file_ids: list[str] = field(default_factory=list)
+    # Optional preset source snapshot. Appended after ``attached_file_ids``
+    # so older positional constructors stay valid. None = no baseline.
+    preset_baseline: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        baseline = (
+            copy.deepcopy(self.preset_baseline)
+            if isinstance(self.preset_baseline, dict)
+            else None
+        )
+        return {
+            "schema": _SCHEMA,
+            "name": self.name,
+            "tab_color": self.tab_color,
+            "view_id": self.view_id,
+            "attached_file_ids": list(self.attached_file_ids),
+            "panes": [p.to_dict() for p in self.panes],
+            "params": dict(self.params),
+            "compare": dict(self.compare),
+            "preset_baseline": baseline,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AnalysisViewState":
+        panes = [PaneState.from_dict(p) for p in data.get("panes", [])]
+        if not panes:
+            panes = [PaneState()]
+        compare = {"x_linked": True, "levels_locked": True}
+        compare.update(data.get("compare", {}))
+        # dB reference defaults (Task 8, spec §13 S3/S5): a legacy blob with
+        # db_reference but no db_reference_mode migrates to Manual -- the
+        # bare number WAS the old authoritative display reference. Keyed off
+        # field presence (migrate_legacy_reference_params), never off the
+        # "schema" field itself (see _SCHEMA note above); a view with no
+        # db_reference at all keeps the key absent so the live control's
+        # current Auto/Manual state drives it instead of an injected default.
+        params = migrate_legacy_reference_params(dict(data.get("params", {})))
+        # Schema-5-and-earlier FRF views hid range origin and Time-View
+        # identity beside the shared range inputs.  Read that historical
+        # state once, then reduce it to the universal explicit pane range
+        # contract.  A missing old range_mode meant "full"; schema 6 no
+        # longer writes it, so do not erase a newly persisted explicit range.
+        is_legacy_payload = int(data.get("schema") or 0) < 6
+        is_frf = any(
+            pane.input_source is not None and pane.output_source is not None
+            for pane in panes
+        )
+        if "range_mode" in params or (is_legacy_payload and is_frf):
+            legacy_range_mode = str(params.pop("range_mode", "full") or "full")
+            if legacy_range_mode not in {"manual", "current_time"}:
+                for pane in panes:
+                    pane.time_range = None
+            for pane in panes:
+                pane.source_time_view_id = None
+        if "attached_file_ids" in data:
+            attached = normalize_analysis_attachments(data.get("attached_file_ids"))
+        else:
+            attached = analysis_view_source_fids(
+                {"panes": [p.to_dict() for p in panes]}
+            )
+        return cls(
+            name=data["name"],
+            tab_color=data["tab_color"],
+            view_id=str(data.get("view_id") or uuid4()),
+            panes=panes[:MAX_PANES],
+            params=params,
+            compare=compare,
+            attached_file_ids=attached,
+            preset_baseline=_coerce_preset_baseline(data.get("preset_baseline")),
+        )
+
+    # -- structure ops -------------------------------------------------
+    def add_pane(self) -> bool:
+        if len(self.panes) >= MAX_PANES:
+            return False
+        self.panes.append(PaneState())
+        return True
+
+    def remove_second_pane(self) -> None:
+        del self.panes[1:]
+
+    def validate(self, *, allow_overlay: bool) -> list[str]:
+        """Heatmap sections pass allow_overlay=False (1 source per pane)."""
+        errs = []
+        attached = {str(fid) for fid in self.attached_file_ids}
+        for i, p in enumerate(self.panes):
+            if not allow_overlay and len(p.sources) > 1:
+                errs.append(
+                    f"pane {i}: overlay ({len(p.sources)} sources) "
+                    "not allowed for heatmap sections")
+            for key in p.sources:
+                if str(key[0]) not in attached:
+                    errs.append(
+                        f"pane {i}: source fid {key[0]!r} not in "
+                        "attached_file_ids"
+                    )
+            for role_name, role in (
+                ("rpm_source", p.rpm_source),
+                ("input_source", p.input_source),
+                ("output_source", p.output_source),
+            ):
+                if role is not None and str(role[0]) not in attached:
+                    errs.append(
+                        f"pane {i}: {role_name} fid {role[0]!r} "
+                        "not in attached_file_ids"
+                    )
+        return errs
+
+
+def analysis_view_has_sources(section: str, state: AnalysisViewState) -> bool:
+    """Whether a restored analysis view has enough source intent to compute."""
+
+    if str(section) == "frf":
+        return any(
+            pane.input_source is not None and pane.output_source is not None
+            for pane in state.panes
+        )
+    return any(pane.sources for pane in state.panes)

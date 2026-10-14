@@ -1,0 +1,28 @@
+{
+  "repo": "VibeBB__fpga-agent",
+  "file": "scripts/trivy_gate_summary.py",
+  "function": "main",
+  "line": 73,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function (parameters: argv).",
+  "prompt_source": "def main(argv: list[str]) -> int:\n    \"\"\"Implement the `main` function (parameters: argv).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main(argv: list[str]) -> int:\n    path = argv[1] if len(argv) > 1 else \"trivy-image.json\"\n    with open(path, encoding=\"utf-8\") as fh:\n        data: Any = json.load(fh)\n    document = cast(dict[str, Any], data if isinstance(data, dict) else {})\n    rows = _trivy_rows(document) if \"Results\" in document else _sarif_rows(document)\n\n    if rows:\n        print(\"### Trivy gate: fixable CRITICAL/HIGH findings\\n\")\n        print(\"| rule | severity (CVSS) | level | detail |\")\n        print(\"|---|---|---|---|\")\n        for rid, cvss, level, message in rows:\n            message = \" \".join(message.split()).replace(\"|\", \"\\\\|\")[:160]\n            print(f\"| {rid} | {cvss} | {level} | {message} |\")\n    return 0",
+  "module_source": "#!/usr/bin/env python3\n\"\"\"Render the fixable CRITICAL/HIGH findings that fail the publish gate\nas a markdown table on stdout.\n\nAccepts either the trivy JSON report (`Results[].Vulnerabilities[]` \u2014\nfiltered to Severity CRITICAL/HIGH with a non-empty FixedVersion, the\nsame set the jq gate fails on) or a SARIF file (`runs[].results[]`).\nThe publish workflow appends the output to $GITHUB_STEP_SUMMARY when the\ngate fails so the offending rules are reviewable without downloading\nartifacts.\n\nUsage: trivy_gate_summary.py [PATH]\n\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nimport sys\nfrom typing import Any, cast\n\n\ndef _list_of_dicts(node: dict[str, Any], *path: str) -> list[dict[str, Any]]:\n    current: Any = node\n    for key in path:\n        if not isinstance(current, dict):\n            return []\n        current = cast(dict[str, Any], current).get(key)\n    if not isinstance(current, list):\n        return []\n    return [\n        cast(dict[str, Any], item) for item in cast(list[Any], current) if isinstance(item, dict)\n    ]\n\n\ndef _sarif_rows(document: dict[str, Any]) -> list[tuple[str, str, str, str]]:\n    rules: dict[str, dict[str, Any]] = {}\n    for run in _list_of_dicts(document, \"runs\"):\n        for rule in _list_of_dicts(run, \"tool\", \"driver\", \"rules\"):\n            rules[str(rule.get(\"id\") or \"\")] = rule\n    rows: list[tuple[str, str, str, str]] = []\n    for run in _list_of_dicts(document, \"runs\"):\n        for result in _list_of_dicts(run, \"results\"):\n            rid = str(result.get(\"ruleId\") or \"?\")\n            rule = rules.get(rid) or {}\n            properties = rule.get(\"properties\")\n            cvss = \"\"\n            if isinstance(properties, dict):\n                cvss = str(cast(dict[str, Any], properties).get(\"security-severity\") or \"\")\n            level = str(result.get(\"level\") or \"\")\n            message_node = result.get(\"message\")\n            message = \"\"\n            if isinstance(message_node, dict):\n                message = str(cast(dict[str, Any], message_node).get(\"text\") or \"\")\n            rows.append((rid, cvss, level, message))\n    return rows\n\n\ndef _trivy_rows(document: dict[str, Any]) -> list[tuple[str, str, str, str]]:\n    rows: list[tuple[str, str, str, str]] = []\n    for result in _list_of_dicts(document, \"Results\"):\n        for v in _list_of_dicts(result, \"Vulnerabilities\"):\n            severity = str(v.get(\"Severity\") or \"\")\n            fixed = str(v.get(\"FixedVersion\") or \"\")\n            if severity not in (\"CRITICAL\", \"HIGH\") or not fixed:\n                continue\n            rid = str(v.get(\"VulnerabilityID\") or \"?\")\n            pkg = str(v.get(\"PkgName\") or \"?\")\n            detail = f\"{pkg} fixed in {fixed}\"\n            rows.append((rid, severity, severity.lower(), detail))\n    return rows\n\n\ndef main(argv: list[str]) -> int:\n    path = argv[1] if len(argv) > 1 else \"trivy-image.json\"\n    with open(path, encoding=\"utf-8\") as fh:\n        data: Any = json.load(fh)\n    document = cast(dict[str, Any], data if isinstance(data, dict) else {})\n    rows = _trivy_rows(document) if \"Results\" in document else _sarif_rows(document)\n\n    if rows:\n        print(\"### Trivy gate: fixable CRITICAL/HIGH findings\\n\")\n        print(\"| rule | severity (CVSS) | level | detail |\")\n        print(\"|---|---|---|---|\")\n        for rid, cvss, level, message in rows:\n            message = \" \".join(message.split()).replace(\"|\", \"\\\\|\")[:160]\n            print(f\"| {rid} | {cvss} | {level} | {message} |\")\n    return 0\n\n\nif __name__ == \"__main__\":\n    sys.exit(main(sys.argv))\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 15
+    },
+    "ai_commit": "770f80b29a0d",
+    "evidence": "author/committer='devin-ai-integration[bot] <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      73,
+      87
+    ]
+  }
+}

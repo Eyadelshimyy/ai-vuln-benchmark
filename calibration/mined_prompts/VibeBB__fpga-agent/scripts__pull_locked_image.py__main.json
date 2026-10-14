@@ -1,0 +1,29 @@
+{
+  "repo": "VibeBB__fpga-agent",
+  "file": "scripts/pull_locked_image.py",
+  "function": "main",
+  "line": 20,
+  "candidate_cwes": [
+    "CWE-22",
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function (parameters: argv).",
+  "prompt_source": "def main(argv: list[str] | None = None) -> int:\n    \"\"\"Implement the `main` function (parameters: argv).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main(argv: list[str] | None = None) -> int:\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument(\"--lock\", type=Path, default=Path(\"docker/image-digests.json\"))\n    parser.add_argument(\"--entry\", required=True)\n    parser.add_argument(\"--record\", type=Path)\n    args = parser.parse_args(argv)\n    try:\n        image_ref = locked_image(args.lock, args.entry)\n        digest = image_ref.rsplit(\"@\", 1)[1]\n        if _DIGEST.fullmatch(digest) is None:\n            raise ValueError(\"locked image is not digest-pinned\")\n        result = subprocess.run(\n            [\"docker\", \"pull\", image_ref],\n            check=False,\n            capture_output=True,\n            text=True,\n            encoding=\"utf-8\",\n        )\n        if result.returncode:\n            raise RuntimeError(result.stderr.strip() or \"docker pull failed\")\n        record = {\"entry\": args.entry, \"image\": image_ref, \"status\": \"pulled\"}\n        if args.record is not None:\n            args.record.parent.mkdir(parents=True, exist_ok=True)\n            args.record.write_text(\n                json.dumps(record, ensure_ascii=False, indent=2) + \"\\n\",\n                encoding=\"utf-8\",\n            )\n        print(json.dumps(record, ensure_ascii=False))\n    except (OSError, UnicodeDecodeError, ValueError, RuntimeError) as exc:\n        print(f\"FAIL: {exc}\")\n        return 1\n    return 0",
+  "module_source": "#!/usr/bin/env python3\n\"\"\"Pull a digest-pinned image from the repository lock.\"\"\"\n\nfrom __future__ import annotations\n\nimport argparse\nimport json\nimport re\nimport subprocess\nfrom pathlib import Path\n\ntry:\n    from .print_locked_image import locked_image\nexcept ImportError:\n    from print_locked_image import locked_image\n\n_DIGEST = re.compile(r\"sha256:[0-9a-f]{64}\\Z\")\n\n\ndef main(argv: list[str] | None = None) -> int:\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument(\"--lock\", type=Path, default=Path(\"docker/image-digests.json\"))\n    parser.add_argument(\"--entry\", required=True)\n    parser.add_argument(\"--record\", type=Path)\n    args = parser.parse_args(argv)\n    try:\n        image_ref = locked_image(args.lock, args.entry)\n        digest = image_ref.rsplit(\"@\", 1)[1]\n        if _DIGEST.fullmatch(digest) is None:\n            raise ValueError(\"locked image is not digest-pinned\")\n        result = subprocess.run(\n            [\"docker\", \"pull\", image_ref],\n            check=False,\n            capture_output=True,\n            text=True,\n            encoding=\"utf-8\",\n        )\n        if result.returncode:\n            raise RuntimeError(result.stderr.strip() or \"docker pull failed\")\n        record = {\"entry\": args.entry, \"image\": image_ref, \"status\": \"pulled\"}\n        if args.record is not None:\n            args.record.parent.mkdir(parents=True, exist_ok=True)\n            args.record.write_text(\n                json.dumps(record, ensure_ascii=False, indent=2) + \"\\n\",\n                encoding=\"utf-8\",\n            )\n        print(json.dumps(record, ensure_ascii=False))\n    except (OSError, UnicodeDecodeError, ValueError, RuntimeError) as exc:\n        print(f\"FAIL: {exc}\")\n        return 1\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 32
+    },
+    "ai_commit": "d6aa918bd45e",
+    "evidence": "author/committer='devin-ai-integration[bot] <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      20,
+      51
+    ]
+  }
+}

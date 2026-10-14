@@ -1,0 +1,28 @@
+{
+  "repo": "kamoras__civitas",
+  "file": "backend/migrations/versions/0008_retract_mixed_issues.py",
+  "function": "upgrade",
+  "line": 29,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `upgrade` function.",
+  "prompt_source": "def upgrade() -> None:\n    \"\"\"Implement the `upgrade` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def upgrade() -> None:\n    op.execute(\"DELETE FROM action_issues WHERE id IN (753, 759)\")\n    op.execute(\n        \"DELETE FROM timeline_entries WHERE date = '2026-09-27' \"\n        \"AND title = 'Young people in China are fangirling over a professor who gets their anxiety'\"\n    )",
+  "module_source": "\"\"\"retract two issues built from unrelated stories\n\nIssues 753 (i612cf1a1) and 759 (i1679cbc7) were assembled by the\nsingle-linkage clustering fixed in PR #659: 759 joined floods in Bangkok,\na Hawaii hurricane, a nor'easter and an HIV emergency in Fiji; 753 took\nits headline from an unrelated article and cited unrelated sources. No\narticle text is stored, so they cannot be rebuilt, and are removed rather\nthan left up. Their pages answer 410 with the reason from\napp/data/retractions.json, and their Bluesky posts are deleted by the\nretraction job. The day's timeline entry that carried 753's mixed-up\nheadline is removed too; the next refresh records the day's top issue\nagain.\n\nData only, no schema change. Not reversible: the rows are gone.\n\nRevision ID: 0008\nRevises: 0007\nCreate Date: 2026-09-27\n\"\"\"\nfrom alembic import op\n\n\nrevision = \"0008\"\ndown_revision = \"0007\"\nbranch_labels = None\ndepends_on = None\n\n\ndef upgrade() -> None:\n    op.execute(\"DELETE FROM action_issues WHERE id IN (753, 759)\")\n    op.execute(\n        \"DELETE FROM timeline_entries WHERE date = '2026-09-27' \"\n        \"AND title = 'Young people in China are fangirling over a professor who gets their anxiety'\"\n    )\n\n\ndef downgrade() -> None:\n    pass\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 6
+    },
+    "ai_commit": "e3cfaa59cc7f",
+    "evidence": "Generated with [Claude Code]",
+    "ai_line_fraction": 1.0,
+    "span": [
+      29,
+      34
+    ]
+  }
+}

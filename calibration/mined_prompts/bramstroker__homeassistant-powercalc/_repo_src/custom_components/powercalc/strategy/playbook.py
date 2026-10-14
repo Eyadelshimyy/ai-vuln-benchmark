@@ -1,0 +1,277 @@
+from collections import deque
+from collections.abc import Callable
+import csv
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from decimal import Decimal
+import logging
+import os
+
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP, STATE_OFF
+from homeassistant.core import CALLBACK_TYPE, Event, HassJob, HomeAssistant, State, callback
+import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.event import async_track_point_in_time
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.util import dt
+
+from custom_components.powercalc.const import (
+    CONF_AUTOSTART,
+    CONF_PLAYBOOKS,
+    CONF_REPEAT,
+    CONF_STATE_TRIGGER,
+    CONF_STATES_TRIGGER,
+)
+from custom_components.powercalc.errors import StrategyConfigurationError
+from custom_components.powercalc.validation import vol
+
+from .profile_data import open_profile_csv
+from .strategy_interface import PowerCalculationStrategyInterface
+
+CONFIG_SCHEMA = vol.All(
+    cv.deprecated(CONF_STATES_TRIGGER, replacement_key=CONF_STATE_TRIGGER),
+    vol.Schema(
+        {
+            vol.Optional(CONF_PLAYBOOKS): vol.Schema(
+                {cv.string: cv.string},
+            ),
+            vol.Optional(CONF_AUTOSTART): cv.string,
+            vol.Optional(CONF_REPEAT, default=False): cv.boolean,
+            vol.Optional(CONF_STATE_TRIGGER): vol.Schema(
+                {cv.string: cv.string},
+            ),
+            vol.Optional(CONF_STATES_TRIGGER): vol.Schema(
+                {cv.string: cv.string},
+            ),
+        },
+    ),
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class PlaybookStrategy(PowerCalculationStrategyInterface):
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        config: ConfigType,
+        playbook_directory: str | None = None,
+    ) -> None:
+        self._hass = hass
+        self._active_playbook: Playbook | None = None
+        self._loaded_playbooks: dict[str, Playbook] = {}
+        self._update_callback: Callable[[Decimal], None] = lambda power: None
+        self._start_time: datetime = dt.utcnow()
+        self._cancel_timer: CALLBACK_TYPE | None = None
+        self._cancel_stop_listener: CALLBACK_TYPE | None = None
+        self._config = config
+        self._repeat: bool = bool(config.get(CONF_REPEAT))
+        self._autostart: str | None = config.get(CONF_AUTOSTART)
+        self._power = Decimal(0)
+        self._states_trigger: dict[str, str] | None = config.get(CONF_STATE_TRIGGER, config.get(CONF_STATES_TRIGGER))
+        self._playbook_directory = playbook_directory or os.path.join(hass.config.config_dir, "powercalc/playbooks")
+
+    def set_update_callback(self, update_callback: Callable[[Decimal], None]) -> None:
+        """
+        Register update callback which allows to give the strategy instance access to the power sensor
+        and manipulate the state
+        """
+        self._update_callback = update_callback
+
+    async def calculate(self, entity_state: State) -> Decimal | None:
+        if self._states_trigger:
+            if entity_state.state in self._states_trigger:
+                playbook_id = self._states_trigger[entity_state.state]
+                await self.activate_playbook(playbook_id)
+            else:
+                await self.stop_playbook()
+
+        return self._power
+
+    async def on_start(self, hass: HomeAssistant) -> None:
+        if self._autostart:
+            await self.activate_playbook(self._autostart)
+
+    async def activate_playbook(self, playbook_id: str) -> None:
+        """Activate and execute a given playbook"""
+        if self._active_playbook:
+            await self.stop_playbook()
+
+        _LOGGER.debug("Activating playbook %s", playbook_id)
+        playbook = await self._load_playbook(playbook_id=playbook_id)
+        playbook.queue.reset()
+        self._active_playbook = playbook
+        self._start_time = dt.utcnow()
+
+        self._execute_playbook_entry()
+
+    async def stop_playbook(self) -> None:
+        """Activate and execute a given playbook"""
+        if not self._active_playbook:
+            return
+
+        _LOGGER.debug("Stopping playbook")
+        self._active_playbook = None
+        self._power = Decimal(0)
+        if self._cancel_timer is not None:
+            self._cancel_timer()
+            self._cancel_timer = None
+        if self._cancel_stop_listener is not None:
+            self._cancel_stop_listener()
+            self._cancel_stop_listener = None
+
+    def get_active_playbook(self) -> Playbook | None:
+        """Get running playbook"""
+        return self._active_playbook
+
+    @callback
+    def _execute_playbook_entry(self) -> None:
+        """Execute one step of the playbook"""
+        self._cancel_pending_timer()
+
+        if not self._active_playbook:  # pragma: no cover
+            _LOGGER.error("Could not execute next playbook entry. No active playbook")
+            return
+
+        playbook = self._active_playbook
+        if self._complete_or_repeat_playbook(playbook):
+            return
+
+        entry = playbook.queue.dequeue()
+        self._schedule_playbook_entry_update(playbook, entry)
+
+    @callback
+    def _cancel_pending_timer(self) -> None:
+        if self._cancel_timer is not None:
+            self._cancel_timer()
+            self._cancel_timer = None
+
+    @callback
+    def _complete_or_repeat_playbook(self, playbook: Playbook) -> bool:
+        queue = playbook.queue
+        if len(queue) != 0:
+            return False
+
+        if self._repeat:
+            _LOGGER.debug("Playbook %s repeating", playbook.key)
+            self._start_time = dt.utcnow()
+            queue.reset()
+            self._execute_playbook_entry()
+            return True
+
+        _LOGGER.debug("Playbook %s completed", playbook.key)
+        self._active_playbook = None
+        return True
+
+    @callback
+    def _schedule_playbook_entry_update(self, playbook: Playbook, entry: PlaybookEntry) -> None:
+        """Schedule the next playbook power update."""
+
+        @callback
+        def _update_power(date_time: datetime) -> None:
+            active_playbook = self._active_playbook
+            if active_playbook is None:  # pragma: no cover
+                return
+            self._power = entry.power
+            _LOGGER.debug("playbook %s: Update power %.2f", active_playbook.key, self._power)
+            self._update_callback(self._power)
+            self._execute_playbook_entry()
+
+        @callback
+        def _cancel_pending_updates_on_stop(_: Event) -> None:
+            self._cancel_pending_timer()
+            if self._cancel_stop_listener is not None:
+                self._cancel_stop_listener()
+                self._cancel_stop_listener = None
+            self._active_playbook = None
+
+        if self._cancel_stop_listener is not None:
+            self._cancel_stop_listener()
+        self._cancel_stop_listener = self._hass.bus.async_listen_once(
+            EVENT_HOMEASSISTANT_STOP,
+            _cancel_pending_updates_on_stop,
+        )
+
+        # Schedule update in the future
+        self._cancel_timer = async_track_point_in_time(
+            self._hass,
+            HassJob(
+                _update_power,
+                name=f"powercalc playbook {playbook.key}",
+                cancel_on_shutdown=True,
+            ),
+            self._start_time + timedelta(seconds=entry.time),
+        )
+
+    async def _load_playbook(self, playbook_id: str) -> Playbook:
+        """Lazy load a playbook from a CSV file"""
+        if playbook_id in self._loaded_playbooks:
+            return self._loaded_playbooks[playbook_id]
+
+        playbooks: dict[str, str] = dict(self._config.get(CONF_PLAYBOOKS) or {})
+        if playbook_id not in playbooks:
+            raise StrategyConfigurationError(
+                f"Playbook with id {playbook_id} not defined in playbooks config",
+            )
+
+        file_path = os.path.join(self._playbook_directory, playbooks[playbook_id])
+
+        def _load_playbook_entries() -> list[PlaybookEntry]:
+            """Load playbook entries from a CSV file, with support for gzipped files"""
+            if not (os.path.exists(file_path) or os.path.exists(f"{file_path}.gz")):
+                raise StrategyConfigurationError(
+                    f"Playbook file '{file_path}' does not exist",
+                )
+            actual_path = file_path if os.path.exists(file_path) else f"{file_path}.gz"
+            with open_profile_csv(actual_path) as csv_file:
+                csv_reader = csv.reader(csv_file)
+                entries = []
+                for row in csv_reader:
+                    if len(row) != 2:
+                        raise StrategyConfigurationError(
+                            f"Playbook file '{actual_path}' has invalid structure, please see the documentation.",
+                        )
+                    entries.append(PlaybookEntry(time=float(row[0]), power=Decimal(row[1])))
+                return entries
+
+        playbook_entries = await self._hass.async_add_executor_job(_load_playbook_entries)
+
+        self._loaded_playbooks[playbook_id] = Playbook(
+            key=playbook_id,
+            queue=PlaybookQueue(playbook_entries),
+        )
+        return self._loaded_playbooks[playbook_id]
+
+    def can_calculate_standby(self) -> bool:
+        return bool(self._states_trigger and STATE_OFF in self._states_trigger)
+
+    @property
+    def registered_playbooks(self) -> list[str]:
+        playbooks = dict(self._config.get(CONF_PLAYBOOKS, {}))
+        return list(playbooks.keys())
+
+
+class PlaybookQueue:
+    def __init__(self, items: list[PlaybookEntry]) -> None:
+        self._items = items
+        self._queue: deque[PlaybookEntry] = deque(items)
+
+    def dequeue(self) -> PlaybookEntry:
+        return self._queue.popleft()
+
+    def reset(self) -> None:
+        self._queue = deque(self._items)
+
+    def __len__(self) -> int:
+        return len(self._queue)
+
+
+@dataclass
+class Playbook:
+    key: str
+    queue: PlaybookQueue
+
+
+@dataclass
+class PlaybookEntry:
+    time: float
+    power: Decimal

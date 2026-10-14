@@ -1,0 +1,171 @@
+"""Tests for house_ptr.py — index parsing and the fetch/parse orchestration.
+
+Network is mocked (no live requests); PDF table parsing itself is covered
+by test_ptr_common.py, so here we only verify the wiring (dedupe via cache,
+tagging rows with source_url/filing_id/parse_confidence).
+"""
+
+import io
+import zipfile
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from app.pipeline.fetch.house_ptr import fetch_and_parse_ptr, fetch_ptr_filing_index
+from app.pipeline.fetch.ptr_common import TradeRow
+
+_SAMPLE_XML = b"""<?xml version="1.0"?>
+<Members>
+  <Member>
+    <Last>Smith</Last>
+    <First>Jane</First>
+    <FilingType>P</FilingType>
+    <StateDst>CA05</StateDst>
+    <Year>2026</Year>
+    <FilingDate>2/1/2026</FilingDate>
+    <DocID>20026590</DocID>
+  </Member>
+  <Member>
+    <Last>Doe</Last>
+    <First>John</First>
+    <FilingType>O</FilingType>
+    <StateDst>TX01</StateDst>
+    <Year>2026</Year>
+    <FilingDate>2/2/2026</FilingDate>
+    <DocID>20026591</DocID>
+  </Member>
+</Members>
+"""
+
+
+def _sample_zip() -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("2026FD.xml", _SAMPLE_XML)
+    return buf.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_fetch_ptr_filing_index_filters_to_ptr_only(db_session):
+    with patch(
+        "app.pipeline.fetch.house_ptr.fetch_bytes_with_retry", new_callable=AsyncMock
+    ) as mock_fetch:
+        mock_fetch.return_value = _sample_zip()
+        filings = await fetch_ptr_filing_index(None, db_session, 2026)
+
+    assert len(filings) == 1
+    assert filings[0]["last"] == "Smith"
+    assert filings[0]["first"] == "Jane"
+    assert filings[0]["doc_id"] == "20026590"
+    assert filings[0]["filing_date"] == "2026-02-01"
+    assert filings[0]["pdf_url"].endswith("/ptr-pdfs/2026/20026590.pdf")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [
+    pytest.param(b"not a zip file", id="bad_zip"),
+    pytest.param(None, id="fetch_failure"),
+])
+async def test_fetch_ptr_filing_index_failure_returns_empty(db_session, body):
+    with patch(
+        "app.pipeline.fetch.house_ptr.fetch_bytes_with_retry", new_callable=AsyncMock, return_value=body,
+    ):
+        filings = await fetch_ptr_filing_index(None, db_session, 2026)
+    assert filings == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_parse_ptr_tags_rows(db_session):
+    filing = {"doc_id": "20026590", "pdf_url": "https://example.com/20026590.pdf"}
+    parsed_rows = [
+        TradeRow(
+            ticker="AAPL", asset_name="Apple Inc. (AAPL)", owner="self",
+            transaction_type="purchase", transaction_date="2026-01-02",
+            disclosure_date="2026-02-01", amount_low=1001.0, amount_high=15000.0,
+        )
+    ]
+    with patch(
+        "app.pipeline.fetch.house_ptr.fetch_bytes_with_retry", new_callable=AsyncMock
+    ) as mock_fetch, patch(
+        "app.pipeline.fetch.house_ptr.parse_pdf_bytes"
+    ) as mock_parse:
+        mock_fetch.return_value = b"%PDF-fake-bytes"
+        mock_parse.return_value = (parsed_rows, "text")
+        rows = await fetch_and_parse_ptr(None, db_session, filing)
+
+    assert len(rows) == 1
+    assert rows[0].parse_confidence == "text"
+    assert rows[0].source_url == "https://example.com/20026590.pdf"
+    assert rows[0].filing_id == "20026590"
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_parse_ptr_pdf_fetch_failure_returns_none(db_session):
+    """None, not []: "could not fetch" must stay distinguishable from "read
+    it, and it holds nothing" — a stored filing's re-read keeps its rows on
+    the first and drops an older reading of a scan on the second."""
+    filing = {"doc_id": "20026590", "pdf_url": "https://example.com/20026590.pdf"}
+    with patch(
+        "app.pipeline.fetch.house_ptr.fetch_bytes_with_retry", new_callable=AsyncMock
+    ) as mock_fetch:
+        mock_fetch.return_value = None
+        rows = await fetch_and_parse_ptr(None, db_session, filing)
+    assert rows is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_parse_ptr_parse_exception_returns_none_not_raises(db_session):
+    filing = {"doc_id": "20026590", "pdf_url": "https://example.com/20026590.pdf"}
+    with patch(
+        "app.pipeline.fetch.house_ptr.fetch_bytes_with_retry", new_callable=AsyncMock
+    ) as mock_fetch, patch(
+        "app.pipeline.fetch.house_ptr.parse_pdf_bytes"
+    ) as mock_parse:
+        mock_fetch.return_value = b"%PDF-1.4 corrupt"
+        mock_parse.side_effect = Exception("corrupt PDF")
+        rows = await fetch_and_parse_ptr(None, db_session, filing)
+    assert rows is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_index_download_is_not_cached_as_empty(db_session):
+    from app.pipeline.fetch.house_ptr import fetch_filing_index
+
+    with patch("app.pipeline.fetch.house_ptr.fetch_bytes_with_retry", new_callable=AsyncMock, return_value=b"not a zip"):
+        assert await fetch_filing_index(None, db_session, 2026, filing_types={"O"}, pdf_dir="x") is None
+    with patch("app.pipeline.fetch.house_ptr.fetch_bytes_with_retry", new_callable=AsyncMock, return_value=None) as get:
+        assert await fetch_filing_index(None, db_session, 2026, filing_types={"O"}, pdf_dir="x") is None
+    get.assert_awaited_once()  # asked again, not answered from a cached []
+
+
+async def test_a_scan_row_without_a_legible_date_carries_the_filing_date(db_session):
+    """A scanned House PTR row whose date alone didn't read is kept undated
+    (ptr_common.ocr_extract_rows); its disclosure date is the filing's, and
+    the scan's dates are bounded by it."""
+    filing = {"doc_id": "8220001", "pdf_url": "https://example.com/8220001.pdf", "filing_date": "2026-05-14"}
+    undated = TradeRow(
+        ticker=None, asset_name="COMCAST CORP", owner="unknown", transaction_type="purchase",
+        transaction_date=None, disclosure_date="", amount_low=1001.0, amount_high=15000.0,
+    )
+    with patch("app.pipeline.fetch.house_ptr.fetch_bytes_with_retry", new_callable=AsyncMock) as mock_fetch, \
+            patch("app.pipeline.fetch.house_ptr.parse_pdf_bytes") as mock_parse:
+        mock_fetch.return_value = b"%PDF-fake-bytes"
+        mock_parse.return_value = ([undated], "ocr")
+        rows = await fetch_and_parse_ptr(None, db_session, filing)
+    assert mock_parse.call_args.kwargs == {"not_after": "2026-05-14", "keep_undated": True}
+    assert (rows[0].transaction_date, rows[0].disclosure_date) == (None, "2026-05-14")
+
+
+@pytest.mark.asyncio
+async def test_a_rows_disclosure_date_is_the_reports_filing_date(db_session):
+    """Filing 20030387: trades of 05/08-05/12/2025, notified 05/15, filed
+    06/22. The STOCK Act's 45 days run from the trade to the report."""
+    filing = {"doc_id": "20030387", "pdf_url": "https://example.com/20030387.pdf", "filing_date": "2025-06-22"}
+    row = TradeRow(ticker="ABT", asset_name="Abbott Laboratories Common Stock (ABT) [ST]", owner="self",
+                   transaction_type="sale_full", transaction_date="2025-05-12", disclosure_date="2025-05-15",
+                   amount_low=50001.0, amount_high=100000.0)
+    with patch(
+        "app.pipeline.fetch.house_ptr.fetch_bytes_with_retry", new_callable=AsyncMock, return_value=b"%PDF-1.4",
+    ), patch("app.pipeline.fetch.house_ptr.parse_pdf_bytes", return_value=([row], "text")):
+        rows = await fetch_and_parse_ptr(None, db_session, filing)
+    assert rows[0].disclosure_date == "2025-06-22"

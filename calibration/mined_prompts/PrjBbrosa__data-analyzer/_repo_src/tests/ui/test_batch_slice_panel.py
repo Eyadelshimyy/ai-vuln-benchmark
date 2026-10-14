@@ -1,0 +1,530 @@
+"""Tests for the batch spectrogram slice-export panel (stage 6 of the
+2026-08-03 batch heatmap slice design).
+
+``SlicePanel`` only applies to the two spectrogram methods (``fft_time`` /
+``order_time``); ``time``/``fft`` never see it. The panel follows the
+"预处理" card skeleton: a ``PillSwitch`` main toggle that collapses the whole
+settings area when off, plus a single-dimension slice editor (segmented axis
+choice + comma-separated positions).
+"""
+from __future__ import annotations
+
+import pytest
+from PyQt5.QtCore import QPoint, Qt
+from PyQt5.QtTest import QSignalSpy, QTest
+
+from mf4_analyzer.ui.drawers.batch.analysis_panel import AnalysisPanel
+from mf4_analyzer.ui.drawers.batch.slice_panel import SlicePanel
+from mf4_analyzer.ui.widgets.pill_switch import PillSwitch
+from mf4_analyzer.ui_kit.motion import POLICY_LIGHT
+
+
+def _make_panel(qtbot) -> SlicePanel:
+    panel = SlicePanel()
+    qtbot.addWidget(panel)
+    return panel
+
+
+# ---------------------------------------------------------------------------
+# Panel-level behaviour
+# ---------------------------------------------------------------------------
+
+def test_slice_panel_main_switch_is_a_pill_switch(qtbot):
+    panel = _make_panel(qtbot)
+    assert isinstance(panel._enable_switch, PillSwitch)
+    assert panel._enable_switch.motion_policy() == POLICY_LIGHT
+
+
+def test_slice_user_click_animates_and_apply_params_snaps(qtbot, qapp):
+    panel = _make_panel(qtbot)
+    panel.show()
+    qapp.processEvents()
+    switch = panel._enable_switch
+    toggled = QSignalSpy(switch.toggled)
+    changed = QSignalSpy(panel.changed)
+
+    QTest.mouseClick(switch, Qt.LeftButton, Qt.NoModifier, QPoint(22, 12))
+    assert switch.isChecked()
+    assert list(toggled) == [[True]]
+    assert len(changed) == 1
+    driver = switch._value_driver
+    assert driver is not None and driver.is_active()
+
+    panel.apply_params({
+        "slice": {"enabled": True, "axis": "time", "positions": [5.0, 15.0]},
+    })
+    assert switch.isChecked()
+    assert not driver.is_active()
+    assert panel.get_params()["slice"]["positions"] == [5.0, 15.0]
+    assert len(changed) == 2
+
+
+def test_slice_panel_settings_collapse_when_switch_is_off(qtbot):
+    panel = _make_panel(qtbot)
+    assert panel._enable_switch.isChecked() is False
+    assert panel._settings.isHidden() is True
+
+    panel._enable_switch.setChecked(True)
+    assert panel._settings.isHidden() is False
+
+    panel._enable_switch.setChecked(False)
+    assert panel._settings.isHidden() is True
+
+
+def test_slice_panel_summary_text_tracks_switch_and_position_count(qtbot):
+    panel = _make_panel(qtbot)
+    assert panel._summary_note.text() == "切片关闭 · 仅导出谱图"
+
+    panel._enable_switch.setChecked(True)
+    panel._positions_edit.setText("5, 15, 25")
+
+    assert panel._summary_note.text() == "固定时间 · 3 处"
+
+
+def test_slice_panel_summary_counts_unique_positions(qtbot):
+    panel = _make_panel(qtbot)
+    panel._enable_switch.setChecked(True)
+    panel._positions_edit.setText("15, 5, 15")
+
+    assert panel._summary_note.text() == "固定时间 · 2 处"
+
+
+def test_slice_panel_summary_caps_position_count_at_export_limit(qtbot):
+    panel = _make_panel(qtbot)
+    panel._enable_switch.setChecked(True)
+    panel._positions_edit.setText("1, 2, 3, 4, 5, 6")
+
+    assert panel._summary_note.text() == "固定时间 · 4 处"
+
+
+def test_slice_panel_axis_switch_updates_unit_label(qtbot):
+    panel = _make_panel(qtbot)
+    assert panel._unit_label.text() == "s"
+
+    panel._axis_combo.setCurrentIndex(panel._axis_combo.findData("y"))
+    assert panel._unit_label.text() == "Hz"
+
+    panel._axis_combo.setCurrentIndex(panel._axis_combo.findData("time"))
+    assert panel._unit_label.text() == "s"
+
+
+def test_slice_axis_uses_segmented_choice_not_dropdown(qtbot):
+    """Binary 切片维度 is a one-click SegmentedChoice; the combo stays hidden."""
+    from mf4_analyzer.ui_kit.widgets.segmented_choice import SegmentedChoice
+
+    panel = _make_panel(qtbot)
+    panel._enable_switch.setChecked(True)
+    panel.resize(288, 400)
+    panel.show()
+    qtbot.wait(20)
+
+    from mf4_analyzer.ui_kit.motion import POLICY_LIGHT
+
+    assert isinstance(panel._axis_choice, SegmentedChoice)
+    assert panel._axis_choice.motion_policy() == POLICY_LIGHT
+    assert panel._axis_choice.bound_combo() is panel._axis_combo
+    assert panel._axis_combo.isHidden() is True
+    assert panel._axis_choice.isVisibleTo(panel) is True
+    assert tuple(button.text() for button in panel._axis_choice.buttons()) == (
+        "固定时间",
+        "固定频率",
+    )
+    # Both segment labels remain fully painted inside the narrow Batch column.
+    for button in panel._axis_choice.buttons():
+        assert button.width() >= button.fontMetrics().horizontalAdvance(button.text())
+
+
+def test_slice_axis_light_plate_keeps_track_corners(qtbot, qapp):
+    from PyQt5.QtGui import QColor
+
+    from mf4_analyzer.ui_kit import load_stylesheet
+    from mf4_analyzer.ui_kit.control_style import CONTROL_COLORS
+    from mf4_analyzer.ui_kit.motion import POLICY_LIGHT
+
+    old = qapp.styleSheet()
+    try:
+        load_stylesheet(qapp)
+        panel = _make_panel(qtbot)
+        panel._enable_switch.setChecked(True)
+        panel.resize(288, 400)
+        panel.show()
+        qapp.processEvents()
+        choice = panel._axis_choice
+        assert choice.motion_policy() == POLICY_LIGHT
+        plate = choice._selection_pill
+        assert plate is not None
+        image = choice.grab().toImage()
+        dpr = float(image.devicePixelRatio() or 1.0)
+        origin = plate.mapTo(choice, plate.rect().topLeft())
+        track = QColor(CONTROL_COLORS["CONTROL_TRACK"])
+        px = min(max(int(round(origin.x() * dpr)), 0), image.width() - 1)
+        py = min(max(int(round(origin.y() * dpr)), 0), image.height() - 1)
+        corner = QColor(image.pixel(px, py))
+        assert max(
+            abs(corner.red() - track.red()),
+            abs(corner.green() - track.green()),
+            abs(corner.blue() - track.blue()),
+        ) <= 18
+    finally:
+        qapp.setStyleSheet(old)
+
+
+def test_slice_dimension_rename_snaps_without_extra_signals(qtbot, qapp):
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtTest import QTest
+
+    from mf4_analyzer.ui_kit.motion import POLICY_LIGHT
+
+    panel = _make_panel(qtbot)
+    panel._enable_switch.setChecked(True)
+    panel.resize(288, 400)
+    panel.show()
+    qapp.processEvents()
+
+    choice = panel._axis_choice
+    assert choice.motion_policy() == POLICY_LIGHT
+    driver = choice._motion_driver
+    assert driver is not None
+    assert not driver.is_active()
+
+    changed = QSignalSpy(panel.changed)
+    combo_spy = QSignalSpy(panel._axis_combo.currentIndexChanged)
+    QTest.mouseClick(choice.buttons()[1], Qt.LeftButton)
+
+    assert choice.currentIndex() == 1
+    assert panel._axis_combo.currentData() == "y"
+    assert list(combo_spy) == [[1]]
+    assert len(changed) == 1
+    assert driver.is_active()
+    payload = panel.get_params()
+
+    panel.set_context(method="order_time")
+
+    assert panel.get_params() == payload
+    assert choice.buttons()[1].text() == "固定阶次"
+    assert panel._axis_combo.itemText(1) == "固定阶次"
+    assert list(combo_spy) == [[1]]
+    assert len(changed) == 1
+    assert not driver.is_active()
+
+
+def test_slice_panel_order_time_context_renames_second_axis_and_clears_unit(qtbot):
+    panel = _make_panel(qtbot)
+    panel.set_context(method="order_time")
+
+    assert panel._axis_combo.itemText(1) == "固定阶次"
+    assert panel._axis_choice.buttons()[1].text() == "固定阶次"
+
+    panel._axis_combo.setCurrentIndex(panel._axis_combo.findData("y"))
+    assert panel._unit_label.text() == ""
+
+
+def test_slice_panel_context_switch_back_to_fft_time_restores_frequency_wording(qtbot):
+    panel = _make_panel(qtbot)
+    panel.set_context(method="order_time")
+    panel.set_context(method="fft_time")
+
+    assert panel._axis_combo.itemText(1) == "固定频率"
+    assert panel._axis_choice.buttons()[1].text() == "固定频率"
+
+    panel._axis_combo.setCurrentIndex(panel._axis_combo.findData("y"))
+    assert panel._unit_label.text() == "Hz"
+
+
+# ---------------------------------------------------------------------------
+# Positions parsing / get_params
+# ---------------------------------------------------------------------------
+
+def test_slice_panel_comma_separated_positions_parse_to_floats(qtbot):
+    panel = _make_panel(qtbot)
+    panel._enable_switch.setChecked(True)
+    panel._positions_edit.setText("5, 15, 25")
+
+    params = panel.get_params()
+
+    assert params == {
+        "slice": {"enabled": True, "axis": "time", "positions": [5.0, 15.0, 25.0]}
+    }
+
+
+@pytest.mark.parametrize(
+    "text",
+    ("5，15，25", "5、15、25", "5， 15, 25", "5;15；25"),
+)
+def test_slice_panel_accepts_chinese_and_mixed_separators(qtbot, text):
+    panel = _make_panel(qtbot)
+    panel._enable_switch.setChecked(True)
+    panel._positions_edit.setText(text)
+
+    assert panel.positions_error() == ""
+    assert panel.get_params()["slice"]["positions"] == [5.0, 15.0, 25.0]
+    # Stored recipe stays ASCII-normalized floats; raw editor text is untouched.
+    assert panel._positions_edit.text() == text
+
+
+def test_slice_panel_disabled_get_params_is_empty(qtbot):
+    panel = _make_panel(qtbot)
+    panel._positions_edit.setText("5, 15, 25")
+
+    assert panel.get_params() == {}
+
+
+def test_slice_panel_does_not_rewrite_the_users_raw_text(qtbot):
+    """Sorting/dedup is a recipe-normalization concern (design D7), not a
+    panel concern — the panel must leave whatever the user typed alone."""
+    panel = _make_panel(qtbot)
+    panel._enable_switch.setChecked(True)
+    panel._positions_edit.setText("15, 5, 15")
+
+    assert panel._positions_edit.text() == "15, 5, 15"
+    assert panel.get_params()["slice"]["positions"] == [15.0, 5.0, 15.0]
+
+
+# ---------------------------------------------------------------------------
+# positions_error()
+# ---------------------------------------------------------------------------
+
+def test_slice_panel_positions_error_empty_when_disabled(qtbot):
+    panel = _make_panel(qtbot)
+    panel._positions_edit.setText("not a number")
+
+    assert panel.positions_error() == ""
+
+
+def test_slice_panel_positions_error_on_empty_positions(qtbot):
+    panel = _make_panel(qtbot)
+    panel._enable_switch.setChecked(True)
+    panel._positions_edit.setText("")
+
+    assert panel.positions_error() != ""
+
+
+def test_slice_panel_positions_error_on_unparsable_text(qtbot):
+    panel = _make_panel(qtbot)
+    panel._enable_switch.setChecked(True)
+    panel._positions_edit.setText("5, abc, 25")
+
+    assert panel.positions_error() != ""
+
+
+def test_slice_panel_positions_error_over_four_positions(qtbot):
+    panel = _make_panel(qtbot)
+    panel._enable_switch.setChecked(True)
+    panel._positions_edit.setText("1, 2, 3, 4, 5")
+
+    assert panel.positions_error() != ""
+
+
+def test_slice_panel_positions_error_clear_for_valid_input(qtbot):
+    panel = _make_panel(qtbot)
+    panel._enable_switch.setChecked(True)
+    panel._positions_edit.setText("5, 15, 25")
+
+    assert panel.positions_error() == ""
+
+
+def test_slice_panel_positions_error_rejects_negative_y_position(qtbot):
+    panel = _make_panel(qtbot)
+    panel._enable_switch.setChecked(True)
+    panel._axis_combo.setCurrentIndex(panel._axis_combo.findData("y"))
+    panel._positions_edit.setText("-5, 10")
+
+    assert panel.positions_error() == "位置：固定频率或阶次不能为负数"
+
+
+def test_sheet_maps_slice_recipe_issue_to_positions_messages():
+    from mf4_analyzer.batch_validation import ValidationIssue
+    from mf4_analyzer.ui.drawers.batch.sheet import (
+        _analysis_issue_summary, _blocked_issue_reason,
+    )
+
+    issue = ValidationIssue(
+        "slice", "invalid_slice_positions", "slice positions are invalid",
+    )
+
+    assert _analysis_issue_summary(issue, "fft_time") == (
+        "时频 · 切片位置无效"
+    )
+    assert _blocked_issue_reason(issue) == "请检查切片位置"
+
+
+# ---------------------------------------------------------------------------
+# apply_params / get_params round trip
+# ---------------------------------------------------------------------------
+
+def test_slice_panel_apply_params_get_params_round_trip(qtbot):
+    panel = _make_panel(qtbot)
+    payload = {
+        "slice": {"enabled": True, "axis": "y", "positions": [620.0, 1240.0]},
+    }
+
+    panel.apply_params(payload)
+
+    assert panel.get_params() == payload
+
+
+@pytest.mark.parametrize("payload", [
+    {},
+    {"slice": {"enabled": True, "axis": "y", "positions": [5.0, 15.0]}},
+])
+def test_slice_apply_params_emits_one_changed_and_forwarded_notification(
+    qtbot, payload,
+):
+    """One programmatic slice apply is one observable parameter transaction."""
+    panel = AnalysisPanel()
+    qtbot.addWidget(panel)
+    changed = QSignalSpy(panel._slice.changed)
+    forwarded = QSignalSpy(panel.paramsChanged)
+
+    panel._slice.apply_params(payload)
+
+    assert len(changed) == 1
+    assert len(forwarded) == 1
+
+
+def test_slice_panel_apply_params_none_slice_resets_to_disabled(qtbot):
+    panel = _make_panel(qtbot)
+    panel.apply_params({
+        "slice": {"enabled": True, "axis": "time", "positions": [5.0]},
+    })
+
+    panel.apply_params({})
+
+    assert panel._enable_switch.isChecked() is False
+    assert panel.get_params() == {}
+
+
+def test_slice_panel_apply_params_without_slice_key_keeps_axis_and_positions(qtbot):
+    """A slice-disabled preset must not erase the user's slice draft."""
+    panel = _make_panel(qtbot)
+    panel._axis_combo.setCurrentIndex(panel._axis_combo.findData("y"))
+    panel._positions_edit.setText("5, 15, 25")
+
+    panel.apply_params({"window": "hanning"})
+
+    assert panel._enable_switch.isChecked() is False
+    assert panel._axis_combo.currentData() == "y"
+    assert panel._positions_edit.text() == "5, 15, 25"
+
+
+# ---------------------------------------------------------------------------
+# AnalysisPanel wiring
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("method", ("fft_time", "order_time"))
+def test_analysis_panel_shows_slice_panel_only_for_spectrogram_methods(
+    qtbot, method,
+):
+    panel = AnalysisPanel()
+    qtbot.addWidget(panel)
+
+    panel.apply_method(method)
+    assert panel._slice.isVisibleTo(panel) is True
+
+    panel.apply_method("time")
+    assert panel._slice.isVisibleTo(panel) is False
+
+    panel.apply_method("fft")
+    assert panel._slice.isVisibleTo(panel) is False
+
+
+def test_analysis_panel_method_switch_updates_slice_axis_wording(qtbot):
+    panel = AnalysisPanel()
+    qtbot.addWidget(panel)
+
+    panel.apply_method("fft_time")
+    assert panel._slice._axis_combo.itemText(1) == "固定频率"
+
+    panel.apply_method("order_time")
+    assert panel._slice._axis_combo.itemText(1) == "固定阶次"
+
+
+def test_analysis_panel_get_params_merges_slice_for_spectrogram_methods(qtbot):
+    panel = AnalysisPanel()
+    qtbot.addWidget(panel)
+    panel.apply_method("fft_time")
+
+    panel._slice._enable_switch.setChecked(True)
+    panel._slice._positions_edit.setText("5, 15, 25")
+
+    params = panel.get_params()
+
+    assert params["slice"] == {
+        "enabled": True, "axis": "time", "positions": [5.0, 15.0, 25.0],
+    }
+
+
+def test_analysis_panel_switching_to_time_drops_slice_from_params(qtbot):
+    panel = AnalysisPanel()
+    qtbot.addWidget(panel)
+    panel.apply_method("fft_time")
+    panel._slice._enable_switch.setChecked(True)
+    panel._slice._positions_edit.setText("5, 15, 25")
+    assert "slice" in panel.get_params()
+
+    panel.apply_method("time")
+
+    assert "slice" not in panel.get_params()
+
+
+def test_analysis_panel_slice_positions_error_forwards_from_panel(qtbot):
+    panel = AnalysisPanel()
+    qtbot.addWidget(panel)
+    panel.apply_method("fft_time")
+
+    assert panel.slice_positions_error() == ""
+
+    panel._slice._enable_switch.setChecked(True)
+    panel._slice._positions_edit.setText("")
+    assert panel.slice_positions_error() != ""
+
+    panel._slice._positions_edit.setText("5, 15, 25")
+    assert panel.slice_positions_error() == ""
+
+
+def test_analysis_panel_slice_positions_error_ignored_outside_spectrogram_methods(
+    qtbot,
+):
+    panel = AnalysisPanel()
+    qtbot.addWidget(panel)
+    panel.apply_method("fft_time")
+    panel._slice._enable_switch.setChecked(True)
+    panel._slice._positions_edit.setText("")
+    assert panel.slice_positions_error() != ""
+
+    panel.apply_method("time")
+
+    assert panel.slice_positions_error() == ""
+
+
+# ---------------------------------------------------------------------------
+# BatchSheet integration: the slice error gates the Run button.
+# ---------------------------------------------------------------------------
+
+def test_sheet_blocks_run_button_when_slice_positions_are_invalid(qtbot, tmp_path):
+    from mf4_analyzer.ui.drawers.batch.sheet import BatchSheet
+
+    sheet = BatchSheet(None, files={})
+    qtbot.addWidget(sheet)
+    sheet._input_panel._file_list.add_loaded_file(
+        "s1", "one.hdf", frozenset({"sig"}),
+    )
+    sheet.apply_signals(("sig",))
+    sheet.apply_method("fft_time")
+    sheet._output_panel.apply_directory(str(tmp_path))
+
+    sheet._analysis_panel._slice._enable_switch.setChecked(True)
+    sheet._analysis_panel._slice._positions_edit.setText("")
+    sheet._recompute_pipeline_status()
+
+    assert any(
+        issue.field == "slice_positions" for issue in sheet.preflight_issues()
+    )
+    assert sheet.is_runnable() is False
+
+    sheet._analysis_panel._slice._positions_edit.setText("5, 15")
+    sheet._recompute_pipeline_status()
+
+    assert not any(
+        issue.field == "slice_positions" for issue in sheet.preflight_issues()
+    )

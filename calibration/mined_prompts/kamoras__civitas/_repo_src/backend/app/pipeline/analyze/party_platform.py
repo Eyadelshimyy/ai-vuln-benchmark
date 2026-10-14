@@ -1,0 +1,1235 @@
+"""
+Content-based party alignment using Bayesian-blended platform centroids.
+
+Determines which party's platform a bill aligns with by analyzing what
+the bill actually DOES, not how senators voted on it.
+
+Centroid construction
+---------------------
+Party platform centroids are built from two sources, blended via
+Bayesian MAP estimation:
+
+1. **Seed descriptions** (prior): hand-authored summaries of each
+   party's known positions per policy area. These serve as the prior,
+   weighted as ``_PRIOR_WEIGHT`` virtual observations.
+
+2. **Congressional bill data** (likelihood): bills from previous
+   pipeline runs with known party_leaning, grouped by
+   (party, policy_area). Each group's embedding centroid provides
+   observed data.
+
+The posterior centroid is:
+    centroid = (seed · w_prior + data · n_bills) / (w_prior + n_bills)
+
+With ``_PRIOR_WEIGHT=3``, three real bills halve the seed influence.
+As the corpus grows, centroids converge to pure data.  On cold start
+(no bill history), pure seeds are used.
+
+This implements the self-training paradigm (Yarowsky 1995) with an
+informative prior — addressing the critique that pure seed-based
+classifiers are brittle (Abney 2004, "Understanding the Yarowsky
+Algorithm," Computational Linguistics 30:3).
+
+Academic rationale
+------------------
+Roll-call-based ideology measures (e.g. DW-NOMINATE; Poole & Rosenthal
+1985, 1997) are the standard in political science, but they conflate
+policy content with strategic behavior. As Clinton, Jackman & Rivers
+(2004, "The Statistical Analysis of Roll Call Data," APSR 98:2) note,
+ideal-point estimates from votes assume sincere voting — an assumption
+violated by logrolling, whip pressure, and omnibus packaging.
+
+Content-based approaches address this limitation directly. The Comparative
+Manifestos Project (Budge et al. 2001, "Mapping Policy Preferences")
+pioneered coding party positions from text. Laver, Benoit & Garry (2003,
+"Extracting Policy Positions from Political Texts Using Words as Data,"
+APSR 97:2) showed that automated text analysis can recover party positions
+as accurately as expert coders.
+
+This module extends that approach to individual bills: rather than
+scaling entire manifestos, we compute embedding similarity between
+bill content and each party's Bayesian-posterior platform centroids.
+This is equivalent to a nearest-centroid classifier in semantic space
+(Rocchio 1971; Manning, Raghavan & Schütze 2008, "Introduction to
+Information Retrieval," Ch. 14) with a Normal prior on centroid
+location (Nigam et al. 2000, "Text Classification from Labeled and
+Unlabeled Documents using EM," Machine Learning 39:2-3).
+
+The stance direction (pro/anti) disambiguates cases where both parties
+have positions on the same topic area. A "pro" environment bill
+(strengthen EPA) aligns with D platform positions, while an "anti"
+environment bill (roll back regulations) aligns with R. This mirrors
+the saliency-plus-direction model from manifesto research (Laver &
+Garry 2000, "Estimating Policy Positions from Political Texts").
+
+References
+----------
+- Poole, K. & Rosenthal, H. (1985). AJPS, 29(2), 357-384.
+- Clinton, J. et al. (2004). APSR, 98(2), 355-370.
+- Budge, I. et al. (2001). Mapping Policy Preferences. Oxford UP.
+- Laver, M. et al. (2003). APSR, 97(2).
+- Laver, M. & Garry, J. (2000). AJPS, 44(3), 619-634.
+- Manning, C. et al. (2008). Intro to IR. Cambridge UP. Ch. 14.
+- Yarowsky, D. (1995). ACL, 189-196.
+- Abney, S. (2004). Computational Linguistics, 30(3), 365-395.
+- Nigam, K. et al. (2000). Machine Learning, 39(2-3), 103-134.
+"""
+
+import logging
+
+import numpy as np
+from sqlalchemy.orm import Session
+
+from app.models import KeyVote, RepKeyVote, RollCall
+from app.pipeline.transform.normalize_votes import is_housekeeping
+
+logger = logging.getLogger(__name__)
+
+
+# Seed descriptions: Bayesian prior for each party's positions per policy area.
+# These initialize the classifier before bill data is available.  As the pipeline
+# accumulates real congressional bills with known party_leaning, the Bayesian
+# posterior centroids converge toward the observed data (see _bayesian_blend).
+
+# Seed content refreshed 2026-07 (platform review round 2, P1-P7): each
+# party's positions are written in that party's OWN framing (no plank is
+# phrased the way its opponents would describe it), updated to the
+# 2024-26 platforms (the prior text was a ~2019-20 snapshot with several
+# inverted-by-now positions), and an ABORTION area was added — the most
+# party-predictive issue domain of this era was previously absent from
+# the entire construct space. Seeds remain the Bayesian PRIOR only:
+# the centroids built from bills earlier runs labelled for each party
+# (_build_data_centroids; the roll-call split where there was one) correct
+# residual content errors as real bill data accumulates, and the
+# pipeline's analysis-code fingerprint clears cached classifications so
+# these take effect cleanly. Validated downstream by ground_truth.py's
+# reference ranges + population-stdev floors on the next full run.
+R_PLATFORM_POSITIONS: dict[str, str] = {
+    "TAXES": (
+        "reduce taxes, cut tax rates, lower corporate tax, repeal estate tax, "
+        "reduce government spending, balanced budget amendment, limit IRS, "
+        "preserve low tax rates, supply-side economics, reduce deficit through cuts"
+    ),
+    "HEALTHCARE": (
+        "market-based healthcare reform, health savings accounts, price transparency in healthcare, "
+        "reduce healthcare regulation, competition across state lines, "
+        "voluntary private insurance, patient choice, "
+        "reduce prescription drug regulation, tort reform"
+    ),
+    "ENVIRONMENT": (
+        "energy independence, reduce EPA regulations, approve drilling permits, "
+        "approve pipeline construction, support clean coal, expand nuclear energy, "
+        "market-based environmental solutions, reduce environmental compliance burden, "
+        "withdraw from climate agreements, support fossil fuel industry"
+    ),
+    "DEFENSE": (
+        "peace through strength, increase defense spending, strong military "
+        "readiness, missile defense, support veterans benefits, military "
+        "modernization, strengthen national security, "
+        "prioritize countering China in the Indo-Pacific, "
+        "demand NATO allies pay their fair share of defense, "
+        "skeptical of open-ended foreign military aid commitments, "
+        "support arms sales to allies, streamline defense exports, "
+        "border security as national security"
+    ),
+    "GUNS": (
+        "protect second amendment rights, defend gun ownership and access to firearms, "
+        "support concealed carry reciprocity, preserve access to ammunition and magazines, "
+        "support gun manufacturer liability protection, "
+        "arm teachers for self-defense, expand firearm freedoms, "
+        "castle doctrine, stand your ground laws, deregulate firearms"
+    ),
+    "IMMIGRATION": (
+        "secure the border, build border wall, reduce illegal immigration, "
+        "merit-based legal immigration, enforcement-first approach, "
+        "increase border patrol funding, end sanctuary cities, "
+        "end DACA, mandatory E-Verify"
+    ),
+    "EDUCATION": (
+        "school choice, charter schools, voucher programs, "
+        "reduce federal education mandates, local curriculum control, "
+        "parental rights in curriculum, reduce Department of Education, "
+        "personal responsibility for student debt"
+    ),
+    "FINANCIAL": (
+        "reduce banking regulation, repeal Dodd-Frank provisions, "
+        "reduce CFPB authority, support cryptocurrency innovation, "
+        "free market financial activity, reduce compliance burden"
+    ),
+    "ENERGY": (
+        "energy independence, expand domestic production, reduce energy regulation, "
+        "support nuclear power, market-driven energy mix, "
+        "reduce utility regulation, fossil fuel production"
+    ),
+    "JUSTICE": (
+        "tough on crime, support law enforcement funding, back the blue, "
+        "mandatory minimum sentences, support death penalty, "
+        "oppose cashless bail policies, appoint constitutionalist judges, "
+        "election integrity safeguards, voter ID requirements, "
+        "secure elections and accurate voter rolls"
+    ),
+    "TRADE": (
+        "fair trade enforcement, tariffs to protect American industry, reciprocal tariffs, renegotiate trade deals, "
+        "protect domestic manufacturing, trade reciprocity, "
+        "bilateral trade agreements, support defense exports to allies"
+    ),
+    "WELFARE": (
+        "work requirements for benefits, reduce welfare spending, "
+        "reform Social Security, reduce entitlement growth, "
+        "block-grant federal programs to states, self-sufficiency over dependency"
+    ),
+    "LABOR": (
+        "right-to-work legislation, worker freedom to choose union membership, "
+        "market-determined wages, reduce workplace regulation, "
+        "voluntary employer benefits, support gig economy flexibility"
+    ),
+    "ABORTION": (
+        "protect unborn life, pro-life protections for the unborn, "
+        "restrict late-term abortion, oppose taxpayer funding of abortion, "
+        "support the Hyde Amendment, parental notification requirements, "
+        "support pregnancy resource centers, "
+        "conscience protections for healthcare providers"
+    ),
+    "TECH": (
+        "hold Big Tech accountable, reform Section 230 platform liability, "
+        "combat online censorship of political speech, "
+        "antitrust scrutiny of dominant tech platforms, "
+        "protect children online, support American AI leadership, "
+        "support innovation, oppose government-directed content moderation"
+    ),
+}
+
+D_PLATFORM_POSITIONS: dict[str, str] = {
+    "TAXES": (
+        "progressive taxation, increase taxes on wealthy, raise corporate tax rates, "
+        "expand earned income tax credit, close tax loopholes, "
+        "increase capital gains tax, tax financial transactions, "
+        "fund social programs through revenue, oppose tax cuts for wealthy"
+    ),
+    "HEALTHCARE": (
+        "expand healthcare access, protect and strengthen ACA, public option, "
+        "reduce prescription drug costs, Medicare expansion, "
+        "universal healthcare coverage, Medicaid expansion, "
+        "regulate pharmaceutical prices, mental health funding"
+    ),
+    "ENVIRONMENT": (
+        "climate action, clean energy investment, emissions reduction targets, "
+        "strengthen EPA enforcement, defend clean energy tax credits, "
+        "renewable energy incentives, methane emissions regulation, "
+        "environmental justice, limit new fossil fuel leases, "
+        "electric vehicle incentives"
+    ),
+    "DEFENSE": (
+        "support NATO and defense alliances, "
+        "support Ukraine's defense against Russian invasion, "
+        "enforce sanctions on Russia, honor security commitments to allies, "
+        "responsible military spending with oversight, diplomacy alongside "
+        "strength, arms control agreements, support veterans, "
+        "military sexual assault reform, "
+        "regulate arms sales and exports, arms trade oversight, "
+        "human rights conditions on military transfers"
+    ),
+    "GUNS": (
+        "universal background checks, assault weapons ban, "
+        "red flag laws, gun violence prevention, "
+        "limit magazine capacity, close gun show loophole, "
+        "fund gun violence research, repeal gun manufacturer liability protections, "
+        "regulate ammunition sales and transfers, restrict access to firearms, "
+        "mandatory waiting periods, safe storage requirements"
+    ),
+    "IMMIGRATION": (
+        "path to citizenship, protect DACA and Dreamers, "
+        "comprehensive immigration reform, asylum rights, "
+        "reunite separated families, reduce deportation, "
+        "increase refugee admissions, oppose border wall"
+    ),
+    "EDUCATION": (
+        "increase public school funding, universal pre-K, "
+        "student loan forgiveness, free community college, "
+        "increase Pell grants, oppose school vouchers, "
+        "support teachers unions, reduce school-to-prison pipeline"
+    ),
+    "FINANCIAL": (
+        "strengthen banking regulation, expand Dodd-Frank, "
+        "strengthen CFPB consumer protections, "
+        "regulate cryptocurrency, financial transaction tax, "
+        "break up big banks, increase corporate accountability"
+    ),
+    "ENERGY": (
+        "renewable energy mandates, solar and wind investment, "
+        "phase out fossil fuel subsidies, clean energy jobs, "
+        "modernize power grid, community solar programs, "
+        "clean energy manufacturing incentives, oppose new pipelines"
+    ),
+    "JUSTICE": (
+        "criminal justice reform, police reform, end qualified immunity, "
+        "ban chokeholds, reduce mandatory minimums, "
+        "expand voting rights, protect access to the ballot, "
+        "early voting and vote by mail access, abolish private prisons, "
+        "end cash bail, decriminalize marijuana"
+    ),
+    "TRADE": (
+        "labor standards in trade agreements, environmental protections in trade, "
+        "oppose unfair trade practices, support worker adjustment assistance, "
+        "multilateral trade agreements, "
+        "regulate arms exports, human rights conditions on foreign sales"
+    ),
+    "WELFARE": (
+        "expand social safety net, increase SNAP benefits, "
+        "expand Social Security, affordable childcare, "
+        "increase minimum wage, expand housing assistance, "
+        "child tax credit expansion, paid family leave"
+    ),
+    "LABOR": (
+        "raise minimum wage, protect union rights, PRO Act, "
+        "expand collective bargaining, paid family leave mandate, "
+        "strengthen OSHA, close gender pay gap, "
+        "expand overtime protections, gig worker protections"
+    ),
+    "ABORTION": (
+        "protect abortion access and reproductive freedom, "
+        "restore and codify Roe v. Wade protections, "
+        "defend access to contraception and IVF, "
+        "oppose state and national abortion bans, "
+        "protect patients and doctors from criminalization, "
+        "repeal the Hyde Amendment, fund family planning services"
+    ),
+    "TECH": (
+        "regulate big tech, antitrust enforcement, "
+        "data privacy legislation, net neutrality, "
+        "expand broadband access, AI regulation, "
+        "protect children online, section 230 reform"
+    ),
+}
+
+# Bayesian prior weight: the seed descriptions count as this many
+# "virtual bills."  As real bill data accumulates, the data centroid
+# dominates.  A value of 3 means 3 real bills halve the seed influence.
+_PRIOR_WEIGHT = 3.0
+
+# Below this R/D score margin, a bill is classified "bipartisan" rather
+# than assigned to either party — empirically calibrated (see
+# classify_party_alignment's docstring) against bills with known
+# single-party sponsorship in the 117th-119th Congresses.
+_BIPARTISAN_MARGIN_THRESHOLD = 0.06
+
+
+def _build_seed_embeddings() -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Embed the hand-authored seed platform descriptions.
+
+    These serve as the Bayesian prior when no bill data is available.
+    """
+    from app.pipeline.vector_store import get_embedding_model
+    model = get_embedding_model()
+
+    r_seeds: dict[str, np.ndarray] = {}
+    d_seeds: dict[str, np.ndarray] = {}
+
+    for area, desc in R_PLATFORM_POSITIONS.items():
+        emb = model.encode([desc], show_progress_bar=False)[0]
+        r_seeds[area] = emb / np.linalg.norm(emb)
+
+    for area, desc in D_PLATFORM_POSITIONS.items():
+        emb = model.encode([desc], show_progress_bar=False)[0]
+        d_seeds[area] = emb / np.linalg.norm(emb)
+
+    return r_seeds, d_seeds
+
+
+def _build_data_centroids(db: Session) -> tuple[
+    dict[str, tuple[np.ndarray, int]],
+    dict[str, tuple[np.ndarray, int]],
+]:
+    """Build party platform centroids from actual congressional bill data.
+
+    Queries bills with known party_leaning from previous pipeline runs, in
+    both chambers (KeyVote and RepKeyVote: a party's positions on a policy
+    area don't depend on which chamber voted), and computes
+    per-(party, policy_area) embedding centroids.
+
+    Returns:
+        (r_centroids, d_centroids) where each maps
+        policy_area -> (centroid_embedding, n_bills).
+    """
+    from app.pipeline.vector_store import get_embedding_model
+    from collections import defaultdict
+
+    # A housekeeping roll call carries its bill's title under the label of
+    # its own split, the opposite of the bill's. Rows stored since v6.28 are
+    # marked PROCEDURAL; earlier ones are recognized by their roll call's
+    # question, so the first run after the change doesn't learn from them.
+    housekeeping = {
+        f"{rc.chamber}-{rc.congress}-{rc.session}-{rc.number}"
+        for rc in db.query(RollCall.chamber, RollCall.congress, RollCall.session, RollCall.number, RollCall.question)
+        if is_housekeeping(rc.question, rc.chamber)
+    }
+
+    bills = []
+    for model_cls in (KeyVote, RepKeyVote):
+        bills += [
+            row[:4]
+            for row in db.query(
+                model_cls.bill_name, model_cls.description, model_cls.policy_area, model_cls.party_leaning,
+                model_cls.roll_call,
+            )
+            .filter(
+                model_cls.party_leaning.in_(["R", "D"]),
+                model_cls.policy_area != "",
+                model_cls.policy_area != "PROCEDURAL",
+            )
+            .all()
+            if row[4] not in housekeeping
+        ]
+
+    groups: dict[tuple[str, str], list[str]] = defaultdict(list)
+    seen: set[tuple[str, str, str]] = set()
+    for bill_name, description, policy_area, party in bills:
+        text = (description or bill_name or "").strip()
+        if len(text) < 20:
+            continue
+        key = (party, policy_area, text[:200])
+        if key in seen:
+            continue
+        seen.add(key)
+        groups[(party, policy_area)].append(text[:500])
+
+    if not groups:
+        return {}, {}
+
+    model = get_embedding_model()
+
+    r_centroids: dict[str, tuple[np.ndarray, int]] = {}
+    d_centroids: dict[str, tuple[np.ndarray, int]] = {}
+
+    for (party, area), texts in groups.items():
+        embs = model.encode(texts, show_progress_bar=False, batch_size=min(64, len(texts)))
+        centroid = embs.mean(axis=0)
+        norm = np.linalg.norm(centroid)
+        if norm > 0:
+            centroid = centroid / norm
+        n = len(texts)
+
+        if party == "R":
+            r_centroids[area] = (centroid, n)
+        else:
+            d_centroids[area] = (centroid, n)
+
+    return r_centroids, d_centroids
+
+
+def _bayesian_blend(
+    seed_emb: np.ndarray,
+    data_centroid: np.ndarray,
+    n_data: int,
+    prior_weight: float = _PRIOR_WEIGHT,
+) -> np.ndarray:
+    """Bayesian posterior centroid: blend seed prior with observed data.
+
+    Implements MAP estimation with a Normal prior.  The seed description
+    embedding acts as a prior worth `prior_weight` virtual observations.
+    As n_data grows, the posterior converges to the pure data centroid.
+
+    With prior_weight=3:
+      n_data=0  → 100% seed
+      n_data=3  → 50% seed, 50% data
+      n_data=12 → 20% seed, 80% data
+      n_data=30 → 9% seed, 91% data
+    """
+    blended = seed_emb * prior_weight + data_centroid * n_data
+    norm = np.linalg.norm(blended)
+    if norm > 0:
+        blended = blended / norm
+    return blended
+
+
+def _populate_party_embeddings(
+    areas: set[str],
+    seeds: dict[str, np.ndarray],
+    data: dict[str, tuple[np.ndarray, int]],
+    embeddings: dict[str, np.ndarray],
+) -> int:
+    """Populate `embeddings` in place from seeds, Bayesian-blended with
+    data centroids where available. Returns the count of areas blended
+    with data (vs. pure seed). Shared by the R and D passes in
+    _PlatformEmbeddingCache.initialize(), which are otherwise identical
+    except for which party's seeds/data/embeddings dict they operate on.
+    """
+    blended_count = 0
+    for area in areas:
+        if area not in seeds:
+            continue
+        if area in data:
+            data_emb, n = data[area]
+            embeddings[area] = _bayesian_blend(seeds[area], data_emb, n)
+            blended_count += 1
+        else:
+            embeddings[area] = seeds[area]
+    return blended_count
+
+
+def _normalized_mean(embeddings: dict[str, np.ndarray]) -> np.ndarray:
+    """Unit-normalized centroid of all embeddings in the dict."""
+    stacked = np.stack(list(embeddings.values()))
+    mean = stacked.mean(axis=0)
+    return mean / np.linalg.norm(mean)
+
+
+class _PlatformEmbeddingCache:
+    """In-memory cache of blended R/D party-platform centroid embeddings.
+
+    Built once per pipeline run and cleared between runs. The two
+    parties' embedding dicts and aggregate vectors are always populated
+    together in initialize() and cleared together in clear() — a class
+    makes that invariant explicit instead of implicit across two
+    separate `global` statements.
+    """
+
+    def __init__(self) -> None:
+        self.r_embeddings: dict[str, np.ndarray] = {}
+        self.d_embeddings: dict[str, np.ndarray] = {}
+        self.r_aggregate: np.ndarray | None = None
+        self.d_aggregate: np.ndarray | None = None
+
+    @property
+    def is_loaded(self) -> bool:
+        return bool(self.r_embeddings and self.d_embeddings)
+
+    def clear(self) -> None:
+        self.r_embeddings.clear()
+        self.d_embeddings.clear()
+        self.r_aggregate = None
+        self.d_aggregate = None
+
+    def initialize(self, db: Session | None = None) -> None:
+        """Build blended party platform centroids from seeds + bill data.
+
+        If a db session is provided, bill data from previous pipeline
+        runs is used to update the seed priors (Bayesian self-training).
+        Without a session, pure seed descriptions are used (cold-start).
+        """
+        if self.is_loaded:
+            return
+
+        r_seeds, d_seeds = _build_seed_embeddings()
+
+        r_data: dict[str, tuple[np.ndarray, int]] = {}
+        d_data: dict[str, tuple[np.ndarray, int]] = {}
+        if db is not None:
+            try:
+                r_data, d_data = _build_data_centroids(db)
+            except Exception:
+                logger.warning("Failed to build data-driven centroids, using seeds only", exc_info=True)
+
+        all_areas = set(R_PLATFORM_POSITIONS) | set(D_PLATFORM_POSITIONS)
+        r_blended_count = _populate_party_embeddings(all_areas, r_seeds, r_data, self.r_embeddings)
+        d_blended_count = _populate_party_embeddings(all_areas, d_seeds, d_data, self.d_embeddings)
+
+        self.r_aggregate = _normalized_mean(self.r_embeddings)
+        self.d_aggregate = _normalized_mean(self.d_embeddings)
+
+        logger.info(
+            "Platform embeddings: %d R (%d data-blended), %d D (%d data-blended)",
+            len(self.r_embeddings), r_blended_count,
+            len(self.d_embeddings), d_blended_count,
+        )
+
+    def ensure(self) -> None:
+        """Cold-start fallback: initialize with seeds only if not already loaded."""
+        if not self.is_loaded:
+            self.initialize(db=None)
+
+
+_platform_cache = _PlatformEmbeddingCache()
+
+
+def clear_platform_cache() -> None:
+    """Clear cached party platform embeddings between pipeline runs."""
+    _platform_cache.clear()
+
+
+def initialize_platform_embeddings(db: Session | None = None) -> None:
+    """Build blended party platform centroids from seeds + bill data.
+
+    Call once at pipeline start.  Subsequent calls to
+    classify_party_alignment use the cached embeddings.
+
+    If a db session is provided, bill data from previous pipeline runs
+    is used to update the seed priors (Bayesian self-training).  Without
+    a session, pure seed descriptions are used (cold-start).
+    """
+    _platform_cache.initialize(db)
+
+
+def _ensure_platform_embeddings() -> None:
+    """Compute and cache party platform embeddings (cold-start fallback).
+
+    Prefer calling initialize_platform_embeddings(db) at pipeline start
+    to get data-blended centroids.  This function is the fallback when
+    that hasn't happened (e.g., called from tests or ad-hoc scripts).
+    """
+    _platform_cache.ensure()
+
+
+def _stance_conditioned_query(bill_text: str, stance_direction: str) -> str:
+    """Construct a stance-conditioned query for embedding classification.
+
+    Sentence-transformer models struggle with antonymy and negation
+    (Ettinger 2020, "What BERT Is Not: Lessons from a New Suite of
+    Psycholinguistic Diagnostics for Language Models").  A bill that
+    "restricts ammunition" and a platform that "defends access to
+    ammunition" share most semantic content, making cosine similarity
+    unreliable for distinguishing pro from anti stances.
+
+    By prepending a directional prefix, we shift the query embedding
+    toward the region of semantic space that matches the bill's
+    legislative intent, allowing the nearest-centroid classifier to
+    assign the correct party alignment.
+    """
+    if stance_direction == "pro":
+        return f"legislation to support and strengthen: {bill_text[:480]}"
+    if stance_direction == "anti":
+        return f"legislation to restrict and limit: {bill_text[:480]}"
+    return bill_text[:500]
+
+
+def classify_party_alignment(
+    bill_text: str,
+    policy_area: str,
+    stance_direction: str,
+) -> str:
+    """Determine which party's platform a bill aligns with based on content.
+
+    Implements a nearest-centroid classifier (Rocchio 1971) in
+    sentence-embedding space with stance-conditioned query construction.
+    Each party's position on each policy area is a centroid; the bill is
+    assigned to the party whose centroid it is most similar to.
+
+    Stance conditioning (Reimers & Gurevych 2019, Sentence-BERT)
+    ---------------------------------------------------------------
+    The stance direction (pro/anti/neutral) is used to construct a
+    directionally explicit query embedding.  Sentence-transformer models
+    are weak at capturing negation/antonymy — "oppose gun control" and
+    "gun control" embed nearly identically (Ettinger 2020, "What BERT Is
+    Not").  Rather than relying on the embedding model to distinguish
+    pro-X from anti-X, we prepend a stance-appropriate prefix that makes
+    the bill's legislative direction explicit:
+
+      pro  → "legislation to support and strengthen: ..."
+      anti → "legislation to restrict and limit: ..."
+
+    This shifts the query embedding toward the correct party's centroid
+    without hardcoded party-stance mappings.  The platform descriptions
+    are written in directionally positive language (what each party WANTS),
+    so a "restrict" prefix naturally aligns with the party that wants
+    restrictions in that policy area.
+
+    Margin thresholds were empirically calibrated against bills with known
+    single-party sponsorship in the 117th-119th Congresses.
+
+    Returns "R", "D", or "bipartisan".
+    """
+    _ensure_platform_embeddings()
+
+    from app.pipeline.vector_store import get_embedding_model
+    model = get_embedding_model()
+
+    query_text = _stance_conditioned_query(bill_text, stance_direction)
+    query_emb = model.encode([query_text], show_progress_bar=False)[0]
+    query_emb = query_emb / np.linalg.norm(query_emb)
+
+    r_score = 0.0
+    d_score = 0.0
+
+    r_policy_emb = _platform_cache.r_embeddings.get(policy_area)
+    d_policy_emb = _platform_cache.d_embeddings.get(policy_area)
+
+    if r_policy_emb is not None and d_policy_emb is not None:
+        r_score = float(np.dot(query_emb, r_policy_emb))
+        d_score = float(np.dot(query_emb, d_policy_emb))
+    else:
+        r_score = float(np.dot(query_emb, _platform_cache.r_aggregate))
+        d_score = float(np.dot(query_emb, _platform_cache.d_aggregate))
+
+    margin = abs(r_score - d_score)
+
+    if margin < _BIPARTISAN_MARGIN_THRESHOLD:
+        return "bipartisan"
+
+    return "R" if r_score > d_score else "D"
+
+
+def classify_party_alignment_multi(
+    bill_text: str,
+    policy_areas: list[dict],
+    stance_direction: str,
+) -> dict:
+    """Determine per-area party alignment and weighted aggregate for multi-area bills.
+
+    Real legislation spans multiple policy domains (Adler & Wilkerson 2012).
+    A bill touching HEALTHCARE and TAXES may align with D on healthcare
+    (expanding coverage) but R on taxes (certain deductions). A senator's
+    vote on such a bill represents a nuanced position, not a binary party
+    choice.
+
+    Per-area alignment uses the same nearest-centroid classifier as
+    classify_party_alignment, with stance-conditioned query construction
+    and directional platform descriptions.  The aggregate is a
+    confidence-weighted vote: each area's alignment vote is weighted by its
+    embedding confidence. That is a design choice, not a result — the
+    forecast-combination literature finds equal weights hard to beat
+    (Clemen 1989, "Combining Forecasts: A Review and Annotated
+    Bibliography," Intl J Forecasting 5(4)), and these weights have not
+    been measured against equal ones.
+
+    Returns:
+        {
+            "overall": "R" | "D" | "bipartisan",
+            "weight": float 0-1 (how strongly the bill leans toward the overall party),
+            "areas": [{"area": str, "party": str, "confidence": float}, ...]
+        }
+    """
+    _ensure_platform_embeddings()
+
+    if not policy_areas or all(a["area"] == "PROCEDURAL" for a in policy_areas):
+        return {
+            "overall": "bipartisan",
+            "weight": 0.0,
+            "areas": [],
+        }
+
+    from app.pipeline.vector_store import get_embedding_model
+    model = get_embedding_model()
+
+    query_text = _stance_conditioned_query(bill_text, stance_direction)
+    query_emb = model.encode([query_text], show_progress_bar=False)[0]
+    query_emb = query_emb / np.linalg.norm(query_emb)
+
+    area_results: list[dict] = []
+    r_weight = 0.0
+    d_weight = 0.0
+
+    for pa in policy_areas:
+        area = pa["area"]
+        area_conf = pa.get("confidence", 0.5)
+
+        if area == "PROCEDURAL":
+            continue
+
+        r_policy_emb = _platform_cache.r_embeddings.get(area)
+        d_policy_emb = _platform_cache.d_embeddings.get(area)
+
+        if r_policy_emb is not None and d_policy_emb is not None:
+            r_score = float(np.dot(query_emb, r_policy_emb))
+            d_score = float(np.dot(query_emb, d_policy_emb))
+        else:
+            r_score = float(np.dot(query_emb, _platform_cache.r_aggregate))
+            d_score = float(np.dot(query_emb, _platform_cache.d_aggregate))
+
+        margin = abs(r_score - d_score)
+
+        if margin < _BIPARTISAN_MARGIN_THRESHOLD:
+            party = "bipartisan"
+        else:
+            party = "R" if r_score > d_score else "D"
+
+        area_results.append({
+            "area": area,
+            "party": party,
+            "confidence": round(area_conf, 4),
+        })
+
+        if party == "R":
+            r_weight += area_conf
+        elif party == "D":
+            d_weight += area_conf
+
+    if not area_results:
+        return {"overall": "bipartisan", "weight": 0.0, "areas": []}
+
+    total_partisan_weight = r_weight + d_weight
+    if total_partisan_weight < 0.01:
+        return {"overall": "bipartisan", "weight": 0.0, "areas": area_results}
+
+    if r_weight > d_weight:
+        overall = "R"
+        weight = r_weight / total_partisan_weight
+    elif d_weight > r_weight:
+        overall = "D"
+        weight = d_weight / total_partisan_weight
+    else:
+        overall = "bipartisan"
+        weight = 0.5
+
+    return {
+        "overall": overall,
+        "weight": round(weight, 4),
+        "areas": area_results,
+    }
+
+
+def refine_with_vote_data(
+    content_alignment: str,
+    vote_alignment: str | None,
+) -> str:
+    """Combine content-based and vote-based party alignment.
+
+    The actual roll-call split wins whenever it exists. partyLeaning's
+    downstream consumer is the voted-with-party computation, and "did
+    this member break with their party" is defined by how the parties
+    actually voted, not by the bill's inherent ideology. In particular,
+    a bill whose content reads partisan but which passed with both party
+    majorities ("bipartisan" split) must be excluded from party-loyalty
+    counting — the 2026-06 audit found the previous rule (content wins
+    over a bipartisan split) marked members of one party as voting
+    "against party" on bills nearly everyone supported, which pinned
+    House Independent Voting scores at ≈87-89 for all 431 reps.
+
+    Content analysis is used only when no roll-call member data exists.
+
+    Args:
+        content_alignment: "R", "D", or "bipartisan" from content analysis
+        vote_alignment: "R", "D", "bipartisan", or None from compute_party_split
+
+    Returns:
+        Final party alignment: "R", "D", or "bipartisan"
+    """
+    if vote_alignment is None:
+        return content_alignment
+
+    return vote_alignment
+
+
+def analyze_partisan_depth(
+    promises: list[dict],
+    senator_party: str,
+    voting_record: dict | None = None,
+    ideology_score: float | None = None,
+) -> dict:
+    """Analyze a senator's partisan depth from voting record + platform positions.
+
+    Primary signal: the senator's actual votes on bills with known party
+    alignment (party_leaning).  Each vote on a D-leaning or R-leaning bill
+    is a direct behavioral observation of partisan positioning — far more
+    reliable than platform text analysis.
+
+    Secondary signal: campaign promises, analyzed via embedding similarity
+    to party platform positions (manifesto analysis approach, Budge et al.
+    2001).  These enrich the profile but cannot override the vote signal.
+
+    Tertiary signal: SVD-derived ideology score from cosponsorship patterns
+    (Tauberer 2012, adapted from Poole & Rosenthal 1985).  This serves as
+    a prior in a linear blend, weight 1 - min(votes/15, 1) — with sparse
+    vote data it has more influence, with 15+ votes none. (A fixed-rate
+    blend, not a posterior: no variance is estimated.)
+
+    Args:
+        promises: List of dicts with at least 'promiseText' and 'category'.
+        senator_party: "R", "D", or "I".
+        voting_record: Dict with 'keyVotes' and/or 'recentVotes' lists.
+        ideology_score: 0.0 (far left) to 1.0 (far right) from SVD on
+            cosponsorship matrix, or None if unavailable.
+
+    Returns:
+        Dict with:
+          overallLean: float, negative = D, positive = R (final value set
+            by finalize_partisan_depth, which needs the whole chamber)
+          overallParty: "R" | "D" | "centrist"
+          depth: "deep" | "moderate" | "centrist" | "cross-cutting" —
+            relative to the member's own party, set by finalize_partisan_depth
+          voteLean, partisanVoteCount, ideologyLean, evalParty, crossRatio:
+            the inputs finalize_partisan_depth works from
+          crossPartyCount: int (positions aligning with opposite party)
+          totalPositions: int
+          policyBreakdown: list of per-area alignment dicts
+    """
+    area_alignments = _alignments_from_votes(voting_record or {})
+
+    # Promises are the SECONDARY signal (docstring: they "enrich the
+    # profile but cannot override the vote signal") — implemented
+    # literally (2026-07 fix): a promise-derived area alignment is used
+    # only for areas with NO vote-derived alignment, extending coverage
+    # without ever outvoting behavioral observations. Previously
+    # per-promise entries (one per promise, raw cosine-margin leans)
+    # were appended alongside per-area vote entries and averaged
+    # together, so many near-zero promise margins numerically dragged a
+    # reliably partisan voting record toward "centrist".
+    vote_areas = {a["area"] for a in area_alignments}
+    promise_alignments = [
+        a for a in _alignments_from_promises(promises or [])
+        if a["area"] not in vote_areas
+    ]
+    if promise_alignments:
+        area_alignments.extend(promise_alignments)
+
+    if not area_alignments:
+        return {
+            "overallLean": 0.0,
+            "overallParty": "centrist",
+            "depth": "centrist",
+            "crossPartyCount": 0,
+            "totalPositions": 0,
+            "policyBreakdown": [],
+        }
+
+    leans = [a["lean"] for a in area_alignments]
+    vote_lean = sum(leans) / len(leans)
+
+    vr = voting_record or {}
+    all_v = (vr.get("keyVotes") or []) + (vr.get("recentVotes") or [])
+    partisan_vote_count = sum(
+        1 for v in all_v
+        if isinstance(v, dict) and v.get("vote") in ("Yea", "Nay")
+        and not v.get("reconsiderSwitch")
+    )
+    ideology_lean = (ideology_score - 0.5) * 2.0 if ideology_score is not None else None
+
+    eval_party = senator_party
+    if senator_party == "I":
+        d_count = sum(1 for a in area_alignments if a["alignment"] == "D")
+        r_count = sum(1 for a in area_alignments if a["alignment"] == "R")
+        if d_count > r_count:
+            eval_party = "D"
+        elif r_count > d_count:
+            eval_party = "R"
+
+    cross_party = 0
+    cross_ratio = 0.0
+    if eval_party in ("R", "D"):
+        opposite = "D" if eval_party == "R" else "R"
+        cross_party = sum(1 for a in area_alignments if a["alignment"] == opposite)
+        # Strength-weighted: a weak opposite-party signal (strength 0.19)
+        # counts less than a strong one (0.8+), so a reliably partisan
+        # member isn't labeled cross-cutting over several barely-opposite
+        # positions.
+        total_weight = sum(a["strength"] for a in area_alignments)
+        cross_weight = sum(a["strength"] for a in area_alignments if a["alignment"] == opposite)
+        cross_ratio = cross_weight / total_weight if total_weight > 0 else 0.0
+
+    breakdown = sorted(area_alignments, key=lambda a: abs(a["lean"]), reverse=True)
+    profile = {
+        "voteLean": round(vote_lean, 4),
+        "partisanVoteCount": partisan_vote_count,
+        "ideologyLean": round(ideology_lean, 4) if ideology_lean is not None else None,
+        "evalParty": eval_party,
+        "crossRatio": round(cross_ratio, 4),
+        "crossPartyCount": cross_party,
+        "totalPositions": len(area_alignments),
+        "policyBreakdown": [
+            {"area": a["area"], "alignment": a["alignment"], "strength": a["strength"]}
+            for a in breakdown
+        ],
+    }
+    # overallLean / depth need the chamber: finalize_partisan_depth sets
+    # them over every member. On its own (a single profile) the lean is
+    # the vote signal and the depth is provisional.
+    return _label(profile, profile["voteLean"], None)
+
+
+# A member needs this many Yea/Nay votes before their own record carries
+# full weight over the cosponsorship-ideology prior (count confidence,
+# min(n / threshold, 1)), and the prior's mapping onto the vote-lean scale
+# is fitted only from members at or above it.
+_FULL_CONFIDENCE_VOTES = 15
+# More than this strength-weighted share of positions with the other party
+# is "cross-cutting" whatever the overall lean — a definition, not a
+# calibration.
+_CROSS_CUTTING_RATIO = 0.3
+# Fewest members of a party before its terciles are measured.
+_MIN_PARTY_MEMBERS_FOR_TERCILES = 6
+
+
+def _label(profile: dict, lean: float, party_cuts: tuple[float, float] | None) -> dict:
+    """Fill overallLean / overallParty / depth. `party_cuts` is the member's
+    own party's (33rd, 67th) percentile of lean toward that party."""
+    profile["overallLean"] = round(lean, 4)
+    profile["overallParty"] = "centrist" if abs(lean) < 0.02 else ("R" if lean > 0 else "D")
+    party = profile.get("evalParty")
+    if profile.get("crossRatio", 0.0) > _CROSS_CUTTING_RATIO:
+        depth = "cross-cutting"
+    elif party in ("D", "R") and party_cuts is not None:
+        toward_party = lean if party == "R" else -lean
+        low, high = party_cuts
+        depth = "deep" if toward_party >= high else ("moderate" if toward_party >= low else "centrist")
+    else:
+        depth = profile.get("depth") or "moderate"
+    profile["depth"] = depth
+    return profile
+
+
+def finalize_partisan_depth(profiles: list[dict]) -> list[dict]:
+    """Set overallLean and depth for every member of a chamber, in place.
+
+    Two things need the whole chamber, so they happen here rather than in
+    analyze_partisan_depth:
+
+    1. The cosponsorship-ideology prior is put on the vote-lean scale before
+       blending. The SVD ideology spans [-1, 1] across the cohort, while
+       vote leans are compressed (observed 2026-07: -0.30 to +0.43), so a
+       member with few votes used to get a prior-dominated lean of up to +/-1
+       and land at the extreme. The mapping is a least-squares line of
+       vote lean on ideology over members with full vote data, measured from
+       this chamber every run.
+    2. Depth is relative to the member's own party: deep = the most partisan
+       third of their party by lean toward it, moderate = the middle third,
+       centrist = the least partisan third (cross-cutting stays a
+       definition, see _CROSS_CUTTING_RATIO). The previous fixed cut-offs
+       (|lean| > 0.20 deep, > 0.10 moderate) were tuned so named senators
+       landed in chosen bands, and one threshold for both parties is
+       asymmetric when the parties' lean ranges differ (-0.30..-0.05 vs
+       +0.10..+0.43) — the same reason the ideology labels are party-relative
+       (sponsorship_analysis.party_ideology_bounds).
+    """
+    import numpy as np
+
+    full = [p for p in profiles
+            if p.get("ideologyLean") is not None and "voteLean" in p
+            and p.get("partisanVoteCount", 0) >= _FULL_CONFIDENCE_VOTES]
+    fit = None
+    if len(full) >= 10:
+        x = np.array([p["ideologyLean"] for p in full])
+        y = np.array([p["voteLean"] for p in full])
+        if np.ptp(x) > 0:
+            b, a = np.polyfit(x, y, 1)
+            fit = (float(a), float(b))
+
+    leans: list[float] = []
+    for p in profiles:
+        if "voteLean" not in p:  # stored before this change: keep its lean
+            leans.append(float(p.get("overallLean", 0.0)))
+            continue
+        lean = p["voteLean"]
+        if fit is not None and p.get("ideologyLean") is not None:
+            conf = min(p.get("partisanVoteCount", 0) / _FULL_CONFIDENCE_VOTES, 1.0)
+            prior = fit[0] + fit[1] * p["ideologyLean"]
+            lean = conf * lean + (1 - conf) * prior
+        leans.append(lean)
+
+    cuts: dict[str, tuple[float, float]] = {}
+    for party in ("D", "R"):
+        toward = [(ln if party == "R" else -ln) for p, ln in zip(profiles, leans)
+                  if p.get("evalParty") == party and p.get("totalPositions", 0) > 0]
+        if len(toward) >= _MIN_PARTY_MEMBERS_FOR_TERCILES:
+            cuts[party] = (float(np.percentile(toward, 100 / 3)), float(np.percentile(toward, 200 / 3)))
+
+    for p, lean in zip(profiles, leans):
+        _label(p, lean, cuts.get(p.get("evalParty")))
+    return profiles
+
+
+def _alignments_from_votes(voting_record: dict) -> list[dict]:
+    """Derive per-policy-area partisan alignments from actual votes.
+
+    Uses multi-area bill data when available: each bill may span multiple
+    policy areas (e.g. a bill touching HEALTHCARE and TAXES). A senator's
+    Yea/Nay on the bill registers the bill's own lean (how the parties
+    voted on it) in each area separately, weighted by the area's
+    confidence.  This follows Adler & Wilkerson (2012) in treating
+    legislation as multi-dimensional, and Poole & Rosenthal (1985) in
+    reading lean from roll-call behaviour.
+
+    Fallback: when `policyAreas` is absent, uses the single `policyArea`
+    with the bill's overall `partyLeaning`.
+
+    Votes are weighted: voting FOR a party-leaning bill = +weight for
+    that party, voting AGAINST = +weight for the opposing party.
+    """
+    from collections import defaultdict
+
+    all_votes = (voting_record.get("keyVotes") or []) + (
+        voting_record.get("recentVotes") or []
+    )
+    if not all_votes:
+        return []
+
+    area_counts: dict[str, dict[str, float]] = defaultdict(
+        lambda: {"d": 0.0, "r": 0.0}
+    )
+
+    for v in all_votes:
+        if not isinstance(v, dict):
+            continue
+        vote = v.get("vote", "")
+        if vote not in ("Yea", "Nay"):
+            continue
+        # The majority leader's procedural switch to the prevailing side
+        # against their own party — a Nay on a failing motion it backed, or a
+        # Yea on one carrying over its opposition (normalize_votes.
+        # MAJORITY_LEADER_TITLES) — records no position on the bill, so it
+        # is no evidence of lean either.
+        if v.get("reconsiderSwitch"):
+            continue
+
+        multi_areas = v.get("policyAreas") or []
+        if multi_areas and isinstance(multi_areas, list):
+            # The bill's lean is how the parties voted on it (partyLeaning,
+            # refine_with_vote_data; its content only where the roll call
+            # gave no split), credited to each policy area it touches by
+            # the area's confidence. Each area's content label decided it
+            # before, so a Yea on a bill both parties passed counted as a
+            # Democratic or Republican vote in an area (AGENTS.md §4).
+            bill_party = v.get("partyLeaning") or v.get("party_leaning", "")
+            if bill_party not in ("D", "R"):
+                continue
+            for pa in multi_areas:
+                if not isinstance(pa, dict):
+                    continue
+                area = pa.get("area", "")
+                if not area or area == "PROCEDURAL":
+                    continue
+                area_party = bill_party
+                conf = pa.get("confidence", 0.5)
+
+                if vote == "Yea":
+                    area_counts[area][area_party.lower()] += conf
+                else:
+                    opposite = "r" if area_party == "D" else "d"
+                    area_counts[area][opposite] += conf
+        else:
+            party_leaning = v.get("partyLeaning") or v.get("party_leaning", "")
+            if party_leaning not in ("D", "R"):
+                continue
+            area = v.get("policyArea") or v.get("policy_area", "")
+            if not area or area == "PROCEDURAL":
+                continue
+
+            if vote == "Yea":
+                area_counts[area][party_leaning.lower()] += 1.0
+            else:
+                opposite = "r" if party_leaning == "D" else "d"
+                area_counts[area][opposite] += 1.0
+
+    alignments: list[dict] = []
+    for area, counts in area_counts.items():
+        d_ct = counts["d"]
+        r_ct = counts["r"]
+        total = d_ct + r_ct
+        if total < 2:
+            continue
+
+        lean = (r_ct - d_ct) / total
+        if abs(lean) < 0.10:
+            alignment = "bipartisan"
+            strength = 0.0
+        elif lean > 0:
+            alignment = "R"
+            strength = min(abs(lean), 1.0)
+        else:
+            alignment = "D"
+            strength = min(abs(lean), 1.0)
+
+        alignments.append({
+            "area": area,
+            "alignment": alignment,
+            "strength": round(strength, 2),
+            "lean": round(lean, 4),
+        })
+
+    return alignments
+
+
+def _alignments_from_promises(promises: list[dict]) -> list[dict]:
+    """Derive per-policy-area partisan alignments from campaign promise text
+    via embedding similarity.
+
+    Returns ONE aggregated entry per policy area (2026-07 fix), on the same
+    [-1, +1] lean scale as _alignments_from_votes. Previously this returned
+    one entry PER PROMISE with `lean` set to the raw embedding cosine margin
+    (empirically |margin| <~ 0.15) — two incompatibilities that together
+    let a senator with 25 promises and 4 vote-areas have a reliably
+    partisan voting record (per-area leans around +-0.8) numerically
+    dragged toward 0 by 25 near-zero raw margins in one unweighted average,
+    reading "centrist". Each promise's margin is rescaled through the same
+    0.15 saturation the strength field already used (so scaled lean =
+    signed strength), then averaged within its area; the alignment/strength
+    labels use the same |lean| < 0.10 bipartisan convention as the vote
+    side so the two sources are directly comparable."""
+    if not promises:
+        return []
+
+    _ensure_platform_embeddings()
+
+    from app.pipeline.vector_store import get_embedding_model
+    from app.pipeline.analyze.bill_analyzer import classify_policy_area
+    model = get_embedding_model()
+
+    area_leans: dict[str, list[float]] = {}
+
+    for p in promises:
+        text = p.get("promiseText", "")
+        if not text or len(text.strip()) < 10:
+            continue
+
+        category = (p.get("category") or "other").upper()
+        policy_area, _ = classify_policy_area(text)
+        if policy_area == "PROCEDURAL":
+            policy_area = _map_category_to_policy(category)
+
+        query_emb = model.encode([text[:300]], show_progress_bar=False)[0]
+        norm = np.linalg.norm(query_emb)
+        if norm > 0:
+            query_emb = query_emb / norm
+
+        r_emb = _platform_cache.r_embeddings.get(policy_area)
+        d_emb = _platform_cache.d_embeddings.get(policy_area)
+
+        if r_emb is not None and d_emb is not None:
+            r_score = float(np.dot(query_emb, r_emb))
+            d_score = float(np.dot(query_emb, d_emb))
+        else:
+            r_score = float(np.dot(query_emb, _platform_cache.r_aggregate))
+            d_score = float(np.dot(query_emb, _platform_cache.d_aggregate))
+
+        margin = r_score - d_score
+        # Rescale the raw cosine margin onto the vote-lean [-1, +1] scale
+        # via the same 0.15 saturation the old per-promise strength used.
+        scaled_lean = max(-1.0, min(margin / 0.15, 1.0))
+        area_leans.setdefault(policy_area, []).append(scaled_lean)
+
+    alignments: list[dict] = []
+    for area, leans_list in area_leans.items():
+        lean = sum(leans_list) / len(leans_list)
+        # Same alignment/strength conventions as _alignments_from_votes.
+        if abs(lean) < 0.10:
+            alignment = "bipartisan"
+            strength = 0.0
+        elif lean > 0:
+            alignment = "R"
+            strength = min(abs(lean), 1.0)
+        else:
+            alignment = "D"
+            strength = min(abs(lean), 1.0)
+        alignments.append({
+            "area": area,
+            "alignment": alignment,
+            "strength": round(strength, 2),
+            "lean": round(lean, 4),
+        })
+
+    return alignments
+
+
+_CATEGORY_POLICY_MAP: dict[str, str] = {
+    "HEALTHCARE": "HEALTHCARE",
+    "ECONOMY": "TAXES",
+    "DEFENSE": "DEFENSE",
+    "ENVIRONMENT": "ENVIRONMENT",
+    "IMMIGRATION": "IMMIGRATION",
+    "EDUCATION": "EDUCATION",
+    "LABOR": "LABOR",
+    "JUSTICE": "JUSTICE",
+    "GUNS": "GUNS",
+    "TECH": "TECH",
+    "FINANCE": "FINANCIAL",
+    "ENERGY": "ENERGY",
+    "TRADE": "TRADE",
+    "WELFARE": "WELFARE",
+    "INFRASTRUCTURE": "WELFARE",
+    "CIVIL RIGHTS": "JUSTICE",
+    "ABORTION": "ABORTION",
+    "FOREIGN POLICY": "DEFENSE",
+}
+
+
+def _map_category_to_policy(category: str) -> str:
+    """Map a platform category to the nearest policy taxonomy area."""
+    return _CATEGORY_POLICY_MAP.get(category, "WELFARE")

@@ -50,8 +50,17 @@ import re
 import subprocess
 import sys
 import tempfile
+import warnings
 from functools import lru_cache
 from pathlib import Path
+
+# A mined repo's OWN source frequently contains sloppy string literals (e.g. a
+# regex written "\." instead of r"\."). Parsing those with ast on Python >=3.12
+# emits a SyntaxWarning PER occurrence -- on a big repo that is thousands of lines
+# of noise that bury the miner's real output and look (wrongly) like failures.
+# These warnings are about the TARGET repo's code, not ours, and never affect
+# mining, so silence them here at the entry point.
+warnings.filterwarnings("ignore", category=SyntaxWarning)
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "analysis"))
@@ -90,20 +99,72 @@ SKIP_DIR_COMPONENTS = {
 }
 
 
+# Throwaway AI "patch scripts" (seen in real mined repos, e.g. pagos's
+# .cursor_tmp_patch_*.py / _fix_*.py): one-off edit scripts an agent wrote to
+# modify the repo, not real library code. They pass the AI-provenance gate
+# (the agent did write them) but are low-value, noisy functions that dilute the
+# corpus. Exclude by filename so they never become candidates.
+_JUNK_FILE_PREFIXES = ("_fix_", "_add_", "_replace_", "_insert_", "_reorder_",
+                       "_p0", "tools_patch", "tools_batch", ".cursor_tmp", "_ced")
+_JUNK_FILE_SUBSTR = ("_tmp_patch", "tmp_patch")
+
+
+def _is_junk_script(path: Path) -> bool:
+    n = path.name
+    return (n.startswith(_JUNK_FILE_PREFIXES)
+            or any(s in n for s in _JUNK_FILE_SUBSTR))
+
+
 def _is_skippable(path: Path, repo_root: Path) -> bool:
     try:
         rel_parts = path.relative_to(repo_root).parts
     except ValueError:
         rel_parts = path.parts
-    return any(part in SKIP_DIR_COMPONENTS for part in rel_parts)
+    if any(part in SKIP_DIR_COMPONENTS for part in rel_parts):
+        return True
+    return _is_junk_script(path)
 
 MIN_BODY_LINES = 4     # skip trivial one-liners -- nothing for a model to get wrong
 MAX_BODY_LINES = 60    # skip huge functions -- unrealistic prompt, unclear ground truth
 
 
+# Sink patterns for the three newer classes, mirroring the patched sinks in
+# analysis/iast/sinks.py (yaml.load / pickle.loads; lxml.etree parsers; urlopen
+# / requests). Matched as QUALIFIED names via _is_call_named so common safe
+# look-alikes (json.load/loads, dict.get, str.parse) don't create off-topic
+# noise. A few names that are specific enough on their own (urlopen, fromstring,
+# XML) are also matched bare. These mirror sinks.py rather than taint_scan.py,
+# whose static scanner still covers only the original three classes.
+DESERIALIZE_SINK_NAMES = {"yaml.load", "pickle.loads", "pickle.load",
+                          "cPickle.loads", "cPickle.load", "_pickle.loads", "_pickle.load",
+                          # explicitly-unsafe yaml variants (yaml.load alone was
+                          # too narrow -- yaml.load with a SafeLoader is safe,
+                          # while these are unsafe by definition regardless of args)
+                          "yaml.unsafe_load", "yaml.full_load", "yaml.load_all",
+                          "yaml.unsafe_load_all", "yaml.full_load_all",
+                          # other common deserialization sinks called directly
+                          "dill.load", "dill.loads", "jsonpickle.decode",
+                          "marshal.load", "marshal.loads"}
+# Bare attribute forms, so `from pickle import loads; loads(x)` / `yload(x)`
+# (aliased imports) and `self.loads(...)`-style calls are still caught, mirroring
+# how the SQL/path lists already match on the method name alone.
+DESERIALIZE_SINK_ATTRS = {"unsafe_load", "full_load", "load_all"}
+XXE_SINK_ATTRS = {"fromstring", "XML"}
+XXE_SINK_NAMES = {"etree.parse", "etree.fromstring", "etree.XML",
+                  "lxml.etree.fromstring", "lxml.etree.XML", "lxml.etree.parse"}
+SSRF_SINK_ATTRS = {"urlopen"}
+SSRF_SINK_NAMES = {"urlopen", "urllib.request.urlopen", "request.urlopen",
+                   "requests.get", "requests.post", "requests.put", "requests.head",
+                   "requests.delete", "requests.patch", "requests.request",
+                   # async / modern HTTP clients with the same SSRF shape
+                   "httpx.get", "httpx.post", "httpx.request", "httpx.stream",
+                   "aiohttp.request", "urllib3.request"}
+
+
 def classify_sink(func_node: ast.FunctionDef) -> list[str]:
-    """Return which of CWE-89/78/22 this function's body plausibly touches,
-    using the identical sink-name matching taint_scan.py uses at scan time."""
+    """Return which CWE class this function's body plausibly touches (CWE-89/78/
+    22 via taint_scan.py's taxonomy, plus CWE-502/611/918 via the sink patterns
+    above), using the same name-based matching the rest of the project uses."""
     tags: set[str] = set()
     for node in ast.walk(func_node):
         if not isinstance(node, ast.Call):
@@ -116,6 +177,15 @@ def classify_sink(func_node: ast.FunctionDef) -> list[str]:
             tags.add("CWE-22")
         if isinstance(node.func, ast.Attribute) and node.func.attr in PATH_SINK_METHOD_NAMES:
             tags.add("CWE-22")
+        if _is_call_named(node, DESERIALIZE_SINK_NAMES) or \
+           (isinstance(node.func, ast.Attribute) and node.func.attr in DESERIALIZE_SINK_ATTRS):
+            tags.add("CWE-502")
+        if _is_call_named(node, XXE_SINK_NAMES) or \
+           (isinstance(node.func, ast.Attribute) and node.func.attr in XXE_SINK_ATTRS):
+            tags.add("CWE-611")
+        if _is_call_named(node, SSRF_SINK_NAMES) or \
+           (isinstance(node.func, ast.Attribute) and node.func.attr in SSRF_SINK_ATTRS):
+            tags.add("CWE-918")
     return sorted(tags)
 
 
@@ -417,31 +487,124 @@ def main() -> None:
     ap.add_argument("--repo-url", type=str, help="Git URL to shallow-clone into a temp dir")
     ap.add_argument("--repo-name", type=str, help="Label for output folder (default: inferred)")
     ap.add_argument("--limit", type=int, default=25, help="Max functions to mine")
+    ap.add_argument("--max-files", type=int, default=15000,
+                    help="Skip a repo with more than this many .py files (default 15000): only "
+                         "skips truly pathological monorepos. Large real projects (e.g. litellm, "
+                         "~3k files) now mine. Set 0 to disable the guard entirely.")
+    ap.add_argument("--require-ai-provenance", action="store_true",
+                    help="REAL-AI-REPO arm: mine ONLY functions whose lines git-blame to a "
+                         "commit with strong AI-authorship evidence (see analysis/provenance.py). "
+                         "Each kept candidate is stamped with its auditable evidence. Forces a "
+                         "FULL clone (history needed) and refuses a shallow one.")
+    ap.add_argument("--keep-clone", action="store_true",
+                    help="keep the temp clone made for --repo-url (default: delete it after mining, "
+                         "since the importable source is already vendored into _repo_src -- this stops "
+                         "a 32-repo batch from filling /tmp and silently truncating the run)")
+    ap.add_argument("--stamp-provenance", action="store_true",
+                    help="Attribute AI authorship per function and record it on every candidate, "
+                         "but do NOT exclude non-AI functions (annotate-only).")
     args = ap.parse_args()
 
     if not args.repo_dir and not args.repo_url:
         ap.error("provide --repo-dir or --repo-url")
 
+    want_provenance = args.require_ai_provenance or args.stamp_provenance
+
     tmp_clone = None
     if args.repo_url:
         tmp_clone = Path(tempfile.mkdtemp(prefix="mine_prompts_"))
-        print(f"Cloning {args.repo_url} -> {tmp_clone} ...", file=sys.stderr)
-        subprocess.run(
-            ["git", "clone", "--depth", "1", args.repo_url, str(tmp_clone)],
-            check=True,
-        )
+        # Provenance needs real git history -> full clone. Otherwise keep the
+        # cheap --depth 1 clone (mining itself never looks at history).
+        # RESILIENT CLONE: big repos over a flaky link throw transient
+        # "RPC failed; curl 92 HTTP/2 stream ... CANCEL / early EOF". Force
+        # HTTP/1.1 (the standard fix for that curl-92 error), bump postBuffer,
+        # and retry a few times. On final failure, skip this repo cleanly
+        # (clear message, no scary traceback) so a 32-repo batch loses one repo
+        # at worst instead of aborting.
+        base = ["git", "-c", "http.version=HTTP/1.1", "-c", "http.postBuffer=524288000",
+                "clone"] + ([] if want_provenance else ["--depth", "1"])
+        clone_cmd = base + [args.repo_url, str(tmp_clone)]
+        print(f"Cloning {args.repo_url} -> {tmp_clone} "
+              f"({'full history' if want_provenance else 'shallow'}) ...", file=sys.stderr)
+        import shutil as _sh0
+        ok = False
+        for attempt in range(1, 4):
+            if tmp_clone.exists():
+                _sh0.rmtree(tmp_clone, ignore_errors=True)
+            tmp_clone.mkdir(parents=True, exist_ok=True)
+            r = subprocess.run(clone_cmd, capture_output=True, text=True)
+            if r.returncode == 0:
+                ok = True
+                break
+            print(f"  clone attempt {attempt}/3 failed (rc={r.returncode}): "
+                  f"{(r.stderr or '').strip().splitlines()[-1] if r.stderr else ''}", file=sys.stderr)
+        if not ok:
+            _sh0.rmtree(tmp_clone, ignore_errors=True)
+            print(f"SKIP {args.repo_url}: clone failed after 3 attempts (transient network). "
+                  f"Re-run later to include it.", file=sys.stderr)
+            raise SystemExit(0)   # clean exit -> the batch driver moves on, no traceback
         repo_dir = tmp_clone
     else:
         repo_dir = args.repo_dir
 
+    _prov = None
+    if want_provenance:
+        try:
+            import provenance as _prov  # sibling module in analysis/
+        except ImportError:
+            _here = str(Path(__file__).resolve().parent)
+            if _here not in sys.path:
+                sys.path.insert(0, _here)
+            import provenance as _prov
+        if not (repo_dir / ".git").exists():
+            raise SystemExit(f"--require/stamp-ai-provenance needs a git repo, but {repo_dir} "
+                             f"has no .git history. Clone with --repo-url (full) or point "
+                             f"--repo-dir at a full clone.")
+        if _prov.is_shallow(repo_dir):
+            raise SystemExit(f"{repo_dir} is a SHALLOW clone -- git history is truncated, so AI "
+                             f"authorship cannot be attributed. Run: git -C {repo_dir} fetch "
+                             f"--unshallow  (or re-clone without --depth).")
+
     repo_name = args.repo_name or repo_dir.name
 
     py_files = [p for p in repo_dir.rglob("*.py") if not _is_skippable(p, repo_dir)]
+    if args.max_files and len(py_files) > args.max_files:
+        print(f"SKIP {repo_name}: {len(py_files)} .py files exceeds --max-files "
+              f"{args.max_files} -- a repo this large is a mature library, not a representative "
+              f"AI-built project, and mining it is slow. Raise --max-files to include it anyway.",
+              file=sys.stderr)
+        raise SystemExit(0)   # clean exit -> batch driver (discover_repos, check=False) moves on
     print(f"Scanning {len(py_files)} .py file(s) in {repo_dir} ...", file=sys.stderr)
 
     all_records: list[dict] = []
     for py_file in sorted(py_files):
         all_records.extend(mine_file(py_file, repo_name, repo_dir))
+
+    # AI-provenance attribution (REAL-AI-REPO arm). Attribute every candidate
+    # BEFORE the CWE-spread selection, so a gated run draws its spread from the
+    # AI-authored pool rather than selecting first and dropping most. Each
+    # record gets an `ai_provenance` block (auditable evidence); with
+    # --require-ai-provenance, non-AI-attributed functions are excluded here.
+    if want_provenance:
+        attributed = 0
+        for r in all_records:
+            fp = _prov.function_provenance(repo_dir, r["file"], r.get("line", 0))
+            r["ai_provenance"] = {
+                "ai_attributed": fp["ai_attributed"],
+                "ai_tools": fp.get("ai_tools", {}),
+                "ai_commit": fp.get("ai_commit"),
+                "evidence": fp.get("evidence"),
+                "ai_line_fraction": fp.get("ai_line_fraction", 0.0),
+                "span": fp.get("span"),
+            }
+            attributed += bool(fp["ai_attributed"])
+        print(f"AI-provenance: {attributed}/{len(all_records)} candidate functions are "
+              f"AI-attributed (strong evidence).", file=sys.stderr)
+        if args.require_ai_provenance:
+            kept = [r for r in all_records if r["ai_provenance"]["ai_attributed"]]
+            print(f"--require-ai-provenance: keeping {len(kept)} AI-authored, dropping "
+                  f"{len(all_records) - len(kept)} human/unattributed.", file=sys.stderr)
+            all_records = kept
 
     # Prefer a spread across CWEs and files over just the first N matches.
     by_cwe: dict[str, list[dict]] = {}
@@ -486,11 +649,88 @@ def main() -> None:
         summary_lines.append(f"- **{r['function']}** ({', '.join(r['candidate_cwes'])}) -- `{r['file']}:{r['line']}`")
     (out_subdir / "SUMMARY.md").write_text("\n".join(summary_lines))
 
+    # Vendor the repo's importable source beside the candidates so the harness
+    # can import the REAL package (resolving its relative imports) at detect/
+    # recycle time WITHOUT a working pip/wheel build -- the dominant construction
+    # failure for cloned-but-not-pip-installable repos (poetry / PEP-517 backends
+    # whose wheel build fails). The source travels with the corpus, so the
+    # benchmark stays reproducible; run_detection/run_recycle add this dir to
+    # sys.path. Only top-level importable packages/modules are copied (not tests,
+    # docs, .git) -- construction recipes were already extracted into records.
+    import shutil as _shutil
+    vendor = out_subdir / "_repo_src"
+    if vendor.exists():
+        _shutil.rmtree(vendor)
+    vendor.mkdir()
+    # Copy EVERY .py preserving directory structure (not just top-level packages).
+    # FOUND BY THE CORPUS CENSUS: the old "top-level packages + src/ only" rule
+    # returned "nothing found" for repos whose code lives in nested or non-
+    # standard dirs (backend/app/..., flat script folders), and those repos then
+    # failed at execution with NameError/AttributeError because their real
+    # modules were never importable. Copying only .py (no data/assets/.git) keeps
+    # _repo_src small while making any layout importable; a runtime read of a
+    # non-.py data file is a separate, honest FileNotFoundError, not an import gap.
+    _SKIP_PARTS = {".git", "__pycache__", "node_modules", ".venv", "venv",
+                   "build", "dist", ".tox", ".mypy_cache", ".pytest_cache", "site-packages"}
+    n_py = 0
+    for py in repo_dir.rglob("*.py"):
+        rel = py.relative_to(repo_dir)
+        if any(part in _SKIP_PARTS for part in rel.parts):
+            continue
+        try:
+            dest = vendor / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            _shutil.copy2(py, dest)
+            n_py += 1
+        except Exception as e:  # noqa: BLE001 -- vendoring is best-effort
+            print(f"  (vendor skip {rel}: {e})", file=sys.stderr)
+
+    # Compute the sys.path roots that make these modules importable, and record
+    # them in .pathdirs (relative to _repo_src). Consumers add each to sys.path.
+    #   - the vendor root itself (flat top-level modules / top-level packages)
+    #   - src/ if present
+    #   - the PARENT of every top-of-chain package (so nested packages import)
+    #   - the directory of each mined candidate file (flat scripts with no package)
+    path_roots = {"."}
+    if (vendor / "src").is_dir():
+        path_roots.add("src")
+    for initf in vendor.rglob("__init__.py"):
+        d = initf.parent
+        # climb to the top of the package chain
+        while d != vendor and (d.parent / "__init__.py").exists() and d.parent != vendor:
+            d = d.parent
+        # the sys.path root is the package's PARENT -- but if the package sits
+        # at the vendor root itself (a repo with a top-level __init__.py, e.g.
+        # ComfyUI custom nodes), its parent is OUTSIDE vendor; the root is just
+        # "." then. (Without this guard relative_to() raised ValueError and
+        # crashed the whole mine -- found on hdzwzqbxlk/ComfyUI...).
+        if d == vendor:
+            path_roots.add(".")
+        else:
+            path_roots.add(d.parent.relative_to(vendor).as_posix() or ".")
+    for r in selected:
+        cand_dir = (vendor / r["file"]).parent
+        if cand_dir.is_dir() and cand_dir != vendor:
+            try:
+                path_roots.add(cand_dir.relative_to(vendor).as_posix() or ".")
+            except ValueError:
+                pass
+    (vendor / ".pathdirs").write_text("\n".join(sorted(path_roots)) + "\n")
+    print(f"Vendored importable source -> {vendor.relative_to(ROOT)}/ "
+          f"({n_py} .py files, {len(path_roots)} import roots)"
+          if n_py else f"Vendored importable source -> {vendor.relative_to(ROOT)}/ (nothing found)",
+          file=sys.stderr)
+
     print(f"\n{len(all_records)} on-topic candidates found, {len(selected)} mined -> {out_subdir.relative_to(ROOT)}/")
     print(f"See {out_subdir.relative_to(ROOT)}/SUMMARY.md for an overview.")
 
     if tmp_clone:
-        print(f"(Cloned repo left at {tmp_clone} -- delete it manually if you don't need it.)", file=sys.stderr)
+        if args.keep_clone:
+            print(f"(Cloned repo left at {tmp_clone} -- --keep-clone set.)", file=sys.stderr)
+        else:
+            import shutil as _sh
+            _sh.rmtree(tmp_clone, ignore_errors=True)
+            print(f"(Deleted temp clone {tmp_clone}; vendored source is in _repo_src.)", file=sys.stderr)
 
 
 if __name__ == "__main__":

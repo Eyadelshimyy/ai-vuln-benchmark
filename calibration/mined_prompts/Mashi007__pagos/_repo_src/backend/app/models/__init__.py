@@ -1,0 +1,179 @@
+from app.core.database import Base
+from app.models.cliente import Cliente
+from app.models.cliente_email_historial import ClienteEmailHistorial
+from app.models.prestamo import Prestamo
+from app.models.ticket import Ticket
+from app.models.cuota import Cuota
+from app.models.cuota_pago import CuotaPago
+from app.models.pagos_whatsapp import PagosWhatsapp
+from app.models.conversacion_cobranza import ConversacionCobranza
+from app.models.pagos_informe import PagosInforme
+from app.models.configuracion import Configuracion
+from app.models.auditoria import Auditoria
+from app.models.auditoria_cartera_revision import AuditoriaCarteraRevision
+from app.models.auditoria_pago_control5_visto import AuditoriaPagoControl5Visto
+from app.models.auditoria_conciliacion_manual import AuditoriaConciliacionManual
+from app.models.auditoria_rebote_gmail import AuditoriaReboteGmail
+from app.models.auditoria_rebote_gmail_kpi import AuditoriaReboteGmailKpi
+from app.models.auditoria_email import (
+    AuditoriaEmailMessage,
+    AuditoriaEmailReceipt,
+    AuditoriaEmailScan,
+)
+from app.models.registro_cambios import RegistroCambios
+from app.models.user import User
+from app.models.definicion_campo import DefinicionCampo
+from app.models.conversacion_ai import ConversacionAI
+from app.models.diccionario_semantico import DiccionarioSemantico
+from app.models.mensaje_whatsapp import MensajeWhatsapp
+from app.models.pago import Pago
+from app.models.pago_comprobante_imagen import PagoComprobanteImagen
+from app.models.plantilla_notificacion import PlantillaNotificacion
+from app.models.variable_notificacion import VariableNotificacion
+from app.models.modelo_vehiculo import ModeloVehiculo
+from app.models.reporte_contable_cache import ReporteContableCache
+from app.models.revisar_pago import RevisarPago
+from app.models.pago_con_error import PagoConError
+from app.models.conciliacion_temporal import ConciliacionTemporal
+from app.models.cliente_con_error import ClienteConError
+from app.models.prestamo_con_error import PrestamoConError
+from app.models.pagos_gmail_sync import PagosGmailSync, PagosGmailSyncItem
+from app.models.pagos_gmail_abcd_cuotas_traza import PagosGmailAbcdCuotasTraza
+from app.models.pago_reportado import PagoReportado, PagoReportadoHistorial
+from app.models.infopagos_escaner_borrador import InfopagosEscanerBorrador
+from app.models.pago_reportado_exportado import PagoReportadoExportado
+from app.models.pago_pendiente_descargar import PagoPendienteDescargar
+from app.models.datos_importados_conerrores import DatosImportadosConErrores
+from app.models.estado_cuenta_codigo import EstadoCuentaCodigo
+from app.models.cobros_publico_codigo import CobrosPublicoCodigo
+from app.models.envio_notificacion import EnvioNotificacion
+from app.models.envio_notificacion_adjunto import EnvioNotificacionAdjunto
+from app.models.adjunto_fijo_cobranza_documento import AdjuntoFijoCobranzaDocumento
+from app.models.crm_campana import CampanaCrm
+from app.models.crm_campana_envio import CampanaEnvioCrm
+from app.models.cedula_reportar_bs import CedulaReportarBs
+from app.models.tasa_cambio_diaria import TasaCambioDiaria
+from app.models.analista import Analista
+from app.models.concesionario import Concesionario
+from app.models.finiquito import (
+    FiniquitoAreaTrabajoAuditoria,
+    FiniquitoCaso,
+    FiniquitoEstadoHistorial,
+    FiniquitoLoginCodigo,
+    FiniquitoUsuarioAcceso,
+)
+from app.models.finiquito_conciliacion_reserva import FiniquitoConciliacionReserva
+from app.models.cobranza import (
+    CobranzaAcuerdo,
+    CobranzaCaso,
+    CobranzaImagen,
+    CobranzaNotaAdjunto,
+)
+from app.models.cobranza_gestor import (
+    CobranzaGestorAsignacion,
+    CobranzaGestorDesempenoDiario,
+)
+from app.models.cobranza_universo import (
+    CobranzaUniversoCedula,
+    CobranzaUniversoDesempenoDiario,
+)
+from app.models.aseguradora_universo import AseguradoraUniversoCedula
+from app.models.conciliacion_sheet import (
+    ConciliacionSheetMeta,
+    ConciliacionSheetRow,
+    ConciliacionSheetSyncRun,
+)
+from app.models.drive import DriveRow
+from app.models.auditoria_cliente_alta_desde_drive import AuditoriaClienteAltaDesdeDrive
+from app.models.drive_clientes_candidatos_cache import DriveClientesCandidatosCache
+from app.models.clientes_drive_export_excel_auditoria import ClientesDriveExportExcelAuditoria
+from app.models.drive_candidato_eliminado_pasivo import DriveCandidatoEliminadoPasivo
+from app.models.recibos_email_envio import RecibosEmailEnvio
+from app.models.evidencia_notificacion import EvidenciaNotificacion
+from app.models.revision_manual_prestamo_temporal import RevisionManualPrestamoTemp
+from app.models.revision_manual_conciliacion_reserva import RevisionManualConciliacionReserva
+
+__all__ = [
+    "Base",
+    "Cliente",
+    "ClienteEmailHistorial",
+    "Prestamo",
+    "Ticket",
+    "Cuota",
+    "CuotaPago",
+    "Pago",
+    "PagoComprobanteImagen",
+    "PagosWhatsapp",
+    "PlantillaNotificacion",
+    "VariableNotificacion",
+    "ConversacionCobranza",
+    "PagosInforme",
+    "MensajeWhatsapp",
+    "Configuracion",
+    "Auditoria",
+    "AuditoriaCarteraRevision",
+    "AuditoriaPagoControl5Visto",
+    "AuditoriaConciliacionManual",
+    "AuditoriaReboteGmail",
+    "AuditoriaReboteGmailKpi",
+    "AuditoriaEmailScan",
+    "AuditoriaEmailMessage",
+    "AuditoriaEmailReceipt",
+    "RegistroCambios",
+    "User",
+    "DefinicionCampo",
+    "ConversacionAI",
+    "DiccionarioSemantico",
+    "ModeloVehiculo",
+    "ReporteContableCache",
+    "RevisarPago",
+    "PagoConError",
+    "ClienteConError",
+    "PrestamoConError",
+    "ConciliacionTemporal",
+    "PagoReportado",
+    "PagoReportadoHistorial",
+    "InfopagosEscanerBorrador",
+    "PagoReportadoExportado",
+    "PagoPendienteDescargar",
+    "DatosImportadosConErrores",
+    "EstadoCuentaCodigo",
+    "CobrosPublicoCodigo",
+    "EnvioNotificacion",
+    "EnvioNotificacionAdjunto",
+    "AdjuntoFijoCobranzaDocumento",
+    "CampanaCrm",
+    "CampanaEnvioCrm",
+    "CedulaReportarBs",
+    "TasaCambioDiaria",
+    "Analista",
+    "Concesionario",
+    "FiniquitoAreaTrabajoAuditoria",
+    "FiniquitoCaso",
+    "FiniquitoEstadoHistorial",
+    "FiniquitoLoginCodigo",
+    "FiniquitoUsuarioAcceso",
+    "FiniquitoConciliacionReserva",
+    "CobranzaCaso",
+    "CobranzaImagen",
+    "CobranzaAcuerdo",
+    "CobranzaNotaAdjunto",
+    "CobranzaGestorAsignacion",
+    "CobranzaGestorDesempenoDiario",
+    "CobranzaUniversoCedula",
+    "CobranzaUniversoDesempenoDiario",
+    "AseguradoraUniversoCedula",
+    "ConciliacionSheetMeta",
+    "ConciliacionSheetRow",
+    "ConciliacionSheetSyncRun",
+    "DriveRow",
+    "AuditoriaClienteAltaDesdeDrive",
+    "DriveClientesCandidatosCache",
+    "ClientesDriveExportExcelAuditoria",
+    "DriveCandidatoEliminadoPasivo",
+    "RecibosEmailEnvio",
+    "EvidenciaNotificacion",
+    "PagosGmailAbcdCuotasTraza",
+    "RevisionManualPrestamoTemp",
+    "RevisionManualConciliacionReserva",
+]
