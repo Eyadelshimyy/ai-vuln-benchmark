@@ -4,7 +4,7 @@
 - file: servers/project-hub-server/tools/docs_writer.py
 - tainted parameter: docs_path
 - Tier-2 sink: Path.write_text
-- Tier-2 exploit proof: traversal write escaped to /tmp/tier2_proof_q42pcfte/pwned_0cfbbc89b195
+- Tier-2 exploit proof: traversal write escaped to /tmp/tier2_proof_en5smg5t/pwned_fb6fc97aba19
 
 ## Reachability (what makes this disclosable)
 - reachable from a real entry point: **True**
@@ -13,7 +13,7 @@
 
     write_note_to_disk
 
-- dynamic reproduce verdict: SETUP_FAILED
+- dynamic reproduce verdict: NEEDS_MANUAL
 
 ## Manual verification checklist
 1. Open the entry point (`write_note_to_disk`) and confirm it takes external/attacker input.
@@ -21,6 +21,6 @@
 3. Reproduce the exploit (payload below) through that entry point against a local run.
 4. Only then prepare a responsible-disclosure report.
 
-- payload: `/tmp/tier2_proof_q42pcfte/pwned_0cfbbc89b195`
+- payload: `/tmp/tier2_proof_en5smg5t/pwned_fb6fc97aba19`
 
 NOTE: reachability here is a NAME-BASED static call graph (conservative, may over-connect). Step 1-3 above are the human confirmation that closes that gap before any disclosure.

@@ -5,17 +5,19 @@
   "function": "send_webhook",
   "cwe": "CWE-918",
   "param": "url",
-  "payload": "http://127.0.0.1:37949/185093d270a5",
-  "verdict": "SETUP_FAILED",
-  "detail": "clone/checkout failed",
-  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:37949/185093d270a5",
+  "payload": "http://127.0.0.1:45095/7e0d1aed9ee4",
+  "verdict": "NEEDS_MANUAL",
+  "detail": "the public function has other REQUIRED arguments; a faithful real-interface call needs a human to supply realistic values.",
+  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:45095/7e0d1aed9ee4",
   "tier2_sink": "requests.Session.request",
   "reachable": true,
-  "entry_kind": "api",
+  "entry_kind": "http",
   "call_path": [
+    "create_order",
     "send_webhook"
   ],
-  "reproduce_verdict": "SETUP_FAILED",
+  "reproduce_verdict": "NEEDS_MANUAL",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
-  "repo_full": "nthplusio/skills"
+  "repo_full": "nthplusio/skills",
+  "reprove_status": "reproven"
 }

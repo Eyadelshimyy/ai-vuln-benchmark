@@ -5,17 +5,21 @@
   "function": "read_record",
   "cwe": "CWE-22",
   "param": "path",
-  "payload": "/tmp/tier2_proof__wx7d863/secret_143276c7c712.txt",
-  "verdict": "SETUP_FAILED",
-  "detail": "clone/checkout failed",
-  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof__wx7d863/secret_143276c7c712.txt (proven by live execution trace; read-traversal, no output echo required)",
+  "payload": "/tmp/tier2_proof_r20_8wo5/secret_c84afa1b9228.txt",
+  "verdict": "REPRODUCED_PUBLIC_API",
+  "detail": "calling the real public backend.app.shared_state.read_record(path=<payload>) on a clean clone at  fired the CWE-22 sink -- reachable through the package's own API.",
+  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_r20_8wo5/secret_c84afa1b9228.txt (proven by live execution trace; read-traversal, no output echo required)",
   "tier2_sink": "open",
   "reachable": true,
-  "entry_kind": "api",
+  "entry_kind": "http",
   "call_path": [
+    "pipeline_status",
+    "get_next_run_time",
+    "read_heartbeat",
     "read_record"
   ],
-  "reproduce_verdict": "SETUP_FAILED",
+  "reproduce_verdict": "REPRODUCED_PUBLIC_API",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
-  "repo_full": "kamoras/civitas"
+  "repo_full": "kamoras/civitas",
+  "reprove_status": "reproven"
 }

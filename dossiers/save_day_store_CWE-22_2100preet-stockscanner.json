@@ -5,17 +5,20 @@
   "function": "save_day_store",
   "cwe": "CWE-22",
   "param": "path",
-  "payload": "/tmp/tier2_proof_e6vu56al/pwned_4f4df620b971",
+  "payload": "/tmp/tier2_proof_k2e1b0vi/pwned_490d41199377",
   "verdict": "NEEDS_MANUAL",
   "detail": "the public function has other REQUIRED arguments; a faithful real-interface call needs a human to supply realistic values.",
-  "tier2_proof": "traversal write escaped to /tmp/tier2_proof_e6vu56al/pwned_4f4df620b971",
+  "tier2_proof": "traversal write escaped to /tmp/tier2_proof_k2e1b0vi/pwned_490d41199377",
   "tier2_sink": "Path.write_text",
   "reachable": true,
-  "entry_kind": "api",
+  "entry_kind": "http",
   "call_path": [
+    "snapshot",
+    "build_sure_winner_board",
     "save_day_store"
   ],
   "reproduce_verdict": "NEEDS_MANUAL",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
-  "repo_full": "2100preet/stockscanner"
+  "repo_full": "2100preet/stockscanner",
+  "reprove_status": "reproven"
 }

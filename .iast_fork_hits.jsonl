@@ -1,0 +1,2 @@
+{"cwe": "CWE-78", "sink": "os.posix_spawn", "detail": "path='/bin/sh' argv=['/bin/sh', '-c', '$(touch /tmp/tier2_proof_3or8lhcy/pwned_439d7278b5ab)']"}
+{"cwe": "CWE-78", "sink": "os.posix_spawn", "detail": "path='/bin/sh' argv=['/bin/sh', '-c', '$(touch /tmp/tier2_proof_qf8j21f2/pwned_5c08dc6cd1b9)']"}

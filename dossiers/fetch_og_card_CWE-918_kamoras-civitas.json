@@ -5,17 +5,24 @@
   "function": "fetch_og_card",
   "cwe": "CWE-918",
   "param": "url",
-  "payload": "http://127.0.0.1:37055/0bb42bc29e22",
+  "payload": "http://127.0.0.1:39025/b6bba3d3f4fb",
   "verdict": "SETUP_FAILED",
-  "detail": "clone/checkout failed",
-  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:37055/0bb42bc29e22",
+  "detail": "reproduce raised",
+  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:39025/b6bba3d3f4fb",
   "tier2_sink": "httpx.Client.send",
   "reachable": true,
-  "entry_kind": "api",
+  "entry_kind": "http",
   "call_path": [
+    "refresh_action_center",
+    "refresh_action_issues",
+    "_run_refresh",
+    "_run_periodic_bluesky_posts",
+    "fill_missing_cards",
+    "capture_card",
     "fetch_og_card"
   ],
   "reproduce_verdict": "SETUP_FAILED",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
-  "repo_full": "kamoras/civitas"
+  "repo_full": "kamoras/civitas",
+  "reprove_status": "reproven"
 }

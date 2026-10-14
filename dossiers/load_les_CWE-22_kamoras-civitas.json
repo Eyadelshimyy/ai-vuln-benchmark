@@ -5,17 +5,18 @@
   "function": "load_les",
   "cwe": "CWE-22",
   "param": "path",
-  "payload": "/tmp/tier2_proof_ef97jngk/secret_eea854a7c788.txt",
-  "verdict": "SETUP_FAILED",
-  "detail": "clone/checkout failed",
-  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_ef97jngk/secret_eea854a7c788.txt (proven by live execution trace; read-traversal, no output echo required)",
+  "payload": "/tmp/tier2_proof_f4l2tmve/secret_e746d07f6932.txt",
+  "verdict": "NEEDS_MANUAL",
+  "detail": "the public function has other REQUIRED arguments; a faithful real-interface call needs a human to supply realistic values.",
+  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_f4l2tmve/secret_e746d07f6932.txt (proven by live execution trace; read-traversal, no output echo required)",
   "tier2_sink": "open",
   "reachable": true,
   "entry_kind": "api",
   "call_path": [
     "load_les"
   ],
-  "reproduce_verdict": "SETUP_FAILED",
+  "reproduce_verdict": "NEEDS_MANUAL",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
-  "repo_full": "kamoras/civitas"
+  "repo_full": "kamoras/civitas",
+  "reprove_status": "reproven"
 }

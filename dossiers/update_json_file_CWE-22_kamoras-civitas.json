@@ -5,17 +5,25 @@
   "function": "update_json_file",
   "cwe": "CWE-22",
   "param": "path",
-  "payload": "/tmp/tier2_proof_m3rppglj/secret_c345bed99988.txt",
-  "verdict": "SETUP_FAILED",
-  "detail": "clone/checkout failed",
-  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_m3rppglj/secret_c345bed99988.txt (proven by live execution trace; read-traversal, no output echo required)",
+  "payload": "/tmp/tier2_proof_ld2yzruz/secret_6d040f67574c.txt",
+  "verdict": "NEEDS_MANUAL",
+  "detail": "the public function has other REQUIRED arguments; a faithful real-interface call needs a human to supply realistic values.",
+  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_ld2yzruz/secret_6d040f67574c.txt (proven by live execution trace; read-traversal, no output echo required)",
   "tier2_sink": "open",
   "reachable": true,
-  "entry_kind": "api",
+  "entry_kind": "http",
   "call_path": [
+    "trigger_pipeline",
+    "start_pipeline_trigger",
+    "triggered_chain",
+    "nightly_links",
+    "run_senate_pipeline",
+    "refresh_member_ideal_points",
+    "write_member_ideal_points",
     "update_json_file"
   ],
-  "reproduce_verdict": "SETUP_FAILED",
+  "reproduce_verdict": "NEEDS_MANUAL",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
-  "repo_full": "kamoras/civitas"
+  "repo_full": "kamoras/civitas",
+  "reprove_status": "reproven"
 }

@@ -4,7 +4,7 @@
 - file: servers/project-hub-server/tools/knowledge.py
 - tainted parameter: project_type
 - Tier-2 sink: Path.write_text
-- Tier-2 exploit proof: traversal write escaped to /tmp/tier2_proof_v6bxz87m/pwned_16b5744fb565
+- Tier-2 exploit proof: traversal write escaped to /tmp/tier2_proof_fc0mg801/pwned_074788e50fce
 
 ## Reachability (what makes this disclosable)
 - reachable from a real entry point: **True**
@@ -13,7 +13,7 @@
 
     save_knowledge
 
-- dynamic reproduce verdict: SETUP_FAILED
+- dynamic reproduce verdict: NEEDS_MANUAL
 
 ## Manual verification checklist
 1. Open the entry point (`save_knowledge`) and confirm it takes external/attacker input.
@@ -21,6 +21,6 @@
 3. Reproduce the exploit (payload below) through that entry point against a local run.
 4. Only then prepare a responsible-disclosure report.
 
-- payload: `/tmp/tier2_proof_v6bxz87m/pwned_16b5744fb565`
+- payload: `/tmp/tier2_proof_fc0mg801/pwned_074788e50fce`
 
 NOTE: reachability here is a NAME-BASED static call graph (conservative, may over-connect). Step 1-3 above are the human confirmation that closes that gap before any disclosure.

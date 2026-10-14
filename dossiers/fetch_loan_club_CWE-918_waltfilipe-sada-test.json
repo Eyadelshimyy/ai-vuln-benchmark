@@ -5,17 +5,18 @@
   "function": "fetch_loan_club",
   "cwe": "CWE-918",
   "param": "url",
-  "payload": "http://127.0.0.1:34097/3ea71fd2357b",
-  "verdict": "SETUP_FAILED",
-  "detail": "clone/checkout failed",
-  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:34097/3ea71fd2357b",
+  "payload": "http://127.0.0.1:36689/0a36263eaf68",
+  "verdict": "REPRODUCED_PUBLIC_API",
+  "detail": "calling the real public scripts.enrich_loan_status.fetch_loan_club(url=<payload>) on a clean clone at  fired the CWE-918 sink -- reachable through the package's own API.",
+  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:36689/0a36263eaf68",
   "tier2_sink": "urllib.request.urlopen",
   "reachable": true,
   "entry_kind": "api",
   "call_path": [
     "fetch_loan_club"
   ],
-  "reproduce_verdict": "SETUP_FAILED",
+  "reproduce_verdict": "REPRODUCED_PUBLIC_API",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
-  "repo_full": "waltfilipe/sada-test"
+  "repo_full": "waltfilipe/sada-test",
+  "reprove_status": "reproven"
 }

@@ -5,17 +5,18 @@
   "function": "tool_read",
   "cwe": "CWE-22",
   "param": "path",
-  "payload": "/tmp/tier2_proof_5qy9km7s/secret_87f069c5e069.txt",
-  "verdict": "SETUP_FAILED",
-  "detail": "clone/checkout failed",
-  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_5qy9km7s/secret_87f069c5e069.txt (proven by live execution trace; read-traversal, no output echo required)",
+  "payload": "/tmp/tier2_proof_gjpx1hag/secret_d463819c7d45.txt",
+  "verdict": "REPRODUCED_PUBLIC_API",
+  "detail": "calling the real public 03-tools.src.tools.tool_read(path=<payload>) on a clean clone at  fired the CWE-22 sink -- reachable through the package's own API.",
+  "tier2_proof": "traversal read exfiltrated the planted canary from /tmp/tier2_proof_gjpx1hag/secret_d463819c7d45.txt",
   "tier2_sink": "open",
   "reachable": true,
   "entry_kind": "api",
   "call_path": [
     "tool_read"
   ],
-  "reproduce_verdict": "SETUP_FAILED",
+  "reproduce_verdict": "REPRODUCED_PUBLIC_API",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
-  "repo_full": "loveRhythm1990/mini-pi"
+  "repo_full": "loveRhythm1990/mini-pi",
+  "reprove_status": "reproven"
 }

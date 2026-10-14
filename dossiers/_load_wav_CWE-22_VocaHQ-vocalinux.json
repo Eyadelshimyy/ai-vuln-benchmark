@@ -5,10 +5,10 @@
   "function": "_load_wav",
   "cwe": "CWE-22",
   "param": "path",
-  "payload": "/tmp/tier2_proof_hjz74yvq/secret_67257714e474.txt",
+  "payload": "/tmp/tier2_proof_cygndjww/secret_af4e4c6f3da5.txt",
   "verdict": "NEEDS_MANUAL",
   "detail": "target '_load_wav' is internal (underscore-prefixed or under a private module). An external attacker reaches it only via a public caller / CLI / HTTP entry -- trace that path by hand before disclosing.",
-  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_hjz74yvq/secret_67257714e474.txt (proven by live execution trace; read-traversal, no output echo required)",
+  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_cygndjww/secret_af4e4c6f3da5.txt (proven by live execution trace; read-traversal, no output echo required)",
   "tier2_sink": "open",
   "reachable": true,
   "entry_kind": "api",
@@ -18,5 +18,6 @@
   ],
   "reproduce_verdict": "NEEDS_MANUAL",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
-  "repo_full": "VocaHQ/vocalinux"
+  "repo_full": "VocaHQ/vocalinux",
+  "reprove_status": "reproven"
 }

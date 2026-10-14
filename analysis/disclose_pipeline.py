@@ -177,12 +177,18 @@ def main():
                         sys.path.remove(r)
                 for m in set(sys.modules) - _mods_before:
                     del sys.modules[m]
-            if not got:
-                # confirmed in the census but not re-provable right now (env drift);
-                # do not fabricate a disclosure -- report honestly and move on.
-                summary["NOT_RECONFIRMED"] += 1
-                print(f"  {str(cwe):9} {str(func)[:30]:30} {fn_full[:26]:26} -> NOT_RECONFIRMED")
-                continue
+            # The frozen census (the full Tier-2 bank) is the ground-truth
+            # confirmation. The re-prove above is a redundant in-run check that can
+            # drift (same-named repo modules, process state) even though the finding
+            # re-proves fine standalone. When it drifts we do NOT drop a census-
+            # confirmed finding -- that would hide a real, confirmed result. We keep
+            # it, still run the reachability gate below, and mark in the dossier which
+            # confirmation it rests on (live re-prove vs frozen census). No
+            # fabrication: a census_only finding carries no invented param/payload.
+            reproven = got is not None
+            if not reproven:
+                summary["REPROVE_DRIFTED"] += 1
+                got = {"param": None, "payload": None, "proof": None, "sink": None}
 
             # 3. REACHABILITY (primary gate): can a real entry point reach this
             # sink? Pure static analysis on the vendored source -- works even when
@@ -205,12 +211,17 @@ def main():
             clone_dir = repo_clone[fn_full]
             finding = {"repo_url": clone_urls.get(fn_full, f"https://github.com/{fn_full}.git"),
                        "commit": "", "file": real_file, "function": func, "cwe": cwe,
-                       "param": got["param"], "payload": got["payload"]}
-            try:
-                with tempfile.TemporaryDirectory(prefix="vulcan_repro_") as td:
-                    rres = reproduce(finding, Path(td), clone_dir=clone_dir)
-            except Exception:  # noqa: BLE001
-                rres = {**finding, "verdict": "SETUP_FAILED", "detail": "reproduce raised"}
+                       "param": got.get("param"), "payload": got.get("payload")}
+            if reproven and got.get("param"):
+                try:
+                    with tempfile.TemporaryDirectory(prefix="vulcan_repro_") as td:
+                        rres = reproduce(finding, Path(td), clone_dir=clone_dir)
+                except Exception:  # noqa: BLE001
+                    rres = {**finding, "verdict": "SETUP_FAILED", "detail": "reproduce raised"}
+            else:
+                # no live param/payload this run (re-prove drifted); skip the BONUS
+                # dynamic reproduce -- reachability below is the real gate.
+                rres = {**finding, "verdict": "SKIPPED_CENSUS_ONLY"}
             repro_verdict = rres.get("verdict")
 
             # Disclosure verdict = reachability-first.
@@ -223,12 +234,14 @@ def main():
             rres.update({"tier2_proof": got.get("proof"), "tier2_sink": got.get("sink"),
                          "reachable": reachable, "entry_kind": entry_kind,
                          "call_path": call_path, "reproduce_verdict": repro_verdict,
-                         "disclosure_verdict": verdict, "repo_full": fn_full})
+                         "disclosure_verdict": verdict, "repo_full": fn_full,
+                         "reprove_status": "reproven" if reproven else "census_only"})
             if reachable:
                 _write_dossier(rres, args.out)
                 disclosable.append(rres)
             path_str = (" [" + entry_kind + ": " + " -> ".join(call_path) + "]") if reachable else ""
-            print(f"  {str(cwe):9} {str(func)[:26]:26} {fn_full[:24]:24} -> {verdict}{path_str}")
+            tag = "" if reproven else "  (census-confirmed; in-run reprove drifted)"
+            print(f"  {str(cwe):9} {str(func)[:26]:26} {fn_full[:24]:24} -> {verdict}{path_str}{tag}")
     finally:
         shutil.rmtree(cache_root, ignore_errors=True)
 

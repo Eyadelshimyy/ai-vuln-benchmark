@@ -5,3 +5,4 @@ mine_prompts_*/
 *.log
 .env
 *token*
+*:Zone.Identifier

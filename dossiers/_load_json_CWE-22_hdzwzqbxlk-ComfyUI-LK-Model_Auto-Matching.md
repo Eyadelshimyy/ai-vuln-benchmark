@@ -4,23 +4,23 @@
 - file: core/config.py
 - tainted parameter: path
 - Tier-2 sink: open
-- Tier-2 exploit proof: attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_91hw8xf3/secret_114772106f7e.txt (proven by live execution trace; read-traversal, no output echo required)
+- Tier-2 exploit proof: attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_8mi701nt/secret_3f9f39027a6b.txt (proven by live execution trace; read-traversal, no output echo required)
 
 ## Reachability (what makes this disclosable)
 - reachable from a real entry point: **True**
-- entry-point type: **http**
+- entry-point type: **api**
 - call path to verify by hand:
 
-    search_models -> search -> _apply_source_preference -> get_all_config -> load_all_config -> _load_json
+    load_all_config -> _load_json
 
 - dynamic reproduce verdict: NEEDS_MANUAL
 
 ## Manual verification checklist
-1. Open the entry point (`search_models`) and confirm it takes external/attacker input.
+1. Open the entry point (`load_all_config`) and confirm it takes external/attacker input.
 2. Follow the call path above and confirm the input reaches `_load_json` without being sanitized.
 3. Reproduce the exploit (payload below) through that entry point against a local run.
 4. Only then prepare a responsible-disclosure report.
 
-- payload: `/tmp/tier2_proof_91hw8xf3/secret_114772106f7e.txt`
+- payload: `/tmp/tier2_proof_8mi701nt/secret_3f9f39027a6b.txt`
 
 NOTE: reachability here is a NAME-BASED static call graph (conservative, may over-connect). Step 1-3 above are the human confirmation that closes that gap before any disclosure.

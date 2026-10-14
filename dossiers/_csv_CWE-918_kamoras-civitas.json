@@ -5,23 +5,19 @@
   "function": "_csv",
   "cwe": "CWE-918",
   "param": "url",
-  "payload": "http://127.0.0.1:46381/44e2a8fd287b",
+  "payload": "http://127.0.0.1:34473/b1f20bd3d236",
   "verdict": "NEEDS_MANUAL",
   "detail": "target '_csv' is internal (underscore-prefixed or under a private module). An external attacker reaches it only via a public caller / CLI / HTTP entry -- trace that path by hand before disclosing.",
-  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:46381/44e2a8fd287b",
+  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:34473/b1f20bd3d236",
   "tier2_sink": "urllib.request.urlopen",
   "reachable": true,
-  "entry_kind": "http",
+  "entry_kind": "api",
   "call_path": [
-    "refresh_action_center",
-    "refresh_action_issues",
-    "_run_refresh",
-    "calibrate",
-    "switcher_test",
     "member_rows",
     "_csv"
   ],
   "reproduce_verdict": "NEEDS_MANUAL",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
-  "repo_full": "kamoras/civitas"
+  "repo_full": "kamoras/civitas",
+  "reprove_status": "reproven"
 }

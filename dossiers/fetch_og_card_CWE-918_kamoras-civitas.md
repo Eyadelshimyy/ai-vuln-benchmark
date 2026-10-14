@@ -4,23 +4,23 @@
 - file: backend/app/pipeline/analyze/bluesky_utils.py
 - tainted parameter: url
 - Tier-2 sink: httpx.Client.send
-- Tier-2 exploit proof: SSRF: program fetched the attacker-controlled URL http://127.0.0.1:37055/0bb42bc29e22
+- Tier-2 exploit proof: SSRF: program fetched the attacker-controlled URL http://127.0.0.1:39025/b6bba3d3f4fb
 
 ## Reachability (what makes this disclosable)
 - reachable from a real entry point: **True**
-- entry-point type: **api**
+- entry-point type: **http**
 - call path to verify by hand:
 
-    fetch_og_card
+    refresh_action_center -> refresh_action_issues -> _run_refresh -> _run_periodic_bluesky_posts -> fill_missing_cards -> capture_card -> fetch_og_card
 
 - dynamic reproduce verdict: SETUP_FAILED
 
 ## Manual verification checklist
-1. Open the entry point (`fetch_og_card`) and confirm it takes external/attacker input.
+1. Open the entry point (`refresh_action_center`) and confirm it takes external/attacker input.
 2. Follow the call path above and confirm the input reaches `fetch_og_card` without being sanitized.
 3. Reproduce the exploit (payload below) through that entry point against a local run.
 4. Only then prepare a responsible-disclosure report.
 
-- payload: `http://127.0.0.1:37055/0bb42bc29e22`
+- payload: `http://127.0.0.1:39025/b6bba3d3f4fb`
 
 NOTE: reachability here is a NAME-BASED static call graph (conservative, may over-connect). Step 1-3 above are the human confirmation that closes that gap before any disclosure.

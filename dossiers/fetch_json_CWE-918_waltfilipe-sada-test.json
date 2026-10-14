@@ -5,17 +5,18 @@
   "function": "fetch_json",
   "cwe": "CWE-918",
   "param": "url",
-  "payload": "http://127.0.0.1:35957/3492ad565df3",
-  "verdict": "SETUP_FAILED",
-  "detail": "clone/checkout failed",
-  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:35957/3492ad565df3",
+  "payload": "http://127.0.0.1:45919/e42af4f706bc",
+  "verdict": "REPRODUCED_PUBLIC_API",
+  "detail": "calling the real public scripts.download_club_logos.fetch_json(url=<payload>) on a clean clone at  fired the CWE-918 sink -- reachable through the package's own API.",
+  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:45919/e42af4f706bc",
   "tier2_sink": "urllib.request.urlopen",
   "reachable": true,
   "entry_kind": "api",
   "call_path": [
     "fetch_json"
   ],
-  "reproduce_verdict": "SETUP_FAILED",
+  "reproduce_verdict": "REPRODUCED_PUBLIC_API",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
-  "repo_full": "waltfilipe/sada-test"
+  "repo_full": "waltfilipe/sada-test",
+  "reprove_status": "reproven"
 }

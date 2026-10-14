@@ -5,17 +5,18 @@
   "function": "execute_bash",
   "cwe": "CWE-78",
   "param": "command",
-  "payload": "$(touch /tmp/tier2_proof_65zjmb2t/pwned_43c1e53fb8f2)",
-  "verdict": "SETUP_FAILED",
-  "detail": "clone/checkout failed",
-  "tier2_proof": "injected shell command created /tmp/tier2_proof_65zjmb2t/pwned_43c1e53fb8f2",
+  "payload": "$(touch /tmp/tier2_proof_qf8j21f2/pwned_5c08dc6cd1b9)",
+  "verdict": "REPRODUCED_PUBLIC_API",
+  "detail": "calling the real public 02-providers.src.main.execute_bash(command=<payload>) on a clean clone at  fired the CWE-78 sink -- reachable through the package's own API.",
+  "tier2_proof": "injected shell command created /tmp/tier2_proof_qf8j21f2/pwned_5c08dc6cd1b9",
   "tier2_sink": "subprocess.Popen",
   "reachable": true,
   "entry_kind": "api",
   "call_path": [
     "execute_bash"
   ],
-  "reproduce_verdict": "SETUP_FAILED",
+  "reproduce_verdict": "REPRODUCED_PUBLIC_API",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
-  "repo_full": "loveRhythm1990/mini-pi"
+  "repo_full": "loveRhythm1990/mini-pi",
+  "reprove_status": "reproven"
 }

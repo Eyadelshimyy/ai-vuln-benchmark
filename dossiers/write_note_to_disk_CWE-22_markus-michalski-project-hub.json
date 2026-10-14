@@ -5,17 +5,18 @@
   "function": "write_note_to_disk",
   "cwe": "CWE-22",
   "param": "docs_path",
-  "payload": "/tmp/tier2_proof_q42pcfte/pwned_0cfbbc89b195",
-  "verdict": "SETUP_FAILED",
-  "detail": "clone/checkout failed",
-  "tier2_proof": "traversal write escaped to /tmp/tier2_proof_q42pcfte/pwned_0cfbbc89b195",
+  "payload": "/tmp/tier2_proof_en5smg5t/pwned_fb6fc97aba19",
+  "verdict": "NEEDS_MANUAL",
+  "detail": "the public function has other REQUIRED arguments; a faithful real-interface call needs a human to supply realistic values.",
+  "tier2_proof": "traversal write escaped to /tmp/tier2_proof_en5smg5t/pwned_fb6fc97aba19",
   "tier2_sink": "Path.write_text",
   "reachable": true,
   "entry_kind": "api",
   "call_path": [
     "write_note_to_disk"
   ],
-  "reproduce_verdict": "SETUP_FAILED",
+  "reproduce_verdict": "NEEDS_MANUAL",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
-  "repo_full": "markus-michalski/project-hub"
+  "repo_full": "markus-michalski/project-hub",
+  "reprove_status": "reproven"
 }

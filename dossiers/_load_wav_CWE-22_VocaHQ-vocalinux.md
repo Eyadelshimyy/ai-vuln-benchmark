@@ -4,7 +4,7 @@
 - file: src/vocalinux/speech_recognition/diarization.py
 - tainted parameter: path
 - Tier-2 sink: open
-- Tier-2 exploit proof: attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_hjz74yvq/secret_67257714e474.txt (proven by live execution trace; read-traversal, no output echo required)
+- Tier-2 exploit proof: attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_cygndjww/secret_af4e4c6f3da5.txt (proven by live execution trace; read-traversal, no output echo required)
 
 ## Reachability (what makes this disclosable)
 - reachable from a real entry point: **True**
@@ -21,6 +21,6 @@
 3. Reproduce the exploit (payload below) through that entry point against a local run.
 4. Only then prepare a responsible-disclosure report.
 
-- payload: `/tmp/tier2_proof_hjz74yvq/secret_67257714e474.txt`
+- payload: `/tmp/tier2_proof_cygndjww/secret_af4e4c6f3da5.txt`
 
 NOTE: reachability here is a NAME-BASED static call graph (conservative, may over-connect). Step 1-3 above are the human confirmation that closes that gap before any disclosure.
