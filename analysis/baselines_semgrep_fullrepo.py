@@ -68,6 +68,8 @@ def main():
     ap.add_argument("--census", required=True, type=Path)
     ap.add_argument("--root", type=Path, default=Path("calibration/mined_prompts"))
     ap.add_argument("--config", default="p/security-audit")
+    ap.add_argument("--label", choices=["confirmed","triggered"], default="confirmed",
+                    help="ground-truth positive: execution-confirmed (default, defensible) or static-triggered (candidate)")
     ap.add_argument("--semgrep-cmd", default="semgrep",
                     help='command that runs semgrep; e.g. for Docker: "docker run --rm -v $PWD:/src -w /src semgrep/semgrep semgrep"')
     ap.add_argument("--out", type=Path, default=Path("semgrep_fullrepo.json"))
@@ -119,7 +121,20 @@ def main():
                 if start == 0 or (f["start"] <= end and f["end"] >= start):
                     flagged = True
                     break
-            is_vuln = bool(r.get("triggered"))
+            # Ground-truth label. Reviewers' key point: static 'triggered' is a
+            # CANDIDATE set, not ground truth. The defensible label set is
+            # execution-CONFIRMED (positive) vs executed-but-no-trigger (negative);
+            # 'triggered-unconfirmed' and 'non-executable' are INCONCLUSIVE and are
+            # EXCLUDED (an unexecuted function is not a proven-safe negative).
+            if args.label == "confirmed":
+                if r.get("confirmed"):
+                    is_vuln = True
+                elif r.get("executable") and not r.get("triggered"):
+                    is_vuln = False
+                else:
+                    continue   # inconclusive -> excluded from the detector metric
+            else:
+                is_vuln = bool(r.get("triggered"))
             if is_vuln:
                 for c in (r.get("cwes") or []):
                     per_cwe[c][1] += 1
