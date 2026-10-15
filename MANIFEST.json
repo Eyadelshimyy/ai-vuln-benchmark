@@ -1,0 +1,147 @@
+{
+  "generated_utc": "2026-10-15T04:07:41+00:00",
+  "git_commit": "dcfb0944370d540e69049d4c441673b3935d647f",
+  "git_dirty": false,
+  "verdict_definitions": {
+    "executable": "the function ran under the harness without an import/setup error",
+    "triggered (Tier-1)": "static taint reached a security-relevant sink",
+    "confirmed (Tier-2)": "the deterministic exploit bank made the sink fire",
+    "reachable": "a real entry point (http/cli/api/main) reaches the sink in the static call graph",
+    "REACHABLE_FROM_ENTRYPOINT": "reachable AND confirmed; a disclosure lead pending trust-boundary review",
+    "real_net_confirmed": "driven to a live exploit by hand against operator-controlled infra",
+    "COULD_NOT_EXECUTE": "inconclusive -- excluded from safe/vuln labels, never counted as safe"
+  },
+  "artifacts": {
+    "corpus_census.json": {
+      "sha256_16": "8764876083dbadc8",
+      "bytes": 401852
+    },
+    "gold_set.json": {
+      "sha256_16": "0e3444f4ba66b67a",
+      "bytes": 17906
+    },
+    "reachable_worklist.json": {
+      "sha256_16": "6c8e10be6312af19",
+      "bytes": 359469
+    },
+    "semgrep_fullrepo.json": {
+      "sha256_16": "7b825bc91c12fff3",
+      "bytes": 191670
+    },
+    "semgrep_default.json": {
+      "sha256_16": "4757b7ce673fc005",
+      "bytes": 191583
+    },
+    "semgrep_owasp.json": {
+      "sha256_16": "64e68218521b954e",
+      "bytes": 191706
+    },
+    "semgrep_union.json": {
+      "sha256_16": "822f3117c4f09c7f",
+      "bytes": 526
+    },
+    "repo_archetypes.json": {
+      "sha256_16": "e1617b5c04023a89",
+      "bytes": 18293
+    },
+    "provenance_records.json": {
+      "sha256_16": "b8ffd1ff78976166",
+      "bytes": 589083
+    },
+    "finalize.json": {
+      "sha256_16": "df94b3aaf0e910dc",
+      "bytes": 18474
+    }
+  },
+  "census": {
+    "file": "corpus_census.json",
+    "tier2": true,
+    "n_candidates": 1216,
+    "verdict_tally": {
+      "COULD_NOT_EXECUTE": 351,
+      "NOT_TRIGGERED": 759,
+      "TRIGGERED": 106
+    },
+    "funnel": {
+      "candidates": 1216,
+      "executable": 865,
+      "triggered": 106,
+      "confirmed": 48
+    },
+    "confirmed_by_cwe": {
+      "CWE-22": 38,
+      "CWE-918": 13,
+      "CWE-78": 2
+    }
+  },
+  "mined_corpus": {
+    "n_repos": 39,
+    "candidates_per_repo": {
+      "2100preet__stockscanner": 27,
+      "AIfromScratch__qsent": 3,
+      "AaronGrace978__composable-lora": 0,
+      "ContextualWisdomLab__fast-mlsirm": 7,
+      "DeepCivic__womblex": 27,
+      "FrancescoCiulla__NLWeb": 2,
+      "Gunrunner444__BugForge": 38,
+      "Mashi007__pagos": 18,
+      "Neotech3000__led-matrix": 9,
+      "PrjBbrosa__data-analyzer": 38,
+      "ProtossBlaster__leapmotor-mate": 255,
+      "SamNobsResideo__git-ssh-gateway": 0,
+      "Shazari888__diagram-generation-api": 0,
+      "VibeBB__fpga-agent": 43,
+      "VocaHQ__vocalinux": 39,
+      "airbytehq__airbyte": 44,
+      "alexandrelheinen__clave": 12,
+      "alexandrelheinen__fret": 28,
+      "banknit123__New_Billsure": 12,
+      "bramstroker__homeassistant-powercalc": 8,
+      "briandconnelly__skills": 10,
+      "chikolavosaki-sys__canopy-mapping-rover": 1,
+      "ckoutz__gud-vector-agent-suite": 0,
+      "clarmso__openings.info": 22,
+      "danielreuter__research-notes": 71,
+      "hdzwzqbxlk__ComfyUI-LK-Model_Auto-Matching": 10,
+      "kamoras__civitas": 264,
+      "loveRhythm1990__mini-pi": 10,
+      "marcus-rox__rox-dox": 0,
+      "markus-michalski__project-hub": 35,
+      "mikelane__pytest-gremlins": 27,
+      "nthplusio__skills": 29,
+      "olinickalls__PyFaceWipe": 2,
+      "paulosalem__ellements": 22,
+      "saltyscott0521__tracebi": 50,
+      "scaryrawr__homebrew-formulae": 6,
+      "shizukutanaka__Slice": 35,
+      "thokodi__thokodi.github.io": 1,
+      "waltfilipe__sada-test": 8
+    }
+  },
+  "baselines": {
+    "semgrep_fullrepo.json": {
+      "config": "p/security-audit",
+      "recall": 0.1792452830188679,
+      "precision": 0.3392857142857143
+    },
+    "semgrep_default.json": {
+      "config": "p/default",
+      "recall": 0.20754716981132076,
+      "precision": 0.176
+    },
+    "semgrep_owasp.json": {
+      "config": "p/owasp-top-ten",
+      "recall": 0.02830188679245283,
+      "precision": 0.14285714285714285
+    },
+    "semgrep_union.json": {
+      "config": [
+        "p/security-audit",
+        "p/owasp-top-ten",
+        "p/default"
+      ],
+      "recall": 0.20754716981132076,
+      "precision": 0.1732283464566929
+    }
+  }
+}
