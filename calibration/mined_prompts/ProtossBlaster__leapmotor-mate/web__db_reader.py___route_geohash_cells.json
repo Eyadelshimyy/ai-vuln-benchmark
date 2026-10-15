@@ -24,5 +24,19 @@
       8059,
       8095
     ]
+  },
+  "provenance": {
+    "source_sha256": "6d030ce567f429d557eeb4969a5fc2b784fa359cb1b52dea8730a2e0f94dc8cb",
+    "ai_commit": "bdf4ec74dd63",
+    "ai_tools": {
+      "claude-code": 37
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      8059,
+      8095
+    ]
   }
 }

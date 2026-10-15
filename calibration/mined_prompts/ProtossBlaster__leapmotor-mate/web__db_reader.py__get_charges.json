@@ -24,5 +24,19 @@
       8273,
       8308
     ]
+  },
+  "provenance": {
+    "source_sha256": "7e9a3266520697361b67c215c4d324918952824bea57e224dc9ac6599aaae79b",
+    "ai_commit": "a8e675554983",
+    "ai_tools": {
+      "claude-code": 9
+    },
+    "ai_line_fraction": 0.25,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      8273,
+      8308
+    ]
   }
 }

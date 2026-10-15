@@ -24,5 +24,19 @@
       2822,
       2845
     ]
+  },
+  "provenance": {
+    "source_sha256": "a7e08e3723fc5d4c9359d2584fdc40398f9a7712849c7e4910d2519682b7bad9",
+    "ai_commit": "bbdd5af99222",
+    "ai_tools": {
+      "claude-code": 24
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      2822,
+      2845
+    ]
   }
 }

@@ -24,5 +24,19 @@
       433,
       456
     ]
+  },
+  "provenance": {
+    "source_sha256": "de514e209cbaddb577e817ebef723b9021c957cc8c851599c7298a9a52803521",
+    "ai_commit": "4ba0f711a857",
+    "ai_tools": {
+      "claude-code": 24
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "Co-authored-by: Claude <noreply@anthropic.com>",
+    "span": [
+      433,
+      456
+    ]
   }
 }

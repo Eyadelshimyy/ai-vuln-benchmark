@@ -29,5 +29,17 @@
       1730,
       1772
     ]
+  },
+  "provenance": {
+    "source_sha256": "531b0ccf464b321acdf323d85a9d232d7cb99cf9c2c668a4db0b4c13d65e1773",
+    "ai_commit": null,
+    "ai_tools": {},
+    "ai_line_fraction": 0.0,
+    "ai_attributed": false,
+    "evidence": null,
+    "span": [
+      1711,
+      1740
+    ]
   }
 }

@@ -1,10 +1,14 @@
 # Disclosure dossier: fetch_loan_club (CWE-918)
 
+> **✅ REAL-NET CONFIRMED (hand-proven end-to-end).** CWE-918 SSRF -- poc_sada_ssrf_realnet.py: planted profile_url, ran the real scripts/enrich_loan_status.py, request landed at an operator-controlled webhook.
+>
+> This finding was driven to a live exploit against operator-controlled infrastructure. It is the top rung of the ladder, not a lead.
+
 - repo: waltfilipe/sada-test  (https://github.com/waltfilipe/sada-test.git)
 - file: scripts/enrich_loan_status.py
 - tainted parameter: url
 - Tier-2 sink: urllib.request.urlopen
-- Tier-2 exploit proof: SSRF: program fetched the attacker-controlled URL http://127.0.0.1:36689/0a36263eaf68
+- Tier-2 exploit proof: SSRF: program fetched the attacker-controlled URL http://127.0.0.1:36667/054dc5bf7759
 
 ## Reachability (what makes this disclosable)
 - reachable from a real entry point: **True**
@@ -21,6 +25,6 @@
 3. Reproduce the exploit (payload below) through that entry point against a local run.
 4. Only then prepare a responsible-disclosure report.
 
-- payload: `http://127.0.0.1:36689/0a36263eaf68`
+- payload: `http://127.0.0.1:36667/054dc5bf7759`
 
 NOTE: reachability here is a NAME-BASED static call graph (conservative, may over-connect). Step 1-3 above are the human confirmation that closes that gap before any disclosure.

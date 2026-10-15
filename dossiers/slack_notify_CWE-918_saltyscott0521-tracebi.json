@@ -5,10 +5,10 @@
   "function": "slack_notify",
   "cwe": "CWE-918",
   "param": "webhook_url",
-  "payload": "http://127.0.0.1:40995/e92b4b6430c0",
+  "payload": "http://127.0.0.1:37743/db1f8b2f2917",
   "verdict": "NEEDS_MANUAL",
   "detail": "target 'slack_notify' is internal (underscore-prefixed or under a private module). An external attacker reaches it only via a public caller / CLI / HTTP entry -- trace that path by hand before disclosing.",
-  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:40995/e92b4b6430c0",
+  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:37743/db1f8b2f2917",
   "tier2_sink": "urllib.request.urlopen",
   "reachable": true,
   "entry_kind": "api",
@@ -18,5 +18,7 @@
   "reproduce_verdict": "NEEDS_MANUAL",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
   "repo_full": "saltyscott0521/tracebi",
-  "reprove_status": "reproven"
+  "reprove_status": "reproven",
+  "real_net_confirmed": false,
+  "real_net_evidence": null
 }

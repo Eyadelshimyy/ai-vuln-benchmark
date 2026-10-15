@@ -24,5 +24,8 @@
       20,
       65
     ]
+  },
+  "provenance": {
+    "source_sha256": "331c0fd4c79f2c652b131efd6bf0c1129b5a40df92cea340c05bfeb10d6f5248"
   }
 }

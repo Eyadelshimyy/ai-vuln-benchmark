@@ -29,5 +29,19 @@
       695,
       713
     ]
+  },
+  "provenance": {
+    "source_sha256": "9cd0f687195c8a14bf9ebc71c4f0897eed2465717831b95b6fb273a3a6df639a",
+    "ai_commit": "66a96e70dbb3",
+    "ai_tools": {
+      "claude-code": 1
+    },
+    "ai_line_fraction": 0.053,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      695,
+      713
+    ]
   }
 }

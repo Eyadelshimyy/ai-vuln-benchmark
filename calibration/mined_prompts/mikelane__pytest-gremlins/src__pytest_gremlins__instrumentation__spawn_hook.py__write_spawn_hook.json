@@ -24,5 +24,19 @@
       201,
       213
     ]
+  },
+  "provenance": {
+    "source_sha256": "5d9652b4494094dd91d4820bcf067ea43c2dde2c12c6809c122f7281b643d99a",
+    "ai_commit": "954c9e0faf31",
+    "ai_tools": {
+      "claude-code": 13
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "Generated with [Claude Code]",
+    "span": [
+      201,
+      213
+    ]
   }
 }

@@ -29,5 +29,19 @@
       1774,
       1817
     ]
+  },
+  "provenance": {
+    "source_sha256": "f10045f1d636319dc3543a84c65e4e15e275c8f219567aab98a74b30a4ed797c",
+    "ai_commit": "c35d098d0e1b",
+    "ai_tools": {
+      "claude-code": 19
+    },
+    "ai_line_fraction": 0.442,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      1742,
+      1784
+    ]
   }
 }

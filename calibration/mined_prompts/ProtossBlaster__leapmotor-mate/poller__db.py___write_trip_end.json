@@ -29,5 +29,17 @@
       1978,
       2031
     ]
+  },
+  "provenance": {
+    "source_sha256": "405943207e70bcd3fe176a83107c7a40650d817b0b0e0ab32e283e57855461e6",
+    "ai_commit": null,
+    "ai_tools": {},
+    "ai_line_fraction": 0.0,
+    "ai_attributed": false,
+    "evidence": null,
+    "span": [
+      1975,
+      1988
+    ]
   }
 }

@@ -24,5 +24,19 @@
       1863,
       1899
     ]
+  },
+  "provenance": {
+    "source_sha256": "356e3155425778e02335c3be800cf0077cebed1e7fab192f1bac08b3a9feb54c",
+    "ai_commit": "883e3ffeb4d2",
+    "ai_tools": {
+      "claude-code": 37
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      1863,
+      1899
+    ]
   }
 }

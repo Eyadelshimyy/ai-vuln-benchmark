@@ -24,5 +24,17 @@
       341,
       373
     ]
+  },
+  "provenance": {
+    "source_sha256": "f2d7b127583e2b249d6863e82db91758e667b888b74698273e7ac6b86a7cbf59",
+    "ai_commit": null,
+    "ai_tools": {},
+    "ai_line_fraction": 0.0,
+    "ai_attributed": false,
+    "evidence": null,
+    "span": [
+      341,
+      352
+    ]
   }
 }

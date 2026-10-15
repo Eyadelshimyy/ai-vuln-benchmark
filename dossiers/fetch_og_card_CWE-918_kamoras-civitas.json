@@ -5,10 +5,10 @@
   "function": "fetch_og_card",
   "cwe": "CWE-918",
   "param": "url",
-  "payload": "http://127.0.0.1:39025/b6bba3d3f4fb",
+  "payload": "http://127.0.0.1:43555/aecdb2a6ec3f",
   "verdict": "SETUP_FAILED",
   "detail": "reproduce raised",
-  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:39025/b6bba3d3f4fb",
+  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:43555/aecdb2a6ec3f",
   "tier2_sink": "httpx.Client.send",
   "reachable": true,
   "entry_kind": "http",
@@ -24,5 +24,7 @@
   "reproduce_verdict": "SETUP_FAILED",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
   "repo_full": "kamoras/civitas",
-  "reprove_status": "reproven"
+  "reprove_status": "reproven",
+  "real_net_confirmed": false,
+  "real_net_evidence": null
 }

@@ -29,5 +29,17 @@
       2181,
       2230
     ]
+  },
+  "provenance": {
+    "source_sha256": "606c21121c55d71d44164ce5277c2ea635842d134186b374e07b65c8b9397576",
+    "ai_commit": null,
+    "ai_tools": {},
+    "ai_line_fraction": 0.0,
+    "ai_attributed": false,
+    "evidence": null,
+    "span": [
+      2177,
+      2191
+    ]
   }
 }

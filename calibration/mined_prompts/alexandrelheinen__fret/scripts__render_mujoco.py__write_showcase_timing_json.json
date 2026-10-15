@@ -24,5 +24,19 @@
       2186,
       2210
     ]
+  },
+  "provenance": {
+    "source_sha256": "d9b15c26f013b4d173d45108aadfd6d3083a87af93521255a0bccc12f32441c6",
+    "ai_commit": "0481d74ebc8f",
+    "ai_tools": {
+      "cursor": 25
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "span": [
+      2186,
+      2210
+    ]
   }
 }

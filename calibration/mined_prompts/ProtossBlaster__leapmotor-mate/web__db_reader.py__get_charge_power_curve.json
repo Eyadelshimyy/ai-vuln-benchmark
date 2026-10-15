@@ -24,5 +24,19 @@
       8644,
       8700
     ]
+  },
+  "provenance": {
+    "source_sha256": "609df6066a84c48def3057050a23468ddfe4cf4e534e26cc181ad04e0e1e7a91",
+    "ai_commit": "dc8df4736c22",
+    "ai_tools": {
+      "claude-code": 28
+    },
+    "ai_line_fraction": 0.491,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      8644,
+      8700
+    ]
   }
 }

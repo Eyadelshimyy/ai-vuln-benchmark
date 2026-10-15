@@ -5,10 +5,10 @@
   "function": "tool_edit",
   "cwe": "CWE-22",
   "param": "path",
-  "payload": "/tmp/tier2_proof_7embeael/secret_77b973e1a88d.txt",
+  "payload": "/tmp/tier2_proof_yp5hopq8/secret_fbb9579a70a0.txt",
   "verdict": "NEEDS_MANUAL",
   "detail": "the public function has other REQUIRED arguments; a faithful real-interface call needs a human to supply realistic values.",
-  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_7embeael/secret_77b973e1a88d.txt (proven by live execution trace; read-traversal, no output echo required)",
+  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_yp5hopq8/secret_fbb9579a70a0.txt (proven by live execution trace; read-traversal, no output echo required)",
   "tier2_sink": "open",
   "reachable": true,
   "entry_kind": "api",
@@ -18,5 +18,7 @@
   "reproduce_verdict": "NEEDS_MANUAL",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
   "repo_full": "loveRhythm1990/mini-pi",
-  "reprove_status": "reproven"
+  "reprove_status": "reproven",
+  "real_net_confirmed": false,
+  "real_net_evidence": null
 }

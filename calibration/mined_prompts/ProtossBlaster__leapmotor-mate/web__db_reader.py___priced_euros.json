@@ -24,5 +24,19 @@
       6511,
       6521
     ]
+  },
+  "provenance": {
+    "source_sha256": "38157ff38904d2ef09dff0a641191cd07225cde8c8bf4b0c4c1311b89e5f5f4a",
+    "ai_commit": "c581309f821c",
+    "ai_tools": {
+      "claude-code": 1
+    },
+    "ai_line_fraction": 0.091,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      6511,
+      6521
+    ]
   }
 }

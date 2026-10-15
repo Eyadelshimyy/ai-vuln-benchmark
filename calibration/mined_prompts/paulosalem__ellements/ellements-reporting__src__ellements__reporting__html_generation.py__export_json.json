@@ -24,5 +24,19 @@
       122,
       126
     ]
+  },
+  "provenance": {
+    "source_sha256": "aee35e4c76717a6f4613f2ad389ff509972b5928c706ae5a37b2e46491ce6c60",
+    "ai_commit": "d5f95b93f1aa",
+    "ai_tools": {
+      "github-copilot": 5
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "Co-authored-by: Copilot <",
+    "span": [
+      122,
+      126
+    ]
   }
 }

@@ -24,5 +24,19 @@
       1810,
       1832
     ]
+  },
+  "provenance": {
+    "source_sha256": "b3bd4a8854e722c39db0b981b5ebba6271a33a7a3380719a680b566230c877e2",
+    "ai_commit": "a1725f7cfc4c",
+    "ai_tools": {
+      "claude-code": 14
+    },
+    "ai_line_fraction": 0.609,
+    "ai_attributed": true,
+    "evidence": "Generated with [Claude Code]",
+    "span": [
+      1810,
+      1832
+    ]
   }
 }

@@ -5,10 +5,10 @@
   "function": "_fetch",
   "cwe": "CWE-918",
   "param": "url",
-  "payload": "http://127.0.0.1:38197/9b2792b2e48a",
+  "payload": "http://127.0.0.1:39473/3c755da03b53",
   "verdict": "NEEDS_MANUAL",
   "detail": "target '_fetch' is internal (underscore-prefixed or under a private module). An external attacker reaches it only via a public caller / CLI / HTTP entry -- trace that path by hand before disclosing.",
-  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:38197/9b2792b2e48a",
+  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:39473/3c755da03b53",
   "tier2_sink": "urllib.request.urlopen",
   "reachable": true,
   "entry_kind": "api",
@@ -19,5 +19,7 @@
   "reproduce_verdict": "NEEDS_MANUAL",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
   "repo_full": "clarmso/openings.info",
-  "reprove_status": "reproven"
+  "reprove_status": "reproven",
+  "real_net_confirmed": false,
+  "real_net_evidence": null
 }

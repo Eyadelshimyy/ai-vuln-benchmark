@@ -5,10 +5,10 @@
   "function": "update_json_file",
   "cwe": "CWE-22",
   "param": "path",
-  "payload": "/tmp/tier2_proof_ld2yzruz/secret_6d040f67574c.txt",
+  "payload": "/tmp/tier2_proof_07szyehf/secret_4dcb80cda3a4.txt",
   "verdict": "NEEDS_MANUAL",
   "detail": "the public function has other REQUIRED arguments; a faithful real-interface call needs a human to supply realistic values.",
-  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_ld2yzruz/secret_6d040f67574c.txt (proven by live execution trace; read-traversal, no output echo required)",
+  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_07szyehf/secret_4dcb80cda3a4.txt (proven by live execution trace; read-traversal, no output echo required)",
   "tier2_sink": "open",
   "reachable": true,
   "entry_kind": "http",
@@ -25,5 +25,7 @@
   "reproduce_verdict": "NEEDS_MANUAL",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
   "repo_full": "kamoras/civitas",
-  "reprove_status": "reproven"
+  "reprove_status": "reproven",
+  "real_net_confirmed": false,
+  "real_net_evidence": null
 }

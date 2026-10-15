@@ -24,5 +24,19 @@
       8721,
       8731
     ]
+  },
+  "provenance": {
+    "source_sha256": "377b293c81afea45a8c78246fab4f2e0da989c1dddb8ed72c42d02927741a9c4",
+    "ai_commit": "3cd7dbf07eca",
+    "ai_tools": {
+      "claude-code": 1
+    },
+    "ai_line_fraction": 0.091,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      8721,
+      8731
+    ]
   }
 }

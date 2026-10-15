@@ -4,7 +4,7 @@
 - file: scripts/plot_telemetry.py
 - tainted parameter: path
 - Tier-2 sink: open
-- Tier-2 exploit proof: traversal read exfiltrated the planted canary from /tmp/tier2_proof_vp1lbxx2/secret_9f2ee229a0c1.txt
+- Tier-2 exploit proof: traversal read exfiltrated the planted canary from /tmp/tier2_proof_wy78izj6/secret_0351f212458c.txt
 
 ## Reachability (what makes this disclosable)
 - reachable from a real entry point: **True**
@@ -21,6 +21,6 @@
 3. Reproduce the exploit (payload below) through that entry point against a local run.
 4. Only then prepare a responsible-disclosure report.
 
-- payload: `/tmp/tier2_proof_vp1lbxx2/secret_9f2ee229a0c1.txt`
+- payload: `/tmp/tier2_proof_wy78izj6/secret_0351f212458c.txt`
 
 NOTE: reachability here is a NAME-BASED static call graph (conservative, may over-connect). Step 1-3 above are the human confirmation that closes that gap before any disclosure.

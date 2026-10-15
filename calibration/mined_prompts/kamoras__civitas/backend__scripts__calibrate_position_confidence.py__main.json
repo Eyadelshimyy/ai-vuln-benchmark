@@ -24,5 +24,19 @@
       1504,
       1531
     ]
+  },
+  "provenance": {
+    "source_sha256": "111fa4dfc6145a832011f13f1401d94317c2c73d417e487d315781884993acb0",
+    "ai_commit": "4898dc0941dd",
+    "ai_tools": {
+      "claude-code": 28
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "Co-authored-by: Claude <noreply@anthropic.com>",
+    "span": [
+      1504,
+      1531
+    ]
   }
 }

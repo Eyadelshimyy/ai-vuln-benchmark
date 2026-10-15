@@ -24,5 +24,19 @@
       8311,
       8328
     ]
+  },
+  "provenance": {
+    "source_sha256": "80aab82c255d785e8dc1c4b8cb82c4f2305640674073f9a6e38508b36127f9ef",
+    "ai_commit": "3cd7dbf07eca",
+    "ai_tools": {
+      "claude-code": 10
+    },
+    "ai_line_fraction": 0.556,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      8311,
+      8328
+    ]
   }
 }

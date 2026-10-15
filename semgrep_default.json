@@ -1,0 +1,6116 @@
+{
+  "tool": "semgrep-fullrepo",
+  "config": "p/default",
+  "TP": 22,
+  "FP": 103,
+  "FN": 84,
+  "TN": 1007,
+  "precision": 0.176,
+  "recall": 0.20754716981132076,
+  "fpr": 0.09279279279279279,
+  "accuracy": 0.8462171052631579,
+  "per_cwe": {
+    "CWE-22": {
+      "recall_num": 6,
+      "recall_den": 50
+    },
+    "CWE-918": {
+      "recall_num": 17,
+      "recall_den": 19
+    },
+    "CWE-78": {
+      "recall_num": 2,
+      "recall_den": 38
+    },
+    "CWE-89": {
+      "recall_num": 3,
+      "recall_den": 4
+    },
+    "CWE-611": {
+      "recall_num": 0,
+      "recall_den": 5
+    }
+  },
+  "predictions": [
+    {
+      "file": "2100preet__stockscanner/odte_scanner__alert_pulse.py__pulse_desk_alerts.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__alerts__dispatcher.py___save_seen.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__alerts__telegram.py__send_telegram_text.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__alerts__whatsapp.py___send_callmebot.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__alerts__whatsapp.py___send_meta.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__alerts__whatsapp.py___send_twilio.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__challenge__tracker.py__save.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__config.py__load_config.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__data__polygon.py___get.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__data__tradier.py__fetch_clock.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__data__tradier.py__fetch_expirations.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__data__tradier.py__fetch_history.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__data__tradier.py__fetch_strikes.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__echo__chain_ladder.py__save_cached_ladder.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__echo__darkpool.py___cache_set.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__echo__darkpool.py___finra_post.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__options__yahoo_session.py___persist_crumb.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__scanner.py___persist.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__signals__sure_winners.py__save_day_store.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__signals__unusual_whales.py__fetch_flow_per_expiry.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__signals__unusual_whales.py__fetch_market_tide.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__trading__rec_log.py__save.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__trading__webull.py__save.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__ui.py___job.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__ui.py__run_ui.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/odte_scanner__ui.py__trigger_scan.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "2100preet__stockscanner/scripts__extract_signal_desk.py__main.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "AIfromScratch__qsent/src__qsf__ingestion__news_alphavantage.py__get_articles.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "AIfromScratch__qsent/src__qsf__ingestion__news_marketaux.py__get_articles.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "AIfromScratch__qsent/src__qsf__ingestion__news_massive.py__get_articles.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ContextualWisdomLab__fast-mlsirm/python__fast_mlsirm__io.py___open_stable_input.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ContextualWisdomLab__fast-mlsirm/python__fast_mlsirm__io.py___validate_numpy_stream.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ContextualWisdomLab__fast-mlsirm/tools__classify_renames_and_defaults.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ContextualWisdomLab__fast-mlsirm/tools__inventory_public_api.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ContextualWisdomLab__fast-mlsirm/tools__license_inventory.py__bind_upstream_license_files.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ContextualWisdomLab__fast-mlsirm/tools__license_inventory.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ContextualWisdomLab__fast-mlsirm/tools__license_inventory.py__read_crate_license_files.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/fixtures__synthetic__generate.py___fixed_zip.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/fixtures__synthetic__generate.py__audit_pdf.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/fixtures__synthetic__generate.py__form_image.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/fixtures__synthetic__generate.py__line_image.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/fixtures__synthetic__generate.py__page_image.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/fixtures__synthetic__generate.py__register_csv.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/fixtures__synthetic__generate.py__scanned_letter_pdf.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/src__womblex__cli__serve.py__cmd_serve.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/src__womblex__cli__ui.py__cmd_ui.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/src__womblex__cloud__stage_runner.py___run_unit.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/src__womblex__cloud__stage_runner.py__run_stage_local.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/src__womblex__cloud__workflow_plan.py___estimate.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/src__womblex__cloud__workflow_store.py___write.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/src__womblex__cloud__workflow_store.py__delete.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/src__womblex__cloud__workflow_store.py__list.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/src__womblex__ingest__gnaf.py___has_header_row.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/src__womblex__ingest__layout_onnx.py__analyze.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/src__womblex__ingest__pdf___image.py____init__.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/src__womblex__ingest__pdf___pdfium_doc.py__open_document.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/src__womblex__process__ground_truth.py___units_for_document.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/src__womblex__store__build_info.py___git.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/src__womblex__store__egress.py___write_egress_manifest.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/src__womblex__store__ground_truth_output.py__write_sidecar.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/src__womblex__store__remote.py__read_parquet_footer.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/src__womblex__store__remote.py__write_stream.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/src__womblex__ui__readers.py__save_preset.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "DeepCivic__womblex/src__womblex__utils__checksum.py__sha256_file.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "FrancescoCiulla__NLWeb/code__python__misc__podcast_scraper.py__get_page.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "FrancescoCiulla__NLWeb/code__python__misc__podcast_scraper.py__save_to_tsv.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__alembic__versions__022_phase20_finding_key.py__upgrade.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__alembic__versions__026_phase38_lead_relationships.py__upgrade.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__adapters__discovery__ityfuzz.py___execute_campaign.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__adapters__discovery__runtime.py___execute.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__adapters__hackerone__intents.py___store_bytes.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__adapters__proxies__burp.py___from_xml.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__adapters__security_tools__zap.py___execute.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__discovery__bounty__compiler_diff.py__version.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__discovery__bounty__solc_resolve.py__reported_version.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__discovery__bounty__solc_resolve.py__supported_evm_versions.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__execution__docker_executor.py__local_image_present.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__parsing__solidity_compiler.py__run_solc_standard_json.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__parsing__solidity_replay.py___execute.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__parsing__solidity_replay.py___run_in_docker.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__parsing__solidity_replay.py___sanitize_tree.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__parsing__solidity_verification.py___forge_runner.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__parsing__solidity_verification.py___solc_runner.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__parsing__solidity_verification.py__tool_version.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__repositories__hackerone_repo.py___program_row.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__repositories__hackerone_repo.py__get_submission.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__repositories__hackerone_repo.py__list_programs.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__repositories__hackerone_repo.py__save_submission.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__repositories__security_agent_repo.py___replace_exploratory.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__repositories__security_agent_repo.py__load_row.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__repositories__security_finding_repo.py___load_existing_by_key.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__repositories__security_finding_repo.py__competing_findings.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__repositories__security_finding_repo.py__get_by_key.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__repositories__security_finding_repo.py__get_for_update.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__repositories__security_finding_repo.py__list_for_analysis.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__repositories__security_finding_repo.py__list_for_project.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__security_agent__benchmark.py__run_benchmark.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__security_agent__executors.py___repo_commit.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__security_agent__executors.py___reproduce.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__security_agent__executors.py__run.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__security_agent__leads.py__load_project_leads.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__security_agent__reproduction.py__execute_reproduction.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__security_testing__exploratory.py__prepare_foundry_workspace.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Gunrunner444__BugForge/backend__app__security_testing__screenshots.py__save.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Mashi007__pagos/backend__app__api__v1__endpoints__cobros__reportados_dedup_helpers.py___cedulas_en_clientes_matching_norms.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Mashi007__pagos/backend__app__api__v1__endpoints__cobros__reportados_dedup_helpers.py___query_reportados_falla_validadores_pendientes_exportar.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Mashi007__pagos/backend__app__api__v1__endpoints__revision_manual__routes.py__get_pagos_por_cedula.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Mashi007__pagos/backend__app__services__cobranzas__pagos_confirmados_manual_service.py__load_manual_pagos_confirmados_map.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Mashi007__pagos/backend__app__services__estado_cuenta_datos.py__cedula_tiene_algun_prestamo_desistimiento.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Mashi007__pagos/backend__app__services__prestamo_candidatos_drive_validadores.py___conteo_prestamos_por_cedula_norm_filtrado.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Mashi007__pagos/backend__app__services__prestamo_candidatos_drive_validadores.py__conteo_prestamos_desistimiento_por_cedula_norm.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Mashi007__pagos/backend__app__services__prestamo_candidatos_drive_validadores.py__conteo_prestamos_liquidados_por_cedula_norm.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Mashi007__pagos/backend__app__services__prestamo_candidatos_drive_validadores.py__conteo_prestamos_no_liquidado_terminado_por_cedula_norm.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Mashi007__pagos/backend__app__services__prestamo_candidatos_drive_validadores.py__conteos_cupo_para_una_cedula.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Mashi007__pagos/backend__app__services__prestamos__cupo_cedula_aprobados.py__claves_cedula_con_n_aprobados_en_cartera.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "Mashi007__pagos/backend__app__services__prestamos__cupo_cedula_aprobados.py__claves_cedula_con_n_prestamos_en_cartera.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "Mashi007__pagos/backend__app__services__prestamos__cupo_cedula_aprobados.py__claves_cedula_cupo_aprobado_excedido_en_cartera.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "Mashi007__pagos/backend__app__services__prestamos__cupo_cedula_aprobados.py__contar_aprobados_misma_clave_cupo.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "Mashi007__pagos/backend__app__services__prestamos__cupo_cedula_aprobados.py__contar_aprobados_por_claves_cupo.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "Mashi007__pagos/backend__app__services__prestamos__prestamos_por_cedula_titular.py__prestamo_ids_activos_por_cedulas_batch.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Mashi007__pagos/backend__app__services__prestamos__prestamos_por_cedula_titular.py__select_prestamo_ids_por_cedula_titular.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Mashi007__pagos/backend__app__services__recibos_conciliacion_email_job.py__listar_pagos_recibos_ventana.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Neotech3000__led-matrix/matrix_deck____main__.py___pids_from_lsof.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Neotech3000__led-matrix/matrix_deck____main__.py___pids_from_netstat.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Neotech3000__led-matrix/matrix_deck____main__.py___redirect_gui_logs.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Neotech3000__led-matrix/matrix_deck____main__.py__free_listen_port.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Neotech3000__led-matrix/matrix_deck__hardware.py____init__.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Neotech3000__led-matrix/matrix_deck__hardware.py___darwin_ioreg_matrices.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Neotech3000__led-matrix/matrix_deck__window.py__fetch_health.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "Neotech3000__led-matrix/matrix_deck__window.py__open_window.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "Neotech3000__led-matrix/matrix_deck__window.py__request_quit.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/can_logger__p0__a2l_probe.py__load_measurement_summary.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_capture__backends.py___run_pyxcp_import_probe.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_capture__backends.py__start.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_capture__config_store.py___write_config_file.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_capture__config_store.py__write_recent.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_capture__runtime_smoke.py___production_pya2l_import_probe.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_capture__runtime_smoke.py__run.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_capture__session.py__write_sidecar.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_capture__thresholds.py__save_user_settings.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_ui__main_window___connection_mixin.py___warn_connection_preconditions.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_ui__main_window___settings_mixin.py___open_settings_dialog.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_ui__main_window___settings_mixin.py___show_dropped_frames_prompt.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_ui__main_window___settings_mixin.py___warn_a2l_load_problems.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_ui__main_window__window.py___open_review_modal.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_ui__review_modal.py___show_archive_failure.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_ui__review_modal.py___show_discard_confirm.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_ui__review_modal.py___write_manifest_entry.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__batch_manifest.py__sha256_file.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__batch_preset_io.py__save_preset_to_json.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__help____init__.py___open_in_browser.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__io__asc_can_format.py___preflight_asc_format.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__io__mat_format.py___detect_version.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__ui__drawers__batch__runner_thread.py__run.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__ui__heatmap_color_coordinator.py___anchor_request.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__ui__pg_canvas___perf_probe.py___emit.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__ui__pg_canvas__line_canvas.py___enable_idle_quality.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__ui__pg_canvas__quality.py___open_aa_backstop_epoch.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/scripts__probe_aa_ink_budget.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/scripts__probe_switch_smoothness.py___emit.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/scripts__probe_view_switch_quality.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/tools__build_icons.py__build_icns.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/tools__build_icons.py__build_ico.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/tools__make_wwt_display_trailer.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/tools__matlab_ports__emit_wwt_export_candidates.py___emit_inplace_trials.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/tools__matlab_ports__emit_wwt_export_candidates.py___emit_mutate_real.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/tools__matlab_ports__emit_wwt_timeaxis_probes.py__emit_g.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/tools__matlab_ports__emit_wwt_timeaxis_probes.py__emit_h.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "PrjBbrosa__data-analyzer/tools__measure_windows_startup.py___kill_process_tree.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__abrp.py__send.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__client.py__relogin.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__crypto.py__load_or_create_key.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___backfill_charge_odometer.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___backfill_null_vehicle_id.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___backfill_trip_geohashes.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___backfill_trip_readings.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___backfill_vehicle_capacity.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___capacity_for_new_vehicle.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___charging_end_in_window.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___drop_phantom_charges.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___final_park_run.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___last_charging_soc.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___last_energising_soc.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___learned_wallbox_location.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___repair_bogus_wallbox_energy.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___repair_charges_anchored_below_the_detection_floor.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___repair_negative_efficiency.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___repair_odometer_trips.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___repair_phantom_zero_soc_charges.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___repair_quantized_trip_distance.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___repair_reev_engine_efficiency.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___repair_rows_written_from_a_misread_map.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___repair_snap_to_full_charges.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___repair_trips_given_a_cloud_energy_that_doubles_the_battery.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___repair_zero_range_beside_charge.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py___write_trip_end.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__accumulate_wallbox_energy.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__add_trip_position.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__charge_end_from_last_charging.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__charge_open_since.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__charge_stopped_adding_at.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__create_charge.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__create_reconstructed_charge.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__create_reconstructed_trip.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__create_trip.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__delete_trip.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__dominant_coord_signs.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__ensure_vehicle.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__factory_reset.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__get_abilities.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__get_battery_capacity.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__get_car_type.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__get_last_frame_ts.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__get_last_odometer_reading.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__get_last_soc.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__get_open_charge.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__get_open_trip.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__get_or_create_device_id.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__insert_energy_snapshot.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__last_energy_snapshot.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__prune_poll_log.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__prune_positions.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__prune_raw_signals.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__save_position.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__set_battery_capacity.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__set_charge_wallbox_start.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__set_setting.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__db.py__update_charge_max_power.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__events.py___prune_where.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__events.py__clamp_cursors.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__main.py___climate_ctx_from_db.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__outside_temp.py__fetch_current_temp.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__seed_demo.py__charge.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__seed_demo.py__drive.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__seed_demo.py__pos.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__session_share.py___read_bytes.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__session_share.py___restore.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__session_share.py___save.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__session_share.py___write_bytes.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/poller__session_share.py__ensure_account_cert.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__charger_locator.py___ocm_stations.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__charger_locator.py___pun_query.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__charger_locator.py___query.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__charger_locator.py___tomtom_stations.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__charger_locator.py__ocm_station_by_id.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__charger_locator.py__test_ocm_key.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__charger_locator.py__test_tomtom_key.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__command_client.py___send_ac_on.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__command_client.py__ac_off.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__command_client.py__ac_on.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__command_client.py__quick_vent.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__command_client.py__save_charge_schedule.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__command_client.py__save_climate_schedule.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__command_client.py__seat_comfort.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__command_client.py__send_destination.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__command_client.py__set_charge_limit.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__command_client.py__set_climate_temp.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__command_client.py__set_prepare_car_schedule.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__command_client.py__windshield_defrost.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__crypto.py__load_or_create_key.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___add_context.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___charge_active_window.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___charge_children_by_parent.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___charge_energy_below_soc.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___charge_has_active_use.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___charge_has_soc_jump.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___charge_moments.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___charge_temp_odo.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___charges_have_cost_manual.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___charges_have_gross.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___charges_have_gross_from.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___children_by_parent.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___command_moments.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___current_vehicle_id.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___data_version.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___dynamic_sensor_cost.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___ensure_command_log.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___ensure_fuel_detected.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___ensure_fuel_purchases.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___flush_fuel_run.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___fuel_before_pct.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___km_since_previous_map.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___learned_wallbox_location.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___merged_piece_ids.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___next_charge_start_utc.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___priced_euros.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___recovered_in_window.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___reev_stock_rows.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___route_geohash_cells.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___segment_ids.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___selected_or_first.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___trip_blended_rate_fn.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___trip_fuel_rate_fn.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___trip_moments.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___trip_stop_charges.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py___wallbox_home_charges_raw.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__add_fuel_purchase.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__add_logbook_note.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__add_manual_charge.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__apply_ec_trip_energy.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__assign_charging_place.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__auto_confirm_home_charges.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__boost_selected_car.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__charges_with_power.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__charging_places_context.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__checkpoint.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__command_responsiveness.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__confirm_fuel_detected.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__count_raw_signals.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__delete_charge.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__delete_fuel_purchase.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__delete_trip.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__dismiss_fuel_detected.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__fuel_blended_price_at.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__generate_fuel_auto_note.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_adjacent_trips.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_all_track.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_battery_capacity_kwh.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_charge.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_charge_local_date.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_charge_location.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_charge_power_curve.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_charge_prices.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_charge_stats.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_charges.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_first_trip_date.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_first_trip_ts.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_frequent_places.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_fuel_purchase.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_fuel_totals_between.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_labelled_charges_missing_url.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_labelled_locations.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_last_charge_end.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_location_lookup_candidates.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_logbook.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_merge_preview_route.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_mergeable_pairs.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_month_track.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_monthly_stats.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_or_create_device_id.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_position_near.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_raw_signal_rows.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_setting.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_trip_local_date.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_trip_points_for_elevation.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_trip_route.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_trip_track.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_trip_years.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_trips.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_trips_needing_ec.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_trips_needing_elevation.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_trips_summary.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__get_vehicle.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__has_location_lookup_candidates.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__is_home_charge.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__join_charges_split_by_a_pause.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__latest_charge_id_with_power.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__latest_fuel_liters.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__latest_fuel_pct.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__latest_home_charge_cost.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__latest_raw_signals.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__list_fuel_detected.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__list_fuel_purchases.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__log_command.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__merge_charges.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__merge_trips.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__newest_unconfirmed_charge_id.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__open_charge.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__preview_merge.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__preview_merge_charges.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__price_default_home_charges.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__reev_actual_spend.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__reev_total_consumption.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__repair_merged_charge_pieces.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__research_cloud_trip_records.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__research_fuel_purchases.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__revert_ec_trip_energy.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__revert_trip_ec.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__save_charge_note.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__save_charging_place.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__save_trip_note.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__set_charge_cost.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__set_charge_free.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__set_charge_gross_kwh.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__set_charge_location_url.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__set_charge_solar_kwh.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__set_setting.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__set_vehicle_capacity_current.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__store_trip_ec.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__store_trip_elevation.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__trip_ec_window.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__trip_group.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__trip_local_start_hhmm.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__trip_outside_temp_samples.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__unconfirmed_charges_count.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__unmerge_charges.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__unmerge_trip.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__update_manual_charge.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__upsert_vehicle.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__wallbox_power_samples.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__db_reader.py__write_optimistic_status.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__demo.py__set_flag.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__diagnostics.py___cost_wallbox_section.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__diagnostics.py___count.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__diagnostics.py___rows_cutoff.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__diagnostics.py___soc_daily_section.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__diagnostics.py___temperature_line.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__diagnostics.py__read_full_log.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__diagnostics.py__read_log_tail.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__elevation_enrich.py__fetch_elevations.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__elevation_enrich.py__fetch_trip_temperature.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__ha_client.py___request.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__main.py__charge_place_picker.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__maintenance.py___ensure_table.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__maintenance.py__add_log.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__maintenance.py__delete_log.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__maintenance.py__get_baseline.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__maintenance.py__latest_logs.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__session_share.py___read_bytes.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__session_share.py___restore.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__session_share.py___save.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__session_share.py___write_bytes.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__session_share.py__ensure_account_cert.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "ProtossBlaster__leapmotor-mate/web__update_check.py___refresh_for.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "VibeBB__fpga-agent/plugins__fpga__hooks__scripts__record_image_observation.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/plugins__fpga__hooks__scripts__record_vision_tool_event.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/plugins__fpga__scripts__fpga_launcher.py___docker_info_security_options.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/plugins__fpga__scripts__fpga_launcher.py___ensure_image.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/plugins__fpga__scripts__fpga_launcher.py___run_timed.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__bump_version.py___apply.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__bump_version.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__check_dependency_updates.py___default_list_remote_tags.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__check_dependency_updates.py___default_run_uv.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__check_dependency_updates.py__load_deferrals.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__check_dependency_updates.py__lock_versions.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__check_dependency_updates.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__container_hardening_markdown.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__container_hardening_report.py___load.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__extract_device_profiles.py___gowin_pins.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__extract_device_profiles.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__fetch_hdl_libraries.py__fetch.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__library_smoke.py__synth_unit.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__measure_image_tools.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__measure_image_tools.py__measure.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__mutation_probe.py___pytest.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__mutation_probe.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__mutation_probe.py__run.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__package_level_sbom.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__pull_locked_image.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__structural_coverage.py__dump.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__structural_coverage.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__structural_coverage.py__report.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__structural_coverage.py__run.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__trivy_gate_summary.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/scripts__update_image_digest_lock.py__update_lock.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/src__fpga___envelope.py__write_envelope.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/src__fpga__coverage.py__cobertura_counts.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/src__fpga__doctor.py___probe.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/src__fpga__flow.py__synthesize.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/src__fpga__formal.py__run_formal.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/src__fpga__gates.py__spdx_ids.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/src__fpga__mcp_server.py___run.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/src__fpga__records.py___append.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/src__fpga__render.py__write_png.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/src__fpga__requests.py__write_request.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/src__fpga__sim_thermal.py__write_sim_request.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VibeBB__fpga-agent/src__fpga__toolrun.py__run_tool.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__audio__pipewire.py___run_host_command.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__audio__pipewire.py___test_pipewire_input.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__audio__pipewire.py__reopen.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__speech_recognition__diarization.py___load_wav.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__speech_recognition__diarization.py___load_with_ffmpeg.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__speech_recognition__recognition_manager.py___open.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__text_injection__ibus_engine.py___query_xserver_xkb_rules.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__text_injection__ibus_engine.py___read_gnome_input_sources_key.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__text_injection__ibus_engine.py___resolve_registered_xkb_engine.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__text_injection__ibus_engine.py__get_current_engine.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__text_injection__ibus_engine.py__get_current_xkb_layout.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__text_injection__ibus_engine.py__is_engine_active.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__text_injection__ibus_engine.py__is_ibus_daemon_running.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__text_injection__ibus_engine.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__text_injection__ibus_engine.py__restore_xkb_layout.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__text_injection__ibus_engine.py__start_ibus_daemon.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__text_injection__ibus_engine.py__switch_engine.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__text_injection__remote_desktop_portal.py___load_restore_token.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__text_injection__remote_desktop_portal.py___save_restore_token.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__text_injection__text_injector.py___clear_clipboard.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__text_injection__text_injector.py___kde_virtual_keyboard_enabled.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__text_injection__text_injector.py___read_clipboard.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__text_injection__text_injector.py___switch_to_non_ibus_backend.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__ui__config_manager.py__load_config.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__ui__keyboard_backends__evdev_backend.py____init__.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__ui__keyboard_backends__evdev_backend.py__find_keyboard_devices.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__ui__logging_dialog.py___confirm_replace.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__ui__logging_dialog.py___export_logs.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__ui__settings_dialog.py___on_power_user_toggled.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__ui__settings_dialog.py___on_test_proxy_connection.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__ui__settings_dialog.py__test_connection.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__ui__transcript_dialog.py___confirm_replace.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__ui__transcript_dialog.py___save_to_file.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__ui__transcription_history.py___load_store.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__ui__tray_indicator.py___on_transcribe_file_clicked.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__utils__proxy.py___gsettings_proxy_values.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__utils__system_language.py___gsettings_get.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__utils__system_language.py__detect_keyboard_layout.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "VocaHQ__vocalinux/src__vocalinux__utils__update_checker.py___fetch_stable_from_releases_page.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__destination-duckdb__integration_tests__integration_test.py__test_large_number_of_writes.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__destination-duckdb__integration_tests__integration_test.py__test_write.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__destination-glassflow__integration_tests__integration_test.py__test_check_fails.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__destination-glassflow__integration_tests__integration_test.py__test_check_succeeds.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__destination-glassflow__integration_tests__integration_test.py__test_write.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__destination-motherduck__unit_tests__test_serialize_object_columns.py__test_serialize_object_columns_normalized_column_names.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__destination-motherduck__unit_tests__test_serialize_object_columns.py__test_serialize_object_columns_prevents_empty_struct_error.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__destination-sqlite__destination_sqlite__destination.py__check.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-amazon-ads__unit_tests__integrations__test_report_streams.py__test_given_425_naming_report_that_differs_from_request_then_waits_and_requests_new_report.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-amazon-ads__unit_tests__integrations__test_report_streams.py__test_given_425_without_report_id_on_report_creation_then_fails_with_transient_error.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-amazon-ads__unit_tests__integrations__test_report_streams.py__test_given_425_without_report_id_then_waits_and_requests_report_again.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-amazon-seller-partner__components.py___fetch_failure_reason.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-amazon-seller-partner__components.py___fetch_rdt_token.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-appsflyer__source_appsflyer__source.py__check_connection.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-bing-ads__components.py__decode.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-box-data-extract__source_box_data_extract__box_api.py___do_request.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-facebook-marketing__source_facebook_marketing__api.py__call.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-facebook-marketing__source_facebook_marketing__streams__patches.py__load_next_page.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-facebook-marketing__unit_tests__test_api.py__test_call_quota_block_budget_spans_backoff_retries.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-facebook-marketing__unit_tests__test_streams.py__test_ad_creatives_from_ads_repeated_failed_creative_remains_a_failure.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-facebook-pages__unit_tests__test_manifest_page_fields.py___load_page_property_list.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-gcs__integration_tests__conftest.py__connector_setup_fixture.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-gcs__source_gcs__stream_reader.py___open_gzip_encoded_blob.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-gcs__source_gcs__stream_reader.py__open_file.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-gcs__unit_tests__test_zip_helper.py__test_filename_collision_shared_tmp_dir.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-github__unit_tests__test_manifest_parent_child_streams.py__test_issue_timeline_events_collapse_a_page_into_one_record.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-github__unit_tests__test_manifest_special_incremental_streams.py__test_contributor_activity_reads_the_response_fixture.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-gmail__unit_tests__test_streams.py__test_api_budget_weighs_each_call_by_its_gmail_quota_cost.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-greenhouse__unit_tests__test_pagination.py__test_documented_v3_examples_validate_against_stream_schemas.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-greenhouse__unit_tests__test_pagination.py__test_scorecard_question_answers_value_is_always_a_string.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-jira__components.py___resolve_cloud_id.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-microsoft-dataverse__source_microsoft_dataverse__dataverse.py___execute_batch_datetime_request.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-monday__components.py___migrate_legacy_token.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-pinterest__unit_tests__test_config_migrations.py___load_migration_template.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-pinterest__unit_tests__test_config_migrations.py__test_manifest_has_config_normalization_rules.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-pinterest__unit_tests__test_config_migrations.py__test_manifest_has_window_days_migration.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-pinterest__unit_tests__test_config_migrations.py__test_spec_default_values_are_integers.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-reddit-ads__unit_tests__test_manifest_config.py__test_api_budget_resolves_separate_campaign_and_report_policies.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-salesforce__unit_tests__test_rate_limiting.py___create_backoff_exception.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-shopify__source_shopify__shopify_graphql__bulk__external_sort.py___iter_run.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-shopify__unit_tests__graphql_bulk__test_query.py__test_bulk_query_prepare.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/airbyte-integrations__connectors__source-tiktok-marketing__unit_tests__test_source.py__test_51004_retry_handlers_also_retry_51002.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/tools__schema_generator__schema_generator__configure_catalog.py__configure_catalog.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "airbytehq__airbyte/tools__schema_generator__schema_generator__infer_schemas.py__infer_schemas.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__clave/src__clave__benchmark__pack.py__write.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__clave/src__clave__candidates__bench.py___machine.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__clave/src__clave__corpus__artifacts.py__digest_of.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__clave/src__clave__data__dataset.py___describe.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__clave/src__clave__demo__still.py__write_png.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__clave/src__clave__demo__video.py____init__.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__clave/src__clave__experiment__run.py__write.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__clave/src__clave__runtime__bridge.py____enter__.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__clave/src__clave__runtime__loop.py__write_record.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__clave/src__clave__runtime__play.py__play.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__clave/src__clave__sim__overlay.py___write_beliefs.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__clave/src__clave__sim__report.py___git.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/scripts__evidence_dubins_physics_seed.py___run_physics.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/scripts__gen_plotjuggler_layouts.py___write.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/scripts__generate_dubins_race_mjcf.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/scripts__generate_dubins_warehouse_layout.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/scripts__plot_telemetry.py___load_csv.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/scripts__release__audit_showcase_renders.py___wall_contact_rate.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/scripts__release__render_gallery.py___simulate_dubins.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/scripts__release__render_showcase.py__render_scenario.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/scripts__render_mujoco.py__apply_realtime_video_speedup.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/scripts__render_mujoco.py__write_showcase_timing_json.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/scripts__render_omy_honest_physics.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/scripts__vision_algorithm_figures.py__render_markdown.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/scripts__vision_web_ball_gallery.py___download.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "alexandrelheinen__fret/scripts__vision_web_ball_gallery.py___upload_r2.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/src__fret___cli.py__fretsim.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/src__fret__config_loader.py__load_yaml_file.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/src__fret__control__controller_node.py___load_config.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/src__fret__mjcf__omx.py__ensure_omx_mjcf.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/src__fret__mjcf__omy.py__ensure_omy_mjcf.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/src__fret__ros__dubins_race_node.py___controller_update_rate.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/src__fret__ros__mujoco_bridge.py___load_bridge_config.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/src__fret__ros__mujoco_physics_log.py____init__.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/src__fret__ros__mujoco_physics_log.py__close.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/src__fret__ros__mujoco_physics_log.py__column_contacts_logged.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/src__fret__ros__perception_bridge.py___load_config.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/src__fret__sitl_config.py__load_scenario_parameters.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/src__fret__telemetry__session.py___write_csv.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "alexandrelheinen__fret/src__fret__telemetry__session.py___write_manifest.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "banknit123__New_Billsure/backend__scheduler.py___run_locked.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "banknit123__New_Billsure/backend__supabase_db.py__count_documents.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "banknit123__New_Billsure/backend__supabase_db.py__delete_many.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "banknit123__New_Billsure/backend__supabase_db.py__delete_one.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "banknit123__New_Billsure/backend__supabase_db.py__find_many.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "banknit123__New_Billsure/backend__supabase_db.py__find_one.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "banknit123__New_Billsure/backend__supabase_db.py__find_with_fields.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "banknit123__New_Billsure/backend__supabase_db.py__increment_active_plan_totals.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "banknit123__New_Billsure/backend__supabase_db.py__increment_wallet_balance.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "banknit123__New_Billsure/backend__supabase_db.py__insert_many.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "banknit123__New_Billsure/backend__supabase_db.py__update_many.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "banknit123__New_Billsure/backend__supabase_db.py__update_one.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "bramstroker__homeassistant-powercalc/custom_components__powercalc__power_profile__loader__profile_cache.py___sync_directory.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "bramstroker__homeassistant-powercalc/custom_components__powercalc__power_profile__loader__remote.py___load_profile_hashes.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "bramstroker__homeassistant-powercalc/custom_components__powercalc__power_profile__loader__remote.py___read_local_library_json.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "bramstroker__homeassistant-powercalc/utils__library__build_info_table.py__write_md_table.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "bramstroker__homeassistant-powercalc/utils__library__common.py___read_model_json.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "bramstroker__homeassistant-powercalc/utils__library__extract_device_specs.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "bramstroker__homeassistant-powercalc/utils__library__update_library.py__get_manufacturer_json.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "bramstroker__homeassistant-powercalc/utils__library__update_library.py__update_translations.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "briandconnelly__skills/pi-coding-agent__scripts__check_drift.py__pi_help.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "briandconnelly__skills/pi-coding-agent__scripts__drift_report.py___gh.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "briandconnelly__skills/pi-coding-agent__scripts__pi_gate.py____init__.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "briandconnelly__skills/pi-coding-agent__scripts__pi_gate.py___entry.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "briandconnelly__skills/pi-coding-agent__scripts__pi_gate.py___listed_mcp_checks.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "briandconnelly__skills/pi-coding-agent__scripts__pi_gate.py__flag_checks.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "briandconnelly__skills/pi-coding-agent__scripts__pi_gate.py__observe.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "briandconnelly__skills/pi-coding-agent__scripts__pi_gate.py__original_mcp_checks.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "briandconnelly__skills/vega-lite__scripts__render.py___render_stage.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "briandconnelly__skills/vega-lite__scripts__render.py__load_schema.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "chikolavosaki-sys__canopy-mapping-rover/datasets__download_scripts__check_links.py__check.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "clarmso__openings.info/crawl.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "clarmso__openings.info/scripts__ai_canada.py___load_cache.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "clarmso__openings.info/scripts__ai_canada.py___run_copilot_cli.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "clarmso__openings.info/scripts__ai_canada.py___save_cache.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "clarmso__openings.info/scripts__generate_companies_page.py___build_manifest.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "clarmso__openings.info/scripts__generate_companies_page.py___load_open_ids.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "clarmso__openings.info/scripts__generate_companies_page.py___scan_company_jobs.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "clarmso__openings.info/scripts__generate_companies_page.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "clarmso__openings.info/scripts__generate_new_jobs.py___build_manifest.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "clarmso__openings.info/scripts__generate_new_jobs.py___load_ats_by_slug.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "clarmso__openings.info/scripts__generate_new_jobs.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "clarmso__openings.info/scripts__post_social.py___bluesky_create_session.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "clarmso__openings.info/scripts__post_social.py___load_state.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "clarmso__openings.info/scripts__post_social.py___post_bluesky.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "clarmso__openings.info/scripts__post_social.py___post_mastodon.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "clarmso__openings.info/scripts__post_social.py___save_state.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "clarmso__openings.info/scripts__post_social.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "clarmso__openings.info/src__crawl____init__.py___fetch_jobs_personio.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "clarmso__openings.info/src__crawl____init__.py___fetch_jobs_trakstar.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "clarmso__openings.info/src__crawl____init__.py___write_open_jobs_state.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "clarmso__openings.info/src__crawl____init__.py__crawl.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "clarmso__openings.info/src__http.py___fetch.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "danielreuter__research-notes/bundles__20260926T2231Z-bench-spine-pr91-placement.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/bundles__20260926T2231Z-bench-spine-pr91-placement.py__remote_probe.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/bundles__20260926T2250Z-bench-spine-pr91-placement.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/bundles__20260926T2250Z-bench-spine-pr91-placement.py__remote_probe.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/campaigns__pouw__price-twins-lean__gen_kernel_gamma.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/campaigns__pouw__price-twins-lean__v1-hot__gen_v1hot_gamma.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/campaigns__pouw__price-twins-lean__v2-hot__gen_hot_gamma.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/campaigns__pouw__red-team__basesplit_sparse_pattern_ops.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/campaigns__pouw__red-team__divsqrt_ftz_check.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/campaigns__pouw__red-team__f1prime_mc_check.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/campaigns__pouw__red-team__gemm_fill_summary.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/campaigns__pouw__red-team__hot_deep.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/campaigns__pouw__red-team__hot_deep_long.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/campaigns__pouw__red-team__hot_late_start.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/campaigns__pouw__red-team__nvfp4_structure_census.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/campaigns__pouw__red-team__rt_result.py__write.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/campaigns__pouw__red-team__scalar_model_check.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/campaigns__pouw__red-team__t1_closures_attack.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/campaigns__pouw__red-team__t1_closures_attack.py__merge.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/campaigns__pouw__red-team__weight_compressibility.py__tensors.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/campaigns__pouw__rtx-pro__workers__pouw-mvp-e2e__prio.py__record.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__circuits-grid-models__feeder__add_models.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__circuits-grid-models__feeder__gm_feed.py__cpu_pending.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__circuits-grid-models__feeder__gm_feed.py__log.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__circuits-grid-models__feeder__trim_build_mem.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__circuits-grid-models__feeder__twins.py__log.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__circuits-grid-models__feeder__twins.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__circuits-grid-models__labeller__label_loop.py__fill_auto.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__circuits-grid-models__labeller__label_loop.py__gather.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__circuits-grid-models__labeller__label_loop.py__node_env.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__circuits-grid-models__labeller__label_loop.py__one_pass.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__circuits-grid-models__labeller__label_loop.py__silu_cause.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__circuits-grid-models__labeller__silu_check.py__fetch.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-n2-guest__tools__refill.py__gpu_h_used.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-n2-guest__tools__refill.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-n2-guest__tools__refill.py__rsync_done.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-n2-guest__tools__refill.py__submit.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-n2-guest__tools__verify.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-n2-hill__tools__n2h.py___busy.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-n2-hill__tools__n2h.py___n2h_item.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-n2-hill__tools__n2h.py___proc.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-n2-hill__tools__n2h.py___tree.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-n2-hill__tools__n2h.py__bin_key.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-n2-hill__tools__n2h.py__launch_cpu.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-n2-hill__tools__n2h.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-n2-hill__tools__n2h.py__record.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-n2-hill__tools__n2h.py__submit.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-n2-hill__tools__n2h.py__sync_cache.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-n2-hill__tools__n2h.py__tree_dir.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-n2-hill__tools__n2h.py__update.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-n2-hill__tools__n2h.py__venv.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-rows__tools__split_measure.py__log.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-rows__tools__split_measure.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-rows__tools__split_measure.py__pod.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-rows__tools__split_measure.py__put.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-rows__tools__split_measure.py__sha256.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-rows__tools__split_measure.py__timing.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-rows__tools__stage_mark.py__finish.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-rows__tools__stage_mark.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__proofs-rows__tools__stage_mark.py__sha256.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__rec-ksweep__tools__curve.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__vllm-epoch-run__followup__digest_line.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__vllm-epoch-run__followup__fu.py__finish.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__vllm-epoch-run__followup__fu.py__launch.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__vllm-epoch-run__followup__fu.py__note_first.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__vllm-epoch-run__followup__fu.py__poll.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__vllm-epoch-run__labeller__label_loop.py__gather.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__vllm-sm120-attention__tools__nvfp4_kernel_capture_gpu.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__vllm-sm120-attention__tools__nvfp4_kernel_capture_gpu.py__sass_mma.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__vllm-sm120-kernels__tools__sm120_b_diag.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__vllm-sm120-kernels__tools__sm120_moe_bulk.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "danielreuter__research-notes/lanes__vllm-sm120-kernels__tools__sm120_tp2_live.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "hdzwzqbxlk__ComfyUI-LK-Model_Auto-Matching/build_models_db.py__collect_models_data.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "hdzwzqbxlk__ComfyUI-LK-Model_Auto-Matching/build_models_db.py__import_to_sqlite.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "hdzwzqbxlk__ComfyUI-LK-Model_Auto-Matching/build_models_db.py__write_json.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "hdzwzqbxlk__ComfyUI-LK-Model_Auto-Matching/core__config.py___load_json.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "hdzwzqbxlk__ComfyUI-LK-Model_Auto-Matching/core__database.py___load_civitai_map.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "hdzwzqbxlk__ComfyUI-LK-Model_Auto-Matching/core__database.py___migration_v1.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "hdzwzqbxlk__ComfyUI-LK-Model_Auto-Matching/core__database.py__get_schema_version.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "hdzwzqbxlk__ComfyUI-LK-Model_Auto-Matching/core__models_db_reader.py___load.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "hdzwzqbxlk__ComfyUI-LK-Model_Auto-Matching/regression_tests__matcher_config_regression.py__test_db_lookup_matches_prefix_style_filename.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "hdzwzqbxlk__ComfyUI-LK-Model_Auto-Matching/regression_tests__matcher_config_regression.py__test_db_lookup_uses_configured_semantic_threshold.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__explore.py__get_explore_document_summary.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__explore.py__limit.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__health.py__health_check.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__justices.py___run_pipeline_background.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__presidents.py___run_pipeline_background.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__public_mcp.py__run.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__rate_limit.py__check.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__rate_limit.py__public_read_limit.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__rate_limit.py__spend_upstream.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__rate_limit.py__try_spend_upstream.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__throttle.py____enter__.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__throttle.py____exit__.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__throttle.py___open.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__throttle.py___purge_expired.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__throttle.py___rotate.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__throttle.py___truncate_wal.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__throttle.py__claim.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__throttle.py__clear.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__throttle.py__held.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__throttle.py__hit.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__throttle.py__hold.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__throttle.py__take.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__throttle.py__tallied.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__throttle.py__tally.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__visits.py___load_or_create_salt.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__api__visits.py__track_visit.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__atomic_write.py__update_json_file.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__atomic_write.py__write_text_atomic.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__database.py___add_missing_baseline_columns.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__app__database.py___backfill_bsky_posted_facts.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__database.py___copy_page_load_timings.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__database.py___init_lock.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__database.py___migrate_president_ids.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__database.py___migrate_presidents_schema_rebuild.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__database.py___migrate_state_office_tables.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__app__database.py___migrate_visits_data_to_own_db.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__database.py___rekey_legacy_visitor_hashes.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__database.py___set_sqlite_pragmas.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__database.py__rekey.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__file_cache.py__read_json.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__main.py___take_pipeline_role_lock.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__member_ids.py___move.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__member_ids.py___record_alias.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__member_ids.py___rename_all.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__net_stats.py__own_totals.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__net_stats.py__run_recorder.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__ops_alerts.py__check_feedback_token_expiration.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__analyze__action_center.py___refresh_open_comment_views.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__analyze__action_center.py___resolve_url.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__analyze__bill_learning.py__record_classification.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__analyze__bluesky_utils.py__build_link_card.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__analyze__bluesky_utils.py__fetch_og_card.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__analyze__document_authority.py__update_document_authority.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__analyze__ollama_client.py___call_llama_server.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__cache.py__api_cache_set.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__congress_activity.py___senate_amended_bill.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_al.py__statement_links.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_ar.py__issue_links.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_az.py__page_words.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_az.py__pamphlet_urls.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_ca.py__names_general_election.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_ca.py__parse_quick_reference.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_ca.py__parse_title_summary.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_ca.py__proposition_links.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_ca.py__quick_reference_numbers.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_fl.py__listed_measures.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_fl.py__parse_detail.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_fl.py__search_form_fields.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_ga.py__find_booklet_url.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_ga.py__pdf_words.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_hi.py__fetch_measures.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_hi.py__parse_page.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_il.py__election_option_value.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_il.py__parse_questions_page.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_il.py__postback_form.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_in.py___summary_hrefs.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_in.py__pdf_text.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_ky.py__parse_page.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_md.py__parse_page.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_mi.py___pdf_links.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_mi.py__pdf_lines.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_mn.py__parse_page.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_mo.py__fetch_measures.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_ms.py__sample_ballot_urls.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_mt.py___first_page_text.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_mt.py___resolve_pdf.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_mt.py__qualified_issues.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_nd.py__ballot_language_links.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_ne.py__read_elections_page.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_ne.py__slip_law_url.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_nh.py__find_questions_url.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_nm.py__fetch_measures.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_nm.py__find_publication_url.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_nv.py__booklet_urls.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_oh.py__find_sample_ballot_url.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_oh.py__pdf_words.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_ok.py__next_page_form.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_ok.py__reaches_before.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_or.py__book_url.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_or.py__fetch_measures.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_ri.py__fetch_measures.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_sc.py__parse_detail.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_sc.py__statewide_rows.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_sd.py__certified_questions.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_sd.py__pamphlet_url.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_state_common.py__pdf_pages.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_state_common.py__pdf_text.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_state_common.py__pdf_text_flow.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_tx.py__parse_results.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_ut.py__find_certification_url.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_wa.py___pdf_text.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_wa.py__measure_links.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_measures_wv.py__listing_rows.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ballot_pdf.py___parse_pdf.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__committee_leadership.py___xml_root.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__congressional_record.py__speech_granules.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__cspan_historians_survey.py___parse_survey_table.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__fec.py__fetch_committee_contributions.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__floor_logs.py__parse_house_floor.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__floor_logs.py__parse_senate_floor.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__fr_rulemaking.py___fetch_body_text.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__historical_executive_orders.py___parse_eo_table.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__house_clerk.py__parse_apportionment.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__house_clerk.py__parse_caucuses.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__house_clerk.py__parse_sworn_dates.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__house_fd.py__parse_annual_pdf.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__house_leadership.py__official_names.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__house_leadership.py__parse_clerk_leadership.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__house_ptr.py___fetch_index_entries.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__president_ptr.py___parse_index.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__presidential_actions.py___fetch_body_text.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__presidential_approval.py__parse_approval_index.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__presidential_elections.py___mandates_rows.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__presidential_elections.py___parse_election_year_page.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__presidential_roster.py__parse_dates_in_office.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__ptr_common.py__parse_pdf_bytes.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__senate_classes.py__parse_senate_classes.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__senate_fd.py___as_doc.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__state_candidates_canvass_xml.py___fetch_document.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__state_candidates_canvass_xml.py___ftp_get.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__state_candidates_canvass_xml.py___ftp_list.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__state_candidates_certified_table.py___form_fields.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__state_candidates_certified_table.py___rows.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__state_candidates_certified_table.py__html_table_rows.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__state_candidates_certified_table.py__outline_rows.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__state_candidates_certified_table.py__report_grid_rows.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__state_candidates_ct.py__parse_endorsements.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__state_candidates_dos_canlist.py__parse_canlist.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__state_candidates_ms.py___parse_recap_pdf.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__state_candidates_nj.py__fetch_confirmed_candidates.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__state_candidates_oh.py__sheet_rows.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__state_candidates_or.py___federal_contests.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__state_candidates_or.py___statewide_contests.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__state_candidates_sd_vip.py___rows.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__state_candidates_totalvote.py___contests.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__state_candidates_totalvote.py__general_contests.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__state_candidates_vrems.py___rows.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__state_candidates_vrems.py___search_form.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__supreme_court.py__parse_slip_opinions.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__fetch__trending.py___fetch_google_trends.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__holdings_pipeline.py___retry_after_lapse.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__justice_pipeline.py___bundled_rows.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__lease.py__acquire.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__lexical_index.py___create_triggers.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__lexical_index.py___fts_available.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__lexical_index.py___run_backfill.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__lexical_index.py__rebuild_index.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__transform__occupation_industry.py___data.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__vector_store.py___delete_ids.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__vector_store.py___ensure_schema.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__vector_store.py___read_conn.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__vector_store.py___ready_count.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__vector_store.py___record_chunks_per_doc.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__vector_store.py___record_text_hash.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__vector_store.py___set_meta.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__vector_store.py___snapshot.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__vector_store.py___swap_tables.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__vector_store.py___writing.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__vector_store.py__clear_bills.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__vector_store.py__collection_stats.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__vector_store.py__get_bill_reference.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__vector_store.py__get_embedded_explore_ids.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__vector_store.py__get_embedded_hashes.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__vector_store.py__get_vec_conn.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__vector_store.py__index_is_whole.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__vector_store.py__purge_bills.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline__vector_store.py__update_explore_metadata.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__app__pipeline_chain.py___run_link.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__services__explore_search.py___collapse_duplicates.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__services__explore_search.py___hydrate.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__app__services__explore_search.py__full_text.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__shared_state.py__read_record.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__shared_state.py__write_row.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__app__sqlite_wal.py__switch_to_wal.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__migrations__versions__0006_trade_owner_reread.py__upgrade.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__migrations__versions__0008_retract_mixed_issues.py__upgrade.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__migrations__versions__0018_measure_coverage_freshness.py__upgrade.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__migrations__versions__0021_action_issue_iso_dates.py__upgrade.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__migrations__versions__0022_member_trade_undated.py__downgrade.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__migrations__versions__0030_issue_fact_links.py__upgrade.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__migrations__versions__0035_small_donor_share_nullable.py__downgrade.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__audit_funding_components.py__fetch.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__audit_pac_ratio.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__benchmark_validation.py__load_les.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__build_county_district_crosswalk.py__download.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__build_county_district_crosswalk.py__load_county_names.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__build_county_district_crosswalk.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__build_district_topology.py___mapshaper.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__build_district_topology.py___write_cd120_assignments.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__build_district_topology.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__build_name_casing.py__fetch.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__build_name_casing.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__calibrate_action_thresholds.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__calibrate_commemorative.py___govtrack.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__calibrate_committee_routing.py__routed_outcomes.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__calibrate_constituent_reference.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__calibrate_explore_ranking.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__calibrate_lda_bill_match.py___get.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__calibrate_lda_bill_match.py__bill_titles.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__calibrate_lda_bill_match.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__calibrate_les_credit_scale.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__calibrate_position_confidence.py___csv.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__calibrate_position_confidence.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__calibrate_position_confidence.py__nested.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__check_signal_correlations.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__check_torch_cpu_pin.py__published.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__evaluate_embedding_models.py__encode.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__evaluate_embedding_models.py__load_bill_task.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__evaluate_embedding_models.py__load_donor_task.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__evaluate_industry_classifier.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_ces_approval.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_committee_data.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_committee_jurisdictions.py___pdf_text.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_committee_jurisdictions.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_district_pvi.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_fec_party_codes.py__main.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_occupation_industry.py__crosstab.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_occupation_industry.py__fetch.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_occupation_industry.py__labels.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_occupation_industry.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_occupation_industry.py__titles.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_peer_gdp.py__main.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_poll_close_times.py__main.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_poll_close_times.py__rederive.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_senate_classes.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_site_fonts.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_state_leg_crosswalk.py___query.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_state_leg_crosswalk.py__bef_rows.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_state_leg_crosswalk.py__build_state.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_state_leg_crosswalk.py__download.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_state_leg_crosswalk.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_state_population.py__fetch_state_populations.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_state_population.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_state_pvi.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_state_small_donor_baseline.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__fetch_statewide_district_towns.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__rescore.py__attach_live_references.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__rescore.py__load_fec_caches.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__research_constituent_alignment.py__fetch.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__research_justice_loyalty.py___tenure.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__research_justice_loyalty.py__fetch.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__research_justice_loyalty.py__write_bundle.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__research_les_stage_classifier.py___bills.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__research_les_stage_classifier.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "kamoras__civitas/backend__scripts__research_president_scores.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "loveRhythm1990__mini-pi/01-loop__src__main.py__execute_bash.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "loveRhythm1990__mini-pi/02-providers__src__main.py__execute_bash.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "loveRhythm1990__mini-pi/03-tools__src__test_tools.py__test_bash_cwd.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "loveRhythm1990__mini-pi/03-tools__src__test_tools.py__test_concurrent_edit.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "loveRhythm1990__mini-pi/03-tools__src__test_tools.py__test_edit_multiple_matches.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "loveRhythm1990__mini-pi/03-tools__src__test_tools.py__test_edit_success.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "loveRhythm1990__mini-pi/03-tools__src__test_tools.py__test_write.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "loveRhythm1990__mini-pi/03-tools__src__tools.py__tool_edit.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "loveRhythm1990__mini-pi/03-tools__src__tools.py__tool_read.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "loveRhythm1990__mini-pi/03-tools__src__tools.py__tool_write.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__attachments.py___convert_to_markdown_sibling.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__attachments.py__attach_file.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__attachments.py__attach_files.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__attachments.py__remove_attachment.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__config.py__get_config.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__contacts.py___find_duplicate_shared_contact.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__contacts.py__add_contact.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__contacts.py__delete_contact.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__contacts.py__list_contacts.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__contacts.py__list_shared_contacts.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__contacts.py__update_contact.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__db.py__get_connection.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__docs_writer.py___append_action_item.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__docs_writer.py__write_note_to_disk.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__knowledge.py__save_knowledge.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__knowledge.py__sync_knowledge_templates.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__notes.py__delete_note.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__notes.py__list_notes.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__notes.py__update_note.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__project_links.py___resolve_project.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__project_links.py__get_links_for_project.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__project_links.py__link_project.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__project_links.py__unlink_project.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__projects.py__create_project.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__projects.py__delete_project.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__projects.py__get_project.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__projects.py__get_project_by_id.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__projects.py__list_projects.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__projects.py__update_project.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__report.py___render_all_projects.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__search.py__search_contacts.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__search.py__search_notes.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__session.py__clear_session.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__session.py__get_session.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__session.py__set_session.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/benchmarks__run_benchmarks.py__get_environment_info.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/demo__playwright_diffs_demo.py___start_server.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/demo__playwright_history_demo.py___set_history.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__cache__store.py___init_schema_on_conn.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__cache__store.py__count.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__cache__store.py__delete.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__cache__store.py__delete_by_prefix.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__cache__store.py__get.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__cache__store.py__has.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__cache__store.py__keys.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__cache__store.py__put.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__config.py__discover_by_project_name.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__config.py__discover_source_paths.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__control_run.py__run_control.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__control_run.py__run_unmutated.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__instrumentation__origin_finder.py___compile_tree.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__instrumentation__origin_finder.py___unpickle_tree.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__instrumentation__spawn_hook.py__write_spawn_hook.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__node_id_args.py___read_node_ids.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__parallel__fork_executor.py___execute_batch_in_fork.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__parallel__fork_executor.py__execute.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__parallel__lightweight.py__write_safe_tests.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__plugin.py___add_source_file.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__plugin.py___launch_prescan.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__plugin.py___verify_suite_loads_unmutated.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__reporting__history.py__append_history_entry.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__reporting__html.py__write_report.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__harness-discovery__evals__test_state.py__setUp.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__harness-discovery__evals__test_state.py__test_a_version_1_configuration_is_left_for_the_setup_interview.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__harness-discovery__evals__test_state.py__test_conflicting_current_state_is_refused_and_left_alone.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__harness-discovery__evals__test_state.py__test_every_fixture_migrates_to_the_current_schema.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__harness-discovery__evals__test_state.py__test_root_defaults_to_the_working_directorys_git_repository.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__harness-discovery__evals__test_state.py__test_tracked_legacy_files_move_with_git.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__harness-discovery__scripts__state.py__repository_root.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__optimize-ci__scripts__gh_ci_baseline.py__gh.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__orchestration-run__evals__test_dashboard.py__test_malformed_discovery_fails_validation_and_resolution_without_tools.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__orchestration-run__evals__test_dashboard.py__test_malformed_setup_fails_before_tools.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__orchestration-run__evals__test_dashboard.py__test_stage_skills_are_optional_validated_and_resolved.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__orchestration-run__scripts__state.py__repository_root.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__orchestration-setup__scripts__state.py__repository_root.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__pr-review-round__scripts__findings.py__gh.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__pr-review-round__scripts__land.py__enqueue.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__pr-review-round__scripts__land.py__gh.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__pr-review-round__scripts__ledger.py___read.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__pr-review-round__scripts__ledger.py__round_end.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__pr-review-round__scripts__prstate.py__gh.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__pr-review-round__scripts__prstate.py__have.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__pr-review-round__scripts__queue.py__gh_json.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__pr-review-round__scripts__queue.py__load_overrides.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__pr-review-round__scripts__round_report.py__gh.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__pr-review-round__scripts__stale_sweep.py__count_since.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__pr-review-round__scripts__stale_sweep.py__gh.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__pr-review-round__scripts__test_reach.py__pr_diff.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__visualize-spec__evals__check_mechanical.py__render.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__visualize-spec__evals__fixtures__order-hooks__src__order_hooks__webhooks.py__send_webhook.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "nthplusio__skills/skills__scoussens-skills__work-proposal__scripts__check-totals.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "olinickalls__PyFaceWipe/scripts__publish_release.py__tag_commit.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "olinickalls__PyFaceWipe/scripts__set_variant.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-agents__src__ellements__agents__builder.py__run.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-agents__src__ellements__agents__claude_backend.py__run.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-agents__src__ellements__agents__openai_backend.py__run.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-agents__src__ellements__agents__runner.py__run_agent_with_progress.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-benchmarking__src__ellements__benchmarking__harness.py___strategy_call.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-benchmarking__src__ellements__benchmarking__results.py__to_csv.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-cli__src__ellements__cli__agent_tui.py___invoke_runner.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-cli__src__ellements__cli__agent_tui.py__save.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-core__src__ellements__core__caching__disk.py__set.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-core__src__ellements__core__config.py__load_toml.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-core__src__ellements__core__llm__image_transport.py___mask_fault.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-core__src__ellements__core__observability__jsonl_logger.py___append_line.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-fslm__src__ellements__fslm__cli.py___init_state.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-fslm__src__ellements__fslm__cli.py___step.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-fslm__src__ellements__fslm__models.py__to_json_file.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-reporting__src__ellements__reporting__html_generation.py__export_html.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-reporting__src__ellements__reporting__html_generation.py__export_json.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-reporting__src__ellements__reporting__html_generation.py__generate.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-standard-tools__src__ellements__standard_tools__web__browser_viewer.py__open_remote.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-standard-tools__src__ellements__standard_tools__web__browser_viewer.py__serve_local.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-standard-tools__src__ellements__standard_tools__web__youtube.py___patched_sync_get.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements-standard-tools__src__ellements__standard_tools__web__youtube.py___patched_sync_post.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "paulosalem__ellements/ellements__yaml.py__load_yaml.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/evals__agent__score.py___tracebi.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/scripts__ui_audit.py__serve.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/site__build_docs.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi___delivery.py___slack_request.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi___delivery.py__slack_notify.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi___gateway_log.py___write.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi___gateway_log.py__read_lines.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi___session_export.py___export_markdown.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi___session_export.py___read_full_feed.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi___updates.py___cached_release.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi___updates.py___fetch.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi___updates.py__latest_release.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__cli.py___build_report_target.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__cli.py___dev_in_the_app.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__cli.py___migrate_declarative.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__cli.py___migrate_model.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__cli.py___serve_file.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__cli.py__cmd_init.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__cli.py__cmd_new_model.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__cli.py__cmd_new_pipeline.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__cli.py__cmd_new_transform.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__cli.py__cmd_update.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__connections.py__read_connection_doc.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__connectors__duckdb_connector.py___check_append_decimal_types.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__connectors__duckdb_connector.py___write_into.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__connectors__duckdb_connector.py__column_schema.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__connectors__duckdb_connector.py__list_tables.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__connectors__duckdb_connector.py__load.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__connectors__snowflake_connector.py__load.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__contracts.py__reconcile.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__mcp_server.py__serve.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__model__model_spec.py__read_model_doc.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__pipeline__pipeline_spec.py__read_pipeline_doc.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__pipeline__runner.py___add_missing_run_columns.json",
+      "vuln": false,
+      "flagged": true
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__pipeline__runner.py___execute_locked.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__pipeline__runner.py___insert_returning_id.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__pipeline__runner.py___latest_run_id.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__pipeline__runner.py___write_run_end.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__pipeline__runner.py__run_history.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__pipeline__runner.py__start.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__reports__embed.py__stamp.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__reports__report.py___current_git_sha.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__schedule.py___refresh.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__spec.py__build.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__spec.py__resolve.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__web__api__main.py___mcp_sessions.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__web__api__routers__pipelines.py__run_layer.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__web__demo_app__pipeline.py__seed_and_run.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__web__demo_app__wealth_pipeline.py__seed_and_run.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "saltyscott0521__tracebi/tracebi__web__run.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "scaryrawr__homebrew-formulae/scripts__update-olaunch.py__get_latest_release.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "scaryrawr__homebrew-formulae/scripts__update-olaunch.py__get_sha256.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "scaryrawr__homebrew-formulae/scripts__update-smahtutils.py__get_latest_release.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "scaryrawr__homebrew-formulae/scripts__update-smahtutils.py__get_latest_tag.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "scaryrawr__homebrew-formulae/scripts__update-smahtutils.py__get_sha256.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "scaryrawr__homebrew-formulae/scripts__update-smahtutils.py__update_smahtutils_formula.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_analyze.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_analyze_multi.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_audit.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_audit_dir.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_audit_store.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_autocrop.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_batch.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_bench.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_contrad.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_describe.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_diff.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_evid.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_export.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_human.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_imgqual.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_limbcov.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_mirror.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_mutate.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_oks.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_probe.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_reid.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___cmd_rig.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___compare_doc.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice____main__.py___diff_load.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice__bench.py__main.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice__bitmap.py___decode_pillow.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice__knowledge.py___index_add.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice__knowledge.py___index_load.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice__knowledge.py__get.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice__knowledge.py__list.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice__knowledge.py__save.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice__rest.py___audit.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice__rest.py___get_overlay.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice__rest.py___save_overlay.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "shizukutanaka__Slice/slice__rest.py__do_GET.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "thokodi__thokodi.github.io/repo__repository.thokodi__plugin.video.thokodi__default.py__safe_extract_zip.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "waltfilipe__sada-test/scripts__backfill_transfermarkt.py__write_everywhere.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "waltfilipe__sada-test/scripts__download_club_logos.py__download_file.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "waltfilipe__sada-test/scripts__download_club_logos.py__fetch_json.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "waltfilipe__sada-test/scripts__engine__sofascore_heatmap.py__save_heatmap.json",
+      "vuln": true,
+      "flagged": false
+    },
+    {
+      "file": "waltfilipe__sada-test/scripts__engine__sofascore_heatmap.py__write_heatmap_index.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "waltfilipe__sada-test/scripts__enrich_loan_status.py__fetch_loan_club.json",
+      "vuln": true,
+      "flagged": true
+    },
+    {
+      "file": "waltfilipe__sada-test/scripts__fetch_defensive_league.py__run_collection.json",
+      "vuln": false,
+      "flagged": false
+    },
+    {
+      "file": "waltfilipe__sada-test/scripts__onlyheatmaps.py__write_index.json",
+      "vuln": false,
+      "flagged": false
+    }
+  ]
+}

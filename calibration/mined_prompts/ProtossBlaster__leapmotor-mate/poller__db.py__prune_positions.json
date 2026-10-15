@@ -29,5 +29,19 @@
       1051,
       1090
     ]
+  },
+  "provenance": {
+    "source_sha256": "b006fca0e421368d457ddf51f64b0ea1b645aac181749bb6e1e436b51656de83",
+    "ai_commit": "d92e92137a72",
+    "ai_tools": {
+      "claude-code": 15
+    },
+    "ai_line_fraction": 0.375,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      1051,
+      1090
+    ]
   }
 }

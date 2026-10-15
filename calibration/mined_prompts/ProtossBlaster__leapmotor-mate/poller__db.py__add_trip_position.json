@@ -29,5 +29,19 @@
       1819,
       1835
     ]
+  },
+  "provenance": {
+    "source_sha256": "eb6d5ef68736febb6fdf25f6228b015fa90d147ea2a02fda2e15bc92deecd9c4",
+    "ai_commit": "ffad256d47bb",
+    "ai_tools": {
+      "claude-code": 44
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      1786,
+      1829
+    ]
   }
 }

@@ -5,10 +5,10 @@
   "function": "_load_csv",
   "cwe": "CWE-22",
   "param": "path",
-  "payload": "/tmp/tier2_proof_vp1lbxx2/secret_9f2ee229a0c1.txt",
+  "payload": "/tmp/tier2_proof_wy78izj6/secret_0351f212458c.txt",
   "verdict": "NEEDS_MANUAL",
   "detail": "target '_load_csv' is internal (underscore-prefixed or under a private module). An external attacker reaches it only via a public caller / CLI / HTTP entry -- trace that path by hand before disclosing.",
-  "tier2_proof": "traversal read exfiltrated the planted canary from /tmp/tier2_proof_vp1lbxx2/secret_9f2ee229a0c1.txt",
+  "tier2_proof": "traversal read exfiltrated the planted canary from /tmp/tier2_proof_wy78izj6/secret_0351f212458c.txt",
   "tier2_sink": "open",
   "reachable": true,
   "entry_kind": "api",
@@ -19,5 +19,7 @@
   "reproduce_verdict": "NEEDS_MANUAL",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
   "repo_full": "alexandrelheinen/fret",
-  "reprove_status": "reproven"
+  "reprove_status": "reproven",
+  "real_net_confirmed": false,
+  "real_net_evidence": null
 }

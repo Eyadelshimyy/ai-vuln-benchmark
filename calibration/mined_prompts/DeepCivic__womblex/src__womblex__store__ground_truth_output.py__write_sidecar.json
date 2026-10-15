@@ -24,5 +24,19 @@
       269,
       278
     ]
+  },
+  "provenance": {
+    "source_sha256": "9ba3db6edeb19b9089a14fb4b1b8afb00d0a8aac9d818017baa10eaa1abc8c6a",
+    "ai_commit": "d736011ecb6c",
+    "ai_tools": {
+      "claude-code": 10
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "Co-authored-by: Claude <noreply@anthropic.com>",
+    "span": [
+      269,
+      278
+    ]
   }
 }

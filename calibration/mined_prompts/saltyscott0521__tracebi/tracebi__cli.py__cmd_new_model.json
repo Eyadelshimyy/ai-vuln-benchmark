@@ -25,5 +25,20 @@
       1236,
       1268
     ]
+  },
+  "provenance": {
+    "source_sha256": "46f7fe8185fc45c32064ecc5eba69c4886c9b8d920f8bdedeaad93c8390066ba",
+    "ai_commit": "1d161ca14acf",
+    "ai_tools": {
+      "claude-code": 28,
+      "cursor": 3
+    },
+    "ai_line_fraction": 0.939,
+    "ai_attributed": true,
+    "evidence": "author/committer='Claude <noreply@anthropic.com>'",
+    "span": [
+      1236,
+      1268
+    ]
   }
 }

@@ -4,14 +4,14 @@
 - file: backend/scripts/calibrate_lda_bill_match.py
 - tainted parameter: url
 - Tier-2 sink: urllib.request.urlopen
-- Tier-2 exploit proof: SSRF: program fetched the attacker-controlled URL http://127.0.0.1:39381/18e54fb61b7c
+- Tier-2 exploit proof: SSRF: program fetched the attacker-controlled URL http://127.0.0.1:39269/230671718ebb
 
 ## Reachability (what makes this disclosable)
 - reachable from a real entry point: **True**
 - entry-point type: **http**
 - call path to verify by hand:
 
-    trigger_pipeline -> start_pipeline_trigger -> triggered_chain -> nightly_links -> run_supplementary_pipeline -> run_justice_pipeline -> _measure_loyalty -> fetch_fjc -> _get
+    trigger_pipeline -> start_pipeline_trigger -> triggered_chain -> nightly_links -> run_supplementary_pipeline -> run_justice_pipeline -> _measure_loyalty -> fetch_martin_quinn -> _get
 
 - dynamic reproduce verdict: NEEDS_MANUAL
 
@@ -21,6 +21,6 @@
 3. Reproduce the exploit (payload below) through that entry point against a local run.
 4. Only then prepare a responsible-disclosure report.
 
-- payload: `http://127.0.0.1:39381/18e54fb61b7c`
+- payload: `http://127.0.0.1:39269/230671718ebb`
 
 NOTE: reachability here is a NAME-BASED static call graph (conservative, may over-connect). Step 1-3 above are the human confirmation that closes that gap before any disclosure.

@@ -29,5 +29,19 @@
       1946,
       1961
     ]
+  },
+  "provenance": {
+    "source_sha256": "361ca90d2c8f8389605cc628ba0374e7b09a321d50c06459d04c1c5985df5ee7",
+    "ai_commit": "13c9d2f8b9f4",
+    "ai_tools": {
+      "claude-code": 17
+    },
+    "ai_line_fraction": 0.944,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      1939,
+      1956
+    ]
   }
 }

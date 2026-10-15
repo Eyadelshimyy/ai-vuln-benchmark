@@ -24,5 +24,19 @@
       1348,
       1355
     ]
+  },
+  "provenance": {
+    "source_sha256": "84bdb1c0108bf8cb6d7ef5104c882f0bac65085d7e84266e537f0bd560a78cb7",
+    "ai_commit": "7332c778a54c",
+    "ai_tools": {
+      "claude-code": 5
+    },
+    "ai_line_fraction": 0.625,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      1348,
+      1355
+    ]
   }
 }

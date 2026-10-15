@@ -25,5 +25,20 @@
       2505,
       2548
     ]
+  },
+  "provenance": {
+    "source_sha256": "13e3b12b5dd8785990178e98bd1715adf3548c712bd74885a382800feb660b6b",
+    "ai_commit": "65deb74f6587",
+    "ai_tools": {
+      "claude-code": 24,
+      "cursor": 20
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      2505,
+      2548
+    ]
   }
 }

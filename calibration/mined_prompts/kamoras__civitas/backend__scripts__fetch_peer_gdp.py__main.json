@@ -25,5 +25,19 @@
       38,
       67
     ]
+  },
+  "provenance": {
+    "source_sha256": "66a00f8e8d600535b8be23a0799ac382aaac7ac806fc6b7d5ae4ec8089cb16ff",
+    "ai_commit": "78030b8cded3",
+    "ai_tools": {
+      "claude-code": 30
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "Generated with [Claude Code]",
+    "span": [
+      38,
+      67
+    ]
   }
 }

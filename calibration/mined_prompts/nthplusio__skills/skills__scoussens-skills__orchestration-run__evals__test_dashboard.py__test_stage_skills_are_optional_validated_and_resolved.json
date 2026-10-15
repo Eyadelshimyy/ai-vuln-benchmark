@@ -24,5 +24,17 @@
       730,
       742
     ]
+  },
+  "provenance": {
+    "source_sha256": "ff3f26725b28b7c2af1870fb7b87176f6d36a857fc75126bcac3385cafed4948",
+    "ai_commit": null,
+    "ai_tools": null,
+    "ai_line_fraction": null,
+    "ai_attributed": false,
+    "evidence": null,
+    "span": [
+      730,
+      760
+    ]
   }
 }

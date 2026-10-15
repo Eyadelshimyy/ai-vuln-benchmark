@@ -24,5 +24,19 @@
       3891,
       3924
     ]
+  },
+  "provenance": {
+    "source_sha256": "4f1f6a604ee0b9529c21e59ce58dbf44b9bbe41776839542cf7a76c443fb3897",
+    "ai_commit": "f32000ecc455",
+    "ai_tools": {
+      "claude-code": 30
+    },
+    "ai_line_fraction": 0.882,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      3891,
+      3924
+    ]
   }
 }

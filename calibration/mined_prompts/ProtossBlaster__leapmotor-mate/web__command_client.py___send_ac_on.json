@@ -24,5 +24,19 @@
       1428,
       1432
     ]
+  },
+  "provenance": {
+    "source_sha256": "d61ca0d8b48f0820f06b07e24c280ac39f9598f856b5412397d3012201314696",
+    "ai_commit": "9e4286a96654",
+    "ai_tools": {
+      "claude-code": 5
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      1428,
+      1432
+    ]
   }
 }

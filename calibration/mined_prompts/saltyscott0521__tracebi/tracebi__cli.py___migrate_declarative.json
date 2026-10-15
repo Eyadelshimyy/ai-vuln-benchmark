@@ -24,5 +24,19 @@
       1902,
       1942
     ]
+  },
+  "provenance": {
+    "source_sha256": "2a83aebdcc4c305e1705c0305bc7a33ed8ca26d4cf47a14e986f6e91d651304d",
+    "ai_commit": "57e86fad7995",
+    "ai_tools": {
+      "claude-code": 41
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      1902,
+      1942
+    ]
   }
 }

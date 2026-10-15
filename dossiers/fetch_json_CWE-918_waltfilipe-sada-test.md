@@ -4,7 +4,7 @@
 - file: scripts/download_club_logos.py
 - tainted parameter: url
 - Tier-2 sink: urllib.request.urlopen
-- Tier-2 exploit proof: SSRF: program fetched the attacker-controlled URL http://127.0.0.1:45919/e42af4f706bc
+- Tier-2 exploit proof: SSRF: program fetched the attacker-controlled URL http://127.0.0.1:39541/d9b20bac58f3
 
 ## Reachability (what makes this disclosable)
 - reachable from a real entry point: **True**
@@ -21,6 +21,6 @@
 3. Reproduce the exploit (payload below) through that entry point against a local run.
 4. Only then prepare a responsible-disclosure report.
 
-- payload: `http://127.0.0.1:45919/e42af4f706bc`
+- payload: `http://127.0.0.1:39541/d9b20bac58f3`
 
 NOTE: reachability here is a NAME-BASED static call graph (conservative, may over-connect). Step 1-3 above are the human confirmation that closes that gap before any disclosure.

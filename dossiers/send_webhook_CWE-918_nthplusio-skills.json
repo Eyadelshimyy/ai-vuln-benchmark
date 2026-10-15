@@ -5,10 +5,10 @@
   "function": "send_webhook",
   "cwe": "CWE-918",
   "param": "url",
-  "payload": "http://127.0.0.1:45095/7e0d1aed9ee4",
+  "payload": "http://127.0.0.1:41611/721d19e955d0",
   "verdict": "NEEDS_MANUAL",
   "detail": "the public function has other REQUIRED arguments; a faithful real-interface call needs a human to supply realistic values.",
-  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:45095/7e0d1aed9ee4",
+  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:41611/721d19e955d0",
   "tier2_sink": "requests.Session.request",
   "reachable": true,
   "entry_kind": "http",
@@ -19,5 +19,7 @@
   "reproduce_verdict": "NEEDS_MANUAL",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
   "repo_full": "nthplusio/skills",
-  "reprove_status": "reproven"
+  "reprove_status": "reproven",
+  "real_net_confirmed": false,
+  "real_net_evidence": null
 }

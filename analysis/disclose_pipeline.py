@@ -30,12 +30,35 @@ USAGE
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
 import shutil
 import sys
 import tempfile
 from collections import Counter
 from pathlib import Path
+
+# Findings driven to a LIVE, real-internet exploit BY HAND (request-catcher
+# confirmed). Matched on (repo substring, function). These are stamped in their
+# dossier as REAL_NET_CONFIRMED -- the top rung of the ladder, distinct from the
+# reachable-but-not-yet-exploited leads. Evidence is the human-run PoC, not a
+# claim this pipeline made.
+HAND_PROVEN = {
+    ("sada-test", "fetch_loan_club"):
+        "CWE-918 SSRF -- poc_sada_ssrf_realnet.py: planted profile_url, ran the real "
+        "scripts/enrich_loan_status.py, request landed at an operator-controlled webhook.",
+    ("mini-pi", "execute_bash"):
+        "CWE-78 RCE -- poc_minipi_rce.py: injected bash tool-call through mini-pi's real "
+        "agent_loop; $(id)/$(hostname) executed and exfiltrated to an operator-controlled webhook.",
+}
+
+
+def _hand_proven(repo_full: str, func: str):
+    for (repo_sub, fn), ev in HAND_PROVEN.items():
+        if repo_sub in (repo_full or "") and fn == func:
+            return ev
+    return None
 
 _REPO = Path(__file__).resolve().parent.parent
 for _p in (_REPO, _REPO / "analysis", _REPO / "analysis" / "iast"):
@@ -70,8 +93,15 @@ def _write_dossier(res: dict, out: Path):
     slug = f"{res.get('function','fn')}_{res.get('cwe','')}_{res.get('repo_full','')}".replace("/", "-")
     (out / f"{slug}.json").write_text(json.dumps(res, indent=2))
     path = " -> ".join(res.get("call_path") or [])
+    banner = ""
+    if res.get("real_net_confirmed"):
+        banner = (f"> **✅ REAL-NET CONFIRMED (hand-proven end-to-end).** "
+                  f"{res.get('real_net_evidence')}\n>\n"
+                  f"> This finding was driven to a live exploit against operator-controlled "
+                  f"infrastructure. It is the top rung of the ladder, not a lead.\n\n")
     (out / f"{slug}.md").write_text(
         f"# Disclosure dossier: {res.get('function')} ({res.get('cwe')})\n\n"
+        + banner +
         f"- repo: {res.get('repo_full')}  ({res.get('repo_url')})\n"
         f"- file: {res.get('file')}\n"
         f"- tainted parameter: {res.get('param')}\n"
@@ -162,15 +192,22 @@ def main():
             # module later in the run -> spurious NOT_RECONFIRMED (process drift).
             _mods_before = set(sys.modules)
             try:
-                for pn in params:
-                    try:
-                        res = attempt_exploit(rec, pn, cwe, use="ground_truth",
-                                              max_agent=0, timeout=args.timeout)
-                    except Exception:  # noqa: BLE001
-                        continue
-                    if res.get("confirmed"):
-                        got = res
-                        break
+                # Importing/executing a target repo can spew its OWN output -- to
+                # stderr (vocalinux's whisper.cpp warning) AND stdout (mini-pi's
+                # `🔧 执行命令` / `✅ 命令完成` prints as it runs the bank payload).
+                # None of it is ours or a result; silence both streams only for the
+                # duration of the re-prove so VULCAN's own verdicts stay clean.
+                with open(os.devnull, "w") as _dn, \
+                        contextlib.redirect_stderr(_dn), contextlib.redirect_stdout(_dn):
+                    for pn in params:
+                        try:
+                            res = attempt_exploit(rec, pn, cwe, use="ground_truth",
+                                                  max_agent=0, timeout=args.timeout)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if res.get("confirmed"):
+                            got = res
+                            break
             finally:
                 for r in injected:
                     if r in sys.path:
@@ -231,16 +268,23 @@ def main():
                 verdict = "INTERNAL_UNREACHABLE"
             summary[verdict] += 1
 
+            proven_ev = _hand_proven(fn_full, func)
             rres.update({"tier2_proof": got.get("proof"), "tier2_sink": got.get("sink"),
                          "reachable": reachable, "entry_kind": entry_kind,
                          "call_path": call_path, "reproduce_verdict": repro_verdict,
                          "disclosure_verdict": verdict, "repo_full": fn_full,
-                         "reprove_status": "reproven" if reproven else "census_only"})
-            if reachable:
+                         "reprove_status": "reproven" if reproven else "census_only",
+                         "real_net_confirmed": bool(proven_ev),
+                         "real_net_evidence": proven_ev})
+            if proven_ev:
+                summary["REAL_NET_CONFIRMED"] += 1
+            if reachable or proven_ev:
                 _write_dossier(rres, args.out)
                 disclosable.append(rres)
             path_str = (" [" + entry_kind + ": " + " -> ".join(call_path) + "]") if reachable else ""
             tag = "" if reproven else "  (census-confirmed; in-run reprove drifted)"
+            if proven_ev:
+                tag += "  ** REAL-NET CONFIRMED (hand-proven e2e) **"
             print(f"  {str(cwe):9} {str(func)[:26]:26} {fn_full[:24]:24} -> {verdict}{path_str}{tag}")
     finally:
         shutil.rmtree(cache_root, ignore_errors=True)
@@ -248,6 +292,10 @@ def main():
     print("\n==================== DISCLOSURE TRIAGE ====================")
     for k, v in summary.most_common():
         print(f"  {v:3}  {k}")
+    nproven = summary.get("REAL_NET_CONFIRMED", 0)
+    if nproven:
+        print(f"\n  ** {nproven} finding(s) REAL-NET CONFIRMED (hand-proven end-to-end) -- "
+              f"the top rung, dossiers flagged **")
     nreach = summary.get("REACHABLE_FROM_ENTRYPOINT", 0)
     print(f"\n{nreach} finding(s) REACHABLE from a real entry point (HTTP route / CLI / public API)")
     print(f"-> dossiers with the call path written to {args.out}/")

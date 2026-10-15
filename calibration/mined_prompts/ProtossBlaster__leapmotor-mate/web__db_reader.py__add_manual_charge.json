@@ -24,5 +24,19 @@
       3079,
       3126
     ]
+  },
+  "provenance": {
+    "source_sha256": "3502d59c7c22cf044c1edb1963854b7dc5c25d486a482bd32f418d4ee5113a38",
+    "ai_commit": "5ad155566262",
+    "ai_tools": {
+      "claude-code": 39
+    },
+    "ai_line_fraction": 0.812,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      3079,
+      3126
+    ]
   }
 }

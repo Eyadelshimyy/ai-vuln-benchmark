@@ -24,5 +24,19 @@
       183,
       191
     ]
+  },
+  "provenance": {
+    "source_sha256": "87fa9f4e7c0ecb4ce3dadcde5b32973b48a5e4c17da745738997bbf5c6a23606",
+    "ai_commit": "e215d7a0d5e7",
+    "ai_tools": {
+      "cursor": 9
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "span": [
+      183,
+      191
+    ]
   }
 }

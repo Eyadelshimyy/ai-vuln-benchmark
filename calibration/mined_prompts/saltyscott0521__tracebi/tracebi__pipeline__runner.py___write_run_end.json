@@ -30,5 +30,20 @@
       677,
       697
     ]
+  },
+  "provenance": {
+    "source_sha256": "879faf8cbbe5c3378fe28e5fb591e6aa4f3cea4ddc2306ed673eae3d56387e08",
+    "ai_commit": "f91348eb098c",
+    "ai_tools": {
+      "claude-code": 20,
+      "cursor": 1
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      677,
+      697
+    ]
   }
 }

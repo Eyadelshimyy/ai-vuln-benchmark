@@ -24,5 +24,8 @@
       35,
       42
     ]
+  },
+  "provenance": {
+    "source_sha256": "123844723e66abc31cff84375155749a7ba755a1d92290ccbe5459b362d8de15"
   }
 }

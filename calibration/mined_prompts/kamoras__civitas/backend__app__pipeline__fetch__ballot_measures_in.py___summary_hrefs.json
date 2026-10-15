@@ -24,5 +24,19 @@
       88,
       95
     ]
+  },
+  "provenance": {
+    "source_sha256": "bbc9dc656ce891b8cbde308c0905639d9548ecf01ba71ea9b2b89d93d5f87000",
+    "ai_commit": "9e5c456272b2",
+    "ai_tools": {
+      "claude-code": 8
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "Co-authored-by: Claude <noreply@anthropic.com>",
+    "span": [
+      88,
+      95
+    ]
   }
 }

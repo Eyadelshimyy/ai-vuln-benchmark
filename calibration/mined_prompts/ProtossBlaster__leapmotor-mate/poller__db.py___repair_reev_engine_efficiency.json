@@ -29,5 +29,19 @@
       787,
       803
     ]
+  },
+  "provenance": {
+    "source_sha256": "0a4e36abd124f6fc6f47966feb8dac4763ba0e16de0301d276b628764707ee08",
+    "ai_commit": "191723cabcd6",
+    "ai_tools": {
+      "claude-code": 17
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      787,
+      803
+    ]
   }
 }

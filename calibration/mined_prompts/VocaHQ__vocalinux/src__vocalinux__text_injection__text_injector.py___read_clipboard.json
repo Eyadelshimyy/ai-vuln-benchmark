@@ -29,5 +29,19 @@
       1949,
       2000
     ]
+  },
+  "provenance": {
+    "source_sha256": "dfe6ff88a56dd15d001ae3039c8b77934f23c1e173891ac6da30ce5e9cdbb5d3",
+    "ai_commit": "a15baa8170ed",
+    "ai_tools": {
+      "claude-code": 22
+    },
+    "ai_line_fraction": 0.423,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      1949,
+      2000
+    ]
   }
 }

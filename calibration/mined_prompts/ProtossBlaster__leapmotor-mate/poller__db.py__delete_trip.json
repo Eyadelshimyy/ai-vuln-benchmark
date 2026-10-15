@@ -29,5 +29,19 @@
       2033,
       2037
     ]
+  },
+  "provenance": {
+    "source_sha256": "3aa81d4d5a42639526551a2b46207e5c806dc5c1e6ee8c5a90ea36bbaa52162b",
+    "ai_commit": "8cfb28d06532",
+    "ai_tools": {
+      "claude-code": 46
+    },
+    "ai_line_fraction": 0.852,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      1990,
+      2043
+    ]
   }
 }

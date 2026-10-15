@@ -29,5 +29,19 @@
       1629,
       1643
     ]
+  },
+  "provenance": {
+    "source_sha256": "b78caf9a07d0cabdc9ca10b3fe0ed331640cd385798ad0ec5d521e540c8be529",
+    "ai_commit": "f6effffed4fb",
+    "ai_tools": {
+      "claude-code": 15
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      1629,
+      1643
+    ]
   }
 }

@@ -5,16 +5,16 @@
   "function": "read_json",
   "cwe": "CWE-22",
   "param": "path",
-  "payload": "/tmp/tier2_proof_v17bkiy0/secret_efe1b682a341.txt",
+  "payload": "/tmp/tier2_proof_3myv_u4p/secret_26f13dc33a18.txt",
   "verdict": "REPRODUCED_PUBLIC_API",
   "detail": "calling the real public backend.app.file_cache.read_json(path=<payload>) on a clean clone at  fired the CWE-22 sink -- reachable through the package's own API.",
-  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_v17bkiy0/secret_efe1b682a341.txt (proven by live execution trace; read-traversal, no output echo required)",
+  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_3myv_u4p/secret_26f13dc33a18.txt (proven by live execution trace; read-traversal, no output echo required)",
   "tier2_sink": "open",
   "reachable": true,
   "entry_kind": "http",
   "call_path": [
     "state_ballot",
-    "seats_up_for_year",
+    "next_senate_election_year",
     "senate_classes",
     "read_json_preferring",
     "read_json"
@@ -22,5 +22,7 @@
   "reproduce_verdict": "REPRODUCED_PUBLIC_API",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
   "repo_full": "kamoras/civitas",
-  "reprove_status": "reproven"
+  "reprove_status": "reproven",
+  "real_net_confirmed": false,
+  "real_net_evidence": null
 }

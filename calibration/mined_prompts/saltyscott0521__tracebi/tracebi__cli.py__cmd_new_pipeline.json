@@ -24,5 +24,19 @@
       1341,
       1370
     ]
+  },
+  "provenance": {
+    "source_sha256": "cae7febfa83dc9e00d8db7d974a5341545eab1b27a4482a671bf3a257e79d1d4",
+    "ai_commit": "253e8ebb7df9",
+    "ai_tools": {
+      "claude-code": 28
+    },
+    "ai_line_fraction": 0.933,
+    "ai_attributed": true,
+    "evidence": "author/committer='Claude <noreply@anthropic.com>'",
+    "span": [
+      1341,
+      1370
+    ]
   }
 }

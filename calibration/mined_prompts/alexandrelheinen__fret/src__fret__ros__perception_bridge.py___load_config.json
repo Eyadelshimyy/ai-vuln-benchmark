@@ -24,5 +24,19 @@
       183,
       200
     ]
+  },
+  "provenance": {
+    "source_sha256": "eaa8ee4e80852e6344f51d5570a756797fc8ebb0ffab6db28c421026b3b6f17b",
+    "ai_commit": "b7cdbef44703",
+    "ai_tools": {
+      "github-copilot": 18
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "author/committer='copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>'",
+    "span": [
+      183,
+      200
+    ]
   }
 }

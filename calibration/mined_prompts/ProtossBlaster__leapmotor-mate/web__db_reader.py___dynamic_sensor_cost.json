@@ -24,5 +24,19 @@
       2217,
       2270
     ]
+  },
+  "provenance": {
+    "source_sha256": "c3f8d1e8fecfbe254ae34c99d48f0f097ef8f358a8c4de1841cabe18611f6e19",
+    "ai_commit": "d0224e399d3a",
+    "ai_tools": {
+      "claude-code": 26
+    },
+    "ai_line_fraction": 0.481,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      2217,
+      2270
+    ]
   }
 }

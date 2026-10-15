@@ -24,5 +24,19 @@
       8765,
       8776
     ]
+  },
+  "provenance": {
+    "source_sha256": "322e072597e08084f8078c795c6eacc28c354dcafcbccbc43402821fb98d323f",
+    "ai_commit": "abea35eda1de",
+    "ai_tools": {
+      "claude-code": 11
+    },
+    "ai_line_fraction": 0.917,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      8765,
+      8776
+    ]
   }
 }

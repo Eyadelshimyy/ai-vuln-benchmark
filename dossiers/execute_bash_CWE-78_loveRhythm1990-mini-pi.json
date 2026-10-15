@@ -5,10 +5,10 @@
   "function": "execute_bash",
   "cwe": "CWE-78",
   "param": "command",
-  "payload": "$(touch /tmp/tier2_proof_qf8j21f2/pwned_5c08dc6cd1b9)",
+  "payload": "$(touch /tmp/tier2_proof_l1sxfv8w/pwned_b74641b99499)",
   "verdict": "REPRODUCED_PUBLIC_API",
   "detail": "calling the real public 02-providers.src.main.execute_bash(command=<payload>) on a clean clone at  fired the CWE-78 sink -- reachable through the package's own API.",
-  "tier2_proof": "injected shell command created /tmp/tier2_proof_qf8j21f2/pwned_5c08dc6cd1b9",
+  "tier2_proof": "injected shell command created /tmp/tier2_proof_l1sxfv8w/pwned_b74641b99499",
   "tier2_sink": "subprocess.Popen",
   "reachable": true,
   "entry_kind": "api",
@@ -18,5 +18,7 @@
   "reproduce_verdict": "REPRODUCED_PUBLIC_API",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
   "repo_full": "loveRhythm1990/mini-pi",
-  "reprove_status": "reproven"
+  "reprove_status": "reproven",
+  "real_net_confirmed": true,
+  "real_net_evidence": "CWE-78 RCE -- poc_minipi_rce.py: injected bash tool-call through mini-pi's real agent_loop; $(id)/$(hostname) executed and exfiltrated to an operator-controlled webhook."
 }

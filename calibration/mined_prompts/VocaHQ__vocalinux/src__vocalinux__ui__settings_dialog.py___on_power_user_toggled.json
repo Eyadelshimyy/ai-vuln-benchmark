@@ -24,5 +24,19 @@
       7459,
       7492
     ]
+  },
+  "provenance": {
+    "source_sha256": "dc1d4f9427fcc6f058102c66f51837eb37821a96f1af76983eac6e6d79a6b957",
+    "ai_commit": "004696bbe0f7",
+    "ai_tools": {
+      "devin": 1
+    },
+    "ai_line_fraction": 0.029,
+    "ai_attributed": true,
+    "evidence": "author/committer='devin-ai-integration[bot] <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "span": [
+      7459,
+      7492
+    ]
   }
 }

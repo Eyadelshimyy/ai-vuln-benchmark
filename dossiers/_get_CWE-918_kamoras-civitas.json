@@ -5,10 +5,10 @@
   "function": "_get",
   "cwe": "CWE-918",
   "param": "url",
-  "payload": "http://127.0.0.1:39381/18e54fb61b7c",
+  "payload": "http://127.0.0.1:39269/230671718ebb",
   "verdict": "NEEDS_MANUAL",
   "detail": "target '_get' is internal (underscore-prefixed or under a private module). An external attacker reaches it only via a public caller / CLI / HTTP entry -- trace that path by hand before disclosing.",
-  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:39381/18e54fb61b7c",
+  "tier2_proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:39269/230671718ebb",
   "tier2_sink": "urllib.request.urlopen",
   "reachable": true,
   "entry_kind": "http",
@@ -20,11 +20,13 @@
     "run_supplementary_pipeline",
     "run_justice_pipeline",
     "_measure_loyalty",
-    "fetch_fjc",
+    "fetch_martin_quinn",
     "_get"
   ],
   "reproduce_verdict": "NEEDS_MANUAL",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
   "repo_full": "kamoras/civitas",
-  "reprove_status": "reproven"
+  "reprove_status": "reproven",
+  "real_net_confirmed": false,
+  "real_net_evidence": null
 }

@@ -24,5 +24,19 @@
       33,
       42
     ]
+  },
+  "provenance": {
+    "source_sha256": "dfb6cbd5d453024c9468637c32faea4b2545b4850521854250c15603e8629a36",
+    "ai_commit": "541ece651d70",
+    "ai_tools": {
+      "github-copilot": 10
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "author/committer='copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>'",
+    "span": [
+      33,
+      42
+    ]
   }
 }

@@ -24,5 +24,17 @@
       858,
       873
     ]
+  },
+  "provenance": {
+    "source_sha256": "2e73319154163d5a50640332de3b1fbe3896065f7fb16923823cc2e52a7c70cd",
+    "ai_commit": null,
+    "ai_tools": null,
+    "ai_line_fraction": null,
+    "ai_attributed": false,
+    "evidence": null,
+    "span": [
+      858,
+      888
+    ]
   }
 }

@@ -1,0 +1,4 @@
+[
+  {"name": "gpt-4o-mini",   "base_url": "https://api.openai.com/v1", "model": "gpt-4o-mini",   "api_key_env": "OPENAI_API_KEY"},
+  {"name": "opencode-model", "base_url": "https://YOUR-OPENCODE-ENDPOINT/v1", "model": "MODEL-ID", "api_key_env": "OPENCODE_KEY"}
+]

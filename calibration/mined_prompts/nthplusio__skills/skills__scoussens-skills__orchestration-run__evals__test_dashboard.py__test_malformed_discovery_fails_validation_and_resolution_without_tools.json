@@ -24,5 +24,17 @@
       839,
       856
     ]
+  },
+  "provenance": {
+    "source_sha256": "cb88c42f8604bfb05f055501b655cd9f194ee44f4f8f6c8fc2d4edfa835c9d35",
+    "ai_commit": null,
+    "ai_tools": null,
+    "ai_line_fraction": null,
+    "ai_attributed": false,
+    "evidence": null,
+    "span": [
+      839,
+      869
+    ]
   }
 }

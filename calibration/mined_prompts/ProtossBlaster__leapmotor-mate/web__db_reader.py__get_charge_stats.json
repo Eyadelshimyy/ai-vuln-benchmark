@@ -24,5 +24,19 @@
       9961,
       10019
     ]
+  },
+  "provenance": {
+    "source_sha256": "be810241411dbeb8fe974e0ec9363be71b4921f3c38afd3ce549f0043508b375",
+    "ai_commit": "8cfb28d06532",
+    "ai_tools": {
+      "claude-code": 19
+    },
+    "ai_line_fraction": 0.322,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      9961,
+      10019
+    ]
   }
 }

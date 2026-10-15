@@ -4,7 +4,7 @@
 - file: 03-tools/src/tools.py
 - tainted parameter: path
 - Tier-2 sink: open
-- Tier-2 exploit proof: traversal write escaped to /tmp/tier2_proof_5jl_9lvn/pwned_ac7f5bab7484
+- Tier-2 exploit proof: traversal write escaped to /tmp/tier2_proof_vas0s464/pwned_ff9facf00199
 
 ## Reachability (what makes this disclosable)
 - reachable from a real entry point: **True**
@@ -21,6 +21,6 @@
 3. Reproduce the exploit (payload below) through that entry point against a local run.
 4. Only then prepare a responsible-disclosure report.
 
-- payload: `/tmp/tier2_proof_5jl_9lvn/pwned_ac7f5bab7484`
+- payload: `/tmp/tier2_proof_vas0s464/pwned_ff9facf00199`
 
 NOTE: reachability here is a NAME-BASED static call graph (conservative, may over-connect). Step 1-3 above are the human confirmation that closes that gap before any disclosure.

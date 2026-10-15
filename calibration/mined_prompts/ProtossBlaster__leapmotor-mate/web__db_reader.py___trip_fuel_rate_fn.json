@@ -24,5 +24,19 @@
       7633,
       7667
     ]
+  },
+  "provenance": {
+    "source_sha256": "3eaca4e523d5c9bb30807cc2db51b15eecfa12c48fe9ed8a5b1d95ae0eb179f7",
+    "ai_commit": "0a0c81cad4ea",
+    "ai_tools": {
+      "claude-code": 35
+    },
+    "ai_line_fraction": 1.0,
+    "ai_attributed": true,
+    "evidence": "Co-Authored-By: Claude",
+    "span": [
+      7633,
+      7667
+    ]
   }
 }

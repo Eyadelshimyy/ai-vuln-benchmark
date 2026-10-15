@@ -4,7 +4,7 @@
 - file: skills/scoussens-skills/visualize-spec/evals/fixtures/order-hooks/src/order_hooks/webhooks.py
 - tainted parameter: url
 - Tier-2 sink: requests.Session.request
-- Tier-2 exploit proof: SSRF: program fetched the attacker-controlled URL http://127.0.0.1:45095/7e0d1aed9ee4
+- Tier-2 exploit proof: SSRF: program fetched the attacker-controlled URL http://127.0.0.1:41611/721d19e955d0
 
 ## Reachability (what makes this disclosable)
 - reachable from a real entry point: **True**
@@ -21,6 +21,6 @@
 3. Reproduce the exploit (payload below) through that entry point against a local run.
 4. Only then prepare a responsible-disclosure report.
 
-- payload: `http://127.0.0.1:45095/7e0d1aed9ee4`
+- payload: `http://127.0.0.1:41611/721d19e955d0`
 
 NOTE: reachability here is a NAME-BASED static call graph (conservative, may over-connect). Step 1-3 above are the human confirmation that closes that gap before any disclosure.

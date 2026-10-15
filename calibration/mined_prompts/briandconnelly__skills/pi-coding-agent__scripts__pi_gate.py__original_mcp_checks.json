@@ -24,5 +24,19 @@
       1307,
       1356
     ]
+  },
+  "provenance": {
+    "source_sha256": "8d622d425ece924ee8065377fd317b17570feaac6370e157fed052fb44df8396",
+    "ai_commit": "ea877addde3f",
+    "ai_tools": {
+      "claude-code": 40
+    },
+    "ai_line_fraction": 0.8,
+    "ai_attributed": true,
+    "evidence": "Generated with Claude Code",
+    "span": [
+      1307,
+      1356
+    ]
   }
 }

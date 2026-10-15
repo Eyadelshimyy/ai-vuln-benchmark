@@ -5,10 +5,10 @@
   "function": "load_overrides",
   "cwe": "CWE-22",
   "param": "path",
-  "payload": "/tmp/tier2_proof_682td1gs/secret_9ecec282a4fb.txt",
+  "payload": "/tmp/tier2_proof__ay968oh/secret_eeaa6d7e28ce.txt",
   "verdict": "REPRODUCED_PUBLIC_API",
   "detail": "calling the real public skills.scoussens-skills.pr-review-round.scripts.queue.load_overrides(path=<payload>) on a clean clone at  fired the CWE-22 sink -- reachable through the package's own API.",
-  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_682td1gs/secret_9ecec282a4fb.txt (proven by live execution trace; read-traversal, no output echo required)",
+  "tier2_proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof__ay968oh/secret_eeaa6d7e28ce.txt (proven by live execution trace; read-traversal, no output echo required)",
   "tier2_sink": "open",
   "reachable": true,
   "entry_kind": "api",
@@ -18,5 +18,7 @@
   "reproduce_verdict": "REPRODUCED_PUBLIC_API",
   "disclosure_verdict": "REACHABLE_FROM_ENTRYPOINT",
   "repo_full": "nthplusio/skills",
-  "reprove_status": "reproven"
+  "reprove_status": "reproven",
+  "real_net_confirmed": false,
+  "real_net_evidence": null
 }
