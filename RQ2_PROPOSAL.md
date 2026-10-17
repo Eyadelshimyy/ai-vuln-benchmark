@@ -25,16 +25,28 @@ execution oracle but not the detector comparison its research question promises.
   a leaderboard + a majority-vote "consortium" detector. Validated with a mock run.
 
 ## 3. The ask (three decisions)
-1. **Approve a model panel.** Proposed 3–5 *credible, citable, versioned* models —
-   e.g. one frontier API model (GPT-4o-mini or Claude), two open code models
-   (Qwen2.5-Coder-32B-Instruct, DeepSeek-Coder-V2), optionally one documented
-   security-tuned model reported next to its base. (Explicitly **not** abliterated/
-   "dealigned" community checkpoints — they add no detection benefit, degrade
-   reasoning, and are not reproducible.)
-2. **API budget / compute.** At `--balance 2` the evaluation is ~318 calls per
-   model (≈106 confirmed-positive + ~212 executed-negative). For N models that is
-   ~318·N calls — inexpensive for small/open models; a few dollars for a frontier
-   API model. Caching makes re-runs free.
+1. **Approve this 5-model panel** (credible, versioned, citable; diverse vendors +
+   code specialists). All reachable through **one OpenAI-compatible endpoint
+   (OpenRouter)** — one key, one base URL, so the run is simple and reproducible:
+
+   | Role | Model (id) |
+   |---|---|
+   | Frontier, cheap | `openai/gpt-4o-mini` |
+   | Frontier, different lab | `anthropic/claude-3.5-haiku` |
+   | Frontier, different lab | `google/gemini-2.0-flash` |
+   | Open code specialist | `qwen/qwen-2.5-coder-32b-instruct` |
+   | Open, strong code | `deepseek/deepseek-chat` |
+
+   Plus a majority-vote "consortium" row (computed, free). **Not** abliterated/
+   "dealigned" checkpoints — no detection benefit, degraded reasoning, not citable.
+   (Exact ids to be confirmed against the provider's live list before the run.)
+
+2. **API budget: ~US $5–20 total.** At `--balance 2` the evaluation is ~318 calls
+   per model (≈106 confirmed-positive + ~212 executed-negative). Across 5 models
+   that is ~1,600 calls — a few dollars for the small/open models, a few more for
+   the frontier ones. A **10-case pilot** runs first to verify validity and cost
+   before the full spend; caching makes any re-run free.
+
 3. **Sign off on the frozen protocol** (section 4) so the result is defensible.
 
 ## 4. Frozen protocol
