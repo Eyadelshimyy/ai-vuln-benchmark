@@ -119,6 +119,10 @@ def main():
     ap.add_argument("--census", required=True, type=Path,
                     help="a corpus_census.json (the execution ground truth)")
     ap.add_argument("--tools", default="bandit,semgrep")
+    ap.add_argument("--label", choices=["confirmed", "triggered"], default="confirmed",
+                    help="ground-truth positive: execution-confirmed (default, defensible) "
+                         "or static-triggered (candidate). Negatives are always executed-no-trigger; "
+                         "triggered-unconfirmed and non-executable are excluded as inconclusive.")
     ap.add_argument("--semgrep-config", default="p/python",
                     help="Semgrep ruleset (needs a one-time network fetch); e.g. p/python, p/security-audit")
     ap.add_argument("--out", type=Path, default=Path("baselines.json"))
@@ -128,11 +132,12 @@ def main():
     # ground truth per candidate FILE (relative to root), from execution
     truth = {}
     for row in census.get("rows", []):
-        if row.get("triggered"):
+        pos = row.get("confirmed") if args.label == "confirmed" else row.get("triggered")
+        if pos:
             truth[row["file"]] = ("VULN", row.get("exec_cwe"))
-        elif row.get("executable"):
+        elif row.get("executable") and not row.get("triggered"):
             truth[row["file"]] = ("SAFE", None)
-        # UNRESOLVED -> excluded
+        # inconclusive (triggered-unconfirmed when label=confirmed, or non-executable) -> excluded
     print(f"ground truth: {sum(1 for v in truth.values() if v[0]=='VULN')} VULN, "
           f"{sum(1 for v in truth.values() if v[0]=='SAFE')} SAFE "
           f"(from {args.census.name})", file=sys.stderr)

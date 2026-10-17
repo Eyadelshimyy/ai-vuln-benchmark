@@ -1,0 +1,35 @@
+{
+  "n": 807,
+  "tools": {
+    "bandit": {
+      "matrix": {
+        "TP": 12,
+        "FN": 36,
+        "FP": 97,
+        "TN": 662,
+        "n": 807,
+        "precision": 0.11,
+        "recall": 0.25,
+        "FPR": 0.128,
+        "accuracy": 0.835
+      },
+      "per_cwe_recall": {
+        "CWE-22": {
+          "recall": 0.0,
+          "caught": 0,
+          "n": 33
+        },
+        "CWE-78": {
+          "recall": 1.0,
+          "caught": 2,
+          "n": 2
+        },
+        "CWE-918": {
+          "recall": 0.769,
+          "caught": 10,
+          "n": 13
+        }
+      }
+    }
+  }
+}
