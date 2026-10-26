@@ -48,7 +48,7 @@ import secrets
 # collide with a marker baked into some unrelated string in the code under
 # test. Short enough to read in debug output, long enough that an accidental
 # real-world string matching it is effectively impossible.
-_MARKER_PREFIX = "IAST_TAINT_"
+_MARKER_PREFIX = "iasttaint"
 
 
 def new_marker() -> str:

@@ -171,13 +171,19 @@ def main() -> None:
         for c in cwes:
             if executable:
                 execd[c] += 1
-            if triggered:
-                trig[c] += 1
+        # FIX: Triggered attributes to the class that ACTUALLY fired (exec_cwe),
+        # not every static candidate tag -- [CWE-22, CWE-611] triggering via its
+        # path sink must not inflate CWE-611.
+        if triggered:
+            _tc = exec_cwe or (cwes[0] if cwes else None)
+            if _tc:
+                trig[_tc] += 1
         if args.why and v == "COULD_NOT_EXECUTE":
             cause[_classify_error(err_text)] += 1
             sig[_signature(err_text)] += 1
 
         confirmed = False
+        confirmed_cwe = None
         if args.tier2 and triggered:
             # deterministic bank only (max_agent=0) -> NO LLM. Try the candidate's
             # own CWE strategy on each plausible param until one confirms.
@@ -193,6 +199,7 @@ def main() -> None:
                                           max_agent=0, timeout=args.timeout)
                     if res.get("confirmed"):
                         confirmed = True
+                        confirmed_cwe = tgt_cwe
                         break
             except Exception:  # noqa: BLE001
                 pass
@@ -200,13 +207,14 @@ def main() -> None:
                 for r in injected:
                     if r in sys.path:
                         sys.path.remove(r)
-            if confirmed:
-                for c in cwes:
-                    conf[c] += 1
+            # FIX: Confirmed attributes to the class whose exploit fired, not every tag.
+            if confirmed and confirmed_cwe:
+                conf[confirmed_cwe] += 1
 
         rows.append({"file": str(path.relative_to(args.root)), "cwes": cwes,
                      "verdict": v, "exec_cwe": exec_cwe, "executable": executable,
                      "triggered": triggered, "confirmed": confirmed,
+                     "confirmed_cwe": confirmed_cwe,
                      "error": (err_text or "").strip().splitlines()[0][:300] if (args.why and err_text) else None})
         if i % 25 == 0 or i == total:
             print(f"  {i}/{total}", file=sys.stderr, flush=True)

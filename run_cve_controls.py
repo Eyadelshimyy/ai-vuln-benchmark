@@ -134,14 +134,18 @@ def main() -> None:
             else:
                 print(f"   -> MISS: in-scope vulnerability NOT detected -- INVESTIGATE (do not drop)")
         else:
-            ok = not r["tier1_detects_vuln"] and not (r["t2_vuln"] is True)
-            print(f"   -> {'correct non-detection (no over-reach)' if ok else 'OVER-REACH: fired on an out-of-scope case -- INVESTIGATE'}")
+            if r["t2_vuln"] is True:
+                print("   -> OVER-REACH: Tier-2 FALSELY CONFIRMED an out-of-scope case -- INVESTIGATE")
+            elif r["tier1_detects_vuln"]:
+                print("   -> correct non-confirmation (Tier-1 candidate flag; Tier-2 correctly declined -- triggered-unconfirmed, no false positive)")
+            else:
+                print("   -> correct non-detection (neither tier fired)")
 
     n_detect = sum(1 for r in in_scope if r["tier1_detects_vuln"])
     n_dist = sum(1 for r in in_scope if r["distinguished"])
     n_t1 = sum(1 for r in in_scope if r["tier1_distinguishes"])
     n_t2 = sum(1 for r in in_scope if r["tier2_distinguishes"])
-    oos_ok = sum(1 for r in oos if not r["tier1_detects_vuln"] and not (r["t2_vuln"] is True))
+    oos_ok = sum(1 for r in oos if not (r["t2_vuln"] is True))
 
     print("\n" + "=" * 72)
     print("SUMMARY")

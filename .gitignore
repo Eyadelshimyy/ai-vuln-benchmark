@@ -6,3 +6,14 @@ mine_prompts_*/
 .env
 *token*
 *:Zone.Identifier
+# VULCAN scratch (not part of the frozen snapshot)
+.consortium_cache/
+.consortium_cache_mock*/
+_advdb/
+ai_repos_copilot.json
+ai_repos_cursor.json
+*.bak
+*.bak_*
+*.preP3.bak
+ai_repos_*.json
+baselines_confirmed.json

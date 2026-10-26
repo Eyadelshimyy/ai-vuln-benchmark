@@ -99,6 +99,33 @@ SAFE = [
      "    if ip.is_loopback or ip.is_private or ip.is_reserved or ip.is_link_local:\n"
      "        raise ValueError('blocked host')\n"
      "    return requests.get(url, timeout=3).status_code\n"),
+    ("pp_confine", "CWE-22", "p",
+     "def pp_confine(p: 'Path'):\n"
+     "    from pathlib import Path\n"
+     "    base = Path('/tmp/snd_pc').resolve(); base.mkdir(parents=True, exist_ok=True)\n"
+     "    full = (base / Path(p)).resolve()\n"
+     "    if not str(full).startswith(str(base) + '/'):\n"
+     "        raise ValueError('escape')\n"
+     "    full.write_text('x'); return full.read_text()\n"),
+    ("pp_basename", "CWE-22", "p",
+     "def pp_basename(p: 'Path'):\n"
+     "    from pathlib import Path\n"
+     "    base = Path('/tmp/snd_pb'); base.mkdir(parents=True, exist_ok=True)\n"
+     "    full = base / Path(p).name\n"
+     "    full.write_text('x'); return full.read_text()\n"),
+    ("pm_confine", "CWE-22", "p",
+     "def pm_confine(p: 'Path'):\n"
+     "    from pathlib import Path\n"
+     "    base = Path('/tmp/snd_mkc').resolve(); base.mkdir(parents=True, exist_ok=True)\n"
+     "    full = base / Path(p).name\n"
+     "    full.mkdir(parents=True, exist_ok=True); return str(full)\n"),
+    ("po_confine", "CWE-22", "p",
+     "def po_confine(p: 'Path'):\n"
+     "    from pathlib import Path\n"
+     "    base = Path('/tmp/snd_po').resolve(); base.mkdir(parents=True, exist_ok=True)\n"
+     "    full = base / Path(p).name\n"
+     "    with full.open('w') as f: f.write('x')\n"
+     "    with full.open() as f: return f.read()\n"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -134,6 +161,36 @@ VULN = [
      "def v_ssrf(url, params=None, headers=None):\n"
      "    import requests\n"
      "    return requests.get(url, params=params, headers=headers, timeout=3).status_code\n"),
+    ("pv_write", "CWE-22", "p",
+     "def pv_write(p: 'Path'):\n"
+     "    from pathlib import Path\n"
+     "    Path(p).write_text('x'); return 1\n"),
+    ("pv_read", "CWE-22", "p",
+     "def pv_read(p: 'Path'):\n"
+     "    from pathlib import Path\n"
+     "    return len(Path(p).read_text())\n"),
+    ("pv_openparent", "CWE-22", "p",
+     "def pv_openparent(p: 'Path'):\n"
+     "    from pathlib import Path\n"
+     "    pp = Path(p); pp.parent.mkdir(parents=True, exist_ok=True)\n"
+     "    pp.write_text('x'); return 1\n"),
+    ("vm_mkdir", "CWE-22", "p",
+     "def vm_mkdir(p: 'Path'):\n"
+     "    from pathlib import Path\n"
+     "    Path(p).mkdir(parents=True, exist_ok=True); return 1\n"),
+    ("vm_osmakedirs", "CWE-22", "q",
+     "def vm_osmakedirs(q):\n"
+     "    import os\n"
+     "    os.makedirs(q, exist_ok=True); return 1\n"),
+    ("po_write", "CWE-22", "p",
+     "def po_write(p: 'Path'):\n"
+     "    from pathlib import Path\n"
+     "    with Path(p).open('w') as f: f.write('x')\n"
+     "    return 1\n"),
+    ("po_read", "CWE-22", "p",
+     "def po_read(p: 'Path'):\n"
+     "    from pathlib import Path\n"
+     "    with Path(p).open() as f: return len(f.read())\n"),
 ]
 
 
@@ -145,6 +202,45 @@ def _confirm(fn, cwe, param, src):
 
 
 # ---- pytest entry points (one assertion per case for readable failures) ----
+SAFE += [
+    ("ssti_sandbox", "CWE-1336", "tpl",
+     "def ssti_sandbox(tpl):\n"
+     "    from jinja2.sandbox import ImmutableSandboxedEnvironment\n"
+     "    return ImmutableSandboxedEnvironment().from_string(tpl).render()\n"),
+    ("ssti_constant", "CWE-1336", "tpl",
+     "def ssti_constant(tpl):\n"
+     "    import jinja2\n"
+     "    return jinja2.Environment().from_string('safe constant template').render(x=tpl)\n"),
+]
+VULN += [
+    ("ssti_vuln", "CWE-1336", "tpl",
+     "def ssti_vuln(tpl):\n"
+     "    import jinja2\n"
+     "    return jinja2.Environment().from_string(tpl).render()\n"),
+]
+
+
+SAFE += [
+    ("ssti_sandbox_deferred", "CWE-1336", "tpl",
+     "def ssti_sandbox_deferred(tpl):\n"
+     "    from jinja2.sandbox import ImmutableSandboxedEnvironment\n"
+     "    env = ImmutableSandboxedEnvironment()\n"
+     "    compiled = env.from_string(tpl)\n"
+     "    def _later(_c=None):\n"
+     "        return compiled.render(_c or {})\n"
+     "    return _later\n"),
+]
+VULN += [
+    ("ssti_vuln_deferred", "CWE-1336", "tpl",
+     "def ssti_vuln_deferred(tpl):\n"
+     "    import jinja2\n"
+     "    env = jinja2.Environment()\n"
+     "    compiled = env.from_string(tpl)\n"
+     "    def _later(_c=None):\n"
+     "        return compiled.render(_c or {})\n"
+     "    return _later\n"),
+]
+
 def test_safe_never_confirmed():
     for fn, cwe, param, src in SAFE:
         confirmed, bucket = _confirm(fn, cwe, param, src)

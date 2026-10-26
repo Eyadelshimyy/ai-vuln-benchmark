@@ -33,6 +33,24 @@
     "prio": 0
   },
   {
+    "repo": "2100preet/stockscanner",
+    "function": "load_config",
+    "file": "odte_scanner/config.py",
+    "entry_kind": "http",
+    "call_path": [
+      "snapshot",
+      "ensure_challenge_win_table",
+      "build_win_rate_table",
+      "load_config"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "2100preet__stockscanner/odte_scanner__config.py__load_config.json",
+    "prio": 0
+  },
+  {
     "repo": "kamoras/civitas",
     "function": "read_record",
     "file": "backend/app/shared_state.py",
@@ -130,6 +148,28 @@
   },
   {
     "repo": "kamoras/civitas",
+    "function": "build_link_card",
+    "file": "backend/app/pipeline/analyze/bluesky_utils.py",
+    "entry_kind": "http",
+    "call_path": [
+      "refresh_action_center",
+      "refresh_action_issues",
+      "_run_refresh",
+      "_run_periodic_bluesky_posts",
+      "deliver_pending",
+      "_deliver_to_bluesky",
+      "publish_post",
+      "build_link_card"
+    ],
+    "reach_cwes": [
+      "CWE-918"
+    ],
+    "exec_cwe": "CWE-918",
+    "census_file": "kamoras__civitas/backend__app__pipeline__analyze__bluesky_utils.py__build_link_card.json",
+    "prio": 0
+  },
+  {
+    "repo": "kamoras/civitas",
     "function": "update_json_file",
     "file": "backend/app/atomic_write.py",
     "entry_kind": "http",
@@ -175,6 +215,106 @@
     "prio": 0
   },
   {
+    "repo": "Gunrunner444/BugForge",
+    "function": "prepare_foundry_workspace",
+    "file": "backend/app/security_testing/exploratory.py",
+    "entry_kind": "http",
+    "call_path": [
+      "analyze_repository",
+      "analyze_session_repository",
+      "analyze_repository",
+      "_rules_over_graphs",
+      "build_compiler_project",
+      "_compile_version_groups",
+      "_host_runner_binary",
+      "run_solc_standard_json",
+      "run",
+      "_execute",
+      "prepare_foundry_workspace"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "Gunrunner444__BugForge/backend__app__security_testing__exploratory.py__prepare_foundry_workspace.json",
+    "prio": 0
+  },
+  {
+    "repo": "2100preet/stockscanner",
+    "function": "pulse_desk_alerts",
+    "file": "odte_scanner/alert_pulse.py",
+    "entry_kind": "api",
+    "call_path": [
+      "pulse_desk_alerts"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "2100preet__stockscanner/odte_scanner__alert_pulse.py__pulse_desk_alerts.json",
+    "prio": 2
+  },
+  {
+    "repo": "2100preet/stockscanner",
+    "function": "run_ui",
+    "file": "odte_scanner/ui.py",
+    "entry_kind": "api",
+    "call_path": [
+      "run_ui"
+    ],
+    "reach_cwes": [
+      "CWE-78"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "2100preet__stockscanner/odte_scanner__ui.py__run_ui.json",
+    "prio": 2
+  },
+  {
+    "repo": "DeepCivic/womblex",
+    "function": "open_document",
+    "file": "src/womblex/ingest/pdf/_pdfium_doc.py",
+    "entry_kind": "api",
+    "call_path": [
+      "open_document"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "DeepCivic__womblex/src__womblex__ingest__pdf___pdfium_doc.py__open_document.json",
+    "prio": 2
+  },
+  {
+    "repo": "DeepCivic/womblex",
+    "function": "register_csv",
+    "file": "fixtures/synthetic/generate.py",
+    "entry_kind": "api",
+    "call_path": [
+      "register_csv"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "DeepCivic__womblex/fixtures__synthetic__generate.py__register_csv.json",
+    "prio": 2
+  },
+  {
+    "repo": "DeepCivic/womblex",
+    "function": "scanned_letter_pdf",
+    "file": "fixtures/synthetic/generate.py",
+    "entry_kind": "api",
+    "call_path": [
+      "scanned_letter_pdf"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "DeepCivic__womblex/fixtures__synthetic__generate.py__scanned_letter_pdf.json",
+    "prio": 2
+  },
+  {
     "repo": "DeepCivic/womblex",
     "function": "sha256_file",
     "file": "src/womblex/utils/checksum.py",
@@ -187,6 +327,217 @@
     ],
     "exec_cwe": "CWE-22",
     "census_file": "DeepCivic__womblex/src__womblex__utils__checksum.py__sha256_file.json",
+    "prio": 2
+  },
+  {
+    "repo": "PrjBbrosa/data-analyzer",
+    "function": "run",
+    "file": "mf4_analyzer/acquisition_capture/runtime_smoke.py",
+    "entry_kind": "api",
+    "call_path": [
+      "run"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_capture__runtime_smoke.py__run.json",
+    "prio": 2
+  },
+  {
+    "repo": "PrjBbrosa/data-analyzer",
+    "function": "run",
+    "file": "mf4_analyzer/ui/drawers/batch/runner_thread.py",
+    "entry_kind": "api",
+    "call_path": [
+      "run"
+    ],
+    "reach_cwes": [
+      "CWE-78"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_capture__runtime_smoke.py__run.json",
+    "prio": 2
+  },
+  {
+    "repo": "PrjBbrosa/data-analyzer",
+    "function": "sha256_file",
+    "file": "mf4_analyzer/batch_manifest.py",
+    "entry_kind": "api",
+    "call_path": [
+      "sha256_file"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "PrjBbrosa__data-analyzer/mf4_analyzer__batch_manifest.py__sha256_file.json",
+    "prio": 2
+  },
+  {
+    "repo": "VibeBB/fpga-agent",
+    "function": "spdx_ids",
+    "file": "src/fpga/gates.py",
+    "entry_kind": "api",
+    "call_path": [
+      "spdx_ids"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "VibeBB__fpga-agent/src__fpga__gates.py__spdx_ids.json",
+    "prio": 2
+  },
+  {
+    "repo": "VibeBB/fpga-agent",
+    "function": "synth_unit",
+    "file": "scripts/library_smoke.py",
+    "entry_kind": "api",
+    "call_path": [
+      "synth_unit"
+    ],
+    "reach_cwes": [
+      "CWE-22",
+      "CWE-78"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "VibeBB__fpga-agent/scripts__library_smoke.py__synth_unit.json",
+    "prio": 2
+  },
+  {
+    "repo": "VibeBB/fpga-agent",
+    "function": "write_png",
+    "file": "src/fpga/render.py",
+    "entry_kind": "api",
+    "call_path": [
+      "write_png"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "VibeBB__fpga-agent/src__fpga__render.py__write_png.json",
+    "prio": 2
+  },
+  {
+    "repo": "alexandrelheinen/clave",
+    "function": "digest_of",
+    "file": "src/clave/corpus/artifacts.py",
+    "entry_kind": "api",
+    "call_path": [
+      "digest_of"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "alexandrelheinen__clave/src__clave__corpus__artifacts.py__digest_of.json",
+    "prio": 2
+  },
+  {
+    "repo": "alexandrelheinen/clave",
+    "function": "play",
+    "file": "src/clave/runtime/play.py",
+    "entry_kind": "api",
+    "call_path": [
+      "play"
+    ],
+    "reach_cwes": [
+      "CWE-78"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "alexandrelheinen__clave/src__clave__runtime__play.py__play.json",
+    "prio": 2
+  },
+  {
+    "repo": "alexandrelheinen/clave",
+    "function": "write",
+    "file": "src/clave/benchmark/pack.py",
+    "entry_kind": "api",
+    "call_path": [
+      "write"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "alexandrelheinen__clave/src__clave__experiment__run.py__write.json",
+    "prio": 2
+  },
+  {
+    "repo": "alexandrelheinen/clave",
+    "function": "write",
+    "file": "src/clave/experiment/run.py",
+    "entry_kind": "api",
+    "call_path": [
+      "write"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "alexandrelheinen__clave/src__clave__experiment__run.py__write.json",
+    "prio": 2
+  },
+  {
+    "repo": "alexandrelheinen/clave",
+    "function": "write_record",
+    "file": "src/clave/runtime/loop.py",
+    "entry_kind": "api",
+    "call_path": [
+      "write_record"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "alexandrelheinen__clave/src__clave__runtime__loop.py__write_record.json",
+    "prio": 2
+  },
+  {
+    "repo": "danielreuter/research-notes",
+    "function": "fetch",
+    "file": "lanes/circuits-grid-models/labeller/silu_check.py",
+    "entry_kind": "api",
+    "call_path": [
+      "fetch"
+    ],
+    "reach_cwes": [
+      "CWE-78"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "danielreuter__research-notes/lanes__circuits-grid-models__labeller__silu_check.py__fetch.json",
+    "prio": 2
+  },
+  {
+    "repo": "danielreuter/research-notes",
+    "function": "sha256",
+    "file": "lanes/proofs-rows/tools/split_measure.py",
+    "entry_kind": "api",
+    "call_path": [
+      "sha256"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "danielreuter__research-notes/lanes__proofs-rows__tools__stage_mark.py__sha256.json",
+    "prio": 2
+  },
+  {
+    "repo": "danielreuter/research-notes",
+    "function": "sha256",
+    "file": "lanes/proofs-rows/tools/stage_mark.py",
+    "entry_kind": "api",
+    "call_path": [
+      "sha256"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "danielreuter__research-notes/lanes__proofs-rows__tools__stage_mark.py__sha256.json",
     "prio": 2
   },
   {
@@ -217,6 +568,21 @@
     ],
     "exec_cwe": "CWE-22",
     "census_file": "danielreuter__research-notes/lanes__proofs-n2-guest__tools__refill.py__submit.json",
+    "prio": 2
+  },
+  {
+    "repo": "danielreuter/research-notes",
+    "function": "sync_cache",
+    "file": "lanes/proofs-n2-hill/tools/n2h.py",
+    "entry_kind": "api",
+    "call_path": [
+      "sync_cache"
+    ],
+    "reach_cwes": [
+      "CWE-78"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "danielreuter__research-notes/lanes__proofs-n2-hill__tools__n2h.py__sync_cache.json",
     "prio": 2
   },
   {
@@ -253,6 +619,100 @@
   },
   {
     "repo": "kamoras/civitas",
+    "function": "fetch",
+    "file": "backend/scripts/audit_funding_components.py",
+    "entry_kind": "api",
+    "call_path": [
+      "fetch"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "kamoras__civitas/backend__scripts__research_justice_loyalty.py__fetch.json",
+    "prio": 2
+  },
+  {
+    "repo": "kamoras/civitas",
+    "function": "fetch",
+    "file": "backend/scripts/build_name_casing.py",
+    "entry_kind": "api",
+    "call_path": [
+      "fetch"
+    ],
+    "reach_cwes": [
+      "CWE-22",
+      "CWE-918"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "kamoras__civitas/backend__scripts__research_justice_loyalty.py__fetch.json",
+    "prio": 2
+  },
+  {
+    "repo": "kamoras/civitas",
+    "function": "fetch",
+    "file": "backend/scripts/fetch_occupation_industry.py",
+    "entry_kind": "api",
+    "call_path": [
+      "fetch"
+    ],
+    "reach_cwes": [
+      "CWE-22",
+      "CWE-918"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "kamoras__civitas/backend__scripts__research_justice_loyalty.py__fetch.json",
+    "prio": 2
+  },
+  {
+    "repo": "kamoras/civitas",
+    "function": "fetch",
+    "file": "backend/scripts/research_constituent_alignment.py",
+    "entry_kind": "api",
+    "call_path": [
+      "fetch"
+    ],
+    "reach_cwes": [
+      "CWE-22",
+      "CWE-918"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "kamoras__civitas/backend__scripts__research_justice_loyalty.py__fetch.json",
+    "prio": 2
+  },
+  {
+    "repo": "kamoras/civitas",
+    "function": "fetch",
+    "file": "backend/scripts/research_justice_loyalty.py",
+    "entry_kind": "api",
+    "call_path": [
+      "fetch"
+    ],
+    "reach_cwes": [
+      "CWE-22",
+      "CWE-918"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "kamoras__civitas/backend__scripts__research_justice_loyalty.py__fetch.json",
+    "prio": 2
+  },
+  {
+    "repo": "kamoras/civitas",
+    "function": "labels",
+    "file": "backend/scripts/fetch_occupation_industry.py",
+    "entry_kind": "api",
+    "call_path": [
+      "labels"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "kamoras__civitas/backend__scripts__fetch_occupation_industry.py__labels.json",
+    "prio": 2
+  },
+  {
+    "repo": "kamoras/civitas",
     "function": "load_county_names",
     "file": "backend/scripts/build_county_district_crosswalk.py",
     "entry_kind": "api",
@@ -268,6 +728,21 @@
   },
   {
     "repo": "kamoras/civitas",
+    "function": "load_donor_task",
+    "file": "backend/scripts/evaluate_embedding_models.py",
+    "entry_kind": "api",
+    "call_path": [
+      "load_donor_task"
+    ],
+    "reach_cwes": [
+      "CWE-918"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "kamoras__civitas/backend__scripts__evaluate_embedding_models.py__load_donor_task.json",
+    "prio": 2
+  },
+  {
+    "repo": "kamoras/civitas",
     "function": "load_les",
     "file": "backend/scripts/benchmark_validation.py",
     "entry_kind": "api",
@@ -279,6 +754,21 @@
     ],
     "exec_cwe": "CWE-22",
     "census_file": "kamoras__civitas/backend__scripts__benchmark_validation.py__load_les.json",
+    "prio": 2
+  },
+  {
+    "repo": "kamoras/civitas",
+    "function": "rederive",
+    "file": "backend/scripts/fetch_poll_close_times.py",
+    "entry_kind": "api",
+    "call_path": [
+      "rederive"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "kamoras__civitas/backend__scripts__fetch_poll_close_times.py__rederive.json",
     "prio": 2
   },
   {
@@ -387,6 +877,36 @@
     "prio": 2
   },
   {
+    "repo": "mikelane/pytest-gremlins",
+    "function": "append_history_entry",
+    "file": "src/pytest_gremlins/reporting/history.py",
+    "entry_kind": "api",
+    "call_path": [
+      "append_history_entry"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "mikelane__pytest-gremlins/src__pytest_gremlins__reporting__history.py__append_history_entry.json",
+    "prio": 2
+  },
+  {
+    "repo": "mikelane/pytest-gremlins",
+    "function": "write_spawn_hook",
+    "file": "src/pytest_gremlins/instrumentation/spawn_hook.py",
+    "entry_kind": "api",
+    "call_path": [
+      "write_spawn_hook"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "mikelane__pytest-gremlins/src__pytest_gremlins__instrumentation__spawn_hook.py__write_spawn_hook.json",
+    "prio": 2
+  },
+  {
     "repo": "nthplusio/skills",
     "function": "load_overrides",
     "file": "skills/scoussens-skills/pr-review-round/scripts/queue.py",
@@ -399,6 +919,97 @@
     ],
     "exec_cwe": "CWE-22",
     "census_file": "nthplusio__skills/skills__scoussens-skills__pr-review-round__scripts__queue.py__load_overrides.json",
+    "prio": 2
+  },
+  {
+    "repo": "paulosalem/ellements",
+    "function": "load_toml",
+    "file": "ellements-core/src/ellements/core/config.py",
+    "entry_kind": "api",
+    "call_path": [
+      "load_toml"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "paulosalem__ellements/ellements-core__src__ellements__core__config.py__load_toml.json",
+    "prio": 2
+  },
+  {
+    "repo": "saltyscott0521/tracebi",
+    "function": "read_connection_doc",
+    "file": "tracebi/connections.py",
+    "entry_kind": "api",
+    "call_path": [
+      "read_connection_doc"
+    ],
+    "reach_cwes": [
+      "CWE-502"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "saltyscott0521__tracebi/tracebi__connections.py__read_connection_doc.json",
+    "prio": 2
+  },
+  {
+    "repo": "saltyscott0521/tracebi",
+    "function": "read_model_doc",
+    "file": "tracebi/model/model_spec.py",
+    "entry_kind": "api",
+    "call_path": [
+      "read_model_doc"
+    ],
+    "reach_cwes": [
+      "CWE-502"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "saltyscott0521__tracebi/tracebi__model__model_spec.py__read_model_doc.json",
+    "prio": 2
+  },
+  {
+    "repo": "saltyscott0521/tracebi",
+    "function": "read_pipeline_doc",
+    "file": "tracebi/pipeline/pipeline_spec.py",
+    "entry_kind": "api",
+    "call_path": [
+      "read_pipeline_doc"
+    ],
+    "reach_cwes": [
+      "CWE-502"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "saltyscott0521__tracebi/tracebi__pipeline__pipeline_spec.py__read_pipeline_doc.json",
+    "prio": 2
+  },
+  {
+    "repo": "saltyscott0521/tracebi",
+    "function": "serve",
+    "file": "scripts/ui_audit.py",
+    "entry_kind": "api",
+    "call_path": [
+      "serve"
+    ],
+    "reach_cwes": [
+      "CWE-22",
+      "CWE-78"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "saltyscott0521__tracebi/scripts__ui_audit.py__serve.json",
+    "prio": 2
+  },
+  {
+    "repo": "saltyscott0521/tracebi",
+    "function": "serve",
+    "file": "tracebi/mcp_server.py",
+    "entry_kind": "api",
+    "call_path": [
+      "serve"
+    ],
+    "reach_cwes": [
+      "CWE-78"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "saltyscott0521__tracebi/scripts__ui_audit.py__serve.json",
     "prio": 2
   },
   {
@@ -463,6 +1074,52 @@
     "prio": 2
   },
   {
+    "repo": "waltfilipe/sada-test",
+    "function": "save_heatmap",
+    "file": "scripts/engine/sofascore_heatmap.py",
+    "entry_kind": "api",
+    "call_path": [
+      "save_heatmap"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "waltfilipe__sada-test/scripts__engine__sofascore_heatmap.py__save_heatmap.json",
+    "prio": 2
+  },
+  {
+    "repo": "waltfilipe/sada-test",
+    "function": "write_heatmap_index",
+    "file": "scripts/engine/sofascore_heatmap.py",
+    "entry_kind": "api",
+    "call_path": [
+      "write_heatmap_index"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "waltfilipe__sada-test/scripts__engine__sofascore_heatmap.py__write_heatmap_index.json",
+    "prio": 2
+  },
+  {
+    "repo": "DeepCivic/womblex",
+    "function": "_has_header_row",
+    "file": "src/womblex/ingest/gnaf.py",
+    "entry_kind": "api",
+    "call_path": [
+      "ingest_psv",
+      "_has_header_row"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "DeepCivic__womblex/src__womblex__ingest__gnaf.py___has_header_row.json",
+    "prio": 2
+  },
+  {
     "repo": "PrjBbrosa/data-analyzer",
     "function": "_emit",
     "file": "mf4_analyzer/ui/pg_canvas/_perf_probe.py",
@@ -511,6 +1168,22 @@
     "prio": 2
   },
   {
+    "repo": "PrjBbrosa/data-analyzer",
+    "function": "_write_config_file",
+    "file": "mf4_analyzer/acquisition_capture/config_store.py",
+    "entry_kind": "api",
+    "call_path": [
+      "toggle_favorite",
+      "_write_config_file"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_capture__config_store.py___write_config_file.json",
+    "prio": 2
+  },
+  {
     "repo": "VibeBB/fpga-agent",
     "function": "_load",
     "file": "scripts/container_hardening_report.py",
@@ -556,6 +1229,22 @@
     ],
     "exec_cwe": "CWE-22",
     "census_file": "alexandrelheinen__fret/scripts__plot_telemetry.py___load_csv.json",
+    "prio": 2
+  },
+  {
+    "repo": "alexandrelheinen/fret",
+    "function": "_wall_contact_rate",
+    "file": "scripts/release/audit_showcase_renders.py",
+    "entry_kind": "api",
+    "call_path": [
+      "audit",
+      "_wall_contact_rate"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "alexandrelheinen__fret/scripts__release__audit_showcase_renders.py___wall_contact_rate.json",
     "prio": 2
   },
   {
@@ -640,6 +1329,22 @@
     "prio": 2
   },
   {
+    "repo": "markus-michalski/project-hub",
+    "function": "_append_action_item",
+    "file": "servers/project-hub-server/tools/docs_writer.py",
+    "entry_kind": "api",
+    "call_path": [
+      "write_note_to_disk",
+      "_append_action_item"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "markus-michalski__project-hub/servers__project-hub-server__tools__docs_writer.py___append_action_item.json",
+    "prio": 2
+  },
+  {
     "repo": "mikelane/pytest-gremlins",
     "function": "_read_node_ids",
     "file": "src/pytest_gremlins/node_id_args.py",
@@ -653,6 +1358,22 @@
     ],
     "exec_cwe": "CWE-22",
     "census_file": "mikelane__pytest-gremlins/src__pytest_gremlins__node_id_args.py___read_node_ids.json",
+    "prio": 2
+  },
+  {
+    "repo": "saltyscott0521/tracebi",
+    "function": "_build_report_target",
+    "file": "tracebi/cli.py",
+    "entry_kind": "api",
+    "call_path": [
+      "cmd_report",
+      "_build_report_target"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "saltyscott0521__tracebi/tracebi__cli.py___build_report_target.json",
     "prio": 2
   },
   {
@@ -688,6 +1409,22 @@
     "exec_cwe": "CWE-22",
     "census_file": "alexandrelheinen__fret/src__fret__ros__mujoco_bridge.py___load_bridge_config.json",
     "prio": 2
+  },
+  {
+    "repo": "VibeBB/fpga-agent",
+    "function": "dump",
+    "file": "scripts/structural_coverage.py",
+    "entry_kind": "main",
+    "call_path": [
+      "main",
+      "dump"
+    ],
+    "reach_cwes": [
+      "CWE-22"
+    ],
+    "exec_cwe": "CWE-22",
+    "census_file": "VibeBB__fpga-agent/scripts__structural_coverage.py__dump.json",
+    "prio": 3
   },
   {
     "repo": "clarmso/openings.info",

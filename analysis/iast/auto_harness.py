@@ -130,6 +130,48 @@ TRUSTED_PARAM_NAMES = {
 }
 
 
+_SQL_KEYWORDS = {"SELECT","FROM","WHERE","AND","OR","NOT","NULL","IS","IN","LIKE","ORDER","BY","GROUP",
+  "LIMIT","OFFSET","AS","ON","JOIN","LEFT","RIGHT","INNER","OUTER","FULL","CROSS","UNION","ALL","INSERT","INTO",
+  "VALUES","UPDATE","SET","DELETE","CREATE","TABLE","COALESCE","MIN","MAX","COUNT","SUM","AVG","DISTINCT","CASE",
+  "WHEN","THEN","ELSE","END","ASC","DESC","HAVING","EXISTS","BETWEEN","IF","REPLACE","INDEX","PRIMARY","KEY",
+  "FOREIGN","REFERENCES","DEFAULT","AUTOINCREMENT","INTEGER","TEXT","REAL","BLOB","NUMERIC","CAST","LENGTH",
+  "LOWER","UPPER","SUBSTR","TRIM","ROUND","ABS","DATE","DATETIME","TIME","STRFTIME","JULIANDAY","NULLIF","IFNULL",
+  "PRAGMA","BEGIN","COMMIT","ROLLBACK","TRANSACTION","WITH","RECURSIVE","OVER","PARTITION","GLOB","COLLATE","USING"}
+def _cols_from_sql(sql):
+    import re as _re2
+    out=[]; seen=set()
+    for tok in _re2.findall(r"[A-Za-z_][A-Za-z0-9_]*", sql or ""):
+        if tok.upper() in _SQL_KEYWORDS or tok in seen: continue
+        seen.add(tok); out.append(tok)
+    return ", ".join('"%s"' % c for c in out) or '"id"'
+def _autoschema_call(conn, real_method, sql, *args, **kwargs):
+    """On 'no such table', create an EMPTY table with the query's identifiers as
+    typeless columns and retry. Neutral (empty tables never change an injection
+    outcome); the real taint-checking execute still decides vuln vs safe."""
+    last=None
+    for _ in range(16):
+        try:
+            return real_method(sql, *args, **kwargs)
+        except Exception as e:
+            last=e; m=str(e)
+            if "no such table:" in m:
+                tbl=m.split("no such table:",1)[1].strip().split()[0].strip('"[]`')
+                try: conn.execute('CREATE TABLE IF NOT EXISTS "%s" (%s)' % (tbl, _cols_from_sql(sql)))
+                except Exception: break
+                continue
+            raise
+    if last is not None: raise last
+class _AutoSchemaCursor:
+    def __init__(self, cur, conn):
+        self.__dict__["_cur"]=cur; self.__dict__["_conn"]=conn
+    def execute(self, sql, *a, **kw):
+        return _autoschema_call(self.__dict__["_conn"], self.__dict__["_cur"].execute, sql, *a, **kw)
+    def executemany(self, sql, *a, **kw):
+        return _autoschema_call(self.__dict__["_conn"], self.__dict__["_cur"].executemany, sql, *a, **kw)
+    def __iter__(self): return iter(self.__dict__["_cur"])
+    def __getattr__(self, n): return getattr(self.__dict__["_cur"], n)
+
+
 class _SelfConnFallback:
     """Mixin giving a generic `self` stand-in an HONEST recovery for the one
     construction gap that dominates the COULD_NOT_EXECUTE bucket: a DB-wrapper
@@ -177,7 +219,17 @@ class _SelfConnFallback:
             self.__dict__[name] = conn  # stable on repeat access
             return conn
         if name in _SelfConnFallback._SQL_CONN_METHODS:
-            return getattr(self._real_sqlite_conn(), name)
+            _conn = self._real_sqlite_conn()
+            if name in ("execute", "executemany"):
+                _real = getattr(_conn, name)
+                def _ash(sql, *a, **kw):
+                    return _autoschema_call(_conn, _real, sql, *a, **kw)
+                return _ash
+            if name == "cursor":
+                def _ash_cur(*a, **kw):
+                    return _AutoSchemaCursor(_conn.cursor(*a, **kw), _conn)
+                return _ash_cur
+            return getattr(_conn, name)
         raise AttributeError(
             f"{type(self).__name__} has no real attribute {name!r} -- the "
             "candidate expected a fully-formed object this generic harness "
@@ -521,6 +573,14 @@ def _looks_url(name: str) -> bool:
     return any(h in n for h in _URL_NAME_HINTS)
 
 
+def _looks_path(name, annotation):
+    """INERT auxiliary param annotated Path/PathLike -> a real temp Path, so the
+    candidate runs to the sink instead of crashing on .mkdir()/.open()/.parent / '/'.
+    Annotation-only (never guesses by name) so it can't regress a str param. Never
+    the tainted marker, so it cannot create a false confirmation."""
+    return bool(annotation) and (("Path" in annotation) or ("PathLike" in annotation))
+
+
 def _build_arg(name: str, annotation: str | None, marker: str | None, live: bool = False):
     """Build one call argument. `marker` is not None exactly for the ONE
     parameter being tested as the attacker-controlled injection point on
@@ -538,6 +598,13 @@ def _build_arg(name: str, annotation: str | None, marker: str | None, live: bool
         # correctly NOT triggered (soundness unaffected; verified by the battery).
         if (not live) and _looks_url(name) and "://" not in str(marker):
             return f"http://{marker}.oracle.invalid/{marker}"
+        # CWE-22 sibling of the URL wrap: a path-typed injection TARGET handed a
+        # bare str dies on .open()/.write_text()/.parent before the filesystem sink.
+        # Wrap the SAME marker in a real Path so the real path op runs; traversal
+        # payload preserved (is_tainted() str()s it) and a resolve()+containment fn
+        # still blocks it -> NOT confirmed. Reuses the existing _looks_path detector.
+        if _looks_path(name, annotation):
+            return Path(marker)
         return marker
     if name in _CONTEXT_PARAM_NAMES:
         # invoke/fabric Context handle -> honest run()/sudo() routed to the
@@ -568,6 +635,9 @@ def _build_arg(name: str, annotation: str | None, marker: str | None, live: bool
     # Default stand-in for anything else (unannotated, or annotated as a
     # plausible string/object): a short, clearly-inert placeholder string.
     # Deliberately NOT a marker -- only the one targeted param gets that.
+    if _looks_path(name, annotation):
+        import tempfile
+        return Path(tempfile.mkdtemp(prefix="ah_aux_")) / "autoharness_path"
     return "autoharness_placeholder"
 
 

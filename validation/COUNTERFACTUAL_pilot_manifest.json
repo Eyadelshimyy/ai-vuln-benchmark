@@ -1,0 +1,30 @@
+{
+  "seed": 42,
+  "selection": "random.sample per exec_cwe, sorted universe, seed fixed BEFORE audit",
+  "cases": [
+    {
+      "exec_cwe": "CWE-22",
+      "repo": "VibeBB__fpga-agent",
+      "function": "spdx_ids",
+      "file": "VibeBB__fpga-agent/src__fpga__gates.py__spdx_ids.json"
+    },
+    {
+      "exec_cwe": "CWE-22",
+      "repo": "Cognition-Partner-Workshops__otterworks-workshop-2610",
+      "function": "sha256_file",
+      "file": "Cognition-Partner-Workshops__otterworks-workshop-2610/migration__job__ldm__staging.py__sha256_file.json"
+    },
+    {
+      "exec_cwe": "CWE-918",
+      "repo": "waltfilipe__sada-test",
+      "function": "fetch_json",
+      "file": "waltfilipe__sada-test/scripts__download_club_logos.py__fetch_json.json"
+    },
+    {
+      "exec_cwe": "CWE-78",
+      "repo": "loveRhythm1990__mini-pi",
+      "function": "execute_bash",
+      "file": "loveRhythm1990__mini-pi/02-providers__src__main.py__execute_bash.json"
+    }
+  ]
+}

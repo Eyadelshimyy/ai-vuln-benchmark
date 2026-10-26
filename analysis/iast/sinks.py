@@ -680,6 +680,53 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
     real_write_text = pathlib.Path.write_text
     real_write_bytes = pathlib.Path.write_bytes
 
+    real_path_mkdir = pathlib.Path.mkdir
+    real_os_mkdir = os.mkdir
+    real_os_makedirs = os.makedirs
+    real_path_open = pathlib.Path.open
+
+    def patched_path_mkdir(self, *a, **kw):
+        # Directory-creation CWE-22 sink: a tainted dir path created outside the
+        # intended tree. Reuses the write-escape observable (os.path.exists on the
+        # proof path) -- a dir there proves escape, exactly like a written file.
+        _trace_path_sink("Path.mkdir", self)
+        if is_tainted(self, rec.marker):
+            rec.record_hit("CWE-22", "Path.mkdir", f"path={self!r}")
+            if not live:
+                raise SinkTriggered(rec.hits[-1])
+        return real_path_mkdir(self, *a, **kw)
+
+    def patched_os_mkdir(path, *a, **kw):
+        _trace_path_sink("os.mkdir", path)
+        if is_tainted(path, rec.marker):
+            rec.record_hit("CWE-22", "os.mkdir", f"path={path!r}")
+            if not live:
+                raise SinkTriggered(rec.hits[-1])
+        return real_os_mkdir(path, *a, **kw)
+
+    def patched_os_makedirs(path, *a, **kw):
+        _trace_path_sink("os.makedirs", path)
+        if is_tainted(path, rec.marker):
+            rec.record_hit("CWE-22", "os.makedirs", f"path={path!r}")
+            if not live:
+                raise SinkTriggered(rec.hits[-1])
+        return real_os_makedirs(path, *a, **kw)
+
+    def patched_path_open(self, *a, **kw):
+        # pathlib.Path.open is the pathlib twin of builtins.open -- same CWE-22
+        # read/write escape, different binding. Reuses the exact read/write
+        # observables: proof-file-exists (write), canary-in-output OR the
+        # opened-planted-file execution trace (read, branch c). No new verify logic.
+        _e = _trace_path_sink("Path.open", self)
+        if is_tainted(self, rec.marker):
+            rec.record_hit("CWE-22", "Path.open", f"path={self!r}")
+            if not live:
+                raise SinkTriggered(rec.hits[-1])
+        _fh = real_path_open(self, *a, **kw)
+        if _e is not None:
+            _e["opened_ok"] = True  # real open succeeded -> read-traversal trace (verify branch c)
+        return _fh
+
     def patched_write_text(self, data, *a, **kw):
         # Method-receiver sink: the DANGEROUS value is `self` (the path the
         # Path object was built with), not `data` -- mirrors taint_scan.py's
@@ -701,6 +748,34 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
             if not live:
                 raise SinkTriggered(rec.hits[-1])
         _r = real_write_bytes(self, data)
+        if _e is not None:
+            _e["opened_ok"] = True
+        return _r
+
+    real_read_text = pathlib.Path.read_text
+    real_read_bytes = pathlib.Path.read_bytes
+
+    def patched_read_text(self, *a, **kw):
+        # Method-receiver READ sink, mirror of patched_write_text: the
+        # dangerous value is `self` (the path). Path.read_text/read_bytes go
+        # through io.open, NOT builtins.open, so patched_open never sees them.
+        _e = _trace_path_sink("Path.read_text", self)
+        if is_tainted(self, rec.marker):
+            rec.record_hit("CWE-22", "Path.read_text", f"path={self!r}")
+            if not live:
+                raise SinkTriggered(rec.hits[-1])
+        _r = real_read_text(self, *a, **kw)
+        if _e is not None:
+            _e["opened_ok"] = True
+        return _r
+
+    def patched_read_bytes(self, *a, **kw):
+        _e = _trace_path_sink("Path.read_bytes", self)
+        if is_tainted(self, rec.marker):
+            rec.record_hit("CWE-22", "Path.read_bytes", f"path={self!r}")
+            if not live:
+                raise SinkTriggered(rec.hits[-1])
+        _r = real_read_bytes(self, *a, **kw)
         if _e is not None:
             _e["opened_ok"] = True
         return _r
@@ -847,6 +922,39 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
                     raise SinkTriggered(rec.hits[-1])
             return real_urllib3_urlopen(self, method, url, *a, **kw)
 
+    # --- CWE-1336: server-side template injection -- tainted template reaching Jinja2.
+    # Patching Environment.from_string covers SandboxedEnvironment and Flask's
+    # render_template_string (both route through it). Tier-1 records only that taint
+    # REACHED the engine; it does NOT distinguish a sandboxed render from an
+    # unsandboxed one -- that is decided solely at Tier-2, where the RCE gadget
+    # escapes an unsandboxed env and no other. Over-approximates "triggered" and
+    # stays sound, exactly like the lxml/HTML XXE case above.
+    real_jinja_from_string = None
+    try:
+        import jinja2 as _jinja2_ssti
+    except Exception:
+        _jinja2_ssti = None
+    if _jinja2_ssti is not None:
+        real_jinja_from_string = _jinja2_ssti.Environment.from_string
+        def patched_jinja_from_string(self, source, *a, **kw):
+            compiled = real_jinja_from_string(self, source, *a, **kw)
+            if is_tainted(source, rec.marker):
+                rec.record_hit("CWE-1336", "jinja2.Environment.from_string", f"source={str(source)[:120]!r}")
+                if not live:
+                    raise SinkTriggered(rec.hits[-1])
+                # Tier-2 exploitability test: render the attacker template against the REAL
+                # bound environment. The gadget's os.system(touch __PROOF__) fires iff this
+                # env permits code execution (unsandboxed); a SandboxedEnvironment raises and
+                # creates nothing. Confirms SSTI whose .render() is DEFERRED to another
+                # method/closure -- the from_string site is reached per-function (the
+                # exploitability fact); the app's own render is a separate Layer-2 question.
+                try:
+                    compiled.render()
+                except Exception:
+                    pass
+            return compiled
+
+
     # Apply all patches, yield control to the caller, then ALWAYS restore
     # the real functions afterward (the try/finally), even if the code
     # under test raises an exception.
@@ -858,8 +966,16 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
         _CassandraSession.execute = patched_cassandra_execute
         _CassandraSession.prepare = patched_cassandra_prepare
     builtins.open = patched_open
+    if real_jinja_from_string is not None:
+        _jinja2_ssti.Environment.from_string = patched_jinja_from_string
     pathlib.Path.write_text = patched_write_text
     pathlib.Path.write_bytes = patched_write_bytes
+    pathlib.Path.mkdir = patched_path_mkdir
+    os.mkdir = patched_os_mkdir
+    os.makedirs = patched_os_makedirs
+    pathlib.Path.open = patched_path_open
+    pathlib.Path.read_text = patched_read_text
+    pathlib.Path.read_bytes = patched_read_bytes
     if real_yaml_load is not None:
         _yaml.load = patched_yaml_load
     _pickle.loads = patched_pickle_loads
@@ -888,8 +1004,16 @@ def patched_sinks(marker: str, strict: bool = False, live: bool = False):
             _CassandraSession.execute = real_cassandra_execute
             _CassandraSession.prepare = real_cassandra_prepare
         builtins.open = real_open
+        if real_jinja_from_string is not None:
+            _jinja2_ssti.Environment.from_string = real_jinja_from_string
         pathlib.Path.write_text = real_write_text
         pathlib.Path.write_bytes = real_write_bytes
+        pathlib.Path.mkdir = real_path_mkdir
+        os.mkdir = real_os_mkdir
+        os.makedirs = real_os_makedirs
+        pathlib.Path.open = real_path_open
+        pathlib.Path.read_text = real_read_text
+        pathlib.Path.read_bytes = real_read_bytes
         if real_yaml_load is not None:
             _yaml.load = real_yaml_load
         _pickle.loads = real_pickle_loads

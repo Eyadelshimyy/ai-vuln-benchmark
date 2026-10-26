@@ -152,6 +152,8 @@ DESERIALIZE_SINK_ATTRS = {"unsafe_load", "full_load", "load_all"}
 XXE_SINK_ATTRS = {"fromstring", "XML"}
 XXE_SINK_NAMES = {"etree.parse", "etree.fromstring", "etree.XML",
                   "lxml.etree.fromstring", "lxml.etree.XML", "lxml.etree.parse"}
+SSTI_SINK_ATTRS = {"from_string"}
+SSTI_SINK_NAMES = {"render_template_string"}
 SSRF_SINK_ATTRS = {"urlopen"}
 SSRF_SINK_NAMES = {"urlopen", "urllib.request.urlopen", "request.urlopen",
                    "requests.get", "requests.post", "requests.put", "requests.head",
@@ -186,6 +188,9 @@ def classify_sink(func_node: ast.FunctionDef) -> list[str]:
         if _is_call_named(node, SSRF_SINK_NAMES) or \
            (isinstance(node.func, ast.Attribute) and node.func.attr in SSRF_SINK_ATTRS):
             tags.add("CWE-918")
+        if _is_call_named(node, SSTI_SINK_NAMES) or \
+           (isinstance(node.func, ast.Attribute) and node.func.attr in SSTI_SINK_ATTRS):
+            tags.add("CWE-1336")
     return sorted(tags)
 
 

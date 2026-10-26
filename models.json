@@ -1,7 +1,7 @@
 [
-  {"name": "gpt-4o-mini",      "base_url": "https://openrouter.ai/api/v1", "model": "openai/gpt-4o-mini",               "api_key_env": "OPENROUTER_KEY"},
-  {"name": "claude-3.5-haiku", "base_url": "https://openrouter.ai/api/v1", "model": "anthropic/claude-3.5-haiku",        "api_key_env": "OPENROUTER_KEY"},
-  {"name": "gemini-2.0-flash", "base_url": "https://openrouter.ai/api/v1", "model": "google/gemini-2.0-flash",          "api_key_env": "OPENROUTER_KEY"},
-  {"name": "qwen2.5-coder-32b","base_url": "https://openrouter.ai/api/v1", "model": "qwen/qwen-2.5-coder-32b-instruct", "api_key_env": "OPENROUTER_KEY"},
-  {"name": "deepseek-v3",      "base_url": "https://openrouter.ai/api/v1", "model": "deepseek/deepseek-chat",           "api_key_env": "OPENROUTER_KEY"}
+  {"name":"claude-haiku-5-5", "cli": true, "model":"opencode-go/claude-haiku-5-5"},
+  {"name":"gpt-6-luna",       "cli": true, "model":"opencode-go/gpt-6-luna"},
+  {"name":"deepseek-v4-pro",  "cli": true, "model":"opencode-go/deepseek-v4-pro"},
+  {"name":"kimi-k3",          "cli": true, "model":"opencode-go/kimi-k3"},
+  {"name":"qwen3.8-max",      "cli": true, "model":"opencode-go/qwen3.8-max"}
 ]
