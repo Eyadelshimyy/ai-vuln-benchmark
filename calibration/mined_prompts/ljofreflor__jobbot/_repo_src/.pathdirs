@@ -1,0 +1,9 @@
+.
+src
+src/jobbot
+src/jobbot/browser
+src/jobbot/companies
+src/jobbot/cv
+src/jobbot/portals
+src/jobbot/profile
+src/jobbot/resources

@@ -209,11 +209,10 @@
     }
   },
   "corpus_release": {
-    "file": "vulcan_corpus_candidates.tar.gz",
-    "sha256": "6565d94a6e4a6e7b426b6fe9cd13380be4c1248648e4976051c1ff174fec7c68",
-    "size": "45M",
-    "contents": "candidate JSONs for all non-ai-ssti corpus repos (embeds ground_truth_source/module_source)",
-    "repo_src": "not shipped; see validation/corpus_repo_pins.json to re-vendor for reachability",
-    "excludes": "ai-ssti-*/llama-cpp-ssti (SSTI sub-study, selection-biased)"
+    "candidate_corpus": "committed in-tree: calibration/mined_prompts/<repo>/*.json (embeds ground_truth_source/module_source); 96 non-ai-ssti repos",
+    "repo_src_in_tree": "vendored source committed for the 3 repos whose candidates need it to reach the sink (bermuda1023__ExposureEclipse, ljofreflor__jobbot, Cognition-Partner-Workshops__otterworks-workshop-2610) -- sufficient to reproduce ALL 160 confirmed from a clean clone",
+    "repo_src_full": "the complete ~540M vendored environment (all repos) is NOT committed; re-vendor from validation/corpus_repo_pins.json to reproduce the full Tier-1 triggered funnel (289) and reachability",
+    "excludes": "ai-ssti-*/llama-cpp-ssti (SSTI sub-study, selection-biased); excluded in corpus_census.py",
+    "reproduce": "git clone --branch vulcan-freeze-149-rc <repo> && python3 analysis/corpus_census.py --tier2  ->  2032 candidates / 160 confirmed {CWE-22:130, CWE-78:4, CWE-918:26}"
   }
 }

@@ -1,0 +1,10 @@
+"""Product identity — user-facing names, domain, outbound User-Agent."""
+
+BRAND_NAME = "Peril Vista"
+BRAND_SLUG = "peril-vista"
+BRAND_DOMAIN = "perilvista.com"
+BRAND_URL = "https://perilvista.com"
+SERVICE_ID = "peril-vista-backend"
+CONTACT_EMAIL = "james.anfossi@accountingbda.com"
+USER_AGENT = f"PerilVista/1.0 (+{BRAND_URL}; contact {CONTACT_EMAIL})"
+EXPORT_FILENAME = "peril-vista-export.xlsx"
