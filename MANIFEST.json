@@ -207,5 +207,13 @@
       "recall": 0.20754716981132076,
       "precision": 0.1732283464566929
     }
+  },
+  "corpus_release": {
+    "file": "vulcan_corpus_candidates.tar.gz",
+    "sha256": "6565d94a6e4a6e7b426b6fe9cd13380be4c1248648e4976051c1ff174fec7c68",
+    "size": "45M",
+    "contents": "candidate JSONs for all non-ai-ssti corpus repos (embeds ground_truth_source/module_source)",
+    "repo_src": "not shipped; see validation/corpus_repo_pins.json to re-vendor for reachability",
+    "excludes": "ai-ssti-*/llama-cpp-ssti (SSTI sub-study, selection-biased)"
   }
 }

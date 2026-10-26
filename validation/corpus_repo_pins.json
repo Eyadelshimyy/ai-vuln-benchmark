@@ -1,0 +1,382 @@
+{
+  "2100preet__stockscanner": {
+    "url": "https://github.com/2100preet/stockscanner",
+    "pinned_commit": "eff0ec3b6f40"
+  },
+  "AIfromScratch__qsent": {
+    "url": "https://github.com/AIfromScratch/qsent",
+    "pinned_commit": "12dd13fd5388"
+  },
+  "AaronGrace978__composable-lora": {
+    "url": "https://github.com/AaronGrace978/composable-lora",
+    "pinned_commit": null
+  },
+  "BerriAI__litellm": {
+    "url": "https://github.com/BerriAI/litellm",
+    "pinned_commit": null
+  },
+  "BuiDinhTuyen24__BuiDinhTuyen24": {
+    "url": "https://github.com/BuiDinhTuyen24/BuiDinhTuyen24",
+    "pinned_commit": null
+  },
+  "Chuqonu__epi-preclean-patent-monitor": {
+    "url": "https://github.com/Chuqonu/epi-preclean-patent-monitor",
+    "pinned_commit": null
+  },
+  "Cognition-Partner-Workshops__otterworks-workshop-2610": {
+    "url": "https://github.com/Cognition-Partner-Workshops/otterworks-workshop-2610",
+    "pinned_commit": null
+  },
+  "ContextualWisdomLab__fast-mlsirm": {
+    "url": "https://github.com/ContextualWisdomLab/fast-mlsirm",
+    "pinned_commit": "37d7e4012157"
+  },
+  "DeepCivic__womblex": {
+    "url": "https://github.com/DeepCivic/womblex",
+    "pinned_commit": "952e76d1e934"
+  },
+  "DevTuskers__Vibhaga-QGen-Plugin": {
+    "url": "https://github.com/DevTuskers/Vibhaga-QGen-Plugin",
+    "pinned_commit": null
+  },
+  "EdgarSocrates98__api-forge": {
+    "url": "https://github.com/EdgarSocrates98/api-forge",
+    "pinned_commit": null
+  },
+  "EdgarSocrates98__forge-doctor-api": {
+    "url": "https://github.com/EdgarSocrates98/forge-doctor-api",
+    "pinned_commit": null
+  },
+  "EdgarSocrates98__forge-doctor-data": {
+    "url": "https://github.com/EdgarSocrates98/forge-doctor-data",
+    "pinned_commit": null
+  },
+  "EdgarSocrates98__platform-forge": {
+    "url": "https://github.com/EdgarSocrates98/platform-forge",
+    "pinned_commit": null
+  },
+  "EdgarSocrates98__spark-forge-aws": {
+    "url": "https://github.com/EdgarSocrates98/spark-forge-aws",
+    "pinned_commit": null
+  },
+  "EdgarSocrates98__spark-forge-azure": {
+    "url": "https://github.com/EdgarSocrates98/spark-forge-azure",
+    "pinned_commit": null
+  },
+  "EdgarSocrates98__the-forge": {
+    "url": "https://github.com/EdgarSocrates98/the-forge",
+    "pinned_commit": null
+  },
+  "Fejjii__AlphaTrade-AI": {
+    "url": "https://github.com/Fejjii/AlphaTrade-AI",
+    "pinned_commit": null
+  },
+  "FrancescoCiulla__NLWeb": {
+    "url": "https://github.com/FrancescoCiulla/NLWeb",
+    "pinned_commit": "6b0c083c5574"
+  },
+  "GPD-Research__SimpleStax": {
+    "url": "https://github.com/GPD-Research/SimpleStax",
+    "pinned_commit": null
+  },
+  "Gunrunner444__BugForge": {
+    "url": "https://github.com/Gunrunner444/BugForge",
+    "pinned_commit": "4d20587780f7"
+  },
+  "HagegeR__telegram-devin-bridge": {
+    "url": "https://github.com/HagegeR/telegram-devin-bridge",
+    "pinned_commit": null
+  },
+  "KenYanL__contrib-tetris": {
+    "url": "https://github.com/KenYanL/contrib-tetris",
+    "pinned_commit": null
+  },
+  "Mashi007__pagos": {
+    "url": "https://github.com/Mashi007/pagos",
+    "pinned_commit": "fb19326306c5"
+  },
+  "Neotech3000__led-matrix": {
+    "url": "https://github.com/Neotech3000/led-matrix",
+    "pinned_commit": "decf4012dd5f"
+  },
+  "Nithanth__office-hours": {
+    "url": "https://github.com/Nithanth/office-hours",
+    "pinned_commit": null
+  },
+  "PrjBbrosa__data-analyzer": {
+    "url": "https://github.com/PrjBbrosa/data-analyzer",
+    "pinned_commit": "30922a9a8b84"
+  },
+  "ProtossBlaster__leapmotor-mate": {
+    "url": "https://github.com/ProtossBlaster/leapmotor-mate",
+    "pinned_commit": "9e4286a96654"
+  },
+  "SamNobsResideo__git-ssh-gateway": {
+    "url": "https://github.com/SamNobsResideo/git-ssh-gateway",
+    "pinned_commit": null
+  },
+  "Shazari888__diagram-generation-api": {
+    "url": "https://github.com/Shazari888/diagram-generation-api",
+    "pinned_commit": null
+  },
+  "TTashev__llm-inference-benchmark": {
+    "url": "https://github.com/TTashev/llm-inference-benchmark",
+    "pinned_commit": null
+  },
+  "TracecatHQ__tracecat": {
+    "url": "https://github.com/TracecatHQ/tracecat",
+    "pinned_commit": null
+  },
+  "VibeBB__fpga-agent": {
+    "url": "https://github.com/VibeBB/fpga-agent",
+    "pinned_commit": "6cd9aacd33d2"
+  },
+  "VocaHQ__vocalinux": {
+    "url": "https://github.com/VocaHQ/vocalinux",
+    "pinned_commit": "96e012d9bd4e"
+  },
+  "YufeiSun5__japanese-n3-learning": {
+    "url": "https://github.com/YufeiSun5/japanese-n3-learning",
+    "pinned_commit": null
+  },
+  "aditya9729__roboeval_challenge": {
+    "url": "https://github.com/aditya9729/roboeval_challenge",
+    "pinned_commit": null
+  },
+  "airbytehq__airbyte": {
+    "url": "https://github.com/airbytehq/airbyte",
+    "pinned_commit": null
+  },
+  "airbytehq__airbyte-python-cdk": {
+    "url": "https://github.com/airbytehq/airbyte-python-cdk",
+    "pinned_commit": null
+  },
+  "alexandrelheinen__clave": {
+    "url": "https://github.com/alexandrelheinen/clave",
+    "pinned_commit": "65d432631474"
+  },
+  "alexandrelheinen__fret": {
+    "url": "https://github.com/alexandrelheinen/fret",
+    "pinned_commit": "65a8f1ff9775"
+  },
+  "atanasvasilevjourney__ORBIS-EQUITY-": {
+    "url": "https://github.com/atanasvasilevjourney/ORBIS-EQUITY-",
+    "pinned_commit": null
+  },
+  "austenstone__not-hotdog": {
+    "url": "https://github.com/austenstone/not-hotdog",
+    "pinned_commit": null
+  },
+  "banknit123__New_Billsure": {
+    "url": "https://github.com/banknit123/New_Billsure",
+    "pinned_commit": "eef013f5c9fb"
+  },
+  "bermuda1023__ExposureEclipse": {
+    "url": "https://github.com/bermuda1023/ExposureEclipse",
+    "pinned_commit": null
+  },
+  "bramstroker__homeassistant-powercalc": {
+    "url": "https://github.com/bramstroker/homeassistant-powercalc",
+    "pinned_commit": "4c75326775de"
+  },
+  "briandconnelly__skills": {
+    "url": "https://github.com/briandconnelly/skills",
+    "pinned_commit": "6c6c8c12bcea"
+  },
+  "c-wenlong__blenderkc": {
+    "url": "https://github.com/c-wenlong/blenderkc",
+    "pinned_commit": null
+  },
+  "cardouken__homeassistant-unifi-unas": {
+    "url": "https://github.com/cardouken/homeassistant-unifi-unas",
+    "pinned_commit": null
+  },
+  "chikolavosaki-sys__canopy-mapping-rover": {
+    "url": "https://github.com/chikolavosaki-sys/canopy-mapping-rover",
+    "pinned_commit": "9e9172a2148a"
+  },
+  "ckoutz__gud-vector-agent-suite": {
+    "url": "https://github.com/ckoutz/gud-vector-agent-suite",
+    "pinned_commit": null
+  },
+  "clarmso__openings.info": {
+    "url": "https://github.com/clarmso/openings.info",
+    "pinned_commit": "d21a2c056e22"
+  },
+  "danielreuter__research-notes": {
+    "url": "https://github.com/danielreuter/research-notes",
+    "pinned_commit": null
+  },
+  "dumanonur42-rgb__ticimax-stok": {
+    "url": "https://github.com/dumanonur42-rgb/ticimax-stok",
+    "pinned_commit": null
+  },
+  "e2b-dev__E2B": {
+    "url": "https://github.com/e2b-dev/E2B",
+    "pinned_commit": null
+  },
+  "gcnewbief__Log-Grabber": {
+    "url": "https://github.com/gcnewbief/Log-Grabber",
+    "pinned_commit": null
+  },
+  "gesh75__netlog-ai": {
+    "url": "https://github.com/gesh75/netlog-ai",
+    "pinned_commit": null
+  },
+  "hdzwzqbxlk__ComfyUI-LK-Model_Auto-Matching": {
+    "url": "https://github.com/hdzwzqbxlk/ComfyUI-LK-Model_Auto-Matching",
+    "pinned_commit": "a880c4abfbd5"
+  },
+  "j0shuadamian125-cyber__deus-enterprise": {
+    "url": "https://github.com/j0shuadamian125-cyber/deus-enterprise",
+    "pinned_commit": null
+  },
+  "jjh050713__ITCEN-Tool": {
+    "url": "https://github.com/jjh050713/ITCEN-Tool",
+    "pinned_commit": null
+  },
+  "joemccann__radon": {
+    "url": "https://github.com/joemccann/radon",
+    "pinned_commit": null
+  },
+  "kamoras__civitas": {
+    "url": "https://github.com/kamoras/civitas",
+    "pinned_commit": "9a108a4a69a0"
+  },
+  "lakshmaiah-narisetty__CursorAgentPOC": {
+    "url": "https://github.com/lakshmaiah-narisetty/CursorAgentPOC",
+    "pinned_commit": null
+  },
+  "leeyodam__OTP": {
+    "url": "https://github.com/leeyodam/OTP",
+    "pinned_commit": null
+  },
+  "libneinu__redstone_dart": {
+    "url": "https://github.com/libneinu/redstone_dart",
+    "pinned_commit": null
+  },
+  "ljofreflor__jobbot": {
+    "url": "https://github.com/ljofreflor/jobbot",
+    "pinned_commit": null
+  },
+  "loveRhythm1990__mini-pi": {
+    "url": "https://github.com/loveRhythm1990/mini-pi",
+    "pinned_commit": "fc2068c92374"
+  },
+  "marcus-rox__rox-dox": {
+    "url": "https://github.com/marcus-rox/rox-dox",
+    "pinned_commit": null
+  },
+  "markus-michalski__project-hub": {
+    "url": "https://github.com/markus-michalski/project-hub",
+    "pinned_commit": "5a4d2d3d6337"
+  },
+  "miguelCT__track-id": {
+    "url": "https://github.com/miguelCT/track-id",
+    "pinned_commit": null
+  },
+  "mikelane__pytest-gremlins": {
+    "url": "https://github.com/mikelane/pytest-gremlins",
+    "pinned_commit": "dac7b058cd60"
+  },
+  "monaxovdulov__MyKnowledgeBase": {
+    "url": "https://github.com/monaxovdulov/MyKnowledgeBase",
+    "pinned_commit": null
+  },
+  "naoiseirwin__strava-grokbot-bridge": {
+    "url": "https://github.com/naoiseirwin/strava-grokbot-bridge",
+    "pinned_commit": null
+  },
+  "noppiki__youtube-live-translator": {
+    "url": "https://github.com/noppiki/youtube-live-translator",
+    "pinned_commit": null
+  },
+  "nthplusio__skills": {
+    "url": "https://github.com/nthplusio/skills",
+    "pinned_commit": "675a435df806"
+  },
+  "oamin__fpl-engine": {
+    "url": "https://github.com/oamin/fpl-engine",
+    "pinned_commit": null
+  },
+  "olinickalls__PyFaceWipe": {
+    "url": "https://github.com/olinickalls/PyFaceWipe",
+    "pinned_commit": "15f51f3e39cd"
+  },
+  "paulosalem__ellements": {
+    "url": "https://github.com/paulosalem/ellements",
+    "pinned_commit": "d5f95b93f1aa"
+  },
+  "philipvibecodes-maker__VibeCodedShortcutCheatsheet": {
+    "url": "https://github.com/philipvibecodes-maker/VibeCodedShortcutCheatsheet",
+    "pinned_commit": null
+  },
+  "qndelmar__tbnano": {
+    "url": "https://github.com/qndelmar/tbnano",
+    "pinned_commit": null
+  },
+  "quantam101__profitenginev5": {
+    "url": "https://github.com/quantam101/profitenginev5",
+    "pinned_commit": null
+  },
+  "quantam101__tradegate2": {
+    "url": "https://github.com/quantam101/tradegate2",
+    "pinned_commit": null
+  },
+  "royles__AppliedAIModelTraining": {
+    "url": "https://github.com/royles/AppliedAIModelTraining",
+    "pinned_commit": null
+  },
+  "saltyscott0521__tracebi": {
+    "url": "https://github.com/saltyscott0521/tracebi",
+    "pinned_commit": "eaeb5c182972"
+  },
+  "scaryrawr__homebrew-formulae": {
+    "url": "https://github.com/scaryrawr/homebrew-formulae",
+    "pinned_commit": "b43412f8ccd0"
+  },
+  "shizukutanaka__Slice": {
+    "url": "https://github.com/shizukutanaka/Slice",
+    "pinned_commit": "cdc9797b679b"
+  },
+  "taku629__ledgerpilot": {
+    "url": "https://github.com/taku629/ledgerpilot",
+    "pinned_commit": null
+  },
+  "the-sword__paper-reader": {
+    "url": "https://github.com/the-sword/paper-reader",
+    "pinned_commit": null
+  },
+  "thokodi__thokodi.github.io": {
+    "url": "https://github.com/thokodi/thokodi.github.io",
+    "pinned_commit": "063ba3bcbac1"
+  },
+  "thsangyk-oss__sget": {
+    "url": "https://github.com/thsangyk-oss/sget",
+    "pinned_commit": null
+  },
+  "tonezzz__chaba": {
+    "url": "https://github.com/tonezzz/chaba",
+    "pinned_commit": null
+  },
+  "trsdn__macos-notarization-broker": {
+    "url": "https://github.com/trsdn/macos-notarization-broker",
+    "pinned_commit": null
+  },
+  "waltfilipe__sada-test": {
+    "url": "https://github.com/waltfilipe/sada-test",
+    "pinned_commit": "9433a13a5762"
+  },
+  "wstomber__devinexecdemo": {
+    "url": "https://github.com/wstomber/devinexecdemo",
+    "pinned_commit": null
+  },
+  "x-uuid__syforce": {
+    "url": "https://github.com/x-uuid/syforce",
+    "pinned_commit": null
+  },
+  "z-mio__parse_hub_bot": {
+    "url": "https://github.com/z-mio/parse_hub_bot",
+    "pinned_commit": null
+  }
+}
