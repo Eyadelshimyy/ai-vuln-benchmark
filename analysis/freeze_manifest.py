@@ -72,8 +72,7 @@ def main():
         cwe_conf = Counter()
         for r in rows:
             if r.get("confirmed"):
-                for c in (r.get("cwes") or []):
-                    cwe_conf[c] += 1
+                cwe_conf[r.get("exec_cwe")] += 1   # by the class that FIRED (exec_cwe), not tags
         man["census"] = {
             "file": str(args.census), "tier2": cen.get("tier2") if isinstance(cen, dict) else None,
             "n_candidates": cen.get("n_candidates") if isinstance(cen, dict) else len(rows),

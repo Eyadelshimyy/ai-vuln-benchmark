@@ -1,23 +1,23 @@
 # VULCAN reproducibility manifest
 
-- generated: 2026-10-15T04:07:41+00:00
-- git commit: `dcfb0944370d540e69049d4c441673b3935d647f`
+- generated: 2026-10-26T01:30:09+00:00
+- git commit: `8308f5b2528be656c0213a92926dcea0ba52cc1b`  **(working tree dirty)**
 
 ## Funnel (this corpus version)
 
-- candidates mined: 1216
-- executable: 865
-- triggered (Tier-1): 106
-- confirmed (Tier-2): 48
+- candidates mined: 2032
+- executable: 1501
+- triggered (Tier-1): 289
+- confirmed (Tier-2): 160
 - census tier2 flag: True
-- verdict tally: {'COULD_NOT_EXECUTE': 351, 'NOT_TRIGGERED': 759, 'TRIGGERED': 106}
+- verdict tally: {'TRIGGERED': 289, 'COULD_NOT_EXECUTE': 531, 'NOT_TRIGGERED': 1212}
 
-## Corpus: 39 repos
+## Corpus: 103 repos
 
 ## Artifact hashes (sha256, first 16)
 
 - `corpus_census.json`  8764876083dbadc8
-- `gold_set.json`  0e3444f4ba66b67a
+- `gold_set.json`  1b423a5463660654
 - `reachable_worklist.json`  6c8e10be6312af19
 - `semgrep_fullrepo.json`  7b825bc91c12fff3
 - `semgrep_default.json`  4757b7ce673fc005
