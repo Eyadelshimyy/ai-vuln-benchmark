@@ -1,0 +1,28 @@
+{
+  "repo": "Chuqonu__epi-preclean-patent-monitor",
+  "file": "scripts/apply_cn_pending_exclude.py",
+  "function": "main",
+  "line": 16,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main() -> int:\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main() -> int:\n    disp = json.loads(DISPOSITION.read_text(encoding=\"utf-8\"))\n    if disp.get(\"disposition\") != \"exclude\":\n        raise SystemExit(\"Unexpected disposition: \" + str(disp.get(\"disposition\")))\n\n    data = json.loads(REPORT.read_text(encoding=\"utf-8\"))\n    before = data.get(\"pending_or_related\") or []\n    removed = [p.get(\"publication_id\") for p in before]\n    data[\"pending_or_related\"] = []\n\n    for note in list(data.get(\"notes\") or []):\n        if \"\u5173\u8054\u5f85\u6838\uff08active\uff09\" in note or \"CN122564748A\" in note and \"\u5f85\u6838\" in note:\n            data[\"notes\"].remove(note)\n    data.setdefault(\"notes\", []).append(\n        \"\u5173\u8054\u5f85\u6838\uff08content-pending\uff09\uff1a\u65e0 active \u884c\uff1bCN122564748A \u5df2\u88c1\u5b9a exclude\uff08\u89c1 EVIDENCE-PENDING-DISPOSITION-CN122564748A-2026-10-20.json\uff09\u3002\"\n    )\n    data[\"coverage_note\"] = (\n        \"\u5728 Dot \u57fa\u7ebf\u4e0a\u5408\u5e76 Gate\u2462 \u4e0e Sprint \u589e\u91cf\u3002\"\n        \"\u5173\u8054\u5f85\u6838 content-pending \u961f\u5217\u73b0\u4e3a\u7a7a\uff08CN122564748A exclude\uff09\u3002\"\n        \"\u4e0d\u5f97\u4f2a\u79f0\u96f6\u9057\u6f0f\u6216\u6b63\u5f0f\u4ea4\u4ed8\u3002\"\n    )\n\n    data.setdefault(\"change_history\", []).append(\n        {\n            \"at\": datetime.now(timezone.utc).strftime(\"%Y-%m-%dT%H:%M:%SZ\"),\n            \"by\": \"cn-pending-exclude\",\n            \"action\": \"clear_pending_or_related\",\n            \"detail\": \"Removed from queue (exclude): \" + \", \".join(removed) if removed else \"already empty\",\n        }\n    )\n\n    sys.path.insert(0, str(ROOT / \"scripts\"))\n    from report_metrics import recompute_counts\n\n    recompute_counts(data)\n    REPORT.write_text(json.dumps(data, ensure_ascii=False, indent=2) + \"\\n\", encoding=\"utf-8\")\n    print(json.dumps({\"removed\": removed, \"pending\": data[\"counts\"][\"pending\"]}))\n    return 0",
+  "module_source": "#!/usr/bin/env python3\n\"\"\"Clear CN122564748A from pending_or_related per exclude disposition (pending \u2192 0).\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nimport sys\nfrom datetime import datetime, timezone\nfrom pathlib import Path\n\nROOT = Path(__file__).resolve().parents[1]\nREPORT = ROOT / \"data\" / \"report.json\"\nDISPOSITION = ROOT / \"docs\" / \"EVIDENCE-PENDING-DISPOSITION-CN122564748A-2026-10-20.json\"\n\n\ndef main() -> int:\n    disp = json.loads(DISPOSITION.read_text(encoding=\"utf-8\"))\n    if disp.get(\"disposition\") != \"exclude\":\n        raise SystemExit(\"Unexpected disposition: \" + str(disp.get(\"disposition\")))\n\n    data = json.loads(REPORT.read_text(encoding=\"utf-8\"))\n    before = data.get(\"pending_or_related\") or []\n    removed = [p.get(\"publication_id\") for p in before]\n    data[\"pending_or_related\"] = []\n\n    for note in list(data.get(\"notes\") or []):\n        if \"\u5173\u8054\u5f85\u6838\uff08active\uff09\" in note or \"CN122564748A\" in note and \"\u5f85\u6838\" in note:\n            data[\"notes\"].remove(note)\n    data.setdefault(\"notes\", []).append(\n        \"\u5173\u8054\u5f85\u6838\uff08content-pending\uff09\uff1a\u65e0 active \u884c\uff1bCN122564748A \u5df2\u88c1\u5b9a exclude\uff08\u89c1 EVIDENCE-PENDING-DISPOSITION-CN122564748A-2026-10-20.json\uff09\u3002\"\n    )\n    data[\"coverage_note\"] = (\n        \"\u5728 Dot \u57fa\u7ebf\u4e0a\u5408\u5e76 Gate\u2462 \u4e0e Sprint \u589e\u91cf\u3002\"\n        \"\u5173\u8054\u5f85\u6838 content-pending \u961f\u5217\u73b0\u4e3a\u7a7a\uff08CN122564748A exclude\uff09\u3002\"\n        \"\u4e0d\u5f97\u4f2a\u79f0\u96f6\u9057\u6f0f\u6216\u6b63\u5f0f\u4ea4\u4ed8\u3002\"\n    )\n\n    data.setdefault(\"change_history\", []).append(\n        {\n            \"at\": datetime.now(timezone.utc).strftime(\"%Y-%m-%dT%H:%M:%SZ\"),\n            \"by\": \"cn-pending-exclude\",\n            \"action\": \"clear_pending_or_related\",\n            \"detail\": \"Removed from queue (exclude): \" + \", \".join(removed) if removed else \"already empty\",\n        }\n    )\n\n    sys.path.insert(0, str(ROOT / \"scripts\"))\n    from report_metrics import recompute_counts\n\n    recompute_counts(data)\n    REPORT.write_text(json.dumps(data, ensure_ascii=False, indent=2) + \"\\n\", encoding=\"utf-8\")\n    print(json.dumps({\"removed\": removed, \"pending\": data[\"counts\"][\"pending\"]}))\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 38
+    },
+    "ai_commit": "192da9a70cc9",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      16,
+      53
+    ]
+  }
+}

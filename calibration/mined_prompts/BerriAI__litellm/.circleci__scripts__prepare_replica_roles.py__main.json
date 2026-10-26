@@ -1,0 +1,28 @@
+{
+  "repo": "BerriAI__litellm",
+  "file": ".circleci/scripts/prepare_replica_roles.py",
+  "function": "main",
+  "line": 17,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main() -> None:\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main() -> None:\n    with psycopg.connect(postgres_url(), autocommit=True) as admin:\n        admin.execute(\"CREATE EXTENSION IF NOT EXISTS pg_stat_statements\")\n        admin.execute(\"CREATE ROLE litellm_writer LOGIN PASSWORD 'litellm-writer' NOSUPERUSER\")\n        admin.execute(\"CREATE ROLE litellm_reader LOGIN PASSWORD 'litellm-reader' NOSUPERUSER NOINHERIT\")\n        admin.execute(\"ALTER ROLE litellm_reader SET default_transaction_read_only = on\")\n        admin.execute(\"ALTER DATABASE circle_test OWNER TO litellm_writer\")\n        admin.execute(\"GRANT CONNECT ON DATABASE circle_test TO litellm_reader\")\n    with psycopg.connect(DATABASE_URL, autocommit=True) as admin:\n        admin.execute(\"GRANT USAGE ON SCHEMA public TO litellm_reader\")\n        admin.execute(\n            \"ALTER DEFAULT PRIVILEGES FOR ROLE litellm_writer IN SCHEMA public GRANT SELECT ON TABLES TO litellm_reader\"\n        )\n        admin.execute(\"GRANT SELECT ON ALL TABLES IN SCHEMA public TO litellm_reader\")\n\n    parsed: Final = urlsplit(DATABASE_URL)\n    reader_url: Final = urlunsplit(\n        parsed._replace(netloc=f\"litellm_reader:litellm-reader@{parsed.hostname}:{parsed.port}\")\n    )\n    writer_url: Final = urlunsplit(\n        parsed._replace(netloc=f\"litellm_writer:litellm-writer@{parsed.hostname}:{parsed.port}\")\n    )\n    with psycopg.connect(reader_url, autocommit=True) as reader:\n        assert reader.execute(\"SHOW transaction_read_only\").fetchone() == (\"on\",)\n        try:\n            reader.execute(\"CREATE TABLE integration_readonly_probe (id int)\")\n        except psycopg.errors.ReadOnlySqlTransaction:\n            pass\n        else:\n            raise AssertionError(\"litellm_reader executed a write statement\")\n    with psycopg.connect(writer_url, autocommit=True) as writer:\n        assert writer.execute(\"SELECT current_user\").fetchone() == (\"litellm_writer\",)",
+  "module_source": "from __future__ import annotations\n\nimport os\nfrom typing import Final\nfrom urllib.parse import urlsplit, urlunsplit\n\nimport psycopg\n\nDATABASE_URL: Final = os.environ[\"DATABASE_URL\"]\n\n\ndef postgres_url() -> str:\n    parsed: Final = urlsplit(DATABASE_URL)\n    return urlunsplit(parsed._replace(path=\"/postgres\"))\n\n\ndef main() -> None:\n    with psycopg.connect(postgres_url(), autocommit=True) as admin:\n        admin.execute(\"CREATE EXTENSION IF NOT EXISTS pg_stat_statements\")\n        admin.execute(\"CREATE ROLE litellm_writer LOGIN PASSWORD 'litellm-writer' NOSUPERUSER\")\n        admin.execute(\"CREATE ROLE litellm_reader LOGIN PASSWORD 'litellm-reader' NOSUPERUSER NOINHERIT\")\n        admin.execute(\"ALTER ROLE litellm_reader SET default_transaction_read_only = on\")\n        admin.execute(\"ALTER DATABASE circle_test OWNER TO litellm_writer\")\n        admin.execute(\"GRANT CONNECT ON DATABASE circle_test TO litellm_reader\")\n    with psycopg.connect(DATABASE_URL, autocommit=True) as admin:\n        admin.execute(\"GRANT USAGE ON SCHEMA public TO litellm_reader\")\n        admin.execute(\n            \"ALTER DEFAULT PRIVILEGES FOR ROLE litellm_writer IN SCHEMA public GRANT SELECT ON TABLES TO litellm_reader\"\n        )\n        admin.execute(\"GRANT SELECT ON ALL TABLES IN SCHEMA public TO litellm_reader\")\n\n    parsed: Final = urlsplit(DATABASE_URL)\n    reader_url: Final = urlunsplit(\n        parsed._replace(netloc=f\"litellm_reader:litellm-reader@{parsed.hostname}:{parsed.port}\")\n    )\n    writer_url: Final = urlunsplit(\n        parsed._replace(netloc=f\"litellm_writer:litellm-writer@{parsed.hostname}:{parsed.port}\")\n    )\n    with psycopg.connect(reader_url, autocommit=True) as reader:\n        assert reader.execute(\"SHOW transaction_read_only\").fetchone() == (\"on\",)\n        try:\n            reader.execute(\"CREATE TABLE integration_readonly_probe (id int)\")\n        except psycopg.errors.ReadOnlySqlTransaction:\n            pass\n        else:\n            raise AssertionError(\"litellm_reader executed a write statement\")\n    with psycopg.connect(writer_url, autocommit=True) as writer:\n        assert writer.execute(\"SELECT current_user\").fetchone() == (\"litellm_writer\",)\n\n\nif __name__ == \"__main__\":\n    main()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 32
+    },
+    "ai_commit": "3fb6f8740b10",
+    "evidence": "author/committer='devin-ai-integration[bot] <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      17,
+      48
+    ]
+  }
+}

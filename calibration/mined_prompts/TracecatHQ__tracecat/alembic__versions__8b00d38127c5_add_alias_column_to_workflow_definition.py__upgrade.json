@@ -1,0 +1,28 @@
+{
+  "repo": "TracecatHQ__tracecat",
+  "file": "alembic/versions/8b00d38127c5_add_alias_column_to_workflow_definition.py",
+  "function": "upgrade",
+  "line": 22,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `upgrade` function.",
+  "prompt_source": "def upgrade() -> None:\n    # Add alias column to workflow_definition\n    \"\"\"Implement the `upgrade` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def upgrade() -> None:\n    # Add alias column to workflow_definition\n    op.add_column(\"workflow_definition\", sa.Column(\"alias\", sa.String(), nullable=True))\n    op.create_index(\n        op.f(\"ix_workflow_definition_alias\"),\n        \"workflow_definition\",\n        [\"alias\"],\n        unique=False,\n    )\n\n    # Backfill existing workflow definitions with their workflow's current alias\n    # For each workflow_definition, copy the alias from the associated workflow\n    op.execute(\n        \"\"\"\n        UPDATE workflow_definition wd\n        SET alias = w.alias\n        FROM workflow w\n        WHERE wd.workflow_id = w.id\n        AND w.alias IS NOT NULL\n        \"\"\"\n    )",
+  "module_source": "\"\"\"add alias column to workflow_definition\n\nRevision ID: 8b00d38127c5\nRevises: 9079ae19374b\nCreate Date: 2025-12-15 14:48:11.880306\n\n\"\"\"\n\nfrom collections.abc import Sequence\n\nimport sqlalchemy as sa\n\nfrom alembic import op\n\n# revision identifiers, used by Alembic.\nrevision: str = \"8b00d38127c5\"\ndown_revision: str | None = \"9079ae19374b\"\nbranch_labels: str | Sequence[str] | None = None\ndepends_on: str | Sequence[str] | None = None\n\n\ndef upgrade() -> None:\n    # Add alias column to workflow_definition\n    op.add_column(\"workflow_definition\", sa.Column(\"alias\", sa.String(), nullable=True))\n    op.create_index(\n        op.f(\"ix_workflow_definition_alias\"),\n        \"workflow_definition\",\n        [\"alias\"],\n        unique=False,\n    )\n\n    # Backfill existing workflow definitions with their workflow's current alias\n    # For each workflow_definition, copy the alias from the associated workflow\n    op.execute(\n        \"\"\"\n        UPDATE workflow_definition wd\n        SET alias = w.alias\n        FROM workflow w\n        WHERE wd.workflow_id = w.id\n        AND w.alias IS NOT NULL\n        \"\"\"\n    )\n\n\ndef downgrade() -> None:\n    op.drop_index(\n        op.f(\"ix_workflow_definition_alias\"), table_name=\"workflow_definition\"\n    )\n    op.drop_column(\"workflow_definition\", \"alias\")\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 21
+    },
+    "ai_commit": "2911a9318a17",
+    "evidence": "Co-authored-by: Claude <noreply@anthropic.com>",
+    "ai_line_fraction": 1.0,
+    "span": [
+      22,
+      42
+    ]
+  }
+}

@@ -52,6 +52,8 @@ _SKIP = {"auto_harness_results.json", "benchmark_results.json",
 
 def _candidate_files(root: Path):
     for p in sorted(root.glob("*/*.json")):
+        if p.parent.name.startswith("ai-ssti-") or p.parent.name == "llama-cpp-ssti":
+            continue  # SSTI sub-study dirs: selection-biased, excluded from main census
         if p.name in _SKIP:
             continue
         try:

@@ -1,0 +1,28 @@
+{
+  "repo": "Chuqonu__epi-preclean-patent-monitor",
+  "file": "scripts/restore_uspto_portrait_sheet_rotation.py",
+  "function": "main",
+  "line": 30,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main() -> int:\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main() -> int:\n    data = json.loads(REPORT.read_text(encoding=\"utf-8\"))\n    changed = False\n    for m in data.get(\"months\") or []:\n        for fam in m.get(\"families\") or []:\n            pub = fam.get(\"publication_id\") or \"\"\n            if pub != TARGET_PUB:\n                continue\n            for fig in fam.get(\"figures\") or []:\n                sha = str(fig.get(\"asset_sha256\") or fig.get(\"sha256\") or \"\")\n                if TARGET_SHA_PREFIX not in sha:\n                    continue\n                set_rot(fig, TARGET_ROT)\n                changed = True\n\n    if not changed:\n        print(\"target figure not found\", file=sys.stderr)\n        return 1\n\n    data.setdefault(\"change_history\", []).append(\n        {\n            \"at\": datetime.now(timezone.utc).strftime(\"%Y-%m-%dT%H:%M:%SZ\"),\n            \"by\": \"vision-figure-orientation\",\n            \"action\": \"set_display_rotation_90\",\n            \"detail\": f\"{TARGET_PUB} Fig.4 vision-confirmed sideways drawing body.\",\n        }\n    )\n    REPORT.write_text(json.dumps(data, ensure_ascii=False, indent=2) + \"\\n\", encoding=\"utf-8\")\n\n    if MAP.is_file():\n        mapping = json.loads(MAP.read_text(encoding=\"utf-8\"))\n        for item in (mapping.get(\"entries\") or {}).values():\n            sha = str(item.get(\"asset_sha256\") or \"\")\n            if TARGET_SHA_PREFIX in sha:\n                set_rot(item, TARGET_ROT)\n        MAP.write_text(json.dumps(mapping, ensure_ascii=False, indent=2) + \"\\n\", encoding=\"utf-8\")\n\n    print(json.dumps({\"publication_id\": TARGET_PUB, \"display_rotation\": TARGET_ROT}))\n    return 0",
+  "module_source": "#!/usr/bin/env python3\n\"\"\"Apply vision-confirmed display_rotation for a single figure (US12757647B2 Fig.4).\n\nDo not bulk-restore historical rot90 list or Tesseract OSD output \u2014 see docs/FIGURE-ORIENTATION-RESTORE-2026-10-20.json.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nimport sys\nfrom datetime import datetime, timezone\nfrom pathlib import Path\n\nROOT = Path(__file__).resolve().parents[1]\nREPORT = ROOT / \"data\" / \"report.json\"\nMAP = ROOT / \"data\" / \"figure-recovery-map.json\"\n\nTARGET_PUB = \"US12757647B2\"\nTARGET_SHA_PREFIX = \"e5d5f61dac3d4b7a\"\nTARGET_ROT = 90\n\n\ndef set_rot(fig: dict, rot: int) -> None:\n    fig[\"display_rotation\"] = rot\n    geom = fig.get(\"source_geometry\")\n    if isinstance(geom, dict):\n        geom[\"display_rotation\"] = rot\n\n\ndef main() -> int:\n    data = json.loads(REPORT.read_text(encoding=\"utf-8\"))\n    changed = False\n    for m in data.get(\"months\") or []:\n        for fam in m.get(\"families\") or []:\n            pub = fam.get(\"publication_id\") or \"\"\n            if pub != TARGET_PUB:\n                continue\n            for fig in fam.get(\"figures\") or []:\n                sha = str(fig.get(\"asset_sha256\") or fig.get(\"sha256\") or \"\")\n                if TARGET_SHA_PREFIX not in sha:\n                    continue\n                set_rot(fig, TARGET_ROT)\n                changed = True\n\n    if not changed:\n        print(\"target figure not found\", file=sys.stderr)\n        return 1\n\n    data.setdefault(\"change_history\", []).append(\n        {\n            \"at\": datetime.now(timezone.utc).strftime(\"%Y-%m-%dT%H:%M:%SZ\"),\n            \"by\": \"vision-figure-orientation\",\n            \"action\": \"set_display_rotation_90\",\n            \"detail\": f\"{TARGET_PUB} Fig.4 vision-confirmed sideways drawing body.\",\n        }\n    )\n    REPORT.write_text(json.dumps(data, ensure_ascii=False, indent=2) + \"\\n\", encoding=\"utf-8\")\n\n    if MAP.is_file():\n        mapping = json.loads(MAP.read_text(encoding=\"utf-8\"))\n        for item in (mapping.get(\"entries\") or {}).values():\n            sha = str(item.get(\"asset_sha256\") or \"\")\n            if TARGET_SHA_PREFIX in sha:\n                set_rot(item, TARGET_ROT)\n        MAP.write_text(json.dumps(mapping, ensure_ascii=False, indent=2) + \"\\n\", encoding=\"utf-8\")\n\n    print(json.dumps({\"publication_id\": TARGET_PUB, \"display_rotation\": TARGET_ROT}))\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 39
+    },
+    "ai_commit": "c88d91a99f5f",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      30,
+      68
+    ]
+  }
+}

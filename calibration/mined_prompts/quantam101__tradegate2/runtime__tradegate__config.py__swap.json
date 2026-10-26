@@ -1,0 +1,33 @@
+{
+  "repo": "quantam101__tradegate2",
+  "file": "runtime/tradegate/config.py",
+  "function": "swap",
+  "line": 71,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `swap` function.",
+  "prompt_source": "    def swap(self, **changes) -> EngineConfig:\n        \"\"\"Implement the `swap` function.\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    def swap(self, **changes) -> EngineConfig:\n        data = self._config.to_dict()\n        data.update(changes)\n        data[\"version\"] = self._config.version + 1\n        data[\"last_updated\"] = time.time()\n        new = EngineConfig(**data)\n        self._config = new\n        if self.manifest_path:\n            self.manifest_path.parent.mkdir(parents=True, exist_ok=True)\n            tmp = self.manifest_path.with_suffix(\".tmp\")\n            tmp.write_text(json.dumps(new.to_dict(), indent=2), encoding=\"utf-8\")\n            tmp.replace(self.manifest_path)\n        for cb in self._listeners:\n            cb(new)\n        return new",
+  "module_source": "\"\"\"Engine configuration with atomic, versioned hot-swapping.\n\nThe original spec mutated one shared ``EngineConfig`` from Agent 9 while\nAgents 2\u20137 read it mid-flight \u2014 a data race that also breaks the \"zero\nshared mutable state\" pillar. Here ``ConfigStore`` keeps an immutable\nsnapshot; readers call ``snapshot()`` (O(1), no lock needed for reads\nunder asyncio) and Agent 9 calls ``swap()`` to publish a new version.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nimport time\nfrom dataclasses import asdict, dataclass, field\nfrom pathlib import Path\n\n\n@dataclass(frozen=True)\nclass EngineConfig:\n    \"\"\"Immutable parameter manifest. Bump via ConfigStore.swap().\"\"\"\n\n    min_imbalance: float = 2.2          # Agent 2/3: bid/ask depth trigger\n    cvd_min: float = 0.0                # Agent 3: required CVD sign for sweeps\n    atr_multiplier: float = 1.8         # Agent 6/7: stop distance = mult * ATR\n    atr_window: int = 14                # bars used for ATR estimation\n    safety_factor: float = 0.33         # fractional Kelly scale\n    max_drawdown_limit: float = 0.04    # equity circuit breaker (fraction)\n    max_trade_fraction: float = 0.04    # hard per-trade capital ceiling\n    min_win_rate: float = 0.60          # WFO acceptance floor\n    rolling_win_rate: float = 0.60      # updated from live ledger stats\n    rolling_payout_ratio: float = 1.2   # avg win / avg loss from ledger\n    cancel_after_sec: float = 30.0      # resting-order expiry (paper: queue TTL)\n    mom_window: int = 20                # bars for momentum lookback (trend input)\n    rsi_window: int = 14                # bars for RSI\n    rsi_overbought: float = 70.0        # alpha refuses entries above this\n    rsi_oversold: float = 35.0          # beta enters only below this\n    trend_min: float = 0.0              # min mom_window return to count as trend\n    # \u2500\u2500 Governance layer (spec: fat-finger guardrails, consensus, latency) \u2500\u2500\n    max_notional_usd: float = 20_000_000.0   # absolute per-order notional cap\n    max_slippage_bps: float = 40.0           # max deviation vs mid, basis points\n    consensus_threshold_usd: float = 2_000_000.0  # orders above need quorum\n    consensus_min_votes: int = 3             # of the 4 voting agents\n    consensus_min_score: float = 0.82        # min mean confidence across votes\n    latency_degrade_ms: float = 15_000.0     # >this lag \u2192 passive-only mode\n    version: int = 1\n    last_updated: float = field(default_factory=time.time)\n\n    def to_dict(self) -> dict:\n        return asdict(self)\n\n\nclass ConfigStore:\n    \"\"\"Publishes immutable EngineConfig snapshots.\n\n    ``snapshot()`` returns the current manifest. ``swap()`` validates,\n    versions, persists (if manifest_path set) and atomically replaces it.\n    \"\"\"\n\n    def __init__(self, config: EngineConfig | None = None,\n                 manifest_path: Path | None = None):\n        self._config = config or EngineConfig()\n        self.manifest_path = Path(manifest_path) if manifest_path else None\n        self._listeners = []\n\n    def snapshot(self) -> EngineConfig:\n        return self._config\n\n    def on_swap(self, callback) -> None:\n        self._listeners.append(callback)\n\n    def swap(self, **changes) -> EngineConfig:\n        data = self._config.to_dict()\n        data.update(changes)\n        data[\"version\"] = self._config.version + 1\n        data[\"last_updated\"] = time.time()\n        new = EngineConfig(**data)\n        self._config = new\n        if self.manifest_path:\n            self.manifest_path.parent.mkdir(parents=True, exist_ok=True)\n            tmp = self.manifest_path.with_suffix(\".tmp\")\n            tmp.write_text(json.dumps(new.to_dict(), indent=2), encoding=\"utf-8\")\n            tmp.replace(self.manifest_path)\n        for cb in self._listeners:\n            cb(new)\n        return new\n\n    @classmethod\n    def from_manifest(cls, path: Path) -> ConfigStore:\n        p = Path(path)\n        if p.exists():\n            return cls(EngineConfig(**json.loads(p.read_text())), manifest_path=p)\n        return cls(manifest_path=p)\n",
+  "construction_recipe": {
+    "call_args_source": "()",
+    "uses_tmp_path": false,
+    "source_file": "tests/test_governance.py",
+    "source_line": 82
+  },
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 15
+    },
+    "ai_commit": "dcd24f32bedf",
+    "evidence": "author/committer='devin-ai-integration[bot] <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      71,
+      85
+    ]
+  }
+}

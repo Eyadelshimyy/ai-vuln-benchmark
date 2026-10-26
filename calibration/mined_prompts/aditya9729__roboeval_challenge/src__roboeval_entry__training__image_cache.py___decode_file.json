@@ -1,0 +1,28 @@
+{
+  "repo": "aditya9729__roboeval_challenge",
+  "file": "src/roboeval_entry/training/image_cache.py",
+  "function": "_decode_file",
+  "line": 22,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `_decode_file` function (parameters: task).",
+  "prompt_source": "def _decode_file(task):\n    \"\"\"Implement the `_decode_file` function (parameters: task).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def _decode_file(task):\n    path, cam_cols = task\n    import pyarrow.parquet as pq\n    from PIL import Image\n\n    table = pq.read_table(path, columns=cam_cols)\n    out = {}\n    for c in cam_cols:\n        imgs = []\n        for entry in table.column(c).to_pylist():\n            blob = entry[\"bytes\"] if isinstance(entry, dict) else entry\n            imgs.append(np.asarray(Image.open(io.BytesIO(blob)).convert(\"RGB\")))\n        out[c] = np.stack(imgs)\n    return out",
+  "module_source": "\"\"\"Build decoded-image memmap caches for RoboEval variants (openpi env).\n\nPer variant writes <out_dir>/<variant>/<cam>.u8 (uint8 N,256,256,3) in global\n(episode_index, frame_index) order plus index.json recording that order, the\nuuids, per-cam sha256, and the dataset commit.\n\"\"\"\nfrom __future__ import annotations\n\nimport hashlib\nimport io\nimport json\nimport multiprocessing as mp\nfrom pathlib import Path\nfrom typing import Sequence\n\nimport numpy as np\n\nDEFAULT_OUT = Path(\"/workspace/roboeval/data/image_cache\")\nDATASET_COMMIT = \"918b4072cd1d15f28b1f96a440ac7aa84591ce92\"\n\n\ndef _decode_file(task):\n    path, cam_cols = task\n    import pyarrow.parquet as pq\n    from PIL import Image\n\n    table = pq.read_table(path, columns=cam_cols)\n    out = {}\n    for c in cam_cols:\n        imgs = []\n        for entry in table.column(c).to_pylist():\n            blob = entry[\"bytes\"] if isinstance(entry, dict) else entry\n            imgs.append(np.asarray(Image.open(io.BytesIO(blob)).convert(\"RGB\")))\n        out[c] = np.stack(imgs)\n    return out\n\n\ndef _sha256(path: Path) -> str:\n    h = hashlib.sha256()\n    with open(path, \"rb\") as f:\n        for chunk in iter(lambda: f.read(1 << 22), b\"\"):\n            h.update(chunk)\n    return h.hexdigest()\n\n\ndef build_image_cache(dataset_root: str | Path, variant: str,\n                      cameras: Sequence[str] = (\"head\", \"left_wrist\", \"right_wrist\"),\n                      out_dir: str | Path = DEFAULT_OUT,\n                      procs: int = 32) -> Path:\n    import pyarrow.parquet as pq\n\n    vdir = Path(dataset_root) / variant\n    files = sorted((vdir / \"data\").rglob(\"*.parquet\"))\n    cam_cols = [f\"cam_{c}\" for c in cameras]\n\n    order: list[tuple[int, int]] = []\n    uuids: list[str] = []\n    file_row_pos: list[tuple[Path, list[int]]] = []\n    for path in files:\n        t = pq.read_table(path, columns=[\"episode_index\", \"frame_index\", \"uuid\"])\n        eps = t.column(\"episode_index\").to_pylist()\n        frs = t.column(\"frame_index\").to_pylist()\n        file_row_pos.append((path, list(range(len(eps)))))\n        order.extend(zip(eps, frs))\n        uuids.extend(str(u) for u in t.column(\"uuid\").to_pylist())\n\n    sort_idx = sorted(range(len(order)), key=lambda i: order[i])\n    position = [0] * len(order)\n    sorted_order = [order[i] for i in sort_idx]\n    sorted_uuids = [uuids[i] for i in sort_idx]\n    for pos, orig in enumerate(sort_idx):\n        position[orig] = pos\n\n    out = Path(out_dir) / variant\n    out.mkdir(parents=True, exist_ok=True)\n    n = len(order)\n    maps = {}\n    for cam, col in zip(cameras, cam_cols):\n        mm = np.memmap(out / f\"{cam}.u8\", dtype=np.uint8, mode=\"w+\",\n                       shape=(n, 256, 256, 3))\n        maps[col] = mm\n\n    with mp.Pool(procs) as pool:\n        for file_i, decoded in enumerate(\n                pool.imap(_decode_file, [(p, cam_cols) for p, _ in file_row_pos])):\n            path, rows = file_row_pos[file_i]\n            base = sum(len(r) for _, r in file_row_pos[:file_i])\n            for col, imgs in decoded.items():\n                mm = maps[col]\n                for local_i, img in enumerate(imgs):\n                    mm[position[base + local_i]] = img\n    for mm in maps.values():\n        mm.flush()\n\n    index = {\n        \"n_frames\": n,\n        \"order\": [[int(e), int(f)] for e, f in sorted_order],\n        \"uuids\": sorted_uuids,\n        \"cameras\": list(cameras),\n        \"dataset_commit\": DATASET_COMMIT,\n        \"sha256_per_cam\": {},\n    }\n    for cam, col in zip(cameras, cam_cols):\n        index[\"sha256_per_cam\"][cam] = _sha256(out / f\"{cam}.u8\")\n    (out / \"index.json\").write_text(json.dumps(index))\n    return out\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 14
+    },
+    "ai_commit": "bef1846731b3",
+    "evidence": "author/committer='Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      22,
+      35
+    ]
+  }
+}

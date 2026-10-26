@@ -1,0 +1,28 @@
+{
+  "repo": "Chuqonu__epi-preclean-patent-monitor",
+  "file": "scripts/apply_read_ruling.py",
+  "function": "main",
+  "line": 15,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main() -> int:\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main() -> int:\n    if not RULING.is_file():\n        print(\"Missing ruling file\", RULING, file=sys.stderr)\n        return 1\n    ruling = json.loads(RULING.read_text(encoding=\"utf-8\"))\n    team_ids = set(ruling[\"team_read_publication_ids\"])\n    expected = int(ruling[\"locked_team_read_total\"])\n    span = ruling.get(\"read_span_label\") or \"Gate\u2462 \u8bc1\u636e\u590d\u6838\uff1a\u6743\u5229\u8981\u6c42\u7ea7\u9605\u8bfb\"\n\n    data = json.loads(REPORT.read_text(encoding=\"utf-8\"))\n    for m in data.get(\"months\") or []:\n        for fam in m.get(\"families\") or []:\n            pub = fam.get(\"publication_id\")\n            if pub in team_ids:\n                fam[\"team_independent_read\"] = True\n                fam[\"actual_read_spans\"] = [span]\n            elif fam.get(\"discovery_source\") == \"independent_search\":\n                fam[\"team_independent_read\"] = False\n                fam[\"actual_read_spans\"] = []\n\n    sys.path.insert(0, str(ROOT / \"scripts\"))\n    from report_metrics import recompute_counts\n\n    recompute_counts(data)\n    got = data[\"counts\"][\"actually_read\"]\n\n    if got != expected:\n        print(f\"ERROR team_read {got} != locked {expected}\", file=sys.stderr)\n        return 1\n\n    REPORT.write_text(json.dumps(data, ensure_ascii=False, indent=2) + \"\\n\", encoding=\"utf-8\")\n    print(f\"Applied team_read={got}\")\n    return 0",
+  "module_source": "#!/usr/bin/env python3\n\"\"\"Apply docs/EVIDENCE-READ-RULING-COMBINED-2026-10-20.json to data/report.json.\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nimport sys\nfrom pathlib import Path\n\nROOT = Path(__file__).resolve().parents[1]\nREPORT = ROOT / \"data\" / \"report.json\"\nRULING = ROOT / \"docs\" / \"EVIDENCE-READ-RULING-COMBINED-2026-10-20.json\"\n\n\ndef main() -> int:\n    if not RULING.is_file():\n        print(\"Missing ruling file\", RULING, file=sys.stderr)\n        return 1\n    ruling = json.loads(RULING.read_text(encoding=\"utf-8\"))\n    team_ids = set(ruling[\"team_read_publication_ids\"])\n    expected = int(ruling[\"locked_team_read_total\"])\n    span = ruling.get(\"read_span_label\") or \"Gate\u2462 \u8bc1\u636e\u590d\u6838\uff1a\u6743\u5229\u8981\u6c42\u7ea7\u9605\u8bfb\"\n\n    data = json.loads(REPORT.read_text(encoding=\"utf-8\"))\n    for m in data.get(\"months\") or []:\n        for fam in m.get(\"families\") or []:\n            pub = fam.get(\"publication_id\")\n            if pub in team_ids:\n                fam[\"team_independent_read\"] = True\n                fam[\"actual_read_spans\"] = [span]\n            elif fam.get(\"discovery_source\") == \"independent_search\":\n                fam[\"team_independent_read\"] = False\n                fam[\"actual_read_spans\"] = []\n\n    sys.path.insert(0, str(ROOT / \"scripts\"))\n    from report_metrics import recompute_counts\n\n    recompute_counts(data)\n    got = data[\"counts\"][\"actually_read\"]\n\n    if got != expected:\n        print(f\"ERROR team_read {got} != locked {expected}\", file=sys.stderr)\n        return 1\n\n    REPORT.write_text(json.dumps(data, ensure_ascii=False, indent=2) + \"\\n\", encoding=\"utf-8\")\n    print(f\"Applied team_read={got}\")\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 33
+    },
+    "ai_commit": "4a7c7b1a284d",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      15,
+      47
+    ]
+  }
+}

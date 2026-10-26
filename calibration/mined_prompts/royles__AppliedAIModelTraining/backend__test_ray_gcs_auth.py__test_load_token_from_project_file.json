@@ -1,0 +1,28 @@
+{
+  "repo": "royles__AppliedAIModelTraining",
+  "file": "backend/test_ray_gcs_auth.py",
+  "function": "test_load_token_from_project_file",
+  "line": 13,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `test_load_token_from_project_file` function (parameters: tmp_path, monkeypatch).",
+  "prompt_source": "def test_load_token_from_project_file(tmp_path, monkeypatch):\n    \"\"\"Implement the `test_load_token_from_project_file` function (parameters: tmp_path, monkeypatch).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def test_load_token_from_project_file(tmp_path, monkeypatch):\n    path = tmp_path / \".ray_gcs_auth_token\"\n    path.write_text(\"abc123\\n\", encoding=\"utf-8\")\n    monkeypatch.setattr(\n        \"app.services.ray_gcs_auth.project_gcs_auth_token_path\",\n        lambda: path,\n    )\n    with patch.dict(os.environ, {}, clear=True):\n        assert load_gcs_auth_token_from_disk() == \"abc123\"\n        assert os.environ[\"RAY_AUTH_TOKEN\"] == \"abc123\"",
+  "module_source": "import os\nfrom pathlib import Path\nfrom unittest.mock import patch\n\nfrom app.services.ray_gcs_auth import (\n    invalidate_stored_gcs_auth_tokens,\n    load_gcs_auth_token_from_disk,\n    project_gcs_auth_token_path,\n    sync_ray_gcs_auth_token,\n)\n\n\ndef test_load_token_from_project_file(tmp_path, monkeypatch):\n    path = tmp_path / \".ray_gcs_auth_token\"\n    path.write_text(\"abc123\\n\", encoding=\"utf-8\")\n    monkeypatch.setattr(\n        \"app.services.ray_gcs_auth.project_gcs_auth_token_path\",\n        lambda: path,\n    )\n    with patch.dict(os.environ, {}, clear=True):\n        assert load_gcs_auth_token_from_disk() == \"abc123\"\n        assert os.environ[\"RAY_AUTH_TOKEN\"] == \"abc123\"\n\n\ndef test_sync_persists_cli_token(tmp_path, monkeypatch):\n    path = tmp_path / \".ray_gcs_auth_token\"\n    monkeypatch.setattr(\n        \"app.services.ray_gcs_auth.project_gcs_auth_token_path\",\n        lambda: path,\n    )\n\n    class Proc:\n        returncode = 0\n        stdout = \"deadbeef\\n\"\n        stderr = \"\"\n\n    with patch(\"app.services.ray_gcs_auth.subprocess.run\", return_value=Proc()):\n        with patch(\n            \"app.services.ray_gcs_auth.ray_gcs_status_ok\",\n            side_effect=lambda _gcs, tok: tok == \"deadbeef\",\n        ):\n            with patch.dict(os.environ, {\"RAY_AUTH_TOKEN\": \"stale\"}, clear=False):\n                token = sync_ray_gcs_auth_token(\"10.0.0.1:6379\", required=True)\n    assert token == \"deadbeef\"\n    assert \"RAY_AUTH_TOKEN=deadbeef\" in path.read_text(encoding=\"utf-8\")\n    assert \"RAY_GCS_ADDRESS=10.0.0.1:6379\" in path.read_text(encoding=\"utf-8\")\n\n\ndef test_sync_strips_stale_env_before_cli(tmp_path, monkeypatch):\n    path = tmp_path / \".ray_gcs_auth_token\"\n    monkeypatch.setattr(\n        \"app.services.ray_gcs_auth.project_gcs_auth_token_path\",\n        lambda: path,\n    )\n    seen_envs: list[dict[str, str]] = []\n\n    class Proc:\n        returncode = 0\n        stdout = \"fresh\\n\"\n        stderr = \"\"\n\n    def fake_run(_argv, env, **_kwargs):\n        seen_envs.append(dict(env))\n        return Proc()\n\n    with patch(\"app.services.ray_gcs_auth.subprocess.run\", side_effect=fake_run):\n        with patch(\"app.services.ray_gcs_auth.ray_gcs_status_ok\", return_value=False):\n            with patch.dict(os.environ, {\"RAY_AUTH_TOKEN\": \"stale\"}, clear=False):\n                token = sync_ray_gcs_auth_token(\"10.0.0.1:6379\", required=True)\n    assert token == \"fresh\"\n    assert seen_envs\n    assert \"RAY_AUTH_TOKEN\" not in seen_envs[0]\n\n\ndef test_invalidate_removes_project_token(tmp_path, monkeypatch):\n    path = tmp_path / \".ray_gcs_auth_token\"\n    path.write_text(\"old\\n\", encoding=\"utf-8\")\n    monkeypatch.setattr(\n        \"app.services.ray_gcs_auth.project_gcs_auth_token_path\",\n        lambda: path,\n    )\n    invalidate_stored_gcs_auth_tokens()\n    assert not path.is_file()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 10
+    },
+    "ai_commit": "2223a5309306",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      13,
+      22
+    ]
+  }
+}

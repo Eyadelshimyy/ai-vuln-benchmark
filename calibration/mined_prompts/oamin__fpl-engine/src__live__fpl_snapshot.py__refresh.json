@@ -1,0 +1,28 @@
+{
+  "repo": "oamin__fpl-engine",
+  "file": "src/live/fpl_snapshot.py",
+  "function": "refresh",
+  "line": 18,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Download bootstrap and fixtures into ``data/live``. Returns both payloads.",
+  "prompt_source": "def refresh(cache: Path | None = None, client: httpx.Client | None = None) -> dict[str, Any]:\n    \"\"\"Download bootstrap and fixtures into ``data/live``. Returns both payloads.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def refresh(cache: Path | None = None, client: httpx.Client | None = None) -> dict[str, Any]:\n    \"\"\"Download bootstrap and fixtures into ``data/live``. Returns both payloads.\"\"\"\n    folder = cache or CACHE\n    folder.mkdir(parents=True, exist_ok=True)\n    own = client is None\n    client = client or httpx.Client(timeout=60.0, headers={\"User-Agent\": \"fpl-engine-live\"})\n    try:\n        bootstrap = client.get(BOOTSTRAP_URL).json()\n        fixtures = client.get(FIXTURES_URL).json()\n    finally:\n        if own:\n            client.close()\n    (folder / \"bootstrap.json\").write_text(json.dumps(bootstrap), encoding=\"utf-8\")\n    (folder / \"fixtures.json\").write_text(json.dumps(fixtures), encoding=\"utf-8\")\n    return {\"bootstrap\": bootstrap, \"fixtures\": fixtures}",
+  "module_source": "\"\"\"Free FPL API snapshot: bootstrap and fixtures. No odds.\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nfrom pathlib import Path\nfrom typing import Any\n\nimport httpx\n\nROOT = Path(__file__).resolve().parents[2]\nCACHE = ROOT / \"data\" / \"live\"\nBOOTSTRAP_URL = \"https://fantasy.premierleague.com/api/bootstrap-static/\"\nFIXTURES_URL = \"https://fantasy.premierleague.com/api/fixtures/\"\nELEMENT = {1: \"GKP\", 2: \"DEF\", 3: \"MID\", 4: \"FWD\"}\n\n\ndef refresh(cache: Path | None = None, client: httpx.Client | None = None) -> dict[str, Any]:\n    \"\"\"Download bootstrap and fixtures into ``data/live``. Returns both payloads.\"\"\"\n    folder = cache or CACHE\n    folder.mkdir(parents=True, exist_ok=True)\n    own = client is None\n    client = client or httpx.Client(timeout=60.0, headers={\"User-Agent\": \"fpl-engine-live\"})\n    try:\n        bootstrap = client.get(BOOTSTRAP_URL).json()\n        fixtures = client.get(FIXTURES_URL).json()\n    finally:\n        if own:\n            client.close()\n    (folder / \"bootstrap.json\").write_text(json.dumps(bootstrap), encoding=\"utf-8\")\n    (folder / \"fixtures.json\").write_text(json.dumps(fixtures), encoding=\"utf-8\")\n    return {\"bootstrap\": bootstrap, \"fixtures\": fixtures}\n\n\ndef load(cache: Path | None = None) -> dict[str, Any]:\n    folder = cache or CACHE\n    bootstrap = json.loads((folder / \"bootstrap.json\").read_text(encoding=\"utf-8\"))\n    fixtures = json.loads((folder / \"fixtures.json\").read_text(encoding=\"utf-8\"))\n    return {\"bootstrap\": bootstrap, \"fixtures\": fixtures}\n\n\ndef next_event(bootstrap: dict[str, Any]) -> dict[str, Any]:\n    \"\"\"The deadline still ahead. Falls back to the current event if none is next.\"\"\"\n    events = bootstrap[\"events\"]\n    nxt = next((row for row in events if row.get(\"is_next\")), None)\n    if nxt is not None:\n        return nxt\n    current = next((row for row in events if row.get(\"is_current\")), None)\n    if current is None:\n        raise ValueError(\"bootstrap has no current or next event\")\n    return current\n\n\ndef fixture_counts(fixtures: list[dict[str, Any]], gw: int) -> dict[int, int]:\n    \"\"\"How many fixtures each club has in this gameweek. Absent clubs have zero.\"\"\"\n    counts: dict[int, int] = {}\n    for row in fixtures:\n        if int(row.get(\"event\") or 0) != int(gw):\n            continue\n        for side in (\"team_h\", \"team_a\"):\n            club = int(row[side])\n            counts[club] = counts.get(club, 0) + 1\n    return counts\n\n\ndef week_flags(counts: dict[int, int], clubs: list[int]) -> tuple[bool, bool]:\n    \"\"\"(any listed club is blank, any listed club has two or more fixtures).\"\"\"\n    played = [counts.get(int(club), 0) for club in clubs]\n    return (any(n <= 0 for n in played), any(n >= 2 for n in played))\n\n\ndef players_table(bootstrap: dict[str, Any]) -> list[dict[str, Any]]:\n    \"\"\"Prices in tenths, position codes, and status. Scoring constants stay in the rules module.\"\"\"\n    teams = {int(row[\"id\"]): row[\"name\"] for row in bootstrap[\"teams\"]}\n    rows = []\n    for el in bootstrap[\"elements\"]:\n        rows.append(\n            {\n                \"player_id\": str(el[\"id\"]),\n                \"web_name\": el[\"web_name\"],\n                \"team_id\": int(el[\"team\"]),\n                \"team\": teams[int(el[\"team\"])],\n                \"position\": ELEMENT[int(el[\"element_type\"])],\n                \"now_cost\": int(el[\"now_cost\"]),\n                \"status\": el[\"status\"],\n                \"chance_of_playing_next_round\": el.get(\"chance_of_playing_next_round\"),\n            }\n        )\n    return rows\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 15
+    },
+    "ai_commit": "750822b2920f",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      18,
+      32
+    ]
+  }
+}

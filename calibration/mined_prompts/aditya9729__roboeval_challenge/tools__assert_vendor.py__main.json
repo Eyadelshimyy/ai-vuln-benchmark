@@ -1,0 +1,28 @@
+{
+  "repo": "aditya9729__roboeval_challenge",
+  "file": "tools/assert_vendor.py",
+  "function": "main",
+  "line": 15,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main() -> int:\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main() -> int:\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument(\"vendor\", type=Path)\n    args = parser.parse_args()\n    root = args.vendor.resolve()\n    config = json.loads((Path(__file__).resolve().parents[1] / \"configs/challenge.json\").read_text())\n    if platform.system() != \"Linux\" or platform.machine() not in {\"x86_64\", \"AMD64\"}:\n        parser.error(\"Official replay target is Linux x86-64; use that host\")\n    if \"avx2\" not in Path(\"/proc/cpuinfo\").read_text().lower().split():\n        parser.error(\"AVX2 CPU capability not found\")\n    if git(root, \"rev-parse\", \"HEAD\") != config[\"expected_commit\"]:\n        parser.error(\"Benchmark commit differs from reviewed source snapshot\")\n    if git(root, \"status\", \"--porcelain\", \"--untracked-files=normal\"):\n        parser.error(\"Benchmark tree has edits or untracked files; use a clean external checkout\")\n    submodules = git(root, \"submodule\", \"status\", \"--recursive\")\n    if any(line.startswith((\"+\", \"-\", \"U\")) for line in submodules.splitlines()):\n        parser.error(\"Submodule revision is changed, missing or conflicted\")\n    # This imports the package in the actual interpreter used for evaluation.\n    module = importlib.import_module(\"roboeval\")\n    location = Path(module.__file__).resolve()\n    if not location.is_relative_to(root):\n        parser.error(f\"Wrong installed RoboEval: {location}\")\n    spec = importlib.import_module(\"roboeval.challenge.spec\")\n    if spec.CONTROL_FREQUENCY != config[\"control_frequency_hz\"]:\n        parser.error(\"Control frequency mismatch\")\n    if tuple(spec.EVAL_SEEDS) != tuple(range(config[\"official_seed_start\"], config[\"official_seed_end_inclusive\"] + 1)):\n        parser.error(\"Official seed specification changed\")\n    if {t.key: t.budget_seconds for t in spec.TASK_FAMILIES} != config[\"tasks_budget_seconds\"]:\n        parser.error(\"Task manifest changed\")\n    print(f\"Pinned clean source verified: {config['expected_commit']}\")\n    print(f\"Imported package: {location}\")\n    return 0",
+  "module_source": "\"\"\"Fail closed unless the current simulator environment imports the pinned tree.\"\"\"\nfrom __future__ import annotations\nimport argparse\nimport importlib\nimport json\nimport platform\nimport subprocess\nfrom pathlib import Path\n\n\ndef git(root: Path, *args: str) -> str:\n    return subprocess.check_output([\"git\", \"-C\", str(root), *args], text=True).strip()\n\n\ndef main() -> int:\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument(\"vendor\", type=Path)\n    args = parser.parse_args()\n    root = args.vendor.resolve()\n    config = json.loads((Path(__file__).resolve().parents[1] / \"configs/challenge.json\").read_text())\n    if platform.system() != \"Linux\" or platform.machine() not in {\"x86_64\", \"AMD64\"}:\n        parser.error(\"Official replay target is Linux x86-64; use that host\")\n    if \"avx2\" not in Path(\"/proc/cpuinfo\").read_text().lower().split():\n        parser.error(\"AVX2 CPU capability not found\")\n    if git(root, \"rev-parse\", \"HEAD\") != config[\"expected_commit\"]:\n        parser.error(\"Benchmark commit differs from reviewed source snapshot\")\n    if git(root, \"status\", \"--porcelain\", \"--untracked-files=normal\"):\n        parser.error(\"Benchmark tree has edits or untracked files; use a clean external checkout\")\n    submodules = git(root, \"submodule\", \"status\", \"--recursive\")\n    if any(line.startswith((\"+\", \"-\", \"U\")) for line in submodules.splitlines()):\n        parser.error(\"Submodule revision is changed, missing or conflicted\")\n    # This imports the package in the actual interpreter used for evaluation.\n    module = importlib.import_module(\"roboeval\")\n    location = Path(module.__file__).resolve()\n    if not location.is_relative_to(root):\n        parser.error(f\"Wrong installed RoboEval: {location}\")\n    spec = importlib.import_module(\"roboeval.challenge.spec\")\n    if spec.CONTROL_FREQUENCY != config[\"control_frequency_hz\"]:\n        parser.error(\"Control frequency mismatch\")\n    if tuple(spec.EVAL_SEEDS) != tuple(range(config[\"official_seed_start\"], config[\"official_seed_end_inclusive\"] + 1)):\n        parser.error(\"Official seed specification changed\")\n    if {t.key: t.budget_seconds for t in spec.TASK_FAMILIES} != config[\"tasks_budget_seconds\"]:\n        parser.error(\"Task manifest changed\")\n    print(f\"Pinned clean source verified: {config['expected_commit']}\")\n    print(f\"Imported package: {location}\")\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 32
+    },
+    "ai_commit": "3be182fcf0da",
+    "evidence": "author/committer='Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      15,
+      46
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "repo": "royles__AppliedAIModelTraining",
+  "file": "backend/app/services/ray_head_options.py",
+  "function": "state_api_reachable",
+  "line": 53,
+  "candidate_cwes": [
+    "CWE-918"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `state_api_reachable` function (parameters: host, port, timeout_sec).",
+  "prompt_source": "def state_api_reachable(\n    host: str = \"127.0.0.1\",\n    port: int | None = None,\n    timeout_sec: float = 2.0,\n) -> bool:\n    \"\"\"Implement the `state_api_reachable` function (parameters: host, port, timeout_sec).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def state_api_reachable(\n    host: str = \"127.0.0.1\",\n    port: int | None = None,\n    timeout_sec: float = 2.0,\n) -> bool:\n    if port is None:\n        port = int(os.environ.get(\"RAY_DASHBOARD_PORT\", \"8265\") or \"8265\")\n    url = f\"http://{host}:{port}/api/version\"\n    try:\n        with urlopen(url, timeout=timeout_sec) as resp:\n            return 200 <= getattr(resp, \"status\", 200) < 300\n    except (URLError, OSError, ValueError):\n        return False",
+  "module_source": "\"\"\"Ray head / State API options for Ray Train v2 (PlacementGroupCleaner).\"\"\"\n\nfrom __future__ import annotations\n\nimport os\nfrom urllib.error import URLError\nfrom urllib.request import urlopen\n\n\ndef ray_dashboard_importable() -> bool:\n    \"\"\"\n    True only when the dashboard can actually start (not just ``ray.dashboard`` present).\n\n    Minimal ``pip install ray`` often ships dashboard stubs but omits extras such as\n    ``aiohttp_cors``, which makes ``ray start --head --include-dashboard=true`` abort\n    the entire head process.\n    \"\"\"\n    try:\n        import aiohttp_cors  # noqa: F401\n        import ray.dashboard.dashboard  # noqa: F401\n    except ImportError:\n        return False\n    return True\n\n\ndef ray_start_include_dashboard() -> bool:\n    \"\"\"\n    Whether `ray start --head` should pass --include-dashboard=true.\n\n    Ray Train v2's PlacementGroupCleaner polls actor state via ray.util.state (HTTP API).\n    With dashboard disabled, those calls fail and spam warnings.\n\n    Never returns True unless ``ray.dashboard`` is importable \u2014 otherwise\n    ``ray start --head`` fails with \"Cannot include dashboard with missing packages.\"\n    \"\"\"\n    explicit = os.environ.get(\"RAY_INCLUDE_DASHBOARD\", \"\").strip().lower()\n    if explicit in (\"0\", \"false\", \"no\"):\n        return False\n    importable = ray_dashboard_importable()\n    if explicit in (\"1\", \"true\", \"yes\"):\n        return importable\n    return importable\n\n\ndef ray_head_dashboard_cli_args() -> list[str]:\n    \"\"\"CLI flags for ``ray start --head`` (dashboard only when packages exist).\"\"\"\n    if ray_start_include_dashboard():\n        port = int(os.environ.get(\"RAY_DASHBOARD_PORT\", \"8265\") or \"8265\")\n        return [f\"--dashboard-port={port}\", \"--include-dashboard=true\"]\n    return [\"--include-dashboard=false\"]\n\n\ndef state_api_reachable(\n    host: str = \"127.0.0.1\",\n    port: int | None = None,\n    timeout_sec: float = 2.0,\n) -> bool:\n    if port is None:\n        port = int(os.environ.get(\"RAY_DASHBOARD_PORT\", \"8265\") or \"8265\")\n    url = f\"http://{host}:{port}/api/version\"\n    try:\n        with urlopen(url, timeout=timeout_sec) as resp:\n            return 200 <= getattr(resp, \"status\", 200) < 300\n    except (URLError, OSError, ValueError):\n        return False\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 13
+    },
+    "ai_commit": "82a68d657919",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      53,
+      65
+    ]
+  }
+}

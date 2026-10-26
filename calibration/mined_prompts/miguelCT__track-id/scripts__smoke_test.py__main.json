@@ -1,0 +1,28 @@
+{
+  "repo": "miguelCT__track-id",
+  "file": "scripts/smoke_test.py",
+  "function": "main",
+  "line": 106,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main() -> None:\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main() -> None:\n    try:\n        raise SystemExit(asyncio.run(_run()))\n    except Exception as exc:  # noqa: BLE001 - CLI should print a clean message\n        print(f\"error: {exc}\", file=sys.stderr)\n        raise SystemExit(1) from exc",
+  "module_source": "\"\"\"Resolve a public SoundCloud URL, cut one clip, and optionally recognize it.\n\nThis hits the network. It is not part of the pytest suite.\n\nExamples:\n    PYTHONPATH=src python scripts/smoke_test.py \\\\\n        \"https://soundcloud.com/artist/track\" 0:30\n\n    PYTHONPATH=src python scripts/smoke_test.py URL 1:02 --out /tmp/clip.mp3 --no-recognize\n\"\"\"\n\nfrom __future__ import annotations\n\nimport argparse\nimport asyncio\nimport os\nimport sys\nimport time\nfrom pathlib import Path\nfrom urllib.parse import urlsplit\n\nROOT = Path(__file__).resolve().parents[1]\nsys.path.insert(0, str(ROOT / \"src\"))\n\nfrom track_id.audio import (  # noqa: E402\n    clip_window,\n    extract_clip_to,\n    resolve_track,\n    soundcloud_path,\n)\nfrom track_id.config import load_settings  # noqa: E402\nfrom track_id.timestamps import format_timestamp, parse_timestamp  # noqa: E402\n\n\ndef _parser() -> argparse.ArgumentParser:\n    parser = argparse.ArgumentParser(\n        description=\"Clip (and optionally recognize) one SoundCloud moment.\"\n    )\n    parser.add_argument(\"url\", help=\"Public https://soundcloud.com/... URL\")\n    parser.add_argument(\n        \"timestamp\", nargs=\"?\", default=\"0:30\", help='For example \"42:10\" or \"90\"'\n    )\n    parser.add_argument(\n        \"--out\",\n        default=\"clip.mp3\",\n        help=\"Where to write the MP3 so you can listen to it\",\n    )\n    parser.add_argument(\n        \"--no-recognize\",\n        action=\"store_true\",\n        help=\"Only resolve and clip; do not call a recognition backend\",\n    )\n    return parser\n\n\nasync def _run() -> int:\n    args = _parser().parse_args()\n    if not os.environ.get(\"MCP_PATH_SECRET\") and not os.environ.get(\"ALLOW_INSECURE_NO_SECRET\"):\n        os.environ[\"ALLOW_INSECURE_NO_SECRET\"] = \"1\"\n    settings = load_settings()\n    timestamp = parse_timestamp(args.timestamp)\n\n    started = time.perf_counter()\n    resolved = await resolve_track(args.url, settings, force=True)\n    resolve_s = time.perf_counter() - started\n    host = urlsplit(resolved.stream_url).hostname\n    print(f\"title:    {resolved.title}\")\n    print(f\"uploader: {resolved.uploader}\")\n    duration = format_timestamp(resolved.duration_seconds)\n    print(f\"duration: {duration} ({resolved.duration_seconds:.1f}s)\")\n    print(f\"path:     {soundcloud_path(resolved.page_url)}\")\n    print(f\"stream:   {host} (signed URL not printed)\")\n    if resolved.preview_only:\n        print(\"note:     Go+ preview only; about 30 seconds of audio are readable\")\n\n    start, length = clip_window(timestamp, resolved.playable_seconds, settings.clip_seconds)\n    print(f\"clip:     {format_timestamp(start)} for {length:.1f}s -> {args.out}\")\n    clip_started = time.perf_counter()\n    await extract_clip_to(resolved, start, length, args.out, settings)\n    clip_s = time.perf_counter() - clip_started\n    size = await asyncio.to_thread(os.path.getsize, args.out)\n    print(f\"wrote:    {args.out} ({size} bytes)\")\n\n    recognize_s = 0.0\n    if not args.no_recognize:\n        from track_id.recognizers import recognize_file\n\n        recognize_started = time.perf_counter()\n        match, backend = await recognize_file(args.out, settings)\n        recognize_s = time.perf_counter() - recognize_started\n        if match is None:\n            print(\"match:    none\")\n        else:\n            print(f\"match:    {match.artist} \u2014 {match.title} [{backend}]\")\n            if match.album:\n                print(f\"album:    {match.album}\")\n            if match.link:\n                print(f\"link:     {match.link}\")\n\n    print(\n        f\"timings:  resolve {resolve_s:.2f}s, clip {clip_s:.2f}s, recognize {recognize_s:.2f}s\"\n    )\n    return 0\n\n\ndef main() -> None:\n    try:\n        raise SystemExit(asyncio.run(_run()))\n    except Exception as exc:  # noqa: BLE001 - CLI should print a clean message\n        print(f\"error: {exc}\", file=sys.stderr)\n        raise SystemExit(1) from exc\n\n\nif __name__ == \"__main__\":\n    main()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 6
+    },
+    "ai_commit": "d7098c867cf1",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      106,
+      111
+    ]
+  }
+}

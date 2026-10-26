@@ -1,0 +1,28 @@
+{
+  "repo": "atanasvasilevjourney__ORBIS-EQUITY-",
+  "file": "pipeline/compute/loop_strategy_bus.py",
+  "function": "latest_signal_as_of",
+  "line": 11,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `latest_signal_as_of` function (parameters: sb, strategy_id, through).",
+  "prompt_source": "def latest_signal_as_of(sb, strategy_id: str, through: date) -> date | None:\n    \"\"\"Implement the `latest_signal_as_of` function (parameters: sb, strategy_id, through).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def latest_signal_as_of(sb, strategy_id: str, through: date) -> date | None:\n    resp = (\n        sb.table(\"strategy_signals\")\n        .select(\"as_of\")\n        .eq(\"strategy_id\", strategy_id)\n        .lte(\"as_of\", through.isoformat())\n        .order(\"as_of\", desc=True)\n        .limit(1)\n        .execute()\n    )\n    row = (resp.data or [None])[0]\n    if not row or not row.get(\"as_of\"):\n        return None\n    try:\n        return date.fromisoformat(str(row[\"as_of\"])[:10])\n    except ValueError:\n        return None",
+  "module_source": "\"\"\"Read donchian_vwap candidates from strategy_signals for portfolio_loop.\"\"\"\nfrom __future__ import annotations\n\nfrom datetime import date\n\nfrom pipeline.utils.supabase import fetch_all\n\nSTRATEGY_DONCHIAN = \"donchian_vwap\"\n\n\ndef latest_signal_as_of(sb, strategy_id: str, through: date) -> date | None:\n    resp = (\n        sb.table(\"strategy_signals\")\n        .select(\"as_of\")\n        .eq(\"strategy_id\", strategy_id)\n        .lte(\"as_of\", through.isoformat())\n        .order(\"as_of\", desc=True)\n        .limit(1)\n        .execute()\n    )\n    row = (resp.data or [None])[0]\n    if not row or not row.get(\"as_of\"):\n        return None\n    try:\n        return date.fromisoformat(str(row[\"as_of\"])[:10])\n    except ValueError:\n        return None\n\n\ndef donchian_buy_scores(sb, as_of: date) -> dict[str, float]:\n    rows = fetch_all(\n        sb,\n        \"strategy_signals\",\n        \"symbol, score\",\n        filters=lambda q: q.eq(\"strategy_id\", STRATEGY_DONCHIAN)\n        .eq(\"side\", \"BUY\")\n        .eq(\"as_of\", as_of.isoformat()),\n    )\n    return {r[\"symbol\"]: float(r.get(\"score\") or 0.0) for r in rows if r.get(\"symbol\")}\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 17
+    },
+    "ai_commit": "59664ee4a815",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      11,
+      27
+    ]
+  }
+}

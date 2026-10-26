@@ -1,0 +1,28 @@
+{
+  "repo": "Fejjii__AlphaTrade-AI",
+  "file": "backend/src/app/db/migrations/versions/a18riskpolicy003_breaker_intervals.py",
+  "function": "downgrade",
+  "line": 55,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `downgrade` function.",
+  "prompt_source": "def downgrade() -> None:\n    \"\"\"Implement the `downgrade` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def downgrade() -> None:\n    bind = op.get_bind()\n    stored = bind.execute(sa.text(\"SELECT 1 FROM risk_policy_breaker_intervals LIMIT 1\")).first()\n    if stored is not None:\n        raise RuntimeError(\"Risk-policy breaker intervals exist; downgrade would delete them.\")\n    op.drop_table(\"risk_policy_breaker_intervals\")",
+  "module_source": "\"\"\"Persist breaker open and close intervals.\n\nRevision ID: a18riskpolicy003\nRevises: a17riskpolicy002\nCreate Date: 2026-10-18 03:05:00.000000\n\nThe live breaker row is the current latch. These rows are the history used\nto decide whether a loosening's effective time fell inside a breaker window.\nDowngrade refuses while any interval exists.\n\"\"\"\n\nfrom __future__ import annotations\n\nfrom collections.abc import Sequence\n\nimport sqlalchemy as sa\nfrom alembic import op\n\nrevision: str = \"a18riskpolicy003\"\ndown_revision: str | None = \"a17riskpolicy002\"\nbranch_labels: str | Sequence[str] | None = None\ndepends_on: str | Sequence[str] | None = None\n\n\ndef upgrade() -> None:\n    op.create_table(\n        \"risk_policy_breaker_intervals\",\n        sa.Column(\"id\", sa.Uuid(), nullable=False),\n        sa.Column(\"organization_id\", sa.Uuid(), nullable=False),\n        sa.Column(\"account_id\", sa.Uuid(), nullable=False),\n        sa.Column(\"kind\", sa.String(length=16), nullable=False),\n        sa.Column(\"phase\", sa.String(length=8), nullable=False),\n        sa.Column(\"occurred_at\", sa.DateTime(timezone=True), nullable=False),\n        sa.CheckConstraint(\n            \"kind IN ('daily', 'consecutive', 'drawdown')\",\n            name=\"ck_risk_policy_breaker_interval_kind\",\n        ),\n        sa.CheckConstraint(\n            \"phase IN ('open', 'close')\",\n            name=\"ck_risk_policy_breaker_interval_phase\",\n        ),\n        sa.ForeignKeyConstraint([\"organization_id\"], [\"organizations.id\"]),\n        sa.PrimaryKeyConstraint(\"id\"),\n        sa.UniqueConstraint(\n            \"organization_id\",\n            \"account_id\",\n            \"kind\",\n            \"phase\",\n            \"occurred_at\",\n            name=\"uq_risk_policy_breaker_interval\",\n        ),\n    )\n\n\ndef downgrade() -> None:\n    bind = op.get_bind()\n    stored = bind.execute(sa.text(\"SELECT 1 FROM risk_policy_breaker_intervals LIMIT 1\")).first()\n    if stored is not None:\n        raise RuntimeError(\"Risk-policy breaker intervals exist; downgrade would delete them.\")\n    op.drop_table(\"risk_policy_breaker_intervals\")\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 6
+    },
+    "ai_commit": "a551e859b317",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      55,
+      60
+    ]
+  }
+}

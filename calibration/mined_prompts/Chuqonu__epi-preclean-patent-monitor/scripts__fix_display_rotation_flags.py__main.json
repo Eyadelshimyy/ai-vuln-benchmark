@@ -1,0 +1,28 @@
+{
+  "repo": "Chuqonu__epi-preclean-patent-monitor",
+  "file": "scripts/fix_display_rotation_flags.py",
+  "function": "main",
+  "line": 41,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main() -> int:\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main() -> int:\n    cleared_report = 0\n    data = json.loads(REPORT.read_text(encoding=\"utf-8\"))\n    for m in data.get(\"months\") or []:\n        for fam in m.get(\"families\") or []:\n            for fig in fam.get(\"figures\") or []:\n                if normalize_rot(fig):\n                    cleared_report += 1\n    REPORT.write_text(json.dumps(data, ensure_ascii=False, indent=2) + \"\\n\", encoding=\"utf-8\")\n\n    cleared_map = 0\n    if MAP.is_file():\n        mapping = json.loads(MAP.read_text(encoding=\"utf-8\"))\n        for item in mapping.get(\"entries\", {}).values():\n            if normalize_rot(item):\n                cleared_map += 1\n        MAP.write_text(json.dumps(mapping, ensure_ascii=False, indent=2) + \"\\n\", encoding=\"utf-8\")\n\n    print(json.dumps({\"cleared_report\": cleared_report, \"cleared_map\": cleared_map}))\n    return 0",
+  "module_source": "#!/usr/bin/env python3\n\"\"\"Clear mistaken display_rotation on portrait bytes only when explicitly listed.\n\nUSPTO portrait *pages* with sideways drawing bodies keep display_rotation=90 (see restore_uspto_portrait_sheet_rotation.py).\nDo not auto-clear all h>w rotation \u2014 that breaks US12757647B2-class figures.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nfrom pathlib import Path\n\nROOT = Path(__file__).resolve().parents[1]\nREPORT = ROOT / \"data\" / \"report.json\"\nMAP = ROOT / \"data\" / \"figure-recovery-map.json\"\n\n\n# Gate\u2462 WO/TW Fig.2 true PNG \u2014 portrait bytes already upright; rot90 was wrong.\nUPRIGHT_PORTRAIT_SHA_PREFIXES = (\"77e2a1525aeebf656\",)\n\n\ndef normalize_rot(fig: dict) -> bool:\n    rot = fig.get(\"display_rotation\") or 0\n    if rot not in (90, 270):\n        return False\n    sha = str(\n        fig.get(\"sha256\")\n        or fig.get(\"asset_sha256\")\n        or fig.get(\"source_display_sha256\")\n        or \"\"\n    )\n    if not any(sha.startswith(p) for p in UPRIGHT_PORTRAIT_SHA_PREFIXES):\n        return False\n    fig[\"display_rotation\"] = 0\n    geom = fig.get(\"source_geometry\")\n    if isinstance(geom, dict):\n        geom[\"display_rotation\"] = 0\n    return True\n\n\ndef main() -> int:\n    cleared_report = 0\n    data = json.loads(REPORT.read_text(encoding=\"utf-8\"))\n    for m in data.get(\"months\") or []:\n        for fam in m.get(\"families\") or []:\n            for fig in fam.get(\"figures\") or []:\n                if normalize_rot(fig):\n                    cleared_report += 1\n    REPORT.write_text(json.dumps(data, ensure_ascii=False, indent=2) + \"\\n\", encoding=\"utf-8\")\n\n    cleared_map = 0\n    if MAP.is_file():\n        mapping = json.loads(MAP.read_text(encoding=\"utf-8\"))\n        for item in mapping.get(\"entries\", {}).values():\n            if normalize_rot(item):\n                cleared_map += 1\n        MAP.write_text(json.dumps(mapping, ensure_ascii=False, indent=2) + \"\\n\", encoding=\"utf-8\")\n\n    print(json.dumps({\"cleared_report\": cleared_report, \"cleared_map\": cleared_map}))\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 20
+    },
+    "ai_commit": "685f34dfeedb",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      41,
+      60
+    ]
+  }
+}

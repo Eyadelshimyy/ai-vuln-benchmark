@@ -1,0 +1,28 @@
+{
+  "repo": "Chuqonu__epi-preclean-patent-monitor",
+  "file": "scripts/apply_independent_evidence.py",
+  "function": "main",
+  "line": 73,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main() -> int:\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main() -> int:\n    data = json.loads(REPORT.read_text(encoding=\"utf-8\"))\n    epi = json.loads(EPI.read_text(encoding=\"utf-8\"))\n    pre = json.loads(PRE.read_text(encoding=\"utf-8\"))\n\n    for m in data.get(\"months\") or []:\n        for fam in m.get(\"families\") or []:\n            trim_hybrid_preclean_cross_events(fam)\n\n    apply_epi_team_read(data, epi)\n    apply_preclean_not_read(data, pre)\n\n    counts = recompute_counts(data)\n    REPORT.write_text(json.dumps(data, ensure_ascii=False, indent=2) + \"\\n\", encoding=\"utf-8\")\n    print(\"counts\", counts)\n    return 0",
+  "module_source": "#!/usr/bin/env python3\n\"\"\"Apply EPI/Preclean evidence supplements + event attribution fixes to report.json.\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nimport sys\nfrom pathlib import Path\n\nROOT = Path(__file__).resolve().parents[1]\nREPORT = ROOT / \"data\" / \"report.json\"\nEPI = ROOT / \"docs\" / \"EPI-EVIDENCE-SUPPLEMENT-2026-10-20.json\"\nPRE = ROOT / \"docs\" / \"PRECLEAN-EVIDENCE-SUPPLEMENT-2026-10-20.json\"\n\nsys.path.insert(0, str(ROOT / \"scripts\"))\nfrom report_metrics import recompute_counts, card_events_for_month  # noqa: E402\n\n\ndef trim_hybrid_preclean_cross_events(fam: dict) -> None:\n    \"\"\"WO/TW month cards must not list the sibling's primary publication (double-count fix).\"\"\"\n    if fam.get(\"family_id\") != \"FAM-merge-hybrid-preclean\":\n        return\n    pub = fam.get(\"publication_id\")\n    evs = fam.get(\"family_events\") or []\n    fam[\"family_events\"] = [e for e in evs if e.get(\"publication_id\") == pub]\n\n\ndef apply_epi_team_read(data: dict, supplement: dict) -> None:\n    by_pub = {r[\"publication_id\"]: r for r in supplement.get(\"team_read\", [])}\n    for m in data.get(\"months\") or []:\n        for fam in m.get(\"families\") or []:\n            pub = fam.get(\"publication_id\")\n            if pub not in by_pub:\n                continue\n            row = by_pub[pub]\n            fam[\"team_independent_read\"] = True\n            fam[\"read_disposition\"] = \"team_read_claims_level\"\n            fam[\"source_urls\"] = row.get(\"source_urls\") or fam.get(\"source_urls\")\n            fam[\"source_retrieved_at\"] = row.get(\"source_retrieved_at\")\n            fam[\"source_sha256\"] = row.get(\"source_sha256\")\n            fam[\"actual_read_spans\"] = row.get(\"actual_read_spans\") or []\n            fam[\"read_query\"] = row.get(\"read_query\")\n            fam[\"reviewer\"] = row.get(\"reviewer\")\n            fam[\"reviewed_at\"] = row.get(\"reviewed_at\")\n            if row.get(\"read_evidence_note\"):\n                fam[\"read_evidence_note\"] = row[\"read_evidence_note\"]\n            if row.get(\"official_source_url\"):\n                fam[\"official_source_url\"] = row[\"official_source_url\"]\n\n\ndef apply_preclean_not_read(data: dict, supplement: dict) -> None:\n    by_pub = {r[\"publication_id\"]: r for r in supplement.get(\"included_not_team_read\", [])}\n    for m in data.get(\"months\") or []:\n        for fam in m.get(\"families\") or []:\n            pub = fam.get(\"publication_id\")\n            if pub not in by_pub:\n                if fam.get(\"discovery_source\") == \"independent_search\":\n                    fam.setdefault(\"team_independent_read\", False)\n                continue\n            row = by_pub[pub]\n            fam[\"team_independent_read\"] = False\n            fam[\"read_disposition\"] = row.get(\"disposition\", \"included_not_team_read\")\n            fam[\"read_status\"] = row.get(\"read_status\")\n            fam[\"actual_read_spans\"] = []\n            fam[\"reviewer\"] = None\n            fam[\"reviewed_at\"] = None\n            fam[\"source_sha256\"] = None\n            fam[\"source_retrieved_at\"] = None\n            if row.get(\"pending_reason\"):\n                fam[\"pending_reason\"] = row[\"pending_reason\"]\n\n\ndef main() -> int:\n    data = json.loads(REPORT.read_text(encoding=\"utf-8\"))\n    epi = json.loads(EPI.read_text(encoding=\"utf-8\"))\n    pre = json.loads(PRE.read_text(encoding=\"utf-8\"))\n\n    for m in data.get(\"months\") or []:\n        for fam in m.get(\"families\") or []:\n            trim_hybrid_preclean_cross_events(fam)\n\n    apply_epi_team_read(data, epi)\n    apply_preclean_not_read(data, pre)\n\n    counts = recompute_counts(data)\n    REPORT.write_text(json.dumps(data, ensure_ascii=False, indent=2) + \"\\n\", encoding=\"utf-8\")\n    print(\"counts\", counts)\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 16
+    },
+    "ai_commit": "4a7c7b1a284d",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      73,
+      88
+    ]
+  }
+}

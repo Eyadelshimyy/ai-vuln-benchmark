@@ -1,0 +1,28 @@
+{
+  "repo": "x-uuid__syforce",
+  "file": "app/syforce/config.py",
+  "function": "reload",
+  "line": 42,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `reload` function (parameters: force).",
+  "prompt_source": "    def reload(self, force=False):\n        \"\"\"Implement the `reload` function (parameters: force).\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    def reload(self, force=False):\n        t = time.time()\n        if not force and t - self.chk < 2: return\n        self.chk = t\n        try: mt = os.stat(self.path).st_mtime\n        except OSError: mt = 0\n        if mt == self.mtime and not force: return\n        self.mtime = mt\n        user = {}\n        if mt:\n            try:\n                with open(self.path, encoding=\"utf-8\") as f: user = json.load(f)\n            except Exception as e:\n                print(\"config parse error %r (using defaults)\" % e)\n        self.data = _merge(DEFAULTS, user)\n        self.hide_names = {str(x).strip().lower() for x in self.data.get(\"hide\") or [] if str(x).strip()}",
+  "module_source": "\"\"\"Config loading: defaults <- config.json (or --config path) <- CLI flags. Hide list is hot-reloaded.\"\"\"\nimport json, os, re, time\n\nDEFAULTS = {\n    \"port\": 9001,\n    \"bind\": \"0.0.0.0\",\n    \"title\": \"\",                      # top-left title; \"\" = short hostname\n    \"host_label\": \"\",                 # label of the centre node; \"\" = short hostname\n    \"language\": \"zh\",                 # zh | en | ja (default when the browser has no saved choice)\n    \"fps_mode\": \"eco\",                # eco (\u8282\u80fd) | smooth (\u6d41\u7545)\n    \"names\": {},                      # {\"<ip or tailscale name>\": \"label\"}  e.g. {\"192.168.1.1\": \"Router\"}\n    \"hide\": [],                       # names or IPs never sent to the browser (still collected)\n    \"ping_targets\": [{\"name\": \"DNS\", \"ip\": \"1.1.1.1\", \"role\": \"inet\"}],\n    \"topology\": {\"gateway\": \"auto\", \"traceroute_hops\": 2, \"traceroute_target\": \"1.1.1.1\", \"refresh_s\": 600},\n    \"tailscale\": {\"enabled\": \"auto\", \"binary\": \"\"},\n    \"models\": {\"enabled\": \"auto\", \"ports\": [8000, 8001, 8002, 11434], \"autodiscover\": True,\n               \"manager_port\": None, \"skip_ports\": [22, 53, 631]},\n    \"docker\": {\"enabled\": \"auto\"},\n    \"gpu\": {\"enabled\": \"auto\"},\n}\n\nHERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\n\n\ndef _merge(a, b):\n    out = dict(a)\n    for k, v in (b or {}).items():\n        if isinstance(v, dict) and isinstance(out.get(k), dict):\n            out[k] = _merge(out[k], v)\n        else:\n            out[k] = v\n    return out\n\n\nclass Config:\n    def __init__(self, path=None):\n        self.path = path or os.path.join(HERE, \"config.json\")\n        self.data = dict(DEFAULTS); self.mtime = None; self.chk = 0\n        self.hide_names = set(); self.hide_ips = set()\n        self.reload(force=True)\n\n    def reload(self, force=False):\n        t = time.time()\n        if not force and t - self.chk < 2: return\n        self.chk = t\n        try: mt = os.stat(self.path).st_mtime\n        except OSError: mt = 0\n        if mt == self.mtime and not force: return\n        self.mtime = mt\n        user = {}\n        if mt:\n            try:\n                with open(self.path, encoding=\"utf-8\") as f: user = json.load(f)\n            except Exception as e:\n                print(\"config parse error %r (using defaults)\" % e)\n        self.data = _merge(DEFAULTS, user)\n        self.hide_names = {str(x).strip().lower() for x in self.data.get(\"hide\") or [] if str(x).strip()}\n\n    def __getitem__(self, k): return self.data[k]\n    def get(self, k, d=None): return self.data.get(k, d)\n\n    # ---- hide list ----\n    def name_hit(self, v):\n        v = (v or \"\").lower().rstrip(\".\")\n        return bool(v) and any(v == n or v.startswith(n + \".\") for n in self.hide_names)\n\n    def resolve_hidden(self, peers):\n        ips = {n for n in self.hide_names if re.match(r\"^[\\d.:a-f]+$\", n) and any(c.isdigit() for c in n)}\n        for p in peers or []:\n            if self.name_hit(p.get(\"name\")) or self.name_hit(p.get(\"dns\")) or (p.get(\"ip\") or \"\").lower() in self.hide_names:\n                ips |= set(p.get(\"ips\") or [p.get(\"ip\")])\n        ips.discard(None); ips.discard(\"\")\n        self.hide_ips = ips\n\n    def ip_hit(self, ip): return bool(ip) and ip in self.hide_ips\n\n    def text_hit(self, txt):\n        if not self.hide_names and not self.hide_ips: return False\n        low = txt.lower()\n        return any(re.search(r\"(^|[^\\w.-])\" + re.escape(x) + r\"($|[^\\w-])\", low) for x in self.hide_names | self.hide_ips)\n\n    def public(self):\n        \"\"\"subset the browser is allowed to see (/api/config)\"\"\"\n        return {\"language\": self.data.get(\"language\"), \"fps_mode\": self.data.get(\"fps_mode\"),\n                \"title\": self.data.get(\"title\"), \"host_label\": self.data.get(\"host_label\")}\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 16
+    },
+    "ai_commit": "5ea632480197",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      42,
+      57
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "repo": "quantam101__tradegate2",
+  "file": "runtime/tradegate/feed.py",
+  "function": "stream",
+  "line": 34,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `stream` function (parameters: symbol).",
+  "prompt_source": "    async def stream(self, symbol: str | None = None) -> AsyncIterator[Tick]:\n        \"\"\"Implement the `stream` function (parameters: symbol).\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    async def stream(self, symbol: str | None = None) -> AsyncIterator[Tick]:\n        with self.path.open() as f:\n            for line in f:\n                line = line.strip()\n                if not line:\n                    continue\n                t = Tick(**json.loads(line))\n                if symbol and t.symbol != symbol:\n                    continue\n                yield t\n                if self.pace:\n                    await asyncio.sleep(self.pace)",
+  "module_source": "\"\"\"Market data sources.\n\n``MarketDataSource`` is the single seam between the mesh and the outside\nworld: replay feeds (recorded JSONL ticks, used for backtests and CI),\na seeded synthetic random-walk feed (used by the paper daemon and tests),\nand a stub for real exchange WebSocket adapters to implement later.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport asyncio\nimport json\nimport random\nfrom collections.abc import AsyncIterator\nfrom pathlib import Path\nfrom typing import Protocol\n\n\nclass MarketDataSource(Protocol):\n    def stream(self, symbol: str) -> AsyncIterator[Tick]: ...\n\n\n# import here to keep the public Protocol above the fold\nfrom .events import Tick\n\n\nclass ReplayFeed:\n    \"\"\"Streams ticks from a JSONL file (one Tick-shaped dict per line).\"\"\"\n\n    def __init__(self, path: Path, pace: float = 0.0):\n        self.path = Path(path)\n        self.pace = pace  # seconds between ticks; 0 = as fast as possible\n\n    async def stream(self, symbol: str | None = None) -> AsyncIterator[Tick]:\n        with self.path.open() as f:\n            for line in f:\n                line = line.strip()\n                if not line:\n                    continue\n                t = Tick(**json.loads(line))\n                if symbol and t.symbol != symbol:\n                    continue\n                yield t\n                if self.pace:\n                    await asyncio.sleep(self.pace)\n\n\nclass SyntheticFeed:\n    \"\"\"Deterministic regime-switching random-walk feed.\n\n    Alternates trending (sweep-friendly) and ranging (reversion-friendly)\n    regimes with seeded randomness so tests and backtests are repeatable.\n    Depth and CVD are synthesized consistently with the regime.\n    \"\"\"\n\n    def __init__(self, symbol: str = \"PAPER/USD\", price: float = 100.0,\n                 steps: int = 5000, seed: int = 7, interval: float = 0.0):\n        self.symbol = symbol\n        self.price = price\n        self.steps = steps\n        self.interval = interval\n        self.rng = random.Random(seed)\n\n    async def stream(self, symbol: str | None = None) -> AsyncIterator[Tick]:\n        if symbol and symbol != self.symbol:\n            return\n        rng, price = self.rng, self.price\n        trend = 0.0\n        for i in range(self.steps):\n            if i % 400 == 0:\n                # regime switch: trend in [-0.0015, 0.0015] per step\n                trend = rng.uniform(-0.0015, 0.0015)\n            vol = 0.004\n            ret = trend + rng.gauss(0, vol)\n            prev = price\n            price = max(0.01, price * (1 + ret))\n            hi = max(prev, price) * (1 + abs(rng.gauss(0, vol / 4)))\n            lo = min(prev, price) * (1 - abs(rng.gauss(0, vol / 4)))\n            strong = abs(ret) > vol  # directional frames get depth skew\n            bids = rng.uniform(8e4, 1.6e5)\n            asks = rng.uniform(8e4, 1.6e5)\n            if strong and ret > 0:\n                bids, asks = asks * rng.uniform(2.2, 3.4), asks\n            elif strong and ret < 0:\n                bids, asks = bids, bids * rng.uniform(2.2, 3.4)\n            vd = (1 if ret > 0 else -1) * rng.uniform(0, 60) * (abs(ret) / vol)\n            yield Tick(\n                symbol=self.symbol,\n                timestamp=i,\n                price=price,\n                bid=price * (1 - 1e-4),\n                ask=price * (1 + 1e-4),\n                bids_depth=bids,\n                asks_depth=asks,\n                volume_delta=vd,\n                high=hi,\n                low=lo,\n            )\n            if self.interval:\n                await asyncio.sleep(self.interval)\n\n\nclass ExchangeWebSocketFeed:\n    \"\"\"Seam for a real exchange adapter. Not implemented by design:\n\n    live trading requires exchange credentials, which this repo does not\n    carry (zero-spend / approval-gated). Implement ``stream()`` to yield\n    normalized ``Tick`` objects and everything downstream works unchanged.\n    \"\"\"\n\n    async def stream(self, symbol: str) -> AsyncIterator[Tick]:  # pragma: no cover\n        raise NotImplementedError(\n            \"No live exchange adapter is configured. Use ReplayFeed or \"\n            \"SyntheticFeed, or implement stream() behind approval gates.\"\n        )\n        yield  # make this an async generator\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 11
+    },
+    "ai_commit": "dcd24f32bedf",
+    "evidence": "author/committer='devin-ai-integration[bot] <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 0.917,
+    "span": [
+      34,
+      45
+    ]
+  }
+}

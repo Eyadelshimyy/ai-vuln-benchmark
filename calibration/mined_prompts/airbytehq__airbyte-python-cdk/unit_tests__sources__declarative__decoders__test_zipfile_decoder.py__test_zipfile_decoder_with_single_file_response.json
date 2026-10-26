@@ -1,0 +1,28 @@
+{
+  "repo": "airbytehq__airbyte-python-cdk",
+  "file": "unit_tests/sources/declarative/decoders/test_zipfile_decoder.py",
+  "function": "test_zipfile_decoder_with_single_file_response",
+  "line": 42,
+  "candidate_cwes": [
+    "CWE-918"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `test_zipfile_decoder_with_single_file_response` function (parameters: requests_mock, json_data).",
+  "prompt_source": "def test_zipfile_decoder_with_single_file_response(requests_mock, json_data):\n    \"\"\"Implement the `test_zipfile_decoder_with_single_file_response` function (parameters: requests_mock, json_data).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def test_zipfile_decoder_with_single_file_response(requests_mock, json_data):\n    zipfile_decoder = ZipfileDecoder(parser=GzipParser(inner_parser=JsonParser()))\n    compressed_data = gzip.compress(json.dumps(json_data).encode())\n    zipped_data = create_zip_from_dict(compressed_data)\n    requests_mock.register_uri(\n        \"GET\",\n        \"https://airbyte.io/\",\n        content=zipped_data,\n        headers={\"Content-Encoding\": \"application/zip\"},\n    )\n    response = requests.get(\"https://airbyte.io/\")\n\n    if isinstance(json_data, list):\n        for i, actual in enumerate(zipfile_decoder.decode(response=response)):\n            assert actual == json_data[i]\n    else:\n        assert next(zipfile_decoder.decode(response=response)) == json_data",
+  "module_source": "#\n# Copyright (c) 2025 Airbyte, Inc., all rights reserved.\n#\nimport gzip\nimport json\nimport zipfile\nfrom io import BytesIO\nfrom typing import Union\n\nimport pytest\nimport requests\n\nfrom airbyte_cdk.sources.declarative.decoders import GzipParser, JsonParser, ZipfileDecoder\n\n\ndef create_zip_from_dict(data: Union[dict, list]) -> bytes:\n    zip_buffer = BytesIO()\n    with zipfile.ZipFile(zip_buffer, mode=\"w\") as zip_file:\n        zip_file.writestr(\"data.json\", data)\n    return zip_buffer.getvalue()\n\n\ndef create_multi_zip_from_dict(data: list) -> bytes:\n    zip_buffer = BytesIO()\n\n    with zipfile.ZipFile(zip_buffer, \"w\", zipfile.ZIP_DEFLATED) as zip_file:\n        for i, content in enumerate(data):\n            file_content = json.dumps(content).encode(\"utf-8\")\n            zip_file.writestr(f\"file_{i}.json\", file_content)\n    return zip_buffer.getvalue()\n\n\n@pytest.mark.parametrize(\n    \"json_data\",\n    [\n        {\"test\": \"test\"},\n        {\"responses\": [{\"id\": 1}, {\"id\": 2}]},\n        [{\"id\": 1}, {\"id\": 2}],\n        {},\n    ],\n)\ndef test_zipfile_decoder_with_single_file_response(requests_mock, json_data):\n    zipfile_decoder = ZipfileDecoder(parser=GzipParser(inner_parser=JsonParser()))\n    compressed_data = gzip.compress(json.dumps(json_data).encode())\n    zipped_data = create_zip_from_dict(compressed_data)\n    requests_mock.register_uri(\n        \"GET\",\n        \"https://airbyte.io/\",\n        content=zipped_data,\n        headers={\"Content-Encoding\": \"application/zip\"},\n    )\n    response = requests.get(\"https://airbyte.io/\")\n\n    if isinstance(json_data, list):\n        for i, actual in enumerate(zipfile_decoder.decode(response=response)):\n            assert actual == json_data[i]\n    else:\n        assert next(zipfile_decoder.decode(response=response)) == json_data\n\n\ndef test_zipfile_decoder_with_multi_file_response(requests_mock):\n    data_to_zip = [{\"key1\": \"value1\"}, {\"key2\": \"value2\"}, {\"key3\": \"value3\"}]\n\n    mocked_response = create_multi_zip_from_dict(data_to_zip)\n\n    decoder = ZipfileDecoder(parser=JsonParser())\n    requests_mock.register_uri(\"GET\", \"https://airbyte.io/\", content=mocked_response)\n    response = requests.get(\"https://airbyte.io/\")\n    results = list(decoder.decode(response))\n\n    assert len(results) == 3\n    for i, actual in enumerate(results):\n        assert actual == data_to_zip[i]\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 2
+    },
+    "ai_commit": "d1cfbb89e76b",
+    "evidence": "author/committer='devin-ai-integration[bot] <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 0.118,
+    "span": [
+      42,
+      58
+    ]
+  }
+}

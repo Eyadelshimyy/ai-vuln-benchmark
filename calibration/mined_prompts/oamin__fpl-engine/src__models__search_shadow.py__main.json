@@ -1,0 +1,28 @@
+{
+  "repo": "oamin__fpl-engine",
+  "file": "src/models/search_shadow.py",
+  "function": "main",
+  "line": 101,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main() -> None:\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main() -> None:\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"--season\", default=\"\")\n    args = parser.parse_args()\n    if args.season:\n        matched = [pair for pair in EARLIER if pair[0] == args.season]\n        if len(matched) != 1:\n            raise SystemExit(f\"unknown season {args.season}\")\n        print(run_season(*matched[0]), flush=True)\n        return\n    print(run(), flush=True)",
+  "module_source": "\"\"\"Cross-position value the beam does not try, on the three earlier seasons.\n\nThe search is unchanged. ``structural_gap`` is the same shadow as stage 44.\nA rewrite is rejected when every season averages under 0.25 points of\nthree-week value a week and has fewer than three weeks at or above 1.\nA season above either bar is inconclusive. The search stays either way.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport argparse\nfrom pathlib import Path\n\nimport pandas as pd\n\nfrom src.models.stage_44_search_counts import structural_gap\n\nROOT = Path(__file__).resolve().parents[2]\nPROCESSED = ROOT / \"data\" / \"processed\"\nREPORTS = ROOT / \"reports\"\n\nEARLIER: list[tuple[str, str]] = [\n    (\"2022-23\", \"2223\"),\n    (\"2023-24\", \"2324\"),\n    (\"2024-25\", \"2425\"),\n]\nMEAN_MAX = 0.25\nWEEKS_AT_LEAST_1 = 3\n\n\ndef season_quiet(mean_gap: float, weeks_over_1: float) -> bool:\n    \"\"\"True when this season is too small to justify a search rewrite.\"\"\"\n    if pd.isna(mean_gap) or pd.isna(weeks_over_1):\n        return False\n    return float(mean_gap) < MEAN_MAX and float(weeks_over_1) < WEEKS_AT_LEAST_1\n\n\ndef rewrite_rejected(rows: list[dict[str, float]]) -> bool:\n    \"\"\"True only when all three locked seasons are quiet.\"\"\"\n    if len(rows) != len(EARLIER):\n        return False\n    return all(\n        season_quiet(float(row[\"mean_gap\"]), float(row[\"weeks_over_1\"])) for row in rows\n    )\n\n\ndef _write(frame: pd.DataFrame, rejected: bool) -> None:\n    lines = [\n        \"# Search shadow\",\n        \"\",\n        \"The published search is unchanged. Each row is the three-week value \"\n        \"of the best cross-position pair the beam does not try, minus the \"\n        \"move it did choose. The same shadow on 2025/26 was 0.06 a week, \"\n        \"with no week at 1. A rewrite is rejected when every season here \"\n        f\"averages under {MEAN_MAX:.2f} and has fewer than {WEEKS_AT_LEAST_1} \"\n        \"weeks at or above 1. A season above either bar is inconclusive. \"\n        \"The search stays in both cases.\",\n        \"\",\n        \"| season | weeks | mean value | weeks at or above 1 | largest week | quiet |\",\n        \"|---|---:|---:|---:|---:|---|\",\n    ]\n    for row in frame.itertuples(index=False):\n        quiet = season_quiet(float(row.mean_gap), float(row.weeks_over_1))\n        lines.append(\n            f\"| {row.season} | {row.weeks:.0f} | {row.mean_gap:.3f} | \"\n            f\"{row.weeks_over_1:.0f} | {row.max_gap:.2f} | \"\n            f\"{'yes' if quiet else 'no'} |\"\n        )\n    if rejected:\n        call = (\n            \"Every season is under both bars. The rewrite is rejected. \"\n            \"The search stays as it is.\"\n        )\n    else:\n        call = (\n            \"At least one season is above a bar, or a season is missing. \"\n            \"That is inconclusive. The search stays as it is.\"\n        )\n    lines += [\"\", call, \"\"]\n    REPORTS.mkdir(parents=True, exist_ok=True)\n    (REPORTS / \"search_shadow.md\").write_text(\"\\n\".join(lines), encoding=\"utf-8\")\n\n\ndef run_season(season: str, code: str) -> dict[str, float]:\n    row = structural_gap(season, code)\n    PROCESSED.mkdir(parents=True, exist_ok=True)\n    pd.DataFrame([row]).to_csv(PROCESSED / f\"search_shadow_{code}.csv\", index=False)\n    return row\n\n\ndef run() -> dict[str, object]:\n    rows = [run_season(season, code) for season, code in EARLIER]\n    frame = pd.DataFrame(rows)\n    rejected = rewrite_rejected(rows)\n    PROCESSED.mkdir(parents=True, exist_ok=True)\n    frame.to_csv(PROCESSED / \"search_shadow.csv\", index=False)\n    _write(frame, rejected)\n    return {\"rejected\": rejected, \"seasons\": rows}\n\n\ndef main() -> None:\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"--season\", default=\"\")\n    args = parser.parse_args()\n    if args.season:\n        matched = [pair for pair in EARLIER if pair[0] == args.season]\n        if len(matched) != 1:\n            raise SystemExit(f\"unknown season {args.season}\")\n        print(run_season(*matched[0]), flush=True)\n        return\n    print(run(), flush=True)\n\n\nif __name__ == \"__main__\":\n    main()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 11
+    },
+    "ai_commit": "7096fefb86a4",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      101,
+      111
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "repo": "EdgarSocrates98__the-forge",
+  "file": "scripts/feedback_bundle.py",
+  "function": "_run",
+  "line": 17,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `_run` function (parameters: cmd).",
+  "prompt_source": "def _run(cmd: list[str]) -> str:\n    \"\"\"Implement the `_run` function (parameters: cmd).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def _run(cmd: list[str]) -> str:\n    try:\n        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)\n        return (out.stdout + out.stderr).strip()[:4000]\n    except Exception as exc:  # honest: report the failure, never fake output\n        return f\"unavailable: {exc}\"",
+  "module_source": "\"\"\"Opt-in feedback bundle (cyc10-03, \u00a710.12).\n\nProduces a LOCAL, user-inspected bundle the user may choose to attach to a\nGitHub issue. No telemetry: nothing is sent anywhere; the file is written\nnext to the workspace and its contents are printed for review first.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nimport platform\nimport subprocess\nimport sys\nfrom pathlib import Path\n\n\ndef _run(cmd: list[str]) -> str:\n    try:\n        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)\n        return (out.stdout + out.stderr).strip()[:4000]\n    except Exception as exc:  # honest: report the failure, never fake output\n        return f\"unavailable: {exc}\"\n\n\ndef main() -> int:\n    bundle = {\n        \"schema\": \"forge/FeedbackBundle/v1\",\n        \"os\": platform.platform(),\n        \"python\": platform.python_version(),\n        \"theforge_version\": _run([sys.executable, \"-m\", \"theforge\", \"--version\"]),\n        \"doctor\": _run([sys.executable, \"-m\", \"theforge\", \"doctor\"]),\n        \"user_notes\": \"<descreva o problema ou feedback aqui>\",\n    }\n    path = Path(\"feedback-bundle.json\")\n    path.write_text(json.dumps(bundle, indent=2, ensure_ascii=False))\n    print(path.read_text())\n    print(f\"\\nwrote {path} \u2014 revise e anexe numa issue do GitHub (opt-in).\")\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 6
+    },
+    "ai_commit": "b4c679f6c9e1",
+    "evidence": "author/committer='Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      17,
+      22
+    ]
+  }
+}

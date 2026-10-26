@@ -1,0 +1,28 @@
+{
+  "repo": "x-uuid__syforce",
+  "file": "app/syforce/plugins/docker.py",
+  "function": "poll",
+  "line": 21,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `poll` function.",
+  "prompt_source": "    def poll(self):\n        \"\"\"Implement the `poll` function.\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    def poll(self):\n        out = run([\"docker\", \"ps\", \"--no-trunc\", \"--format\", \"{{.ID}}\\t{{.Names}}\\t{{.Image}}\\t{{.Ports}}\\t{{.Status}}\"], timeout=8)\n        if not out: self.ok = False; return\n        ctrs = {}; p2c = {}\n        for line in out.splitlines():\n            sp = line.split(\"\\t\")\n            if len(sp) < 5: continue\n            cid, name, image, ports, status = sp\n            c = {\"id\": cid[:12], \"name\": name, \"image\": image, \"status\": status, \"ports\": []}\n            for m in re.finditer(r\"(?:[\\d.]+|\\[::\\]):(\\d+)->(\\d+)/tcp\", ports):\n                hp = int(m.group(1)); c.setdefault(\"cport\", {})[hp] = int(m.group(2))\n                if hp not in c[\"ports\"]: c[\"ports\"].append(hp)\n                p2c[hp] = cid\n            ctrs[cid] = c\n        new = [c for c in ctrs if c not in self.started]\n        if new:\n            for line in run([\"docker\", \"inspect\", \"-f\", \"{{.Id}} {{.State.StartedAt}} {{.State.Pid}}\"] + new, timeout=8).splitlines():\n                sp = line.split()\n                if len(sp) >= 3:\n                    try: ts = datetime.fromisoformat(re.sub(r\"(\\.\\d{6})\\d*\", r\"\\1\", sp[1]).replace(\"Z\", \"+00:00\")).timestamp()\n                    except Exception: ts = None\n                    self.started[sp[0]] = (ts, int(sp[2]))\n        with self.lock:\n            self.ctrs = ctrs; self.port2ctr = p2c; self.ok = True",
+  "module_source": "\"\"\"Docker plugin (optional): container names / images / published ports for model attribution. `docker ps` only (read-only).\"\"\"\nimport re, shutil, threading, time\nfrom datetime import datetime\nfrom ..util import run, log\n\n\nclass Docker:\n    def __init__(self, cfg):\n        self.lock = threading.Lock(); self.ctrs = {}; self.port2ctr = {}; self.started = {}; self.ok = False\n        self.enabled = str(cfg[\"docker\"].get(\"enabled\", \"auto\")).lower() != \"false\" and bool(shutil.which(\"docker\"))\n\n    def start(self):\n        if self.enabled: threading.Thread(target=self.loop, daemon=True).start()\n\n    def loop(self):\n        while True:\n            try: self.poll()\n            except Exception as e: log(\"docker err %r\" % e)\n            time.sleep(30)\n\n    def poll(self):\n        out = run([\"docker\", \"ps\", \"--no-trunc\", \"--format\", \"{{.ID}}\\t{{.Names}}\\t{{.Image}}\\t{{.Ports}}\\t{{.Status}}\"], timeout=8)\n        if not out: self.ok = False; return\n        ctrs = {}; p2c = {}\n        for line in out.splitlines():\n            sp = line.split(\"\\t\")\n            if len(sp) < 5: continue\n            cid, name, image, ports, status = sp\n            c = {\"id\": cid[:12], \"name\": name, \"image\": image, \"status\": status, \"ports\": []}\n            for m in re.finditer(r\"(?:[\\d.]+|\\[::\\]):(\\d+)->(\\d+)/tcp\", ports):\n                hp = int(m.group(1)); c.setdefault(\"cport\", {})[hp] = int(m.group(2))\n                if hp not in c[\"ports\"]: c[\"ports\"].append(hp)\n                p2c[hp] = cid\n            ctrs[cid] = c\n        new = [c for c in ctrs if c not in self.started]\n        if new:\n            for line in run([\"docker\", \"inspect\", \"-f\", \"{{.Id}} {{.State.StartedAt}} {{.State.Pid}}\"] + new, timeout=8).splitlines():\n                sp = line.split()\n                if len(sp) >= 3:\n                    try: ts = datetime.fromisoformat(re.sub(r\"(\\.\\d{6})\\d*\", r\"\\1\", sp[1]).replace(\"Z\", \"+00:00\")).timestamp()\n                    except Exception: ts = None\n                    self.started[sp[0]] = (ts, int(sp[2]))\n        with self.lock:\n            self.ctrs = ctrs; self.port2ctr = p2c; self.ok = True\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 24
+    },
+    "ai_commit": "5ea632480197",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      21,
+      44
+    ]
+  }
+}

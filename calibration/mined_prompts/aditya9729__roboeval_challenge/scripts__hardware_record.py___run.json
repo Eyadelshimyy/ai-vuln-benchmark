@@ -1,0 +1,28 @@
+{
+  "repo": "aditya9729__roboeval_challenge",
+  "file": "scripts/hardware_record.py",
+  "function": "_run",
+  "line": 18,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `_run` function (parameters: cmd).",
+  "prompt_source": "def _run(cmd: list[str]) -> str:\n    \"\"\"Implement the `_run` function (parameters: cmd).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def _run(cmd: list[str]) -> str:\n    try:\n        return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL,\n                                       timeout=30).strip()\n    except Exception as e:\n        return f\"unavailable: {e}\"",
+  "module_source": "\"\"\"Record host hardware into reports/hardware.json (any env; run with sim python).\"\"\"\nfrom __future__ import annotations\n\nimport json\nimport platform\nimport re\nimport subprocess\nimport sys\nfrom pathlib import Path\n\nREPO = Path(__file__).resolve().parents[1]\nsys.path.insert(0, str(REPO / \"src\"))\n\nfrom roboeval_entry.data.io import sha256_file, write_json_atomic  # noqa: E402\nfrom roboeval_entry.evaluation.scoring import vendor_root  # noqa: E402\n\n\ndef _run(cmd: list[str]) -> str:\n    try:\n        return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL,\n                                       timeout=30).strip()\n    except Exception as e:\n        return f\"unavailable: {e}\"\n\n\ndef _nvidia_smi() -> dict:\n    out = _run([\"nvidia-smi\", \"--query-gpu=name,memory.total,driver_version\",\n                \"--format=csv,noheader\"])\n    gpus = []\n    for line in out.splitlines():\n        name, mem, driver = (p.strip() for p in line.split(\",\"))\n        gpus.append({\"name\": name, \"memory\": mem, \"driver\": driver})\n    return {\"gpus\": gpus, \"count\": len(gpus)}\n\n\ndef _cpu() -> dict:\n    out = _run([\"lscpu\"])\n    info = {}\n    for line in out.splitlines():\n        k, _, v = line.partition(\":\")\n        info[k.strip()] = v.strip()\n    return {\n        \"model\": info.get(\"Model name\"),\n        \"sockets\": info.get(\"Socket(s)\"),\n        \"cores_per_socket\": info.get(\"Core(s) per socket\"),\n        \"threads_per_core\": info.get(\"Thread(s) per core\"),\n        \"cpus\": info.get(\"CPU(s)\"),\n        \"flags_avx2\": \"avx2\" in info.get(\"Flags\", \"\").split(),\n    }\n\n\ndef _mem_gb() -> float:\n    text = Path(\"/proc/meminfo\").read_text()\n    m = re.search(r\"MemTotal:\\s+(\\d+) kB\", text)\n    return round(int(m.group(1)) / 1e6, 1) if m else -1.0\n\n\ndef main() -> int:\n    vendor = vendor_root()\n    record = {\n        \"python\": sys.version,\n        \"platform\": platform.platform(),\n        \"cpu\": _cpu(),\n        \"gpu\": _nvidia_smi(),\n        \"mem_gb\": _mem_gb(),\n        \"vendor_root\": str(vendor),\n        \"vendor_commit\": _run([\"git\", \"-C\", str(vendor), \"rev-parse\", \"HEAD\"]),\n        \"vendor_dirty\": bool(_run([\"git\", \"-C\", str(vendor), \"status\", \"--porcelain\",\n                                   \"--untracked-files=normal\"])),\n        \"locks\": {\n            p.name: sha256_file(p)\n            for p in sorted(Path(\"/workspace/roboeval/envs\").glob(\"*requirements.lock.txt\"))\n        },\n    }\n    out = write_json_atomic(REPO / \"reports\" / \"hardware.json\", record)\n    print(f\"wrote {out}\")\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 6
+    },
+    "ai_commit": "3be182fcf0da",
+    "evidence": "author/committer='Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      18,
+      23
+    ]
+  }
+}

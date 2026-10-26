@@ -1,0 +1,28 @@
+{
+  "repo": "aditya9729__roboeval_challenge",
+  "file": "src/roboeval_entry/data/io.py",
+  "function": "sha256_file",
+  "line": 18,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `sha256_file` function (parameters: path, chunk).",
+  "prompt_source": "def sha256_file(path: str | Path, chunk: int = 1 << 20) -> str:\n    \"\"\"Implement the `sha256_file` function (parameters: path, chunk).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def sha256_file(path: str | Path, chunk: int = 1 << 20) -> str:\n    digest = hashlib.sha256()\n    with open(path, \"rb\") as f:\n        while block := f.read(chunk):\n            digest.update(block)\n    return digest.hexdigest()",
+  "module_source": "\"\"\"Small artifact IO helpers: atomic JSON writes and file hashing.\"\"\"\nfrom __future__ import annotations\n\nimport hashlib\nimport json\nfrom pathlib import Path\n\n\ndef write_json_atomic(path: str | Path, obj) -> Path:\n    path = Path(path)\n    path.parent.mkdir(parents=True, exist_ok=True)\n    tmp = path.with_suffix(path.suffix + \".tmp\")\n    tmp.write_text(json.dumps(obj, indent=2, default=str))\n    tmp.replace(path)\n    return path\n\n\ndef sha256_file(path: str | Path, chunk: int = 1 << 20) -> str:\n    digest = hashlib.sha256()\n    with open(path, \"rb\") as f:\n        while block := f.read(chunk):\n            digest.update(block)\n    return digest.hexdigest()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 6
+    },
+    "ai_commit": "3be182fcf0da",
+    "evidence": "author/committer='Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      18,
+      23
+    ]
+  }
+}

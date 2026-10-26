@@ -1,0 +1,29 @@
+{
+  "repo": "wstomber__devinexecdemo",
+  "file": "tests_python/test_demo_compare.py",
+  "function": "setUp",
+  "line": 20,
+  "candidate_cwes": [
+    "CWE-22",
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `setUp` function.",
+  "prompt_source": "    def setUp(self):\n        \"\"\"Implement the `setUp` function.\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    def setUp(self):\n        self.dir = tempfile.TemporaryDirectory()\n        self.addCleanup(self.dir.cleanup)\n        self.p = Path(self.dir.name)\n        (self.p / \"in.dat\").write_bytes(RECORD)\n        subprocess.run([sys.executable, str(ROOT / \"tools\" / \"fixtures.py\"), \"--cwf-source\",\n                        str(ROOT / \"fixtures\" / \"cwf.json\"), \"--output\", str(self.p / \"cwf.dat\")], check=True)",
+  "module_source": "\"\"\"Regression tests for tools/demo_compare.py (presentation tooling).\"\"\"\nimport json\nimport subprocess\nimport sys\nimport tempfile\nimport unittest\nfrom pathlib import Path\n\nROOT = Path(__file__).resolve().parents[1]\nTOOL = ROOT / \"tools\" / \"demo_compare.py\"\nRECORD = b\"T1\".ljust(12) + b\"0000100000\" * 2 + b\"0000010000\" + b\"0\" * 20 + b\"----------N1EG4TE5MK7320250315\\n\"\n\n\ndef compare(cwd, *args):\n    subprocess.run([sys.executable, str(TOOL), *args], cwd=cwd, check=False,\n                   capture_output=True, text=True)\n\n\nclass DemoCompareTests(unittest.TestCase):\n    def setUp(self):\n        self.dir = tempfile.TemporaryDirectory()\n        self.addCleanup(self.dir.cleanup)\n        self.p = Path(self.dir.name)\n        (self.p / \"in.dat\").write_bytes(RECORD)\n        subprocess.run([sys.executable, str(ROOT / \"tools\" / \"fixtures.py\"), \"--cwf-source\",\n                        str(ROOT / \"fixtures\" / \"cwf.json\"), \"--output\", str(self.p / \"cwf.dat\")], check=True)\n\n    def summary(self):\n        return json.loads((self.p / \"out\" / \"summary.json\").read_text())\n\n    def test_relative_paths_resolve_from_caller_directory(self):\n        python = f\"{sys.executable} python/msp.py\"\n        compare(self.p, \"--input\", \"in.dat\", \"--cwf\", \"cwf.dat\", \"--out\", \"out\", \"--cobol\", python, \"--python\", python)\n        self.assertEqual(self.summary()[\"verdict\"], \"MATCH\")\n        self.assertEqual(self.summary()[\"records_compared\"], 1)\n\n    def test_failed_runs_do_not_reuse_stale_outputs(self):\n        python = f\"{sys.executable} python/msp.py\"\n        compare(self.p, \"--input\", \"in.dat\", \"--cwf\", \"cwf.dat\", \"--out\", \"out\", \"--cobol\", python, \"--python\", python)\n        compare(self.p, \"--input\", \"in.dat\", \"--cwf\", \"cwf.dat\", \"--out\", \"out\", \"--cobol\", \"false\", \"--python\", \"false\")\n        self.assertEqual(self.summary()[\"verdict\"], \"MISMATCH\")\n        self.assertFalse((self.p / \"out\" / \"python-results.csv\").exists())\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 7
+    },
+    "ai_commit": "dd83cd0e2351",
+    "evidence": "author/committer='Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      20,
+      26
+    ]
+  }
+}

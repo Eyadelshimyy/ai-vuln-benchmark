@@ -1,0 +1,28 @@
+{
+  "repo": "EdgarSocrates98__api-forge",
+  "file": "src/apiforge/mcp/main.py",
+  "function": "main",
+  "line": 42,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function (parameters: argv).",
+  "prompt_source": "def main(argv: list[str] | None = None) -> int:\n    \"\"\"Implement the `main` function (parameters: argv).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main(argv: list[str] | None = None) -> int:\n    for stream in (sys.stdout, sys.stderr):\n        reconfigure = getattr(stream, \"reconfigure\", None)\n        if reconfigure is not None:\n            reconfigure(encoding=\"utf-8\", errors=\"replace\")\n    surface = resolve_surface(argv)\n    protocol = resolve_protocol(argv)\n    try:\n        from apiforge.mcp.server import MCP_OPTIONAL_UNAVAILABLE, build_server\n\n        server = build_server(surface, protocol=protocol)\n    except ImportError as exc:\n        missing = exc.name or \"\"\n        if missing != \"mcp\" and not missing.startswith(\"mcp.\"):\n            raise  # unrelated transitive import failure \u2014 not the extra\n        print(\n            f\"{MCP_UNAVAILABLE}: the mcp package is not installed; \"\n            \"unlock: pip install 'apiforge-af[mcp]'\",\n            file=sys.stderr,\n        )\n        return 2\n    except RuntimeError as exc:\n        if MCP_OPTIONAL_UNAVAILABLE not in str(exc):\n            raise\n        print(\n            f\"{MCP_UNAVAILABLE}: the mcp package is not installed; \"\n            \"unlock: pip install 'apiforge-af[mcp]'\",\n            file=sys.stderr,\n        )\n        return 2\n    server.run()\n    return 0",
+  "module_source": "\"\"\"Entry point for ``apiforge-mcp`` \u2014 lazy SDK import with a named refusal.\n\n``--surface full|compact`` (or ``APIFORGE_MCP_SURFACE``) picks the tool\nsurface; ``--host`` (or ``APIFORGE_HOST``) picks it from the declared host\nprojection. Full is the default.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport argparse\nimport os\nimport sys\n\nMCP_UNAVAILABLE = \"AF-MCP-UNAVAILABLE\"\n\n\ndef resolve_surface(argv: list[str] | None = None) -> str:\n    parser = argparse.ArgumentParser(prog=\"apiforge-mcp\")\n    parser.add_argument(\"--surface\", choices=(\"full\", \"compact\"), default=None)\n    parser.add_argument(\"--host\", default=None)\n    parser.add_argument(\"--protocol\", choices=(\"legacy\", \"modern\"), default=None)\n    args = parser.parse_args(argv)\n    if args.surface:\n        return str(args.surface)\n    host = args.host or os.environ.get(\"APIFORGE_HOST\")\n    if host:\n        from apiforge.agentops.projection import project_host\n\n        return project_host(host).mcp_surface\n    return os.environ.get(\"APIFORGE_MCP_SURFACE\", \"full\")\n\n\ndef resolve_protocol(argv: list[str] | None = None) -> str:\n    parser = argparse.ArgumentParser(prog=\"apiforge-mcp\")\n    parser.add_argument(\"--surface\", choices=(\"full\", \"compact\"), default=None)\n    parser.add_argument(\"--host\", default=None)\n    parser.add_argument(\"--protocol\", choices=(\"legacy\", \"modern\"), default=None)\n    args = parser.parse_args(argv)\n    return str(args.protocol or os.environ.get(\"APIFORGE_MCP_PROTOCOL\", \"legacy\"))\n\n\ndef main(argv: list[str] | None = None) -> int:\n    for stream in (sys.stdout, sys.stderr):\n        reconfigure = getattr(stream, \"reconfigure\", None)\n        if reconfigure is not None:\n            reconfigure(encoding=\"utf-8\", errors=\"replace\")\n    surface = resolve_surface(argv)\n    protocol = resolve_protocol(argv)\n    try:\n        from apiforge.mcp.server import MCP_OPTIONAL_UNAVAILABLE, build_server\n\n        server = build_server(surface, protocol=protocol)\n    except ImportError as exc:\n        missing = exc.name or \"\"\n        if missing != \"mcp\" and not missing.startswith(\"mcp.\"):\n            raise  # unrelated transitive import failure \u2014 not the extra\n        print(\n            f\"{MCP_UNAVAILABLE}: the mcp package is not installed; \"\n            \"unlock: pip install 'apiforge-af[mcp]'\",\n            file=sys.stderr,\n        )\n        return 2\n    except RuntimeError as exc:\n        if MCP_OPTIONAL_UNAVAILABLE not in str(exc):\n            raise\n        print(\n            f\"{MCP_UNAVAILABLE}: the mcp package is not installed; \"\n            \"unlock: pip install 'apiforge-af[mcp]'\",\n            file=sys.stderr,\n        )\n        return 2\n    server.run()\n    return 0\n\n\nif __name__ == \"__main__\":\n    sys.exit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 4
+    },
+    "ai_commit": "0e831872a6a2",
+    "evidence": "author/committer='Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 0.125,
+    "span": [
+      42,
+      73
+    ]
+  }
+}

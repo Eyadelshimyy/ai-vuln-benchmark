@@ -1,0 +1,33 @@
+{
+  "repo": "qndelmar__tbnano",
+  "file": "tbnano/backends/scripted.py",
+  "function": "__init__",
+  "line": 29,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `__init__` function (parameters: script).",
+  "prompt_source": "    def __init__(self, script: str = \"quitter\", **_):\n        \"\"\"Implement the `__init__` function (parameters: script).\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    def __init__(self, script: str = \"quitter\", **_):\n        self.script = script\n        self._tok = ApproxTokenizer()\n        self._oracle_lines: list[str] = []\n        self._file_replies: list[str] = []\n        if script.startswith(\"file:\"):\n            with open(script[5:]) as f:\n                self._file_replies = [l.rstrip(\"\\n\") for l in f if l.strip()]",
+  "module_source": "\"\"\"Scripted backend \u2014 deterministic fake model for tbnano's own validation.\n\nScript forms (the part after `scripted:`):\n    quitter            -> immediately emits a finish() call\n    ls_then_quit       -> one `ls` then finish \u2014 must score 0% but have\n                          grounded_first_call=100% (spec v2 8)\n    echo:<fmt>         -> always emits `run(cmd=\"echo hi\")` once, then finish\n    oracle             -> replays the task's solution.sh line-by-line through\n                          run(), then finishes with the contents of\n                          /task/answer.txt if present\n    file:<path>        -> newline-separated replies consumed in order\n\nThe oracle is driven from outside via `set_oracle(lines)` before each\nepisode \u2014 see agents/oracle behaviour in runner.py.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nfrom typing import Any, Optional\n\nfrom ..tokens import ApproxTokenizer, Tokenizer\nfrom .base import BackendReply\n\n\nclass ScriptedBackend:\n    name = \"scripted\"\n\n    def __init__(self, script: str = \"quitter\", **_):\n        self.script = script\n        self._tok = ApproxTokenizer()\n        self._oracle_lines: list[str] = []\n        self._file_replies: list[str] = []\n        if script.startswith(\"file:\"):\n            with open(script[5:]) as f:\n                self._file_replies = [l.rstrip(\"\\n\") for l in f if l.strip()]\n\n    def set_oracle(self, lines: list[str]) -> None:\n        self._oracle_lines = list(lines)\n\n    # -- reply selection -------------------------------------------------\n    def _next(self, step: int) -> str:\n        s = self.script\n        if s == \"quitter\":\n            return self._call(\"finish\", {\"answer\": \"\"})\n        if s == \"ls_then_quit\":\n            if step == 0:\n                return self._call(\"run\", {\"cmd\": \"ls\"})\n            return self._call(\"finish\", {\"answer\": \"\"})\n        if s == \"oracle\":\n            if step < len(self._oracle_lines):\n                return self._call(\"run\", {\"cmd\": self._oracle_lines[step]})\n            if step == len(self._oracle_lines):\n                # Probe for a final answer file written by the solution.\n                return self._call(\n                    \"run\",\n                    {\"cmd\": \"cat answer.txt 2>/dev/null || cat /task/answer.txt 2>/dev/null || true\"},\n                )\n            return self._call(\"finish\", {\"answer\": self._oracle_answer})\n        if s.startswith(\"echo\"):\n            if step == 0:\n                return self._call(\"run\", {\"cmd\": \"echo hi\"})\n            return self._call(\"finish\", {\"answer\": \"\"})\n        if s.startswith(\"file:\"):\n            if step < len(self._file_replies):\n                return self._file_replies[step]\n            return self._call(\"finish\", {\"answer\": \"\"})\n        return self._call(\"finish\", {\"answer\": \"\"})\n\n    # `generate` is stateful: it tracks the step and, for the oracle, the\n    # last tool output so it can extract the answer.\n    def generate(\n        self,\n        messages: list[dict[str, Any]],\n        tools: Optional[list[dict[str, Any]]] = None,\n        max_tokens: int = 256,\n        temperature: float = 0.0,\n        seed: Optional[int] = None,\n    ) -> BackendReply:\n        step = getattr(self, \"_step\", 0)\n        # Record the last tool output for the oracle's finish answer.\n        last_tool = next(\n            (m for m in reversed(messages) if m.get(\"role\") == \"tool\"), None\n        )\n        if self.script == \"oracle\" and last_tool is not None:\n            try:\n                out = json.loads(last_tool[\"content\"])\n                self._oracle_answer = (out.get(\"stdout\") or \"\").strip().splitlines()\n                self._oracle_answer = (\n                    self._oracle_answer[-1] if self._oracle_answer else \"\"\n                )\n            except Exception:\n                pass\n        self._step = step + 1\n        return BackendReply(text=self._next(step))\n\n    def _call(self, name: str, args: dict) -> str:\n        return (\n            \"<|tool_call|>\"\n            + json.dumps({\"name\": name, \"arguments\": args})\n            + \"<|tool_call_end|>\"\n        )\n\n    def tokenizer(self) -> Tokenizer:\n        return self._tok\n\n    def count_context(self, messages) -> int:\n        return sum(\n            self._tok.count(str(m.get(\"content\") or \"\")) + 8 for m in messages\n        )\n\n    def reset(self) -> None:\n        self._step = 0\n        self._oracle_answer = \"\"\n",
+  "construction_recipe": {
+    "call_args_source": "(script='quitter')",
+    "uses_tmp_path": false,
+    "source_file": "tests/test_episode.py",
+    "source_line": 54
+  },
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 8
+    },
+    "ai_commit": "b6776f8d728c",
+    "evidence": "author/committer='Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      29,
+      36
+    ]
+  }
+}

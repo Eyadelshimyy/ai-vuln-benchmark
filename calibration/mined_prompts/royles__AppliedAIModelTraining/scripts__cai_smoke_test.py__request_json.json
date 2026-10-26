@@ -1,0 +1,28 @@
+{
+  "repo": "royles__AppliedAIModelTraining",
+  "file": "scripts/cai_smoke_test.py",
+  "function": "request_json",
+  "line": 27,
+  "candidate_cwes": [
+    "CWE-918"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `request_json` function (parameters: method, path, body, timeout).",
+  "prompt_source": "def request_json(\n    method: str,\n    path: str,\n    body: dict | None = None,\n    timeout: float = 120.0,\n) -> dict:\n    \"\"\"Implement the `request_json` function (parameters: method, path, body, timeout).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def request_json(\n    method: str,\n    path: str,\n    body: dict | None = None,\n    timeout: float = 120.0,\n) -> dict:\n    url = f\"{API_BASE}{path}\"\n    data = None\n    headers = {\"Content-Type\": \"application/json\"}\n    if body is not None:\n        data = json.dumps(body).encode(\"utf-8\")\n    req = urllib.request.Request(url, data=data, headers=headers, method=method)\n    with urllib.request.urlopen(req, timeout=timeout) as resp:\n        return json.loads(resp.read().decode(\"utf-8\"))",
+  "module_source": "#!/usr/bin/env python3\n\"\"\"End-to-end smoke test (API on :8000, optional CAI workers).\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nimport os\nimport sys\nfrom pathlib import Path\n\nsys.path.insert(0, str(Path(__file__).resolve().parent))\nimport time\nimport urllib.error\nimport urllib.request\n\ndef _default_api_base() -> str:\n    if os.environ.get(\"API_BASE\"):\n        return os.environ[\"API_BASE\"].rstrip(\"/\")\n    api_port = os.environ.get(\"PLATFORM_API_PORT\", \"8000\")\n    return f\"http://127.0.0.1:{api_port}\"\n\n\nAPI_BASE = _default_api_base().rstrip(\"/\")\nGPUS_PER_WORKER = int(os.environ.get(\"GPUS_PER_WORKER\", \"0\"))\n\n\ndef request_json(\n    method: str,\n    path: str,\n    body: dict | None = None,\n    timeout: float = 120.0,\n) -> dict:\n    url = f\"{API_BASE}{path}\"\n    data = None\n    headers = {\"Content-Type\": \"application/json\"}\n    if body is not None:\n        data = json.dumps(body).encode(\"utf-8\")\n    req = urllib.request.Request(url, data=data, headers=headers, method=method)\n    with urllib.request.urlopen(req, timeout=timeout) as resp:\n        return json.loads(resp.read().decode(\"utf-8\"))\n\n\ndef pretty(obj: dict) -> None:\n    print(json.dumps(obj, indent=2))\n\n\ndef main() -> int:\n    print(\"== Health ==\")\n    pretty(request_json(\"GET\", \"/api/health\"))\n\n    print(\"== Create project ==\")\n    exp = request_json(\n        \"POST\",\n        \"/api/projects\",\n        {\"name\": \"CAI smoke\", \"description\": \"automated test\"},\n    )\n    exp_id = exp[\"id\"]\n    print(f\"project_id={exp_id}\")\n\n    print(\"== Submit training job (scratch_gpt2_tiny, 15 steps) ==\")\n    job = request_json(\n        \"POST\",\n        \"/api/jobs\",\n        {\n            \"experiment_id\": exp_id,\n            \"name\": \"cai-smoke-run\",\n            \"preset\": \"scratch_gpt2_tiny\",\n            \"openai_model_id\": \"cai-smoke-chat\",\n            \"num_workers\": 1,\n            \"gpus_per_worker\": GPUS_PER_WORKER,\n            \"max_steps\": 15,\n            \"batch_size\": 2,\n        },\n        timeout=300.0,\n    )\n    job_id = job[\"id\"]\n    print(f\"job_id={job_id}\")\n\n    print(\"== Poll job status ==\")\n    status = \"\"\n    for attempt in range(1, 121):\n        row = request_json(\"GET\", f\"/api/jobs/{job_id}\")\n        status = row[\"status\"]\n        print(f\"  attempt {attempt}: {status}\")\n        if status == \"succeeded\":\n            break\n        if status == \"failed\":\n            pretty(row)\n            return 1\n        time.sleep(5)\n\n    if status != \"succeeded\":\n        print(f\"Timed out waiting for job {job_id}\", file=sys.stderr)\n        return 1\n\n    print(\"== OpenAI models ==\")\n    pretty(request_json(\"GET\", \"/v1/models\"))\n\n    print(\"== Chat completion ==\")\n    pretty(\n        request_json(\n            \"POST\",\n            \"/v1/chat/completions\",\n            {\n                \"model\": \"cai-smoke-chat\",\n                \"messages\": [\n                    {\"role\": \"user\", \"content\": \"Say hello in one short sentence.\"}\n                ],\n                \"max_tokens\": 32,\n                \"temperature\": 0.7,\n            },\n            timeout=300.0,\n        )\n    )\n\n    print(\"CAI smoke test passed.\")\n    return 0\n\n\nif __name__ == \"__main__\":\n    try:\n        sys.exit(main())\n    except urllib.error.HTTPError as exc:\n        print(exc.read().decode(), file=sys.stderr)\n        sys.exit(1)\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 14
+    },
+    "ai_commit": "3e8ab09ae47e",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      27,
+      40
+    ]
+  }
+}

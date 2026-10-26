@@ -1,0 +1,28 @@
+{
+  "repo": "c-wenlong__blenderkc",
+  "file": "tools/cli/blenderkc_cli/locks.py",
+  "function": "acquire",
+  "line": 34,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Takes the lock; returns the release function.",
+  "prompt_source": "def acquire(f: Path, what: str = \"build\"):\n    \"\"\"Takes the lock; returns the release function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def acquire(f: Path, what: str = \"build\"):\n    \"\"\"Takes the lock; returns the release function.\"\"\"\n    f.parent.mkdir(parents=True, exist_ok=True)\n    for _ in range(4):\n        try:\n            fd = os.open(f, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)\n            os.write(fd, str(os.getpid()).encode())\n            os.close(fd)\n\n            def release():\n                if _pid(f) == os.getpid():\n                    f.unlink(missing_ok=True)\n            return release\n        except FileExistsError:\n            pid = _pid(f)\n            if pid and _alive(pid):\n                raise CliError(f\"another {what} of this topic is running (pid {pid}); wait for it, or delete {f} if that process is not one\")\n            if pid is None:\n                try:\n                    if abs(time.time() - f.stat().st_mtime) < STARTING_S:\n                        raise CliError(f\"another {what} of this topic is starting; wait for it, or delete {f}\")\n                except FileNotFoundError:\n                    continue\n            # stale: take it over only if it still names what we saw\n            if _pid(f) == pid:\n                f.unlink(missing_ok=True)\n    raise CliError(f\"could not take the lock {f}\")",
+  "module_source": "\"\"\"One build (or one render job) per topic at a time: an exclusive lock file\nholding the holder's pid. A lock whose process is gone is stale and is taken\nover; one with no pid yet, made in the last ten seconds, is a holder starting.\"\"\"\n\nfrom __future__ import annotations\n\nimport os\nimport time\nfrom pathlib import Path\n\nfrom .repo import CliError\n\nSTARTING_S = 10\n\n\ndef _alive(pid: int) -> bool:\n    try:\n        os.kill(pid, 0)\n        return True\n    except PermissionError:\n        return True\n    except OSError:\n        return False\n\n\ndef _pid(f: Path) -> int | None:\n    try:\n        t = f.read_text().strip()\n        return int(t) if t.isdigit() else None\n    except OSError:\n        return None\n\n\ndef acquire(f: Path, what: str = \"build\"):\n    \"\"\"Takes the lock; returns the release function.\"\"\"\n    f.parent.mkdir(parents=True, exist_ok=True)\n    for _ in range(4):\n        try:\n            fd = os.open(f, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)\n            os.write(fd, str(os.getpid()).encode())\n            os.close(fd)\n\n            def release():\n                if _pid(f) == os.getpid():\n                    f.unlink(missing_ok=True)\n            return release\n        except FileExistsError:\n            pid = _pid(f)\n            if pid and _alive(pid):\n                raise CliError(f\"another {what} of this topic is running (pid {pid}); wait for it, or delete {f} if that process is not one\")\n            if pid is None:\n                try:\n                    if abs(time.time() - f.stat().st_mtime) < STARTING_S:\n                        raise CliError(f\"another {what} of this topic is starting; wait for it, or delete {f}\")\n                except FileNotFoundError:\n                    continue\n            # stale: take it over only if it still names what we saw\n            if _pid(f) == pid:\n                f.unlink(missing_ok=True)\n    raise CliError(f\"could not take the lock {f}\")\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 27
+    },
+    "ai_commit": "8bdedf00d810",
+    "evidence": "author/committer='Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      34,
+      60
+    ]
+  }
+}

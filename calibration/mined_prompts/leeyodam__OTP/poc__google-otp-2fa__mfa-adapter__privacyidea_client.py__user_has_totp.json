@@ -1,0 +1,28 @@
+{
+  "repo": "leeyodam__OTP",
+  "file": "poc/google-otp-2fa/mfa-adapter/privacyidea_client.py",
+  "function": "user_has_totp",
+  "line": 65,
+  "candidate_cwes": [
+    "CWE-918"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `user_has_totp` function (parameters: username).",
+  "prompt_source": "    def user_has_totp(self, username: str) -> bool:\n        \"\"\"Implement the `user_has_totp` function (parameters: username).\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    def user_has_totp(self, username: str) -> bool:\n        params = {\"username\": username, \"tokentype\": \"totp\"}\n        if self.realm:\n            params[\"realm\"] = self.realm\n        resp = requests.get(\n            f\"{self.base_url}/token/\",\n            params=params,\n            headers=self._headers(),\n            timeout=15,\n        )\n        resp.raise_for_status()\n        data = resp.json()\n        tokens = data.get(\"result\", {}).get(\"value\", {}).get(\"tokens\", [])\n        return len(tokens) > 0",
+  "module_source": "\"\"\"Minimal privacyIDEA REST client for TOTP enroll + validate/check.\"\"\"\nimport logging\nfrom typing import Any, Dict, Optional\n\nimport requests\n\nlog = logging.getLogger(__name__)\n\n\nclass PrivacyIDEAError(Exception):\n    pass\n\n\nclass PrivacyIDEAClient:\n    def __init__(\n        self,\n        base_url: str,\n        admin_user: str,\n        admin_password: str,\n        realm: str = \"\",\n        totp_pin: str = \"\",\n    ) -> None:\n        self.base_url = base_url.rstrip(\"/\")\n        self.realm = realm\n        self.totp_pin = totp_pin\n        self._admin_token: Optional[str] = None\n        self._authenticate_admin(admin_user, admin_password)\n\n    def _authenticate_admin(self, username: str, password: str) -> None:\n        resp = requests.post(\n            f\"{self.base_url}/auth\",\n            data={\"username\": username, \"password\": password},\n            timeout=15,\n        )\n        resp.raise_for_status()\n        body = resp.json()\n        if not body.get(\"result\", {}).get(\"status\"):\n            raise PrivacyIDEAError(f\"admin auth failed: {body}\")\n        self._admin_token = body.get(\"result\", {}).get(\"value\", {}).get(\"token\")\n        if not self._admin_token:\n            raise PrivacyIDEAError(\"admin auth missing token\")\n\n    def _headers(self) -> Dict[str, str]:\n        return {\"Authorization\": self._admin_token or \"\"}\n\n    def ensure_user(self, username: str) -> None:\n        params: Dict[str, Any] = {\"username\": username}\n        if self.realm:\n            params[\"realm\"] = self.realm\n        resp = requests.post(\n            f\"{self.base_url}/user/\",\n            params=params,\n            headers=self._headers(),\n            timeout=15,\n        )\n        if resp.status_code == 200:\n            return\n        body = resp.json()\n        # already exists\n        if body.get(\"result\", {}).get(\"error\", {}).get(\"code\") == 303:\n            return\n        if not body.get(\"result\", {}).get(\"status\"):\n            raise PrivacyIDEAError(f\"create user failed: {body}\")\n\n    def user_has_totp(self, username: str) -> bool:\n        params = {\"username\": username, \"tokentype\": \"totp\"}\n        if self.realm:\n            params[\"realm\"] = self.realm\n        resp = requests.get(\n            f\"{self.base_url}/token/\",\n            params=params,\n            headers=self._headers(),\n            timeout=15,\n        )\n        resp.raise_for_status()\n        data = resp.json()\n        tokens = data.get(\"result\", {}).get(\"value\", {}).get(\"tokens\", [])\n        return len(tokens) > 0\n\n    def enroll_totp(self, username: str) -> Dict[str, Any]:\n        self.ensure_user(username)\n        data = {\"user\": username, \"type\": \"totp\", \"genkey\": \"1\"}\n        if self.realm:\n            data[\"realm\"] = self.realm\n        resp = requests.post(\n            f\"{self.base_url}/token/init\",\n            data=data,\n            headers=self._headers(),\n            timeout=30,\n        )\n        resp.raise_for_status()\n        body = resp.json()\n        if not body.get(\"result\", {}).get(\"status\"):\n            raise PrivacyIDEAError(f\"token init failed: {body}\")\n        return body.get(\"detail\", {})\n\n    def validate_user_otp(self, username: str, otp: str) -> bool:\n        data = {\"user\": username, \"pass\": f\"{self.totp_pin}{otp}\"}\n        if self.realm:\n            data[\"realm\"] = self.realm\n        resp = requests.post(\n            f\"{self.base_url}/validate/check\",\n            data=data,\n            timeout=15,\n        )\n        resp.raise_for_status()\n        body = resp.json()\n        return bool(body.get(\"result\", {}).get(\"value\"))\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 14
+    },
+    "ai_commit": "f2b5e9491330",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      65,
+      78
+    ]
+  }
+}

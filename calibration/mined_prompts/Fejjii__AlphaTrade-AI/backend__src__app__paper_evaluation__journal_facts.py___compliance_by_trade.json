@@ -1,0 +1,28 @@
+{
+  "repo": "Fejjii__AlphaTrade-AI",
+  "file": "backend/src/app/paper_evaluation/journal_facts.py",
+  "function": "_compliance_by_trade",
+  "line": 69,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `_compliance_by_trade` function (parameters: session).",
+  "prompt_source": "def _compliance_by_trade(\n    session: Session,\n    *,\n    organization_id: UUID,\n    trade_ids: tuple[UUID, ...],\n) -> dict[UUID, TradeRuleCompliance]:\n    \"\"\"Implement the `_compliance_by_trade` function (parameters: session).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def _compliance_by_trade(\n    session: Session,\n    *,\n    organization_id: UUID,\n    trade_ids: tuple[UUID, ...],\n) -> dict[UUID, TradeRuleCompliance]:\n    if not trade_ids:\n        return {}\n    rows = session.execute(\n        select(JournalTradeRuleCheck.journal_trade_id, JournalTradeRuleCheck.status).where(\n            JournalTradeRuleCheck.organization_id == organization_id,\n            JournalTradeRuleCheck.journal_trade_id.in_(trade_ids),\n        )\n    ).all()\n    worst: dict[UUID, TradeRuleCompliance] = {}\n    rank: dict[UUID, int] = {}\n    mapping = {\n        RuleComplianceStatus.VIOLATED: TradeRuleCompliance.VIOLATED,\n        RuleComplianceStatus.PARTIAL: TradeRuleCompliance.PARTIAL,\n        RuleComplianceStatus.FOLLOWED: TradeRuleCompliance.COMPLIANT,\n    }\n    for trade_id, status in rows:\n        mapped = mapping.get(status, TradeRuleCompliance.UNASSESSED)\n        score = _WORST.get(status, 0)\n        if score > rank.get(trade_id, -1):\n            rank[trade_id] = score\n            worst[trade_id] = mapped\n    return worst",
+  "module_source": "\"\"\"Read-only journal MFE/MAE and rule-compliance facts for paper evaluation.\"\"\"\n\nfrom __future__ import annotations\n\nfrom decimal import Decimal\nfrom uuid import UUID\n\nfrom sqlalchemy import select\nfrom sqlalchemy.orm import Session\n\nfrom app.db.models import JournalTrade, JournalTradeRuleCheck\nfrom app.paper_evaluation.ports import JournalTradeMeasurement\nfrom app.schemas.common import JournalTradeStatus, RuleComplianceStatus\nfrom app.schemas.journal_statistics import TradeRuleCompliance\n\n_WORST = {\n    RuleComplianceStatus.VIOLATED: 3,\n    RuleComplianceStatus.PARTIAL: 2,\n    RuleComplianceStatus.FOLLOWED: 1,\n    RuleComplianceStatus.NOT_APPLICABLE: 0,\n    RuleComplianceStatus.UNASSESSED: 0,\n}\n\n\nclass SqlAlchemyJournalExcursionPort:\n    \"\"\"Copies recorded journal values. Never writes JournalTrade or calls markets.\"\"\"\n\n    def __init__(self, session: Session) -> None:\n        self._session = session\n\n    def facts_for(\n        self,\n        *,\n        organization_id: UUID,\n        journal_trade_ids: tuple[UUID, ...],\n    ) -> dict[UUID, JournalTradeMeasurement]:\n        if not journal_trade_ids:\n            return {}\n        trades = self._session.scalars(\n            select(JournalTrade).where(\n                JournalTrade.organization_id == organization_id,\n                JournalTrade.id.in_(journal_trade_ids),\n            )\n        ).all()\n        compliance = _compliance_by_trade(\n            self._session,\n            organization_id=organization_id,\n            trade_ids=tuple(row.id for row in trades),\n        )\n        out: dict[UUID, JournalTradeMeasurement] = {}\n        for row in trades:\n            capture = None\n            if row.realized_vs_available_pct is not None:\n                capture = Decimal(str(row.realized_vs_available_pct))\n            out[row.id] = JournalTradeMeasurement(\n                journal_trade_id=row.id,\n                mfe_amount=row.mfe_amount,\n                mae_amount=row.mae_amount,\n                capture_pct=capture,\n                planned_risk_amount=row.planned_risk_amount,\n                net_pnl=row.net_pnl,\n                result=row.result,\n                rule_compliance=compliance.get(row.id, TradeRuleCompliance.UNASSESSED),\n                closed_at=row.exit_time if row.status is JournalTradeStatus.CLOSED else None,\n            )\n        return out\n\n\ndef _compliance_by_trade(\n    session: Session,\n    *,\n    organization_id: UUID,\n    trade_ids: tuple[UUID, ...],\n) -> dict[UUID, TradeRuleCompliance]:\n    if not trade_ids:\n        return {}\n    rows = session.execute(\n        select(JournalTradeRuleCheck.journal_trade_id, JournalTradeRuleCheck.status).where(\n            JournalTradeRuleCheck.organization_id == organization_id,\n            JournalTradeRuleCheck.journal_trade_id.in_(trade_ids),\n        )\n    ).all()\n    worst: dict[UUID, TradeRuleCompliance] = {}\n    rank: dict[UUID, int] = {}\n    mapping = {\n        RuleComplianceStatus.VIOLATED: TradeRuleCompliance.VIOLATED,\n        RuleComplianceStatus.PARTIAL: TradeRuleCompliance.PARTIAL,\n        RuleComplianceStatus.FOLLOWED: TradeRuleCompliance.COMPLIANT,\n    }\n    for trade_id, status in rows:\n        mapped = mapping.get(status, TradeRuleCompliance.UNASSESSED)\n        score = _WORST.get(status, 0)\n        if score > rank.get(trade_id, -1):\n            rank[trade_id] = score\n            worst[trade_id] = mapped\n    return worst\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 28
+    },
+    "ai_commit": "4b7679575db5",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      69,
+      96
+    ]
+  }
+}

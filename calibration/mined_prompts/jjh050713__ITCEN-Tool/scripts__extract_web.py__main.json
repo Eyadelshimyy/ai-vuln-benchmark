@@ -1,0 +1,28 @@
+{
+  "repo": "jjh050713__ITCEN-Tool",
+  "file": "scripts/extract_web.py",
+  "function": "main",
+  "line": 14,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main():\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main():\n    out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ROOT / 'site')\n    spec = importlib.util.spec_from_file_location('tps_portmap', SOURCE)\n    module = importlib.util.module_from_spec(spec)\n    spec.loader.exec_module(module)\n    if '/index.html' not in module.ASSETS:\n        raise SystemExit('index.html\uc774 ASSETS\uc5d0 \uc5c6\uc2b5\ub2c8\ub2e4.')\n    out.mkdir(parents=True, exist_ok=True)\n    for path, payload in module.ASSETS.items():\n        target = out / path.lstrip('/')\n        target.write_bytes(payload)\n        print(f'{target} ({len(payload):,} bytes)')",
+  "module_source": "#!/usr/bin/env python3\n\"\"\"TPS_PortMap_Single.py \uc548\uc5d0 \ub0b4\uc7a5\ub41c \uc6f9\uc571 \ud30c\uc77c\uc744 \ud3f4\ub354\ub85c \uaebc\ub0c5\ub2c8\ub2e4.\n\n\uc0ac\uc6a9: python scripts/extract_web.py [\ucd9c\ub825\ud3f4\ub354]   (\uae30\ubcf8: site)\n\"\"\"\nimport importlib.util\nimport pathlib\nimport sys\n\nROOT = pathlib.Path(__file__).resolve().parent.parent\nSOURCE = ROOT / 'TPS_PortMap_Single.py'\n\n\ndef main():\n    out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ROOT / 'site')\n    spec = importlib.util.spec_from_file_location('tps_portmap', SOURCE)\n    module = importlib.util.module_from_spec(spec)\n    spec.loader.exec_module(module)\n    if '/index.html' not in module.ASSETS:\n        raise SystemExit('index.html\uc774 ASSETS\uc5d0 \uc5c6\uc2b5\ub2c8\ub2e4.')\n    out.mkdir(parents=True, exist_ok=True)\n    for path, payload in module.ASSETS.items():\n        target = out / path.lstrip('/')\n        target.write_bytes(payload)\n        print(f'{target} ({len(payload):,} bytes)')\n\n\nif __name__ == '__main__':\n    main()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 12
+    },
+    "ai_commit": "9b87e0c076bb",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      14,
+      25
+    ]
+  }
+}

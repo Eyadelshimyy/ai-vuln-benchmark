@@ -1,0 +1,28 @@
+{
+  "repo": "aditya9729__roboeval_challenge",
+  "file": "scripts/stage_submission.py",
+  "function": "_sha256",
+  "line": 21,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `_sha256` function (parameters: path).",
+  "prompt_source": "def _sha256(path: Path) -> str:\n    \"\"\"Implement the `_sha256` function (parameters: path).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def _sha256(path: Path) -> str:\n    h = hashlib.sha256()\n    with open(path, \"rb\") as f:\n        for chunk in iter(lambda: f.read(1 << 22), b\"\"):\n            h.update(chunk)\n    return h.hexdigest()",
+  "module_source": "\"\"\"Stage the submission bundle (stdlib-only; any env).\n\nCopies the policy package + action contract into submission/ and writes\ncheckpoint/pi05_server.json describing the inference server endpoint.\n\"\"\"\nfrom __future__ import annotations\n\nimport argparse\nimport hashlib\nimport json\nimport os\nimport shutil\nimport sys\nimport tempfile\nfrom datetime import datetime, timezone\nfrom pathlib import Path\n\nROOT = Path(__file__).resolve().parents[1]\n\n\ndef _sha256(path: Path) -> str:\n    h = hashlib.sha256()\n    with open(path, \"rb\") as f:\n        for chunk in iter(lambda: f.read(1 << 22), b\"\"):\n            h.update(chunk)\n    return h.hexdigest()\n\n\ndef _copy_tree(src: Path, dst: Path) -> None:\n    def ignore(dir_, names):\n        return {n for n in names\n                if n == \"__pycache__\" or n.endswith(\".pyc\")\n                or (Path(dir_) == src and n == \"training\")}\n    if dst.exists():\n        shutil.rmtree(dst)\n    shutil.copytree(src, dst, ignore=ignore)\n\n\ndef _state_mode_from_ckpt(ckpt: Path) -> str:\n    \"\"\"Read the checkpoint's bundled norm_stats.json -> state_mode string.\"\"\"\n    # openpi layout: assets/<repo_id>/<asset_id>/norm_stats.json\n    candidates = sorted((ckpt / \"assets\").rglob(\"norm_stats.json\"))\n    if not candidates:\n        raise FileNotFoundError(\n            f\"no norm_stats.json under {ckpt}/assets \u2014 cannot determine \"\n            f\"state_mode\")\n    stats = json.loads(candidates[0].read_text())[\"norm_stats\"]\n    entry = stats[\"state\"]\n    n = len(entry[\"q01\"] if \"q01\" in entry else entry[\"mean\"])\n    mode = {18: \"qpos18\", 36: \"qpos18_qvel18\"}.get(n)\n    if mode is None:\n        raise ValueError(f\"unexpected state dim {n} in {candidates[0]}\")\n    return mode\n\n\ndef _atomic_write(path: Path, data: str) -> None:\n    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=\".tmp_\")\n    with os.fdopen(fd, \"w\") as f:\n        f.write(data)\n    os.replace(tmp, path)\n\n\ndef main() -> int:\n    p = argparse.ArgumentParser(description=__doc__)\n    p.add_argument(\"--config\", required=True)\n    p.add_argument(\"--checkpoint-dir\", required=True)\n    p.add_argument(\"--host\", default=\"127.0.0.1\")\n    p.add_argument(\"--port\", type=int, default=8000)\n    p.add_argument(\"--execute-steps\", type=int, default=4)\n    p.add_argument(\"--gripper-rule\", action=\"store_true\")\n    p.add_argument(\"--gripper-rule-params\", default=None)\n    p.add_argument(\"--inpaint-steps\", type=int, default=0)\n    args = p.parse_args()\n\n    ckpt = Path(args.checkpoint_dir)\n    weights = ckpt / \"model.safetensors\"\n    if not weights.exists():\n        raise FileNotFoundError(weights)\n\n    sub = ROOT / \"submission\"\n    _copy_tree(ROOT / \"src\" / \"roboeval_entry\",\n               sub / \"policy\" / \"roboeval_entry\")\n    shutil.copy2(ROOT / \"contracts\" / \"action_spec.json\",\n                 sub / \"policy\" / \"action_spec.json\")\n\n    info = {\n        \"config\": args.config,\n        \"checkpoint_dir\": str(ckpt),\n        \"host\": args.host,\n        \"port\": args.port,\n        \"execute_steps\": args.execute_steps,\n        \"inpaint_steps\": args.inpaint_steps,\n        \"state_mode\": _state_mode_from_ckpt(ckpt),\n        \"model_sha256\": _sha256(weights),\n        \"gripper_rule\": (json.loads(args.gripper_rule_params)\n                         if args.gripper_rule and args.gripper_rule_params\n                         else ({} if args.gripper_rule else None)),\n        \"staged_at\": datetime.now(timezone.utc).isoformat(),\n    }\n    out = sub / \"checkpoint\" / \"pi05_server.json\"\n    out.parent.mkdir(parents=True, exist_ok=True)\n    _atomic_write(out, json.dumps(info, indent=1))\n    print(json.dumps(info, indent=1))\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 6
+    },
+    "ai_commit": "3e650ef22d8d",
+    "evidence": "author/committer='Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      21,
+      26
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "repo": "Cognition-Partner-Workshops__otterworks-workshop-2610",
+  "file": "infrastructure/helm/db2-archive/files/health.py",
+  "function": "probe",
+  "line": 29,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `probe` function.",
+  "prompt_source": "def probe():\n    \"\"\"Implement the `probe` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def probe():\n    try:\n        p = subprocess.run([\"su\", \"-\", INSTANCE_USER, \"-c\", CLP.format(db=DB)],\n                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=45)\n        out = p.stdout.decode(\"utf-8\", \"replace\")\n        if p.returncode == 0:\n            return 200, {\"status\": \"ok\", \"database\": DB}\n        flat = out.replace(\"\\n\", \" \")\n        m = re.search(r\"SQL\\d+[NWC].*?SQLSTATE=\\w{5}\", flat) or re.search(r\"SQL\\d+[NWC].{0,200}\", flat)\n        msg = re.sub(r\"\\s+\", \" \", m.group(0)).strip() if m else \"connect failed rc=%d\" % p.returncode\n        return 503, {\"status\": \"unavailable\", \"database\": DB, \"db2\": msg}\n    except subprocess.TimeoutExpired:\n        return 503, {\"status\": \"unavailable\", \"database\": DB, \"db2\": \"connect timed out\"}",
+  "module_source": "#!/usr/bin/env python3\n\"\"\"Health sidecar for the db2-archive StatefulSet (CONTRACTS.md 13.1).\n\nGET /health -> 200 {\"status\":\"ok\",...} iff `db2 CONNECT TO <DB2_DATABASE>` succeeds as the instance\nowner on the shared instance home; 503 with the Db2 message (SQLCODE/SQLSTATE) otherwise. Results are\ncached HEALTH_CACHE_SECONDS so kubelet probes do not each open a connection. Runs on the Db2 image's\nown python3 (3.6): standard library only.\n\"\"\"\nimport http.server\nimport json\nimport os\nimport re\nimport subprocess\nimport threading\nimport time\n\nDB = os.environ[\"DB2_DATABASE\"]\nPORT = int(os.environ.get(\"HEALTH_PORT\", \"8080\"))\nCACHE_SECONDS = float(os.environ.get(\"HEALTH_CACHE_SECONDS\", \"10\"))\nINSTANCE_USER = os.environ.get(\"DB2_INSTANCE_USER\", \"db2inst1\")\n# `;` not `&&`: the CLP front end finds its back end via the parent PID, and bash would exec a\n# trailing `&&` command directly.\nCLP = \"db2 connect to {db}; rc=$?; db2 -o- connect reset >/dev/null 2>&1; db2 -o- terminate >/dev/null 2>&1; exit $rc\"\n\n_lock = threading.Lock()\n_cache = {\"at\": 0.0, \"code\": 503, \"body\": b\"\"}\n\n\ndef probe():\n    try:\n        p = subprocess.run([\"su\", \"-\", INSTANCE_USER, \"-c\", CLP.format(db=DB)],\n                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=45)\n        out = p.stdout.decode(\"utf-8\", \"replace\")\n        if p.returncode == 0:\n            return 200, {\"status\": \"ok\", \"database\": DB}\n        flat = out.replace(\"\\n\", \" \")\n        m = re.search(r\"SQL\\d+[NWC].*?SQLSTATE=\\w{5}\", flat) or re.search(r\"SQL\\d+[NWC].{0,200}\", flat)\n        msg = re.sub(r\"\\s+\", \" \", m.group(0)).strip() if m else \"connect failed rc=%d\" % p.returncode\n        return 503, {\"status\": \"unavailable\", \"database\": DB, \"db2\": msg}\n    except subprocess.TimeoutExpired:\n        return 503, {\"status\": \"unavailable\", \"database\": DB, \"db2\": \"connect timed out\"}\n\n\ndef cached():\n    with _lock:\n        if time.time() - _cache[\"at\"] >= CACHE_SECONDS:\n            code, body = probe()\n            _cache.update(at=time.time(), code=code, body=json.dumps(body).encode())\n        return _cache[\"code\"], _cache[\"body\"]\n\n\nclass Handler(http.server.BaseHTTPRequestHandler):\n    def log_message(self, fmt, *args):  # keep the pod log to state changes only\n        pass\n\n    def do_GET(self):\n        if self.path.split(\"?\")[0] not in (\"/health\", \"/healthz\", \"/ready\", \"/live\"):\n            self.send_response(404)\n            self.end_headers()\n            return\n        code, body = cached()\n        self.send_response(code)\n        self.send_header(\"Content-Type\", \"application/json\")\n        self.send_header(\"Content-Length\", str(len(body)))\n        self.end_headers()\n        self.wfile.write(body)\n\n\nif __name__ == \"__main__\":\n    print(\"health sidecar: :%d -> CONNECT TO %s\" % (PORT, DB), flush=True)\n    srv = http.server.HTTPServer((\"\", PORT), Handler)\n    srv.serve_forever()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 13
+    },
+    "ai_commit": "dfb869bc0795",
+    "evidence": "author/committer='Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      29,
+      41
+    ]
+  }
+}

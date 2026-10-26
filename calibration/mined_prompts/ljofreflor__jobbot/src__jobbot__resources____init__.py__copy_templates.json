@@ -1,0 +1,28 @@
+{
+  "repo": "ljofreflor__jobbot",
+  "file": "src/jobbot/resources/__init__.py",
+  "function": "copy_templates",
+  "line": 30,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Copy packaged Jinja templates into ``dest``; return written paths.",
+  "prompt_source": "def copy_templates(dest: Path) -> list[Path]:\n    \"\"\"Copy packaged Jinja templates into ``dest``; return written paths.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def copy_templates(dest: Path) -> list[Path]:\n    \"\"\"Copy packaged Jinja templates into ``dest``; return written paths.\"\"\"\n    dest.mkdir(parents=True, exist_ok=True)\n    written: list[Path] = []\n    root = resources.files(_PKG).joinpath(\"templates\")\n    for entry in root.iterdir():\n        if not entry.is_file():\n            continue\n        target = dest / entry.name\n        target.write_bytes(entry.read_bytes())\n        written.append(target)\n    app_dir = root.joinpath(\"application\")\n    if app_dir.is_dir():\n        (dest / \"application\").mkdir(parents=True, exist_ok=True)\n        for entry in app_dir.iterdir():\n            if entry.is_file():\n                out = dest / \"application\" / entry.name\n                out.write_bytes(entry.read_bytes())\n                written.append(out)\n    return written",
+  "module_source": "\"\"\"Packaged seeds and templates for cold install (`jobbot init`).\"\"\"\n\nfrom __future__ import annotations\n\nfrom importlib import resources\nfrom pathlib import Path\n\n_PKG = \"jobbot.resources\"\n\n\ndef resource_text(name: str) -> str:\n    \"\"\"Read a UTF-8 text file shipped inside the wheel.\"\"\"\n    return resources.files(_PKG).joinpath(name).read_text(encoding=\"utf-8\")\n\n\ndef resource_bytes(name: str) -> bytes:\n    return resources.files(_PKG).joinpath(name).read_bytes()\n\n\ndef iter_template_names() -> list[str]:\n    \"\"\"Relative paths under ``templates/`` (e.g. ``cv_ats.txt.j2``).\"\"\"\n    root = resources.files(_PKG).joinpath(\"templates\")\n    names: list[str] = []\n    for entry in root.iterdir():\n        if entry.is_file() and entry.name.endswith((\".j2\", \".gitkeep\")):\n            names.append(entry.name)\n    return sorted(names)\n\n\ndef copy_templates(dest: Path) -> list[Path]:\n    \"\"\"Copy packaged Jinja templates into ``dest``; return written paths.\"\"\"\n    dest.mkdir(parents=True, exist_ok=True)\n    written: list[Path] = []\n    root = resources.files(_PKG).joinpath(\"templates\")\n    for entry in root.iterdir():\n        if not entry.is_file():\n            continue\n        target = dest / entry.name\n        target.write_bytes(entry.read_bytes())\n        written.append(target)\n    app_dir = root.joinpath(\"application\")\n    if app_dir.is_dir():\n        (dest / \"application\").mkdir(parents=True, exist_ok=True)\n        for entry in app_dir.iterdir():\n            if entry.is_file():\n                out = dest / \"application\" / entry.name\n                out.write_bytes(entry.read_bytes())\n                written.append(out)\n    return written\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 20
+    },
+    "ai_commit": "6c4d16e5f216",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      30,
+      49
+    ]
+  }
+}

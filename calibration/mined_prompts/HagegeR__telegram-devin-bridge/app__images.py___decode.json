@@ -1,0 +1,28 @@
+{
+  "repo": "HagegeR__telegram-devin-bridge",
+  "file": "app/images.py",
+  "function": "_decode",
+  "line": 16,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `_decode` function (parameters: content).",
+  "prompt_source": "def _decode(content: bytes) -> Image.Image | None:\n    \"\"\"Implement the `_decode` function (parameters: content).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def _decode(content: bytes) -> Image.Image | None:\n    try:\n        image = Image.open(io.BytesIO(content))\n        image.load()\n        image_format = image.format\n        image = ImageOps.exif_transpose(image) or image\n        image.format = image_format\n        return image\n    except (OSError, ValueError, Image.DecompressionBombError):\n        return None",
+  "module_source": "\"\"\"Fit images to Telegram's sendPhoto limits.\"\"\"\n\nfrom __future__ import annotations\n\nimport io\n\nfrom PIL import Image, ImageOps\n\n# https://core.telegram.org/bots/api#sendphoto\nPHOTO_MAX_BYTES = 10 * 1024 * 1024\nPHOTO_MAX_DIMENSION_SUM = 10000\nPHOTO_MAX_RATIO = 20\nPHOTO_LOSSLESS_MAX_SIDE = 1280\n\n\ndef _decode(content: bytes) -> Image.Image | None:\n    try:\n        image = Image.open(io.BytesIO(content))\n        image.load()\n        image_format = image.format\n        image = ImageOps.exif_transpose(image) or image\n        image.format = image_format\n        return image\n    except (OSError, ValueError, Image.DecompressionBombError):\n        return None\n\n\ndef photo_fits_unchanged(content: bytes) -> bool:\n    \"\"\"Return whether sendPhoto can preserve this image without resizing.\"\"\"\n    image = _decode(content)\n    if image is None:\n        return False\n    width, height = image.size\n    return (\n        max(width, height) <= PHOTO_LOSSLESS_MAX_SIDE\n        and width + height <= PHOTO_MAX_DIMENSION_SUM\n        and max(width, height) / min(width, height) <= PHOTO_MAX_RATIO\n        and len(content) <= PHOTO_MAX_BYTES\n    )\n\n\ndef fit_photo(content: bytes) -> tuple[bytes, str] | None:\n    \"\"\"Return (bytes, content_type) acceptable to sendPhoto, or None if the image\n    cannot be made to fit (extreme aspect ratio or undecodable).\"\"\"\n    image = _decode(content)\n    if image is None:\n        return None\n    image_format = image.format\n    width, height = image.size\n    if max(width, height) > PHOTO_MAX_RATIO * min(width, height):\n        return None\n    if width + height <= PHOTO_MAX_DIMENSION_SUM and len(content) <= PHOTO_MAX_BYTES:\n        return (\n            None if image_format is None else (content, f\"image/{image_format.lower()}\")\n        )\n    scale = min(1.0, PHOTO_MAX_DIMENSION_SUM / (width + height))\n    flat = Image.new(\"RGB\", image.size, \"white\")\n    rgba = image.convert(\"RGBA\")\n    flat.paste(rgba, mask=rgba.getchannel(\"A\"))\n    resized = flat.resize(\n        (max(1, int(width * scale)), max(1, int(height * scale))),\n        Image.Resampling.LANCZOS,\n    )\n    for quality in (90, 75, 60):\n        buffer = io.BytesIO()\n        resized.save(buffer, format=\"JPEG\", quality=quality, optimize=True)\n        if buffer.tell() <= PHOTO_MAX_BYTES:\n            return buffer.getvalue(), \"image/jpeg\"\n    return None\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 10
+    },
+    "ai_commit": "44ab011bb7c5",
+    "evidence": "author/committer='devin-ai-integration[bot] <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      16,
+      25
+    ]
+  }
+}

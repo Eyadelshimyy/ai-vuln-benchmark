@@ -1,0 +1,28 @@
+{
+  "repo": "atanasvasilevjourney__ORBIS-EQUITY-",
+  "file": "pipeline/ema200_scanner/config/loader.py",
+  "function": "load_config",
+  "line": 30,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `load_config` function (parameters: path).",
+  "prompt_source": "def load_config(path: str | None = None) -> dict[str, Any]:\n    \"\"\"Implement the `load_config` function (parameters: path).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def load_config(path: str | None = None) -> dict[str, Any]:\n    cfg_path = Path(path) if path else _DEFAULT_PATH\n    with cfg_path.open(encoding=\"utf-8\") as fh:\n        data = yaml.safe_load(fh)\n    if not isinstance(data, dict):\n        raise ValueError(f\"Invalid config at {cfg_path}: expected mapping\")\n    return data",
+  "module_source": "\"\"\"Load EMA200 scanner YAML config (single source for thresholds).\"\"\"\nfrom __future__ import annotations\n\nimport hashlib\nimport json\nfrom functools import lru_cache\nfrom pathlib import Path\nfrom typing import Any\n\nimport yaml\n\n_DEFAULT_PATH = Path(__file__).resolve().parent / \"ema200_scanner.yaml\"\n\n\ndef _deep_freeze(obj: Any) -> Any:\n    if isinstance(obj, dict):\n        return tuple(sorted((k, _deep_freeze(v)) for k, v in obj.items()))\n    if isinstance(obj, list):\n        return tuple(_deep_freeze(x) for x in obj)\n    return obj\n\n\ndef config_hash(cfg: dict[str, Any]) -> str:\n    \"\"\"Stable hash of config for alert footers and reproducibility.\"\"\"\n    payload = json.dumps(_deep_freeze(cfg), sort_keys=True, default=str)\n    return hashlib.sha256(payload.encode()).hexdigest()[:16]\n\n\n@lru_cache(maxsize=1)\ndef load_config(path: str | None = None) -> dict[str, Any]:\n    cfg_path = Path(path) if path else _DEFAULT_PATH\n    with cfg_path.open(encoding=\"utf-8\") as fh:\n        data = yaml.safe_load(fh)\n    if not isinstance(data, dict):\n        raise ValueError(f\"Invalid config at {cfg_path}: expected mapping\")\n    return data\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 7
+    },
+    "ai_commit": "0cee5fdda91b",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      30,
+      36
+    ]
+  }
+}

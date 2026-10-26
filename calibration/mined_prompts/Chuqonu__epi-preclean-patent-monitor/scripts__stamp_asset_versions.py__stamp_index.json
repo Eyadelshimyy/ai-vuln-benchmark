@@ -1,0 +1,28 @@
+{
+  "repo": "Chuqonu__epi-preclean-patent-monitor",
+  "file": "scripts/stamp_asset_versions.py",
+  "function": "stamp_index",
+  "line": 31,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `stamp_index` function (parameters: versions).",
+  "prompt_source": "def stamp_index(versions: dict[str, str]) -> None:\n    \"\"\"Implement the `stamp_index` function (parameters: versions).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def stamp_index(versions: dict[str, str]) -> None:\n    html = INDEX.read_text(encoding=\"utf-8\")\n    css_q = versions[\"report.css\"]\n    js_q = versions[\"report.js\"]\n    data_q = versions[\"report.json\"]\n\n    html = re.sub(\n        r'href=\"assets/css/report\\.css(?:\\?v=[^\"]*)?\"',\n        f'href=\"assets/css/report.css?v={css_q}\"',\n        html,\n        count=1,\n    )\n    html = re.sub(\n        r'src=\"assets/js/report\\.js(?:\\?v=[^\"]*)?\"',\n        f'src=\"assets/js/report.js?v={js_q}\"',\n        html,\n        count=1,\n    )\n    meta_pat = r'<meta name=\"epi-report-data\" content=\"data/report\\.json(?:\\?v=[^\"]*)?\">'\n    meta_new = f'<meta name=\"epi-report-data\" content=\"data/report.json?v={data_q}\">'\n    if re.search(meta_pat, html):\n        html = re.sub(meta_pat, meta_new, html, count=1)\n    else:\n        html = html.replace(\n            '<meta name=\"viewport\"',\n            meta_new + \"\\n  \" + '<meta name=\"viewport\"',\n            1,\n        )\n    INDEX.write_text(html, encoding=\"utf-8\")",
+  "module_source": "#!/usr/bin/env python3\n\"\"\"Write content-hash query strings into index.html for cache-safe GitHub Pages deploys.\"\"\"\n\nfrom __future__ import annotations\n\nimport hashlib\nimport json\nimport re\nfrom datetime import datetime, timezone\nfrom pathlib import Path\n\nROOT = Path(__file__).resolve().parents[1]\nINDEX = ROOT / \"index.html\"\nMANIFEST = ROOT / \"data\" / \"asset-versions.json\"\n\nASSETS = {\n    \"report.css\": ROOT / \"assets\" / \"css\" / \"report.css\",\n    \"report.js\": ROOT / \"assets\" / \"js\" / \"report.js\",\n    \"report.json\": ROOT / \"data\" / \"report.json\",\n}\n\n\ndef file_hash(path: Path, nbytes: int = 12) -> str:\n    h = hashlib.sha256()\n    with path.open(\"rb\") as f:\n        for chunk in iter(lambda: f.read(1 << 20), b\"\"):\n            h.update(chunk)\n    return h.hexdigest()[:nbytes]\n\n\ndef stamp_index(versions: dict[str, str]) -> None:\n    html = INDEX.read_text(encoding=\"utf-8\")\n    css_q = versions[\"report.css\"]\n    js_q = versions[\"report.js\"]\n    data_q = versions[\"report.json\"]\n\n    html = re.sub(\n        r'href=\"assets/css/report\\.css(?:\\?v=[^\"]*)?\"',\n        f'href=\"assets/css/report.css?v={css_q}\"',\n        html,\n        count=1,\n    )\n    html = re.sub(\n        r'src=\"assets/js/report\\.js(?:\\?v=[^\"]*)?\"',\n        f'src=\"assets/js/report.js?v={js_q}\"',\n        html,\n        count=1,\n    )\n    meta_pat = r'<meta name=\"epi-report-data\" content=\"data/report\\.json(?:\\?v=[^\"]*)?\">'\n    meta_new = f'<meta name=\"epi-report-data\" content=\"data/report.json?v={data_q}\">'\n    if re.search(meta_pat, html):\n        html = re.sub(meta_pat, meta_new, html, count=1)\n    else:\n        html = html.replace(\n            '<meta name=\"viewport\"',\n            meta_new + \"\\n  \" + '<meta name=\"viewport\"',\n            1,\n        )\n    INDEX.write_text(html, encoding=\"utf-8\")\n\n\ndef main() -> int:\n    versions = {k: file_hash(p) for k, p in ASSETS.items()}\n    manifest = {\n        \"stamped_at\": datetime.now(timezone.utc).strftime(\"%Y-%m-%dT%H:%M:%SZ\"),\n        \"files\": versions,\n    }\n    MANIFEST.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + \"\\n\", encoding=\"utf-8\")\n    stamp_index(versions)\n    print(\"stamped\", versions)\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 29
+    },
+    "ai_commit": "37bd9b6f01c9",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      31,
+      59
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "repo": "GPD-Research__SimpleStax",
+  "file": "scripts/bump_version.py",
+  "function": "main",
+  "line": 69,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main() -> int:\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main() -> int:\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"level\", choices=LEVELS)\n    parser.add_argument(\"--title\", required=True, help=\"PR title, used when it left no notes\")\n    parser.add_argument(\"--pr\", type=int, help=\"PR number, appended to the fallback entry\")\n    parser.add_argument(\"--date\", type=dt.date.fromisoformat, default=dt.date.today())\n    args = parser.parse_args()\n\n    source = VERSION_FILE.read_text()\n    new = \".\".join(str(part) for part in bumped(read_version(source), args.level))\n    VERSION_FILE.write_text(_VERSION.sub(f'__version__ = \"{new}\"', source))\n    title = plain_text(args.title)\n    fallback = f\"{title} (#{args.pr})\" if args.pr else title\n    README.write_text(close_unreleased(README.read_text(), new, args.date, fallback))\n    print(new)\n    return 0",
+  "module_source": "#!/usr/bin/env python3\n\"\"\"\nBumps SimpleStax's version for a merged PR and closes the README's Unreleased section.\n\n    scripts/bump_version.py minor --title \"Import and frame validation\" --pr 12\n\nPrints the new version. Levels follow the project's rules:\n  patch  single-component fixes, syntax corrections, UI polish, localised bug fixes\n  minor  a finished multi-stage change, a new tool pipeline, a clear step up in capability\n  major  a long-term goal reached, or a rewrite that changes how the app works\n\"\"\"\n\nfrom __future__ import annotations\n\nimport argparse\nimport datetime as dt\nimport re\nfrom pathlib import Path\n\nROOT = Path(__file__).resolve().parent.parent\nVERSION_FILE = ROOT / \"src\" / \"simplestax\" / \"__init__.py\"\nREADME = ROOT / \"README.md\"\nLEVELS = (\"patch\", \"minor\", \"major\")\nUNRELEASED = \"## Unreleased\"\n_VERSION = re.compile(r'__version__ = \"(\\d+)\\.(\\d+)\\.(\\d+)\"')\n\n\ndef bumped(version: tuple[int, int, int], level: str) -> tuple[int, int, int]:\n    major, minor, patch = version\n    if level == \"major\":\n        return major + 1, 0, 0\n    if level == \"minor\":\n        return major, minor + 1, 0\n    if level == \"patch\":\n        return major, minor, patch + 1\n    raise ValueError(f\"unknown level {level!r}\")\n\n\ndef read_version(text: str) -> tuple[int, int, int]:\n    match = _VERSION.search(text)\n    if not match:\n        raise ValueError(\"no __version__ found\")\n    return tuple(int(part) for part in match.groups())  # type: ignore[return-value]\n\n\ndef plain_text(title: str) -> str:\n    \"\"\"One line with Markdown syntax escaped, so a PR title can't add links or headings.\"\"\"\n    return re.sub(r\"([\\\\`*_{}\\[\\]()<>#+!|~])\", r\"\\\\\\1\", \" \".join(title.split()))\n\n\ndef close_unreleased(readme: str, version: str, date: dt.date, fallback: str) -> str:\n    \"\"\"\n    Renames the Unreleased section to the new version and opens an empty one above it. When the\n    PR wrote no notes there, [fallback] (its title) becomes the only entry.\n    \"\"\"\n    heading = f\"## Version {version} ({date:%B %Y})\"\n    if UNRELEASED not in readme:\n        raise ValueError(f\"README has no '{UNRELEASED}' section\")\n    start = readme.index(UNRELEASED) + len(UNRELEASED)\n    following = re.search(r\"^## \", readme[start:], flags=re.MULTILINE)\n    end = start + following.start() if following else len(readme)\n    notes = readme[start:end].strip()\n    if not notes:\n        notes = f\"- {fallback}\"\n    head = readme[: readme.index(UNRELEASED)]\n    return f\"{head}{UNRELEASED}\\n\\n{heading}\\n\\n{notes}\\n\\n{readme[end:].lstrip()}\".rstrip() + \"\\n\"\n\n\ndef main() -> int:\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"level\", choices=LEVELS)\n    parser.add_argument(\"--title\", required=True, help=\"PR title, used when it left no notes\")\n    parser.add_argument(\"--pr\", type=int, help=\"PR number, appended to the fallback entry\")\n    parser.add_argument(\"--date\", type=dt.date.fromisoformat, default=dt.date.today())\n    args = parser.parse_args()\n\n    source = VERSION_FILE.read_text()\n    new = \".\".join(str(part) for part in bumped(read_version(source), args.level))\n    VERSION_FILE.write_text(_VERSION.sub(f'__version__ = \"{new}\"', source))\n    title = plain_text(args.title)\n    fallback = f\"{title} (#{args.pr})\" if args.pr else title\n    README.write_text(close_unreleased(README.read_text(), new, args.date, fallback))\n    print(new)\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 16
+    },
+    "ai_commit": "8c0e9cda6032",
+    "evidence": "author/committer='devin-ai-integration[bot] <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      69,
+      84
+    ]
+  }
+}

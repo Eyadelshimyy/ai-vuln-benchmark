@@ -1,0 +1,28 @@
+{
+  "repo": "Fejjii__AlphaTrade-AI",
+  "file": "backend/src/app/observability/process_memory.py",
+  "function": "_proc_status_kb",
+  "line": 90,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `_proc_status_kb` function.",
+  "prompt_source": "def _proc_status_kb() -> tuple[int | None, int | None]:\n    \"\"\"Implement the `_proc_status_kb` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def _proc_status_kb() -> tuple[int | None, int | None]:\n    rss_kb: int | None = None\n    peak_kb: int | None = None\n    try:\n        with open(\"/proc/self/status\", encoding=\"utf-8\") as handle:\n            for line in handle:\n                if line.startswith(\"VmRSS:\"):\n                    rss_kb = int(line.split()[1])\n                elif line.startswith(\"VmHWM:\"):\n                    peak_kb = int(line.split()[1])\n    except OSError:\n        return None, None\n    return rss_kb, peak_kb",
+  "module_source": "\"\"\"Process memory readings for the paper worker.\n\nValues are byte counts from the local process. They are not account data,\ncredentials, or market payloads.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport ctypes\nimport ctypes.util\nimport gc\nimport os\nimport resource\nimport subprocess\nimport sys\nfrom dataclasses import dataclass\nfrom typing import TypedDict\n\nfrom prometheus_client import Gauge\n\nfrom app.observability.metrics import REGISTRY\n\nPROCESS_RSS_BYTES = Gauge(\n    \"process_resident_memory_bytes\",\n    \"Current process resident set size in bytes\",\n    registry=REGISTRY,\n)\nPROCESS_RSS_PEAK_BYTES = Gauge(\n    \"process_resident_memory_peak_bytes\",\n    \"Peak process resident set size in bytes since process start\",\n    registry=REGISTRY,\n)\n\n_LIBC: ctypes.CDLL | None = None\n_LIBC_READY = False\n\n\nclass MemoryStatusFields(TypedDict):\n    \"\"\"Integer RSS fields published on a runtime-status row.\"\"\"\n\n    process_rss_bytes: int\n    process_rss_peak_bytes: int\n\n\n@dataclass(frozen=True, slots=True)\nclass ProcessMemory:\n    \"\"\"Resident memory of this process, in bytes.\"\"\"\n\n    rss_bytes: int\n    peak_rss_bytes: int\n\n\ndef read_process_memory() -> ProcessMemory:\n    \"\"\"Return current and peak RSS. Peak does not decrease for the life of the process.\"\"\"\n\n    rss_kb, peak_kb = _proc_status_kb()\n    if rss_kb is None:\n        # Darwin reports ru_maxrss in bytes; Linux reports KiB. A high-water\n        # mark cannot measure release, so sample current RSS separately on Mac.\n        current_kb = _darwin_rss_kb() if sys.platform == \"darwin\" else None\n        peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)\n        peak_kb = peak // 1024 if sys.platform == \"darwin\" else peak\n        rss_kb = peak_kb if current_kb is None else current_kb\n        peak_kb = max(peak_kb, rss_kb)\n    if peak_kb is None:\n        peak_kb = rss_kb\n    sample = ProcessMemory(rss_bytes=rss_kb * 1024, peak_rss_bytes=peak_kb * 1024)\n    _observe(sample)\n    return sample\n\n\ndef release_allocator_memory() -> ProcessMemory:\n    \"\"\"Collect unreachable objects and return free heap pages to the OS when possible.\"\"\"\n\n    gc.collect()\n    _malloc_trim()\n    return read_process_memory()\n\n\ndef memory_status_fields() -> MemoryStatusFields:\n    \"\"\"RSS fields for a runtime-status write. Integers only.\"\"\"\n\n    sample = read_process_memory()\n    return {\n        \"process_rss_bytes\": sample.rss_bytes,\n        \"process_rss_peak_bytes\": sample.peak_rss_bytes,\n    }\n\n\ndef _proc_status_kb() -> tuple[int | None, int | None]:\n    rss_kb: int | None = None\n    peak_kb: int | None = None\n    try:\n        with open(\"/proc/self/status\", encoding=\"utf-8\") as handle:\n            for line in handle:\n                if line.startswith(\"VmRSS:\"):\n                    rss_kb = int(line.split()[1])\n                elif line.startswith(\"VmHWM:\"):\n                    peak_kb = int(line.split()[1])\n    except OSError:\n        return None, None\n    return rss_kb, peak_kb\n\n\ndef _darwin_rss_kb() -> int | None:\n    \"\"\"Read this process's current RSS using macOS ps (which reports KiB).\"\"\"\n\n    try:\n        result = subprocess.run(\n            [\"/bin/ps\", \"-o\", \"rss=\", \"-p\", str(os.getpid())],\n            capture_output=True,\n            text=True,\n            check=True,\n            timeout=1,\n        )\n        value = int(result.stdout.strip())\n        return value if value > 0 else None\n    except (OSError, subprocess.SubprocessError, ValueError):\n        return None\n\n\ndef _observe(sample: ProcessMemory) -> None:\n    PROCESS_RSS_BYTES.set(sample.rss_bytes)\n    PROCESS_RSS_PEAK_BYTES.set(sample.peak_rss_bytes)\n\n\ndef _malloc_trim() -> None:\n    global _LIBC, _LIBC_READY\n    if not _LIBC_READY:\n        _LIBC_READY = True\n        name = ctypes.util.find_library(\"c\")\n        if name is None:\n            return\n        try:\n            library = ctypes.CDLL(name)\n        except OSError:\n            return\n        if not hasattr(library, \"malloc_trim\"):\n            return\n        library.malloc_trim.argtypes = [ctypes.c_size_t]\n        library.malloc_trim.restype = ctypes.c_int\n        _LIBC = library\n    if _LIBC is None:\n        return\n    _LIBC.malloc_trim(0)\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 13
+    },
+    "ai_commit": "2cd0823b62fa",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      90,
+      102
+    ]
+  }
+}

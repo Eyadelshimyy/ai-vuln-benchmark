@@ -1,0 +1,28 @@
+{
+  "repo": "TracecatHQ__tracecat",
+  "file": "alembic/versions/c8d7e5a4b321_add_case_triggers.py",
+  "function": "upgrade",
+  "line": 23,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `upgrade` function.",
+  "prompt_source": "def upgrade() -> None:\n    \"\"\"Implement the `upgrade` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def upgrade() -> None:\n    op.create_table(\n        \"case_trigger\",\n        sa.Column(\"surrogate_id\", sa.Integer(), sa.Identity(), primary_key=True),\n        sa.Column(\"id\", sa.UUID(), nullable=False),\n        sa.Column(\"status\", sa.String(length=16), nullable=False),\n        sa.Column(\n            \"event_types\",\n            postgresql.JSONB(astext_type=sa.Text()),\n            server_default=sa.text(\"'[]'::jsonb\"),\n            nullable=False,\n        ),\n        sa.Column(\n            \"tag_filters\",\n            postgresql.JSONB(astext_type=sa.Text()),\n            server_default=sa.text(\"'[]'::jsonb\"),\n            nullable=False,\n        ),\n        sa.Column(\"workflow_id\", sa.UUID(), nullable=False),\n        sa.Column(\"workspace_id\", sa.UUID(), nullable=False),\n        sa.Column(\n            \"created_at\",\n            sa.TIMESTAMP(timezone=True),\n            server_default=sa.text(\"now()\"),\n            nullable=False,\n        ),\n        sa.Column(\n            \"updated_at\",\n            sa.TIMESTAMP(timezone=True),\n            server_default=sa.text(\"now()\"),\n            nullable=False,\n        ),\n        sa.ForeignKeyConstraint([\"workflow_id\"], [\"workflow.id\"], ondelete=\"CASCADE\"),\n        sa.ForeignKeyConstraint([\"workspace_id\"], [\"workspace.id\"], ondelete=\"CASCADE\"),\n        sa.UniqueConstraint(\"id\"),\n        sa.UniqueConstraint(\"workflow_id\"),\n    )\n    op.create_index(\"ix_case_trigger_id\", \"case_trigger\", [\"id\"], unique=False)\n\n    op.execute(\n        \"\"\"\n        INSERT INTO case_trigger\n            (id, workspace_id, workflow_id, status, event_types, tag_filters, created_at, updated_at)\n        SELECT\n            gen_random_uuid(),\n            workspace_id,\n            id,\n            'offline',\n            '[]'::jsonb,\n            '[]'::jsonb,\n            now(),\n            now()\n        FROM workflow;\n        \"\"\"\n    )",
+  "module_source": "\"\"\"add case triggers\n\nRevision ID: c8d7e5a4b321\nRevises: 663883860695\nCreate Date: 2026-02-01 00:00:00.000000\n\n\"\"\"\n\nfrom collections.abc import Sequence\n\nimport sqlalchemy as sa\nfrom sqlalchemy.dialects import postgresql\n\nfrom alembic import op\n\n# revision identifiers, used by Alembic.\nrevision: str = \"c8d7e5a4b321\"\ndown_revision: str | None = \"663883860695\"\nbranch_labels: str | Sequence[str] | None = None\ndepends_on: str | Sequence[str] | None = None\n\n\ndef upgrade() -> None:\n    op.create_table(\n        \"case_trigger\",\n        sa.Column(\"surrogate_id\", sa.Integer(), sa.Identity(), primary_key=True),\n        sa.Column(\"id\", sa.UUID(), nullable=False),\n        sa.Column(\"status\", sa.String(length=16), nullable=False),\n        sa.Column(\n            \"event_types\",\n            postgresql.JSONB(astext_type=sa.Text()),\n            server_default=sa.text(\"'[]'::jsonb\"),\n            nullable=False,\n        ),\n        sa.Column(\n            \"tag_filters\",\n            postgresql.JSONB(astext_type=sa.Text()),\n            server_default=sa.text(\"'[]'::jsonb\"),\n            nullable=False,\n        ),\n        sa.Column(\"workflow_id\", sa.UUID(), nullable=False),\n        sa.Column(\"workspace_id\", sa.UUID(), nullable=False),\n        sa.Column(\n            \"created_at\",\n            sa.TIMESTAMP(timezone=True),\n            server_default=sa.text(\"now()\"),\n            nullable=False,\n        ),\n        sa.Column(\n            \"updated_at\",\n            sa.TIMESTAMP(timezone=True),\n            server_default=sa.text(\"now()\"),\n            nullable=False,\n        ),\n        sa.ForeignKeyConstraint([\"workflow_id\"], [\"workflow.id\"], ondelete=\"CASCADE\"),\n        sa.ForeignKeyConstraint([\"workspace_id\"], [\"workspace.id\"], ondelete=\"CASCADE\"),\n        sa.UniqueConstraint(\"id\"),\n        sa.UniqueConstraint(\"workflow_id\"),\n    )\n    op.create_index(\"ix_case_trigger_id\", \"case_trigger\", [\"id\"], unique=False)\n\n    op.execute(\n        \"\"\"\n        INSERT INTO case_trigger\n            (id, workspace_id, workflow_id, status, event_types, tag_filters, created_at, updated_at)\n        SELECT\n            gen_random_uuid(),\n            workspace_id,\n            id,\n            'offline',\n            '[]'::jsonb,\n            '[]'::jsonb,\n            now(),\n            now()\n        FROM workflow;\n        \"\"\"\n    )\n\n\ndef downgrade() -> None:\n    op.drop_index(\"ix_case_trigger_id\", table_name=\"case_trigger\")\n    op.drop_table(\"case_trigger\")\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 50
+    },
+    "ai_commit": "5817da703444",
+    "evidence": "Co-authored-by: Claude",
+    "ai_line_fraction": 0.909,
+    "span": [
+      23,
+      77
+    ]
+  }
+}

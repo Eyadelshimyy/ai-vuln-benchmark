@@ -1,0 +1,28 @@
+{
+  "repo": "Chuqonu__epi-preclean-patent-monitor",
+  "file": "scripts/fix_report_integrity.py",
+  "function": "main",
+  "line": 51,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main() -> int:\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main() -> int:\n    data = json.loads(REPORT.read_text(encoding=\"utf-8\"))\n    before = dict(data.get(\"counts\") or {})\n\n    for m in data.get(\"months\") or []:\n        for fam in m.get(\"families\") or []:\n            trim_card_family_events(fam)\n\n    scrub_read_metadata(data)\n\n    sys.path.insert(0, str(ROOT / \"scripts\"))\n    import apply_read_ruling as arr\n\n    arr.main()\n\n    data = json.loads(REPORT.read_text(encoding=\"utf-8\"))\n    after = recompute_counts(data)\n    REPORT.write_text(json.dumps(data, ensure_ascii=False, indent=2) + \"\\n\", encoding=\"utf-8\")\n    print(\"before\", before)\n    print(\"after\", after)\n    return 0",
+  "module_source": "#!/usr/bin/env python3\n\"\"\"One-shot integrity repairs on data/report.json (WO/TW events, read metadata).\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nimport sys\nfrom pathlib import Path\n\nROOT = Path(__file__).resolve().parents[1]\nREPORT = ROOT / \"data\" / \"report.json\"\n\nsys.path.insert(0, str(ROOT / \"scripts\"))\nfrom report_metrics import recompute_counts  # noqa: E402\n\n\ndef trim_card_family_events(fam: dict) -> None:\n    pub = fam.get(\"publication_id\")\n    month = fam.get(\"month\") or (fam.get(\"event_date\") or \"\")[:7]\n    evs = fam.get(\"family_events\") or []\n    if not evs:\n        return\n    kept = [ev for ev in evs if ev.get(\"publication_id\") == pub]\n    if not kept:\n        kept = [\n            ev\n            for ev in evs\n            if (ev.get(\"event_date\") or \"\")[:7] == month\n        ]\n    if kept:\n        fam[\"family_events\"] = kept\n\n\ndef scrub_read_metadata(data: dict) -> None:\n    for m in data.get(\"months\") or []:\n        for fam in m.get(\"families\") or []:\n            if fam.get(\"discovery_source\") != \"independent_search\":\n                continue\n            if fam.get(\"team_independent_read\"):\n                if not fam.get(\"source_sha256\"):\n                    fam[\"reviewer\"] = None\n                    fam[\"reviewed_at\"] = None\n                continue\n            fam[\"team_independent_read\"] = False\n            fam[\"actual_read_spans\"] = []\n            fam[\"reviewer\"] = None\n            fam[\"reviewed_at\"] = None\n            fam.pop(\"source_sha256\", None)\n\n\ndef main() -> int:\n    data = json.loads(REPORT.read_text(encoding=\"utf-8\"))\n    before = dict(data.get(\"counts\") or {})\n\n    for m in data.get(\"months\") or []:\n        for fam in m.get(\"families\") or []:\n            trim_card_family_events(fam)\n\n    scrub_read_metadata(data)\n\n    sys.path.insert(0, str(ROOT / \"scripts\"))\n    import apply_read_ruling as arr\n\n    arr.main()\n\n    data = json.loads(REPORT.read_text(encoding=\"utf-8\"))\n    after = recompute_counts(data)\n    REPORT.write_text(json.dumps(data, ensure_ascii=False, indent=2) + \"\\n\", encoding=\"utf-8\")\n    print(\"before\", before)\n    print(\"after\", after)\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 21
+    },
+    "ai_commit": "4a7c7b1a284d",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      51,
+      71
+    ]
+  }
+}

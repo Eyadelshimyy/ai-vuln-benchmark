@@ -1,0 +1,28 @@
+{
+  "repo": "BerriAI__litellm",
+  "file": "litellm/integrations/prometheus_helpers/shared_prometheus_series_admissions.py",
+  "function": "_append",
+  "line": 46,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `_append` function (parameters: label_values).",
+  "prompt_source": "    def _append(self, label_values: tuple[str, ...]) -> None:\n        \"\"\"Implement the `_append` function (parameters: label_values).\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    def _append(self, label_values: tuple[str, ...]) -> None:\n        descriptor: Final = os.open(self._path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)\n        try:\n            os.write(descriptor, b\"\\n\" + _LABEL_VALUES.dump_json(label_values) + b\"\\n\")\n        finally:\n            os.close(descriptor)",
+  "module_source": "from __future__ import annotations\n\nimport os\nfrom threading import RLock\nfrom typing import Final\n\nfrom pydantic import TypeAdapter, ValidationError\n\nfrom litellm.constants import PROMETHEUS_ADMITTED_SERIES_FILE_PREFIX\n\n_LABEL_VALUES: Final = TypeAdapter(tuple[str, ...])\n\n\ndef _parse_admission(line: bytes) -> tuple[str, ...] | None:\n    try:\n        return _LABEL_VALUES.validate_json(line)\n    except ValidationError:\n        return None\n\n\nclass _MetricAdmissions:\n    __slots__ = (\"_label_sets\", \"_max_series\", \"_path\", \"_read_offset\")\n\n    def __init__(self, path: str, max_series: int) -> None:\n        self._path = path\n        self._max_series = max_series\n        self._label_sets: set[tuple[str, ...]] = (  # mutable-ok: a frozenset copy per admission is quadratic in the cap\n            set()\n        )\n        self._read_offset = 0\n\n    def admit(self, label_values: tuple[str, ...]) -> bool:\n        if label_values in self._label_sets:\n            return True\n        if self._is_full():\n            return False\n        self._read_new_admissions()\n        if label_values not in self._label_sets and not self._is_full():\n            self._append(label_values)\n            self._read_new_admissions()\n        return label_values in self._label_sets\n\n    def _is_full(self) -> bool:\n        return len(self._label_sets) >= self._max_series\n\n    def _append(self, label_values: tuple[str, ...]) -> None:\n        descriptor: Final = os.open(self._path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)\n        try:\n            os.write(descriptor, b\"\\n\" + _LABEL_VALUES.dump_json(label_values) + b\"\\n\")\n        finally:\n            os.close(descriptor)\n\n    def _read_new_admissions(self) -> None:\n        try:\n            with open(self._path, \"rb\") as admissions_file:\n                admissions_file.seek(self._read_offset)\n                unread: Final = admissions_file.read()\n        except FileNotFoundError:\n            return\n        complete_lines, newline, _ = unread.rpartition(b\"\\n\")\n        if not newline:\n            return\n        self._read_offset += len(complete_lines) + len(newline)\n        for label_values in map(_parse_admission, complete_lines.split(b\"\\n\")):\n            if self._is_full():\n                return\n            if label_values is not None:\n                self._label_sets.add(label_values)\n\n\nclass SharedPrometheusSeriesAdmissions:\n    \"\"\"Picks which label sets get a series when several worker processes write to one\n    ``PROMETHEUS_MULTIPROC_DIR``. Each metric has one append-only file there, and its first ``max_series``\n    distinct lines are the admitted label sets. Every worker reads the same lines in the same order, so all of\n    them, including a worker that replaces an exited one, admit the same label sets and a scrape that merges\n    the workers stays at the cap. Each record sits between two newlines, so a record a worker could only write\n    part of (the directory ran out of space) is a line of its own that admits nothing for every worker, and\n    it neither hides the records after it nor runs into the next worker's record.\"\"\"\n\n    def __init__(self, directory: str) -> None:\n        self._directory = directory\n        self._admissions: dict[str, _MetricAdmissions] = {}  # mutable-ok: one entry per metric, added on first use\n        self.lock = RLock()\n\n    def admit_series(self, metric_name: str, label_values: tuple[str, ...], max_series: int) -> bool:\n        with self.lock:\n            if metric_name not in self._admissions:\n                self._admissions[metric_name] = _MetricAdmissions(\n                    path=os.path.join(self._directory, f\"{PROMETHEUS_ADMITTED_SERIES_FILE_PREFIX}{metric_name}\"),\n                    max_series=max_series,\n                )\n            return self._admissions[metric_name].admit(label_values)\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 6
+    },
+    "ai_commit": "6f5ca84f691e",
+    "evidence": "author/committer='devin-ai-integration[bot] <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      46,
+      51
+    ]
+  }
+}

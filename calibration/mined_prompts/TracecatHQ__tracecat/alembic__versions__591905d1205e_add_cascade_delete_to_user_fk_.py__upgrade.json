@@ -1,0 +1,28 @@
+{
+  "repo": "TracecatHQ__tracecat",
+  "file": "alembic/versions/591905d1205e_add_cascade_delete_to_user_fk_.py",
+  "function": "upgrade",
+  "line": 20,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `upgrade` function.",
+  "prompt_source": "def upgrade() -> None:\n    \"\"\"Implement the `upgrade` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def upgrade() -> None:\n    op.execute(\"\"\"\n        ALTER TABLE access_token\n            DROP CONSTRAINT fk_access_token_user_id_user,\n            ADD CONSTRAINT fk_access_token_user_id_user\n                FOREIGN KEY (user_id) REFERENCES \"user\"(id) ON DELETE CASCADE\n    \"\"\")\n    op.execute(\"\"\"\n        ALTER TABLE oauth_account\n            DROP CONSTRAINT fk_oauth_account_user_id_user,\n            ADD CONSTRAINT fk_oauth_account_user_id_user\n                FOREIGN KEY (user_id) REFERENCES \"user\"(id) ON DELETE CASCADE\n    \"\"\")",
+  "module_source": "\"\"\"add_cascade_delete_to_user_fk_constraints\n\nRevision ID: 591905d1205e\nRevises: 0fd1f09cd98b\nCreate Date: 2025-12-09 22:53:04.405505\n\n\"\"\"\n\nfrom collections.abc import Sequence\n\nfrom alembic import op\n\n# revision identifiers, used by Alembic.\nrevision: str = \"591905d1205e\"\ndown_revision: str | None = \"0fd1f09cd98b\"\nbranch_labels: str | Sequence[str] | None = None\ndepends_on: str | Sequence[str] | None = None\n\n\ndef upgrade() -> None:\n    op.execute(\"\"\"\n        ALTER TABLE access_token\n            DROP CONSTRAINT fk_access_token_user_id_user,\n            ADD CONSTRAINT fk_access_token_user_id_user\n                FOREIGN KEY (user_id) REFERENCES \"user\"(id) ON DELETE CASCADE\n    \"\"\")\n    op.execute(\"\"\"\n        ALTER TABLE oauth_account\n            DROP CONSTRAINT fk_oauth_account_user_id_user,\n            ADD CONSTRAINT fk_oauth_account_user_id_user\n                FOREIGN KEY (user_id) REFERENCES \"user\"(id) ON DELETE CASCADE\n    \"\"\")\n\n\ndef downgrade() -> None:\n    op.execute(\"\"\"\n        ALTER TABLE oauth_account\n            DROP CONSTRAINT fk_oauth_account_user_id_user,\n            ADD CONSTRAINT fk_oauth_account_user_id_user\n                FOREIGN KEY (user_id) REFERENCES \"user\"(id)\n    \"\"\")\n    op.execute(\"\"\"\n        ALTER TABLE access_token\n            DROP CONSTRAINT fk_access_token_user_id_user,\n            ADD CONSTRAINT fk_access_token_user_id_user\n                FOREIGN KEY (user_id) REFERENCES \"user\"(id)\n    \"\"\")\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 13
+    },
+    "ai_commit": "e77d2d6406a9",
+    "evidence": "Co-authored-by: Claude <noreply@anthropic.com>",
+    "ai_line_fraction": 1.0,
+    "span": [
+      20,
+      32
+    ]
+  }
+}

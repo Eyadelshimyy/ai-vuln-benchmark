@@ -1,0 +1,28 @@
+{
+  "repo": "z-mio__parse_hub_bot",
+  "file": "services/media.py",
+  "function": "make_thumb",
+  "line": 23,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": true,
+  "docstring": "\u538b\u5230 TG thumb \u89c4\u683c(\u2264320px JPEG), \u5931\u8d25\u8fd4\u56de None",
+  "prompt_source": "def make_thumb(src: bytes | str | Path, out_path: str | Path) -> str | None:\n    \"\"\"\u538b\u5230 TG thumb \u89c4\u683c(\u2264320px JPEG), \u5931\u8d25\u8fd4\u56de None\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def make_thumb(src: bytes | str | Path, out_path: str | Path) -> str | None:\n    \"\"\"\u538b\u5230 TG thumb \u89c4\u683c(\u2264320px JPEG), \u5931\u8d25\u8fd4\u56de None\"\"\"\n    try:\n        img = Image.open(io.BytesIO(src) if isinstance(src, bytes) else src).convert(\"RGB\")\n        img.thumbnail((320, 320))\n        img.save(out_path, \"JPEG\", quality=85)\n        return str(out_path)\n    except Exception as e:\n        logger.debug(f\"\u7f29\u7565\u56fe\u5904\u7406\u5931\u8d25: {e}\")\n        return None",
+  "module_source": "import io\nfrom dataclasses import dataclass\nfrom pathlib import Path\n\nimport httpx\nfrom easy_ai18n import PreLocaleSelector\nfrom parsehub.types import AnyMediaFile, DownloadResult, ProgressUnit\nfrom parsehub.utils.media_info import MediaInfoReader\nfrom PIL import Image\n\nfrom log import logger\nfrom utils.helpers import to_list\nfrom utils.media_processing_unit import MediaProcessingUnit\n\n\n@dataclass\nclass ProcessedMedia:\n    source: AnyMediaFile\n    output_paths: list[Path] | None = None\n    output_dir: Path | None = None\n\n\ndef make_thumb(src: bytes | str | Path, out_path: str | Path) -> str | None:\n    \"\"\"\u538b\u5230 TG thumb \u89c4\u683c(\u2264320px JPEG), \u5931\u8d25\u8fd4\u56de None\"\"\"\n    try:\n        img = Image.open(io.BytesIO(src) if isinstance(src, bytes) else src).convert(\"RGB\")\n        img.thumbnail((320, 320))\n        img.save(out_path, \"JPEG\", quality=85)\n        return str(out_path)\n    except Exception as e:\n        logger.debug(f\"\u7f29\u7565\u56fe\u5904\u7406\u5931\u8d25: {e}\")\n        return None\n\n\nasync def fetch_thumb(url: str, out_path: str | Path) -> str | None:\n    \"\"\"\u4e0b\u8f7d\u7f29\u7565\u56fe\u5e76\u538b\u5230 TG thumb \u89c4\u683c, \u5931\u8d25\u8fd4\u56de None\"\"\"\n    try:\n        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:\n            resp = await client.get(url)\n            resp.raise_for_status()\n        return make_thumb(resp.content, out_path)\n    except Exception as e:\n        logger.warning(f\"\u7f29\u7565\u56fe\u83b7\u53d6\u5931\u8d25, \u8df3\u8fc7({url}): {e}\")\n        return None\n\n\ndef resolve_media_info(processed: ProcessedMedia, file_path: str) -> tuple[int, int, int]:\n    \"\"\"\u83b7\u53d6\u5a92\u4f53\u7684\u5bbd\u3001\u9ad8\u3001\u65f6\u957f\u3002\u82e5\u7ecf\u8fc7\u8f6c\u7801\u5219\u4ece\u6587\u4ef6\u8bfb\u53d6\uff0c\u5426\u5219\u4f7f\u7528\u6e90\u4fe1\u606f\u3002\"\"\"\n    if processed.output_paths:\n        info = MediaInfoReader.read(file_path)\n        return info.width, info.height, info.duration\n    return processed.source.width, processed.source.height, getattr(processed.source, \"duration\", 0)\n\n\ndef progress(current: int, total: int, unit: ProgressUnit, _t: PreLocaleSelector) -> str | None:\n    if unit == \"bytes\":\n        if total <= 0:\n            return None\n\n        text = _t(f\"\u4e0b \u8f7d \u4e2d... | {current * 100 / total:.0f}%\")\n        if round(current * 100 / total, 1) % 25 == 0:\n            return str(text)\n    else:\n        text = _t(f\"\u4e0b \u8f7d \u4e2d... | {current}/{total}\")\n        if (current + 1) % 3 == 0 or (current + 1) == total:\n            return str(text)\n    return None\n\n\nasync def process_media_files(download_result: DownloadResult) -> list[ProcessedMedia]:\n    \"\"\"\u5bf9\u4e0b\u8f7d\u7ed3\u679c\u4e2d\u7684\u5a92\u4f53\u6587\u4ef6\u8fdb\u884c\u5904\u7406\uff0c\u8fd4\u56de ProcessedMedia \u5217\u8868\"\"\"\n    processed_dir = download_result.output_dir.joinpath(\"processed\")\n    processor = MediaProcessingUnit(processed_dir, segment_height=1920, logger=logger.bind(name=\"MediaProcessor\").debug)\n    media_files = to_list(download_result.media)\n    logger.debug(f\"\u5f00\u59cb\u5a92\u4f53\u5904\u7406: \u6587\u4ef6\u6570={len(media_files)}, output_dir={processed_dir}\")\n    processed_list: list[ProcessedMedia] = []\n    for media_file in media_files:\n        # \u5bf9\u4e8e\u5b9e\u51b5\u56fe\u7247\u53ea\u5904\u7406\u56fe\u7247, \u4e0d\u5904\u7406\u89c6\u9891\n        logger.debug(f\"\u5904\u7406\u6587\u4ef6: {media_file.path}\")\n        result = await processor.process(media_file.path)\n        logger.debug(f\"\u5904\u7406\u7ed3\u679c: output_paths={result.output_paths}\")\n        processed_list.append(ProcessedMedia(media_file, result.output_paths, result.temp_dir))\n    logger.debug(f\"\u5a92\u4f53\u5904\u7406\u5b8c\u6210: \u5904\u7406\u6570={len(processed_list)}\")\n    return processed_list\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 10
+    },
+    "ai_commit": "b09d5ac95df1",
+    "evidence": "author/committer='devin-ai-integration[bot] <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      23,
+      32
+    ]
+  }
+}

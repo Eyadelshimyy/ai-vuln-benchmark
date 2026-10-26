@@ -1,0 +1,28 @@
+{
+  "repo": "oamin__fpl-engine",
+  "file": "src/models/stage_38_blank_context.py",
+  "function": "main",
+  "line": 94,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main() -> None:\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main() -> None:\n    weekly = run()\n    xp = weekly.loc[weekly[\"method\"] == \"xp_ft\"]\n    gw29 = xp.loc[xp[\"gw\"] == 29, \"n_blank_final\"]\n    print(\n        f\"points {xp['xi_points_cap'].sum():.0f}  \"\n        f\"blanks {xp['n_blank_final'].sum():.0f}  \"\n        f\"gw29 {float(gw29.sum()) if len(gw29) else float('nan'):.0f}\"\n    )",
+  "module_source": "\"\"\"Stage 38 \u2014 fixture tags on the 2023/24 free-transfer climb.\n\nGameweek 29 has four matches. The published climb left 8 blanks there.\nThis run ranks a club with no fixture at 0 and writes the hold and the move.\n\"\"\"\n\nfrom __future__ import annotations\n\nfrom pathlib import Path\n\nimport pandas as pd\n\nfrom src.models.ridge_multiseason import build_one_season\nfrom src.models.season_climb_ft import HORIZON, load_vaastav_roster, run_ft_season\n\nROOT = Path(__file__).resolve().parents[2]\nPROCESSED = ROOT / \"data\" / \"processed\"\nREPORTS = ROOT / \"reports\"\nGWS = list(range(5, 39))\n\n\ndef run() -> pd.DataFrame:\n    feat = build_one_season(\"2023-24\", \"2324\")\n    feat[\"eligible\"] = pd.to_numeric(feat[\"xmi\"], errors=\"coerce\").fillna(0) >= 45.0\n    roster = load_vaastav_roster(\"2023-24\")\n    decisions: list[dict] = []\n    weekly = run_ft_season(\n        feat,\n        {\"xp\": \"score_xp\"},\n        GWS,\n        roster=roster,\n        horizon=HORIZON,\n        decisions=decisions,\n    )\n    PROCESSED.mkdir(parents=True, exist_ok=True)\n    REPORTS.mkdir(parents=True, exist_ok=True)\n    weekly.to_csv(PROCESSED / \"stage_38_blank_context.csv\", index=False)\n    flat = []\n    for row in decisions:\n        for week in row[\"weeks\"]:\n            flat.append(\n                {\n                    \"decision_gw\": row[\"gw\"],\n                    \"role\": row[\"role\"],\n                    \"n_transfers\": row[\"n_transfers\"],\n                    \"margin\": row[\"margin\"],\n                    \"value\": row[\"value\"],\n                    \"horizon_gw\": week[\"gw\"],\n                    \"xi_sum\": week[\"xi_sum\"],\n                    \"n_no_fixture\": week[\"n_no_fixture\"],\n                }\n            )\n    pd.DataFrame(flat).to_csv(PROCESSED / \"stage_38_blank_decisions.csv\", index=False)\n    _write(weekly, pd.DataFrame(flat))\n    return weekly\n\n\ndef _write(weekly: pd.DataFrame, decisions: pd.DataFrame) -> None:\n    xp = weekly.loc[weekly[\"method\"] == \"xp_ft\"]\n    gw29 = xp.loc[xp[\"gw\"] == 29]\n    blanks_29 = float(gw29[\"n_blank_final\"].sum()) if len(gw29) else float(\"nan\")\n    total = float(xp[\"xi_points_cap\"].sum()) if len(xp) else float(\"nan\")\n    hits = float(xp[\"hits\"].sum()) if len(xp) else float(\"nan\")\n    looked = decisions.loc[\n        (decisions[\"role\"] == \"hold\") & (decisions[\"horizon_gw\"] == 29)\n    ]\n    named = int((looked[\"n_no_fixture\"] > 0).sum()) if len(looked) else 0\n    lines = [\n        \"# Stage 38 \u2014 fixture context\",\n        \"\",\n        \"A club with no row in the week is ranked at 0. A score from an earlier \"\n        \"week is not used. A week with no clubs is skipped. The points model and \"\n        \"the transfer penalty are unchanged. The hold and the chosen move each \"\n        \"record the XI sum and the number of no-fixture starters in every week \"\n        \"of the three-week hold.\",\n        \"\",\n        f\"2023/24 Gameweeks 5\u201338: **{total:.0f}** points, {hits:.0f} hits, \"\n        f\"{int(xp['n_blank_final'].sum()) if len(xp) else 0} blanks after substitutes.\",\n        \"\",\n        f\"Gameweek 29 blanks after substitutes: **{blanks_29:.0f}**. \"\n        \"The previous climb on this scorer left 8.\",\n        \"\",\n        f\"Hold records that still name a no-fixture player inside the Gameweek 29 \"\n        f\"XI, when that week is inside the three-week window: **{named}**.\",\n        \"\",\n        \"The previous climb on this scorer scored 1676, with 7 hits and 21 blanks, \"\n        \"8 of them in Gameweek 29. A playing week's score is still copied forward, \"\n        \"so those three steps match. The blank week is the step that changes.\",\n        \"\",\n    ]\n    (REPORTS / \"stage_38_blank_context.md\").write_text(\"\\n\".join(lines) + \"\\n\", encoding=\"utf-8\")\n\n\ndef main() -> None:\n    weekly = run()\n    xp = weekly.loc[weekly[\"method\"] == \"xp_ft\"]\n    gw29 = xp.loc[xp[\"gw\"] == 29, \"n_blank_final\"]\n    print(\n        f\"points {xp['xi_points_cap'].sum():.0f}  \"\n        f\"blanks {xp['n_blank_final'].sum():.0f}  \"\n        f\"gw29 {float(gw29.sum()) if len(gw29) else float('nan'):.0f}\"\n    )\n\n\nif __name__ == \"__main__\":\n    main()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 9
+    },
+    "ai_commit": "ba7f43bcef02",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      94,
+      102
+    ]
+  }
+}

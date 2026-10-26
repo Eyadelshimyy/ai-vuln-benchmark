@@ -1,0 +1,28 @@
+{
+  "repo": "bermuda1023__ExposureEclipse",
+  "file": "backend/app/services/industry_book.py",
+  "function": "_by_geography",
+  "line": 17,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `_by_geography` function.",
+  "prompt_source": "def _by_geography() -> dict[str, tuple[int, int, int, int]]:\n    \"\"\"Implement the `_by_geography` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def _by_geography() -> dict[str, tuple[int, int, int, int]]:\n    path = Path(get_settings().mock_data_dir) / \"industry_exposure_counties.csv\"\n    if not path.exists():\n        return {}\n    out: dict[str, tuple[int, int, int, int]] = {}\n    with path.open(\"r\", encoding=\"utf-8\", newline=\"\") as handle:\n        for row in csv.DictReader(handle):\n            gid = row.get(\"geographyId\") or \"\"\n            if not gid:\n                continue\n            res = int(float(row[\"residentialTiv\"]))\n            com = int(float(row[\"commercialTiv\"]))\n            auto = int(float(row.get(\"autoTiv\") or 0))\n            out[gid] = (res, com, auto, res + com + auto)\n    return out",
+  "module_source": "\"\"\"County TIV from the Industry client book.\n\nThe book is the supplied US windstorm TIV workbook: residential, commercial,\nand auto by county. Counties that are not on that sheet are not in the book.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport csv\nfrom functools import lru_cache\nfrom pathlib import Path\n\nfrom ..config import get_settings\n\n\n@lru_cache(maxsize=1)\ndef _by_geography() -> dict[str, tuple[int, int, int, int]]:\n    path = Path(get_settings().mock_data_dir) / \"industry_exposure_counties.csv\"\n    if not path.exists():\n        return {}\n    out: dict[str, tuple[int, int, int, int]] = {}\n    with path.open(\"r\", encoding=\"utf-8\", newline=\"\") as handle:\n        for row in csv.DictReader(handle):\n            gid = row.get(\"geographyId\") or \"\"\n            if not gid:\n                continue\n            res = int(float(row[\"residentialTiv\"]))\n            com = int(float(row[\"commercialTiv\"]))\n            auto = int(float(row.get(\"autoTiv\") or 0))\n            out[gid] = (res, com, auto, res + com + auto)\n    return out\n\n\ndef county_industry_tiv(geography_id: str) -> tuple[int, int, int, int] | None:\n    \"\"\"Residential, commercial, auto, and bundled TIV for one county.\n\n    Accepts ``US-FL-12086`` or a raw 5-digit GEOID. Bundled is the sum of\n    the three segments.\n    \"\"\"\n    if not geography_id:\n        return None\n    book = _by_geography()\n    if geography_id in book:\n        return book[geography_id]\n    tail = geography_id.split(\"-\")[-1]\n    for gid, values in book.items():\n        if gid.endswith(\"-\" + tail):\n            return values\n    return None\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 4
+    },
+    "ai_commit": "566463aa9117",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 0.267,
+    "span": [
+      17,
+      31
+    ]
+  }
+}

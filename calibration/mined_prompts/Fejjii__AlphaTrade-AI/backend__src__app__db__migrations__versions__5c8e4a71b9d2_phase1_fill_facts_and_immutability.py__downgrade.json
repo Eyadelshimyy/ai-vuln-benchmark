@@ -1,0 +1,28 @@
+{
+  "repo": "Fejjii__AlphaTrade-AI",
+  "file": "backend/src/app/db/migrations/versions/5c8e4a71b9d2_phase1_fill_facts_and_immutability.py",
+  "function": "downgrade",
+  "line": 100,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `downgrade` function.",
+  "prompt_source": "def downgrade() -> None:\n    \"\"\"Implement the `downgrade` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def downgrade() -> None:\n    for statement in historical_immutability_uninstall_statements():\n        op.execute(statement)\n    op.drop_index(\"ix_execution_fill_facts_receipt\", table_name=\"execution_fill_facts\")\n    op.drop_table(\"execution_fill_facts\")\n    op.drop_column(\"risk_reservations\", \"converted_trade_slots\")\n    op.drop_column(\"execution_transitions\", \"unit_price\")",
+  "module_source": "\"\"\"phase 1 fill facts, transition price, and historical immutability\n\nRevision ID: 5c8e4a71b9d2\nRevises: 4f0a2c9b71e8\nCreate Date: 2026-09-15 21:45:00.000000\n\"\"\"\n\nfrom __future__ import annotations\n\nfrom collections.abc import Sequence\n\nimport sqlalchemy as sa\nfrom alembic import op\n\nfrom app.db.historical_immutability import (\n    historical_immutability_install_statements,\n    historical_immutability_uninstall_statements,\n)\n\nrevision: str = \"5c8e4a71b9d2\"\ndown_revision: str | None = \"4f0a2c9b71e8\"\nbranch_labels: str | Sequence[str] | None = None\ndepends_on: str | Sequence[str] | None = None\n\n_TS = sa.DateTime(timezone=True)\n\n\ndef upgrade() -> None:\n    op.add_column(\n        \"execution_transitions\",\n        sa.Column(\"unit_price\", sa.Numeric(20, 8), nullable=True),\n    )\n    op.add_column(\n        \"risk_reservations\",\n        sa.Column(\n            \"converted_trade_slots\",\n            sa.Integer(),\n            nullable=False,\n            server_default=\"0\",\n        ),\n    )\n    op.create_table(\n        \"execution_fill_facts\",\n        sa.Column(\"organization_id\", sa.Uuid(), nullable=False),\n        sa.Column(\"command_id\", sa.Uuid(), nullable=False),\n        sa.Column(\"receipt_id\", sa.Uuid(), nullable=False),\n        sa.Column(\"venue_source\", sa.String(length=80), nullable=False),\n        sa.Column(\"source_fill_identity\", sa.String(length=128), nullable=False),\n        sa.Column(\"quantity\", sa.Numeric(20, 8), nullable=False),\n        sa.Column(\"price\", sa.Numeric(20, 8), nullable=False),\n        sa.Column(\"unit\", sa.String(length=32), nullable=False),\n        sa.Column(\"occurred_at\", _TS, nullable=False),\n        sa.Column(\"content_hash\", sa.String(length=64), nullable=False),\n        sa.Column(\"id\", sa.Uuid(), nullable=False),\n        sa.Column(\n            \"created_at\",\n            _TS,\n            server_default=sa.text(\"CURRENT_TIMESTAMP\"),\n            nullable=False,\n        ),\n        sa.Column(\n            \"updated_at\",\n            _TS,\n            server_default=sa.text(\"CURRENT_TIMESTAMP\"),\n            nullable=False,\n        ),\n        sa.CheckConstraint(\"price > 0\", name=\"ck_execution_fill_fact_price\"),\n        sa.CheckConstraint(\"quantity > 0\", name=\"ck_execution_fill_fact_quantity\"),\n        sa.CheckConstraint(\n            \"length(content_hash) = 64\",\n            name=\"ck_execution_fill_fact_hash_length\",\n        ),\n        sa.ForeignKeyConstraint(\n            [\"command_id\"],\n            [\"execution_commands.id\"],\n            name=\"fk_execution_fill_fact_command\",\n        ),\n        sa.ForeignKeyConstraint([\"organization_id\"], [\"organizations.id\"]),\n        sa.ForeignKeyConstraint(\n            [\"receipt_id\"],\n            [\"execution_receipts.id\"],\n            name=\"fk_execution_fill_fact_receipt\",\n        ),\n        sa.PrimaryKeyConstraint(\"id\"),\n        sa.UniqueConstraint(\n            \"receipt_id\",\n            \"source_fill_identity\",\n            name=\"uq_execution_fill_fact_source\",\n        ),\n    )\n    op.create_index(\n        \"ix_execution_fill_facts_receipt\",\n        \"execution_fill_facts\",\n        [\"receipt_id\"],\n    )\n    for statement in historical_immutability_install_statements():\n        op.execute(statement)\n\n\ndef downgrade() -> None:\n    for statement in historical_immutability_uninstall_statements():\n        op.execute(statement)\n    op.drop_index(\"ix_execution_fill_facts_receipt\", table_name=\"execution_fill_facts\")\n    op.drop_table(\"execution_fill_facts\")\n    op.drop_column(\"risk_reservations\", \"converted_trade_slots\")\n    op.drop_column(\"execution_transitions\", \"unit_price\")\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 7
+    },
+    "ai_commit": "5b398eb59802",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      100,
+      106
+    ]
+  }
+}
