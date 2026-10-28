@@ -10,6 +10,87 @@ Benchmark of AI-Generated Vulnerabilities in Code"** (Eyad Hassan
 Abdelfatah, GIU Cairo, Cybersecurity B.Sc., supervised by Dr. Marwa Zamzam
 and Dr. Ahmed Maghawry).
 
+---
+
+## Current research state (authoritative — 2026-10)
+
+This section is the entry point for a new reader and reflects the actual frozen
+evidence in this repository. Where it differs from the older methodology prose
+below, this section governs.
+
+### Workstreams and their status
+- **RQ1 — function-level execution confirmation (DONE, frozen).** An execution
+  oracle confirms a vulnerability only when a deterministic exploit produces an
+  observable security failure (see `PREDICATES.md`, `validation/TAXONOMY.md`).
+- **Reachability — application-level attacker reach (PARTIAL).** A separate axis:
+  whether a real HTTP entry point drives attacker input to the confirmed sink.
+  Mostly static-screen + manual tracing; one v1 case and one v2 case demonstrated
+  end-to-end (see `validation/reachability/REACH_LEDGER.md`,
+  `validation/corpus_v2/REACHABILITY_V2.md`).
+- **RQ2 — LLM detectors vs execution ground truth (PREPARED, NOT RUN).** The label
+  set, panel, and protocol are frozen (`validation/rq2/`), but **no paid detector
+  run has been executed**. Do not read any detector leaderboard as a completed result.
+
+### Frozen baselines (do not restate differently)
+- **V1: 160 confirmed candidates** (name-deduped to 149 functions; 156 source-unique).
+  By firing class (`exec_cwe`): CWE-22 130, CWE-918 26, CWE-78 4.
+- **V2 (application-level corpus): 37 confirmed candidates** out of 560 records.
+  By class: **CWE-22 30, CWE-89 3, CWE-918 4**. (V2's CWE-89 are the project's first
+  execution-confirmed SQL cases; see `validation/TIER2_COVERAGE_AUDIT.md`.)
+- Counting units differ (candidate rows vs name-deduped functions vs source-unique);
+  always state the unit — see the COUNTING-UNIT KEY in `validation/TAXONOMY.md`.
+
+### Confirmed vs reachable vs inconclusive (keep distinct)
+- **CONFIRMED** = execution proved exploitability of the function under attacker-controlled
+  input. It is *conditional* exploitability, not proof of attacker reach.
+- **Reachability verdicts** (`APP_CONFIRMED` / `REACHABILITY_SUPPORTED` / `REFUTED` /
+  `INCONCLUSIVE`) are a separate axis; `INCONCLUSIVE` is never counted as a negative.
+- Most confirmed CWE-22 findings are "the function opens a caller-supplied path"
+  (DIRECT_CALLER_PATH) — exploitable only if an untrusted caller reaches them
+  (`validation/rq1/EXPOSURE_CLASS.md`).
+
+### Reproduction (verified in this environment)
+- **V1 = 160** reproduces exactly from a clean checkout **in a reconstructed
+  OpenCV-absent environment** (not necessarily the original historical one): a
+  candidate that imports `cv2` stays COULD_NOT_EXECUTE, matching the frozen set.
+  With OpenCV present it yields 161 (one extra SSRF case) — see
+  `validation/REPRODUCIBILITY_FINDING.md`.
+  ```
+  python3 analysis/corpus_census.py --tier2 --out /tmp/v1.json   # expect 160 confirmed, OpenCV absent
+  python3 tier2/test_soundness.py                                # oracle soundness: 0 FP / 0 miss
+  ```
+- **V2 public artifact reproduces 33 of the 37** confirmations from the published
+  candidate records alone (CWE-22 26, CWE-89 3, CWE-918 4). The other **4 require
+  locally supplied third-party source** that is *not* bundled (see below). The
+  canonical V2 baseline remains **37**; the public artifact does not reproduce 37/37 on its own.
+  ```
+  python3 analysis/corpus_census.py --tier2 --root calibration/mined_prompts_v2 --out /tmp/v2.json  # 33 public-only
+  ```
+
+### Limitations, provenance & public release
+- **Four V2 confirmations are source-dependent** (repos: EdgeGuard-Knowledge-Graph,
+  dipcatcher, autoclip, -estate-ez). Their full `_repo_src` trees are **deliberately
+  not bundled**: two are MIT, two are `NOASSERTION` (no clear redistribution license).
+  `validation/EXTERNAL_SOURCE_MANIFEST.json` documents what a researcher must supply.
+  A source manifest identifies dependencies; it does **not** grant redistribution rights.
+- **Three V2 non-confirmed verdict differences** (environment-sensitive CNE↔NOT_TRIGGERED,
+  none affecting the 37) are documented in `validation/PHASE_F_V2_REPRODUCTION.md`.
+- Sampling is **sink-selected** (functions were mined because they contain a security
+  sink); results describe that population, not AI-generated code in general.
+
+### Where the evidence lives
+- `corpus_census_pinned.json` / `corpus_census_reproduced.json` — frozen V1 census + clean-clone reproduction.
+- `corpus_census_v2.json` — frozen V2 census (560 records, 37 confirmed).
+- `calibration/mined_prompts/`, `calibration/mined_prompts_v2/` — the candidate corpora (AI-attributed records).
+- `validation/TAXONOMY.md` — label taxonomy, counting-unit key, confirmability states.
+- `validation/reachability/REACH_LEDGER.json`/`.md` — canonical reachability ledger (197 records).
+- `validation/TIER2_COVERAGE_AUDIT.md` — per-CWE strategy coverage (8 strategies).
+- `validation/rq1/`, `validation/rq2/` — RQ1 generator analysis; RQ2 prepared protocol/label set.
+- `validation/EVIDENCE_INDEX.md` — claim → artifact → reproduction map.
+- `validation/REPRODUCE.md` — full reproduction recipe and execution-profile boundary.
+
+---
+
 ## The gap this project addresses
 
 The literature review behind this thesis (`docs/Literature_Review_Sheet.*`)
