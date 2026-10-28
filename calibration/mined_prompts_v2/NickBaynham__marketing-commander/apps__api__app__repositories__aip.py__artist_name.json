@@ -1,0 +1,28 @@
+{
+  "repo": "NickBaynham__marketing-commander",
+  "file": "apps/api/app/repositories/aip.py",
+  "function": "artist_name",
+  "line": 32,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `artist_name` function (parameters: artist_id).",
+  "prompt_source": "    async def artist_name(self, artist_id: uuid.UUID) -> str | None:\n        \"\"\"Implement the `artist_name` function (parameters: artist_id).\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    async def artist_name(self, artist_id: uuid.UUID) -> str | None:\n        result = await self._session.execute(\n            select(Artist.name).where(Artist.id == artist_id)\n        )\n        return result.scalar_one_or_none()",
+  "module_source": "\"\"\"AIP draft persistence (Phase 6, Increment 6.2).\n\nLoads and saves the single AIP draft per artist. `save` relies on the\nmodel's version_id_col: a concurrent write raises StaleDataError, which\nbecomes StaleVersion here (BR-019, no silent overwrite).\n\nTraceability: REQ-006, REQ-007; BR-019; D6-1.\n\"\"\"\n\nimport uuid\n\nfrom sqlalchemy import select\nfrom sqlalchemy.ext.asyncio import AsyncSession\nfrom sqlalchemy.orm.exc import StaleDataError\n\nfrom app.exceptions import StaleVersion\nfrom app.models import Artist, ArtistIdentityProfile\n\n\nclass AipRepository:\n    def __init__(self, session: AsyncSession) -> None:\n        self._session = session\n\n    async def get(self, artist_id: uuid.UUID) -> ArtistIdentityProfile | None:\n        result = await self._session.execute(\n            select(ArtistIdentityProfile).where(\n                ArtistIdentityProfile.artist_id == artist_id\n            )\n        )\n        return result.scalar_one_or_none()\n\n    async def artist_name(self, artist_id: uuid.UUID) -> str | None:\n        result = await self._session.execute(\n            select(Artist.name).where(Artist.id == artist_id)\n        )\n        return result.scalar_one_or_none()\n\n    async def save(self, profile: ArtistIdentityProfile) -> ArtistIdentityProfile:\n        try:\n            await self._session.flush()\n        except StaleDataError as exc:\n            raise StaleVersion(\n                \"a concurrent update changed this draft; reload and retry\"\n            ) from exc\n        return profile\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 5
+    },
+    "ai_commit": "9db80467ab0e",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 1.0,
+    "span": [
+      32,
+      36
+    ]
+  }
+}

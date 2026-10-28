@@ -177,3 +177,5 @@ if __name__ == "__main__":
         except Exception as e:  # noqa: BLE001
             print(f"ERROR {fn.__name__}: {type(e).__name__}: {e}")
     print(f"\n{passed}/{len(fns)} tests passed")
+    import sys
+    sys.exit(0 if passed == len(fns) else 1)   # non-zero on failure so scripts/CI notice

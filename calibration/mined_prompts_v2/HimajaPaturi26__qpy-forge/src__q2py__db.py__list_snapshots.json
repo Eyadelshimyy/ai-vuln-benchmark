@@ -1,0 +1,28 @@
+{
+  "repo": "HimajaPaturi26__qpy-forge",
+  "file": "src/q2py/db.py",
+  "function": "list_snapshots",
+  "line": 95,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `list_snapshots` function (parameters: limit).",
+  "prompt_source": "def list_snapshots(limit: int = 20) -> list[dict[str, Any]]:\n    \"\"\"Implement the `list_snapshots` function (parameters: limit).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def list_snapshots(limit: int = 20) -> list[dict[str, Any]]:\n    with connect() as conn:\n        rows = conn.execute(\n            \"select id, created_at, corpus_version, corpus_hash, commit_sha, payload from metric_snapshots order by id desc limit ?\",\n            (limit,),\n        ).fetchall()\n    history = []\n    for row in rows:\n        payload = json.loads(row[\"payload\"])\n        history.append(\n            {\n                \"id\": row[\"id\"],\n                \"created_at\": row[\"created_at\"],\n                \"corpus_version\": row[\"corpus_version\"],\n                \"corpus_hash\": row[\"corpus_hash\"],\n                \"commit\": row[\"commit_sha\"],\n                \"semantic_accuracy\": payload.get(\"semantic_accuracy\"),\n                \"sample_size\": payload.get(\"sample_size\"),\n                \"target_met\": payload.get(\"target_met\"),\n            }\n        )\n    return history",
+  "module_source": "\"\"\"SQLite persistence for translation history and metric snapshots.\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nimport os\nimport sqlite3\nfrom datetime import UTC, datetime\nfrom pathlib import Path\nfrom typing import Any\n\n_SCHEMA = \"\"\"\ncreate table if not exists events (\n  id integer primary key,\n  created_at text not null,\n  kind text not null,\n  source text,\n  status text,\n  support text,\n  payload text not null\n);\ncreate table if not exists metric_snapshots (\n  id integer primary key,\n  created_at text not null,\n  corpus_version text not null,\n  corpus_hash text not null,\n  commit_sha text,\n  payload text not null\n);\n\"\"\"\n\n\ndef db_path() -> Path:\n    override = os.environ.get(\"Q2PY_DB\")\n    path = Path(override) if override else Path(\"data\") / \"q2py.sqlite\"\n    path.parent.mkdir(parents=True, exist_ok=True)\n    return path\n\n\ndef connect() -> sqlite3.Connection:\n    conn = sqlite3.connect(db_path())\n    conn.row_factory = sqlite3.Row\n    conn.executescript(_SCHEMA)\n    return conn\n\n\ndef _now() -> str:\n    return datetime.now(UTC).isoformat()\n\n\ndef record_event(kind: str, source: str, status: str, support: str, payload: dict[str, Any]) -> int:\n    with connect() as conn:\n        cursor = conn.execute(\n            \"insert into events (created_at, kind, source, status, support, payload) values (?, ?, ?, ?, ?, ?)\",\n            (_now(), kind, source[:4000], status, support, json.dumps(payload)),\n        )\n        row_id = cursor.lastrowid\n        if row_id is None:\n            raise RuntimeError(\"sqlite insert did not return a row id\")\n        return int(row_id)\n\n\ndef list_events(limit: int = 50) -> list[dict[str, Any]]:\n    with connect() as conn:\n        rows = conn.execute(\n            \"select id, created_at, kind, source, status, support from events order by id desc limit ?\",\n            (limit,),\n        ).fetchall()\n    return [dict(row) for row in rows]\n\n\ndef get_event(event_id: int) -> dict[str, Any] | None:\n    with connect() as conn:\n        row = conn.execute(\"select * from events where id = ?\", (event_id,)).fetchone()\n    if row is None:\n        return None\n    data = dict(row)\n    data[\"payload\"] = json.loads(data[\"payload\"])\n    return data\n\n\ndef save_snapshot(report: dict[str, Any]) -> int:\n    stored = {key: value for key, value in report.items() if key != \"rows\"}\n    with connect() as conn:\n        cursor = conn.execute(\n            \"insert into metric_snapshots (created_at, corpus_version, corpus_hash, commit_sha, payload) values (?, ?, ?, ?, ?)\",\n            (_now(), str(report.get(\"corpus_version\")), str(report.get(\"corpus_hash\")), str(report.get(\"commit\")), json.dumps(stored)),\n        )\n        row_id = cursor.lastrowid\n        if row_id is None:\n            raise RuntimeError(\"sqlite insert did not return a row id\")\n        return int(row_id)\n\n\ndef list_snapshots(limit: int = 20) -> list[dict[str, Any]]:\n    with connect() as conn:\n        rows = conn.execute(\n            \"select id, created_at, corpus_version, corpus_hash, commit_sha, payload from metric_snapshots order by id desc limit ?\",\n            (limit,),\n        ).fetchall()\n    history = []\n    for row in rows:\n        payload = json.loads(row[\"payload\"])\n        history.append(\n            {\n                \"id\": row[\"id\"],\n                \"created_at\": row[\"created_at\"],\n                \"corpus_version\": row[\"corpus_version\"],\n                \"corpus_hash\": row[\"corpus_hash\"],\n                \"commit\": row[\"commit_sha\"],\n                \"semantic_accuracy\": payload.get(\"semantic_accuracy\"),\n                \"sample_size\": payload.get(\"sample_size\"),\n                \"target_met\": payload.get(\"target_met\"),\n            }\n        )\n    return history\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 22
+    },
+    "ai_commit": "71f732b40c90",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      95,
+      116
+    ]
+  }
+}

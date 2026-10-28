@@ -1,0 +1,28 @@
+{
+  "repo": "nibrocsolutions__wifi-monitor",
+  "file": "backend/app/history.py",
+  "function": "_save",
+  "line": 59,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `_save` function.",
+  "prompt_source": "    def _save(self) -> None:\n        \"\"\"Implement the `_save` function.\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    def _save(self) -> None:\n        directory = os.path.dirname(self.path)\n        if directory:\n            os.makedirs(directory, exist_ok=True)\n        tmp = f\"{self.path}.tmp\"\n        with open(tmp, \"w\", encoding=\"utf-8\") as handle:\n            json.dump(self._seen, handle, indent=2, sort_keys=True)\n        os.replace(tmp, self.path)",
+  "module_source": "from __future__ import annotations\n\nimport json\nimport os\nimport threading\nimport time\nfrom datetime import datetime, timezone\nfrom typing import Any\n\nfrom .models import LanDevice, TrafficPoint\n\n\ndef _now_iso() -> str:\n    return datetime.now(timezone.utc).isoformat()\n\n\nclass HistoryStore:\n    def __init__(self, maxlen: int = 180) -> None:\n        self.maxlen = maxlen\n        self._points: list[TrafficPoint] = []\n        self._lock = threading.Lock()\n\n    def add(self, point: TrafficPoint) -> None:\n        with self._lock:\n            self._points.append(point)\n            if len(self._points) > self.maxlen:\n                self._points = self._points[-self.maxlen :]\n\n    def snapshot(self) -> list[TrafficPoint]:\n        with self._lock:\n            return list(self._points)\n\n\nclass DeviceRegistry:\n    def __init__(self, path: str) -> None:\n        self.path = path\n        self._lock = threading.Lock()\n        self._seen: dict[str, dict[str, Any]] = {}\n        self._loaded = False\n        self._boot = time.time()\n\n    def _key(self, device: LanDevice) -> str:\n        return (device.mac or device.ip or \"\").lower()\n\n    def _load(self) -> None:\n        if self._loaded:\n            return\n        self._loaded = True\n        try:\n            with open(self.path, \"r\", encoding=\"utf-8\") as handle:\n                payload = json.load(handle)\n            if isinstance(payload, dict):\n                self._seen = payload\n        except OSError:\n            self._seen = {}\n        except json.JSONDecodeError:\n            self._seen = {}\n\n    def _save(self) -> None:\n        directory = os.path.dirname(self.path)\n        if directory:\n            os.makedirs(directory, exist_ok=True)\n        tmp = f\"{self.path}.tmp\"\n        with open(tmp, \"w\", encoding=\"utf-8\") as handle:\n            json.dump(self._seen, handle, indent=2, sort_keys=True)\n        os.replace(tmp, self.path)\n\n    def observe(self, devices: list[LanDevice]) -> list[LanDevice]:\n        with self._lock:\n            self._load()\n            now = _now_iso()\n            updated: list[LanDevice] = []\n            changed = False\n            for device in devices:\n                key = self._key(device)\n                if not key:\n                    updated.append(device)\n                    continue\n                record = self._seen.get(key)\n                if record is None:\n                    record = {\"first_seen\": now, \"last_seen\": now}\n                    self._seen[key] = record\n                    changed = True\n                    is_new = True\n                else:\n                    record[\"last_seen\"] = now\n                    changed = True\n                    first = record.get(\"first_seen\")\n                    is_new = False\n                    if first:\n                        try:\n                            first_ts = datetime.fromisoformat(first).timestamp()\n                            is_new = (time.time() - first_ts) < 600 and (\n                                time.time() - self._boot\n                            ) < 600\n                        except ValueError:\n                            is_new = False\n                updated.append(\n                    device.model_copy(\n                        update={\n                            \"first_seen\": record.get(\"first_seen\"),\n                            \"last_seen\": record.get(\"last_seen\"),\n                            \"new\": is_new and not device.is_self and not device.is_gateway,\n                        }\n                    )\n                )\n            if changed:\n                try:\n                    self._save()\n                except OSError:\n                    pass\n            return updated\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 8
+    },
+    "ai_commit": "16069abcebed",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      59,
+      66
+    ]
+  }
+}

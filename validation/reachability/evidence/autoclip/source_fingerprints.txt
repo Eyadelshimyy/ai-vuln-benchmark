@@ -1,0 +1,3 @@
+5c45c4c854888443e153489fed116ff633474632b69a35cad0fed9bf3d898377  /home/eyad/ai-vuln-benchmark/calibration/mined_prompts_v2/ayushdad609-code__autoclip/_repo_src/backend/api/v1/projects.py
+711a881fc070959d807cc7080a4a5a9534c7d9a2e65d490a23265f22bc906388  /home/eyad/ai-vuln-benchmark/calibration/mined_prompts_v2/ayushdad609-code__autoclip/_repo_src/backend/core/path_utils.py
+d1cf79b2fc8e65d8869086fc6efa5b46e70d8d7db41f1b624b88b59bd5c3b1c7  /home/eyad/ai-vuln-benchmark/calibration/mined_prompts_v2/ayushdad609-code__autoclip/_repo_src/backend/services/data_sync_service.py

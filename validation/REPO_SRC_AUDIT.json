@@ -1,0 +1,478 @@
+{
+  "v1": {
+    "2100preet__stockscanner": {
+      "exists": true,
+      "tracked_files": 142,
+      "total_files": 197,
+      "untracked_source": false,
+      "confirmed_candidates": 4,
+      "role": "needed+tracked"
+    },
+    "BerriAI__litellm": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 8360,
+      "untracked_source": true,
+      "confirmed_candidates": 1,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "Chuqonu__epi-preclean-patent-monitor": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 26,
+      "untracked_source": true,
+      "confirmed_candidates": 1,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "Cognition-Partner-Workshops__otterworks-workshop-2610": {
+      "exists": true,
+      "tracked_files": 235,
+      "total_files": 235,
+      "untracked_source": false,
+      "confirmed_candidates": 2,
+      "role": "needed+tracked"
+    },
+    "DeepCivic__womblex": {
+      "exists": true,
+      "tracked_files": 315,
+      "total_files": 406,
+      "untracked_source": false,
+      "confirmed_candidates": 6,
+      "role": "needed+tracked"
+    },
+    "FrancescoCiulla__NLWeb": {
+      "exists": true,
+      "tracked_files": 147,
+      "total_files": 147,
+      "untracked_source": false,
+      "confirmed_candidates": 2,
+      "role": "needed+tracked"
+    },
+    "Gunrunner444__BugForge": {
+      "exists": true,
+      "tracked_files": 750,
+      "total_files": 1004,
+      "untracked_source": false,
+      "confirmed_candidates": 1,
+      "role": "needed+tracked"
+    },
+    "PrjBbrosa__data-analyzer": {
+      "exists": true,
+      "tracked_files": 1211,
+      "total_files": 1289,
+      "untracked_source": false,
+      "confirmed_candidates": 5,
+      "role": "needed+tracked"
+    },
+    "ProtossBlaster__leapmotor-mate": {
+      "exists": true,
+      "tracked_files": 693,
+      "total_files": 756,
+      "untracked_source": false,
+      "confirmed_candidates": 4,
+      "role": "needed+tracked"
+    },
+    "TracecatHQ__tracecat": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 2127,
+      "untracked_source": true,
+      "confirmed_candidates": 1,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "VibeBB__fpga-agent": {
+      "exists": true,
+      "tracked_files": 102,
+      "total_files": 135,
+      "untracked_source": false,
+      "confirmed_candidates": 5,
+      "role": "needed+tracked"
+    },
+    "VocaHQ__vocalinux": {
+      "exists": true,
+      "tracked_files": 221,
+      "total_files": 280,
+      "untracked_source": false,
+      "confirmed_candidates": 1,
+      "role": "needed+tracked"
+    },
+    "aditya9729__roboeval_challenge": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 77,
+      "untracked_source": true,
+      "confirmed_candidates": 6,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "airbytehq__airbyte-python-cdk": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 835,
+      "untracked_source": true,
+      "confirmed_candidates": 1,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "alexandrelheinen__clave": {
+      "exists": true,
+      "tracked_files": 208,
+      "total_files": 274,
+      "untracked_source": false,
+      "confirmed_candidates": 4,
+      "role": "needed+tracked"
+    },
+    "alexandrelheinen__fret": {
+      "exists": true,
+      "tracked_files": 189,
+      "total_files": 229,
+      "untracked_source": false,
+      "confirmed_candidates": 4,
+      "role": "needed+tracked"
+    },
+    "atanasvasilevjourney__ORBIS-EQUITY-": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 243,
+      "untracked_source": true,
+      "confirmed_candidates": 3,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "bermuda1023__ExposureEclipse": {
+      "exists": true,
+      "tracked_files": 167,
+      "total_files": 167,
+      "untracked_source": false,
+      "confirmed_candidates": 10,
+      "role": "needed+tracked"
+    },
+    "bramstroker__homeassistant-powercalc": {
+      "exists": true,
+      "tracked_files": 558,
+      "total_files": 566,
+      "untracked_source": false,
+      "confirmed_candidates": 1,
+      "role": "needed+tracked"
+    },
+    "briandconnelly__skills": {
+      "exists": true,
+      "tracked_files": 29,
+      "total_files": 29,
+      "untracked_source": false,
+      "confirmed_candidates": 1,
+      "role": "needed+tracked"
+    },
+    "c-wenlong__blenderkc": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 104,
+      "untracked_source": true,
+      "confirmed_candidates": 8,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "clarmso__openings.info": {
+      "exists": true,
+      "tracked_files": 9,
+      "total_files": 16,
+      "untracked_source": false,
+      "confirmed_candidates": 2,
+      "role": "needed+tracked"
+    },
+    "danielreuter__research-notes": {
+      "exists": true,
+      "tracked_files": 214,
+      "total_files": 214,
+      "untracked_source": false,
+      "confirmed_candidates": 5,
+      "role": "needed+tracked"
+    },
+    "gcnewbief__Log-Grabber": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 8,
+      "untracked_source": true,
+      "confirmed_candidates": 1,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "hdzwzqbxlk__ComfyUI-LK-Model_Auto-Matching": {
+      "exists": true,
+      "tracked_files": 27,
+      "total_files": 33,
+      "untracked_source": false,
+      "confirmed_candidates": 1,
+      "role": "needed+tracked"
+    },
+    "joemccann__radon": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 1532,
+      "untracked_source": true,
+      "confirmed_candidates": 2,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "kamoras__civitas": {
+      "exists": true,
+      "tracked_files": 747,
+      "total_files": 927,
+      "untracked_source": false,
+      "confirmed_candidates": 19,
+      "role": "needed+tracked"
+    },
+    "ljofreflor__jobbot": {
+      "exists": true,
+      "tracked_files": 386,
+      "total_files": 386,
+      "untracked_source": false,
+      "confirmed_candidates": 4,
+      "role": "needed+tracked"
+    },
+    "loveRhythm1990__mini-pi": {
+      "exists": true,
+      "tracked_files": 10,
+      "total_files": 10,
+      "untracked_source": false,
+      "confirmed_candidates": 5,
+      "role": "needed+tracked"
+    },
+    "markus-michalski__project-hub": {
+      "exists": true,
+      "tracked_files": 41,
+      "total_files": 48,
+      "untracked_source": false,
+      "confirmed_candidates": 3,
+      "role": "needed+tracked"
+    },
+    "mikelane__pytest-gremlins": {
+      "exists": true,
+      "tracked_files": 304,
+      "total_files": 361,
+      "untracked_source": false,
+      "confirmed_candidates": 3,
+      "role": "needed+tracked"
+    },
+    "nthplusio__skills": {
+      "exists": true,
+      "tracked_files": 42,
+      "total_files": 46,
+      "untracked_source": false,
+      "confirmed_candidates": 2,
+      "role": "needed+tracked"
+    },
+    "oamin__fpl-engine": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 491,
+      "untracked_source": true,
+      "confirmed_candidates": 3,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "paulosalem__ellements": {
+      "exists": true,
+      "tracked_files": 179,
+      "total_files": 199,
+      "untracked_source": false,
+      "confirmed_candidates": 3,
+      "role": "needed+tracked"
+    },
+    "qndelmar__tbnano": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 888,
+      "untracked_source": true,
+      "confirmed_candidates": 3,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "quantam101__profitenginev5": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 323,
+      "untracked_source": true,
+      "confirmed_candidates": 5,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "quantam101__tradegate2": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 76,
+      "untracked_source": true,
+      "confirmed_candidates": 2,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "royles__AppliedAIModelTraining": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 116,
+      "untracked_source": true,
+      "confirmed_candidates": 3,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "saltyscott0521__tracebi": {
+      "exists": true,
+      "tracked_files": 224,
+      "total_files": 289,
+      "untracked_source": false,
+      "confirmed_candidates": 7,
+      "role": "needed+tracked"
+    },
+    "shizukutanaka__Slice": {
+      "exists": true,
+      "tracked_files": 243,
+      "total_files": 316,
+      "untracked_source": false,
+      "confirmed_candidates": 2,
+      "role": "needed+tracked"
+    },
+    "tonezzz__chaba": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 571,
+      "untracked_source": true,
+      "confirmed_candidates": 1,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "trsdn__macos-notarization-broker": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 12,
+      "untracked_source": true,
+      "confirmed_candidates": 2,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "waltfilipe__sada-test": {
+      "exists": true,
+      "tracked_files": 48,
+      "total_files": 55,
+      "untracked_source": false,
+      "confirmed_candidates": 5,
+      "role": "needed+tracked"
+    },
+    "wstomber__devinexecdemo": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 27,
+      "untracked_source": true,
+      "confirmed_candidates": 4,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "x-uuid__syforce": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 26,
+      "untracked_source": true,
+      "confirmed_candidates": 1,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "z-mio__parse_hub_bot": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 100,
+      "untracked_source": true,
+      "confirmed_candidates": 1,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    }
+  },
+  "v2": {
+    "BerniceZimidzi-code__foodies-sop-rag-system": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 13,
+      "untracked_source": true,
+      "confirmed_candidates": 1,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "Kopanov__EdgeGuard-Knowledge-Graph": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 363,
+      "untracked_source": true,
+      "confirmed_candidates": 5,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "NotoriousPOG__sentinel-agent": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 136,
+      "untracked_source": true,
+      "confirmed_candidates": 1,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "Wazor2__tiger-ai-devin": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 48,
+      "untracked_source": true,
+      "confirmed_candidates": 5,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "artificial-hedge__dipcatcher": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 19695,
+      "untracked_source": true,
+      "confirmed_candidates": 12,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "ayushdad609-code__autoclip": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 648,
+      "untracked_source": true,
+      "confirmed_candidates": 2,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "gyrinx-app__gyrinx": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 1816,
+      "untracked_source": true,
+      "confirmed_candidates": 2,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "nagibator9986__ccupractice": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 64,
+      "untracked_source": true,
+      "confirmed_candidates": 1,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "nibrocsolutions__wifi-monitor": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 15,
+      "untracked_source": true,
+      "confirmed_candidates": 1,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "spectral-butters__hacky-movies": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 27,
+      "untracked_source": true,
+      "confirmed_candidates": 2,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "susu09658-debug__plant-disease-detection": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 67,
+      "untracked_source": true,
+      "confirmed_candidates": 2,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "th0to__inventory_app": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 19,
+      "untracked_source": true,
+      "confirmed_candidates": 1,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    },
+    "zorntyler540-byte__-estate-ez": {
+      "exists": true,
+      "tracked_files": 0,
+      "total_files": 201,
+      "untracked_source": true,
+      "confirmed_candidates": 2,
+      "role": "untracked (supplemental-only; 160 reproduce from embedded candidate JSON source)"
+    }
+  }
+}

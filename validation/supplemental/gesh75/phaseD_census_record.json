@@ -1,0 +1,28 @@
+{
+  "file": "gesh75__netlog-ai/src__ai_log_analyzer__suppression.py__load_topology.json",
+  "cwes": [
+    "CWE-22"
+  ],
+  "verdict": "TRIGGERED",
+  "exec_cwe": "CWE-22",
+  "executable": true,
+  "triggered": true,
+  "confirmed": true,
+  "confirmed_cwe": "CWE-22",
+  "tier2_evidence": {
+    "params_tried": [
+      "manifest",
+      "path"
+    ],
+    "diag_buckets": {
+      "manifest": "EXECUTED_NO_SINK"
+    },
+    "error": null,
+    "param": "path",
+    "payload": "/tmp/tier2_proof_f38j9295/secret_a13ff2ae316d.txt",
+    "proof": "attacker-controlled input opened our out-of-tree planted file /tmp/tier2_proof_f38j9295/secret_a13ff2ae316d.txt (proven by live execution trace; read-traversal, no output echo required)",
+    "sink": "open",
+    "n_attempts": 2
+  },
+  "error": null
+}

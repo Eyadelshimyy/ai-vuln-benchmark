@@ -1,0 +1,1257 @@
+{
+  "pairs": [
+    {
+      "corpus": "v1",
+      "file": "FrancescoCiulla__NLWeb/code__python__misc__podcast_scraper.py__get_page.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__FrancescoCiulla__NLWeb/code__python__misc__podcast_scraper.py__get_page.json",
+      "twin_root_fixed": "v1__FrancescoCiulla__NLWeb/code__python__misc__podcast_scraper.py__get_page__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "atanasvasilevjourney__ORBIS-EQUITY-/pipeline__ingest__universe.py___scrape_sp_tickers.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__atanasvasilevjourney__ORBIS-EQUITY-/pipeline__ingest__universe.py___scrape_sp_tickers.json",
+      "twin_root_fixed": "v1__atanasvasilevjourney__ORBIS-EQUITY-/pipeline__ingest__universe.py___scrape_sp_tickers__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "atanasvasilevjourney__ORBIS-EQUITY-/pipeline__ingest__us_index_universe.py___scrape_table.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__atanasvasilevjourney__ORBIS-EQUITY-/pipeline__ingest__us_index_universe.py___scrape_table.json",
+      "twin_root_fixed": "v1__atanasvasilevjourney__ORBIS-EQUITY-/pipeline__ingest__us_index_universe.py___scrape_table__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "bermuda1023__ExposureEclipse/backend__app__services__jma_typhoon.py___get_json.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__bermuda1023__ExposureEclipse/backend__app__services__jma_typhoon.py___get_json.json",
+      "twin_root_fixed": "v1__bermuda1023__ExposureEclipse/backend__app__services__jma_typhoon.py___get_json__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "bermuda1023__ExposureEclipse/backend__app__services__marine_obs.py___nws_get_absolute.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__bermuda1023__ExposureEclipse/backend__app__services__marine_obs.py___nws_get_absolute.json",
+      "twin_root_fixed": "v1__bermuda1023__ExposureEclipse/backend__app__services__marine_obs.py___nws_get_absolute__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "bermuda1023__ExposureEclipse/backend__app__services__nhc_gis.py___download.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__bermuda1023__ExposureEclipse/backend__app__services__nhc_gis.py___download.json",
+      "twin_root_fixed": "v1__bermuda1023__ExposureEclipse/backend__app__services__nhc_gis.py___download__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "bermuda1023__ExposureEclipse/backend__app__services__nhc_gtwo.py___download_kml.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__bermuda1023__ExposureEclipse/backend__app__services__nhc_gtwo.py___download_kml.json",
+      "twin_root_fixed": "v1__bermuda1023__ExposureEclipse/backend__app__services__nhc_gtwo.py___download_kml__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "bermuda1023__ExposureEclipse/backend__scripts__build_event_evidence.py__fetch.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__bermuda1023__ExposureEclipse/backend__scripts__build_event_evidence.py__fetch.json",
+      "twin_root_fixed": "v1__bermuda1023__ExposureEclipse/backend__scripts__build_event_evidence.py__fetch__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "bermuda1023__ExposureEclipse/backend__scripts__build_onlevel_indices.py__fetch.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__bermuda1023__ExposureEclipse/backend__scripts__build_onlevel_indices.py__fetch.json",
+      "twin_root_fixed": "v1__bermuda1023__ExposureEclipse/backend__scripts__build_onlevel_indices.py__fetch__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "clarmso__openings.info/src__http.py___fetch.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__clarmso__openings.info/src__http.py___fetch.json",
+      "twin_root_fixed": "v1__clarmso__openings.info/src__http.py___fetch__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "danielreuter__research-notes/lanes__circuits-grid-models__labeller__silu_check.py__fetch.json",
+      "cwe": "CWE-22",
+      "fix_kind": "path_confine",
+      "twin_root_original": "v1__danielreuter__research-notes/lanes__circuits-grid-models__labeller__silu_check.py__fetch.json",
+      "twin_root_fixed": "v1__danielreuter__research-notes/lanes__circuits-grid-models__labeller__silu_check.py__fetch__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "danielreuter__research-notes/lanes__proofs-n2-guest__tools__refill.py__submit.json",
+      "cwe": "CWE-22",
+      "fix_kind": "path_confine",
+      "twin_root_original": "v1__danielreuter__research-notes/lanes__proofs-n2-guest__tools__refill.py__submit.json",
+      "twin_root_fixed": "v1__danielreuter__research-notes/lanes__proofs-n2-guest__tools__refill.py__submit__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "joemccann__radon/cloud__demo-vm__demo_vm_autodeploy.py__http_get.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__joemccann__radon/cloud__demo-vm__demo_vm_autodeploy.py__http_get.json",
+      "twin_root_fixed": "v1__joemccann__radon/cloud__demo-vm__demo_vm_autodeploy.py__http_get__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "kamoras__civitas/backend__app__pipeline__analyze__bluesky_utils.py__build_link_card.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__kamoras__civitas/backend__app__pipeline__analyze__bluesky_utils.py__build_link_card.json",
+      "twin_root_fixed": "v1__kamoras__civitas/backend__app__pipeline__analyze__bluesky_utils.py__build_link_card__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "kamoras__civitas/backend__app__pipeline__analyze__bluesky_utils.py__fetch_og_card.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__kamoras__civitas/backend__app__pipeline__analyze__bluesky_utils.py__fetch_og_card.json",
+      "twin_root_fixed": "v1__kamoras__civitas/backend__app__pipeline__analyze__bluesky_utils.py__fetch_og_card__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "kamoras__civitas/backend__scripts__build_county_district_crosswalk.py__download.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__kamoras__civitas/backend__scripts__build_county_district_crosswalk.py__download.json",
+      "twin_root_fixed": "v1__kamoras__civitas/backend__scripts__build_county_district_crosswalk.py__download__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "kamoras__civitas/backend__scripts__calibrate_lda_bill_match.py___get.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__kamoras__civitas/backend__scripts__calibrate_lda_bill_match.py___get.json",
+      "twin_root_fixed": "v1__kamoras__civitas/backend__scripts__calibrate_lda_bill_match.py___get__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "kamoras__civitas/backend__scripts__calibrate_position_confidence.py___csv.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__kamoras__civitas/backend__scripts__calibrate_position_confidence.py___csv.json",
+      "twin_root_fixed": "v1__kamoras__civitas/backend__scripts__calibrate_position_confidence.py___csv__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "kamoras__civitas/backend__scripts__fetch_state_leg_crosswalk.py__download.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__kamoras__civitas/backend__scripts__fetch_state_leg_crosswalk.py__download.json",
+      "twin_root_fixed": "v1__kamoras__civitas/backend__scripts__fetch_state_leg_crosswalk.py__download__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "nthplusio__skills/skills__scoussens-skills__visualize-spec__evals__fixtures__order-hooks__src__order_hooks__webhooks.py__send_webhook.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__nthplusio__skills/skills__scoussens-skills__visualize-spec__evals__fixtures__order-hooks__src__order_hooks__webhooks.py__send_webhook.json",
+      "twin_root_fixed": "v1__nthplusio__skills/skills__scoussens-skills__visualize-spec__evals__fixtures__order-hooks__src__order_hooks__webhooks.py__send_webhook__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "paulosalem__ellements/ellements-reporting__src__ellements__reporting__html_generation.py__export_html.json",
+      "cwe": "CWE-22",
+      "fix_kind": "path_confine",
+      "twin_root_original": "v1__paulosalem__ellements/ellements-reporting__src__ellements__reporting__html_generation.py__export_html.json",
+      "twin_root_fixed": "v1__paulosalem__ellements/ellements-reporting__src__ellements__reporting__html_generation.py__export_html__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "quantam101__profitenginev5/runtime__agent_impls__daily_digest.py___get_json.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__quantam101__profitenginev5/runtime__agent_impls__daily_digest.py___get_json.json",
+      "twin_root_fixed": "v1__quantam101__profitenginev5/runtime__agent_impls__daily_digest.py___get_json__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "quantam101__profitenginev5/runtime__agent_impls__daily_digest.py___post_json.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__quantam101__profitenginev5/runtime__agent_impls__daily_digest.py___post_json.json",
+      "twin_root_fixed": "v1__quantam101__profitenginev5/runtime__agent_impls__daily_digest.py___post_json__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "saltyscott0521__tracebi/tracebi___delivery.py__slack_notify.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__saltyscott0521__tracebi/tracebi___delivery.py__slack_notify.json",
+      "twin_root_fixed": "v1__saltyscott0521__tracebi/tracebi___delivery.py__slack_notify__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "saltyscott0521__tracebi/tracebi___updates.py___fetch.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__saltyscott0521__tracebi/tracebi___updates.py___fetch.json",
+      "twin_root_fixed": "v1__saltyscott0521__tracebi/tracebi___updates.py___fetch__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "waltfilipe__sada-test/scripts__download_club_logos.py__download_file.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__waltfilipe__sada-test/scripts__download_club_logos.py__download_file.json",
+      "twin_root_fixed": "v1__waltfilipe__sada-test/scripts__download_club_logos.py__download_file__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "waltfilipe__sada-test/scripts__download_club_logos.py__fetch_json.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__waltfilipe__sada-test/scripts__download_club_logos.py__fetch_json.json",
+      "twin_root_fixed": "v1__waltfilipe__sada-test/scripts__download_club_logos.py__fetch_json__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "waltfilipe__sada-test/scripts__enrich_loan_status.py__fetch_loan_club.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__waltfilipe__sada-test/scripts__enrich_loan_status.py__fetch_loan_club.json",
+      "twin_root_fixed": "v1__waltfilipe__sada-test/scripts__enrich_loan_status.py__fetch_loan_club__FIXED.json"
+    },
+    {
+      "corpus": "v1",
+      "file": "x-uuid__syforce/app__syforce__util.py__http_get.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v1__x-uuid__syforce/app__syforce__util.py__http_get.json",
+      "twin_root_fixed": "v1__x-uuid__syforce/app__syforce__util.py__http_get__FIXED.json"
+    },
+    {
+      "corpus": "v2",
+      "file": "artificial-hedge__dipcatcher/scripts__fetch_binance_vision_carry.py___http.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v2__artificial-hedge__dipcatcher/scripts__fetch_binance_vision_carry.py___http.json",
+      "twin_root_fixed": "v2__artificial-hedge__dipcatcher/scripts__fetch_binance_vision_carry.py___http__FIXED.json"
+    },
+    {
+      "corpus": "v2",
+      "file": "artificial-hedge__dipcatcher/scripts__require_release_gates.py__github_get_json.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v2__artificial-hedge__dipcatcher/scripts__require_release_gates.py__github_get_json.json",
+      "twin_root_fixed": "v2__artificial-hedge__dipcatcher/scripts__require_release_gates.py__github_get_json__FIXED.json"
+    },
+    {
+      "corpus": "v2",
+      "file": "artificial-hedge__dipcatcher/src__fx1__serve__e2e_audit.py___raw_headers.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v2__artificial-hedge__dipcatcher/src__fx1__serve__e2e_audit.py___raw_headers.json",
+      "twin_root_fixed": "v2__artificial-hedge__dipcatcher/src__fx1__serve__e2e_audit.py___raw_headers__FIXED.json"
+    },
+    {
+      "corpus": "v2",
+      "file": "artificial-hedge__dipcatcher/src__quant_fund__research__witness_scan.py___http.json",
+      "cwe": "CWE-918",
+      "fix_kind": "ssrf_guard",
+      "twin_root_original": "v2__artificial-hedge__dipcatcher/src__quant_fund__research__witness_scan.py___http.json",
+      "twin_root_fixed": "v2__artificial-hedge__dipcatcher/src__quant_fund__research__witness_scan.py___http__FIXED.json"
+    },
+    {
+      "corpus": "v2",
+      "file": "ayushdad609-code__autoclip/backend__services__studio__publish_kit.py__ai_cover.json",
+      "cwe": "CWE-22",
+      "fix_kind": "path_confine",
+      "twin_root_original": "v2__ayushdad609-code__autoclip/backend__services__studio__publish_kit.py__ai_cover.json",
+      "twin_root_fixed": "v2__ayushdad609-code__autoclip/backend__services__studio__publish_kit.py__ai_cover__FIXED.json"
+    }
+  ],
+  "not_eligible": [
+    {
+      "corpus": "v1",
+      "file": "2100preet__stockscanner/odte_scanner__alert_pulse.py__pulse_desk_alerts.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "2100preet__stockscanner/odte_scanner__config.py__load_config.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "2100preet__stockscanner/odte_scanner__signals__sure_winners.py__save_day_store.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "2100preet__stockscanner/odte_scanner__ui.py__run_ui.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "BerriAI__litellm/litellm__llms__oci__common_utils.py__load_private_key_from_file.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "Chuqonu__epi-preclean-patent-monitor/scripts__stamp_asset_versions.py__file_hash.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "Cognition-Partner-Workshops__otterworks-workshop-2610/migration__job__ldm__staging.py__sha256_file.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "Cognition-Partner-Workshops__otterworks-workshop-2610/security__deps__harness__deps_check.py__run.json",
+      "cwe": "CWE-78",
+      "why": "behaviour-coupled helper (parameter is the whole command/query)"
+    },
+    {
+      "corpus": "v1",
+      "file": "DeepCivic__womblex/fixtures__synthetic__generate.py__register_csv.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "DeepCivic__womblex/fixtures__synthetic__generate.py__scanned_letter_pdf.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "DeepCivic__womblex/src__womblex__ingest__gnaf.py___has_header_row.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "DeepCivic__womblex/src__womblex__ingest__pdf___image.py____init__.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "DeepCivic__womblex/src__womblex__ingest__pdf___pdfium_doc.py__open_document.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "DeepCivic__womblex/src__womblex__utils__checksum.py__sha256_file.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "FrancescoCiulla__NLWeb/code__python__misc__podcast_scraper.py__save_to_tsv.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "Gunrunner444__BugForge/backend__app__security_testing__exploratory.py__prepare_foundry_workspace.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_capture__config_store.py___write_config_file.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_capture__runtime_smoke.py__run.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__batch_manifest.py__sha256_file.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "PrjBbrosa__data-analyzer/mf4_analyzer__io__asc_can_format.py___preflight_asc_format.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "PrjBbrosa__data-analyzer/scripts__probe_switch_smoothness.py___emit.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "ProtossBlaster__leapmotor-mate/poller__session_share.py___read_bytes.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "ProtossBlaster__leapmotor-mate/poller__session_share.py___write_bytes.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "ProtossBlaster__leapmotor-mate/web__session_share.py___read_bytes.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "ProtossBlaster__leapmotor-mate/web__session_share.py___write_bytes.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "TracecatHQ__tracecat/tracecat__registry__sync__artifact.py___compute_file_hash.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "VibeBB__fpga-agent/scripts__container_hardening_report.py___load.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "VibeBB__fpga-agent/scripts__library_smoke.py__synth_unit.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "VibeBB__fpga-agent/scripts__structural_coverage.py__dump.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "VibeBB__fpga-agent/src__fpga__gates.py__spdx_ids.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "VibeBB__fpga-agent/src__fpga__render.py__write_png.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "VocaHQ__vocalinux/src__vocalinux__speech_recognition__diarization.py___load_wav.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "aditya9729__roboeval_challenge/scripts__stage_submission.py___sha256.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "aditya9729__roboeval_challenge/src__roboeval_entry__data__io.py__sha256_file.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "aditya9729__roboeval_challenge/src__roboeval_entry__data__io.py__write_json_atomic.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "aditya9729__roboeval_challenge/src__roboeval_entry__training__corr_noise.py___sha256.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "aditya9729__roboeval_challenge/src__roboeval_entry__training__image_cache.py___sha256.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "aditya9729__roboeval_challenge/src__roboeval_entry__training__image_cache.py__build_image_cache.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "airbytehq__airbyte-python-cdk/airbyte_cdk__cli__source_declarative_manifest___run.py___parse_manifest_from_file.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "alexandrelheinen__clave/src__clave__corpus__artifacts.py__digest_of.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "alexandrelheinen__clave/src__clave__experiment__run.py__write.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "alexandrelheinen__clave/src__clave__runtime__loop.py__write_record.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "alexandrelheinen__clave/src__clave__runtime__play.py__play.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "alexandrelheinen__fret/scripts__plot_telemetry.py___load_csv.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "alexandrelheinen__fret/scripts__release__audit_showcase_renders.py___wall_contact_rate.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "alexandrelheinen__fret/src__fret__ros__mujoco_bridge.py___load_bridge_config.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "alexandrelheinen__fret/src__fret__ros__perception_bridge.py___load_config.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "atanasvasilevjourney__ORBIS-EQUITY-/pipeline__ema200_scanner__config__loader.py__load_config.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "bermuda1023__ExposureEclipse/backend__app__services__industry_losses.py___rows.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "bermuda1023__ExposureEclipse/backend__scripts__build_onlevel_indices.py__write_county.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "bermuda1023__ExposureEclipse/backend__scripts__import_pcs_county_estimates.py__write_csv.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "bermuda1023__ExposureEclipse/backend__scripts__import_usws_industry.py___write_source.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "bramstroker__homeassistant-powercalc/utils__library__common.py___read_model_json.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "briandconnelly__skills/pi-coding-agent__scripts__pi_gate.py____init__.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "c-wenlong__blenderkc/blenderkc__overlay.py___save_state.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "c-wenlong__blenderkc/blenderkc__overlay.py__composite_dir.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "c-wenlong__blenderkc/blenderkc__timing.py__timing_from_narration.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "c-wenlong__blenderkc/tools__cli__blenderkc_cli__hostjob.py___tail.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "c-wenlong__blenderkc/tools__cli__blenderkc_cli__media.py__concat.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "c-wenlong__blenderkc/tools__cli__blenderkc_cli__repo.py__sha256_file.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "c-wenlong__blenderkc/tools__cli__blenderkc_cli__repo.py__write_json.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "c-wenlong__blenderkc/tools__cli__blenderkc_cli__timeline.py__write_scene_timings.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "clarmso__openings.info/scripts__generate_new_jobs.py___load_ats_by_slug.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "danielreuter__research-notes/lanes__proofs-n2-hill__tools__n2h.py__sync_cache.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "danielreuter__research-notes/lanes__proofs-rows__tools__split_measure.py__sha256.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "danielreuter__research-notes/lanes__proofs-rows__tools__stage_mark.py__sha256.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "gcnewbief__Log-Grabber/log_grabber.py__zip_case.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "hdzwzqbxlk__ComfyUI-LK-Model_Auto-Matching/core__config.py___load_json.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "joemccann__radon/cloud__demo-vm__demo_vm_autodeploy.py__install_tooling.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "kamoras__civitas/backend__app__atomic_write.py__update_json_file.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "kamoras__civitas/backend__app__file_cache.py__read_json.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "kamoras__civitas/backend__app__shared_state.py__read_record.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "kamoras__civitas/backend__scripts__audit_funding_components.py__fetch.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "kamoras__civitas/backend__scripts__benchmark_validation.py__load_les.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "kamoras__civitas/backend__scripts__build_county_district_crosswalk.py__load_county_names.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "kamoras__civitas/backend__scripts__evaluate_embedding_models.py__load_donor_task.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "kamoras__civitas/backend__scripts__fetch_occupation_industry.py__fetch.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "kamoras__civitas/backend__scripts__fetch_occupation_industry.py__labels.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "kamoras__civitas/backend__scripts__fetch_poll_close_times.py__rederive.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "kamoras__civitas/backend__scripts__research_constituent_alignment.py__fetch.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "kamoras__civitas/backend__scripts__research_justice_loyalty.py___tenure.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "kamoras__civitas/backend__scripts__research_justice_loyalty.py__fetch.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "ljofreflor__jobbot/src__jobbot__companies__registry.py__save_companies.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "ljofreflor__jobbot/src__jobbot__profile__importer_common.py__write_generated_profile.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "ljofreflor__jobbot/src__jobbot__resources____init__.py__copy_templates.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "ljofreflor__jobbot/src__jobbot__workspace.py__init_workspace.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "loveRhythm1990__mini-pi/01-loop__src__main.py__execute_bash.json",
+      "cwe": "CWE-78",
+      "why": "behaviour-coupled helper (parameter is the whole command/query)"
+    },
+    {
+      "corpus": "v1",
+      "file": "loveRhythm1990__mini-pi/02-providers__src__main.py__execute_bash.json",
+      "cwe": "CWE-78",
+      "why": "behaviour-coupled helper (parameter is the whole command/query)"
+    },
+    {
+      "corpus": "v1",
+      "file": "loveRhythm1990__mini-pi/03-tools__src__tools.py__tool_edit.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "loveRhythm1990__mini-pi/03-tools__src__tools.py__tool_read.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "loveRhythm1990__mini-pi/03-tools__src__tools.py__tool_write.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__docs_writer.py___append_action_item.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__docs_writer.py__write_note_to_disk.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "markus-michalski__project-hub/servers__project-hub-server__tools__knowledge.py__save_knowledge.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__instrumentation__spawn_hook.py__write_spawn_hook.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__node_id_args.py___read_node_ids.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "mikelane__pytest-gremlins/src__pytest_gremlins__reporting__history.py__append_history_entry.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "nthplusio__skills/skills__scoussens-skills__pr-review-round__scripts__queue.py__load_overrides.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "oamin__fpl-engine/src__eval__holdout.py__sha256_file.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "oamin__fpl-engine/src__live__deadline.py__write_log.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "oamin__fpl-engine/src__live__fpl_snapshot.py__refresh.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "paulosalem__ellements/ellements-core__src__ellements__core__config.py__load_toml.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "paulosalem__ellements/ellements-core__src__ellements__core__observability__jsonl_logger.py___append_line.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "qndelmar__tbnano/tbnano__generators__base.py__write_task.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "qndelmar__tbnano/tbnano__metrics.py__write_report.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "qndelmar__tbnano/tbnano__tasksio.py__materialize_setup.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "quantam101__profitenginev5/master_distillation__dataset.py____init__.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "quantam101__profitenginev5/master_distillation__dataset.py__digest.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "quantam101__profitenginev5/master_distillation__main.py__atomic_save_text.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "quantam101__tradegate2/runtime__tradegate__rotation.py__load_csv.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "quantam101__tradegate2/runtime__tradegate__truth_ledger.py__run_truth_ledger.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "royles__AppliedAIModelTraining/backend__app__training__dataset_loader.py___load_jsonl.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "royles__AppliedAIModelTraining/backend__app__training__transformer_job.py___save_artifacts.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "royles__AppliedAIModelTraining/scripts__common.py__tmux_new_session.json",
+      "cwe": "CWE-78",
+      "why": "behaviour-coupled helper (parameter is the whole command/query)"
+    },
+    {
+      "corpus": "v1",
+      "file": "saltyscott0521__tracebi/scripts__ui_audit.py__serve.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "saltyscott0521__tracebi/tracebi__cli.py___build_report_target.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "saltyscott0521__tracebi/tracebi__connections.py__read_connection_doc.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "saltyscott0521__tracebi/tracebi__model__model_spec.py__read_model_doc.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "saltyscott0521__tracebi/tracebi__pipeline__pipeline_spec.py__read_pipeline_doc.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "shizukutanaka__Slice/slice____main__.py___compare_doc.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "shizukutanaka__Slice/slice____main__.py___diff_load.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "tonezzz__chaba/scripts__ada__spend-ledger.py__load_usage.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "trsdn__macos-notarization-broker/scripts__broker.py__sha256_file.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "trsdn__macos-notarization-broker/scripts__broker.py__write_json.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "waltfilipe__sada-test/scripts__engine__sofascore_heatmap.py__save_heatmap.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "waltfilipe__sada-test/scripts__engine__sofascore_heatmap.py__write_heatmap_index.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "wstomber__devinexecdemo/demo__evidence.py__read_csv.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "wstomber__devinexecdemo/python__msp.py__load_cwf.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "wstomber__devinexecdemo/python__msp.py__open_output.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "wstomber__devinexecdemo/python__msp.py__run.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v1",
+      "file": "z-mio__parse_hub_bot/services__media.py__make_thumb.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "BerniceZimidzi-code__foodies-sop-rag-system/backend__database.py__execute.json",
+      "cwe": "CWE-89",
+      "why": "behaviour-coupled helper (parameter is the whole command/query)"
+    },
+    {
+      "corpus": "v2",
+      "file": "Kopanov__EdgeGuard-Knowledge-Graph/demo__alert_enrichment_demo.py__load_alerts.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "Kopanov__EdgeGuard-Knowledge-Graph/scripts__run_cypher_catalog_http.py___write_outputs.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "Kopanov__EdgeGuard-Knowledge-Graph/src__baseline_checkpoint.py___atomic_write.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "Kopanov__EdgeGuard-Knowledge-Graph/src__edgeguard.py___baseline_lock_detail.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "Kopanov__EdgeGuard-Knowledge-Graph/src__edgeguard.py___pipeline_lock_detail.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "NotoriousPOG__sentinel-agent/src__sentinel__evals__reports.py__write_reports.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "Wazor2__tiger-ai-devin/pench__model_serving.py__embed.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "Wazor2__tiger-ai-devin/pench__model_serving.py__triage.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "Wazor2__tiger-ai-devin/pench__pipeline.py__append_history_csv.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "Wazor2__tiger-ai-devin/scripts__build_demo_cards.py__as_card.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "Wazor2__tiger-ai-devin/scripts__build_demo_cards.py__measure.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "artificial-hedge__dipcatcher/scripts__dipcatcher_install_smoke.py___emit.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "artificial-hedge__dipcatcher/scripts__dipcatcher_install_smoke.py___prepare_inputs.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "artificial-hedge__dipcatcher/scripts__dipcatcher_install_smoke.py___sha256.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "artificial-hedge__dipcatcher/scripts__dipcatcher_release_smoke.py__sha256_file.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "artificial-hedge__dipcatcher/scripts__dipcatcher_release_smoke.py__write_third_party_pth.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "artificial-hedge__dipcatcher/scripts__dipcatcher_soak.py___spawn_crash.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "artificial-hedge__dipcatcher/scripts__fx1_model_smoke.py___write.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "artificial-hedge__dipcatcher/src__quant_fund__research__timestamp_anchor.py__stamp_timestamp.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "ayushdad609-code__autoclip/scripts__packaging_frame_benchmark.py___write.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "gyrinx-app__gyrinx/n26__core__images.py__to_shape.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "gyrinx-app__gyrinx/playbooks__trace__scripts__analyze_trace_detailed.py__load_and_process.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "nagibator9986__ccupractice/backend__app____init__.py___persistent_secret.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "nibrocsolutions__wifi-monitor/backend__app__util.py__read_text.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "spectral-butters__hacky-movies/backend__database.py__fetch_all.json",
+      "cwe": "CWE-89",
+      "why": "behaviour-coupled helper (parameter is the whole command/query)"
+    },
+    {
+      "corpus": "v2",
+      "file": "spectral-butters__hacky-movies/backend__database.py__fetch_one.json",
+      "cwe": "CWE-89",
+      "why": "behaviour-coupled helper (parameter is the whole command/query)"
+    },
+    {
+      "corpus": "v2",
+      "file": "susu09658-debug__plant-disease-detection/yolo__prepare_dataset.py___count_yolo_classes.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "susu09658-debug__plant-disease-detection/yolo__prepare_dataset.py__convert_supervisely_to_yolo.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "th0to__inventory_app/backend__import_csv.py__write_accounts_log.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "zorntyler540-byte__-estate-ez/backend__app__services__ctseller.py__jpeg_bytes_for_ctseller_post.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    },
+    {
+      "corpus": "v2",
+      "file": "zorntyler540-byte__-estate-ez/backend__app__services__thumbnail_image.py__thumbnail_jpeg_bytes.json",
+      "cwe": "CWE-22",
+      "why": "direct caller path (fix belongs at caller)"
+    }
+  ],
+  "skipped": []
+}

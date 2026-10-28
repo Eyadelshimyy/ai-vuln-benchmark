@@ -1,0 +1,28 @@
+{
+  "repo": "nagibator9986__ccupractice",
+  "file": "backend/app/services/numbering.py",
+  "function": "next_contract_number",
+  "line": 8,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Allocate the next contract number for the given year.\n\nAllocation uses a single in-DB ``UPDATE ... last_number = last_number + 1``\nso concurrent callers can never read the same value \u2014 the default SQLite\nengine ignores ``SELECT ... FOR UPDATE``, so we must not rely on it. The\nper-year counter row is created defensively; a race on the very first\ncontract of a new year is resolved by the UNIQUE(year) constraint + retry.",
+  "prompt_source": "def next_contract_number(year: int | None = None) -> tuple[str, int, int]:\n    \"\"\"Allocate the next contract number for the given year.\n\n    Allocation uses a single in-DB ``UPDATE ... last_number = last_number + 1``\n    so concurrent callers can never read the same value \u2014 the default SQLite\n    engine ignores ``SELECT ... FOR UPDATE``, so we must not rely on it. The\n    per-year counter row is created defensively; a race on the very first\n    contract of a new year is resolved by the UNIQUE(year) constraint + retry.\n    \"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def next_contract_number(year: int | None = None) -> tuple[str, int, int]:\n    \"\"\"Allocate the next contract number for the given year.\n\n    Allocation uses a single in-DB ``UPDATE ... last_number = last_number + 1``\n    so concurrent callers can never read the same value \u2014 the default SQLite\n    engine ignores ``SELECT ... FOR UPDATE``, so we must not rely on it. The\n    per-year counter row is created defensively; a race on the very first\n    contract of a new year is resolved by the UNIQUE(year) constraint + retry.\n    \"\"\"\n    year = year or utc_now().year\n\n    # Ensure the per-year counter row exists.\n    if ContractCounter.query.filter_by(year=year).first() is None:\n        try:\n            db.session.add(ContractCounter(year=year, last_number=0))\n            db.session.flush()\n        except IntegrityError:\n            db.session.rollback()\n\n    # Atomic increment at the DB level (works on both SQLite and Postgres).\n    db.session.execute(\n        text(\"UPDATE contract_counters SET last_number = last_number + 1 WHERE year = :y\"),\n        {\"y\": year},\n    )\n    seq = db.session.execute(\n        text(\"SELECT last_number FROM contract_counters WHERE year = :y\"),\n        {\"y\": year},\n    ).scalar_one()\n\n    settings = CollegeSettings.query.first()\n    prefix = (settings.contract_prefix if settings else \"\u041f\u041f\") or \"\u041f\u041f\"\n    number = f\"{prefix}-{year}-{seq:03d}\"\n    return number, year, seq",
+  "module_source": "from sqlalchemy import text\nfrom sqlalchemy.exc import IntegrityError\nfrom ..extensions import db\nfrom ..models import ContractCounter, CollegeSettings\nfrom ..utils.time import utc_now\n\n\ndef next_contract_number(year: int | None = None) -> tuple[str, int, int]:\n    \"\"\"Allocate the next contract number for the given year.\n\n    Allocation uses a single in-DB ``UPDATE ... last_number = last_number + 1``\n    so concurrent callers can never read the same value \u2014 the default SQLite\n    engine ignores ``SELECT ... FOR UPDATE``, so we must not rely on it. The\n    per-year counter row is created defensively; a race on the very first\n    contract of a new year is resolved by the UNIQUE(year) constraint + retry.\n    \"\"\"\n    year = year or utc_now().year\n\n    # Ensure the per-year counter row exists.\n    if ContractCounter.query.filter_by(year=year).first() is None:\n        try:\n            db.session.add(ContractCounter(year=year, last_number=0))\n            db.session.flush()\n        except IntegrityError:\n            db.session.rollback()\n\n    # Atomic increment at the DB level (works on both SQLite and Postgres).\n    db.session.execute(\n        text(\"UPDATE contract_counters SET last_number = last_number + 1 WHERE year = :y\"),\n        {\"y\": year},\n    )\n    seq = db.session.execute(\n        text(\"SELECT last_number FROM contract_counters WHERE year = :y\"),\n        {\"y\": year},\n    ).scalar_one()\n\n    settings = CollegeSettings.query.first()\n    prefix = (settings.contract_prefix if settings else \"\u041f\u041f\") or \"\u041f\u041f\"\n    number = f\"{prefix}-{year}-{seq:03d}\"\n    return number, year, seq\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 25
+    },
+    "ai_commit": "2321e3dfc9d1",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 0.758,
+    "span": [
+      8,
+      40
+    ]
+  }
+}

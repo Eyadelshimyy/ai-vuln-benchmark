@@ -72,7 +72,8 @@
       "CWE-22": 130,
       "CWE-78": 4,
       "CWE-918": 26
-    }
+    },
+    "confirmed_by_cwe_unit": "candidate-rows (one (function x injection-point) census row); 130/4/26=160. Name-deduped-function unit (149) and v2 (37) splits are in validation/TAXONOMY.md COUNTING-UNIT KEY."
   },
   "mined_corpus": {
     "n_repos": 103,

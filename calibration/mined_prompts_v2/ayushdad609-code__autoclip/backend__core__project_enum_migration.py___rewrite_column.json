@@ -1,0 +1,28 @@
+{
+  "repo": "ayushdad609-code__autoclip",
+  "file": "backend/core/project_enum_migration.py",
+  "function": "_rewrite_column",
+  "line": 52,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `_rewrite_column` function (parameters: conn, column, enum_cls, fallback).",
+  "prompt_source": "def _rewrite_column(conn, column: str, enum_cls, fallback) -> int:\n    \"\"\"Implement the `_rewrite_column` function (parameters: conn, column, enum_cls, fallback).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def _rewrite_column(conn, column: str, enum_cls, fallback) -> int:\n    rows = conn.execute(text(f\"SELECT DISTINCT {column} FROM projects\")).fetchall()\n    changed = 0\n    for (raw,) in rows:\n        if not isinstance(raw, str):\n            continue\n        matched = match_enum_member(enum_cls, raw)\n        target = matched.name if matched is not None else fallback.name\n        if target == raw:\n            continue\n        result = conn.execute(\n            text(f\"UPDATE projects SET {column} = :target WHERE {column} = :raw\"),\n            {\"target\": target, \"raw\": raw},\n        )\n        count = result.rowcount or 0\n        changed += count\n        logger.info(\"\u9879\u76ee %s\uff1a%r \u2192 %s\uff08%s \u884c\uff09\", column, raw, target, count)\n    return changed",
+  "module_source": "\"\"\"\u628a projects.status / projects.project_type \u91cc\u7684\u65e7\u503c\u6539\u6210\u5f53\u524d\u679a\u4e3e\u540d\u3002\n\n\u542f\u52a8\u65f6\u8fd0\u884c\uff0c\u5e42\u7b49\u3002\u684c\u9762\u7aef\u548c Docker \u90fd\u6ca1\u6709\u5355\u72ec\u7684 Alembic \u8fc1\u79fb\u6b65\u9aa4\uff0c\n``create_all`` \u4e5f\u4e0d\u4f1a\u6539\u5df2\u6709 SQLite \u884c\uff0c\u6240\u4ee5\u6e05\u6d17\u653e\u5728\u5efa\u8868\u4e4b\u540e\u3002\n\n\u89c4\u5219\uff08\u53ea\u6539\u8fd9\u4e24\u4e2a\u5b57\u6bb5\uff0c\u4e0d\u5220\u9664\u9879\u76ee\uff09\uff1a\n\n- \u5df2\u7ecf\u662f\u6210\u5458\u540d\uff08``PENDING``\uff09\u7684\u4fdd\u6301\u4e0d\u52a8\n- \u6210\u5458 value\uff08``pending``\uff09\u6539\u6210\u5bf9\u5e94\u7684\u540d\u5b57\uff08``PENDING``\uff09\n- \u65e0\u6cd5\u8bc6\u522b\u7684 status\uff08\u542b\u5df2\u5220\u9664\u7684 ``cancelled`` / ``CANCELLED``\uff09\u6539\u6210 ``FAILED``\n- \u65e0\u6cd5\u8bc6\u522b\u7684 project_type \u6539\u6210 ``DEFAULT``\n\n\u624b\u5de5\u67e5\u770b\uff08\u5347\u7ea7\u524d\u53ef\u9009\uff09::\n\n    SELECT status, COUNT(*) FROM projects GROUP BY status;\n    SELECT project_type, COUNT(*) FROM projects GROUP BY project_type;\n\"\"\"\n\nfrom __future__ import annotations\n\nimport logging\n\nfrom sqlalchemy import inspect, text\nfrom sqlalchemy.engine import Engine\n\nfrom backend.models.lenient_enum import match_enum_member\nfrom backend.models.project import ProjectStatus, ProjectType\n\nlogger = logging.getLogger(__name__)\n\n_COLUMNS = (\n    (\"status\", ProjectStatus, ProjectStatus.FAILED),\n    (\"project_type\", ProjectType, ProjectType.DEFAULT),\n)\n\n\ndef normalize_legacy_project_enums(engine: Engine) -> int:\n    \"\"\"\u6539\u5199\u65e0\u6cd5\u88ab\u5f53\u524d\u679a\u4e3e\u76f4\u63a5\u8bfb\u51fa\u7684\u9879\u76ee\u884c\u3002\u8fd4\u56de\u66f4\u65b0\u7684\u884c\u6570\u3002\"\"\"\n    inspector = inspect(engine)\n    if not inspector.has_table(\"projects\"):\n        return 0\n    present = {col[\"name\"] for col in inspector.get_columns(\"projects\")}\n    updated = 0\n    with engine.begin() as conn:\n        for column, enum_cls, fallback in _COLUMNS:\n            if column not in present:\n                continue\n            updated += _rewrite_column(conn, column, enum_cls, fallback)\n    return updated\n\n\ndef _rewrite_column(conn, column: str, enum_cls, fallback) -> int:\n    rows = conn.execute(text(f\"SELECT DISTINCT {column} FROM projects\")).fetchall()\n    changed = 0\n    for (raw,) in rows:\n        if not isinstance(raw, str):\n            continue\n        matched = match_enum_member(enum_cls, raw)\n        target = matched.name if matched is not None else fallback.name\n        if target == raw:\n            continue\n        result = conn.execute(\n            text(f\"UPDATE projects SET {column} = :target WHERE {column} = :raw\"),\n            {\"target\": target, \"raw\": raw},\n        )\n        count = result.rowcount or 0\n        changed += count\n        logger.info(\"\u9879\u76ee %s\uff1a%r \u2192 %s\uff08%s \u884c\uff09\", column, raw, target, count)\n    return changed\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 18
+    },
+    "ai_commit": "785650961723",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      52,
+      69
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "repo": "srinidhi2608__git-analysis",
+  "file": "app/database.py",
+  "function": "_apply_column_alterations",
+  "line": 38,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `_apply_column_alterations` function (parameters: connection, table_name, existing_columns, alterations).",
+  "prompt_source": "def _apply_column_alterations(connection, table_name: str, existing_columns: set[str], alterations: dict[str, str]) -> None:\n    \"\"\"Implement the `_apply_column_alterations` function (parameters: connection, table_name, existing_columns, alterations).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def _apply_column_alterations(connection, table_name: str, existing_columns: set[str], alterations: dict[str, str]) -> None:\n    for column_name, column_definition in alterations.items():\n        if column_name not in existing_columns:\n            connection.execute(\n                text(\n                    f\"ALTER TABLE {_quoted_identifier(table_name)} \"\n                    f\"ADD COLUMN {_quoted_identifier(column_name)} {_safe_column_definition(column_definition)}\"\n                )\n            )",
+  "module_source": "import re\n\nfrom sqlalchemy import DateTime, Integer, String, create_engine, inspect, text\nfrom sqlalchemy.orm import sessionmaker, declarative_base\n\nfrom app.config import settings\n\nengine = create_engine(settings.database_url)\nSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)\n\nBase = declarative_base()\n\nIDENTIFIER_PATTERN = re.compile(r\"^[A-Za-z_][A-Za-z0-9_]*$\")\nCOLUMN_DEFINITION_PATTERN = re.compile(r\"^[A-Z0-9(), ]+$\")\n\n\ndef _quoted_identifier(value: str) -> str:\n    if not IDENTIFIER_PATTERN.fullmatch(value):\n        raise ValueError(f\"Unsafe SQL identifier: {value}\")\n    return f'\"{value}\"'\n\n\ndef _safe_column_definition(value: str) -> str:\n    if not COLUMN_DEFINITION_PATTERN.fullmatch(value):\n        raise ValueError(f\"Unsafe SQL column definition: {value}\")\n    return value\n\n\ndef _compile_column_definition(column_type, *, nullable: bool = True, default: str | None = None) -> str:\n    parts = [column_type.compile(dialect=engine.dialect).upper()]\n    if not nullable:\n        parts.append(\"NOT NULL\")\n    if default is not None:\n        parts.append(f\"DEFAULT {default}\")\n    return _safe_column_definition(\" \".join(parts))\n\n\ndef _apply_column_alterations(connection, table_name: str, existing_columns: set[str], alterations: dict[str, str]) -> None:\n    for column_name, column_definition in alterations.items():\n        if column_name not in existing_columns:\n            connection.execute(\n                text(\n                    f\"ALTER TABLE {_quoted_identifier(table_name)} \"\n                    f\"ADD COLUMN {_quoted_identifier(column_name)} {_safe_column_definition(column_definition)}\"\n                )\n            )\n\n\ndef ensure_database_schema():\n    Base.metadata.create_all(bind=engine)\n\n    inspector = inspect(engine)\n    pull_request_columns = {column[\"name\"] for column in inspector.get_columns(\"pull_requests\")}\n    commit_columns = {column[\"name\"] for column in inspector.get_columns(\"commits\")}\n    pull_request_comment_columns = {\n        column[\"name\"] for column in inspector.get_columns(\"pull_request_comments\")\n    }\n\n    pull_request_alterations = {\n        \"commit_count\": _compile_column_definition(Integer(), nullable=False, default=\"0\"),\n        \"changed_files\": _compile_column_definition(Integer(), nullable=False, default=\"0\"),\n        \"additions\": _compile_column_definition(Integer(), nullable=False, default=\"0\"),\n        \"deletions\": _compile_column_definition(Integer(), nullable=False, default=\"0\"),\n        \"review_count\": _compile_column_definition(Integer(), nullable=False, default=\"0\"),\n        \"reviewers_count\": _compile_column_definition(Integer(), nullable=False, default=\"0\"),\n        \"approvals_count\": _compile_column_definition(Integer(), nullable=False, default=\"0\"),\n        \"requested_changes_count\": _compile_column_definition(Integer(), nullable=False, default=\"0\"),\n        \"review_decision\": _compile_column_definition(String(64)),\n        \"first_review_comment_at\": _compile_column_definition(DateTime()),\n        \"last_review_comment_at\": _compile_column_definition(DateTime()),\n    }\n    commit_alterations = {\n        \"committed_at\": _compile_column_definition(DateTime()),\n    }\n    pull_request_comment_alterations: dict[str, str] = {}\n\n    with engine.begin() as connection:\n        _apply_column_alterations(connection, \"pull_requests\", pull_request_columns, pull_request_alterations)\n        _apply_column_alterations(connection, \"commits\", commit_columns, commit_alterations)\n        _apply_column_alterations(\n            connection,\n            \"pull_request_comments\",\n            pull_request_comment_columns,\n            pull_request_comment_alterations,\n        )\n\n\ndef get_db():\n    db = SessionLocal()\n    try:\n        yield db\n    finally:\n        db.close()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "github-copilot": 9
+    },
+    "ai_commit": "8d9e3248432b",
+    "evidence": "author/committer='copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      38,
+      46
+    ]
+  }
+}

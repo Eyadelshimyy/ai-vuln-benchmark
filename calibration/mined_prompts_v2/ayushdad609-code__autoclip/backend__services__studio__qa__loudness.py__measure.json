@@ -1,0 +1,28 @@
+{
+  "repo": "ayushdad609-code__autoclip",
+  "file": "backend/services/studio/qa/loudness.py",
+  "function": "measure",
+  "line": 56,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Audio only. Video, subtitles and data streams are not decoded.",
+  "prompt_source": "def measure(path, timeout: float) -> tuple[float, float]:\n    \"\"\"Audio only. Video, subtitles and data streams are not decoded.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def measure(path, timeout: float) -> tuple[float, float]:\n    \"\"\"Audio only. Video, subtitles and data streams are not decoded.\"\"\"\n    from backend.services.render_limits import input_args\n    from backend.utils.ffmpeg_utils import get_ffmpeg_path\n    proc = run([\n        get_ffmpeg_path(), '-hide_banner', *input_args(), '-i', str(path),\n        '-map', '0:a:0', '-vn', '-sn', '-dn', '-af', 'ebur128=peak=true', '-f', 'null', '-',\n    ], timeout, text=True)\n    text = f'{proc.stderr or \"\"}\\n{proc.stdout or \"\"}'\n    if proc.returncode != 0 and 'LUFS' not in text:\n        raise ProbeError('unreadable')\n    return parse_summary(text)",
+  "module_source": "\"\"\"Integrated LUFS and true peak against the platform target.\n\nEvery current strategy uses the plan's social target: \u221214 LUFS \u00b1 1 LU, true\npeak at or below \u22121 dBTP. The table is per strategy so a later target can differ.\n\"\"\"\nfrom __future__ import annotations\n\nimport re\n\nfrom backend.services.studio.qa.media import ProbeError, run\n\n# (integrated LUFS, tolerance LU, true-peak ceiling dBTP)\nTARGETS = {\n    'douyin': (-14.0, 1.0, -1.0),\n    'tiktok': (-14.0, 1.0, -1.0),\n    'instagram_reels': (-14.0, 1.0, -1.0),\n    'youtube_shorts': (-14.0, 1.0, -1.0),\n    'youtube_long': (-14.0, 1.0, -1.0),\n    'bilibili': (-14.0, 1.0, -1.0),\n    'xiaohongshu': (-14.0, 1.0, -1.0),\n    'original': (-14.0, 1.0, -1.0),\n}\nDEFAULT_TARGET = (-14.0, 1.0, -1.0)\n\n_I = re.compile(r'I:\\s*(-?\\d+(?:\\.\\d+)?)\\s*LUFS')\n_PEAK = re.compile(r'Peak:\\s*(-?\\d+(?:\\.\\d+)?)\\s*dBFS')\n\n\ndef target_for(strategy_id: str) -> tuple[float, float, float]:\n    return TARGETS.get(strategy_id, DEFAULT_TARGET)\n\n\ndef judge_levels(lufs: float, peak: float, strategy_id: str = 'original') -> tuple[str, str]:\n    center, tolerance, peak_max = target_for(strategy_id)\n    offset = lufs - center\n    level_bad = abs(offset) > tolerance\n    peak_bad = peak > peak_max\n    if not level_bad and not peak_bad:\n        return 'pass', 'in_target'\n    if level_bad and peak_bad:\n        return 'fail', 'peak_and_level'\n    if peak_bad:\n        return 'fail', 'peak'\n    band = '1_3' if abs(offset) <= 3 else 'gt3'\n    side = 'loud' if offset > 0 else 'quiet'\n    return 'fail', f'{side}_{band}'\n\n\ndef parse_summary(text: str) -> tuple[float, float]:\n    integrated, peaks = _I.findall(text), _PEAK.findall(text)\n    if not integrated or not peaks:\n        raise ProbeError('unreadable')\n    return float(integrated[-1]), float(peaks[-1])\n\n\ndef measure(path, timeout: float) -> tuple[float, float]:\n    \"\"\"Audio only. Video, subtitles and data streams are not decoded.\"\"\"\n    from backend.services.render_limits import input_args\n    from backend.utils.ffmpeg_utils import get_ffmpeg_path\n    proc = run([\n        get_ffmpeg_path(), '-hide_banner', *input_args(), '-i', str(path),\n        '-map', '0:a:0', '-vn', '-sn', '-dn', '-af', 'ebur128=peak=true', '-f', 'null', '-',\n    ], timeout, text=True)\n    text = f'{proc.stderr or \"\"}\\n{proc.stdout or \"\"}'\n    if proc.returncode != 0 and 'LUFS' not in text:\n        raise ProbeError('unreadable')\n    return parse_summary(text)\n\n\ndef check(ctx, timeout: float) -> tuple[str, str]:\n    if ctx.output is None or not getattr(ctx.output, 'is_file', lambda: False)():\n        return 'skip', 'unreadable'\n    try:\n        from backend.services.studio.qa.media import probe_json\n        # A 0.3 s probe expired on ordinary files and skipped the measurement.\n        probe_s = min(1.5, max(0.4, timeout * 0.3))\n        streams = probe_json(ctx.output, probe_s).get('streams') or []\n        if not any(isinstance(row, dict) and row.get('codec_type') == 'audio' for row in streams):\n            return 'skip', 'no_audio'\n        lufs, peak = measure(ctx.output, max(0.5, timeout - probe_s))\n    except ProbeError as error:\n        return 'skip', error.reason\n    return judge_levels(lufs, peak, ctx.strategy_id)\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 11
+    },
+    "ai_commit": "1affde4ca162",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 0.917,
+    "span": [
+      56,
+      67
+    ]
+  }
+}

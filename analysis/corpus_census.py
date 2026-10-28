@@ -81,6 +81,9 @@ def main() -> None:
                          "breakdown (missing module / construction / syntax / timeout / other) plus the "
                          "top missing modules -- tells you which fix recovers the most of the corpus")
     ap.add_argument("--timeout", type=float, default=8.0)
+    ap.add_argument("--only-files", type=Path, default=None,
+                    help="text file of candidate paths (relative to --root), one per line: census only "
+                         "those (diagnostic re-runs; never used for the frozen census)")
     ap.add_argument("--out", type=Path, default=_REPO / "corpus_census.json")
     args = ap.parse_args()
 
@@ -130,6 +133,9 @@ def main() -> None:
     files = list(_candidate_files(args.root))
     if args.cwe:
         files = [(p, r) for p, r in files if args.cwe in (r.get("candidate_cwes") or [])]
+    if args.only_files:
+        keep = {l.strip() for l in args.only_files.read_text().splitlines() if l.strip()}
+        files = [(p, r) for p, r in files if str(p.relative_to(args.root)) in keep]
     if args.limit:
         files = files[: args.limit]
     total = len(files)
@@ -186,25 +192,37 @@ def main() -> None:
 
         confirmed = False
         confirmed_cwe = None
+        # Audit trail for the Tier-2 verdict. Recording only -- it never feeds
+        # back into `confirmed`, so the confirmed set is unchanged.
+        tier2_evidence = None
         if args.tier2 and triggered:
             # deterministic bank only (max_agent=0) -> NO LLM. Try the candidate's
             # own CWE strategy on each plausible param until one confirms.
             for r in injected:
                 if r not in sys.path:
                     sys.path.append(r)
+            tier2_evidence = {"params_tried": [], "diag_buckets": {}, "error": None}
             try:
-                for param in {vd.injected_param for vd in verds if getattr(vd, "injected_param", None)}:
+                # sorted: a set's iteration order varies with PYTHONHASHSEED
+                for param in sorted({vd.injected_param for vd in verds if getattr(vd, "injected_param", None)}):
                     tgt_cwe = exec_cwe or (cwes[0] if cwes else None)
                     if not tgt_cwe:
                         continue
                     res = attempt_exploit(rec, param, tgt_cwe, use="ground_truth",
                                           max_agent=0, timeout=args.timeout)
+                    tier2_evidence["params_tried"].append(param)
                     if res.get("confirmed"):
                         confirmed = True
                         confirmed_cwe = tgt_cwe
+                        tier2_evidence.update({"param": param, "payload": res.get("payload"),
+                                               "proof": res.get("proof"), "sink": res.get("sink"),
+                                               "n_attempts": len(res.get("attempts") or [])})
                         break
-            except Exception:  # noqa: BLE001
-                pass
+                    tier2_evidence["diag_buckets"][param] = res.get("diag_bucket") or res.get("reason")
+            except Exception as e:  # noqa: BLE001
+                # Still NOT confirmed (an error is never a confirmation), but no
+                # longer indistinguishable from "bank tried, nothing fired".
+                tier2_evidence["error"] = f"{type(e).__name__}: {e}"[:300]
             finally:
                 for r in injected:
                     if r in sys.path:
@@ -217,6 +235,7 @@ def main() -> None:
                      "verdict": v, "exec_cwe": exec_cwe, "executable": executable,
                      "triggered": triggered, "confirmed": confirmed,
                      "confirmed_cwe": confirmed_cwe,
+                     "tier2_evidence": tier2_evidence,
                      "error": (err_text or "").strip().splitlines()[0][:300] if (args.why and err_text) else None})
         if i % 25 == 0 or i == total:
             print(f"  {i}/{total}", file=sys.stderr, flush=True)

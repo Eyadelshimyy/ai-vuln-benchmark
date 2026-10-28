@@ -1,0 +1,28 @@
+{
+  "repo": "siddhant248__Forge-v2",
+  "file": "core/role_impact.py",
+  "function": "load_role_impact_overrides",
+  "line": 40,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Load optional hand-reviewed project/role impact values; absent file means no overrides.",
+  "prompt_source": "def load_role_impact_overrides(path=_OVERRIDE_FILE):\n    \"\"\"Load optional hand-reviewed project/role impact values; absent file means no overrides.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def load_role_impact_overrides(path=_OVERRIDE_FILE):\n    \"\"\"Load optional hand-reviewed project/role impact values; absent file means no overrides.\"\"\"\n    if not path.exists():\n        return {}\n    overrides = {}\n    with path.open(encoding=\"utf-8-sig\", newline=\"\") as source:\n        for row in csv.DictReader(source):\n            try:\n                impact = float(row.get(\"impact\", \"\"))\n            except (TypeError, ValueError):\n                continue\n            if row.get(\"id\") and row.get(\"role\") and 0 <= impact <= 1:\n                overrides.setdefault(row[\"id\"], {})[row[\"role\"]] = impact\n    return overrides",
+  "module_source": "\"\"\"Human-reviewed role-to-skill mappings used to estimate portfolio relevance.\"\"\"\nimport csv\nfrom pathlib import Path\n\nfrom .recommender_config import (\n    IMPACT_BASE_RELEVANCE,\n    IMPACT_RELEVANCE_WEIGHT,\n    MAX_FACTOR_RATING,\n    MAX_PROJECT_SKILLS_FOR_ROLE,\n)\n\nROLE_SKILLS = {\n    \"embedded\": {\"embedded\", \"stm32\", \"rtos\", \"can_bus\", \"pcb_design\", \"embedded_linux\", \"fpga\", \"power_electronics\"},\n    \"robotics\": {\"ros\", \"control\", \"motor_control\", \"sensors\", \"mechanical_design\", \"cad\"},\n    \"ml_vision\": {\"ml\", \"vision\", \"python\", \"signal_processing\"},\n    \"hardware\": {\"pcb_design\", \"power_electronics\", \"pcb_soldering\", \"fpga\"},\n    \"iot\": {\"esp32\", \"iot_cloud\", \"rf_comms\", \"wireless_other\", \"bluetooth\"},\n}\n\nCAREER_ROLE_MAP = {\n    \"embedded\": \"embedded\",\n    \"robotics\": \"robotics\",\n    \"vision\": \"ml_vision\",\n    \"iot\": \"iot\",\n    \"undecided\": None,\n    \"sensing\": \"robotics\",\n    \"mechanics\": \"robotics\",\n    \"control\": \"robotics\",\n    \"power\": \"hardware\",\n    \"digital\": \"embedded\",\n    \"fabrication\": \"hardware\",\n    \"assistive\": \"robotics\",\n    \"drones\": \"robotics\",\n    \"space_aerospace\": \"embedded\",\n}\n\n_OVERRIDE_FILE = Path(__file__).with_name(\"project_data\") / \"role_impact_overrides.csv\"\n\n\ndef load_role_impact_overrides(path=_OVERRIDE_FILE):\n    \"\"\"Load optional hand-reviewed project/role impact values; absent file means no overrides.\"\"\"\n    if not path.exists():\n        return {}\n    overrides = {}\n    with path.open(encoding=\"utf-8-sig\", newline=\"\") as source:\n        for row in csv.DictReader(source):\n            try:\n                impact = float(row.get(\"impact\", \"\"))\n            except (TypeError, ValueError):\n                continue\n            if row.get(\"id\") and row.get(\"role\") and 0 <= impact <= 1:\n                overrides.setdefault(row[\"id\"], {})[row[\"role\"]] = impact\n    return overrides\n\n\nROLE_IMPACT_OVERRIDES = load_role_impact_overrides()\n\n\ndef impact_for(project_key, project, roles):\n    \"\"\"Return normalized role-specific impact, or raw demo impact for unknown roles.\"\"\"\n    skills = set(project.get(\"required_skills\", set()))\n    impact_rating = project.get(\"portfolio_impact\", 0) / MAX_FACTOR_RATING\n    if not roles:\n        return impact_rating\n    scores = []\n    for role in roles:\n        override = ROLE_IMPACT_OVERRIDES.get(project_key, {}).get(role)\n        if override is not None:\n            scores.append(override)\n        elif role not in ROLE_SKILLS:\n            scores.append(impact_rating)\n        else:\n            denominator = min(MAX_PROJECT_SKILLS_FOR_ROLE, max(1, len(skills)))\n            relevance = min(1.0, len(skills & ROLE_SKILLS[role]) / denominator)\n            scores.append(\n                impact_rating\n                * (IMPACT_BASE_RELEVANCE + IMPACT_RELEVANCE_WEIGHT * relevance)\n            )\n    return max(scores, default=impact_rating)\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "github-copilot": 14
+    },
+    "ai_commit": "14009037dbf5",
+    "evidence": "Co-authored-by: Copilot <",
+    "ai_line_fraction": 1.0,
+    "span": [
+      40,
+      53
+    ]
+  }
+}

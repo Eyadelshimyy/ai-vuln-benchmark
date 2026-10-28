@@ -1,0 +1,28 @@
+{
+  "repo": "NickBaynham__marketing-commander",
+  "file": "apps/api/app/repositories/workspaces.py",
+  "function": "get_current",
+  "line": 27,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `get_current` function.",
+  "prompt_source": "    async def get_current(self) -> Workspace | None:\n        \"\"\"Implement the `get_current` function.\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    async def get_current(self) -> Workspace | None:\n        result = await self._session.execute(\n            select(Workspace).order_by(Workspace.created_at)\n        )\n        return result.scalars().first()",
+  "module_source": "\"\"\"Workspace persistence (Phase 5, Increment 5.2; hardened post-review).\n\nThe MVP holds exactly one workspace (DEC-01), enforced at the database\nlevel by a singleton unique index \u2014 concurrent first-run creations\ncollapse to one row, with the loser returning the winner's workspace\n(REQ-001). Creation writes audit records for every record it\nmaterializes (BR-020, REQ-040).\n\nTraceability: REQ-001, REQ-040; BR-001, BR-020; DEC-01, DEC-03.\n\"\"\"\n\nfrom sqlalchemy import select\nfrom sqlalchemy.exc import IntegrityError\nfrom sqlalchemy.ext.asyncio import AsyncSession\n\nfrom app.correlation import get_correlation_id\nfrom app.identity import IDENTITY_SOURCE, LOCAL_OWNER_DISPLAY_NAME\nfrom app.models import User, Workspace, WorkspaceMembership\nfrom app.repositories.audit import AuditRepository\n\n\nclass WorkspaceRepository:\n    def __init__(self, session: AsyncSession) -> None:\n        self._session = session\n        self._audit = AuditRepository(session)\n\n    async def get_current(self) -> Workspace | None:\n        result = await self._session.execute(\n            select(Workspace).order_by(Workspace.created_at)\n        )\n        return result.scalars().first()\n\n    async def _record(self, actor_id: str, action: str, entity: str, entity_id):\n        await self._audit.record(\n            actor_id=actor_id,\n            action=action,\n            entity_type=entity,\n            entity_id=str(entity_id),\n            correlation_id=get_correlation_id(),\n        )\n\n    async def get_or_create(self, name: str, actor_id: str) -> tuple[Workspace, bool]:\n        existing = await self.get_current()\n        if existing is not None:\n            return existing, False\n        try:\n            async with self._session.begin_nested():\n                if await self._session.get(User, actor_id) is None:\n                    self._session.add(\n                        User(\n                            id=actor_id,\n                            display_name=LOCAL_OWNER_DISPLAY_NAME,\n                            identity_source=IDENTITY_SOURCE,\n                        )\n                    )\n                    await self._session.flush()\n                    await self._record(actor_id, \"user.created\", \"user\", actor_id)\n                workspace = Workspace(name=name, created_by=actor_id)\n                self._session.add(workspace)\n                await self._session.flush()\n                membership = WorkspaceMembership(\n                    user_id=actor_id,\n                    workspace_id=workspace.id,\n                    role=\"owner\",\n                    granted_by=actor_id,\n                )\n                self._session.add(membership)\n                await self._session.flush()\n                await self._record(\n                    actor_id, \"workspace.created\", \"workspace\", workspace.id\n                )\n                await self._record(\n                    actor_id, \"membership.created\", \"membership\", membership.id\n                )\n        except IntegrityError:\n            # The singleton index fired: a concurrent creator won the\n            # race. The savepoint rolled our insert back; return theirs.\n            existing = await self.get_current()\n            if existing is None:\n                raise\n            return existing, False\n        return workspace, True\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 5
+    },
+    "ai_commit": "156f5bdb9221",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 1.0,
+    "span": [
+      27,
+      31
+    ]
+  }
+}

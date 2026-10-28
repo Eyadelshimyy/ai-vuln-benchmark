@@ -1,0 +1,558 @@
+{
+  "all": {
+    "candidates": 2032,
+    "confirm_rate_ci95_repo_cluster": [
+      0.08056338028169015,
+      0.14802981895633652
+    ],
+    "confirm_rate_exec": 0.10906612133605999,
+    "confirmed": 160,
+    "confirmed_by_cwe": {
+      "CWE-22": 130,
+      "CWE-78": 4,
+      "CWE-918": 26
+    },
+    "confirmed_source_unique": 156,
+    "cwe22_subtypes": {
+      "BASE_JOIN_OVERRIDE": 5,
+      "DIRECT_CALLER_PATH": 125
+    },
+    "executable": 1467,
+    "max_repo_share_of_confirmed": 0.11875,
+    "repos": 75,
+    "repos_with_confirmed": 46,
+    "triggered": 277
+  },
+  "by_generator": {
+    "claude-code": {
+      "candidates": 957,
+      "confirm_rate_ci95_repo_cluster": [
+        0.05466540999057493,
+        0.16535433070866143
+      ],
+      "confirm_rate_exec": 0.08991825613079019,
+      "confirmed": 66,
+      "confirmed_by_cwe": {
+        "CWE-22": 49,
+        "CWE-918": 17
+      },
+      "confirmed_source_unique": 64,
+      "cwe22_subtypes": {
+        "DIRECT_CALLER_PATH": 49
+      },
+      "executable": 734,
+      "max_repo_share_of_confirmed": 0.2878787878787879,
+      "repos": 31,
+      "repos_with_confirmed": 18,
+      "triggered": 101
+    },
+    "cursor": {
+      "candidates": 465,
+      "confirm_rate_ci95_repo_cluster": [
+        0.07008086253369272,
+        0.19480519480519481
+      ],
+      "confirm_rate_exec": 0.12146892655367232,
+      "confirmed": 43,
+      "confirmed_by_cwe": {
+        "CWE-22": 34,
+        "CWE-78": 3,
+        "CWE-918": 6
+      },
+      "confirmed_source_unique": 42,
+      "cwe22_subtypes": {
+        "BASE_JOIN_OVERRIDE": 2,
+        "DIRECT_CALLER_PATH": 32
+      },
+      "executable": 354,
+      "max_repo_share_of_confirmed": 0.13953488372093023,
+      "repos": 26,
+      "repos_with_confirmed": 14,
+      "triggered": 74
+    },
+    "devin": {
+      "candidates": 466,
+      "confirm_rate_ci95_repo_cluster": [
+        0.07102272727272728,
+        0.2125984251968504
+      ],
+      "confirm_rate_exec": 0.13286713286713286,
+      "confirmed": 38,
+      "confirmed_by_cwe": {
+        "CWE-22": 37,
+        "CWE-78": 1
+      },
+      "confirmed_source_unique": 37,
+      "cwe22_subtypes": {
+        "BASE_JOIN_OVERRIDE": 1,
+        "DIRECT_CALLER_PATH": 36
+      },
+      "executable": 286,
+      "max_repo_share_of_confirmed": 0.21052631578947367,
+      "repos": 29,
+      "repos_with_confirmed": 13,
+      "triggered": 69
+    },
+    "github-copilot": {
+      "candidates": 99,
+      "confirm_rate_ci95_repo_cluster": [
+        0.08823529411764706,
+        0.2222222222222222
+      ],
+      "confirm_rate_exec": 0.14492753623188406,
+      "confirmed": 10,
+      "confirmed_by_cwe": {
+        "CWE-22": 9,
+        "CWE-918": 1
+      },
+      "confirmed_source_unique": 10,
+      "cwe22_subtypes": {
+        "BASE_JOIN_OVERRIDE": 1,
+        "DIRECT_CALLER_PATH": 8
+      },
+      "executable": 69,
+      "max_repo_share_of_confirmed": 0.3,
+      "repos": 11,
+      "repos_with_confirmed": 6,
+      "triggered": 28
+    },
+    "mixed": {
+      "candidates": 45,
+      "confirm_rate_ci95_repo_cluster": [
+        0.0,
+        0.2857142857142857
+      ],
+      "confirm_rate_exec": 0.125,
+      "confirmed": 3,
+      "confirmed_by_cwe": {
+        "CWE-22": 1,
+        "CWE-918": 2
+      },
+      "confirmed_source_unique": 3,
+      "cwe22_subtypes": {
+        "BASE_JOIN_OVERRIDE": 1
+      },
+      "executable": 24,
+      "max_repo_share_of_confirmed": 0.6666666666666666,
+      "repos": 14,
+      "repos_with_confirmed": 2,
+      "triggered": 5
+    }
+  },
+  "by_model": {
+    "Claude Haiku 4.5": {
+      "candidates": 3,
+      "confirm_rate_ci95_repo_cluster": [
+        null,
+        null
+      ],
+      "confirm_rate_exec": 0.0,
+      "confirmed": 0,
+      "confirmed_by_cwe": {},
+      "confirmed_source_unique": 0,
+      "cwe22_subtypes": {},
+      "executable": 1,
+      "max_repo_share_of_confirmed": null,
+      "repos": 1,
+      "repos_with_confirmed": 0,
+      "triggered": 0
+    },
+    "Claude Opus 4.5": {
+      "candidates": 24,
+      "confirm_rate_ci95_repo_cluster": [
+        0.0,
+        0.0
+      ],
+      "confirm_rate_exec": 0.0,
+      "confirmed": 0,
+      "confirmed_by_cwe": {},
+      "confirmed_source_unique": 0,
+      "cwe22_subtypes": {},
+      "executable": 23,
+      "max_repo_share_of_confirmed": null,
+      "repos": 3,
+      "repos_with_confirmed": 0,
+      "triggered": 1
+    },
+    "Claude Opus 4.6": {
+      "candidates": 13,
+      "confirm_rate_ci95_repo_cluster": [
+        0.0,
+        0.17647058823529413
+      ],
+      "confirm_rate_exec": 0.08333333333333333,
+      "confirmed": 1,
+      "confirmed_by_cwe": {
+        "CWE-918": 1
+      },
+      "confirmed_source_unique": 1,
+      "cwe22_subtypes": {},
+      "executable": 12,
+      "max_repo_share_of_confirmed": 1.0,
+      "repos": 4,
+      "repos_with_confirmed": 1,
+      "triggered": 1
+    },
+    "Claude Opus 4.7": {
+      "candidates": 34,
+      "confirm_rate_ci95_repo_cluster": [
+        0.0,
+        0.25
+      ],
+      "confirm_rate_exec": 0.20689655172413793,
+      "confirmed": 6,
+      "confirmed_by_cwe": {
+        "CWE-22": 2,
+        "CWE-918": 4
+      },
+      "confirmed_source_unique": 6,
+      "cwe22_subtypes": {
+        "DIRECT_CALLER_PATH": 2
+      },
+      "executable": 29,
+      "max_repo_share_of_confirmed": 0.6666666666666666,
+      "repos": 3,
+      "repos_with_confirmed": 2,
+      "triggered": 12
+    },
+    "Claude Opus 4.8": {
+      "candidates": 208,
+      "confirm_rate_ci95_repo_cluster": [
+        0.0,
+        0.11764705882352941
+      ],
+      "confirm_rate_exec": 0.030864197530864196,
+      "confirmed": 5,
+      "confirmed_by_cwe": {
+        "CWE-22": 5
+      },
+      "confirmed_source_unique": 3,
+      "cwe22_subtypes": {
+        "DIRECT_CALLER_PATH": 5
+      },
+      "executable": 162,
+      "max_repo_share_of_confirmed": 0.8,
+      "repos": 9,
+      "repos_with_confirmed": 2,
+      "triggered": 7
+    },
+    "Claude Opus 5": {
+      "candidates": 124,
+      "confirm_rate_ci95_repo_cluster": [
+        0.0,
+        0.17857142857142858
+      ],
+      "confirm_rate_exec": 0.0625,
+      "confirmed": 6,
+      "confirmed_by_cwe": {
+        "CWE-22": 6
+      },
+      "confirmed_source_unique": 6,
+      "cwe22_subtypes": {
+        "DIRECT_CALLER_PATH": 6
+      },
+      "executable": 96,
+      "max_repo_share_of_confirmed": 0.6666666666666666,
+      "repos": 13,
+      "repos_with_confirmed": 3,
+      "triggered": 21
+    },
+    "Claude Opus 5.5": {
+      "candidates": 197,
+      "confirm_rate_ci95_repo_cluster": [
+        0.0982367758186398,
+        0.4375
+      ],
+      "confirm_rate_exec": 0.1597222222222222,
+      "confirmed": 23,
+      "confirmed_by_cwe": {
+        "CWE-22": 17,
+        "CWE-918": 6
+      },
+      "confirmed_source_unique": 23,
+      "cwe22_subtypes": {
+        "DIRECT_CALLER_PATH": 17
+      },
+      "executable": 144,
+      "max_repo_share_of_confirmed": 0.391304347826087,
+      "repos": 12,
+      "repos_with_confirmed": 7,
+      "triggered": 28
+    },
+    "Claude Sonnet 4.5": {
+      "candidates": 5,
+      "confirm_rate_ci95_repo_cluster": [
+        0.0,
+        0.0
+      ],
+      "confirm_rate_exec": 0.0,
+      "confirmed": 0,
+      "confirmed_by_cwe": {},
+      "confirmed_source_unique": 0,
+      "cwe22_subtypes": {},
+      "executable": 5,
+      "max_repo_share_of_confirmed": null,
+      "repos": 3,
+      "repos_with_confirmed": 0,
+      "triggered": 0
+    },
+    "Claude Sonnet 4.6": {
+      "candidates": 61,
+      "confirm_rate_ci95_repo_cluster": [
+        0.0,
+        0.2
+      ],
+      "confirm_rate_exec": 0.15151515151515152,
+      "confirmed": 5,
+      "confirmed_by_cwe": {
+        "CWE-22": 3,
+        "CWE-918": 2
+      },
+      "confirmed_source_unique": 5,
+      "cwe22_subtypes": {
+        "DIRECT_CALLER_PATH": 3
+      },
+      "executable": 33,
+      "max_repo_share_of_confirmed": 0.6,
+      "repos": 8,
+      "repos_with_confirmed": 2,
+      "triggered": 6
+    },
+    "Claude Sonnet 5": {
+      "candidates": 82,
+      "confirm_rate_ci95_repo_cluster": [
+        0.0,
+        0.0
+      ],
+      "confirm_rate_exec": 0.0,
+      "confirmed": 0,
+      "confirmed_by_cwe": {},
+      "confirmed_source_unique": 0,
+      "cwe22_subtypes": {},
+      "executable": 58,
+      "max_repo_share_of_confirmed": null,
+      "repos": 7,
+      "repos_with_confirmed": 0,
+      "triggered": 3
+    },
+    "Claude Sonnet 5.5": {
+      "candidates": 7,
+      "confirm_rate_ci95_repo_cluster": [
+        0.0,
+        1.0
+      ],
+      "confirm_rate_exec": 0.5,
+      "confirmed": 2,
+      "confirmed_by_cwe": {
+        "CWE-22": 2
+      },
+      "confirmed_source_unique": 2,
+      "cwe22_subtypes": {
+        "DIRECT_CALLER_PATH": 2
+      },
+      "executable": 4,
+      "max_repo_share_of_confirmed": 0.5,
+      "repos": 3,
+      "repos_with_confirmed": 2,
+      "triggered": 2
+    },
+    "gpt-5.4": {
+      "candidates": 1,
+      "confirm_rate_ci95_repo_cluster": [
+        null,
+        null
+      ],
+      "confirm_rate_exec": 0.0,
+      "confirmed": 0,
+      "confirmed_by_cwe": {},
+      "confirmed_source_unique": 0,
+      "cwe22_subtypes": {},
+      "executable": 1,
+      "max_repo_share_of_confirmed": null,
+      "repos": 1,
+      "repos_with_confirmed": 0,
+      "triggered": 0
+    }
+  },
+  "census": "corpus_census_reproduced.json",
+  "census_sha256_16": "b0efdd6ab73d2e6a",
+  "model_coverage": {
+    "candidates": 2032,
+    "with_model": 759
+  },
+  "within_repo": [
+    {
+      "by_generator": {
+        "claude-code": {
+          "confirmed": 1,
+          "executable": 4
+        },
+        "devin": {
+          "confirmed": 0,
+          "executable": 17
+        }
+      },
+      "repo": "BerriAI__litellm"
+    },
+    {
+      "by_generator": {
+        "claude-code": {
+          "confirmed": 4,
+          "executable": 29
+        },
+        "cursor": {
+          "confirmed": 1,
+          "executable": 1
+        }
+      },
+      "repo": "PrjBbrosa__data-analyzer"
+    },
+    {
+      "by_generator": {
+        "claude-code": {
+          "confirmed": 1,
+          "executable": 33
+        },
+        "devin": {
+          "confirmed": 0,
+          "executable": 5
+        }
+      },
+      "repo": "TracecatHQ__tracecat"
+    },
+    {
+      "by_generator": {
+        "claude-code": {
+          "confirmed": 0,
+          "executable": 14
+        },
+        "devin": {
+          "confirmed": 1,
+          "executable": 16
+        }
+      },
+      "repo": "VocaHQ__vocalinux"
+    },
+    {
+      "by_generator": {
+        "claude-code": {
+          "confirmed": 0,
+          "executable": 4
+        },
+        "github-copilot": {
+          "confirmed": 1,
+          "executable": 2
+        }
+      },
+      "repo": "airbytehq__airbyte-python-cdk"
+    },
+    {
+      "by_generator": {
+        "claude-code": {
+          "confirmed": 0,
+          "executable": 1
+        },
+        "cursor": {
+          "confirmed": 3,
+          "executable": 15
+        },
+        "github-copilot": {
+          "confirmed": 1,
+          "executable": 1
+        }
+      },
+      "repo": "alexandrelheinen__fret"
+    },
+    {
+      "by_generator": {
+        "claude-code": {
+          "confirmed": 0,
+          "executable": 2
+        },
+        "cursor": {
+          "confirmed": 1,
+          "executable": 20
+        }
+      },
+      "repo": "atanasvasilevjourney__ORBIS-EQUITY-"
+    },
+    {
+      "by_generator": {
+        "claude-code": {
+          "confirmed": 4,
+          "executable": 15
+        },
+        "cursor": {
+          "confirmed": 6,
+          "executable": 15
+        }
+      },
+      "repo": "bermuda1023__ExposureEclipse"
+    },
+    {
+      "by_generator": {
+        "claude-code": {
+          "confirmed": 2,
+          "executable": 17
+        },
+        "cursor": {
+          "confirmed": 0,
+          "executable": 12
+        }
+      },
+      "repo": "nthplusio__skills"
+    },
+    {
+      "by_generator": {
+        "claude-code": {
+          "confirmed": 0,
+          "executable": 2
+        },
+        "github-copilot": {
+          "confirmed": 3,
+          "executable": 14
+        }
+      },
+      "repo": "paulosalem__ellements"
+    },
+    {
+      "by_generator": {
+        "claude-code": {
+          "confirmed": 0,
+          "executable": 5
+        },
+        "devin": {
+          "confirmed": 0,
+          "executable": 1
+        }
+      },
+      "repo": "philipvibecodes-maker__VibeCodedShortcutCheatsheet"
+    },
+    {
+      "by_generator": {
+        "claude-code": {
+          "confirmed": 2,
+          "executable": 12
+        },
+        "devin": {
+          "confirmed": 3,
+          "executable": 7
+        }
+      },
+      "repo": "quantam101__profitenginev5"
+    },
+    {
+      "by_generator": {
+        "claude-code": {
+          "confirmed": 1,
+          "executable": 1
+        },
+        "devin": {
+          "confirmed": 1,
+          "executable": 8
+        }
+      },
+      "repo": "quantam101__tradegate2"
+    }
+  ]
+}

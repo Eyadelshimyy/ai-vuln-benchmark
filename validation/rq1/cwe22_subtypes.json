@@ -1,0 +1,522 @@
+{
+  "2100preet__stockscanner/odte_scanner__alert_pulse.py__pulse_desk_alerts.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "2100preet__stockscanner/odte_scanner__config.py__load_config.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "2100preet__stockscanner/odte_scanner__signals__sure_winners.py__save_day_store.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "2100preet__stockscanner/odte_scanner__ui.py__run_ui.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "BerriAI__litellm/litellm__llms__oci__common_utils.py__load_private_key_from_file.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "Chuqonu__epi-preclean-patent-monitor/scripts__stamp_asset_versions.py__file_hash.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "Cognition-Partner-Workshops__otterworks-workshop-2610/migration__job__ldm__staging.py__sha256_file.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "DeepCivic__womblex/fixtures__synthetic__generate.py__register_csv.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "DeepCivic__womblex/fixtures__synthetic__generate.py__scanned_letter_pdf.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "DeepCivic__womblex/src__womblex__ingest__gnaf.py___has_header_row.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "DeepCivic__womblex/src__womblex__ingest__pdf___image.py____init__.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "DeepCivic__womblex/src__womblex__ingest__pdf___pdfium_doc.py__open_document.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "DeepCivic__womblex/src__womblex__utils__checksum.py__sha256_file.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "FrancescoCiulla__NLWeb/code__python__misc__podcast_scraper.py__save_to_tsv.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "Gunrunner444__BugForge/backend__app__security_testing__exploratory.py__prepare_foundry_workspace.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_capture__config_store.py___write_config_file.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "PrjBbrosa__data-analyzer/mf4_analyzer__acquisition_capture__runtime_smoke.py__run.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "PrjBbrosa__data-analyzer/mf4_analyzer__batch_manifest.py__sha256_file.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "PrjBbrosa__data-analyzer/mf4_analyzer__io__asc_can_format.py___preflight_asc_format.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "PrjBbrosa__data-analyzer/scripts__probe_switch_smoothness.py___emit.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "ProtossBlaster__leapmotor-mate/poller__session_share.py___read_bytes.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "ProtossBlaster__leapmotor-mate/poller__session_share.py___write_bytes.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "ProtossBlaster__leapmotor-mate/web__session_share.py___read_bytes.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "ProtossBlaster__leapmotor-mate/web__session_share.py___write_bytes.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "TracecatHQ__tracecat/tracecat__registry__sync__artifact.py___compute_file_hash.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "VibeBB__fpga-agent/scripts__container_hardening_report.py___load.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "VibeBB__fpga-agent/scripts__library_smoke.py__synth_unit.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "VibeBB__fpga-agent/scripts__structural_coverage.py__dump.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "VibeBB__fpga-agent/src__fpga__gates.py__spdx_ids.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "VibeBB__fpga-agent/src__fpga__render.py__write_png.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "VocaHQ__vocalinux/src__vocalinux__speech_recognition__diarization.py___load_wav.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "aditya9729__roboeval_challenge/scripts__stage_submission.py___sha256.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "aditya9729__roboeval_challenge/src__roboeval_entry__data__io.py__sha256_file.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "aditya9729__roboeval_challenge/src__roboeval_entry__data__io.py__write_json_atomic.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "aditya9729__roboeval_challenge/src__roboeval_entry__training__corr_noise.py___sha256.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "aditya9729__roboeval_challenge/src__roboeval_entry__training__image_cache.py___sha256.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "aditya9729__roboeval_challenge/src__roboeval_entry__training__image_cache.py__build_image_cache.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "airbytehq__airbyte-python-cdk/airbyte_cdk__cli__source_declarative_manifest___run.py___parse_manifest_from_file.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "alexandrelheinen__clave/src__clave__corpus__artifacts.py__digest_of.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "alexandrelheinen__clave/src__clave__experiment__run.py__write.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "alexandrelheinen__clave/src__clave__runtime__loop.py__write_record.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "alexandrelheinen__clave/src__clave__runtime__play.py__play.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "alexandrelheinen__fret/scripts__plot_telemetry.py___load_csv.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "alexandrelheinen__fret/scripts__release__audit_showcase_renders.py___wall_contact_rate.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "alexandrelheinen__fret/src__fret__ros__mujoco_bridge.py___load_bridge_config.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "alexandrelheinen__fret/src__fret__ros__perception_bridge.py___load_config.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "atanasvasilevjourney__ORBIS-EQUITY-/pipeline__ema200_scanner__config__loader.py__load_config.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "bermuda1023__ExposureEclipse/backend__app__services__industry_losses.py___rows.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "bermuda1023__ExposureEclipse/backend__scripts__build_onlevel_indices.py__write_county.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "bermuda1023__ExposureEclipse/backend__scripts__import_pcs_county_estimates.py__write_csv.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "bermuda1023__ExposureEclipse/backend__scripts__import_usws_industry.py___write_source.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "bramstroker__homeassistant-powercalc/utils__library__common.py___read_model_json.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "briandconnelly__skills/pi-coding-agent__scripts__pi_gate.py____init__.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "c-wenlong__blenderkc/blenderkc__overlay.py___save_state.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "c-wenlong__blenderkc/blenderkc__overlay.py__composite_dir.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "c-wenlong__blenderkc/blenderkc__timing.py__timing_from_narration.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "c-wenlong__blenderkc/tools__cli__blenderkc_cli__hostjob.py___tail.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "c-wenlong__blenderkc/tools__cli__blenderkc_cli__media.py__concat.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "c-wenlong__blenderkc/tools__cli__blenderkc_cli__repo.py__sha256_file.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "c-wenlong__blenderkc/tools__cli__blenderkc_cli__repo.py__write_json.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "c-wenlong__blenderkc/tools__cli__blenderkc_cli__timeline.py__write_scene_timings.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "clarmso__openings.info/scripts__generate_new_jobs.py___load_ats_by_slug.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "danielreuter__research-notes/lanes__circuits-grid-models__labeller__silu_check.py__fetch.json": {
+    "subtype": "BASE_JOIN_OVERRIDE",
+    "why": "Path('/tmp/gm/dive') / item"
+  },
+  "danielreuter__research-notes/lanes__proofs-n2-guest__tools__refill.py__submit.json": {
+    "subtype": "BASE_JOIN_OVERRIDE",
+    "why": "G / 'scripts' / name"
+  },
+  "danielreuter__research-notes/lanes__proofs-n2-hill__tools__n2h.py__sync_cache.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "danielreuter__research-notes/lanes__proofs-rows__tools__split_measure.py__sha256.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "danielreuter__research-notes/lanes__proofs-rows__tools__stage_mark.py__sha256.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "gcnewbief__Log-Grabber/log_grabber.py__zip_case.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "hdzwzqbxlk__ComfyUI-LK-Model_Auto-Matching/core__config.py___load_json.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "joemccann__radon/cloud__demo-vm__demo_vm_autodeploy.py__install_tooling.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "kamoras__civitas/backend__app__atomic_write.py__update_json_file.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "kamoras__civitas/backend__app__file_cache.py__read_json.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "kamoras__civitas/backend__app__shared_state.py__read_record.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "kamoras__civitas/backend__scripts__audit_funding_components.py__fetch.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "kamoras__civitas/backend__scripts__benchmark_validation.py__load_les.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "kamoras__civitas/backend__scripts__build_county_district_crosswalk.py__load_county_names.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "kamoras__civitas/backend__scripts__evaluate_embedding_models.py__load_donor_task.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "kamoras__civitas/backend__scripts__fetch_occupation_industry.py__fetch.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "kamoras__civitas/backend__scripts__fetch_occupation_industry.py__labels.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "kamoras__civitas/backend__scripts__fetch_poll_close_times.py__rederive.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "kamoras__civitas/backend__scripts__research_constituent_alignment.py__fetch.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "kamoras__civitas/backend__scripts__research_justice_loyalty.py___tenure.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "kamoras__civitas/backend__scripts__research_justice_loyalty.py__fetch.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "ljofreflor__jobbot/src__jobbot__companies__registry.py__save_companies.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "ljofreflor__jobbot/src__jobbot__profile__importer_common.py__write_generated_profile.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "ljofreflor__jobbot/src__jobbot__resources____init__.py__copy_templates.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "ljofreflor__jobbot/src__jobbot__workspace.py__init_workspace.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "loveRhythm1990__mini-pi/03-tools__src__tools.py__tool_edit.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "loveRhythm1990__mini-pi/03-tools__src__tools.py__tool_read.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "loveRhythm1990__mini-pi/03-tools__src__tools.py__tool_write.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "markus-michalski__project-hub/servers__project-hub-server__tools__docs_writer.py___append_action_item.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "markus-michalski__project-hub/servers__project-hub-server__tools__docs_writer.py__write_note_to_disk.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "markus-michalski__project-hub/servers__project-hub-server__tools__knowledge.py__save_knowledge.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "mikelane__pytest-gremlins/src__pytest_gremlins__instrumentation__spawn_hook.py__write_spawn_hook.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "mikelane__pytest-gremlins/src__pytest_gremlins__node_id_args.py___read_node_ids.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "mikelane__pytest-gremlins/src__pytest_gremlins__reporting__history.py__append_history_entry.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "nthplusio__skills/skills__scoussens-skills__pr-review-round__scripts__queue.py__load_overrides.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "oamin__fpl-engine/src__eval__holdout.py__sha256_file.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "oamin__fpl-engine/src__live__deadline.py__write_log.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "oamin__fpl-engine/src__live__fpl_snapshot.py__refresh.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "paulosalem__ellements/ellements-core__src__ellements__core__config.py__load_toml.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "paulosalem__ellements/ellements-core__src__ellements__core__observability__jsonl_logger.py___append_line.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "paulosalem__ellements/ellements-reporting__src__ellements__reporting__html_generation.py__export_html.json": {
+    "subtype": "BASE_JOIN_OVERRIDE",
+    "why": "self.output_dir / filename"
+  },
+  "qndelmar__tbnano/tbnano__generators__base.py__write_task.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "qndelmar__tbnano/tbnano__metrics.py__write_report.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "qndelmar__tbnano/tbnano__tasksio.py__materialize_setup.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "quantam101__profitenginev5/master_distillation__dataset.py____init__.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "quantam101__profitenginev5/master_distillation__dataset.py__digest.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "quantam101__profitenginev5/master_distillation__main.py__atomic_save_text.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "quantam101__tradegate2/runtime__tradegate__rotation.py__load_csv.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "quantam101__tradegate2/runtime__tradegate__truth_ledger.py__run_truth_ledger.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "royles__AppliedAIModelTraining/backend__app__training__dataset_loader.py___load_jsonl.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "royles__AppliedAIModelTraining/backend__app__training__transformer_job.py___save_artifacts.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "saltyscott0521__tracebi/scripts__ui_audit.py__serve.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "saltyscott0521__tracebi/tracebi__cli.py___build_report_target.json": {
+    "subtype": "BASE_JOIN_OVERRIDE",
+    "why": "Path(d) / fname"
+  },
+  "saltyscott0521__tracebi/tracebi__connections.py__read_connection_doc.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "saltyscott0521__tracebi/tracebi__model__model_spec.py__read_model_doc.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "saltyscott0521__tracebi/tracebi__pipeline__pipeline_spec.py__read_pipeline_doc.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "shizukutanaka__Slice/slice____main__.py___compare_doc.json": {
+    "subtype": "BASE_JOIN_OVERRIDE",
+    "why": "os.path.join('knowledge_store', path + '.json')"
+  },
+  "shizukutanaka__Slice/slice____main__.py___diff_load.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "tonezzz__chaba/scripts__ada__spend-ledger.py__load_usage.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "trsdn__macos-notarization-broker/scripts__broker.py__sha256_file.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "trsdn__macos-notarization-broker/scripts__broker.py__write_json.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "waltfilipe__sada-test/scripts__engine__sofascore_heatmap.py__save_heatmap.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "waltfilipe__sada-test/scripts__engine__sofascore_heatmap.py__write_heatmap_index.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "wstomber__devinexecdemo/demo__evidence.py__read_csv.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "wstomber__devinexecdemo/python__msp.py__load_cwf.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "wstomber__devinexecdemo/python__msp.py__open_output.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "wstomber__devinexecdemo/python__msp.py__run.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  },
+  "z-mio__parse_hub_bot/services__media.py__make_thumb.json": {
+    "subtype": "DIRECT_CALLER_PATH",
+    "why": "no base composition with a parameter"
+  }
+}

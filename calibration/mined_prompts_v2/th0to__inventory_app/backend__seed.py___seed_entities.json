@@ -1,0 +1,28 @@
+{
+  "repo": "th0to__inventory_app",
+  "file": "backend/seed.py",
+  "function": "_seed_entities",
+  "line": 46,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `_seed_entities` function (parameters: db).",
+  "prompt_source": "def _seed_entities(db: Session) -> None:\n    \"\"\"Implement the `_seed_entities` function (parameters: db).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def _seed_entities(db: Session) -> None:\n    existing = {name for (name,) in db.execute(select(Entity.name)).all()}\n    for entity in ENTITIES:\n        if entity[\"name\"] not in existing:\n            db.add(Entity(name=entity[\"name\"], has_order_num=entity[\"has_order_num\"]))",
+  "module_source": "from __future__ import annotations\n\nimport os\n\nfrom passlib.context import CryptContext\nfrom sqlalchemy import or_, select\nfrom sqlalchemy.orm import Session\n\nfrom database import Base, SessionLocal, engine\nfrom models import Category, Entity, Location, User, UserRole\n\npwd_context = CryptContext(schemes=[\"bcrypt\"], deprecated=\"auto\")\n\nENTITIES = [\n    {\"name\": \"GVA\", \"has_order_num\": False},\n    {\"name\": \"Zurich\", \"has_order_num\": True},\n    {\"name\": \"CDS\", \"has_order_num\": False},\n    {\"name\": \"FIX\", \"has_order_num\": False},\n]\n\nCATEGORIES = [\n    \"Laptop\",\n    \"Desktop\",\n    \"Mobile Workstation\",\n    \"Workstation\",\n    \"Display\",\n    \"Docking\",\n    \"Thin Client\",\n    \"Peripheral\",\n]\n\nLOCATIONS = [\n    \"Stock\",\n    \"Showroom\",\n    \"Client\",\n    \"Test\",\n    \"5eme\",\n    \"Smart Locker\",\n]\n\nDEFAULT_ADMIN_USERNAME = os.getenv(\"ADMIN_USERNAME\", \"admin\")\nDEFAULT_ADMIN_EMAIL = os.getenv(\"ADMIN_EMAIL\", \"admin@inventory.local\")\nDEFAULT_ADMIN_PASSWORD = os.getenv(\"ADMIN_PASSWORD\", \"Admin123!\")\n\n\ndef _seed_entities(db: Session) -> None:\n    existing = {name for (name,) in db.execute(select(Entity.name)).all()}\n    for entity in ENTITIES:\n        if entity[\"name\"] not in existing:\n            db.add(Entity(name=entity[\"name\"], has_order_num=entity[\"has_order_num\"]))\n\n\ndef _seed_categories(db: Session) -> None:\n    existing = {name for (name,) in db.execute(select(Category.name)).all()}\n    for name in CATEGORIES:\n        if name not in existing:\n            db.add(Category(name=name))\n\n\ndef _seed_locations(db: Session) -> None:\n    existing = {name for (name,) in db.execute(select(Location.name)).all()}\n    for name in LOCATIONS:\n        if name not in existing:\n            db.add(Location(name=name))\n\n\ndef _seed_default_admin(db: Session) -> None:\n    admin_user = db.execute(\n        select(User).where(\n            or_(\n                User.username == DEFAULT_ADMIN_USERNAME,\n                User.email == DEFAULT_ADMIN_EMAIL,\n            )\n        )\n    ).scalar_one_or_none()\n\n    if admin_user is None:\n        db.add(\n            User(\n                username=DEFAULT_ADMIN_USERNAME,\n                email=DEFAULT_ADMIN_EMAIL,\n                password_hash=pwd_context.hash(DEFAULT_ADMIN_PASSWORD),\n                role=UserRole.ADMIN,\n                is_active=True,\n            )\n        )\n        return\n\n    if admin_user.role != UserRole.ADMIN:\n        admin_user.role = UserRole.ADMIN\n    if not admin_user.is_active:\n        admin_user.is_active = True\n\n\ndef seed() -> None:\n    db = SessionLocal()\n    try:\n        _seed_entities(db)\n        _seed_categories(db)\n        _seed_locations(db)\n        _seed_default_admin(db)\n        db.commit()\n    except Exception:\n        db.rollback()\n        raise\n    finally:\n        db.close()\n\n\nif __name__ == \"__main__\":\n    seed()\n    print(\"Seed termin\u00e9e : tables cr\u00e9\u00e9es et donn\u00e9es de r\u00e9f\u00e9rence ins\u00e9r\u00e9es.\")\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "github-copilot": 5
+    },
+    "ai_commit": "a8b7197f8a97",
+    "evidence": "author/committer='copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      46,
+      50
+    ]
+  }
+}

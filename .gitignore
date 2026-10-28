@@ -20,3 +20,4 @@ baselines_confirmed.json
 
 # VULCAN candidate corpus: never ignore (AI-generated code snippets named *token*/*lock*/etc., not real secrets)
 !calibration/mined_prompts/**/*.json
+!calibration/mined_prompts_v2/**/*.json

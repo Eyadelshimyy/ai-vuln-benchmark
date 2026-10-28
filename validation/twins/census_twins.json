@@ -1,0 +1,1752 @@
+{
+  "per_cwe": {
+    "CWE-918": {
+      "discovered": 60,
+      "executable": 60,
+      "triggered": 60,
+      "confirmed": 30
+    },
+    "CWE-22": {
+      "discovered": 20,
+      "executable": 20,
+      "triggered": 8,
+      "confirmed": 4
+    },
+    "CWE-78": {
+      "discovered": 2,
+      "executable": 2,
+      "triggered": 0,
+      "confirmed": 0
+    }
+  },
+  "n_candidates": 68,
+  "tier2": true,
+  "rows": [
+    {
+      "file": "v1__FrancescoCiulla__NLWeb/code__python__misc__podcast_scraper.py__get_page.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {},
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:33483/a6ffa55be732",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:33483/a6ffa55be732",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__FrancescoCiulla__NLWeb/code__python__misc__podcast_scraper.py__get_page__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__atanasvasilevjourney__ORBIS-EQUITY-/pipeline__ingest__universe.py___scrape_sp_tickers.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {},
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:41959/f2310ac8ac5e",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:41959/f2310ac8ac5e",
+        "sink": "requests.Session.request",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__atanasvasilevjourney__ORBIS-EQUITY-/pipeline__ingest__universe.py___scrape_sp_tickers__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__atanasvasilevjourney__ORBIS-EQUITY-/pipeline__ingest__us_index_universe.py___scrape_table.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {},
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:36653/69737cab27fb",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:36653/69737cab27fb",
+        "sink": "requests.Session.request",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__atanasvasilevjourney__ORBIS-EQUITY-/pipeline__ingest__us_index_universe.py___scrape_table__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__bermuda1023__ExposureEclipse/backend__app__services__jma_typhoon.py___get_json.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {},
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:44967/1e9b6d83043f",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:44967/1e9b6d83043f",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__bermuda1023__ExposureEclipse/backend__app__services__jma_typhoon.py___get_json__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__bermuda1023__ExposureEclipse/backend__app__services__marine_obs.py___nws_get_absolute.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {},
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:43265/fe04e5b16d11",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:43265/fe04e5b16d11",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__bermuda1023__ExposureEclipse/backend__app__services__marine_obs.py___nws_get_absolute__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__bermuda1023__ExposureEclipse/backend__app__services__nhc_gis.py___download.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {},
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:36757/67165682b4da",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:36757/67165682b4da",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__bermuda1023__ExposureEclipse/backend__app__services__nhc_gis.py___download__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__bermuda1023__ExposureEclipse/backend__app__services__nhc_gtwo.py___download_kml.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {},
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:37011/088fd4e193b8",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:37011/088fd4e193b8",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__bermuda1023__ExposureEclipse/backend__app__services__nhc_gtwo.py___download_kml__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__bermuda1023__ExposureEclipse/backend__scripts__build_event_evidence.py__fetch.json",
+      "cwes": [
+        "CWE-22",
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "cache",
+          "url"
+        ],
+        "diag_buckets": {
+          "cache": "EXECUTED_NO_SINK"
+        },
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:40209/e7cd71174061",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:40209/e7cd71174061",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__bermuda1023__ExposureEclipse/backend__scripts__build_event_evidence.py__fetch__FIXED.json",
+      "cwes": [
+        "CWE-22",
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "cache",
+          "url"
+        ],
+        "diag_buckets": {
+          "cache": "EXECUTED_NO_SINK",
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__bermuda1023__ExposureEclipse/backend__scripts__build_onlevel_indices.py__fetch.json",
+      "cwes": [
+        "CWE-22",
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "cache",
+          "url"
+        ],
+        "diag_buckets": {
+          "cache": "EXECUTED_NO_SINK"
+        },
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:39329/2a611991b072",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:39329/2a611991b072",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__bermuda1023__ExposureEclipse/backend__scripts__build_onlevel_indices.py__fetch__FIXED.json",
+      "cwes": [
+        "CWE-22",
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "cache",
+          "url"
+        ],
+        "diag_buckets": {
+          "cache": "EXECUTED_NO_SINK",
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__clarmso__openings.info/src__http.py___fetch.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "timeout",
+          "url"
+        ],
+        "diag_buckets": {
+          "timeout": "EXECUTED_NO_SINK"
+        },
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:45153/0e2b4c90dffd",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:45153/0e2b4c90dffd",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__clarmso__openings.info/src__http.py___fetch__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "timeout",
+          "url"
+        ],
+        "diag_buckets": {
+          "timeout": "EXECUTED_NO_SINK",
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__danielreuter__research-notes/lanes__circuits-grid-models__labeller__silu_check.py__fetch.json",
+      "cwes": [
+        "CWE-78"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-22",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-22",
+      "tier2_evidence": {
+        "params_tried": [
+          "item"
+        ],
+        "diag_buckets": {},
+        "error": null,
+        "param": "item",
+        "payload": "/tmp/tier2_proof_1i87lnow/pwned_93f8d13c5521",
+        "proof": "traversal write escaped to /tmp/tier2_proof_1i87lnow/pwned_93f8d13c5521",
+        "sink": "Path.mkdir",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__danielreuter__research-notes/lanes__circuits-grid-models__labeller__silu_check.py__fetch__FIXED.json",
+      "cwes": [
+        "CWE-78"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-22",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "item"
+        ],
+        "diag_buckets": {
+          "item": "PATH_TRAVERSAL_NO_OBSERVABLE"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__danielreuter__research-notes/lanes__proofs-n2-guest__tools__refill.py__submit.json",
+      "cwes": [
+        "CWE-22"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-22",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-22",
+      "tier2_evidence": {
+        "params_tried": [
+          "cmd",
+          "header",
+          "name"
+        ],
+        "diag_buckets": {
+          "cmd": "SINK_REACHED_INPUT_ABSENT",
+          "header": "SINK_REACHED_INPUT_ABSENT"
+        },
+        "error": null,
+        "param": "name",
+        "payload": "/tmp/tier2_proof_a7a3i9gv/pwned_667ea580c83f",
+        "proof": "traversal write escaped to /tmp/tier2_proof_a7a3i9gv/pwned_667ea580c83f",
+        "sink": "Path.write_text",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__danielreuter__research-notes/lanes__proofs-n2-guest__tools__refill.py__submit__FIXED.json",
+      "cwes": [
+        "CWE-22"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-22",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "cmd",
+          "header",
+          "name",
+          "what"
+        ],
+        "diag_buckets": {
+          "cmd": "SINK_REACHED_INPUT_ABSENT",
+          "header": "SINK_REACHED_INPUT_ABSENT",
+          "name": "PATH_TRAVERSAL_NO_OBSERVABLE",
+          "what": "SINK_REACHED_INPUT_ABSENT"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__joemccann__radon/cloud__demo-vm__demo_vm_autodeploy.py__http_get.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {},
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:36963/a6944301b6d6",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:36963/a6944301b6d6",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__joemccann__radon/cloud__demo-vm__demo_vm_autodeploy.py__http_get__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__kamoras__civitas/backend__app__pipeline__analyze__bluesky_utils.py__build_link_card.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "client",
+          "url"
+        ],
+        "diag_buckets": {
+          "client": "SINK_REACHED_INPUT_ABSENT"
+        },
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:36253/062044208ae3",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:36253/062044208ae3",
+        "sink": "httpx.Client.send",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__kamoras__civitas/backend__app__pipeline__analyze__bluesky_utils.py__build_link_card__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "client",
+          "url"
+        ],
+        "diag_buckets": {
+          "client": "SINK_REACHED_INPUT_ABSENT",
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__kamoras__civitas/backend__app__pipeline__analyze__bluesky_utils.py__fetch_og_card.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {},
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:33879/8b6a9598c14b",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:33879/8b6a9598c14b",
+        "sink": "httpx.Client.send",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__kamoras__civitas/backend__app__pipeline__analyze__bluesky_utils.py__fetch_og_card__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__kamoras__civitas/backend__scripts__build_county_district_crosswalk.py__download.json",
+      "cwes": [
+        "CWE-22",
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "cache",
+          "url"
+        ],
+        "diag_buckets": {
+          "cache": "EXECUTED_NO_SINK"
+        },
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:37281/c1a4fb10a8d7",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:37281/c1a4fb10a8d7",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__kamoras__civitas/backend__scripts__build_county_district_crosswalk.py__download__FIXED.json",
+      "cwes": [
+        "CWE-22",
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "cache",
+          "url"
+        ],
+        "diag_buckets": {
+          "cache": "EXECUTED_NO_SINK",
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__kamoras__civitas/backend__scripts__calibrate_lda_bill_match.py___get.json",
+      "cwes": [
+        "CWE-22",
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {},
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:36921/8d2f6414d63e",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:36921/8d2f6414d63e",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__kamoras__civitas/backend__scripts__calibrate_lda_bill_match.py___get__FIXED.json",
+      "cwes": [
+        "CWE-22",
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__kamoras__civitas/backend__scripts__calibrate_position_confidence.py___csv.json",
+      "cwes": [
+        "CWE-22",
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "cache",
+          "name",
+          "url"
+        ],
+        "diag_buckets": {
+          "cache": "EXECUTED_NO_SINK",
+          "name": "EXECUTED_NO_SINK"
+        },
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:37473/5cbf52fb908e",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:37473/5cbf52fb908e",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__kamoras__civitas/backend__scripts__calibrate_position_confidence.py___csv__FIXED.json",
+      "cwes": [
+        "CWE-22",
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "cache",
+          "name",
+          "url"
+        ],
+        "diag_buckets": {
+          "cache": "EXECUTED_NO_SINK",
+          "name": "EXECUTED_NO_SINK",
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__kamoras__civitas/backend__scripts__fetch_state_leg_crosswalk.py__download.json",
+      "cwes": [
+        "CWE-22",
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "cache",
+          "url"
+        ],
+        "diag_buckets": {
+          "cache": "EXECUTED_NO_SINK"
+        },
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:45381/cba6520f46dc",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:45381/cba6520f46dc",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__kamoras__civitas/backend__scripts__fetch_state_leg_crosswalk.py__download__FIXED.json",
+      "cwes": [
+        "CWE-22",
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "cache",
+          "url"
+        ],
+        "diag_buckets": {
+          "cache": "EXECUTED_NO_SINK",
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__nthplusio__skills/skills__scoussens-skills__visualize-spec__evals__fixtures__order-hooks__src__order_hooks__webhooks.py__send_webhook.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "payload",
+          "url"
+        ],
+        "diag_buckets": {
+          "payload": "EXECUTED_NO_SINK"
+        },
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:45085/fef5acac1e4b",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:45085/fef5acac1e4b",
+        "sink": "requests.Session.request",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__nthplusio__skills/skills__scoussens-skills__visualize-spec__evals__fixtures__order-hooks__src__order_hooks__webhooks.py__send_webhook__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "payload",
+          "url"
+        ],
+        "diag_buckets": {
+          "payload": "EXECUTED_NO_SINK",
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__paulosalem__ellements/ellements-reporting__src__ellements__reporting__html_generation.py__export_html.json",
+      "cwes": [
+        "CWE-22"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-22",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-22",
+      "tier2_evidence": {
+        "params_tried": [
+          "content",
+          "filename"
+        ],
+        "diag_buckets": {
+          "content": "SINK_REACHED_INPUT_ABSENT"
+        },
+        "error": null,
+        "param": "filename",
+        "payload": "/tmp/tier2_proof_r1so3912/pwned_e7ab8307b807",
+        "proof": "traversal write escaped to /tmp/tier2_proof_r1so3912/pwned_e7ab8307b807",
+        "sink": "Path.write_text",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__paulosalem__ellements/ellements-reporting__src__ellements__reporting__html_generation.py__export_html__FIXED.json",
+      "cwes": [
+        "CWE-22"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-22",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "content",
+          "filename"
+        ],
+        "diag_buckets": {
+          "content": "SINK_REACHED_INPUT_ABSENT",
+          "filename": "PATH_SINK_INPUT_BOUNDED"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__quantam101__profitenginev5/runtime__agent_impls__daily_digest.py___get_json.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {},
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:44753/ee89df97c8f7",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:44753/ee89df97c8f7",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__quantam101__profitenginev5/runtime__agent_impls__daily_digest.py___get_json__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__quantam101__profitenginev5/runtime__agent_impls__daily_digest.py___post_json.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "headers",
+          "payload",
+          "url"
+        ],
+        "diag_buckets": {
+          "headers": "EXECUTED_NO_SINK",
+          "payload": "EXECUTED_NO_SINK"
+        },
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:38555/41161fe0be5f",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:38555/41161fe0be5f",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__quantam101__profitenginev5/runtime__agent_impls__daily_digest.py___post_json__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "headers",
+          "payload",
+          "url"
+        ],
+        "diag_buckets": {
+          "headers": "EXECUTED_NO_SINK",
+          "payload": "EXECUTED_NO_SINK",
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__saltyscott0521__tracebi/tracebi___delivery.py__slack_notify.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "text",
+          "webhook_url"
+        ],
+        "diag_buckets": {
+          "text": "EXECUTED_NO_SINK"
+        },
+        "error": null,
+        "param": "webhook_url",
+        "payload": "http://127.0.0.1:33553/22fba3eec39c",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:33553/22fba3eec39c",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__saltyscott0521__tracebi/tracebi___delivery.py__slack_notify__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "text",
+          "webhook_url"
+        ],
+        "diag_buckets": {
+          "text": "EXECUTED_NO_SINK",
+          "webhook_url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__saltyscott0521__tracebi/tracebi___updates.py___fetch.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {},
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:46077/9c8b9f2bd86d",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:46077/9c8b9f2bd86d",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__saltyscott0521__tracebi/tracebi___updates.py___fetch__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__waltfilipe__sada-test/scripts__download_club_logos.py__download_file.json",
+      "cwes": [
+        "CWE-22",
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "dest",
+          "url"
+        ],
+        "diag_buckets": {
+          "dest": "EXECUTED_NO_SINK"
+        },
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:39849/95903f3c7a69",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:39849/95903f3c7a69",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__waltfilipe__sada-test/scripts__download_club_logos.py__download_file__FIXED.json",
+      "cwes": [
+        "CWE-22",
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "dest",
+          "url"
+        ],
+        "diag_buckets": {
+          "dest": "EXECUTED_NO_SINK",
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__waltfilipe__sada-test/scripts__download_club_logos.py__fetch_json.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {},
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:35617/902c33b85d78",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:35617/902c33b85d78",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__waltfilipe__sada-test/scripts__download_club_logos.py__fetch_json__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__waltfilipe__sada-test/scripts__enrich_loan_status.py__fetch_loan_club.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {},
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:36817/987014013d56",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:36817/987014013d56",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__waltfilipe__sada-test/scripts__enrich_loan_status.py__fetch_loan_club__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v1__x-uuid__syforce/app__syforce__util.py__http_get.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "limit",
+          "timeout",
+          "url"
+        ],
+        "diag_buckets": {
+          "limit": "EXECUTED_NO_SINK",
+          "timeout": "EXECUTED_NO_SINK"
+        },
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:34847/0344d771c1a0",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:34847/0344d771c1a0",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v1__x-uuid__syforce/app__syforce__util.py__http_get__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "limit",
+          "timeout",
+          "url"
+        ],
+        "diag_buckets": {
+          "limit": "EXECUTED_NO_SINK",
+          "timeout": "EXECUTED_NO_SINK",
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v2__artificial-hedge__dipcatcher/scripts__fetch_binance_vision_carry.py___http.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {},
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:42735/9c129f4e211a",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:42735/9c129f4e211a",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v2__artificial-hedge__dipcatcher/scripts__fetch_binance_vision_carry.py___http__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "url"
+        ],
+        "diag_buckets": {
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v2__artificial-hedge__dipcatcher/scripts__require_release_gates.py__github_get_json.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "params",
+          "token",
+          "url"
+        ],
+        "diag_buckets": {
+          "params": "EXECUTED_NO_SINK",
+          "token": "EXECUTED_NO_SINK"
+        },
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:42903/f9bf17dffd99",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:42903/f9bf17dffd99",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v2__artificial-hedge__dipcatcher/scripts__require_release_gates.py__github_get_json__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "params",
+          "token",
+          "url"
+        ],
+        "diag_buckets": {
+          "params": "EXECUTED_NO_SINK",
+          "token": "EXECUTED_NO_SINK",
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v2__artificial-hedge__dipcatcher/src__fx1__serve__e2e_audit.py___raw_headers.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "key",
+          "url"
+        ],
+        "diag_buckets": {
+          "key": "EXECUTED_NO_SINK"
+        },
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:42311/965a35533a63",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:42311/965a35533a63",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v2__artificial-hedge__dipcatcher/src__fx1__serve__e2e_audit.py___raw_headers__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "key",
+          "url"
+        ],
+        "diag_buckets": {
+          "key": "EXECUTED_NO_SINK",
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v2__artificial-hedge__dipcatcher/src__quant_fund__research__witness_scan.py___http.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-918",
+      "tier2_evidence": {
+        "params_tried": [
+          "data",
+          "url"
+        ],
+        "diag_buckets": {
+          "data": "EXECUTED_NO_SINK"
+        },
+        "error": null,
+        "param": "url",
+        "payload": "http://127.0.0.1:41773/3215c4691330",
+        "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:41773/3215c4691330",
+        "sink": "urllib.request.urlopen",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v2__artificial-hedge__dipcatcher/src__quant_fund__research__witness_scan.py___http__FIXED.json",
+      "cwes": [
+        "CWE-918"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-918",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "data",
+          "url"
+        ],
+        "diag_buckets": {
+          "data": "EXECUTED_NO_SINK",
+          "url": "EXECUTED_NO_SINK"
+        },
+        "error": null
+      },
+      "error": null
+    },
+    {
+      "file": "v2__ayushdad609-code__autoclip/backend__services__studio__publish_kit.py__ai_cover.json",
+      "cwes": [
+        "CWE-22"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-22",
+      "executable": true,
+      "triggered": true,
+      "confirmed": true,
+      "confirmed_cwe": "CWE-22",
+      "tier2_evidence": {
+        "params_tried": [
+          "job_id",
+          "project_id"
+        ],
+        "diag_buckets": {
+          "job_id": "PATH_TRAVERSAL_NO_OBSERVABLE"
+        },
+        "error": null,
+        "param": "project_id",
+        "payload": "/tmp/tier2_proof_4he8zl81/pwned_ca6231f909cd",
+        "proof": "traversal write escaped to /tmp/tier2_proof_4he8zl81/pwned_ca6231f909cd",
+        "sink": "Path.mkdir",
+        "n_attempts": 1
+      },
+      "error": null
+    },
+    {
+      "file": "v2__ayushdad609-code__autoclip/backend__services__studio__publish_kit.py__ai_cover__FIXED.json",
+      "cwes": [
+        "CWE-22"
+      ],
+      "verdict": "TRIGGERED",
+      "exec_cwe": "CWE-22",
+      "executable": true,
+      "triggered": true,
+      "confirmed": false,
+      "confirmed_cwe": null,
+      "tier2_evidence": {
+        "params_tried": [
+          "job_id",
+          "project_id",
+          "strategy_id"
+        ],
+        "diag_buckets": {
+          "job_id": "PATH_TRAVERSAL_NO_OBSERVABLE",
+          "project_id": "PATH_TRAVERSAL_NO_OBSERVABLE",
+          "strategy_id": "SINK_REACHED_INPUT_ABSENT"
+        },
+        "error": null
+      },
+      "error": null
+    }
+  ]
+}

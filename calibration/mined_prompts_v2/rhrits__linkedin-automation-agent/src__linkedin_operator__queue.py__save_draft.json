@@ -1,0 +1,28 @@
+{
+  "repo": "rhrits__linkedin-automation-agent",
+  "file": "src/linkedin_operator/queue.py",
+  "function": "save_draft",
+  "line": 36,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `save_draft` function (parameters: draft).",
+  "prompt_source": "def save_draft(draft: Draft) -> Path:\n    \"\"\"Implement the `save_draft` function (parameters: draft).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def save_draft(draft: Draft) -> Path:\n    path = Path(draft.path)\n    path.parent.mkdir(parents=True, exist_ok=True)\n    post = frontmatter.Post(draft.body.strip() + \"\\n\", **draft.meta.model_dump(mode=\"json\"))\n    path.write_text(frontmatter.dumps(post) + \"\\n\", encoding=\"utf-8\")\n    return path",
+  "module_source": "from __future__ import annotations\n\nfrom datetime import date, datetime, time\nfrom pathlib import Path\nfrom zoneinfo import ZoneInfo\n\nimport frontmatter\n\nfrom .models import Draft, DraftMeta, Slot\nfrom .paths import repo_root\n\nIST = ZoneInfo(\"Asia/Kolkata\")\nSLOT_TIMES = {\"a\": time(9, 30), \"b\": time(19, 0)}\n\n\ndef drafts_dir() -> Path:\n    path = repo_root() / \"drafts\"\n    path.mkdir(parents=True, exist_ok=True)\n    return path\n\n\ndef draft_path(day: date, slot: Slot) -> Path:\n    return drafts_dir() / f\"{day.isoformat()}-{slot}.md\"\n\n\ndef default_scheduled_at(day: date, slot: Slot) -> datetime:\n    return datetime.combine(day, SLOT_TIMES[slot], tzinfo=IST)\n\n\ndef load_draft(path: Path) -> Draft:\n    post = frontmatter.load(path)\n    meta = DraftMeta.model_validate(post.metadata)\n    return Draft(path=str(path), meta=meta, body=str(post.content).strip() + \"\\n\")\n\n\ndef save_draft(draft: Draft) -> Path:\n    path = Path(draft.path)\n    path.parent.mkdir(parents=True, exist_ok=True)\n    post = frontmatter.Post(draft.body.strip() + \"\\n\", **draft.meta.model_dump(mode=\"json\"))\n    path.write_text(frontmatter.dumps(post) + \"\\n\", encoding=\"utf-8\")\n    return path\n\n\ndef list_drafts(*, statuses: set[str] | None = None) -> list[Draft]:\n    items: list[Draft] = []\n    for path in sorted(drafts_dir().glob(\"*.md\")):\n        if path.name.lower() == \"readme.md\":\n            continue\n        try:\n            draft = load_draft(path)\n        except Exception:\n            continue\n        if statuses and draft.meta.status not in statuses:\n            continue\n        items.append(draft)\n    return items\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 6
+    },
+    "ai_commit": "79e2befeea0b",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      36,
+      41
+    ]
+  }
+}

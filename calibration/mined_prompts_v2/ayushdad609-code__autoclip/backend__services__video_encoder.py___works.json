@@ -1,0 +1,28 @@
+{
+  "repo": "ayushdad609-code__autoclip",
+  "file": "backend/services/video_encoder.py",
+  "function": "_works",
+  "line": 31,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `_works` function (parameters: ffmpeg, encoder).",
+  "prompt_source": "def _works(ffmpeg: str, encoder: str) -> bool:\n    \"\"\"Implement the `_works` function (parameters: ffmpeg, encoder).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def _works(ffmpeg: str, encoder: str) -> bool:\n    cmd = [ffmpeg, '-v', 'error', '-f', 'lavfi', '-i', 'color=c=black:s=320x568:r=30:d=0.3',\n           *_args(encoder, 320, 568), '-f', 'null', '-']\n    try:\n        return subprocess.run(cmd, capture_output=True, timeout=20).returncode == 0\n    except (OSError, subprocess.SubprocessError):\n        return False",
+  "module_source": "\"\"\"H.264 encoder choice: the machine's hardware encoder when it works, else libx264.\n\nA Studio render used to be one libx264 encode per clip on the CPU; with 30+ clips per video that\nwas most of the run and all of the fan noise. VideoToolbox (macOS) and NVENC / QSV / AMF (Windows,\nLinux) encode the same 1080\u00d71920 clip several times faster with almost no CPU. Each candidate is\nproven once with a tiny test encode; a failed real encode marks it broken and the caller retries\nwith libx264. `AUTOCLIP_VIDEO_ENCODER=x264` forces software encoding.\n\"\"\"\nfrom __future__ import annotations\n\nimport logging\nimport os\nimport subprocess\nimport sys\nimport threading\n\nlogger = logging.getLogger(__name__)\n\nSOFTWARE = 'libx264'\n_lock = threading.Lock()\n_chosen: str | None = None\n_broken: set[str] = set()\n\n\ndef _candidates() -> list[str]:\n    if sys.platform == 'darwin':\n        return ['h264_videotoolbox']\n    return ['h264_nvenc', 'h264_qsv', 'h264_amf']\n\n\ndef _works(ffmpeg: str, encoder: str) -> bool:\n    cmd = [ffmpeg, '-v', 'error', '-f', 'lavfi', '-i', 'color=c=black:s=320x568:r=30:d=0.3',\n           *_args(encoder, 320, 568), '-f', 'null', '-']\n    try:\n        return subprocess.run(cmd, capture_output=True, timeout=20).returncode == 0\n    except (OSError, subprocess.SubprocessError):\n        return False\n\n\ndef encoder() -> str:\n    \"\"\"The encoder to use now (probed once per process).\"\"\"\n    global _chosen\n    if os.getenv('AUTOCLIP_VIDEO_ENCODER', '').strip().lower() in ('x264', 'libx264', 'software'):\n        return SOFTWARE\n    with _lock:\n        if _chosen is None or _chosen in _broken:\n            from backend.utils.ffmpeg_utils import get_ffmpeg_path\n            ffmpeg = get_ffmpeg_path()\n            _chosen = next((name for name in _candidates() if name not in _broken and _works(ffmpeg, name)), SOFTWARE)\n            logger.info('Video encoder: %s', _chosen)\n        return _chosen\n\n\ndef mark_broken(name: str) -> None:\n    if name != SOFTWARE:\n        with _lock:\n            _broken.add(name)\n        logger.warning('Hardware encoder %s failed; using libx264 from now on', name)\n\n\ndef _bitrate(width: int, height: int, fps: int = 30) -> int:\n    # ~0.13 bits per pixel per frame matches libx264 crf 20 on talking-head footage (8 Mbps at 1080\u00d71920@30).\n    return max(1_500_000, int(width * height * fps * 0.13))\n\n\ndef _args(name: str, width: int, height: int) -> list[str]:\n    rate = _bitrate(width, height)\n    vbr = ['-b:v', str(rate), '-maxrate', str(int(rate * 1.5)), '-bufsize', str(rate * 2)]\n    if name == 'h264_videotoolbox':\n        return ['-c:v', name, *vbr, '-profile:v', 'high', '-pix_fmt', 'yuv420p']\n    if name == 'h264_nvenc':\n        return ['-c:v', name, '-preset', 'p4', '-rc', 'vbr', '-cq', '21', *vbr, '-pix_fmt', 'yuv420p']\n    if name == 'h264_qsv':\n        return ['-c:v', name, '-preset', 'medium', '-global_quality', '21', *vbr, '-pix_fmt', 'nv12']\n    if name == 'h264_amf':\n        return ['-c:v', name, '-quality', 'balanced', '-rc', 'vbr_peak', *vbr, '-pix_fmt', 'yuv420p']\n    return ['-c:v', SOFTWARE, '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p']\n\n\ndef h264_args(width: int, height: int, name: str | None = None) -> list[str]:\n    \"\"\"Video codec arguments (codec, rate control, pixel format) for one encode.\"\"\"\n    return _args(name or encoder(), width, height)\n\n\ndef run_with_fallback(build, run):\n    \"\"\"Run `run(build(name))`; if a hardware encode fails, mark it broken and retry with libx264.\n\n    `build(name)` returns the ffmpeg command for that encoder; `run(cmd)` returns a completed process.\n    \"\"\"\n    name = encoder()\n    if name == SOFTWARE:\n        return run(build(name))\n    try:\n        proc = run(build(name))\n    except (subprocess.TimeoutExpired, OSError):\n        proc = None  # a stalled hardware encoder: software encoding still gets its chance\n    if proc is None or proc.returncode:\n        retry = run(build(SOFTWARE))\n        # Only blame the hardware encoder when software succeeds on the same input; a bad source\n        # or filter graph fails both and must not disable hardware encoding for the session.\n        if not retry.returncode:\n            mark_broken(name)\n        return retry\n    return proc\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 7
+    },
+    "ai_commit": "5946cd70ccc8",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 1.0,
+    "span": [
+      31,
+      37
+    ]
+  }
+}

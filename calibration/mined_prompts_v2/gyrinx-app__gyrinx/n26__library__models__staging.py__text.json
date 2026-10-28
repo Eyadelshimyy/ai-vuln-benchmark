@@ -1,0 +1,28 @@
+{
+  "repo": "gyrinx-app__gyrinx",
+  "file": "n26/library/models/staging.py",
+  "function": "text",
+  "line": 79,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": true,
+  "docstring": "The file's contents as text.\n\n``utf-8-sig`` because a spreadsheet exported from a desktop program\nwrites a byte order mark, and it would otherwise arrive stuck to the\nfirst column heading, where no sheet reader would recognise it.",
+  "prompt_source": "    def text(self):\n        \"\"\"The file's contents as text.\n\n        ``utf-8-sig`` because a spreadsheet exported from a desktop program\n        writes a byte order mark, and it would otherwise arrive stuck to the\n        first column heading, where no sheet reader would recognise it.\n        \"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    def text(self):\n        \"\"\"The file's contents as text.\n\n        ``utf-8-sig`` because a spreadsheet exported from a desktop program\n        writes a byte order mark, and it would otherwise arrive stuck to the\n        first column heading, where no sheet reader would recognise it.\n        \"\"\"\n        with self.file.open(\"rb\") as handle:\n            return handle.read().decode(\"utf-8-sig\")",
+  "module_source": "\"\"\"A spreadsheet an author has uploaded, waiting to be previewed and imported.\n\nNot content. Nothing here belongs to a pack, nothing here is ever shown to a\nplayer, and deleting everything an import wrote leaves these rows untouched \u2014\nthey are the files, not the rows the files became.\n\nThey exist because a preview and the import that follows it have to read the\nsame bytes. A browser will not let a server fill a file input back in, so a\npage that previewed an upload and then asked for the file again was asking the\nauthor to promise it was the same one, once per sheet, for as long as it took\nto read the preview. Holding the upload makes preview and import two readings\nof one thing, and it lets a preview be looked at twice, or tomorrow.\n\nAn upload belongs to whoever sent it: two authors working at once each get\ntheir own set of sheets rather than one quietly replacing the other's. One\nsheet of each kind is held at a time \u2014 uploading the Equipment sheet again is\nhow a corrected export replaces a wrong one, which is the whole working\nrhythm while an edition is being built.\n\"\"\"\n\nfrom django.db import models\n\nfrom n26.core.models import Base, Owned\nfrom n26.library.sheets import SHEET_CHOICES\n\n#: Where a held sheet is written inside the site's storage. Uploads land on a\n#: name of their own, so replacing a sheet never overwrites the bytes a\n#: preview somewhere else is still reading.\nUPLOAD_PREFIX = \"ingest-sheets/\"\n\n#: What one sheet may weigh. The whole catalogue is a few hundred kilobytes of\n#: text, so this refuses the mistaken upload \u2014 a workbook, an image, a video \u2014\n#: long before anything tries to read it as CSV.\nMAX_SHEET_BYTES = 8 * 1024 * 1024\n\n\nclass UploadedSheet(Base, Owned):\n    \"\"\"One pre-ingest spreadsheet, held between being uploaded and imported.\n\n    A replacement writes over the row rather than making a new one, so\n    ``modified`` is when the file it holds now arrived and ``created`` is when\n    this sheet was first given one. The pages show the former.\n    \"\"\"\n\n    sheet = models.CharField(\n        max_length=32,\n        choices=SHEET_CHOICES,\n        help_text=\"Which of the pre-ingest sheets this file is.\",\n    )\n    filename = models.CharField(\n        max_length=255,\n        help_text=\"The name the file arrived under, shown so an author can \"\n        \"tell one export from another.\",\n    )\n    file = models.FileField(\n        upload_to=UPLOAD_PREFIX,\n        help_text=\"The uploaded CSV, kept so a preview and the import after \"\n        \"it read the same bytes.\",\n    )\n    lines = models.PositiveIntegerField(\n        default=0,\n        help_text=\"Data lines the file holds, counted when it arrived.\",\n    )\n\n    class Meta:\n        verbose_name = \"uploaded sheet\"\n        verbose_name_plural = \"uploaded sheets\"\n        ordering = [\"sheet\"]\n        constraints = [\n            models.UniqueConstraint(\n                fields=[\"owner\", \"sheet\"],\n                name=\"one_held_sheet_of_each_kind_per_author\",\n            )\n        ]\n\n    def __str__(self):\n        return f\"{self.sheet}: {self.filename}\"\n\n    def text(self):\n        \"\"\"The file's contents as text.\n\n        ``utf-8-sig`` because a spreadsheet exported from a desktop program\n        writes a byte order mark, and it would otherwise arrive stuck to the\n        first column heading, where no sheet reader would recognise it.\n        \"\"\"\n        with self.file.open(\"rb\") as handle:\n            return handle.read().decode(\"utf-8-sig\")\n\n    def delete(self, *args, **kwargs):\n        \"\"\"Take the stored file with the row.\n\n        A queryset delete goes round this, so held sheets are removed one at a\n        time \u2014 five files is not worth a bulk path that leaks bytes.\n        \"\"\"\n        stored = self.file.name\n        result = super().delete(*args, **kwargs)\n        if stored:\n            self.file.storage.delete(stored)\n        return result\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 9
+    },
+    "ai_commit": "8ae5f0863c93",
+    "evidence": "Generated with [Claude Code]",
+    "ai_line_fraction": 1.0,
+    "span": [
+      79,
+      87
+    ]
+  }
+}

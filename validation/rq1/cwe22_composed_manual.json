@@ -1,0 +1,42 @@
+{
+  "method": "hand review of every row the heuristic marked BASE_JOIN_OVERRIDE, plus ai_cover (2026-10-27)",
+  "composed_confirmed": [
+    {
+      "corpus": "v1",
+      "file": "danielreuter__research-notes/lanes__circuits-grid-models__labeller__silu_check.py__fetch.json",
+      "why": "Path('/tmp/gm/dive') / item"
+    },
+    {
+      "corpus": "v1",
+      "file": "danielreuter__research-notes/lanes__proofs-n2-guest__tools__refill.py__submit.json",
+      "why": "G / 'scripts' / name (write)"
+    },
+    {
+      "corpus": "v1",
+      "file": "paulosalem__ellements/ellements-reporting__src__ellements__reporting__html_generation.py__export_html.json",
+      "why": "self.output_dir / filename (write)"
+    },
+    {
+      "corpus": "v2",
+      "file": "ayushdad609-code__autoclip/backend__services__studio__publish_kit.py__ai_cover.json",
+      "why": "get_projects_directory() / project_id via helpers (confirmed via project_id)"
+    }
+  ],
+  "reclassified_direct": [
+    {
+      "corpus": "v1",
+      "file": "saltyscott0521__tracebi/tracebi__cli.py___build_report_target.json",
+      "why": "heuristic matched Path(d)/fname on internal data; caller-supplied path/output used whole"
+    },
+    {
+      "corpus": "v1",
+      "file": "shizukutanaka__Slice/slice____main__.py___compare_doc.json",
+      "why": "join only for 'k_' ids; otherwise the caller's path is opened whole (the absolute-path payload takes that branch)"
+    },
+    {
+      "corpus": "v2",
+      "file": "Wazor2__tiger-ai-devin/scripts__build_demo_cards.py__as_card.json",
+      "why": "confirmed via src, used whole by Image.open(src)"
+    }
+  ]
+}

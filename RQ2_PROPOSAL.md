@@ -1,3 +1,7 @@
+> **Superseded (2026-10-26)** by `validation/rq2/RQ2_PREREGISTRATION.md`. The population
+> below (1,216 functions / 34 repos) predates the frozen census, and the P5 run made from
+> it ran the agentic CLI inside the repo, so labels were readable. Kept for the record.
+
 # RQ2 — AI vulnerability-detector evaluation: experiment proposal
 
 **For:** thesis supervisor review and approval

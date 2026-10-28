@@ -1,0 +1,28 @@
+{
+  "repo": "nagibator9986__ccupractice",
+  "file": "backend/migrations/versions/f0a4b5c6d7e8_contract_verification_code.py",
+  "function": "upgrade",
+  "line": 20,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `upgrade` function.",
+  "prompt_source": "def upgrade():\n    # Two-phase add: nullable first, backfill existing rows with unique codes,\n    # then enforce NOT NULL and uniqueness.\n    \"\"\"Implement the `upgrade` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def upgrade():\n    # Two-phase add: nullable first, backfill existing rows with unique codes,\n    # then enforce NOT NULL and uniqueness.\n    with op.batch_alter_table('contracts', schema=None) as batch_op:\n        batch_op.add_column(\n            sa.Column('verification_code', sa.String(length=24), nullable=True)\n        )\n\n    conn = op.get_bind()\n    rows = conn.execute(sa.text(\"SELECT id FROM contracts\")).fetchall()\n    used: set[str] = set()\n    for (cid,) in rows:\n        while True:\n            code = secrets.token_urlsafe(12)\n            if code not in used:\n                used.add(code)\n                break\n        conn.execute(\n            sa.text(\"UPDATE contracts SET verification_code = :c WHERE id = :i\"),\n            {\"c\": code, \"i\": cid},\n        )\n\n    with op.batch_alter_table('contracts', schema=None) as batch_op:\n        batch_op.alter_column(\n            'verification_code',\n            existing_type=sa.String(length=24),\n            nullable=False,\n        )\n        batch_op.create_unique_constraint(\n            'uq_contracts_verification_code', ['verification_code']\n        )\n        batch_op.create_index(\n            'ix_contracts_verification_code', ['verification_code'], unique=False\n        )",
+  "module_source": "\"\"\"contract verification code for QR stamp\n\nRevision ID: f0a4b5c6d7e8\nRevises: e9f3a4b5c6d7\nCreate Date: 2026-07-01 10:00:00.000000\n\n\"\"\"\nimport secrets\n\nfrom alembic import op\nimport sqlalchemy as sa\n\n\nrevision = 'f0a4b5c6d7e8'\ndown_revision = 'e9f3a4b5c6d7'\nbranch_labels = None\ndepends_on = None\n\n\ndef upgrade():\n    # Two-phase add: nullable first, backfill existing rows with unique codes,\n    # then enforce NOT NULL and uniqueness.\n    with op.batch_alter_table('contracts', schema=None) as batch_op:\n        batch_op.add_column(\n            sa.Column('verification_code', sa.String(length=24), nullable=True)\n        )\n\n    conn = op.get_bind()\n    rows = conn.execute(sa.text(\"SELECT id FROM contracts\")).fetchall()\n    used: set[str] = set()\n    for (cid,) in rows:\n        while True:\n            code = secrets.token_urlsafe(12)\n            if code not in used:\n                used.add(code)\n                break\n        conn.execute(\n            sa.text(\"UPDATE contracts SET verification_code = :c WHERE id = :i\"),\n            {\"c\": code, \"i\": cid},\n        )\n\n    with op.batch_alter_table('contracts', schema=None) as batch_op:\n        batch_op.alter_column(\n            'verification_code',\n            existing_type=sa.String(length=24),\n            nullable=False,\n        )\n        batch_op.create_unique_constraint(\n            'uq_contracts_verification_code', ['verification_code']\n        )\n        batch_op.create_index(\n            'ix_contracts_verification_code', ['verification_code'], unique=False\n        )\n\n\ndef downgrade():\n    with op.batch_alter_table('contracts', schema=None) as batch_op:\n        batch_op.drop_index('ix_contracts_verification_code')\n        batch_op.drop_constraint('uq_contracts_verification_code', type_='unique')\n        batch_op.drop_column('verification_code')\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 34
+    },
+    "ai_commit": "aae39fefdcee",
+    "evidence": "Generated with [Claude Code]",
+    "ai_line_fraction": 1.0,
+    "span": [
+      20,
+      53
+    ]
+  }
+}

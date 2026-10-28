@@ -1,0 +1,15 @@
+{
+  "purpose": "Pinned external-source manifest for the 4 V2 source-dependent confirmations. A reproducibility mechanism, NOT a license grant. 33/37 V2 confirmations reproduce from the public candidate records alone; these 4 need source the researcher must obtain and be entitled to use.",
+  "repos": {
+    "Kopanov__EdgeGuard-Knowledge-Graph": {"upstream":"https://github.com/Kopanov/EdgeGuard-Knowledge-Graph","license":"MIT","redistribution":"permitted WITH MIT license text + attribution","needed_for":"1 CWE-22 confirmation","closure_validated_phaseF":true,"minimal_closure_files":34,"full_repo_src_bytes":8700000},
+    "ayushdad609-code__autoclip": {"upstream":"https://github.com/ayushdad609-code/autoclip","license":"MIT","redistribution":"permitted WITH MIT license text + attribution","needed_for":"1 CWE-22 confirmation (ai_cover)","closure_validated_phaseF":false,"note":"minimal closure incomplete (backend.services.base); full _repo_src required","full_repo_src_bytes":7300000},
+    "artificial-hedge__dipcatcher": {"upstream":"https://github.com/artificial-hedge/dipcatcher","license":"NOASSERTION (no clear license)","redistribution":"NOT established - researcher must obtain source and confirm entitlement","needed_for":"1 CWE-22 confirmation","closure_validated_phaseF":false,"full_repo_src_bytes":82600000},
+    "zorntyler540-byte__-estate-ez": {"upstream":"https://github.com/zorntyler540-byte/-estate-ez","license":"NOASSERTION (no clear license)","redistribution":"NOT established - researcher must obtain source and confirm entitlement","needed_for":"1 CWE-22 confirmation","closure_validated_phaseF":true,"minimal_closure_files":8,"full_repo_src_bytes":2000000}
+  },
+  "verified_commit_shas":"NOT independently verified in this phase; vendored _repo_src lacks .git. Pin against upstream and verify per-file hashes in validation/V2_VERSIONING_PROPOSAL.json before use.",
+  "reproduction_tiers":{
+    "public_release_alone":"33 of 37 V2 confirmations (candidate records are self-contained)",
+    "with_locally_supplied_source":"up to 37 of 37 if the researcher supplies the 4 repos' source and is entitled to use it (EdgeGuard+autoclip MIT; dipcatcher+estate-ez unresolved)",
+    "blocked":"the 2 NOASSERTION repos' confirmations cannot be publicly bundled"
+  }
+}

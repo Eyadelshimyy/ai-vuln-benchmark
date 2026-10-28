@@ -1,0 +1,28 @@
+{
+  "repo": "artificial-hedge__dipcatcher",
+  "file": "scripts/_probe_qlib_quote.py",
+  "function": "main",
+  "line": 16,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main() -> None:\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main() -> None:\n    frames = load_panel(\n        [\n            ROOT / \"data/raw/sources/btcusdt_1d.parquet\",\n            ROOT / \"data/raw/sources/ethusdt_1d.parquet\",\n            ROOT / \"data/raw/sources/solusdt_1d.parquet\",\n        ]\n    )\n    tmp = tempfile.mkdtemp()\n    prov = write_qlib_provider(Path(tmp) / \"qlib_data\", frames)\n\n    import qlib  # noqa: E402\n    from qlib.data import D  # noqa: E402\n\n    qlib.init(provider_uri=str(prov), region=\"cn\")\n\n    out = open(\"probe_quote_out.txt\", \"w\", encoding=\"utf-8\")\n    for sid in (\"SOLUSDT\", \"BTCUSDT\", \"ETHUSDT\"):\n        df = D.features(\n            [sid], [\"$open\", \"$close\", \"$volume\"], start_time=\"2025-02-28\", end_time=\"2025-03-05\"\n        )\n        out.write(f\"=== {sid}\\n{df.to_string()}\\n\\n\")\n\n    # also check the raw bin length vs calendar\n    cal = (Path(tmp) / \"qlib_data\" / \"calendars\" / \"day.txt\").read_text().split()\n    out.write(f\"calendar n={len(cal)} first={cal[0]} last={cal[-1]}\\n\")\n    import numpy as np  # noqa: E402\n\n    b = np.fromfile(Path(tmp) / \"qlib_data/features/solusdt/open.day.bin\", dtype=\"<f4\")\n    out.write(f\"sol open.bin len={len(b)} first_idx={b[0]} last3={b[-3:]}\\n\")\n    idx = cal.index(\"2025-03-03\")\n    out.write(f\"2025-03-03 cal index={idx} -> bin[{idx + 1}]={b[idx + 1]}\\n\")\n    out.close()",
+  "module_source": "\"\"\"Probe qlib quote data around 2025-03-03 for SOLUSDT.\"\"\"\n\nfrom __future__ import annotations\n\nimport sys\nimport tempfile\nfrom pathlib import Path\n\nROOT = Path(__file__).resolve().parent.parent\nsys.path.insert(0, str(ROOT / \"scripts\"))\n\nfrom incumbent_bench_qlib import write_qlib_provider  # noqa: E402\nfrom incumbent_bench_vectorbt import load_panel  # noqa: E402\n\n\ndef main() -> None:\n    frames = load_panel(\n        [\n            ROOT / \"data/raw/sources/btcusdt_1d.parquet\",\n            ROOT / \"data/raw/sources/ethusdt_1d.parquet\",\n            ROOT / \"data/raw/sources/solusdt_1d.parquet\",\n        ]\n    )\n    tmp = tempfile.mkdtemp()\n    prov = write_qlib_provider(Path(tmp) / \"qlib_data\", frames)\n\n    import qlib  # noqa: E402\n    from qlib.data import D  # noqa: E402\n\n    qlib.init(provider_uri=str(prov), region=\"cn\")\n\n    out = open(\"probe_quote_out.txt\", \"w\", encoding=\"utf-8\")\n    for sid in (\"SOLUSDT\", \"BTCUSDT\", \"ETHUSDT\"):\n        df = D.features(\n            [sid], [\"$open\", \"$close\", \"$volume\"], start_time=\"2025-02-28\", end_time=\"2025-03-05\"\n        )\n        out.write(f\"=== {sid}\\n{df.to_string()}\\n\\n\")\n\n    # also check the raw bin length vs calendar\n    cal = (Path(tmp) / \"qlib_data\" / \"calendars\" / \"day.txt\").read_text().split()\n    out.write(f\"calendar n={len(cal)} first={cal[0]} last={cal[-1]}\\n\")\n    import numpy as np  # noqa: E402\n\n    b = np.fromfile(Path(tmp) / \"qlib_data/features/solusdt/open.day.bin\", dtype=\"<f4\")\n    out.write(f\"sol open.bin len={len(b)} first_idx={b[0]} last3={b[-3:]}\\n\")\n    idx = cal.index(\"2025-03-03\")\n    out.write(f\"2025-03-03 cal index={idx} -> bin[{idx + 1}]={b[idx + 1]}\\n\")\n    out.close()\n\n\nif __name__ == \"__main__\":\n    main()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 3
+    },
+    "ai_commit": "ddc404f1f0c6",
+    "evidence": "author/committer='Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 0.091,
+    "span": [
+      16,
+      48
+    ]
+  }
+}

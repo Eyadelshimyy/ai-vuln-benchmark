@@ -1,0 +1,33 @@
+{
+  "repo": "gyrinx-app__gyrinx",
+  "file": "gyrinx/api/management/commands/register_discord_commands.py",
+  "function": "handle",
+  "line": 21,
+  "candidate_cwes": [
+    "CWE-918"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `handle` function.",
+  "prompt_source": "    def handle(self, *args, **options):\n        \"\"\"Implement the `handle` function.\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    def handle(self, *args, **options):\n        if not settings.DISCORD_BOT_TOKEN:\n            raise CommandError(\"DISCORD_BOT_TOKEN is not configured\")\n        if not settings.DISCORD_APPLICATION_ID:\n            raise CommandError(\"DISCORD_APPLICATION_ID is not configured\")\n\n        app_id = settings.DISCORD_APPLICATION_ID\n        url = f\"https://discord.com/api/v10/applications/{app_id}/commands\"\n\n        # Register \"Create Issue\" message context menu command\n        # type 3 = MESSAGE command (context menu on messages)\n        command_data = {\n            \"name\": \"Create Issue\",\n            \"type\": 3,\n        }\n\n        response = requests.put(\n            url,\n            headers={\n                \"Authorization\": f\"Bot {settings.DISCORD_BOT_TOKEN}\",\n                \"Content-Type\": \"application/json\",\n            },\n            json=[command_data],\n            timeout=30,\n        )\n\n        if response.status_code == 200:\n            commands = response.json()\n            self.stdout.write(\n                self.style.SUCCESS(\n                    f\"Registered {len(commands)} command(s) successfully:\"\n                )\n            )\n            for cmd in commands:\n                self.stdout.write(\n                    f\"  - {cmd['name']} (id: {cmd['id']}, type: {cmd['type']})\"\n                )\n        else:\n            raise CommandError(\n                f\"Failed to register commands: {response.status_code} {response.text}\"\n            )",
+  "module_source": "\"\"\"\nRegister Discord application commands.\n\nCreates the \"Create Issue\" message context menu command that allows users\nto right-click a message and file a GitHub issue from it.\n\nUsage:\n    manage register_discord_commands\n\nRequires DISCORD_BOT_TOKEN and DISCORD_APPLICATION_ID in settings.\n\"\"\"\n\nimport requests\nfrom django.conf import settings\nfrom django.core.management.base import BaseCommand, CommandError\n\n\nclass Command(BaseCommand):\n    help = \"Register Discord application commands (message context menu)\"\n\n    def handle(self, *args, **options):\n        if not settings.DISCORD_BOT_TOKEN:\n            raise CommandError(\"DISCORD_BOT_TOKEN is not configured\")\n        if not settings.DISCORD_APPLICATION_ID:\n            raise CommandError(\"DISCORD_APPLICATION_ID is not configured\")\n\n        app_id = settings.DISCORD_APPLICATION_ID\n        url = f\"https://discord.com/api/v10/applications/{app_id}/commands\"\n\n        # Register \"Create Issue\" message context menu command\n        # type 3 = MESSAGE command (context menu on messages)\n        command_data = {\n            \"name\": \"Create Issue\",\n            \"type\": 3,\n        }\n\n        response = requests.put(\n            url,\n            headers={\n                \"Authorization\": f\"Bot {settings.DISCORD_BOT_TOKEN}\",\n                \"Content-Type\": \"application/json\",\n            },\n            json=[command_data],\n            timeout=30,\n        )\n\n        if response.status_code == 200:\n            commands = response.json()\n            self.stdout.write(\n                self.style.SUCCESS(\n                    f\"Registered {len(commands)} command(s) successfully:\"\n                )\n            )\n            for cmd in commands:\n                self.stdout.write(\n                    f\"  - {cmd['name']} (id: {cmd['id']}, type: {cmd['type']})\"\n                )\n        else:\n            raise CommandError(\n                f\"Failed to register commands: {response.status_code} {response.text}\"\n            )\n",
+  "construction_recipe": {
+    "call_args_source": "()",
+    "uses_tmp_path": false,
+    "source_file": "n23/core/tests/test_prodshell.py",
+    "source_line": 16
+  },
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 41
+    },
+    "ai_commit": "dc6d8a85bc21",
+    "evidence": "Generated with [Claude Code]",
+    "ai_line_fraction": 1.0,
+    "span": [
+      21,
+      61
+    ]
+  }
+}

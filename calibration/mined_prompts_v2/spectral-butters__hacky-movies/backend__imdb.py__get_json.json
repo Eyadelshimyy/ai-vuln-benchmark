@@ -1,0 +1,28 @@
+{
+  "repo": "spectral-butters__hacky-movies",
+  "file": "backend/imdb.py",
+  "function": "get_json",
+  "line": 16,
+  "candidate_cwes": [
+    "CWE-918"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `get_json` function (parameters: url).",
+  "prompt_source": "def get_json(\n    url: str,\n    *,\n    headers: Optional[Dict[str, str]] = None,\n    body: Optional[bytes] = None,\n) -> Optional[Dict[str, Any]]:\n    \"\"\"Implement the `get_json` function (parameters: url).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def get_json(\n    url: str,\n    *,\n    headers: Optional[Dict[str, str]] = None,\n    body: Optional[bytes] = None,\n) -> Optional[Dict[str, Any]]:\n    request = Request(\n        url,\n        data=body,\n        headers={\"User-Agent\": BROWSER_USER_AGENT, **(headers or {})},\n    )\n    try:\n        with urlopen(\n            request, timeout=REQUEST_TIMEOUT, context=default_ssl_context()\n        ) as response:\n            return json.loads(response.read().decode(\"utf-8\", errors=\"replace\"))\n    except (HTTPError, URLError, TimeoutError, ValueError, OSError):\n        return None",
+  "module_source": "import json\nfrom typing import Any, Dict, Optional\nfrom urllib.error import HTTPError, URLError\nfrom urllib.request import Request, urlopen\n\nfrom .net import default_ssl_context\n\nGRAPHQL_URL = \"https://api.graphql.imdb.com/\"\nBROWSER_USER_AGENT = (\n    \"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \"\n    \"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\"\n)\nREQUEST_TIMEOUT = 8.0\n\n\ndef get_json(\n    url: str,\n    *,\n    headers: Optional[Dict[str, str]] = None,\n    body: Optional[bytes] = None,\n) -> Optional[Dict[str, Any]]:\n    request = Request(\n        url,\n        data=body,\n        headers={\"User-Agent\": BROWSER_USER_AGENT, **(headers or {})},\n    )\n    try:\n        with urlopen(\n            request, timeout=REQUEST_TIMEOUT, context=default_ssl_context()\n        ) as response:\n            return json.loads(response.read().decode(\"utf-8\", errors=\"replace\"))\n    except (HTTPError, URLError, TimeoutError, ValueError, OSError):\n        return None\n\n\ndef graphql(query: str, variables: Dict[str, Any]) -> Optional[Dict[str, Any]]:\n    \"\"\"IMDb's GraphQL endpoint answers 403 without a browser Origin and Referer.\"\"\"\n    payload = get_json(\n        GRAPHQL_URL,\n        headers={\n            \"Accept\": \"application/json\",\n            \"Content-Type\": \"application/json\",\n            \"Origin\": \"https://www.imdb.com\",\n            \"Referer\": \"https://www.imdb.com/\",\n        },\n        body=json.dumps({\"query\": query, \"variables\": variables}).encode(\"utf-8\"),\n    )\n    return (payload or {}).get(\"data\")\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 18
+    },
+    "ai_commit": "7847cd491b6e",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 1.0,
+    "span": [
+      16,
+      33
+    ]
+  }
+}

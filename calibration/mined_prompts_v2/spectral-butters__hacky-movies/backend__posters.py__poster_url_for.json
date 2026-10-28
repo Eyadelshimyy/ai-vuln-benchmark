@@ -1,0 +1,28 @@
+{
+  "repo": "spectral-butters__hacky-movies",
+  "file": "backend/posters.py",
+  "function": "poster_url_for",
+  "line": 21,
+  "candidate_cwes": [
+    "CWE-918"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `poster_url_for` function (parameters: imdb_id).",
+  "prompt_source": "def poster_url_for(imdb_id: Optional[str]) -> Optional[str]:\n    \"\"\"Implement the `poster_url_for` function (parameters: imdb_id).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def poster_url_for(imdb_id: Optional[str]) -> Optional[str]:\n    if not imdb_id or not IMDB_ID_PATTERN.fullmatch(imdb_id):\n        return None\n    request = Request(\n        SUGGESTION_URL.format(imdb_id=imdb_id),\n        headers={\n            \"User-Agent\": BROWSER_USER_AGENT,\n            \"Accept\": \"application/json\",\n            \"Accept-Language\": \"en-US,en;q=0.9\",\n        },\n    )\n    try:\n        with urlopen(\n            request, timeout=REQUEST_TIMEOUT, context=default_ssl_context()\n        ) as response:\n            payload = json.loads(response.read().decode(\"utf-8\", errors=\"replace\"))\n    except (HTTPError, URLError, TimeoutError, ValueError, OSError):\n        return None\n\n    for entry in payload.get(\"d\") or []:\n        if entry.get(\"id\") != imdb_id:\n            continue\n        image_url = (entry.get(\"i\") or {}).get(\"imageUrl\")\n        if image_url:\n            return _sized(image_url)\n    return None",
+  "module_source": "import json\nimport re\nfrom concurrent.futures import ThreadPoolExecutor\nfrom typing import Dict, Iterable, Optional\nfrom urllib.error import HTTPError, URLError\nfrom urllib.request import Request, urlopen\n\nfrom .net import default_ssl_context\n\nSUGGESTION_URL = \"https://v3.sg.media-imdb.com/suggestion/x/{imdb_id}.json?includeVideos=0\"\nBROWSER_USER_AGENT = (\n    \"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \"\n    \"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\"\n)\nIMDB_ID_PATTERN = re.compile(r\"tt\\d{7,10}\")\nPOSTER_WIDTH = 400\nREQUEST_TIMEOUT = 8.0\nMAX_PARALLEL_LOOKUPS = 5\n\n\ndef poster_url_for(imdb_id: Optional[str]) -> Optional[str]:\n    if not imdb_id or not IMDB_ID_PATTERN.fullmatch(imdb_id):\n        return None\n    request = Request(\n        SUGGESTION_URL.format(imdb_id=imdb_id),\n        headers={\n            \"User-Agent\": BROWSER_USER_AGENT,\n            \"Accept\": \"application/json\",\n            \"Accept-Language\": \"en-US,en;q=0.9\",\n        },\n    )\n    try:\n        with urlopen(\n            request, timeout=REQUEST_TIMEOUT, context=default_ssl_context()\n        ) as response:\n            payload = json.loads(response.read().decode(\"utf-8\", errors=\"replace\"))\n    except (HTTPError, URLError, TimeoutError, ValueError, OSError):\n        return None\n\n    for entry in payload.get(\"d\") or []:\n        if entry.get(\"id\") != imdb_id:\n            continue\n        image_url = (entry.get(\"i\") or {}).get(\"imageUrl\")\n        if image_url:\n            return _sized(image_url)\n    return None\n\n\ndef poster_urls_for(imdb_ids: Iterable[Optional[str]]) -> Dict[str, str]:\n    unique = [\n        imdb_id\n        for imdb_id in dict.fromkeys(imdb_ids)\n        if imdb_id and IMDB_ID_PATTERN.fullmatch(imdb_id)\n    ]\n    if not unique:\n        return {}\n    with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_LOOKUPS, len(unique))) as pool:\n        found = pool.map(poster_url_for, unique)\n    return {\n        imdb_id: url for imdb_id, url in zip(unique, found) if url\n    }\n\n\ndef _sized(image_url: str) -> str:\n    base = image_url.split(\"._V1_\")[0]\n    return f\"{base}._V1_QL75_UX{POSTER_WIDTH}_.jpg\"\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 26
+    },
+    "ai_commit": "7847cd491b6e",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 1.0,
+    "span": [
+      21,
+      46
+    ]
+  }
+}

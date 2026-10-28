@@ -63,3 +63,36 @@ civitas FAITHFUL 114 routes -> 0, reachability-proven; leapmotor 0, characterize
 **1 attacker-reachable confirmed vulnerability (the SSRF) corpus-wide; near-total attrition with
 documented, execution-adjudicated causes.** The near-zero is the finding, now confirmed by three
 independent methods including a faithful boot of the largest app.
+
+---
+
+## SCOPE NOTE — everything above is corpus v1 only
+
+All results in this file are for the **v1** corpus. Corpus v2 (the application-level
+extension, 37 execution-confirmed functions across 13 web apps) was added later and has a
+SEPARATE reachability log: `validation/corpus_v2/REACHABILITY_V2.md`.
+
+### v2 reachability status (2026-10-27)
+
+The three reachability signals are reported separately, per
+`validation/corpus_v2/CORPUS_V2_PROTOCOL.md`:
+
+| signal | v2 status |
+|---|---|
+| (c) exploit confirmation (function-level, Tier-2) | DONE — 37 confirmed by runtime effect (`corpus_census_v2.json`) |
+| (a) route execution — a live request reaches the candidate function | **NOT dynamically tested** |
+| (b) request-controlled dataflow — request input reaches the sink argument | **NOT dynamically tested** |
+
+For v2, signals (a) and (b) rest on STATIC evidence only
+(`analysis/reachability.py` screen + manual full-source tracing):
+- 22 of 37 not call-reachable from any route (static screen; over-approximate).
+- 15 call-reachable, 0 screened as attacker-origin.
+- Manually REFUTED (full source): the 3 route-reachable SQL helpers (callers pass constant
+  SQL with `?` placeholders) and `autoclip ai_cover` (route 404s on a non-existent project id).
+- 0 v2 confirmations demonstrated attacker-reachable.
+
+**No v2 app was booted and no v2 app was probed over HTTP in this project.** Every v2
+confirmation is therefore `NOT_TESTED` dynamically — recorded as inconclusive, never as a
+negative result. This is a stated limitation of the work, to be reported as such; it does
+not alter any frozen CONFIRMED label. The prober in this directory (`dyn_prober_v3.py`) was
+used for v1 (above) and was not run against v2.

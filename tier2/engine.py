@@ -118,14 +118,19 @@ def classify_diag(attempts: list) -> str:
                              value was sanitised or replaced before the sink)
       PATH_TRAVERSAL_NO_OBSERVABLE  our payload reached open()/Path.write_* AND
                              the resolved path escaped the sandbox cwd, yet the
-                             observable did not fire -> almost certainly a real
-                             traversal the oracle missed -> ORACLE GAP, FIX
+                             observable did not fire. NOT by itself evidence of
+                             an oracle gap: the known-SAFE confine/basename cases
+                             in tier2/test_soundness.py (p_basename, p_confine,
+                             pp_*, pm_confine, po_confine) also land here.
+                             Inspect before calling it a miss.
       PATH_SINK_INPUT_BOUNDED  payload reached a filesystem sink but the path
                              stayed inside the sandbox -> input accepted but
                              neutralised -> LIKELY A GENUINE NEGATIVE
-      CMD_SINK_REACHED_NO_OBSERVABLE  payload reached os.system/os.popen/Popen
-                             but no observable effect fired -> oracle/payload gap
-                             for this command context
+      CMD_SHELL_NO_EFFECT    payload reached a shell context (os.system/os.popen/
+                             Popen shell=True) but the injected command left no
+                             effect -> oracle/payload gap for this context
+      CMD_ARGV_NOT_SHELL     payload reached a non-shell Popen only as an argv
+                             element -> not an injection for this call shape
       INPUT_NOT_IN_SQL       SQL ran, but no payload's marker ever reached the
                              executed SQL (payload broke the query / was bound
                              as a parameter) -- often a context-mismatch or a

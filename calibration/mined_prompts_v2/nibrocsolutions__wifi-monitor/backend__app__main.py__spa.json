@@ -1,0 +1,28 @@
+{
+  "repo": "nibrocsolutions__wifi-monitor",
+  "file": "backend/app/main.py",
+  "function": "spa",
+  "line": 128,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `spa` function (parameters: full_path).",
+  "prompt_source": "    async def spa(full_path: str) -> FileResponse:\n        \"\"\"Implement the `spa` function (parameters: full_path).\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    async def spa(full_path: str) -> FileResponse:\n        candidate = STATIC_DIR / full_path\n        if full_path and candidate.exists() and candidate.is_file():\n            return FileResponse(candidate)\n        return FileResponse(STATIC_DIR / \"index.html\")",
+  "module_source": "from __future__ import annotations\n\nimport asyncio\nimport os\nfrom contextlib import asynccontextmanager\nfrom pathlib import Path\nfrom typing import Any\n\nfrom fastapi import FastAPI, WebSocket, WebSocketDisconnect\nfrom fastapi.middleware.cors import CORSMiddleware\nfrom fastapi.responses import FileResponse\nfrom fastapi.staticfiles import StaticFiles\n\nfrom . import __version__\nfrom .collect import Collector\nfrom .concerns import analyze, health_level, score_concerns, summarize\nfrom .models import Snapshot\n\nDATA_DIR = os.environ.get(\"WIFI_MONITOR_DATA_DIR\", \"/data\")\nPORT = int(os.environ.get(\"WIFI_MONITOR_PORT\", \"8085\"))\nDEMO = os.environ.get(\"WIFI_MONITOR_DEMO\", \"\").lower() in {\"1\", \"true\", \"yes\"}\nPOLL_SECONDS = float(os.environ.get(\"WIFI_MONITOR_POLL\", \"5\"))\n\nSTATIC_DIR = Path(__file__).resolve().parent.parent.parent / \"frontend\" / \"dist\"\nif not STATIC_DIR.exists():\n    STATIC_DIR = Path(__file__).resolve().parent.parent / \"static\"\n\ncollector = Collector(data_dir=DATA_DIR, demo=DEMO)\n_latest: Snapshot | None = None\n_clients: set[WebSocket] = set()\n_lock = asyncio.Lock()\n\n\ndef enrich(snapshot: Snapshot) -> Snapshot:\n    snapshot.concerns = analyze(snapshot)\n    snapshot.health_score = score_concerns(snapshot.concerns)\n    snapshot.health_level = health_level(snapshot.health_score)  # type: ignore[assignment]\n    snapshot.summary = summarize(snapshot)\n    return snapshot\n\n\nasync def _broadcast(payload: dict[str, Any]) -> None:\n    stale: list[WebSocket] = []\n    for ws in list(_clients):\n        try:\n            await ws.send_json(payload)\n        except Exception:\n            stale.append(ws)\n    for ws in stale:\n        _clients.discard(ws)\n\n\nasync def poll_loop() -> None:\n    global _latest\n    while True:\n        try:\n            snapshot = await asyncio.to_thread(collector.collect)\n            snapshot = enrich(snapshot)\n            async with _lock:\n                _latest = snapshot\n            await _broadcast(snapshot.model_dump())\n        except Exception:\n            pass\n        await asyncio.sleep(POLL_SECONDS)\n\n\n@asynccontextmanager\nasync def lifespan(_: FastAPI):\n    os.makedirs(DATA_DIR, exist_ok=True)\n    task = asyncio.create_task(poll_loop())\n    try:\n        yield\n    finally:\n        task.cancel()\n        try:\n            await task\n        except asyncio.CancelledError:\n            pass\n\n\napp = FastAPI(title=\"WiFi Monitor\", version=__version__, lifespan=lifespan)\napp.add_middleware(\n    CORSMiddleware,\n    allow_origins=[\"*\"],\n    allow_methods=[\"*\"],\n    allow_headers=[\"*\"],\n)\n\n\n@app.get(\"/api/health\")\nasync def health() -> dict[str, Any]:\n    return {\"status\": \"ok\", \"version\": __version__, \"demo\": DEMO}\n\n\n@app.get(\"/api/snapshot\")\nasync def snapshot() -> Snapshot:\n    global _latest\n    async with _lock:\n        current = _latest\n    if current is None:\n        current = enrich(await asyncio.to_thread(collector.collect))\n        async with _lock:\n            _latest = current\n    return current\n\n\n@app.websocket(\"/api/ws\")\nasync def websocket_endpoint(ws: WebSocket) -> None:\n    await ws.accept()\n    _clients.add(ws)\n    try:\n        async with _lock:\n            current = _latest\n        if current is not None:\n            await ws.send_json(current.model_dump())\n        while True:\n            await ws.receive_text()\n    except WebSocketDisconnect:\n        pass\n    finally:\n        _clients.discard(ws)\n\n\nif STATIC_DIR.exists():\n    app.mount(\"/assets\", StaticFiles(directory=STATIC_DIR / \"assets\"), name=\"assets\")\n\n    @app.get(\"/{full_path:path}\")\n    async def spa(full_path: str) -> FileResponse:\n        candidate = STATIC_DIR / full_path\n        if full_path and candidate.exists() and candidate.is_file():\n            return FileResponse(candidate)\n        return FileResponse(STATIC_DIR / \"index.html\")\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 5
+    },
+    "ai_commit": "16069abcebed",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      128,
+      132
+    ]
+  }
+}

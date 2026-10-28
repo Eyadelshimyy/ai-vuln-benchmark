@@ -1,0 +1,28 @@
+{
+  "repo": "nagibator9986__ccupractice",
+  "file": "backend/migrations/versions/h2c3d4e5f6a7_enrollment_verification_code.py",
+  "function": "upgrade",
+  "line": 33,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `upgrade` function.",
+  "prompt_source": "def upgrade():\n    \"\"\"Implement the `upgrade` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def upgrade():\n    with op.batch_alter_table('enrollment_contracts', schema=None) as batch_op:\n        batch_op.add_column(\n            sa.Column('verification_code', sa.String(length=24), nullable=True)\n        )\n\n    # Backfill every existing row with a unique token.\n    conn = op.get_bind()\n    rows = conn.execute(sa.text(\"SELECT id FROM enrollment_contracts\")).fetchall()\n    taken: set[str] = set()\n    for (eid,) in rows:\n        while True:\n            code = secrets.token_urlsafe(12)\n            if code not in taken:\n                taken.add(code)\n                break\n        conn.execute(\n            sa.text(\n                \"UPDATE enrollment_contracts SET verification_code = :c WHERE id = :i\"\n            ),\n            {\"c\": code, \"i\": eid},\n        )\n\n    with op.batch_alter_table('enrollment_contracts', schema=None) as batch_op:\n        batch_op.alter_column(\n            'verification_code',\n            existing_type=sa.String(length=24),\n            nullable=False,\n        )\n        batch_op.create_unique_constraint(\n            'uq_enrollment_contracts_verification_code', ['verification_code']\n        )\n        batch_op.create_index(\n            'ix_enrollment_contracts_verification_code',\n            ['verification_code'],\n            unique=False,\n        )",
+  "module_source": "\"\"\"enrollment verification code for QR stamp + signature certificate\n\nAdds `enrollment_contracts.verification_code` so each enrollment can be:\n  - QR-stamped at generation (the QR resolves to /verify/<code>);\n  - reached via the public verifier endpoint and the SPA verify page;\n  - referenced from the on-demand \"\u0421\u0435\u0440\u0442\u0438\u0444\u0438\u043a\u0430\u0442 \u043f\u043e\u0434\u043f\u0438\u0441\u0430\u043d\u0438\u044f\" PDF the admin\n    generates for already-signed enrollments to give signers a downloadable\n    proof of signing (the original signed bytes are not modified \u2014 that\n    would invalidate every existing CMS payload).\n\nTwo-phase column add so backfill is atomic on Postgres + SQLite:\n  1) add nullable\n  2) backfill every existing row with a unique URL-safe token\n  3) set NOT NULL + create UNIQUE constraint + index\n\nRevision ID: h2c3d4e5f6a7\nRevises: g1b2c3d4e5f6\nCreate Date: 2026-08-01 09:00:00.000000\n\n\"\"\"\nimport secrets\n\nfrom alembic import op\nimport sqlalchemy as sa\n\n\nrevision = 'h2c3d4e5f6a7'\ndown_revision = 'g1b2c3d4e5f6'\nbranch_labels = None\ndepends_on = None\n\n\ndef upgrade():\n    with op.batch_alter_table('enrollment_contracts', schema=None) as batch_op:\n        batch_op.add_column(\n            sa.Column('verification_code', sa.String(length=24), nullable=True)\n        )\n\n    # Backfill every existing row with a unique token.\n    conn = op.get_bind()\n    rows = conn.execute(sa.text(\"SELECT id FROM enrollment_contracts\")).fetchall()\n    taken: set[str] = set()\n    for (eid,) in rows:\n        while True:\n            code = secrets.token_urlsafe(12)\n            if code not in taken:\n                taken.add(code)\n                break\n        conn.execute(\n            sa.text(\n                \"UPDATE enrollment_contracts SET verification_code = :c WHERE id = :i\"\n            ),\n            {\"c\": code, \"i\": eid},\n        )\n\n    with op.batch_alter_table('enrollment_contracts', schema=None) as batch_op:\n        batch_op.alter_column(\n            'verification_code',\n            existing_type=sa.String(length=24),\n            nullable=False,\n        )\n        batch_op.create_unique_constraint(\n            'uq_enrollment_contracts_verification_code', ['verification_code']\n        )\n        batch_op.create_index(\n            'ix_enrollment_contracts_verification_code',\n            ['verification_code'],\n            unique=False,\n        )\n\n\ndef downgrade():\n    with op.batch_alter_table('enrollment_contracts', schema=None) as batch_op:\n        batch_op.drop_index('ix_enrollment_contracts_verification_code')\n        batch_op.drop_constraint(\n            'uq_enrollment_contracts_verification_code', type_='unique'\n        )\n        batch_op.drop_column('verification_code')\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 37
+    },
+    "ai_commit": "93f741744f33",
+    "evidence": "Generated with [Claude Code]",
+    "ai_line_fraction": 1.0,
+    "span": [
+      33,
+      69
+    ]
+  }
+}

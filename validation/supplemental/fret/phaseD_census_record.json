@@ -1,0 +1,29 @@
+{
+  "file": "alexandrelheinen__fret/scripts__vision_web_ball_gallery.py___download.json",
+  "cwes": [
+    "CWE-22",
+    "CWE-918"
+  ],
+  "verdict": "TRIGGERED",
+  "exec_cwe": "CWE-918",
+  "executable": true,
+  "triggered": true,
+  "confirmed": true,
+  "confirmed_cwe": "CWE-918",
+  "tier2_evidence": {
+    "params_tried": [
+      "dest",
+      "url"
+    ],
+    "diag_buckets": {
+      "dest": "SINK_REACHED_INPUT_ABSENT"
+    },
+    "error": null,
+    "param": "url",
+    "payload": "http://127.0.0.1:36305/ea73c25383f9",
+    "proof": "SSRF: program fetched the attacker-controlled URL http://127.0.0.1:36305/ea73c25383f9",
+    "sink": "urllib.request.urlopen",
+    "n_attempts": 1
+  },
+  "error": null
+}

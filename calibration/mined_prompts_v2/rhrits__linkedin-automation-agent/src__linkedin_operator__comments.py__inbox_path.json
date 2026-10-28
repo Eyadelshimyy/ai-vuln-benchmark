@@ -1,0 +1,28 @@
+{
+  "repo": "rhrits__linkedin-automation-agent",
+  "file": "src/linkedin_operator/comments.py",
+  "function": "inbox_path",
+  "line": 15,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `inbox_path` function.",
+  "prompt_source": "def inbox_path() -> Path:\n    \"\"\"Implement the `inbox_path` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def inbox_path() -> Path:\n    path = repo_root() / \"inbox\" / \"queue.jsonl\"\n    path.parent.mkdir(parents=True, exist_ok=True)\n    if not path.exists():\n        path.write_text(\"\", encoding=\"utf-8\")\n    return path",
+  "module_source": "from __future__ import annotations\n\nimport json\nfrom datetime import datetime, timezone\nfrom pathlib import Path\n\nfrom .audit import audit_text\nfrom .llm import complete, parse_json_object\nfrom .paths import repo_root\nfrom .policy import safe_voice_context\n\nDAILY_CAP = 12\n\n\ndef inbox_path() -> Path:\n    path = repo_root() / \"inbox\" / \"queue.jsonl\"\n    path.parent.mkdir(parents=True, exist_ok=True)\n    if not path.exists():\n        path.write_text(\"\", encoding=\"utf-8\")\n    return path\n\n\ndef add_item(*, url: str, post_text: str, note: str = \"\") -> dict:\n    item = {\n        \"id\": datetime.now(timezone.utc).strftime(\"%Y%m%dT%H%M%SZ\"),\n        \"url\": url,\n        \"post_text\": post_text.strip(),\n        \"note\": note,\n        \"status\": \"pending\",\n        \"options\": [],\n    }\n    with inbox_path().open(\"a\", encoding=\"utf-8\") as handle:\n        handle.write(json.dumps(item) + \"\\n\")\n    return item\n\n\ndef load_inbox() -> list[dict]:\n    path = inbox_path()\n    items: list[dict] = []\n    for line in path.read_text(encoding=\"utf-8\").splitlines():\n        if line.strip():\n            items.append(json.loads(line))\n    return items\n\n\ndef save_inbox(items: list[dict]) -> None:\n    text = \"\".join(json.dumps(item) + \"\\n\" for item in items)\n    inbox_path().write_text(text, encoding=\"utf-8\")\n\n\ndef pending_count_today(items: list[dict]) -> int:\n    today = datetime.now(timezone.utc).date().isoformat().replace(\"-\", \"\")\n    return sum(1 for item in items if item.get(\"id\", \"\").startswith(today) and item.get(\"status\") == \"drafted\")\n\n\ndef template_options(post_text: str) -> list[dict]:\n    snippet = \" \".join(post_text.split())[:120]\n    return [\n        {\n            \"style\": \"constraint\",\n            \"text\": (\n                f\"The part I would pressure-test is the failure mode, not the happy path. \"\n                f\"If this cannot fail closed, it is a demo. Re: {snippet}...\"\n            )[:350],\n        },\n        {\n            \"style\": \"stack\",\n            \"text\": (\n                \"I would keep the model call boring and put the work in ingest, schema, and tenancy. \"\n                \"pgvector without filters is just a junk drawer. Typed outputs beat a clever prompt.\"\n            )[:350],\n        },\n        {\n            \"style\": \"disagree\",\n            \"text\": (\n                \"I would not ship this as a free-text agent. Schema on the way out, human approval \"\n                \"on anything a customer sees. Slower than the demo. That is the point.\"\n            )[:350],\n        },\n    ]\n\n\ndef llm_options(post_text: str) -> list[dict]:\n    raw = complete(\n        \"Draft LinkedIn comments for Hritik Raj. Use only the safe context. JSON only.\\n\\n\" + safe_voice_context(),\n        (\n            \"Return JSON: {\\\"options\\\": [{\\\"style\\\": \\\"constraint|stack|disagree\\\", \\\"text\\\": \\\"...\\\"}, ...]}\\n\"\n            \"Exactly 3 options, 200-350 characters each. No let's connect. No hashtags.\\n\\n\"\n            f\"Post:\\n{post_text[:3000]}\"\n        ),\n    )\n    data = parse_json_object(raw)\n    return list(data[\"options\"])\n\n\ndef draft_comments(item_id: str, *, use_llm: bool) -> dict:\n    items = load_inbox()\n    if pending_count_today(items) >= DAILY_CAP:\n        raise RuntimeError(f\"Daily comment cap of {DAILY_CAP} reached.\")\n    for item in items:\n        if item[\"id\"] == item_id:\n            options = llm_options(item[\"post_text\"]) if use_llm else template_options(item[\"post_text\"])\n            cleaned = []\n            for option in options:\n                text = str(option.get(\"text\") or \"\").strip()\n                result = audit_text(text, slot=\"b\", first_comment=\"n/a\")\n                # Slot B length rules do not apply to comments; keep banned-word check only.\n                banned = [e for e in result.errors if \"Banned\" in e or \"Bait\" in e]\n                cleaned.append(\n                    {\n                        \"style\": option.get(\"style\"),\n                        \"text\": text,\n                        \"chars\": len(text),\n                        \"banned\": banned,\n                    }\n                )\n            item[\"options\"] = cleaned\n            item[\"status\"] = \"drafted\"\n            save_inbox(items)\n            return item\n    raise KeyError(item_id)\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 6
+    },
+    "ai_commit": "79e2befeea0b",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      15,
+      20
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "repo": "Jhoan2626__Proyecto_TaskBoard",
+  "file": "migrations/versions/c71e2a9f4b10_increment5_task_order.py",
+  "function": "upgrade",
+  "line": 18,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `upgrade` function.",
+  "prompt_source": "def upgrade():\n    \"\"\"Implement the `upgrade` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def upgrade():\n    op.add_column(\"tasks\", sa.Column(\"position\", sa.Integer(), nullable=True))\n\n    connection = op.get_bind()\n    tasks = connection.execute(\n        sa.text(\n            \"SELECT id, user_id FROM tasks \"\n            \"ORDER BY user_id, created_at DESC, id DESC\"\n        )\n    ).mappings()\n\n    positions = {}\n    previous_user_id = None\n    position = 0\n    for task in tasks:\n        if task[\"user_id\"] != previous_user_id:\n            previous_user_id = task[\"user_id\"]\n            position = 0\n        positions[task[\"id\"]] = position\n        position += 1\n\n    if positions:\n        connection.execute(\n            sa.text(\"UPDATE tasks SET position = :position WHERE id = :task_id\"),\n            [\n                {\"task_id\": task_id, \"position\": task_position}\n                for task_id, task_position in positions.items()\n            ],\n        )\n\n    with op.batch_alter_table(\"tasks\", schema=None) as batch_op:\n        batch_op.alter_column(\n            \"position\",\n            existing_type=sa.Integer(),\n            nullable=False,\n            server_default=\"0\",\n        )",
+  "module_source": "\"\"\"increment5_task_order\n\nRevision ID: c71e2a9f4b10\nRevises: a4c0ab04c001\nCreate Date: 2026-10-05 22:15:00.000000\n\n\"\"\"\nfrom alembic import op\nimport sqlalchemy as sa\n\n\nrevision = \"c71e2a9f4b10\"\ndown_revision = \"a4c0ab04c001\"\nbranch_labels = None\ndepends_on = None\n\n\ndef upgrade():\n    op.add_column(\"tasks\", sa.Column(\"position\", sa.Integer(), nullable=True))\n\n    connection = op.get_bind()\n    tasks = connection.execute(\n        sa.text(\n            \"SELECT id, user_id FROM tasks \"\n            \"ORDER BY user_id, created_at DESC, id DESC\"\n        )\n    ).mappings()\n\n    positions = {}\n    previous_user_id = None\n    position = 0\n    for task in tasks:\n        if task[\"user_id\"] != previous_user_id:\n            previous_user_id = task[\"user_id\"]\n            position = 0\n        positions[task[\"id\"]] = position\n        position += 1\n\n    if positions:\n        connection.execute(\n            sa.text(\"UPDATE tasks SET position = :position WHERE id = :task_id\"),\n            [\n                {\"task_id\": task_id, \"position\": task_position}\n                for task_id, task_position in positions.items()\n            ],\n        )\n\n    with op.batch_alter_table(\"tasks\", schema=None) as batch_op:\n        batch_op.alter_column(\n            \"position\",\n            existing_type=sa.Integer(),\n            nullable=False,\n            server_default=\"0\",\n        )\n\n\ndef downgrade():\n    with op.batch_alter_table(\"tasks\", schema=None) as batch_op:\n        batch_op.drop_column(\"position\")\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "github-copilot": 37
+    },
+    "ai_commit": "4df0772c3209",
+    "evidence": "Co-authored-by: Copilot <",
+    "ai_line_fraction": 1.0,
+    "span": [
+      18,
+      54
+    ]
+  }
+}

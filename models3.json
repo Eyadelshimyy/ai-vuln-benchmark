@@ -1,0 +1,5 @@
+[
+ {"name":"claude-haiku-5-5","cli":true,"model":"opencode-go/claude-haiku-5-5"},
+ {"name":"gpt-6-luna","cli":true,"model":"opencode-go/gpt-6-luna"},
+ {"name":"deepseek-v4-pro","cli":true,"model":"opencode-go/deepseek-v4-pro"}
+]

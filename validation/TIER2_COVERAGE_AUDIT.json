@@ -1,0 +1,150 @@
+{
+  "v1": {
+    "census": "corpus_census_pinned.json (committed)",
+    "coverage": {
+      "CWE-22": {
+        "tagged": 747,
+        "executable": 566,
+        "invoked_trig_as": 167,
+        "confirmed": 130,
+        "could_not_execute": 181,
+        "state": "REGISTERED_AND_CONFIRMED"
+      },
+      "CWE-78": {
+        "tagged": 451,
+        "executable": 314,
+        "invoked_trig_as": 65,
+        "confirmed": 4,
+        "could_not_execute": 137,
+        "state": "REGISTERED_AND_CONFIRMED"
+      },
+      "CWE-89": {
+        "tagged": 598,
+        "executable": 449,
+        "invoked_trig_as": 3,
+        "confirmed": 0,
+        "could_not_execute": 149,
+        "state": "REGISTERED_AND_EXERCISED_ZERO_CONFIRMED"
+      },
+      "CWE-94": {
+        "tagged": 0,
+        "executable": 0,
+        "invoked_trig_as": 0,
+        "confirmed": 0,
+        "could_not_execute": 0,
+        "state": "REGISTERED_BUT_NOT_EXERCISED"
+      },
+      "CWE-502": {
+        "tagged": 6,
+        "executable": 5,
+        "invoked_trig_as": 0,
+        "confirmed": 0,
+        "could_not_execute": 1,
+        "state": "REGISTERED_BUT_NOT_EXERCISED"
+      },
+      "CWE-611": {
+        "tagged": 101,
+        "executable": 86,
+        "invoked_trig_as": 3,
+        "confirmed": 0,
+        "could_not_execute": 15,
+        "state": "REGISTERED_AND_EXERCISED_ZERO_CONFIRMED"
+      },
+      "CWE-918": {
+        "tagged": 197,
+        "executable": 128,
+        "invoked_trig_as": 51,
+        "confirmed": 26,
+        "could_not_execute": 69,
+        "state": "REGISTERED_AND_CONFIRMED"
+      },
+      "CWE-1336": {
+        "tagged": 0,
+        "executable": 0,
+        "invoked_trig_as": 0,
+        "confirmed": 0,
+        "could_not_execute": 0,
+        "state": "REGISTERED_BUT_NOT_EXERCISED"
+      }
+    }
+  },
+  "v2": {
+    "census": "corpus_census_v2.json (UNTRACKED/new)",
+    "coverage": {
+      "CWE-22": {
+        "tagged": 217,
+        "executable": 146,
+        "invoked_trig_as": 34,
+        "confirmed": 30,
+        "could_not_execute": 71,
+        "state": "REGISTERED_AND_CONFIRMED"
+      },
+      "CWE-78": {
+        "tagged": 148,
+        "executable": 90,
+        "invoked_trig_as": 28,
+        "confirmed": 0,
+        "could_not_execute": 58,
+        "state": "REGISTERED_AND_EXERCISED_ZERO_CONFIRMED"
+      },
+      "CWE-89": {
+        "tagged": 152,
+        "executable": 117,
+        "invoked_trig_as": 5,
+        "confirmed": 3,
+        "could_not_execute": 35,
+        "state": "REGISTERED_AND_CONFIRMED"
+      },
+      "CWE-94": {
+        "tagged": 0,
+        "executable": 0,
+        "invoked_trig_as": 0,
+        "confirmed": 0,
+        "could_not_execute": 0,
+        "state": "REGISTERED_BUT_NOT_EXERCISED"
+      },
+      "CWE-502": {
+        "tagged": 2,
+        "executable": 2,
+        "invoked_trig_as": 0,
+        "confirmed": 0,
+        "could_not_execute": 0,
+        "state": "REGISTERED_BUT_NOT_EXERCISED"
+      },
+      "CWE-611": {
+        "tagged": 2,
+        "executable": 1,
+        "invoked_trig_as": 0,
+        "confirmed": 0,
+        "could_not_execute": 1,
+        "state": "REGISTERED_BUT_NOT_EXERCISED"
+      },
+      "CWE-918": {
+        "tagged": 56,
+        "executable": 39,
+        "invoked_trig_as": 15,
+        "confirmed": 4,
+        "could_not_execute": 17,
+        "state": "REGISTERED_AND_CONFIRMED"
+      },
+      "CWE-1336": {
+        "tagged": 0,
+        "executable": 0,
+        "invoked_trig_as": 0,
+        "confirmed": 0,
+        "could_not_execute": 0,
+        "state": "REGISTERED_BUT_NOT_EXERCISED"
+      }
+    }
+  },
+  "notes": {
+    "invocation_definition": "A Tier-2 strategy is INVOKED only when a candidate triggers at Tier-1 with exec_cwe == that class (census runs the exec_cwe strategy). Tag count != invocation.",
+    "CWE-502": "0 invocations in v1 and v2 -> REGISTERED_BUT_NOT_EXERCISED. The 3 CWE-502-tagged confirmed rows confirm via CWE-22 (exec_cwe=CWE-22), NOT via the deserialization strategy.",
+    "CWE-611": "v1: 3 invocations, all diag EXECUTED_NO_SINK, 0 confirmed (tested denominator = 3, not the 101 tagged). v2: 0 invocations.",
+    "CWE-78": "v2: 28 invocations, 0 confirmed (EXERCISED_ZERO, denominator 28). v1: 65 invoked, 4 confirmed.",
+    "CWE-89": "v1: 3 invoked, 0 confirmed (EXERCISED_ZERO). v2: 5 invoked, 3 confirmed.",
+    "CWE-94": "0 tagged candidates in the main corpus -> NOT_EXERCISED (no candidate). Strategy exists; exercised only as a soundness-battery control, not in the frozen census.",
+    "CWE-1336": "0 tagged candidates in the MAIN census (the ai-ssti/llama-cpp-ssti SSTI sub-study is excluded by corpus_census.py). CWE-1336 is exercised+confirmed in that excluded sub-study and in tier2/test_soundness.py, but is UNKNOWN/out-of-scope for the frozen main V1/V2 counts.",
+    "confirmed_reconciliation": "v1 confirmed by class: CWE-22=130,CWE-78=4,CWE-918=26 (=160). v2: CWE-22=30,CWE-89=3,CWE-918=4 (=37). Matches frozen."
+  }
+}

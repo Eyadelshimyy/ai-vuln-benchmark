@@ -1,0 +1,29 @@
+{
+  "repo": "gyrinx-app__gyrinx",
+  "file": "scripts/lib/port_in_use.py",
+  "function": "_ipv4_listener",
+  "line": 28,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": true,
+  "docstring": "True when /proc/net/tcp shows an IPv4 listener on this port.\n\nMissing or unreadable tables mean unknown, so the caller falls through\nto the loopback bind. A bound socket that has not called listen does\nnot appear here.",
+  "prompt_source": "def _ipv4_listener(port: int) -> bool:\n    \"\"\"True when /proc/net/tcp shows an IPv4 listener on this port.\n\n    Missing or unreadable tables mean unknown, so the caller falls through\n    to the loopback bind. A bound socket that has not called listen does\n    not appear here.\n    \"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def _ipv4_listener(port: int) -> bool:\n    \"\"\"True when /proc/net/tcp shows an IPv4 listener on this port.\n\n    Missing or unreadable tables mean unknown, so the caller falls through\n    to the loopback bind. A bound socket that has not called listen does\n    not appear here.\n    \"\"\"\n    hexport = f\"{port:04X}\"\n    try:\n        with open(\"/proc/net/tcp\", encoding=\"ascii\", errors=\"replace\") as handle:\n            next(handle, None)\n            for line in handle:\n                fields = line.split()\n                if len(fields) < 4 or fields[3] != _LISTEN:\n                    continue\n                if fields[1].rsplit(\":\", 1)[-1].upper() == hexport:\n                    return True\n    except OSError:\n        return False\n    return False",
+  "module_source": "#!/usr/bin/env python3\n\"\"\"Say whether a dev port is already taken.\n\nExit 0 when something is listening. Exit 1 when the port is free.\n\nA connect to 127.0.0.1 catches a listener there. /proc/net/tcp catches a\nlistener on another IPv4 address, which still stops runserver. Binding\n127.0.0.1 catches a wildcard socket that has not called listen yet: that\nsocket is missing from the table, and it still occupies the port. The probe\nnever binds every interface.\n\nA sandbox that refuses the loopback bind is not a listener: EPERM and\nEACCES leave the port free. Dev ports are above 1024, so EACCES here is\nnot the privileged-port check.\n\n    scripts/lib/port_in_use.py 8482\n\nUses the standard library only, so it runs before the worktree venv exists.\n\"\"\"\n\nimport errno\nimport socket\nimport sys\n\n_LISTEN = \"0A\"\n\n\ndef _ipv4_listener(port: int) -> bool:\n    \"\"\"True when /proc/net/tcp shows an IPv4 listener on this port.\n\n    Missing or unreadable tables mean unknown, so the caller falls through\n    to the loopback bind. A bound socket that has not called listen does\n    not appear here.\n    \"\"\"\n    hexport = f\"{port:04X}\"\n    try:\n        with open(\"/proc/net/tcp\", encoding=\"ascii\", errors=\"replace\") as handle:\n            next(handle, None)\n            for line in handle:\n                fields = line.split()\n                if len(fields) < 4 or fields[3] != _LISTEN:\n                    continue\n                if fields[1].rsplit(\":\", 1)[-1].upper() == hexport:\n                    return True\n    except OSError:\n        return False\n    return False\n\n\ndef port_in_use(port: int) -> bool:\n    with socket.socket() as probe:\n        probe.settimeout(0.2)\n        if probe.connect_ex((\"127.0.0.1\", port)) == 0:\n            return True\n    if _ipv4_listener(port):\n        return True\n    with socket.socket() as probe:\n        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n        try:\n            probe.bind((\"127.0.0.1\", port))\n        except OSError as exc:\n            return exc.errno == errno.EADDRINUSE\n    return False\n\n\ndef main(argv: list[str]) -> int:\n    if len(argv) != 2:\n        print(\"Usage: port_in_use.py <port>\", file=sys.stderr)\n        return 2\n    return 0 if port_in_use(int(argv[1])) else 1\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main(sys.argv))\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 16,
+      "claude-code": 4
+    },
+    "ai_commit": "790d8628c9ea",
+    "evidence": "author/committer='cursor[bot] <206951365+cursor[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      28,
+      47
+    ]
+  }
+}

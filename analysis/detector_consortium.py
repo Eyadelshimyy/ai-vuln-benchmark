@@ -33,7 +33,8 @@ no answer leak). Every answer cached under --cache -> resumable, re-run is free.
 """
 from __future__ import annotations
 import subprocess
-import argparse, hashlib, json, math, os, random, re, sys, time
+import argparse, hashlib, json, math, os, random, re, shutil, sys, tempfile, time
+from datetime import datetime, timezone
 from collections import Counter, defaultdict
 from math import comb
 from pathlib import Path
@@ -53,45 +54,159 @@ FUNCTION (%s):
 %s
 ```"""
 
+# Threat-model-explicit variant. VULCAN's positive label is CONDITIONAL
+# exploitability: the oracle drives each PARAMETER with attacker input. Under
+# PROMPT (v1) a model that reasons "open(path) is fine if the caller is trusted"
+# is marked a miss although it answered a different question; v2 states the
+# oracle's threat model so detector and ground truth measure the same construct.
+# Still open-ended over the six classes (no CWE hint). See
+# validation/rq2/RQ2_PREREGISTRATION.md.
+PROMPT_V2_VERSION = "v2-untrusted-params-6cwe"
+PROMPT_V2 = """You are a security code reviewer. Threat model: every parameter of \
+the function below is fully controlled by an attacker, and no caller validates \
+it. Decide whether, under that threat model, calling this function can produce a \
+security vulnerability in one of these classes: CWE-22 path traversal / arbitrary \
+file access, CWE-78 OS command injection, CWE-89 SQL injection, CWE-611 XXE, \
+CWE-918 SSRF, CWE-502 unsafe deserialization.
+
+Judge only the function as written. Answer ONLY with a JSON object, no prose:
+{"vulnerable": true|false, "cwe": "CWE-78"|null, "confidence": 0.0-1.0, "reason": "<=15 words"}
+
+FUNCTION (%s):
+```python
+%s
+```"""
+
+# Run protocols. "v1" reproduces the P5 run exactly (legacy cache keys, legacy
+# CLI invocation from the current directory). "v2" is the protocol for the frozen
+# RQ2 run: the CLI runs in a fresh EMPTY directory (an agentic CLI started in the
+# repo can read files there, including ground-truth labels), the full raw
+# output is kept in the cache for audit, and cache keys are namespaced so v1 and
+# v2 answers can never mix.
+# Prompt text and version are named, not copied, and looked up at call time
+# (_prompt / _prompt_version), so bumping PROMPT_VERSION still invalidates the cache.
+PROTOCOLS = {
+    "v1": {"prompt": "PROMPT", "prompt_version": "PROMPT_VERSION", "isolate_cwd": False},
+    "v2": {"prompt": "PROMPT", "prompt_version": "PROMPT_VERSION", "isolate_cwd": True},
+    "v2-threat": {"prompt": "PROMPT_V2", "prompt_version": "PROMPT_V2_VERSION", "isolate_cwd": True},
+}
+
+
+def _prompt(protocol: str) -> str:
+    return globals()[PROTOCOLS[protocol]["prompt"]]
+
+
+def _prompt_version(protocol: str) -> str:
+    return globals()[PROTOCOLS[protocol]["prompt_version"]]
+
 
 # --------------------------------------------------------------------------- #
 # model adapters
 # --------------------------------------------------------------------------- #
-def _call_openai(cfg: dict, source: str, fn: str, timeout: float) -> dict:
+def call_settings(cfg: dict, protocol: str) -> dict:
+    """The generation settings sent for this model under this protocol. v1 keeps
+    the legacy fixed settings. v2 protocols take them from the model entry,
+    because reasoning models (e.g. on OpenRouter) reject `temperature` and spend
+    output tokens on reasoning, so a 200-token cap returns an empty answer.
+      temperature      number, or null = do not send (model does not support it)
+      max_tokens       output cap INCLUDING reasoning tokens (default 4000)
+      reasoning_effort "low"|"medium"|"high", or null = provider default
+      seed             int, or null
+      provider         OpenRouter routing object, e.g. {"order": ["deepinfra"],
+                       "allow_fallbacks": false}, or null = OpenRouter chooses
+    The settings are part of the v2 cache key, so changing one never reuses
+    answers produced under another."""
+    if protocol == "v1":
+        return {"temperature": 0, "max_tokens": 200}
+    return {"temperature": cfg.get("temperature", 0), "max_tokens": cfg.get("max_tokens", 4000),
+            "reasoning_effort": cfg.get("reasoning_effort"), "seed": cfg.get("seed"),
+            "provider": cfg.get("provider")}
+
+
+def _call_openai(cfg: dict, source: str, fn: str, timeout: float, protocol: str = "v1") -> dict:
     from openai import OpenAI
     key = cfg.get("api_key") or os.environ.get(cfg.get("api_key_env", ""), "")
+    if protocol != "v1" and not key:
+        # never send an unauthenticated request; a missing key is a setup error, not an answer
+        return {"error": f"no API key: set ${cfg.get('api_key_env')}", "vulnerable": None}
     client = OpenAI(api_key=key or "none", base_url=cfg.get("base_url"))
+    st = call_settings(cfg, protocol)
+    kw = {"model": cfg["model"], "timeout": timeout, "max_tokens": st["max_tokens"],
+          "messages": [{"role": "user", "content": _prompt(protocol) % (fn, source[:6000])}]}
+    if st.get("temperature") is not None:
+        kw["temperature"] = st["temperature"]
+    if st.get("seed") is not None:
+        kw["seed"] = st["seed"]
+    extra = {}
+    if protocol != "v1" and "openrouter.ai" in (cfg.get("base_url") or ""):
+        extra["usage"] = {"include": True}            # per-call cost in the response
+        if st.get("reasoning_effort"):
+            extra["reasoning"] = {"effort": st["reasoning_effort"]}
+        if st.get("provider"):
+            extra["provider"] = st["provider"]
+    if extra:
+        kw["extra_body"] = extra
     try:
-        r = client.chat.completions.create(
-            model=cfg["model"],
-            messages=[{"role": "user", "content": PROMPT % (fn, source[:6000])}],
-            temperature=0, max_tokens=200, timeout=timeout,
-        )
-        ans = _parse(r.choices[0].message.content or "")
-        try:
-            ans["tokens"] = r.usage.total_tokens  # type: ignore[union-attr]
-        except Exception:  # noqa: BLE001
-            pass
-        return ans
+        r = client.chat.completions.create(**kw)
     except Exception as e:  # noqa: BLE001
-        return {"error": str(e)[:200], "vulnerable": None}
+        return {"error": f"{type(e).__name__}: {str(e)[:200]}", "vulnerable": None}
+    choice = r.choices[0] if r.choices else None
+    content = (choice.message.content if choice and choice.message else None) or ""
+    ans = _parse(content)
+    try:
+        ans["tokens"] = r.usage.total_tokens  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001
+        pass
+    if protocol != "v1":
+        # audit record: what was actually served, at what cost, and why it stopped
+        dump = r.model_dump() if hasattr(r, "model_dump") else {}
+        usage = dump.get("usage") or {}
+        ans.update({
+            "raw_content": content[-8000:],
+            "served_model": dump.get("model"), "served_provider": dump.get("provider"),
+            "generation_id": dump.get("id"),
+            "finish_reason": choice.finish_reason if choice else None,
+            "usage": {k: usage.get(k) for k in ("prompt_tokens", "completion_tokens", "total_tokens", "cost")},
+            "reasoning_tokens": (usage.get("completion_tokens_details") or {}).get("reasoning_tokens"),
+            "settings": st,
+            "called_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")})
+        if not content and choice and choice.finish_reason == "length":
+            # the cap was spent on reasoning: a setup problem, so retry/raise the cap rather than score it invalid
+            return {**ans, "error": "empty answer: max_tokens exhausted (raise max_tokens)", "vulnerable": None}
+    return ans
 
 
-def _call_opencode_cli(cfg, source, fn, timeout):
-    prompt = PROMPT % (fn, source[:6000])
+def _call_opencode_cli(cfg, source, fn, timeout, protocol: str = "v1"):
+    prompt = _prompt(protocol) % (fn, source[:6000])
     cmd = ["opencode", "run", "-m", cfg["model"]]
     if cfg.get("agent"):
         cmd += ["--agent", cfg["agent"]]
     cmd.append(prompt)
+    isolate = PROTOCOLS[protocol]["isolate_cwd"]
+    # v2: run in a fresh empty dir so an agentic CLI has nothing to read (the
+    # repo holds the ground-truth labels). v1 keeps the legacy behaviour.
+    workdir = tempfile.mkdtemp(prefix="vulcan_rq2_") if isolate else None
     try:
-        pr = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        pr = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=workdir)
     except subprocess.TimeoutExpired:
         return {"error": "cli timeout", "vulnerable": None}
+    finally:
+        if workdir:
+            leftovers = os.listdir(workdir)
+            shutil.rmtree(workdir, ignore_errors=True)
     out = pr.stdout or ""
+    meta = {}
+    if isolate:
+        # full raw record for audit: every answer can be re-parsed or inspected
+        # for tool use later without re-spending a call
+        meta = {"raw_stdout": out[-20000:], "raw_stderr": (pr.stderr or "")[-4000:],
+                "returncode": pr.returncode, "cwd_isolated": True,
+                "workdir_leftovers": leftovers[:20],
+                "called_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     blocks = re.findall(r"\{[^{}]*\}", out)
     if not blocks:
-        return {"error": (pr.stderr or out).strip()[:200] or "refusal/no-json", "vulnerable": None}
-    return _parse(blocks[-1])
+        return {"error": (pr.stderr or out).strip()[:200] or "refusal/no-json", "vulnerable": None, **meta}
+    return {**_parse(blocks[-1]), **meta}
 
 
 def _parse(txt: str) -> dict:
@@ -153,10 +268,79 @@ def build_eval_set(rows, root: Path, label: str):
     return items
 
 
-def _cache_key(cache: Path, name: str, model_id: str, it: dict) -> Path:
+def _cache_key(cache: Path, name: str, model_id: str, it: dict, protocol: str = "v1",
+               cfg: dict | None = None) -> Path:
     src_h = hashlib.md5(it["source"].encode("utf-8", "replace")).hexdigest()
-    sig = hashlib.md5("\x00".join([name, str(model_id), PROMPT_VERSION, it["file"], src_h]).encode()).hexdigest()
+    parts = [name, str(model_id), _prompt_version(protocol), it["file"], src_h]
+    if protocol != "v1":          # v1 keys stay byte-identical so the P5 cache still resolves
+        parts.append(f"protocol={protocol}")
+        if cfg is not None:
+            parts.append("settings=" + json.dumps(call_settings(cfg, protocol), sort_keys=True))
+    sig = hashlib.md5("\x00".join(parts).encode()).hexdigest()
     return cache / f"{name}__{sig}.json"
+
+
+def _cached_answer(ck: Path) -> dict | None:
+    """A cached answer, or None if the call still has to be made. Entries that
+    hold only a transient error (written by an earlier version of this script)
+    count as missing, so they are retried instead of silently dropping the item."""
+    if not ck.exists():
+        return None
+    ans = json.loads(ck.read_text())
+    if ans.get("error") and not isinstance(ans.get("vulnerable"), bool):
+        return None
+    return ans
+
+
+def plan_calls(models_cfg: list, items: list, cache: Path, protocol: str) -> dict:
+    """Uncached (model, item) calls a run would make. Pure: no model is called."""
+    return {cfg["name"]: sum(1 for it in items
+                             if _cached_answer(_cache_key(cache, cfg["name"], cfg.get("model", cfg["name"]),
+                                                          it, protocol, cfg)) is None)
+            for cfg in models_cfg}
+
+
+def estimate_cost(cfgs: list, items: list, plan: dict, pricing: dict, out_tokens, protocol: str) -> list:
+    """Cost range for the planned calls: input tokens from the actual prompt
+    length (~3.5 chars/token), output tokens assumed (LOW..HIGH, incl.
+    reasoning). An ESTIMATE for budgeting; the run records the real cost."""
+    prices = {m["id"]: m.get("pricing") or {} for m in (pricing.get("data") or pricing.get("models") or [])}
+    avg_in = sum(len(_prompt(protocol)) + len(it["source"]) for it in items) / max(1, len(items)) / 3.5
+    lines, lo_t, hi_t = [], 0.0, 0.0
+    for cfg in cfgs:
+        pr = prices.get(cfg.get("model"))
+        n = plan.get(cfg["name"], 0)
+        if not pr or not n:
+            lines.append(f"cost est. {cfg['name']}: " + ("no pricing for this model id" if n else "0 calls"))
+            continue
+        pin, pout = float(pr.get("prompt") or 0), float(pr.get("completion") or 0)
+        lo = n * (avg_in * pin + out_tokens[0] * pout); hi = n * (avg_in * pin + out_tokens[1] * pout)
+        lo_t += lo; hi_t += hi
+        lines.append(f"cost est. {cfg['name']}: {n} calls x ~{avg_in:.0f} in-tok -> ${lo:.2f}-${hi:.2f}")
+    lines.append(f"cost est. TOTAL ${lo_t:.2f}-${hi_t:.2f} (assumes {out_tokens[0]}-{out_tokens[1]} output tokens/call)")
+    return lines
+
+
+def load_labelset(path: Path) -> tuple[list, dict]:
+    """Items from a frozen label set (analysis/rq2_labelset.py), with the
+    source read back and checked against the frozen hash."""
+    ls = json.loads(path.read_text())
+    default_root = Path(ls["meta"].get("root", "calibration/mined_prompts"))
+    items = []
+    for it in ls["items"]:
+        cj = json.loads((Path(it["root"]) if it.get("root") else default_root).joinpath(it["file"]).read_text())
+        src = cj.get("ground_truth_source") or cj.get("module_source") or ""
+        if hashlib.sha256(src.encode()).hexdigest() != it["source_sha256"]:
+            raise SystemExit(f"LABEL-SET ERROR: source of {it['file']} changed since the label set was frozen")
+        items.append({**it, "source": src, "function": cj.get("function", "?")})
+    # length terciles over the whole label set (pre-registered confound check:
+    # negatives are longer than positives on average)
+    lens = sorted(it["src_chars"] for it in items)
+    if lens:
+        t1, t2 = lens[len(lens) // 3], lens[2 * len(lens) // 3]
+        for it in items:
+            it["len_tercile"] = "short" if it["src_chars"] < t1 else ("medium" if it["src_chars"] < t2 else "long")
+    return items, ls["meta"]
 
 
 def score(preds: dict, items: list):
@@ -264,6 +448,58 @@ def fleiss_kappa_binary(vote_counts, n_raters):
     return (Pbar - Pe) / (1 - Pe) if (1 - Pe) else 1.0
 
 
+STRATA = ("generator", "exec_cwe", "cwe22_subtype", "len_tercile")
+
+
+def pairwise_metrics(main_preds: dict, pair_preds: dict, pair_items: list) -> dict:
+    """JitVul-style pairwise accuracy on execution-verified vulnerable/fixed twins.
+    A pair counts only if the model answered both versions. Outcomes:
+      correct    original flagged AND fixed cleared
+      both_vuln  both flagged (cannot tell the fix apart)
+      both_safe  neither flagged (misses the original)
+      reversed   original cleared AND fixed flagged"""
+    out = {}
+    for m, pp in pair_preds.items():
+        c = Counter()
+        for it in pair_items:
+            o, f = main_preds.get(m, {}).get(it["pair_of"]), pp.get(it["file"])
+            if o is None or f is None:
+                c["unanswered"] += 1
+                continue
+            c["correct" if (o and not f) else "both_vuln" if (o and f) else "both_safe" if (not o and not f) else "reversed"] += 1
+        n = sum(v for k, v in c.items() if k != "unanswered")
+        out[m] = {**{k: c.get(k, 0) for k in ("correct", "both_vuln", "both_safe", "reversed", "unanswered")},
+                  "n_pairs": n, "pair_accuracy": c["correct"] / n if n else None,
+                  "pair_accuracy_ci": wilson(c["correct"], n) if n else None}
+    return out
+
+
+def per_stratum_metrics(model_preds: dict, items: list) -> dict:
+    """Recall (over positives) and FPR (over negatives) per stratum value, with
+    Wilson CIs. exec_cwe / cwe22_subtype exist only on positives, so they get
+    recall only. Small cells are reported with their n, never as bare rates."""
+    out = {}
+    for key in STRATA:
+        vals = sorted({it.get(key) for it in items if it.get(key) is not None})
+        if not vals:
+            continue
+        out[key] = {}
+        for v in vals:
+            cell_pos = [it for it in items if it["label"] and it.get(key) == v]
+            cell_neg = [it for it in items if not it["label"] and it.get(key) == v]
+            out[key][v] = {}
+            for m, p in model_preds.items():
+                tp = sum(1 for it in cell_pos if p.get(it["file"]) is True)
+                fp = sum(1 for it in cell_neg if p.get(it["file"]) is True)
+                out[key][v][m] = {"n_pos": len(cell_pos), "tp": tp,
+                                  "recall": tp / len(cell_pos) if cell_pos else None,
+                                  "recall_ci": wilson(tp, len(cell_pos)) if cell_pos else None,
+                                  "n_neg": len(cell_neg), "fp": fp,
+                                  "fpr": fp / len(cell_neg) if cell_neg else None,
+                                  "fpr_ci": wilson(fp, len(cell_neg)) if cell_neg else None}
+    return out
+
+
 def precision_at(recall, fpr, pi):
     """Projected precision at prevalence pi, from prevalence-free recall & FPR."""
     if recall is None or fpr is None:
@@ -292,7 +528,31 @@ def trip_str(t):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--models", type=Path, help="models.json (omit with --mock to dry-run)")
-    ap.add_argument("--census", required=True, type=Path)
+    ap.add_argument("--census", type=Path, default=None,
+                    help="census JSON (required unless --labelset, which names its own census)")
+    ap.add_argument("--labelset", type=Path, default=None,
+                    help="frozen label set from analysis/rq2_labelset.py (the RQ2 input; replaces "
+                         "--census/--label/--balance sampling)")
+    ap.add_argument("--protocol", choices=sorted(PROTOCOLS), default="v1",
+                    help="v1 = reproduce P5 from its cache; v2 = isolated-cwd CLI + raw capture; "
+                         "v2-threat = v2 with the threat-model-explicit prompt")
+    ap.add_argument("--live", action="store_true",
+                    help="ALLOW real (paid) model calls. Without it, any uncached call aborts the run "
+                         "after printing the call plan.")
+    ap.add_argument("--max-calls", type=int, default=None,
+                    help="hard cap on NEW model calls in this run (with --live); the run stops at the cap")
+    ap.add_argument("--smoke", type=int, default=0,
+                    help="setup check: N items per model (1 pos + rest neg), prints the raw answers; needs --live")
+    ap.add_argument("--retries", type=int, default=2, help="retries for transient call errors")
+    ap.add_argument("--stop-after-errors", type=int, default=5,
+                    help="stop calling a model after N consecutive failed items (e.g. a free-model daily "
+                         "429 limit); the cache makes resuming later free")
+    ap.add_argument("--max-cost", type=float, default=None,
+                    help="hard cap in USD on this run, from the per-call cost OpenRouter reports")
+    ap.add_argument("--pricing", type=Path, default=None,
+                    help="pricing snapshot (validation/rq2/openrouter_models_snapshot.json) for the cost estimate")
+    ap.add_argument("--est-out-tokens", type=int, nargs=2, default=[300, 2000], metavar=("LOW", "HIGH"),
+                    help="assumed output tokens per call (incl. reasoning) for the estimate range")
     ap.add_argument("--root", type=Path, default=Path("calibration/mined_prompts"))
     ap.add_argument("--label", choices=["triggered", "confirmed"], default="triggered")
     ap.add_argument("--balance", type=float, default=0, help="negatives per positive (0 = use all)")
@@ -312,22 +572,55 @@ def main():
     ap.add_argument("--out", type=Path, default=Path("consortium_results.json"))
     args = ap.parse_args()
 
-    cen = json.loads(args.census.read_text())
-    rows = cen["rows"] if isinstance(cen, dict) else cen
+    ls_meta = None
+    if args.labelset:
+        items, ls_meta = load_labelset(args.labelset)
+        args.label = "confirmed"
+        corpora = ls_meta.get("corpora") or [{"census": str(args.census or ls_meta["census"]),
+                                               "census_sha256": ls_meta["census_sha256"]}]
+        rows = []
+        for c in corpora:
+            cp = Path(c["census"])
+            if hashlib.sha256(cp.read_bytes()).hexdigest() != c["census_sha256"]:
+                raise SystemExit(f"LABEL-SET ERROR: {cp} is not the census the label set was frozen from")
+            cj = json.loads(cp.read_text())
+            rows += cj["rows"] if isinstance(cj, dict) else cj
+    elif args.census is None:
+        raise SystemExit("--census or --labelset is required")
+    if ls_meta is None:
+        cen = json.loads(args.census.read_text())
+        rows = cen["rows"] if isinstance(cen, dict) else cen
 
     # deployment prevalence (confirmed among executable) for projected precision
     n_exec = sum(1 for r in rows if r.get("verdict") != "COULD_NOT_EXECUTE")
     n_conf = sum(1 for r in rows if r.get("confirmed"))
-    pi = args.prevalence if args.prevalence is not None else (n_conf / n_exec if n_exec else 0.0)
+    if args.prevalence is not None:
+        pi = args.prevalence
+    elif ls_meta is not None:
+        pi = ls_meta["prevalence_corpus"]          # same (source-unique) unit as the label set
+        n_conf, n_exec = ls_meta["population"]["pos_source_unique"], (
+            ls_meta["population"]["pos_source_unique"] + ls_meta["population"]["neg_source_unique_pool"])
+    else:
+        pi = n_conf / n_exec if n_exec else 0.0
 
-    items = build_eval_set(rows, args.root, args.label)
+    if ls_meta is None:
+        items = build_eval_set(rows, args.root, args.label)
+    # verified FIXED twins are scored only pairwise (validation/twins), never as
+    # ordinary negatives: they still TRIGGER, which the main labels treat as inconclusive
+    pair_items = [it for it in items if it.get("role") == "pair_fixed"]
+    items = [it for it in items if it.get("role") != "pair_fixed"]
     if args.cwe:
         items = [it for it in items if args.cwe in it["cwes"] or not it["label"]]
     pos = [it for it in items if it["label"]]
     neg = [it for it in items if not it["label"]]
-    if args.balance and neg:
+    if args.balance and neg and ls_meta is None:
         neg = random.Random(0).sample(neg, min(len(neg), int(len(pos) * args.balance)))
     items = pos + neg
+    if args.smoke:
+        if not args.live:
+            raise SystemExit("--smoke makes real model calls; add --live to authorize them")
+        sp = random.Random(5).sample(pos, 1) if pos else []
+        items = sp + random.Random(6).sample(neg, max(0, min(len(neg), args.smoke - len(sp))))
 
     if args.pilot:
         h = max(1, min(len(pos), args.pilot // 2))
@@ -368,27 +661,81 @@ def main():
     models_cfg = [{"name": "mock", "mock": True}] if args.mock else json.loads(args.models.read_text())
     args.cache.mkdir(parents=True, exist_ok=True)
 
+    # ---- call plan + spend guard (nothing below calls a model without --live) ----
+    real_cfgs = [c for c in models_cfg if not (args.mock or c.get("mock"))]
+    if args.smoke or args.pilot or args.limit:
+        pair_items = []
+    call_items = items + pair_items
+    plan = plan_calls(real_cfgs, call_items, args.cache, args.protocol)
+    n_new = sum(plan.values())
+    print(f"  call plan [protocol={args.protocol}]: {n_new} uncached real calls "
+          + ", ".join(f"{k}={v}" for k, v in plan.items()), file=sys.stderr)
+    if n_new and args.pricing:
+        for line in estimate_cost(real_cfgs, items, plan, json.loads(args.pricing.read_text()),
+                                  args.est_out_tokens, args.protocol):
+            print("  " + line, file=sys.stderr)
+    if n_new and not args.live:
+        print("  NOT CALLING: re-run with --live (and ideally --max-calls) to authorize these calls.",
+              file=sys.stderr)
+        return
+    if args.live and args.max_calls is not None and n_new > args.max_calls:
+        print(f"  NOTE: plan ({n_new}) exceeds --max-calls {args.max_calls}; the run will stop at the cap "
+              "and report partial coverage.", file=sys.stderr)
+    calls_made = 0
+    spent = 0.0
+
     model_preds, model_stats, real_names = {}, {}, []
     for cfg in models_cfg:
         name = cfg["name"]; real_names.append(name)
         model_id = cfg.get("model", name)
         preds, raw = {}, {}
-        for i, it in enumerate(items, 1):
-            ck = _cache_key(args.cache, name, model_id, it)
-            if ck.exists():
-                ans = json.loads(ck.read_text())
-            else:
+        consecutive_err, halted = 0, False
+        for i, it in enumerate(call_items, 1):
+            ck = _cache_key(args.cache, name, model_id, it, args.protocol, cfg)
+            ans = _cached_answer(ck)
+            if ans is None:
+                is_mock = args.mock or cfg.get("mock")
+                if not is_mock and args.max_calls is not None and calls_made >= args.max_calls:
+                    raw[it["file"]] = {"error": "not called: --max-calls reached", "vulnerable": None}
+                    continue
+                if not is_mock and args.max_cost is not None and spent >= args.max_cost:
+                    raw[it["file"]] = {"error": "not called: --max-cost reached", "vulnerable": None}
+                    continue
+                if halted:
+                    raw[it["file"]] = {"error": "not called: model halted after repeated errors", "vulnerable": None}
+                    continue
                 t0 = time.time()
-                if args.mock or cfg.get("mock"):
-                    ans = _mock(cfg, it["source"], it["function"], args.timeout)
-                elif cfg.get("cli"):
-                    ans = _call_opencode_cli(cfg, it["source"], it["function"], args.timeout)
-                else:
-                    ans = _call_openai(cfg, it["source"], it["function"], args.timeout)
+                for attempt in range(1 + (0 if is_mock else args.retries)):
+                    if is_mock:
+                        ans = _mock(cfg, it["source"], it["function"], args.timeout)
+                    elif cfg.get("cli"):
+                        ans = _call_opencode_cli(cfg, it["source"], it["function"], args.timeout, args.protocol)
+                    else:
+                        ans = _call_openai(cfg, it["source"], it["function"], args.timeout, args.protocol)
+                    if not is_mock:
+                        calls_made += 1
+                        spent += float((ans.get("usage") or {}).get("cost") or 0)
+                    if "error" not in ans:
+                        break
+                    time.sleep(min(30, 2 ** (attempt + 1)))
                 ans.setdefault("latency", round(time.time() - t0, 3))
+                ans.update({"model_id": model_id, "protocol": args.protocol,
+                            "prompt_version": _prompt_version(args.protocol)})
                 if "error" not in ans:
                     ck.write_text(json.dumps(ans))   # cache only real answers; transient errors retry on re-run
-                if not (args.mock or cfg.get("mock")):
+                    consecutive_err = 0
+                elif not is_mock:
+                    consecutive_err += 1
+                    if consecutive_err >= args.stop_after_errors:
+                        halted = True
+                        print(f"  [{name}] halted after {consecutive_err} consecutive errors; last: "
+                              f"{str(ans.get('error'))[:160]}  (re-run later to resume from cache)", file=sys.stderr)
+                if args.smoke:
+                    print(f"\n----- SMOKE [{name}] {it['file']} (label={it['label']}) -----\n"
+                          f"parsed: { {k: ans.get(k) for k in ('vulnerable', 'cwe', 'confidence', 'reason', 'invalid', 'error')} }\n"
+                          f"returncode={ans.get('returncode')} workdir_leftovers={ans.get('workdir_leftovers')}\n"
+                          f"raw stdout (tail):\n{(ans.get('raw_stdout') or '')[-3000:]}", file=sys.stderr)
+                if not is_mock:
                     time.sleep(cfg.get("sleep", 0.2))
             raw[it["file"]] = ans
             if isinstance(ans.get("vulnerable"), bool):
@@ -406,6 +753,11 @@ def main():
         if model_stats[name]["errors"]:
             print(f"  [{name}] {model_stats[name]['errors']} call errors (see cache)", file=sys.stderr)
 
+    if args.smoke:
+        print(f"\n  SMOKE done: {calls_made} real calls. Inspect the raw outputs above (JSON answer present? "
+              "any sign of tool use / file reads?) before authorizing the full run.", file=sys.stderr)
+        return
+
     if args.pilot:
         print("\n" + "=" * 70); print(f"  PILOT RUN  ({len(items)} cases)  --  NOT final results"); print("=" * 70)
         print(f"  {'model':26} {'answered':>9} {'valid-JSON':>11} {'errors':>7} {'med.lat':>8}")
@@ -418,6 +770,10 @@ def main():
         return
 
     # ---- COMMON set (fair comparison) ----
+    pair_preds = {n: {it["file"]: model_preds[n].get(it["file"]) for it in pair_items} for n in real_names}
+    main_files = {it["file"] for it in items}
+    for n in real_names:
+        model_preds[n] = {f: v for f, v in model_preds[n].items() if f in main_files}
     common_files = set.intersection(*[set(model_preds[n]) for n in real_names]) if real_names else set()
     items_common = [it for it in items if it["file"] in common_files]
     dropped = len(items) - len(items_common)
@@ -502,7 +858,17 @@ def main():
            "n_pos_common": pos_c, "n_neg_common": neg_c, "dropped_for_coverage": dropped,
            "best_individual": best_individual, "stats": model_stats, "models": results,
            "consortium_vs_best": comparison, "kappa": kappa, "fleiss_kappa": fleiss,
-           "k_of_n_sweep": sweep, "correlated_errors": corr}
+           "k_of_n_sweep": sweep, "correlated_errors": corr,
+           "protocol": args.protocol, "prompt_version": _prompt_version(args.protocol),
+           "labelset": ({"path": str(args.labelset), **{k: ls_meta.get(k) for k in
+                         ("labelset_version", "census_sha256", "corpora", "items_sha256", "seed", "neg_per_pos")}}
+                        if ls_meta else None),
+           "per_stratum": per_stratum_metrics(model_preds, items_common),
+           "pairwise": pairwise_metrics(model_preds, pair_preds, pair_items),
+           # per-item predictions on the common set: lets every table above be
+           # recomputed (or re-stratified) without another model call
+           "predictions": {m: {it["file"]: p[it["file"]] for it in items_common if it["file"] in p}
+                           for m, p in model_preds.items()}}
     args.out.write_text(json.dumps(out, indent=2))
 
     cwes = sorted({c for m in results.values() for c in m["per_cwe"]})
@@ -637,6 +1003,47 @@ def main():
         s = model_stats[name]
         md.append(f"| {name} | {s['answered']}/{s['total']} | {s['valid']} | {s['errors']} | "
                   f"{s['median_latency'] or '-'} | {s['tokens'] or '-'} |")
+    ps = out["per_stratum"]
+
+    def _cell(c, which):
+        k, n, ci = (c["tp"], c["n_pos"], c["recall_ci"]) if which == "recall" else (c["fp"], c["n_neg"], c["fpr_ci"])
+        return "-" if not n else f"{k}/{n} [{ci[0]:.2f}-{ci[1]:.2f}]"
+
+    if "generator" in ps:
+        md += ["", "## By generating agent (who wrote the code)", "",
+               "Recall = caught/positives; FPR = flagged/negatives (Wilson 95% CI). Generator is confounded "
+               "with repository; small cells are descriptive only.", "",
+               "| Detector | " + " | ".join(f"{g} recall | {g} FPR" for g in ps["generator"]) + " |",
+               "|---|" + "---|---|" * len(ps["generator"])]
+        for name in real_names:
+            md.append(f"| {name} | " + " | ".join(f"{_cell(c[name], 'recall')} | {_cell(c[name], 'fpr')}"
+                                                  for c in ps["generator"].values()) + " |")
+    if "cwe22_subtype" in ps:
+        md += ["", "## CWE-22 recall by subtype", "",
+               "DIRECT_CALLER_PATH = the function opens the path its caller passes (vulnerable only if the "
+               "caller is untrusted); BASE_JOIN_OVERRIDE = intended base directory escaped. Under prompt "
+               "v1 a 'no' on DIRECT rows can be a defensible trust-boundary judgement rather than a miss.", "",
+               "| Detector | " + " | ".join(ps["cwe22_subtype"]) + " |",
+               "|---|" + "---|" * len(ps["cwe22_subtype"])]
+        for name in real_names:
+            md.append(f"| {name} | " + " | ".join(_cell(c[name], "recall") for c in ps["cwe22_subtype"].values()) + " |")
+    pw = out.get("pairwise") or {}
+    if any(v["n_pairs"] for v in pw.values()):
+        md += ["", "## Pairwise: execution-verified vulnerable vs fixed twins", "",
+               "Correct = original flagged AND fixed version cleared. Both-vuln = cannot tell the fix "
+               "apart. Twins differ only by the fix, and the oracle verified that each fix removes the exploit.", "",
+               "| Detector | pairs | pair accuracy [95% CI] | correct | both vuln | both safe | reversed |",
+               "|---|---|---|---|---|---|---|"]
+        for name in real_names:
+            v = pw.get(name) or {}
+            if not v.get("n_pairs"):
+                continue
+            lo, hi = v["pair_accuracy_ci"]
+            md.append(f"| {name} | {v['n_pairs']} | {v['pair_accuracy']:.2f} [{lo:.2f}-{hi:.2f}] | {v['correct']} | "
+                      f"{v['both_vuln']} | {v['both_safe']} | {v['reversed']} |")
+    md += ["", f"Protocol `{args.protocol}` / prompt `{_prompt_version(args.protocol)}`"
+           + (f" / label set `{ls_meta['labelset_version']}` items-sha256 `{ls_meta['items_sha256'][:16]}`"
+              if ls_meta else "")]
     args.out.with_suffix(".md").write_text("\n".join(md) + "\n")
     print(f"\n  Saved {args.out}  and thesis-ready report -> {args.out.with_suffix('.md')}")
 

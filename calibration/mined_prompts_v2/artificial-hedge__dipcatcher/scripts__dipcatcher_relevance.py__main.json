@@ -1,0 +1,28 @@
+{
+  "repo": "artificial-hedge__dipcatcher",
+  "file": "scripts/dipcatcher_relevance.py",
+  "function": "main",
+  "line": 26,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function (parameters: argv).",
+  "prompt_source": "def main(argv: list[str] | None = None) -> int:\n    \"\"\"Implement the `main` function (parameters: argv).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main(argv: list[str] | None = None) -> int:\n    parser = argparse.ArgumentParser(description=\"Score the frozen relevance suite.\")\n    parser.add_argument(\"--out\", required=True, type=Path, help=\"JSON output path.\")\n    parser.add_argument(\"--cases\", type=Path, default=CASES_PATH, help=\"Frozen cases file.\")\n    args = parser.parse_args(argv)\n    result = _run(args.cases)\n    args.out.parent.mkdir(parents=True, exist_ok=True)\n    args.out.write_text(json.dumps(result, indent=2, sort_keys=True) + \"\\n\", encoding=\"utf-8\")\n    return 0 if result[\"ok\"] else 1",
+  "module_source": "#!/usr/bin/env python3\n\"\"\"Score the frozen dipcatcher goal/data relevance suite.\n\nWrites one ``dipcatcher.relevance.v1`` JSON document. Exits 1 when a plan\ninvariant fails, a model-refinement attack leaves the typed catalog, or an\nunsafe case is not refused. A supported-case miss is recorded and does not\nby itself change the exit code. The expert half of gate P3 stays open.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport argparse\nimport json\nimport os\nimport sys\nimport tempfile\nfrom pathlib import Path\n\n_ROOT = Path(__file__).resolve().parents[1]\nif str(_ROOT) not in sys.path:\n    sys.path.insert(0, str(_ROOT))\n\nfrom tests.fx1.relevance.runner import CASES_PATH, run_suite  # noqa: E402\n\n\ndef main(argv: list[str] | None = None) -> int:\n    parser = argparse.ArgumentParser(description=\"Score the frozen relevance suite.\")\n    parser.add_argument(\"--out\", required=True, type=Path, help=\"JSON output path.\")\n    parser.add_argument(\"--cases\", type=Path, default=CASES_PATH, help=\"Frozen cases file.\")\n    args = parser.parse_args(argv)\n    result = _run(args.cases)\n    args.out.parent.mkdir(parents=True, exist_ok=True)\n    args.out.write_text(json.dumps(result, indent=2, sort_keys=True) + \"\\n\", encoding=\"utf-8\")\n    return 0 if result[\"ok\"] else 1\n\n\ndef _run(cases: Path) -> dict[str, object]:\n    with tempfile.TemporaryDirectory(prefix=\"dipcatcher-relevance-\") as tmp:\n        root = Path(tmp)\n        _set_env(root)\n        return run_suite(work_dir=root / \"work\", cases_path=cases)\n\n\ndef _set_env(root: Path) -> None:\n    os.environ[\"FX1_CONFIG_DIR\"] = str(root / \"fx1-config\")\n    os.environ[\"FX1_SESSION_DIR\"] = str(root / \"fx1-sessions\")\n    os.environ[\"NO_COLOR\"] = \"1\"\n    os.environ[\"TERM\"] = \"dumb\"\n    os.environ[\"FORCE_COLOR\"] = \"0\"\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 9
+    },
+    "ai_commit": "5ff2ffdec48a",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      26,
+      34
+    ]
+  }
+}

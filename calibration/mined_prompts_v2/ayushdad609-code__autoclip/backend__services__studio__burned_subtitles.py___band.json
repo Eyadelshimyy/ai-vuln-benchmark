@@ -1,0 +1,28 @@
+{
+  "repo": "ayushdad609-code__autoclip",
+  "file": "backend/services/studio/burned_subtitles.py",
+  "function": "_band",
+  "line": 26,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `_band` function (parameters: video, at).",
+  "prompt_source": "def _band(video: Path, at: float) -> bytes | None:\n    \"\"\"Implement the `_band` function (parameters: video, at).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def _band(video: Path, at: float) -> bytes | None:\n    cmd = [\n        get_ffmpeg_path(), '-v', 'error', '-ss', f'{at:.2f}', '-i', str(video), '-frames:v', '1',\n        '-vf', f'crop=iw:ih*0.35:0:ih*0.65,scale={BAND_WIDTH}:{BAND_HEIGHT},format=gray',\n        '-f', 'rawvideo', '-',\n    ]\n    cmd, priority = render_limits.low_priority(cmd)\n    proc = subprocess.run(cmd, capture_output=True, timeout=30, check=False, **priority)\n    data = proc.stdout\n    return data if proc.returncode == 0 and len(data) == BAND_WIDTH * BAND_HEIGHT else None",
+  "module_source": "\"\"\"Detect subtitles already burned into the source picture, locally and without OCR.\n\nBurned subtitles look like bright glyphs with a dark outline or shadow in the lower part of the\nframe, and their shape changes every few seconds. Static overlays such as channel logos stay put,\nso requiring the text mask to change between samples keeps them from counting.\n\"\"\"\nfrom __future__ import annotations\n\nimport statistics\nimport subprocess\nfrom itertools import pairwise\nfrom pathlib import Path\n\nfrom backend.services import render_limits\nfrom backend.utils.ffmpeg_utils import get_ffmpeg_path\n\nBAND_WIDTH, BAND_HEIGHT = 960, 192  # thin outline-free captions (e.g. Bilibili interviews) vanish when shrunk further\nSAMPLES = 12\nBRIGHT, DARK, REACH = 200, 80, 2\nMIN_TEXT_FRACTION = 0.0012     # share of band pixels that look like glyphs on a darker edge\nMIN_FRAMES_WITH_TEXT = 0.6     # most samples must carry text\nMAX_MEDIAN_OVERLAP = 0.5       # text must change between samples (logos do not)\nEDGE = 0.15                    # captions are centred; corner logos and watermarks live in the outer 15 %\n\n\ndef _band(video: Path, at: float) -> bytes | None:\n    cmd = [\n        get_ffmpeg_path(), '-v', 'error', '-ss', f'{at:.2f}', '-i', str(video), '-frames:v', '1',\n        '-vf', f'crop=iw:ih*0.35:0:ih*0.65,scale={BAND_WIDTH}:{BAND_HEIGHT},format=gray',\n        '-f', 'rawvideo', '-',\n    ]\n    cmd, priority = render_limits.low_priority(cmd)\n    proc = subprocess.run(cmd, capture_output=True, timeout=30, check=False, **priority)\n    data = proc.stdout\n    return data if proc.returncode == 0 and len(data) == BAND_WIDTH * BAND_HEIGHT else None\n\n\ndef text_mask(pixels: bytes) -> set[int]:\n    \"\"\"Indexes of bright pixels that sit next to a dark pixel on the same row (outlined glyphs).\"\"\"\n    mask = set()\n    left, right = int(BAND_WIDTH * EDGE), int(BAND_WIDTH * (1 - EDGE))\n    for y in range(BAND_HEIGHT):\n        row = pixels[y * BAND_WIDTH:(y + 1) * BAND_WIDTH]\n        for x, value in enumerate(row):\n            if value < BRIGHT or x < left or x >= right:\n                continue\n            lo, hi = max(0, x - REACH), min(BAND_WIDTH, x + REACH + 1)\n            if min(row[lo:hi]) < DARK:\n                mask.add(y * BAND_WIDTH + x)\n    return mask\n\n\ndef decide(masks: list[set[int]]) -> bool:\n    if not masks:\n        return False\n    threshold = MIN_TEXT_FRACTION * BAND_WIDTH * BAND_HEIGHT\n    texty = [mask for mask in masks if len(mask) >= threshold]\n    if len(texty) < MIN_FRAMES_WITH_TEXT * len(masks) or len(texty) < 3:\n        return False\n    overlaps = [len(a & b) / max(1, len(a | b)) for a, b in pairwise(texty)]\n    return statistics.median(overlaps) < MAX_MEDIAN_OVERLAP\n\n\ndef caption_band(masks: list[set[int]]) -> tuple[float, float] | None:\n    \"\"\"(top, bottom) of the caption lines as fractions of the frame height, with a little margin.\n\n    The sampled band is the bottom 35 % of the frame; rows come from the glyph pixels of the\n    frames that carry text, trimmed of stray outliers.\n    \"\"\"\n    threshold = MIN_TEXT_FRACTION * BAND_WIDTH * BAND_HEIGHT\n    rows = sorted(index // BAND_WIDTH for mask in masks if len(mask) >= threshold for index in mask)\n    if not rows:\n        return None\n    low, high = rows[int(len(rows) * .03)], rows[min(len(rows) - 1, int(len(rows) * .97))]\n    top = 0.65 + 0.35 * low / BAND_HEIGHT - 0.02\n    bottom = 0.65 + 0.35 * (high + 1) / BAND_HEIGHT + 0.02\n    return round(max(0.6, top), 4), round(min(1.0, bottom), 4)\n\n\ndef detect(video: Path, duration: float) -> tuple[bool, tuple[float, float] | None]:\n    \"\"\"(has burned captions, where they sit) from one sampling pass.\"\"\"\n    if duration <= 0:\n        return False, None\n    start, span = duration * 0.05, duration * 0.9\n    times = [start + span * (i + 0.5) / SAMPLES for i in range(SAMPLES)]\n    masks = [text_mask(band) for band in (_band(video, t) for t in times) if band]\n    found = decide(masks)\n    return found, caption_band(masks) if found else None\n\n\ndef has_burned_subtitles(video: Path, duration: float) -> bool:\n    return detect(video, duration)[0]\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 10
+    },
+    "ai_commit": "84f087713652",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 1.0,
+    "span": [
+      26,
+      35
+    ]
+  }
+}

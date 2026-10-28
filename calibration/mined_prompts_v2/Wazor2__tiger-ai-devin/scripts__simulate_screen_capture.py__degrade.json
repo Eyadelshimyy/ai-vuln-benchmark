@@ -1,0 +1,28 @@
+{
+  "repo": "Wazor2__tiger-ai-devin",
+  "file": "scripts/simulate_screen_capture.py",
+  "function": "degrade",
+  "line": 28,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `degrade` function (parameters: img, edge, blur, bright, contrast, quality, tmp).",
+  "prompt_source": "def degrade(img: Image.Image, edge: int, blur: float, bright: float,\n            contrast: float, quality: int, tmp: Path) -> Image.Image:\n    \"\"\"Implement the `degrade` function (parameters: img, edge, blur, bright, contrast, quality, tmp).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def degrade(img: Image.Image, edge: int, blur: float, bright: float,\n            contrast: float, quality: int, tmp: Path) -> Image.Image:\n    out = img.copy()\n    scale = edge / max(out.size)\n    out = out.resize((round(out.width * scale), round(out.height * scale)),\n                     Image.LANCZOS)\n    if blur:\n        out = out.filter(ImageFilter.GaussianBlur(blur))\n    out = ImageEnhance.Brightness(out).enhance(bright)\n    out = ImageEnhance.Contrast(out).enhance(contrast)\n    out.save(tmp, quality=quality)\n    return Image.open(tmp).convert(\"RGB\")",
+  "module_source": "\"\"\"Check the demo cards still classify correctly when filmed off a screen.\n\nThe rehearsal path is: card on a laptop screen -> phone camera -> Iriun ->\nwebcam frame. That round trip costs resolution, sharpness and contrast, so the\ncards are re-scored through a simulation of it before the rehearsal is trusted.\n\"\"\"\nfrom __future__ import annotations\n\nimport argparse\nimport json\nfrom pathlib import Path\n\nfrom PIL import Image, ImageEnhance, ImageFilter\n\nfrom pench.model_serving import BlankFilter, TigerReID\n\nROOT = Path(__file__).resolve().parents[1]\nCARDS = ROOT / \"demo\" / \"demo_cards\"\n\n# (label, webcam long edge, blur radius, brightness, contrast, jpeg quality)\nCONDITIONS = [\n    (\"clean\", 1280, 0.0, 1.0, 1.0, 90),\n    (\"typical\", 1280, 0.8, 0.92, 0.9, 70),\n    (\"harsh\", 960, 1.4, 0.78, 0.78, 55),\n]\n\n\ndef degrade(img: Image.Image, edge: int, blur: float, bright: float,\n            contrast: float, quality: int, tmp: Path) -> Image.Image:\n    out = img.copy()\n    scale = edge / max(out.size)\n    out = out.resize((round(out.width * scale), round(out.height * scale)),\n                     Image.LANCZOS)\n    if blur:\n        out = out.filter(ImageFilter.GaussianBlur(blur))\n    out = ImageEnhance.Brightness(out).enhance(bright)\n    out = ImageEnhance.Contrast(out).enhance(contrast)\n    out.save(tmp, quality=quality)\n    return Image.open(tmp).convert(\"RGB\")\n\n\ndef main() -> int:\n    ap = argparse.ArgumentParser()\n    ap.add_argument(\"--save\", action=\"store_true\",\n                    help=\"keep the degraded frames under demo/demo_cards/_sim\")\n    args = ap.parse_args()\n\n    manifest_path = CARDS / \"manifest.json\"\n    if not manifest_path.exists():\n        print(\"run scripts/build_demo_cards.py first\")\n        return 1\n    manifest = json.loads(manifest_path.read_text())\n\n    blank, reid = BlankFilter(), TigerReID()\n    sim_dir = CARDS / \"_sim\"\n    sim_dir.mkdir(exist_ok=True)\n    results: dict[str, dict] = {}\n\n    for card in manifest[\"cards\"]:\n        path = ROOT / card[\"card\"]\n        img = Image.open(path).convert(\"RGB\")\n        per_card = {}\n        for label, edge, blur, bright, contrast, quality in CONDITIONS:\n            tmp = sim_dir / f\"{path.stem}_{label}.jpg\"\n            frame = degrade(img, edge, blur, bright, contrast, quality, tmp)\n            triage = blank.triage(frame)\n            row = {\"verdict\": triage[\"verdict\"],\n                   \"animal_confidence\": triage[\"animal_confidence\"]}\n            if triage[\"verdict\"] in (\"animal\", \"review\"):\n                res = reid.identify(frame)\n                row[\"reid_decision\"] = res[\"decision\"]\n                row[\"top1\"] = [res[\"top3\"][0][0], round(res[\"top3\"][0][1], 4)]\n            per_card[label] = row\n            if not args.save:\n                tmp.unlink(missing_ok=True)\n        results[card[\"card\"]] = per_card\n        name = f'{card[\"beat\"]}{\" \" + card[\"tiger_id\"] if card.get(\"tiger_id\") else \"\"}'\n        print(name)\n        for label, row in per_card.items():\n            print(\"   \", label, row)\n\n    if not args.save:\n        sim_dir.rmdir()\n    manifest[\"screen_simulation\"] = results\n    manifest_path.write_text(json.dumps(manifest, indent=2))\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 12
+    },
+    "ai_commit": "6497db041e77",
+    "evidence": "author/committer='Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      28,
+      39
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "repo": "artificial-hedge__dipcatcher",
+  "file": "scripts/export_fx1_api_openapi.py",
+  "function": "main",
+  "line": 23,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main() -> int:\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main() -> int:\n    out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(\"clients/typescript/fx1/openapi.json\")\n    spec = create_app().openapi()\n    out.parent.mkdir(parents=True, exist_ok=True)\n    out.write_text(json.dumps(spec, indent=2, sort_keys=True) + \"\\n\")\n    print(f\"wrote {out} ({len(spec.get('paths', {}))} paths)\")\n    return 0",
+  "module_source": "\"\"\"Export the fx-1 harness API's OpenAPI schema.\n\nUsage::\n\n    uv run --no-sync python scripts/export_fx1_api_openapi.py \\\n        [clients/typescript/fx1/openapi.json]\n\nWrites ``app.openapi()`` (the fx-1 harness serve surface \u2014 run/complete/\njobs/receipts routes) to the given path, defaulting to\n``clients/typescript/fx1/openapi.json`` so the generated TypeScript client\ncan be rebuilt from a committed spec.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nimport sys\nfrom pathlib import Path\n\nfrom fx1.serve.api import create_app\n\n\ndef main() -> int:\n    out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(\"clients/typescript/fx1/openapi.json\")\n    spec = create_app().openapi()\n    out.parent.mkdir(parents=True, exist_ok=True)\n    out.write_text(json.dumps(spec, indent=2, sort_keys=True) + \"\\n\")\n    print(f\"wrote {out} ({len(spec.get('paths', {}))} paths)\")\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "devin": 7
+    },
+    "ai_commit": "b54bfe593faa",
+    "evidence": "author/committer='devin-ai-integration[bot] <158243242+devin-ai-integration[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      23,
+      29
+    ]
+  }
+}

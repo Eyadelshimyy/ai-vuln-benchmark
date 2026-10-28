@@ -1,0 +1,28 @@
+{
+  "repo": "zorntyler540-byte__-estate-ez",
+  "file": "backend/app/services/plain_background_cut.py",
+  "function": "cut_one",
+  "line": 14,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `cut_one` function (parameters: src, dest, color, session).",
+  "prompt_source": "def cut_one(src: Path, dest: Path, color: tuple[int, int, int], session: object) -> None:\n    \"\"\"Implement the `cut_one` function (parameters: src, dest, color, session).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def cut_one(src: Path, dest: Path, color: tuple[int, int, int], session: object) -> None:\n    from rembg import remove\n\n    with Image.open(src) as im:\n        rgb = im.convert(\"RGB\")\n    cut = remove(rgb, session=session, post_process_mask=True)\n    if not isinstance(cut, Image.Image):\n        cut = Image.open(BytesIO(cut))\n    out = composite_cutout(cut, color)\n    dest.write_bytes(jpeg_bytes_rgb(out))",
+  "module_source": "\"\"\"Child-process cutout. Imported only by ``python -m`` so the model is not loaded in the API.\"\"\"\n\nfrom __future__ import annotations\n\nimport sys\nfrom io import BytesIO\nfrom pathlib import Path\n\nfrom PIL import Image\n\nfrom app.services.plain_background import PLAIN_BG_COLORS, PLAIN_BG_MODEL, composite_cutout, jpeg_bytes_rgb\n\n\ndef cut_one(src: Path, dest: Path, color: tuple[int, int, int], session: object) -> None:\n    from rembg import remove\n\n    with Image.open(src) as im:\n        rgb = im.convert(\"RGB\")\n    cut = remove(rgb, session=session, post_process_mask=True)\n    if not isinstance(cut, Image.Image):\n        cut = Image.open(BytesIO(cut))\n    out = composite_cutout(cut, color)\n    dest.write_bytes(jpeg_bytes_rgb(out))\n\n\ndef main(argv: list[str]) -> int:\n    if len(argv) != 4:\n        print(\"usage: plain_background_cut COLOR IN_DIR OUT_DIR\", file=sys.stderr)\n        return 2\n    color_name, in_dir_s, out_dir_s = argv[1], argv[2], argv[3]\n    color = PLAIN_BG_COLORS.get(color_name)\n    if color is None:\n        print(f\"Unknown color {color_name}\", file=sys.stderr)\n        return 2\n    try:\n        from rembg import new_session\n    except Exception as exc:  # noqa: BLE001\n        print(f\"Background cutout is not installed ({exc})\", file=sys.stderr)\n        return 1\n    in_dir = Path(in_dir_s)\n    out_dir = Path(out_dir_s)\n    out_dir.mkdir(parents=True, exist_ok=True)\n    session = new_session(PLAIN_BG_MODEL)\n    for src in sorted(in_dir.glob(\"*.jpg\")):\n        try:\n            cut_one(src, out_dir / src.name, color, session)\n        except Exception as exc:  # noqa: BLE001\n            (out_dir / f\"{src.stem}.err\").write_text(str(exc)[:400], encoding=\"utf-8\")\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main(sys.argv))\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 10
+    },
+    "ai_commit": "395b952d3961",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      14,
+      23
+    ]
+  }
+}

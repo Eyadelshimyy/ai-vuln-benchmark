@@ -1,0 +1,33 @@
+{
+  "repo": "gyrinx-app__gyrinx",
+  "file": "gyrinx/pytest_worktree_lock.py",
+  "function": "acquire",
+  "line": 54,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Take the lock. Return an error message when another pytest holds it.",
+  "prompt_source": "    def acquire(self) -> str | None:\n        \"\"\"Take the lock. Return an error message when another pytest holds it.\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    def acquire(self) -> str | None:\n        \"\"\"Take the lock. Return an error message when another pytest holds it.\"\"\"\n        if self._fd is not None:\n            return None\n        self.path.parent.mkdir(parents=True, exist_ok=True)\n        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o644)\n        try:\n            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n        except BlockingIOError:\n            message = busy_message(_read_pid(fd))\n            os.close(fd)\n            return message\n        except OSError as exc:\n            os.close(fd)\n            if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):\n                raise\n            return busy_message(None)\n        os.ftruncate(fd, 0)\n        os.lseek(fd, 0, os.SEEK_SET)\n        os.write(fd, f\"{os.getpid()}\\n\".encode())\n        self._fd = fd\n        return None",
+  "module_source": "\"\"\"One pytest process per worktree.\n\nLoaded with ``-p gyrinx.pytest_worktree_lock`` so the guard is not in the\nroot conftest. A root conftest edit makes the required CI job run the\nwhole suite.\n\nxdist workers inside one invocation share ``test_<DB>_gwN`` on purpose.\nA second pytest process in the same checkout collides on those names\nduring schema creation. The controller holds an exclusive lock for the\nsession. The kernel drops it if that process dies.\n\"\"\"\n\nimport errno\nimport fcntl\nimport os\nfrom pathlib import Path\n\nimport pytest\n\n\ndef is_xdist_worker(config) -> bool:\n    \"\"\"Workers share the controller's test databases on purpose.\"\"\"\n    return getattr(config, \"workerinput\", None) is not None\n\n\n_LOCK = pytest.StashKey()\n\n\ndef pytest_configure(config):\n    \"\"\"Hold the worktree lock for this session, or exit if it is taken.\"\"\"\n    if is_xdist_worker(config):\n        return\n    lock = WorktreePytestLock(config.rootpath)\n    message = lock.acquire()\n    if message:\n        pytest.exit(message, returncode=2)\n    config.stash[_LOCK] = lock\n\n\ndef pytest_unconfigure(config):\n    \"\"\"Drop the worktree lock when this process is finished.\"\"\"\n    lock = config.stash.get(_LOCK, None)\n    if lock is not None:\n        lock.release()\n\n\nclass WorktreePytestLock:\n    \"\"\"Exclusive lock at ``logs/pytest.lock`` for this checkout.\"\"\"\n\n    def __init__(self, rootpath):\n        self.path = Path(rootpath) / \"logs\" / \"pytest.lock\"\n        self._fd: int | None = None\n\n    def acquire(self) -> str | None:\n        \"\"\"Take the lock. Return an error message when another pytest holds it.\"\"\"\n        if self._fd is not None:\n            return None\n        self.path.parent.mkdir(parents=True, exist_ok=True)\n        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o644)\n        try:\n            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n        except BlockingIOError:\n            message = busy_message(_read_pid(fd))\n            os.close(fd)\n            return message\n        except OSError as exc:\n            os.close(fd)\n            if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):\n                raise\n            return busy_message(None)\n        os.ftruncate(fd, 0)\n        os.lseek(fd, 0, os.SEEK_SET)\n        os.write(fd, f\"{os.getpid()}\\n\".encode())\n        self._fd = fd\n        return None\n\n    def release(self) -> None:\n        fd = self._fd\n        if fd is None:\n            return\n        self._fd = None\n        try:\n            fcntl.flock(fd, fcntl.LOCK_UN)\n        finally:\n            os.close(fd)\n\n\ndef busy_message(pid: int | None) -> str:\n    who = f\"pytest (pid {pid})\" if pid else \"another pytest\"\n    return (\n        f\"{who} is already using this worktree's test databases \"\n        \"(test_<DB> and test_<DB>_gwN). Wait for it to finish, then run one suite.\"\n    )\n\n\ndef _read_pid(fd: int) -> int | None:\n    try:\n        os.lseek(fd, 0, os.SEEK_SET)\n        raw = os.read(fd, 32).decode(errors=\"replace\").strip()\n    except OSError:\n        return None\n    if raw.isdigit():\n        return int(raw)\n    return None\n",
+  "construction_recipe": {
+    "call_args_source": "(tmp_path)",
+    "uses_tmp_path": true,
+    "source_file": "gyrinx/tests/test_pytest_worktree_lock.py",
+    "source_line": 30
+  },
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 22
+    },
+    "ai_commit": "3ba98dab40a3",
+    "evidence": "author/committer='cursor[bot] <206951365+cursor[bot]@users.noreply.github.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      54,
+      75
+    ]
+  }
+}

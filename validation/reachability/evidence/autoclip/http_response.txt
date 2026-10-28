@@ -1,0 +1,8 @@
+HTTP/1.1 200 OK
+date: Tue, 27 Oct 2026 04:53:29 GMT
+server: uvicorn
+content-length: 122
+content-type: application/json
+vary: Origin
+
+{"message":"项目数据同步成功","result":{"success":true,"project_id":"..","clips_synced":0,"collections_synced":0}}

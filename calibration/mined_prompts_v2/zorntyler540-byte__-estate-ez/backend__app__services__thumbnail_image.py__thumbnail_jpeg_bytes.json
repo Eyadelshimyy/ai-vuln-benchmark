@@ -1,0 +1,28 @@
+{
+  "repo": "zorntyler540-byte__-estate-ez",
+  "file": "backend/app/services/thumbnail_image.py",
+  "function": "thumbnail_jpeg_bytes",
+  "line": 34,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Resize image to fit within max_px square; output JPEG bytes.",
+  "prompt_source": "def thumbnail_jpeg_bytes(src: Path, max_px: int, *, fast: bool = False) -> bytes:\n    \"\"\"Resize image to fit within max_px square; output JPEG bytes.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def thumbnail_jpeg_bytes(src: Path, max_px: int, *, fast: bool = False) -> bytes:\n    \"\"\"Resize image to fit within max_px square; output JPEG bytes.\"\"\"\n    from PIL import Image, ImageOps\n\n    with Image.open(src) as im:\n        im = ImageOps.exif_transpose(im)\n        if im.mode in (\"RGBA\", \"P\"):\n            rgba = im.convert(\"RGBA\")\n            background = Image.new(\"RGB\", rgba.size, (255, 255, 255))\n            background.paste(rgba, mask=rgba.split()[3])\n            im_rgb = background\n        elif im.mode != \"RGB\":\n            im_rgb = im.convert(\"RGB\")\n        else:\n            im_rgb = im\n        # Bilinear is much faster than LANCZOS for large\u2192small dashboard thumbs; quality is fine at listing sizes.\n        resample = Image.Resampling.BILINEAR if (fast or max_px <= 512) else Image.Resampling.LANCZOS\n        im_rgb.thumbnail((max_px, max_px), resample)\n        buf = BytesIO()\n        im_rgb.save(buf, format=\"JPEG\", quality=86, optimize=not fast)\n        return buf.getvalue()",
+  "module_source": "from __future__ import annotations\n\ntry:\n    from pillow_heif import register_heif_opener  # type: ignore[import-untyped]\n\n    register_heif_opener()\nexcept ImportError:\n    # HEIC/HEIF catalog photos need the same opener as ``image_preprocess`` for ``Image.open``.\n    pass\n\nfrom io import BytesIO\nfrom pathlib import Path\n\n\ndef thumbnail_jpeg_bytes_first_available(paths: list[Path], max_px: int) -> bytes:\n    \"\"\"Try each catalog path in order; skip missing or unreadable files (orphaned DB rows).\"\"\"\n    last_err: Exception | None = None\n    for src in paths:\n        if not src.is_file():\n            continue\n        try:\n            return thumbnail_jpeg_bytes(src, max_px)\n        except OSError as exc:\n            last_err = exc\n            continue\n        except Exception as exc:\n            last_err = exc\n            continue\n    if last_err is not None:\n        raise last_err\n    raise FileNotFoundError(\"No displayable catalog image on disk\")\n\n\ndef thumbnail_jpeg_bytes(src: Path, max_px: int, *, fast: bool = False) -> bytes:\n    \"\"\"Resize image to fit within max_px square; output JPEG bytes.\"\"\"\n    from PIL import Image, ImageOps\n\n    with Image.open(src) as im:\n        im = ImageOps.exif_transpose(im)\n        if im.mode in (\"RGBA\", \"P\"):\n            rgba = im.convert(\"RGBA\")\n            background = Image.new(\"RGB\", rgba.size, (255, 255, 255))\n            background.paste(rgba, mask=rgba.split()[3])\n            im_rgb = background\n        elif im.mode != \"RGB\":\n            im_rgb = im.convert(\"RGB\")\n        else:\n            im_rgb = im\n        # Bilinear is much faster than LANCZOS for large\u2192small dashboard thumbs; quality is fine at listing sizes.\n        resample = Image.Resampling.BILINEAR if (fast or max_px <= 512) else Image.Resampling.LANCZOS\n        im_rgb.thumbnail((max_px, max_px), resample)\n        buf = BytesIO()\n        im_rgb.save(buf, format=\"JPEG\", quality=86, optimize=not fast)\n        return buf.getvalue()\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 3
+    },
+    "ai_commit": "cce7d6f13e56",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 0.143,
+    "span": [
+      34,
+      54
+    ]
+  }
+}

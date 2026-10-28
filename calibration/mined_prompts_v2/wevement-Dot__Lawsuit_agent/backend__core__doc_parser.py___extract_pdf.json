@@ -1,0 +1,28 @@
+{
+  "repo": "wevement-Dot__Lawsuit_agent",
+  "file": "backend/core/doc_parser.py",
+  "function": "_extract_pdf",
+  "line": 37,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `_extract_pdf` function (parameters: path).",
+  "prompt_source": "def _extract_pdf(path: str) -> str:\n    \"\"\"Implement the `_extract_pdf` function (parameters: path).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def _extract_pdf(path: str) -> str:\n    import fitz  # pymupdf\n    doc = fitz.open(path)\n    pages = []\n    for page in doc:\n        pages.append(page.get_text())\n    doc.close()\n    return \"\\n\".join(pages)",
+  "module_source": "\"\"\"\ndoc_parser - \u6587\u6863\u89e3\u6790\u5de5\u5177(MVP \u7248)\n\u652f\u6301 .docx / .pdf / .txt \u4e09\u79cd\u683c\u5f0f\u7684\u6587\u672c\u62bd\u53d6,\u540c\u6b65\u963b\u585e\u64cd\u4f5c\u5c01\u88c5\u4e3a\u72ec\u7acb\u51fd\u6570\u4f9b\u7ebf\u7a0b\u6c60\u8c03\u7528\u3002\n\"\"\"\nimport os\nfrom pathlib import Path\nfrom backend.core.logger import get_logger\n\nlogger = get_logger(__name__)\n\n\ndef extract_text(path: str) -> str:\n    \"\"\"\u6839\u636e\u6269\u5c55\u540d\u62bd\u53d6\u6587\u6863\u6587\u672c\"\"\"\n    suffix = Path(path).suffix.lower()\n    if suffix == \".docx\":\n        return _extract_docx(path)\n    if suffix == \".pdf\":\n        return _extract_pdf(path)\n    if suffix in (\".txt\", \".md\"):\n        return _extract_txt(path)\n    raise ValueError(f\"\u4e0d\u652f\u6301\u7684\u6587\u4ef6\u683c\u5f0f: {suffix} (MVP \u652f\u6301 docx/pdf/txt)\")\n\n\ndef _extract_docx(path: str) -> str:\n    from docx import Document\n    doc = Document(path)\n    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]\n    # \u8868\u683c\u5185\u5bb9\u4e5f\u62bd\u53d6\n    for table in doc.tables:\n        for row in table.rows:\n            cells = [c.text.strip() for c in row.cells if c.text.strip()]\n            if cells:\n                paragraphs.append(\" | \".join(cells))\n    return \"\\n\".join(paragraphs)\n\n\ndef _extract_pdf(path: str) -> str:\n    import fitz  # pymupdf\n    doc = fitz.open(path)\n    pages = []\n    for page in doc:\n        pages.append(page.get_text())\n    doc.close()\n    return \"\\n\".join(pages)\n\n\ndef _extract_txt(path: str) -> str:\n    with open(path, encoding=\"utf-8\", errors=\"replace\") as f:\n        return f.read()\n\n\ndef extract_text_sync(path: str) -> str:\n    \"\"\"\u540c\u6b65\u7248\u672c(\u4f9b\u7ebf\u7a0b\u6c60 executor \u8c03\u7528,\u907f\u514d\u963b\u585e\u4e8b\u4ef6\u5faa\u73af)\"\"\"\n    return extract_text(path)\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 8
+    },
+    "ai_commit": "fe6900b729d8",
+    "evidence": "Co-Authored-By: Claude <noreply@anthropic.com>",
+    "ai_line_fraction": 1.0,
+    "span": [
+      37,
+      44
+    ]
+  }
+}

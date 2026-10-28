@@ -1,0 +1,28 @@
+{
+  "repo": "NickBaynham__marketing-commander",
+  "file": "apps/api/app/repositories/artists.py",
+  "function": "list_for_workspace",
+  "line": 99,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `list_for_workspace` function (parameters: workspace_id).",
+  "prompt_source": "    async def list_for_workspace(self, workspace_id: uuid.UUID) -> list[Artist]:\n        \"\"\"Implement the `list_for_workspace` function (parameters: workspace_id).\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    async def list_for_workspace(self, workspace_id: uuid.UUID) -> list[Artist]:\n        result = await self._session.execute(\n            select(Artist)\n            .where(Artist.workspace_id == workspace_id)\n            .order_by(Artist.created_at)\n        )\n        return list(result.scalars())",
+  "module_source": "\"\"\"Artist persistence (Phase 5, Increment 5.1).\n\ncreate() persists the artist and its empty AIP draft in the same\ntransaction (REQ-003, AC-002): both rows flush together and commit or\nroll back as one unit; no code path creates an artist without its AIP.\n\nTraceability: REQ-003, REQ-004; AC-002; BR-001.\n\"\"\"\n\nimport uuid\n\nfrom sqlalchemy import delete as sa_delete\nfrom sqlalchemy import select\nfrom sqlalchemy.exc import IntegrityError\nfrom sqlalchemy.ext.asyncio import AsyncSession\nfrom sqlalchemy.orm.exc import StaleDataError\n\nfrom app.exceptions import DuplicateArtistName, StaleVersion\nfrom app.models import Artist, ArtistIdentityProfile\n\nUNIQUE_NAME_INDEX = \"uq_artist_workspace_name_ci\"\n\n\ndef _is_duplicate_name(exc: IntegrityError) -> bool:\n    # asyncpg exposes the violated constraint structurally; fall back to\n    # the message only if the attribute is absent.\n    constraint = getattr(exc.orig, \"constraint_name\", None)\n    if constraint is not None:\n        return constraint == UNIQUE_NAME_INDEX\n    return UNIQUE_NAME_INDEX in str(exc.orig)\n\n\nclass ArtistRepository:\n    def __init__(self, session: AsyncSession) -> None:\n        self._session = session\n\n    async def create(\n        self,\n        workspace_id: uuid.UUID,\n        name: str,\n        genre: str | None = None,\n        summary: str | None = None,\n    ) -> Artist:\n        artist = Artist(\n            workspace_id=workspace_id, name=name, genre=genre, summary=summary\n        )\n        self._session.add(artist)\n        try:\n            await self._session.flush()\n        except IntegrityError as exc:\n            if _is_duplicate_name(exc):\n                raise DuplicateArtistName(name) from exc\n            raise\n        self._session.add(\n            ArtistIdentityProfile(artist_id=artist.id, workspace_id=workspace_id)\n        )\n        await self._session.flush()\n        return artist\n\n    async def save(self, artist: Artist) -> Artist:\n        try:\n            await self._session.flush()\n        except IntegrityError as exc:\n            if _is_duplicate_name(exc):\n                raise DuplicateArtistName(artist.name) from exc\n            raise\n        except StaleDataError as exc:\n            # The versioned UPDATE matched no row: a concurrent writer got\n            # there first (BR-019 \u2014 no silent overwrite).\n            raise StaleVersion(\n                \"a concurrent update changed this artist; reload and retry\"\n            ) from exc\n        return artist\n\n    async def delete(self, artist: Artist) -> dict[str, str]:\n        \"\"\"Remove the artist aggregate; the AIP draft cascades. Returns\n        what was removed so the response can name the loss (BR-015).\"\"\"\n        removed = {\"artist\": artist.name, \"aip_draft\": \"empty draft\"}\n        await self._session.execute(\n            sa_delete(ArtistIdentityProfile).where(\n                ArtistIdentityProfile.artist_id == artist.id\n            )\n        )\n        await self._session.delete(artist)\n        await self._session.flush()\n        return removed\n\n    async def get(self, artist_id: uuid.UUID) -> Artist | None:\n        return await self._session.get(Artist, artist_id)\n\n    async def get_profile(self, artist_id: uuid.UUID) -> ArtistIdentityProfile | None:\n        result = await self._session.execute(\n            select(ArtistIdentityProfile).where(\n                ArtistIdentityProfile.artist_id == artist_id\n            )\n        )\n        return result.scalar_one_or_none()\n\n    async def list_for_workspace(self, workspace_id: uuid.UUID) -> list[Artist]:\n        result = await self._session.execute(\n            select(Artist)\n            .where(Artist.workspace_id == workspace_id)\n            .order_by(Artist.created_at)\n        )\n        return list(result.scalars())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 7
+    },
+    "ai_commit": "2e0166b48e08",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 1.0,
+    "span": [
+      99,
+      105
+    ]
+  }
+}

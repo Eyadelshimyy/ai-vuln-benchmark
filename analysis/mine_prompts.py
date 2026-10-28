@@ -505,6 +505,9 @@ def main() -> None:
                     help="keep the temp clone made for --repo-url (default: delete it after mining, "
                          "since the importable source is already vendored into _repo_src -- this stops "
                          "a 32-repo batch from filling /tmp and silently truncating the run)")
+    ap.add_argument("--out-root", type=Path, default=OUT_DIR,
+                    help="corpus root to write into (default: the frozen v1 root). Corpus v2 uses "
+                         "calibration/mined_prompts_v2 so v1 is never touched.")
     ap.add_argument("--stamp-provenance", action="store_true",
                     help="Attribute AI authorship per function and record it on every candidate, "
                          "but do NOT exclude non-AI functions (annotate-only).")
@@ -635,7 +638,7 @@ def main() -> None:
                     selected.append(r)
                     break
 
-    out_subdir = OUT_DIR / repo_name
+    out_subdir = args.out_root / repo_name
     out_subdir.mkdir(parents=True, exist_ok=True)
     for r in selected:
         safe_name = f"{r['file'].replace('/', '__')}__{r['function']}.json"

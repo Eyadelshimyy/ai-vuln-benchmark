@@ -1,0 +1,57 @@
+[
+  {
+    "name": "claude-haiku-5-5",
+    "model": "anthropic/claude-haiku-5.5",
+    "base_url": "https://openrouter.ai/api/v1",
+    "api_key_env": "OPENROUTER_API_KEY",
+    "temperature": null,
+    "seed": null,
+    "max_tokens": 4000,
+    "reasoning_effort": null,
+    "provider": null
+  },
+  {
+    "name": "gpt-6-luna",
+    "model": "openai/gpt-6-luna",
+    "base_url": "https://openrouter.ai/api/v1",
+    "api_key_env": "OPENROUTER_API_KEY",
+    "temperature": null,
+    "seed": 20261026,
+    "max_tokens": 4000,
+    "reasoning_effort": null,
+    "provider": null
+  },
+  {
+    "name": "deepseek-v4-pro",
+    "model": "deepseek/deepseek-v4-pro-0813",
+    "base_url": "https://openrouter.ai/api/v1",
+    "api_key_env": "OPENROUTER_API_KEY",
+    "temperature": 0,
+    "seed": 20261026,
+    "max_tokens": 4000,
+    "reasoning_effort": null,
+    "provider": null
+  },
+  {
+    "name": "kimi-k3",
+    "model": "moonshotai/kimi-k3",
+    "base_url": "https://openrouter.ai/api/v1",
+    "api_key_env": "OPENROUTER_API_KEY",
+    "temperature": 0,
+    "seed": 20261026,
+    "max_tokens": 4000,
+    "reasoning_effort": null,
+    "provider": null
+  },
+  {
+    "name": "qwen3.8-max",
+    "model": "qwen/qwen3.8-max-0902",
+    "base_url": "https://openrouter.ai/api/v1",
+    "api_key_env": "OPENROUTER_API_KEY",
+    "temperature": 0,
+    "seed": 20261026,
+    "max_tokens": 4000,
+    "reasoning_effort": null,
+    "provider": null
+  }
+]

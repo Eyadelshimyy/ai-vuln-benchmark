@@ -1,0 +1,679 @@
+{
+ "3thanHead__ecommerce-ai": {
+  "ai_attributed_functions": 2,
+  "kept": 2,
+  "lead_tools": [
+   "claude-code"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:10:41+00:00",
+  "on_topic_functions": 6,
+  "order": 55,
+  "pinned_commit": "61c72a4f6200c696bd1da846cd4f35c198ef4144",
+  "quota_agent": "claude-code",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/3thanHead/ecommerce-ai"
+ },
+ "AayushRimal2275__Chinari_Chiya": {
+  "ai_attributed_functions": 0,
+  "kept": 0,
+  "lead_tools": [
+   "github-copilot"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:03:10+00:00",
+  "on_topic_functions": 0,
+  "order": 29,
+  "pinned_commit": "7e778e2ecf0104e1de868f9861205e6f0ebe56f2",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/AayushRimal2275/Chinari_Chiya"
+ },
+ "AdnanArab__PyAlgo": {
+  "ai_attributed_functions": 2,
+  "kept": 2,
+  "lead_tools": [
+   "github-copilot"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:11:24+00:00",
+  "on_topic_functions": 2,
+  "order": 59,
+  "pinned_commit": "7954f078323764898fad11440649111dda30f0be",
+  "quota_agent": "github-copilot",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/AdnanArab/PyAlgo"
+ },
+ "BerniceZimidzi-code__foodies-sop-rag-system": {
+  "ai_attributed_functions": 36,
+  "kept": 36,
+  "lead_tools": [
+   "github-copilot"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:03:09+00:00",
+  "on_topic_functions": 52,
+  "order": 25,
+  "pinned_commit": "fc79572bcaf734f7c7c47d1a4cda1773c4e25402",
+  "quota_agent": "github-copilot",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/BerniceZimidzi-code/foodies-sop-rag-system"
+ },
+ "Gesha1318__CP-12": {
+  "ai_attributed_functions": 0,
+  "kept": 0,
+  "lead_tools": [
+   "cursor"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:08:25+00:00",
+  "on_topic_functions": 0,
+  "order": 33,
+  "pinned_commit": "a59d51d086c41989a04eaedefa72a8d62511a4c3",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/Gesha1318/CP-12"
+ },
+ "HimajaPaturi26__qpy-forge": {
+  "ai_attributed_functions": 11,
+  "kept": 11,
+  "lead_tools": [
+   "cursor"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:35:32+00:00",
+  "on_topic_functions": 11,
+  "order": 97,
+  "pinned_commit": "5bc9e9c00ad2a375b0250d1219c768d5f87a72fc",
+  "quota_agent": "cursor",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/HimajaPaturi26/qpy-forge"
+ },
+ "Ifeoluwakolopin__online-shop-project": {
+  "ai_attributed_functions": 0,
+  "kept": 0,
+  "lead_tools": [
+   "github-copilot"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:11:34+00:00",
+  "on_topic_functions": 0,
+  "order": 61,
+  "pinned_commit": "e77b7107b91b7fb61de7bd8cda34af671c302401",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/Ifeoluwakolopin/online-shop-project"
+ },
+ "Jhoan2626__Proyecto_TaskBoard": {
+  "ai_attributed_functions": 1,
+  "kept": 1,
+  "lead_tools": [
+   "github-copilot"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:11:40+00:00",
+  "on_topic_functions": 1,
+  "order": 62,
+  "pinned_commit": "366bf04074ef0604eda8fd61423a80d1416aca7a",
+  "quota_agent": "github-copilot",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/Jhoan2626/Proyecto_TaskBoard"
+ },
+ "Kopanov__EdgeGuard-Knowledge-Graph": {
+  "ai_attributed_functions": 157,
+  "kept": 80,
+  "lead_tools": [
+   "claude-code"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:02:12+00:00",
+  "on_topic_functions": 158,
+  "order": 8,
+  "pinned_commit": "883fda56e779b3ee28448cb35d4d6891af473b27",
+  "quota_agent": "claude-code",
+  "status": "mined",
+  "truncated_by_cap": true,
+  "url": "https://github.com/Kopanov/EdgeGuard-Knowledge-Graph"
+ },
+ "NickBaynham__marketing-commander": {
+  "ai_attributed_functions": 16,
+  "kept": 16,
+  "lead_tools": [
+   "claude-code"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:10:40+00:00",
+  "on_topic_functions": 16,
+  "order": 49,
+  "pinned_commit": "f2d5f01a92dcf4fe05bae7bc339b5c1f7d09b5fb",
+  "quota_agent": "claude-code",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/NickBaynham/marketing-commander"
+ },
+ "NotoriousPOG__sentinel-agent": {
+  "ai_attributed_functions": 2,
+  "kept": 2,
+  "lead_tools": [
+   "cursor"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:09:03+00:00",
+  "on_topic_functions": 3,
+  "order": 39,
+  "pinned_commit": "250e79eed65029804b61bd01bdcdb187a785f890",
+  "quota_agent": "cursor",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/NotoriousPOG/sentinel-agent"
+ },
+ "PlataformaIVItesis__PlataformaIVI": {
+  "ai_attributed_functions": 0,
+  "kept": 0,
+  "lead_tools": [
+   "github-copilot"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:09:01+00:00",
+  "on_topic_functions": 5,
+  "order": 35,
+  "pinned_commit": "ed15dc012019815c7ad1d3b507a6e77ed562898a",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/PlataformaIVItesis/PlataformaIVI"
+ },
+ "Trameur__DofusFashionistaVanced": {
+  "ai_attributed_functions": 0,
+  "kept": 0,
+  "lead_tools": [
+   "github-copilot"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:32:31+00:00",
+  "on_topic_functions": 1117,
+  "order": 95,
+  "pinned_commit": "bd82af4e8f9ea4b7049931e536df2db4a3e2c0d2",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/Trameur/DofusFashionistaVanced"
+ },
+ "Victor-Kipruto-Rop__TELIXO": {
+  "ai_attributed_functions": 10,
+  "kept": 10,
+  "lead_tools": [
+   "github-copilot"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:01:05+00:00",
+  "on_topic_functions": 42,
+  "order": 2,
+  "pinned_commit": "43fe49b6672975c56c2f96dc3f50a0e045f6630b",
+  "quota_agent": "github-copilot",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/Victor-Kipruto-Rop/TELIXO"
+ },
+ "Wazor2__tiger-ai-devin": {
+  "ai_attributed_functions": 21,
+  "kept": 21,
+  "lead_tools": [
+   "devin"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:35:30+00:00",
+  "on_topic_functions": 37,
+  "order": 96,
+  "pinned_commit": "c65706b122158f893b4270091441d328b246e942",
+  "quota_agent": "devin",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/Wazor2/tiger-ai-devin"
+ },
+ "abebegashe83-tech__attendance-management-system": {
+  "ai_attributed_functions": 0,
+  "kept": 0,
+  "lead_tools": [
+   "github-copilot"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:02:13+00:00",
+  "on_topic_functions": 0,
+  "order": 9,
+  "pinned_commit": "47dee025ba8ffd02c53a848b7c31c8f3a3f75184",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/abebegashe83-tech/attendance-management-system"
+ },
+ "anirudhlath__alfred-home-service": {
+  "ai_attributed_functions": 0,
+  "kept": 0,
+  "lead_tools": [
+   "claude-code"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:10:39+00:00",
+  "on_topic_functions": 0,
+  "order": 48,
+  "pinned_commit": "52ef57ba4adc32e2d1d47b4d3e989a069ee8e6ff",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/anirudhlath/alfred-home-service"
+ },
+ "artificial-hedge__dipcatcher": {
+  "ai_attributed_functions": 331,
+  "kept": 80,
+  "lead_tools": [
+   "cursor",
+   "devin"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:43:39+00:00",
+  "on_topic_functions": 475,
+  "order": 98,
+  "pinned_commit": "290ca84812dc3a9fd1bb64b5991b260d3ae2a94c",
+  "quota_agent": "cursor",
+  "status": "mined",
+  "truncated_by_cap": true,
+  "url": "https://github.com/artificial-hedge/dipcatcher"
+ },
+ "ayushdad609-code__autoclip": {
+  "ai_attributed_functions": 85,
+  "kept": 80,
+  "lead_tools": [
+   "cursor"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:10:19+00:00",
+  "on_topic_functions": 313,
+  "order": 42,
+  "pinned_commit": "8f32453dc850596a60110b8dc1482098bd014c90",
+  "quota_agent": "cursor",
+  "status": "mined",
+  "truncated_by_cap": true,
+  "url": "https://github.com/ayushdad609-code/autoclip"
+ },
+ "chanadinh__FB-Insta-Messenger-Automation": {
+  "ai_attributed_functions": 7,
+  "kept": 7,
+  "lead_tools": [
+   "github-copilot"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:11:23+00:00",
+  "on_topic_functions": 23,
+  "order": 58,
+  "pinned_commit": "9e85f8ff1f06d5f252e0797bf997d9868011e0ea",
+  "quota_agent": "github-copilot",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/chanadinh/FB-Insta-Messenger-Automation"
+ },
+ "codingjoe__relay": {
+  "ai_attributed_functions": 0,
+  "kept": 0,
+  "lead_tools": [
+   "github-copilot"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:13:37+00:00",
+  "on_topic_functions": 7,
+  "order": 84,
+  "pinned_commit": "2d81c14086e64740d1a9e474d7567d2eb0c88542",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/codingjoe/relay"
+ },
+ "g-savitha__url-shortner": {
+  "ai_attributed_functions": 1,
+  "kept": 1,
+  "lead_tools": [
+   "cursor"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:13:32+00:00",
+  "on_topic_functions": 2,
+  "order": 80,
+  "pinned_commit": "8cb58d62a91709e9c2077876731ae419527622d3",
+  "quota_agent": "cursor",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/g-savitha/url-shortner"
+ },
+ "gyrinx-app__gyrinx": {
+  "ai_attributed_functions": 60,
+  "kept": 60,
+  "lead_tools": [
+   "claude-code"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:01:42+00:00",
+  "on_topic_functions": 85,
+  "order": 3,
+  "pinned_commit": "ba657257f5b3d2229efc8a8b80dfff196fc94735",
+  "quota_agent": "claude-code",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/gyrinx-app/gyrinx"
+ },
+ "hayeongbag53__gamdong-time": {
+  "ai_attributed_functions": 1,
+  "kept": 1,
+  "lead_tools": [
+   "claude-code"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:02:55+00:00",
+  "on_topic_functions": 1,
+  "order": 23,
+  "pinned_commit": "62e95f7724856ed9de0d7f350e5d4d8ecba33203",
+  "quota_agent": "claude-code",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/hayeongbag53/gamdong-time"
+ },
+ "icycola5556__banana-slides": {
+  "ai_attributed_functions": 6,
+  "kept": 6,
+  "lead_tools": [
+   "devin"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:11:22+00:00",
+  "on_topic_functions": 64,
+  "order": 56,
+  "pinned_commit": "330ee410302e65f65b3764b301d416dcd8e136ab",
+  "quota_agent": "devin",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/icycola5556/banana-slides"
+ },
+ "jeffrey-groneberg__the-mai-workshop": {
+  "ai_attributed_functions": 0,
+  "kept": 0,
+  "lead_tools": [
+   "github-copilot"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:10:26+00:00",
+  "on_topic_functions": 14,
+  "order": 46,
+  "pinned_commit": "3ccde45c709535dd5093e9b743ffee6caf076ad4",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/jeffrey-groneberg/the-mai-workshop"
+ },
+ "johnleotengson80-ai__TengsonFirstWeb": {
+  "ai_attributed_functions": 0,
+  "kept": 0,
+  "lead_tools": [
+   "github-copilot"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:17:38+00:00",
+  "on_topic_functions": 2,
+  "order": 89,
+  "pinned_commit": "f06529e6e9d68b6a11a023e3e9051ffbee80b15a",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/johnleotengson80-ai/TengsonFirstWeb"
+ },
+ "jyang-me__Yang_Hub": {
+  "ai_attributed_functions": 0,
+  "kept": 0,
+  "lead_tools": [
+   "claude-code"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:10:21+00:00",
+  "on_topic_functions": 0,
+  "order": 43,
+  "pinned_commit": "72999082d77613019bd115740109c4004844b478",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/jyang-me/Yang_Hub"
+ },
+ "kanishkagupta88666__pilot-efb": {
+  "ai_attributed_functions": 1,
+  "kept": 1,
+  "lead_tools": [
+   "github-copilot"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:11:32+00:00",
+  "on_topic_functions": 17,
+  "order": 60,
+  "pinned_commit": "09499a45fd8c90a577149d697f0069a15c837d23",
+  "quota_agent": "github-copilot",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/kanishkagupta88666/pilot-efb"
+ },
+ "king-codes04__moviematch": {
+  "ai_attributed_functions": 1,
+  "kept": 1,
+  "lead_tools": [
+   "github-copilot"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:11:49+00:00",
+  "on_topic_functions": 3,
+  "order": 67,
+  "pinned_commit": "a189db917af489e7f032ace83ffc74f10d84ecb2",
+  "quota_agent": "github-copilot",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/king-codes04/moviematch"
+ },
+ "lily-sichani__english-coach": {
+  "ai_attributed_functions": 1,
+  "kept": 1,
+  "lead_tools": [
+   "cursor"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:02:14+00:00",
+  "on_topic_functions": 1,
+  "order": 14,
+  "pinned_commit": "2d47c729fe17ed325010b85cbf51b5b55948046e",
+  "quota_agent": "cursor",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/lily-sichani/english-coach"
+ },
+ "nagibator9986__ccupractice": {
+  "ai_attributed_functions": 11,
+  "kept": 11,
+  "lead_tools": [
+   "claude-code"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:09:33+00:00",
+  "on_topic_functions": 12,
+  "order": 41,
+  "pinned_commit": "0ebba7c4d0c4ebfe08eead8a93a4379af9ab6ec6",
+  "quota_agent": "claude-code",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/nagibator9986/ccupractice"
+ },
+ "nibrocsolutions__wifi-monitor": {
+  "ai_attributed_functions": 6,
+  "kept": 6,
+  "lead_tools": [
+   "cursor"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:08:11+00:00",
+  "on_topic_functions": 6,
+  "order": 31,
+  "pinned_commit": "484f39f7242bee996c7160557c0421e0a731d8ea",
+  "quota_agent": "cursor",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/nibrocsolutions/wifi-monitor"
+ },
+ "rhrits__linkedin-automation-agent": {
+  "ai_attributed_functions": 7,
+  "kept": 7,
+  "lead_tools": [
+   "cursor"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:11:50+00:00",
+  "on_topic_functions": 7,
+  "order": 68,
+  "pinned_commit": "0cc81bdd178c1f82abc8d2a824011689f3aa83cb",
+  "quota_agent": "cursor",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/rhrits/linkedin-automation-agent"
+ },
+ "siddhant248__Forge-v2": {
+  "ai_attributed_functions": 4,
+  "kept": 4,
+  "lead_tools": [
+   "github-copilot"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:01:02+00:00",
+  "on_topic_functions": 9,
+  "order": 0,
+  "pinned_commit": "a560e7e92ab80fb9e3fab54cc5c24aa9b9e87166",
+  "quota_agent": "github-copilot",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/siddhant248/Forge-v2"
+ },
+ "spectral-butters__hacky-movies": {
+  "ai_attributed_functions": 34,
+  "kept": 34,
+  "lead_tools": [
+   "devin"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:43:40+00:00",
+  "on_topic_functions": 34,
+  "order": 100,
+  "pinned_commit": "437144733c969246ddf290f4ab31bcd03191b6d5",
+  "quota_agent": "devin",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/spectral-butters/hacky-movies"
+ },
+ "srinidhi2608__git-analysis": {
+  "ai_attributed_functions": 7,
+  "kept": 7,
+  "lead_tools": [
+   "github-copilot"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:17:39+00:00",
+  "on_topic_functions": 7,
+  "order": 91,
+  "pinned_commit": "055936214983ddd58dc365f194ce4dcd087d80f3",
+  "quota_agent": "github-copilot",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/srinidhi2608/git-analysis"
+ },
+ "susu09658-debug__plant-disease-detection": {
+  "ai_attributed_functions": 17,
+  "kept": 16,
+  "lead_tools": [
+   "github-copilot"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:08:09+00:00",
+  "on_topic_functions": 17,
+  "order": 30,
+  "pinned_commit": "9d847001afecc2322f6b6e55ef14502f9eb1c5f0",
+  "quota_agent": "github-copilot",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/susu09658-debug/plant-disease-detection"
+ },
+ "th0to__inventory_app": {
+  "ai_attributed_functions": 6,
+  "kept": 6,
+  "lead_tools": [
+   "github-copilot"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:11:48+00:00",
+  "on_topic_functions": 6,
+  "order": 66,
+  "pinned_commit": "4361ad24368d8c05c9b22fd447e8b2ef40b92857",
+  "quota_agent": "github-copilot",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/th0to/inventory_app"
+ },
+ "wevement-Dot__Lawsuit_agent": {
+  "ai_attributed_functions": 6,
+  "kept": 6,
+  "lead_tools": [
+   "claude-code"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:12:40+00:00",
+  "on_topic_functions": 6,
+  "order": 77,
+  "pinned_commit": "243404d02bb4f422f0d76313d8acba77c3cce5c0",
+  "quota_agent": "claude-code",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/wevement-Dot/Lawsuit_agent"
+ },
+ "x3beche__sup-port": {
+  "ai_attributed_functions": 3,
+  "kept": 3,
+  "lead_tools": [
+   "claude-code"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:01:44+00:00",
+  "on_topic_functions": 3,
+  "order": 4,
+  "pinned_commit": "78955a2783ae50dc653af4f38f1db6a360f7e74f",
+  "quota_agent": "claude-code",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/x3beche/sup-port"
+ },
+ "ziyihe2026-commits__agent-rag-system": {
+  "ai_attributed_functions": 0,
+  "kept": 0,
+  "lead_tools": [
+   "claude-code"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:02:54+00:00",
+  "on_topic_functions": 21,
+  "order": 16,
+  "pinned_commit": "06265f5cd11659fb2c0e7b0f67cc218684f43274",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/ziyihe2026-commits/agent-rag-system"
+ },
+ "zorntyler540-byte__-estate-ez": {
+  "ai_attributed_functions": 41,
+  "kept": 41,
+  "lead_tools": [
+   "cursor"
+  ],
+  "log_tail": null,
+  "mined_utc": "2026-10-26T21:18:08+00:00",
+  "on_topic_functions": 71,
+  "order": 93,
+  "pinned_commit": "e2d71b9135f9f62f0b4da4074820d085af6092a9",
+  "quota_agent": "cursor",
+  "status": "mined",
+  "truncated_by_cap": false,
+  "url": "https://github.com/zorntyler540-byte/-estate-ez"
+ }
+}

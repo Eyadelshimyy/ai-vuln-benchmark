@@ -1,0 +1,28 @@
+{
+  "repo": "gyrinx-app__gyrinx",
+  "file": "scripts/fresh_database_needed.py",
+  "function": "changed_files_against",
+  "line": 85,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `changed_files_against` function (parameters: base).",
+  "prompt_source": "def changed_files_against(base: str) -> list[str]:\n    \"\"\"Implement the `changed_files_against` function (parameters: base).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def changed_files_against(base: str) -> list[str]:\n    out = subprocess.run(  # nosec B607 \u2014 fixed argv; git resolved from PATH like every repo tool\n        [\n            \"git\",\n            \"diff\",\n            \"--name-only\",\n            \"--no-renames\",\n            \"--diff-filter=AMD\",\n            f\"{base}...HEAD\",\n        ],\n        check=True,\n        capture_output=True,\n        text=True,\n        cwd=ROOT,\n    ).stdout\n    return [line for line in out.splitlines() if line]",
+  "module_source": "#!/usr/bin/env python3\n\"\"\"Say whether a change can break applying the migration graph from scratch.\n\nThe fresh-database CI job migrates an empty database. On a pull request it\nonly needs to when the change touches something that apply depends on:\n\n- a migration file; an app's apps.py, whose label every dependency names;\n  the settings that list the apps in the graph; the dependency lock, since a\n  Django upgrade can retire an operation an old migration still uses;\n- a project module that a migration imports (an icon table, a field type,\n  a model package a data migration reads through), or a package above one.\n\nPrints the matching paths, one per line, and nothing when there are none.\nImports one level deep are read straight out of the migration files, so the\nset follows the migrations as they are written; what those modules import in\nturn is not followed.\n\n    scripts/fresh_database_needed.py            # against origin/main\n    scripts/fresh_database_needed.py origin/dev # against another base\n\nRuns on the system interpreter before the project's environment exists, so it\nuses the standard library only.\n\"\"\"\n\nimport pathlib\nimport re\nimport subprocess  # nosec B404 \u2014 runs one fixed git command to list changed files\nimport sys\nfrom collections.abc import Iterable\n\nROOT = pathlib.Path(__file__).resolve().parent.parent\n\nALWAYS = (\n    re.compile(r\"(^|/)migrations/[^/]+\\.py$\"),\n    re.compile(r\"(^|/)apps\\.py$\"),\n    re.compile(r\"^gyrinx/settings\"),\n    re.compile(r\"^uv\\.lock$\"),\n)\n\nPROJECT_IMPORT = re.compile(\n    r\"^\\s*(?:from|import)\\s+((?:n23|n26|gyrinx)(?:\\.[A-Za-z0-9_]+)*)\", re.MULTILINE\n)\n\n\ndef migration_imports(root: pathlib.Path = ROOT) -> set[str]:\n    \"\"\"Project modules the migrations import, as repo-relative paths sans .py.\"\"\"\n    found: set[str] = set()\n    for migration in root.glob(\"*/*/migrations/*.py\"):\n        for module in PROJECT_IMPORT.findall(migration.read_text(encoding=\"utf-8\")):\n            found.add(module.replace(\".\", \"/\"))\n    return found\n\n\ndef module_path(changed_file: str) -> str:\n    path = pathlib.PurePosixPath(changed_file)\n    if path.name == \"__init__.py\":\n        return path.parent.as_posix()\n    return path.with_suffix(\"\").as_posix()\n\n\ndef touches_import(changed_file: str, imports: Iterable[str]) -> bool:\n    changed = module_path(changed_file)\n    for module in imports:\n        if changed == module or changed.startswith(module + \"/\"):\n            return True\n        if module.startswith(changed + \"/\"):\n            # A package whose __init__ runs when the module beneath it loads.\n            return True\n    return False\n\n\ndef paths_needing_fresh_migrate(\n    changed_files: Iterable[str], imports: Iterable[str]\n) -> list[str]:\n    imports = list(imports)\n    matched = []\n    for path in changed_files:\n        if any(pattern.search(path) for pattern in ALWAYS):\n            matched.append(path)\n        elif path.endswith(\".py\") and touches_import(path, imports):\n            matched.append(path)\n    return matched\n\n\ndef changed_files_against(base: str) -> list[str]:\n    out = subprocess.run(  # nosec B607 \u2014 fixed argv; git resolved from PATH like every repo tool\n        [\n            \"git\",\n            \"diff\",\n            \"--name-only\",\n            \"--no-renames\",\n            \"--diff-filter=AMD\",\n            f\"{base}...HEAD\",\n        ],\n        check=True,\n        capture_output=True,\n        text=True,\n        cwd=ROOT,\n    ).stdout\n    return [line for line in out.splitlines() if line]\n\n\ndef main(argv: list[str]) -> int:\n    base = argv[1] if len(argv) > 1 else \"origin/main\"\n    changed = changed_files_against(base)\n    for path in paths_needing_fresh_migrate(changed, migration_imports()):\n        print(path)\n    return 0\n\n\nif __name__ == \"__main__\":\n    sys.exit(main(sys.argv))\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 16
+    },
+    "ai_commit": "2a4542555ec8",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 1.0,
+    "span": [
+      85,
+      100
+    ]
+  }
+}

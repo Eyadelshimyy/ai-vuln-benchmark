@@ -1,0 +1,2102 @@
+{
+ "3thanHead/ecommerce-ai": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "61c72a4f6200c696bd1da846cd4f35c198ef4144",
+  "lead": {
+   "hits": 2,
+   "keywords": [
+    "endpoint"
+   ],
+   "latest": "2026-07-23T22:03:33.000-04:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 27,
+  "order": 55,
+  "reason": null,
+  "route_handlers": 26
+ },
+ "7anand7s/codegraph": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "ea72e1b190921232aa7bd02e96bef5bbe4fe0ab6",
+  "lead": {
+   "hits": 2,
+   "keywords": [
+    "django",
+    "flask"
+   ],
+   "latest": "2026-05-28T12:38:03.000-05:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 2,
+  "order": 65,
+  "reason": "only 2 non-test .py files (<10)",
+  "route_handlers": 1
+ },
+ "AayushRimal2275/Chinari_Chiya": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "django"
+  ],
+  "head": "7e778e2ecf0104e1de868f9861205e6f0ebe56f2",
+  "lead": {
+   "hits": 2,
+   "keywords": [
+    "django"
+   ],
+   "latest": "2026-03-29T12:45:16.000Z",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 61,
+  "order": 29,
+  "reason": null,
+  "route_handlers": 29
+ },
+ "AdnanArab/PyAlgo": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "7954f078323764898fad11440649111dda30f0be",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-10-19T15:39:53.000+01:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 50,
+  "order": 59,
+  "reason": null,
+  "route_handlers": 9
+ },
+ "Alex002-png/academia-python": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "235edfcab07ca4639cd8a4d4ee682a7d54206d29",
+  "lead": {
+   "hits": 8,
+   "keywords": [
+    "endpoint",
+    "fastapi"
+   ],
+   "latest": "2026-07-24T10:39:15.000-05:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 73,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "BandosMonkies/Chat-Application-Socket-Programming": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "08842bce1a917d8bd130adc65ef04e3d8c7652c5",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "route"
+   ],
+   "latest": "2026-10-26T08:56:49.000Z",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 20,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "BerniceZimidzi-code/foodies-sop-rag-system": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "fc79572bcaf734f7c7c47d1a4cda1773c4e25402",
+  "lead": {
+   "hits": 2,
+   "keywords": [
+    "endpoint"
+   ],
+   "latest": "2026-10-22T09:19:44.000+02:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 11,
+  "order": 25,
+  "reason": null,
+  "route_handlers": 50
+ },
+ "BigtoC/ledgerly": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "5e0edb9dd414c8dd2e6f077c18e5b96233a23820",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "route"
+   ],
+   "latest": "2026-10-22T22:46:37.000+08:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 57,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "CodyNicholson/Rixus_Real_Estate_BE_Project": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "a72b9f007f84121007a9921501b3968a99a237ff",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "endpoint"
+   ],
+   "latest": "2026-10-17T19:48:22.000Z",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 83,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "DevelopWithAnuj/tour-blog-website": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "51781a5c245d9484b790e557530a645093dee85d",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "endpoint"
+   ],
+   "latest": "2026-10-22T16:44:34.000+05:30",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 90,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "Egedemr/insiderone-devops-case": {
+  "decision": "REJECT",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "13b6d0e9f4c0de50d4f7302e9e56710cf0748ea1",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-05-19T11:41:13.000Z",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 3,
+  "order": 15,
+  "reason": "only 3 non-test .py files (<10)",
+  "route_handlers": 3
+ },
+ "ElcanoTek/lens": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "2adca9e2ed1b05b1c3c21b456a86935afa26faca",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-10-16T15:35:49.000-04:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 36,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "Francis054/mn-bootcamp-2026": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "46b88997d8e2b6a5cffb1dfcde84eb22ed5d0f64",
+  "lead": {
+   "hits": 10,
+   "keywords": [
+    "route"
+   ],
+   "latest": "2026-10-25T22:19:20.000Z",
+   "tools": [
+    "cursor"
+   ]
+  },
+  "n_py_nontest": 2,
+  "order": 76,
+  "reason": "only 2 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "Gesha1318/CP-12": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "django"
+  ],
+  "head": "a59d51d086c41989a04eaedefa72a8d62511a4c3",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "django"
+   ],
+   "latest": "2025-08-15T10:28:28.000+03:00",
+   "tools": [
+    "cursor"
+   ]
+  },
+  "n_py_nontest": 34,
+  "order": 33,
+  "reason": null,
+  "route_handlers": 14
+ },
+ "GoodDollar/GoodSDKs": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "a7910a9bfacd98fb587a22e0dd8c2e050beb4100",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "route"
+   ],
+   "latest": "2026-10-13T22:30:32.000+07:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 38,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "HimajaPaturi26/qpy-forge": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "5bc9e9c00ad2a375b0250d1219c768d5f87a72fc",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-10-09T17:33:39.000Z",
+   "tools": [
+    "cursor"
+   ]
+  },
+  "n_py_nontest": 24,
+  "order": 97,
+  "reason": null,
+  "route_handlers": 9
+ },
+ "Ian-Gabaraev/IanGabaraevDev": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "6ec601d6a408516836aa7f890cb4b9e0cd5bb154",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "flask"
+   ],
+   "latest": "2026-10-01T08:47:39.000+07:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 70,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "Ifeoluwakolopin/online-shop-project": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "django"
+  ],
+  "head": "e77b7107b91b7fb61de7bd8cda34af671c302401",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "django"
+   ],
+   "latest": "2026-10-21T21:57:47.000-07:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 49,
+  "order": 61,
+  "reason": null,
+  "route_handlers": 22
+ },
+ "JMMEDIA2026/drma": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "5b5e36230758da660313fc218203ffb0233a9676",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "endpoint"
+   ],
+   "latest": "2026-09-09T02:14:52.000Z",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 64,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "JackCapstaff/jackcapstaff.com": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "flask"
+  ],
+  "head": "0b95f9d016752257dcc4de5ed56ea2340e9b8d22",
+  "lead": {
+   "hits": 9,
+   "keywords": [
+    "flask"
+   ],
+   "latest": "2026-07-17T11:04:17.000+01:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 133,
+  "order": 79,
+  "reason": null,
+  "route_handlers": 357
+ },
+ "Jhoan2626/Proyecto_TaskBoard": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "flask"
+  ],
+  "head": "366bf04074ef0604eda8fd61423a80d1416aca7a",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "route"
+   ],
+   "latest": "2026-10-06T02:40:24.000Z",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 23,
+  "order": 62,
+  "reason": null,
+  "route_handlers": 24
+ },
+ "KUBO-Capstone/kubo-mobile-app": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "46b128cc7156690aab75706eaf82445079ad7487",
+  "lead": {
+   "hits": 2,
+   "keywords": [
+    "endpoint",
+    "route"
+   ],
+   "latest": "2026-10-09T02:39:16.000Z",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 10,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "Kopanov/EdgeGuard-Knowledge-Graph": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "883fda56e779b3ee28448cb35d4d6891af473b27",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-10-10T22:44:45.000+02:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 90,
+  "order": 8,
+  "reason": null,
+  "route_handlers": 15
+ },
+ "LeStarch/fprime-stress-reference": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "688fea3e95a5129e7e11bd8ca4637d10f59c449c",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "flask"
+   ],
+   "latest": "2026-05-19T15:16:17.000Z",
+   "tools": [
+    "devin"
+   ]
+  },
+  "n_py_nontest": 1,
+  "order": 13,
+  "reason": "only 1 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "MrWaisBescheid/Language-Check": {
+  "decision": "REJECT",
+  "frameworks": [
+   "flask"
+  ],
+  "head": "c9abccf3c521ea17a7653fe64e516ee00c44a7da",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "flask"
+   ],
+   "latest": "2026-07-23T09:28:18.000+02:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 1,
+  "order": 81,
+  "reason": "only 1 non-test .py files (<10)",
+  "route_handlers": 7
+ },
+ "NickBaynham/marketing-commander": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "f2d5f01a92dcf4fe05bae7bc339b5c1f7d09b5fb",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-07-19T18:49:06.000-07:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 46,
+  "order": 49,
+  "reason": null,
+  "route_handlers": 22
+ },
+ "NotoriousPOG/sentinel-agent": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "250e79eed65029804b61bd01bdcdb187a785f890",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-09-18T20:15:24.000Z",
+   "tools": [
+    "cursor"
+   ]
+  },
+  "n_py_nontest": 106,
+  "order": 39,
+  "reason": null,
+  "route_handlers": 10
+ },
+ "PlataformaIVItesis/PlataformaIVI": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "django"
+  ],
+  "head": "ed15dc012019815c7ad1d3b507a6e77ed562898a",
+  "lead": {
+   "hits": 2,
+   "keywords": [
+    "django"
+   ],
+   "latest": "2026-10-04T16:49:32.000-03:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 43,
+  "order": 35,
+  "reason": null,
+  "route_handlers": 23
+ },
+ "SEED-platform/seed-angular": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "ee92c0c92d2dc617809e7ce87bd777e0569275ed",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "django"
+   ],
+   "latest": "2026-08-13T10:46:28.000-06:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 21,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "Satzz001/Job_Recommendation_Platform": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "9583242ab63b200d7be695c97855fa9e517a3f7f",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "route"
+   ],
+   "latest": "2026-10-10T08:50:06.000Z",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 44,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "Trameur/DofusFashionistaVanced": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "django"
+  ],
+  "head": "bd82af4e8f9ea4b7049931e536df2db4a3e2c0d2",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "django"
+   ],
+   "latest": "2026-04-09T16:14:32.000Z",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 914,
+  "order": 95,
+  "reason": null,
+  "route_handlers": 198
+ },
+ "Ulvane/Freak-Swiss-Manager": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "cf3ed24ed892bd9b1856306df47ed215f843e3ab",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "endpoint"
+   ],
+   "latest": "2026-09-03T15:34:46.000Z",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 99,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "Victor-Kipruto-Rop/TELIXO": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi",
+   "flask"
+  ],
+  "head": "43fe49b6672975c56c2f96dc3f50a0e045f6630b",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "flask"
+   ],
+   "latest": "2026-07-11T20:09:06.000Z",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 52,
+  "order": 2,
+  "reason": null,
+  "route_handlers": 29
+ },
+ "Wazor2/tiger-ai-devin": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "c65706b122158f893b4270091441d328b246e942",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-08-15T10:36:13.000Z",
+   "tools": [
+    "devin"
+   ]
+  },
+  "n_py_nontest": 44,
+  "order": 96,
+  "reason": null,
+  "route_handlers": 8
+ },
+ "XRPRoofing/XRPROOFING-master": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "52d9b707ac9d5c9349bf821b4609e7ac9e6d7c8a",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "route"
+   ],
+   "latest": "2026-10-22T23:25:40.000Z",
+   "tools": [
+    "devin"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 40,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "abebegashe83-tech/attendance-management-system": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "django"
+  ],
+  "head": "47dee025ba8ffd02c53a848b7c31c8f3a3f75184",
+  "lead": {
+   "hits": 3,
+   "keywords": [
+    "django"
+   ],
+   "latest": "2026-10-03T09:55:15.000+03:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 16,
+  "order": 9,
+  "reason": null,
+  "route_handlers": 41
+ },
+ "allenanswerzq/rerun": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "bc395cc561eb011ea7848bcd939d73317fe40075",
+  "lead": {
+   "hits": 2,
+   "keywords": [
+    "flask"
+   ],
+   "latest": "2026-05-12T09:41:12.000Z",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 874,
+  "order": 47,
+  "reason": "no web application object constructed",
+  "route_handlers": 0
+ },
+ "aloclinica/aloclinica": {
+  "decision": "REJECT",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "2c70883aaa750510eeed7fc146cffbc38489505a",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-07-20T15:57:04.000-03:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 1,
+  "order": 87,
+  "reason": "only 1 non-test .py files (<10)",
+  "route_handlers": 2
+ },
+ "anirudhlath/alfred-home-service": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "52ef57ba4adc32e2d1d47b4d3e989a069ee8e6ff",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-10-14T22:22:07.000-05:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 13,
+  "order": 48,
+  "reason": null,
+  "route_handlers": 3
+ },
+ "ansible-collections/community.general": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "2edf6c27a354b472eec5167fdd57b226c0562bc4",
+  "lead": {
+   "hits": 2,
+   "keywords": [
+    "django"
+   ],
+   "latest": "2026-10-25T09:19:14.000+13:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 800,
+  "order": 1,
+  "reason": "no web application object constructed",
+  "route_handlers": 0
+ },
+ "arbitryum/espace-ouvert": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "0322d959517dbfbca1a60fc45485efcbd7ce8746",
+  "lead": {
+   "hits": 10,
+   "keywords": [
+    "django"
+   ],
+   "latest": "2026-08-29T23:22:10.000+02:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 71,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "artificial-hedge/dipcatcher": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "290ca84812dc3a9fd1bb64b5991b260d3ae2a94c",
+  "lead": {
+   "hits": 30,
+   "keywords": [
+    "endpoint",
+    "fastapi"
+   ],
+   "latest": "2026-10-20T09:42:18.000Z",
+   "tools": [
+    "cursor",
+    "devin"
+   ]
+  },
+  "n_py_nontest": 13779,
+  "order": 98,
+  "reason": null,
+  "route_handlers": 160
+ },
+ "ayushdad609-code/autoclip": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "8f32453dc850596a60110b8dc1482098bd014c90",
+  "lead": {
+   "hits": 4,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-09-23T03:21:15.000Z",
+   "tools": [
+    "cursor"
+   ]
+  },
+  "n_py_nontest": 316,
+  "order": 42,
+  "reason": null,
+  "route_handlers": 267
+ },
+ "bbernhardt15/grocery-price-optimizer": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "3f94e6f432b8c03864576a2f2c56359cfbfd8fae",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "endpoint"
+   ],
+   "latest": "2026-10-26T20:13:42.000Z",
+   "tools": [
+    "cursor"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 103,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "bigfivefoods/supplieradvisor-mvp": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "3b1be20c9956c84c0ccd198bda6454baab84a7fd",
+  "lead": {
+   "hits": 6,
+   "keywords": [
+    "endpoint",
+    "route"
+   ],
+   "latest": "2026-10-07T09:40:15.000+02:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 1,
+  "order": 85,
+  "reason": "only 1 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "chanadinh/FB-Insta-Messenger-Automation": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "9e85f8ff1f06d5f252e0797bf997d9868011e0ea",
+  "lead": {
+   "hits": 3,
+   "keywords": [
+    "endpoint",
+    "route"
+   ],
+   "latest": "2026-10-26T00:43:34.000-04:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 17,
+  "order": 58,
+  "reason": null,
+  "route_handlers": 36
+ },
+ "charles2ke/GraphQL": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "3411772772228816f70ca9aec80f87700b4c3dd2",
+  "lead": {
+   "hits": 2,
+   "keywords": [
+    "endpoint"
+   ],
+   "latest": "2026-09-20T18:30:04.000Z",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 26,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "claude58888-debug/h5-entertainment-platform": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "805da379779e27e06685a9ccce83904fc17ea4cc",
+  "lead": {
+   "hits": 3,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-03-29T17:24:55.000Z",
+   "tools": [
+    "devin"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 50,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "codingjoe/relay": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "django",
+   "starlette"
+  ],
+  "head": "2d81c14086e64740d1a9e474d7567d2eb0c88542",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "django"
+   ],
+   "latest": "2026-10-20T13:07:00.000+02:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 205,
+  "order": 84,
+  "reason": null,
+  "route_handlers": 109
+ },
+ "colyske/WeddingSite": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "9da6eab8fc3666d7f9cae889658add98febb9214",
+  "lead": {
+   "hits": 2,
+   "keywords": [
+    "route"
+   ],
+   "latest": "2026-10-25T23:47:40.000+03:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 74,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "cpolito88/tapio": {
+  "decision": "REJECT",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "379a4d069c9ed3ed9dd1df93540a54c66e1fab9b",
+  "lead": {
+   "hits": 3,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-10-22T00:43:32.000+02:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 98,
+  "order": 37,
+  "reason": "only 2 route handlers (<3)",
+  "route_handlers": 2
+ },
+ "davidlu2025/Hello-World": {
+  "decision": "REJECT",
+  "frameworks": [
+   "flask"
+  ],
+  "head": "34b63f1c968643a527f2897eb39d9a3ddae29db0",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "flask"
+   ],
+   "latest": "2025-08-10T22:25:20.000Z",
+   "tools": [
+    "devin"
+   ]
+  },
+  "n_py_nontest": 3,
+  "order": 72,
+  "reason": "only 3 non-test .py files (<10)",
+  "route_handlers": 6
+ },
+ "erkinalp/fanvue-sync": {
+  "decision": "REJECT",
+  "frameworks": [
+   "aiohttp"
+  ],
+  "head": "283463f24615cf51cf1e7744e0b0d9b5489d0421",
+  "lead": {
+   "hits": 2,
+   "keywords": [
+    "endpoint",
+    "route"
+   ],
+   "latest": "2026-10-23T10:05:27.000Z",
+   "tools": [
+    "devin"
+   ]
+  },
+  "n_py_nontest": 15,
+  "order": 24,
+  "reason": "only 0 route handlers (<3)",
+  "route_handlers": 0
+ },
+ "g-savitha/url-shortner": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "8cb58d62a91709e9c2077876731ae419527622d3",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "endpoint"
+   ],
+   "latest": "2026-10-17T20:11:40.000Z",
+   "tools": [
+    "cursor"
+   ]
+  },
+  "n_py_nontest": 15,
+  "order": 80,
+  "reason": null,
+  "route_handlers": 7
+ },
+ "gratitude5dee/wzrdmail": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "58d43d32258119f0eadbb1ef07716d52b3c853a1",
+  "lead": {
+   "hits": 2,
+   "keywords": [
+    "endpoint"
+   ],
+   "latest": "2026-10-11T05:37:34.000Z",
+   "tools": [
+    "devin"
+   ]
+  },
+  "n_py_nontest": 6,
+  "order": 7,
+  "reason": "only 6 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "gyrinx-app/gyrinx": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "django"
+  ],
+  "head": "ba657257f5b3d2229efc8a8b80dfff196fc94735",
+  "lead": {
+   "hits": 47,
+   "keywords": [
+    "django"
+   ],
+   "latest": "2026-10-25T13:09:50.000Z",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 650,
+  "order": 3,
+  "reason": null,
+  "route_handlers": 209
+ },
+ "happyjack27/ai-skills": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "5a8e45e6e71acf7bed419120875169211b1afa9e",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "route"
+   ],
+   "latest": "2026-10-10T19:32:52.000Z",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 5,
+  "order": 82,
+  "reason": "only 5 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "hayeongbag53/gamdong-time": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "flask"
+  ],
+  "head": "62e95f7724856ed9de0d7f350e5d4d8ecba33203",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "flask"
+   ],
+   "latest": "2026-09-15T15:06:05.000+09:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 25,
+  "order": 23,
+  "reason": null,
+  "route_handlers": 13
+ },
+ "icycola5556/banana-slides": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "330ee410302e65f65b3764b301d416dcd8e136ab",
+  "lead": {
+   "hits": 3,
+   "keywords": [
+    "fastapi",
+    "flask"
+   ],
+   "latest": "2026-03-24T10:02:03.000+08:00",
+   "tools": [
+    "devin"
+   ]
+  },
+  "n_py_nontest": 144,
+  "order": 56,
+  "reason": null,
+  "route_handlers": 87
+ },
+ "jeffrey-groneberg/the-mai-workshop": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "flask"
+  ],
+  "head": "3ccde45c709535dd5093e9b743ffee6caf076ad4",
+  "lead": {
+   "hits": 4,
+   "keywords": [
+    "flask"
+   ],
+   "latest": "2026-09-25T06:40:18.000+02:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 10,
+  "order": 46,
+  "reason": null,
+  "route_handlers": 19
+ },
+ "johnleotengson80-ai/TengsonFirstWeb": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "flask"
+  ],
+  "head": "f06529e6e9d68b6a11a023e3e9051ffbee80b15a",
+  "lead": {
+   "hits": 2,
+   "keywords": [
+    "flask"
+   ],
+   "latest": "2026-10-05T00:44:26.000+08:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 14,
+  "order": 89,
+  "reason": null,
+  "route_handlers": 50
+ },
+ "jyang-me/Yang_Hub": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "django"
+  ],
+  "head": "72999082d77613019bd115740109c4004844b478",
+  "lead": {
+   "hits": 2,
+   "keywords": [
+    "django"
+   ],
+   "latest": "2026-06-20T02:29:40.000+08:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 36,
+  "order": 43,
+  "reason": null,
+  "route_handlers": 8
+ },
+ "kanishkagupta88666/pilot-efb": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "django"
+  ],
+  "head": "09499a45fd8c90a577149d697f0069a15c837d23",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "django"
+   ],
+   "latest": "2026-10-08T16:41:27.000-05:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 22,
+  "order": 60,
+  "reason": null,
+  "route_handlers": 6
+ },
+ "king-codes04/moviematch": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "a189db917af489e7f032ace83ffc74f10d84ecb2",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-10-12T17:59:37.000+03:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 20,
+  "order": 67,
+  "reason": null,
+  "route_handlers": 12
+ },
+ "kntndrsn/rewritten": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "fc0716933b8be5da8fc83a7989a51c0d281d9731",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "route"
+   ],
+   "latest": "2026-10-25T10:01:27.000-05:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 52,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "lama010101/LIKED": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "8cd0c847556e06ada9adbe42afb8ad63d0e4a9e5",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "endpoint"
+   ],
+   "latest": "2026-10-04T09:19:25.000Z",
+   "tools": [
+    "devin"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 28,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "lily-sichani/english-coach": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "2d47c729fe17ed325010b85cbf51b5b55948046e",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-09-22T21:40:07.000Z",
+   "tools": [
+    "cursor"
+   ]
+  },
+  "n_py_nontest": 10,
+  "order": 14,
+  "reason": null,
+  "route_handlers": 3
+ },
+ "masterrey/SpeechAnalyzer": {
+  "decision": "REJECT",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "fe7b1a9f459544f1ce15ba33b90fdd88fced5d5e",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-05-19T11:04:20.000Z",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 1,
+  "order": 86,
+  "reason": "only 1 non-test .py files (<10)",
+  "route_handlers": 1
+ },
+ "matiasgodoyoyanedel-maker/siilckventas": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "aa17babc600962a02588aeb9073684f76546f4c7",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "endpoint"
+   ],
+   "latest": "2026-10-16T14:52:41.000Z",
+   "tools": [
+    "cursor"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 53,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "maxhoelper/algoDat": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "9c460cb92f6cd0c2004ad978ea36a33427be5d66",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "flask"
+   ],
+   "latest": "2026-10-23T13:46:00.000+01:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 17,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "melodic-software/ci-workflows": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "b26e355fe98c372f02a13d74c10a785ad8c9ce2d",
+  "lead": {
+   "hits": 6,
+   "keywords": [
+    "endpoint",
+    "route"
+   ],
+   "latest": "2026-10-26T10:16:52.000Z",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 1,
+  "order": 88,
+  "reason": "only 1 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "mito-ac-25class/Meta-Template-for-Assignment": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "d62eae2eff2455deabc79422c880da05e0e0fd65",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "django"
+   ],
+   "latest": "2026-03-03T03:18:38.000Z",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 5,
+  "order": 102,
+  "reason": "only 5 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "nagibator9986/ccupractice": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "flask"
+  ],
+  "head": "0ebba7c4d0c4ebfe08eead8a93a4379af9ab6ec6",
+  "lead": {
+   "hits": 2,
+   "keywords": [
+    "flask"
+   ],
+   "latest": "2026-06-25T12:20:04.000+05:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 52,
+  "order": 41,
+  "reason": null,
+  "route_handlers": 98
+ },
+ "ncaraffa/Natty-Store": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "fac518e0e406f8b5ee96c77262dee02c716fe590",
+  "lead": {
+   "hits": 2,
+   "keywords": [
+    "endpoint"
+   ],
+   "latest": "2026-07-24T05:38:21.000-04:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 2,
+  "order": 51,
+  "reason": "only 2 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "ncklrs/aviation": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "540995b13d7bd33d96eb3c851ae0b5184ec55e85",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "route"
+   ],
+   "latest": "2026-10-26T19:47:28.000Z",
+   "tools": [
+    "cursor"
+   ]
+  },
+  "n_py_nontest": 4,
+  "order": 22,
+  "reason": "only 4 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "nibrocsolutions/wifi-monitor": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "484f39f7242bee996c7160557c0421e0a731d8ea",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-09-11T19:02:13.000Z",
+   "tools": [
+    "cursor"
+   ]
+  },
+  "n_py_nontest": 11,
+  "order": 31,
+  "reason": null,
+  "route_handlers": 4
+ },
+ "o1brssmsk-blip/pingodocept": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "dae754d88d5d186a55d754cb2b2fdd9812d479a5",
+  "lead": {
+   "hits": 3,
+   "keywords": [
+    "route"
+   ],
+   "latest": "2026-10-25T21:08:47.000+02:00",
+   "tools": [
+    "devin"
+   ]
+  },
+  "n_py_nontest": 2,
+  "order": 18,
+  "reason": "only 2 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "olivierbigras/sftp-sync-for-google-sheets": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "8fcd8f96dd88078a7d92a878504a876eb15fd7ac",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "endpoint"
+   ],
+   "latest": "2026-10-21T12:28:12.000Z",
+   "tools": [
+    "cursor"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 34,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "osapdinjayvee/pos-vue": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "ed064521b075bf0ab6dddd6e130f670a7ab7c723",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "route"
+   ],
+   "latest": "2026-07-25T05:38:13.000+08:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 69,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "panamiaclub/panamia.club": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "6c8440bb219044b7359d7340898c32a134d4ee89",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "endpoint"
+   ],
+   "latest": "2026-10-21T17:11:26.000-04:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 2,
+  "order": 32,
+  "reason": "only 2 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "peev/robocombat-hackaton": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "6286707eba2ff16303ea2ef3e07d77e5ea095b0a",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "endpoint"
+   ],
+   "latest": "2026-10-25T17:30:38.000-05:00",
+   "tools": [
+    "cursor"
+   ]
+  },
+  "n_py_nontest": 1,
+  "order": 94,
+  "reason": "only 1 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "pyvvo/funcd": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "5f6d2bca14c11c60632933b43f1286671900f32b",
+  "lead": {
+   "hits": 4,
+   "keywords": [
+    "endpoint",
+    "route"
+   ],
+   "latest": "2026-10-24T21:17:36.000Z",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 19,
+  "order": 27,
+  "reason": "no web application object constructed",
+  "route_handlers": 0
+ },
+ "qdip-ai/qdip-web": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "20cbd2fa90ede77695bd238e3b8b0f920445f1a0",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "endpoint"
+   ],
+   "latest": "2026-09-04T20:41:24.000Z",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 45,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "rhrits/linkedin-automation-agent": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "0cc81bdd178c1f82abc8d2a824011689f3aa83cb",
+  "lead": {
+   "hits": 2,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-09-12T16:24:38.000Z",
+   "tools": [
+    "cursor"
+   ]
+  },
+  "n_py_nontest": 19,
+  "order": 68,
+  "reason": null,
+  "route_handlers": 10
+ },
+ "robin-tennessine/robin-tennessine": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "d339cddcd1e53a18e3c0de82af1d4dc47fa40975",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "flask"
+   ],
+   "latest": "2026-03-05T13:25:07.000+07:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 19,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "rombolshak/ahlcg": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "a4675b76abfe5f7428533d54570c967812abe078",
+  "lead": {
+   "hits": 5,
+   "keywords": [
+    "endpoint",
+    "route"
+   ],
+   "latest": "2026-10-24T00:58:18.000+03:00",
+   "tools": [
+    "claude-code",
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 6,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "santicova18/Demo-Vibe": {
+  "decision": "REJECT",
+  "frameworks": [
+   "flask"
+  ],
+  "head": "1e08168b303972ed7e1ea2bcb467cc64c1022e25",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "flask"
+   ],
+   "latest": "2026-10-19T17:40:55.000-05:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 1,
+  "order": 12,
+  "reason": "only 1 non-test .py files (<10)",
+  "route_handlers": 8
+ },
+ "schediapp/Schedi": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "b043e3852746af4b7cdd4ab6cafcb955c0040676",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "endpoint"
+   ],
+   "latest": "2026-10-15T23:35:00.000Z",
+   "tools": [
+    "cursor"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 54,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "shawnzhang0509-ai/warehouse-visualizatio": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "a78b7455d323664e54923c7344425886448ada3d",
+  "lead": {
+   "hits": 6,
+   "keywords": [
+    "flask"
+   ],
+   "latest": "2026-10-05T00:14:25.000Z",
+   "tools": [
+    "cursor"
+   ]
+  },
+  "n_py_nontest": 13,
+  "order": 63,
+  "reason": "no web application object constructed",
+  "route_handlers": 0
+ },
+ "shyoo/awardtracker": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "flask"
+  ],
+  "head": "9405cbd9e397d74ba1c563b817525f29d830bdf9",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "flask"
+   ],
+   "latest": "2026-10-23T19:18:25.000-07:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 77,
+  "order": 78,
+  "reason": null,
+  "route_handlers": 49
+ },
+ "siddhant248/Forge-v2": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "a560e7e92ab80fb9e3fab54cc5c24aa9b9e87166",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-10-21T21:39:24.000+05:30",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 65,
+  "order": 0,
+  "reason": null,
+  "route_handlers": 45
+ },
+ "spectral-butters/hacky-movies": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "437144733c969246ddf290f4ab31bcd03191b6d5",
+  "lead": {
+   "hits": 3,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-09-19T14:03:05.000-07:00",
+   "tools": [
+    "devin"
+   ]
+  },
+  "n_py_nontest": 22,
+  "order": 100,
+  "reason": null,
+  "route_handlers": 32
+ },
+ "srinidhi2608/git-analysis": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "055936214983ddd58dc365f194ce4dcd087d80f3",
+  "lead": {
+   "hits": 2,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-08-24T14:21:04.000Z",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 14,
+  "order": 91,
+  "reason": null,
+  "route_handlers": 13
+ },
+ "suhjohn/pufferfs": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "4da354e303fa12e487d3306ba733f5ff42d52431",
+  "lead": {
+   "hits": 2,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-06-03T03:11:07.000Z",
+   "tools": [
+    "devin"
+   ]
+  },
+  "n_py_nontest": 50,
+  "order": 75,
+  "reason": "no web application object constructed",
+  "route_handlers": 0
+ },
+ "susu09658-debug/plant-disease-detection": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "django"
+  ],
+  "head": "9d847001afecc2322f6b6e55ef14502f9eb1c5f0",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "django"
+   ],
+   "latest": "2026-03-18T16:49:18.000Z",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 55,
+  "order": 30,
+  "reason": null,
+  "route_handlers": 39
+ },
+ "syedsawood-09/Find-it": {
+  "decision": "REJECT",
+  "frameworks": [
+   "flask"
+  ],
+  "head": "4d5c870ad8daf1372ba1dc4adf280762e5d08a70",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "flask"
+   ],
+   "latest": "2026-10-07T19:55:11.000+05:30",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 2,
+  "order": 101,
+  "reason": "only 2 non-test .py files (<10)",
+  "route_handlers": 45
+ },
+ "tacurran/hdf5-agent": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "3b1d846940ed2ec1935973eed31a77a40c9c3db9",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "flask"
+   ],
+   "latest": "2026-08-20T16:54:20.000Z",
+   "tools": [
+    "cursor"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 5,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "tangdading6/project_1": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "7f648bd2c13087d560822b52ad036ca02ce68c3d",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-10-18T02:43:30.000Z",
+   "tools": [
+    "cursor"
+   ]
+  },
+  "n_py_nontest": 2,
+  "order": 92,
+  "reason": "only 2 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "th0to/inventory_app": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "4361ad24368d8c05c9b22fd447e8b2ef40b92857",
+  "lead": {
+   "hits": 2,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-05-13T09:51:44.000Z",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 15,
+  "order": 66,
+  "reason": null,
+  "route_handlers": 18
+ },
+ "tohewi/tapahtumakalenteri-ssi-integrator": {
+  "decision": "REJECT",
+  "frameworks": [],
+  "head": "320177d058d5e41f68bad225bc645fa54db622fb",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "endpoint"
+   ],
+   "latest": "2026-10-24T21:32:37.000+03:00",
+   "tools": [
+    "github-copilot"
+   ]
+  },
+  "n_py_nontest": 0,
+  "order": 11,
+  "reason": "only 0 non-test .py files (<10)",
+  "route_handlers": 0
+ },
+ "wevement-Dot/Lawsuit_agent": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "243404d02bb4f422f0d76313d8acba77c3cce5c0",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-08-23T10:39:21.000+08:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 68,
+  "order": 77,
+  "reason": null,
+  "route_handlers": 10
+ },
+ "x3beche/sup-port": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "78955a2783ae50dc653af4f38f1db6a360f7e74f",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "fastapi"
+   ],
+   "latest": "2026-07-21T16:28:10.000+03:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 25,
+  "order": 4,
+  "reason": null,
+  "route_handlers": 64
+ },
+ "ziyihe2026-commits/agent-rag-system": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "06265f5cd11659fb2c0e7b0f67cc218684f43274",
+  "lead": {
+   "hits": 1,
+   "keywords": [
+    "endpoint"
+   ],
+   "latest": "2026-07-22T22:04:49.000+08:00",
+   "tools": [
+    "claude-code"
+   ]
+  },
+  "n_py_nontest": 138,
+  "order": 16,
+  "reason": null,
+  "route_handlers": 45
+ },
+ "zorntyler540-byte/-estate-ez": {
+  "decision": "APP_LEVEL",
+  "frameworks": [
+   "fastapi"
+  ],
+  "head": "e2d71b9135f9f62f0b4da4074820d085af6092a9",
+  "lead": {
+   "hits": 2,
+   "keywords": [
+    "endpoint",
+    "fastapi"
+   ],
+   "latest": "2026-10-20T01:20:19.000Z",
+   "tools": [
+    "cursor"
+   ]
+  },
+  "n_py_nontest": 136,
+  "order": 93,
+  "reason": null,
+  "route_handlers": 146
+ }
+}

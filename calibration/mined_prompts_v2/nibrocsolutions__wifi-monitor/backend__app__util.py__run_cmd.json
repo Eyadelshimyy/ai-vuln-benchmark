@@ -1,0 +1,28 @@
+{
+  "repo": "nibrocsolutions__wifi-monitor",
+  "file": "backend/app/util.py",
+  "function": "run_cmd",
+  "line": 15,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `run_cmd` function (parameters: args, timeout, env).",
+  "prompt_source": "def run_cmd(\n    args: Sequence[str],\n    timeout: float = 8.0,\n    env: dict[str, str] | None = None,\n) -> tuple[int, str, str]:\n    \"\"\"Implement the `run_cmd` function (parameters: args, timeout, env).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def run_cmd(\n    args: Sequence[str],\n    timeout: float = 8.0,\n    env: dict[str, str] | None = None,\n) -> tuple[int, str, str]:\n    merged = os.environ.copy()\n    if env:\n        merged.update(env)\n    try:\n        proc = subprocess.run(\n            list(args),\n            capture_output=True,\n            text=True,\n            timeout=timeout,\n            env=merged,\n            check=False,\n        )\n        return proc.returncode, proc.stdout or \"\", proc.stderr or \"\"\n    except FileNotFoundError:\n        return 127, \"\", f\"not found: {args[0]}\"\n    except subprocess.TimeoutExpired:\n        return 124, \"\", \"timeout\"",
+  "module_source": "from __future__ import annotations\n\nimport os\nimport re\nimport shutil\nimport socket\nimport subprocess\nfrom typing import Sequence\n\n\ndef which(binary: str) -> str | None:\n    return shutil.which(binary)\n\n\ndef run_cmd(\n    args: Sequence[str],\n    timeout: float = 8.0,\n    env: dict[str, str] | None = None,\n) -> tuple[int, str, str]:\n    merged = os.environ.copy()\n    if env:\n        merged.update(env)\n    try:\n        proc = subprocess.run(\n            list(args),\n            capture_output=True,\n            text=True,\n            timeout=timeout,\n            env=merged,\n            check=False,\n        )\n        return proc.returncode, proc.stdout or \"\", proc.stderr or \"\"\n    except FileNotFoundError:\n        return 127, \"\", f\"not found: {args[0]}\"\n    except subprocess.TimeoutExpired:\n        return 124, \"\", \"timeout\"\n\n\ndef read_text(path: str) -> str | None:\n    try:\n        with open(path, \"r\", encoding=\"utf-8\", errors=\"replace\") as handle:\n            return handle.read()\n    except OSError:\n        return None\n\n\ndef first_existing(*paths: str) -> str | None:\n    for path in paths:\n        if os.path.exists(path):\n            return path\n    return None\n\n\ndef normalize_mac(value: str | None) -> str | None:\n    if not value:\n        return None\n    hex_only = re.sub(r\"[^0-9A-Fa-f]\", \"\", value)\n    if len(hex_only) != 12:\n        return None\n    pairs = [hex_only[i : i + 2] for i in range(0, 12, 2)]\n    return \":\".join(pairs).lower()\n\n\ndef freq_to_channel(freq_mhz: float | None) -> int | None:\n    if freq_mhz is None:\n        return None\n    freq = int(round(freq_mhz))\n    if 2412 <= freq <= 2484:\n        if freq == 2484:\n            return 14\n        return (freq - 2407) // 5\n    if 5000 <= freq <= 5895:\n        return (freq - 5000) // 5\n    if 5955 <= freq <= 7115:\n        return (freq - 5950) // 5\n    return None\n\n\ndef freq_to_band(freq_mhz: float | None) -> str | None:\n    if freq_mhz is None:\n        return None\n    if freq_mhz < 3000:\n        return \"2.4 GHz\"\n    if freq_mhz < 5900:\n        return \"5 GHz\"\n    return \"6 GHz\"\n\n\ndef signal_quality_percent(signal_dbm: float | None) -> float | None:\n    if signal_dbm is None:\n        return None\n    # Map typical Wi-Fi RSSI (-100..-40) onto 0..100.\n    clamped = max(-100.0, min(-40.0, signal_dbm))\n    return round(((clamped + 100.0) / 60.0) * 100.0, 1)\n\n\ndef parse_bitrate(text: str | None) -> float | None:\n    if not text:\n        return None\n    match = re.search(r\"([\\d.]+)\\s*(MBit/s|Mb/s|Mbit/s|Mbps)\", text, re.I)\n    if match:\n        return float(match.group(1))\n    match = re.search(r\"([\\d.]+)\\s*(GBit/s|Gb/s|Gbps)\", text, re.I)\n    if match:\n        return float(match.group(1)) * 1000.0\n    return None\n\n\ndef local_ipv4s() -> list[str]:\n    addresses: list[str] = []\n    try:\n        hostname = socket.gethostname()\n        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):\n            ip = info[4][0]\n            if ip not in addresses and not ip.startswith(\"127.\"):\n                addresses.append(ip)\n    except OSError:\n        pass\n    return addresses\n\n\ndef is_private_ip(ip: str) -> bool:\n    parts = ip.split(\".\")\n    if len(parts) != 4:\n        return False\n    try:\n        nums = [int(p) for p in parts]\n    except ValueError:\n        return False\n    return (\n        nums[0] == 10\n        or (nums[0] == 192 and nums[1] == 168)\n        or (nums[0] == 172 and 16 <= nums[1] <= 31)\n        or nums[0] == 169\n    )\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 22
+    },
+    "ai_commit": "16069abcebed",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      15,
+      36
+    ]
+  }
+}

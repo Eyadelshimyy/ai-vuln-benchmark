@@ -1,0 +1,28 @@
+{
+  "repo": "wevement-Dot__Lawsuit_agent",
+  "file": "backend/core/output.py",
+  "function": "save_markdown",
+  "line": 60,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": true,
+  "docstring": "\u4fdd\u5b58 markdown \u5230\u6848\u4ef6\u76ee\u5f55\u5bf9\u5e94\u9636\u6bb5\u3002\n\u547d\u540d:[\u65e5\u671f\u524d\u7f00] [\u6807\u9898].md,\u5982 260821 \u4e89\u8bae\u7126\u70b9\u5206\u6790.md\n\u8fd4\u56de\u4fdd\u5b58\u7684\u5b8c\u6574\u8def\u5f84\u3002",
+  "prompt_source": "def save_markdown(case_id: str, stage: str, title: str, content: str) -> str:\n    \"\"\"\n    \u4fdd\u5b58 markdown \u5230\u6848\u4ef6\u76ee\u5f55\u5bf9\u5e94\u9636\u6bb5\u3002\n    \u547d\u540d:[\u65e5\u671f\u524d\u7f00] [\u6807\u9898].md,\u5982 260821 \u4e89\u8bae\u7126\u70b9\u5206\u6790.md\n    \u8fd4\u56de\u4fdd\u5b58\u7684\u5b8c\u6574\u8def\u5f84\u3002\n    \"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def save_markdown(case_id: str, stage: str, title: str, content: str) -> str:\n    \"\"\"\n    \u4fdd\u5b58 markdown \u5230\u6848\u4ef6\u76ee\u5f55\u5bf9\u5e94\u9636\u6bb5\u3002\n    \u547d\u540d:[\u65e5\u671f\u524d\u7f00] [\u6807\u9898].md,\u5982 260821 \u4e89\u8bae\u7126\u70b9\u5206\u6790.md\n    \u8fd4\u56de\u4fdd\u5b58\u7684\u5b8c\u6574\u8def\u5f84\u3002\n    \"\"\"\n    case_dir = Path(get_case_dir(case_id))\n    stage_dir = case_dir / CASE_DIRS[stage]\n    date_prefix = datetime.now().strftime(\"%y%m%d\")\n    filename = f\"{date_prefix} {title}.md\"\n    filepath = stage_dir / filename\n    filepath.write_text(content, encoding=\"utf-8\")\n    logger.info(\"output.saved\", case_id=case_id, stage=stage, file=str(filepath))\n    return str(filepath)",
+  "module_source": "\"\"\"\noutput - \u6848\u4ef6\u8f93\u51fa\u7ba1\u7406(MVP \u7248)\n\u4ee5\u6848\u4ef6\u6807\u8bc6\u4e3a\u7ef4\u5ea6\u7ec4\u7ec7\u6848\u4ef6\u76ee\u5f55,\u6309\u5206\u6790\u9636\u6bb5\u5f52\u6863,\u62a5\u544a\u4ee5\u65e5\u671f\u524d\u7f00\u547d\u540d\u3002\n\"\"\"\nimport os\nimport re\nfrom pathlib import Path\nfrom datetime import datetime\nfrom backend.core.logger import get_logger\n\nlogger = get_logger(__name__)\n\n# \u6848\u4ef6\u76ee\u5f55\u9636\u6bb5\nCASE_DIRS = {\n    \"raw\":    \"01 - \ud83d\udcc2 \u539f\u59cb\u6750\u6599\",\n    \"analysis\": \"02 - \ud83d\udcc4 \u6848\u4ef6\u5206\u6790\",\n    \"research\": \"03 - \ud83d\udd0d \u6cd5\u5f8b\u7814\u7a76\",\n    \"evidence\": \"05 - \ud83d\udcce \u8bc1\u636e\u6750\u6599\",\n    \"report\":   \"10 - \ud83d\udcca \u7efc\u5408\u62a5\u544a\",\n    \"reference\": \"11 - \ud83d\udcda \u53c2\u8003\u6587\u4ef6\",\n}\n\n\ndef build_case_id(case_no: str, parties: list[str], cause: str) -> str:\n    \"\"\"\n    \u751f\u6210\u6848\u4ef6\u6807\u8bc6\u3002\n    \u4f18\u5148\u7528\u6848\u53f7(\u5982 [2025]\u4eac0105\u6c11\u521d1234\u53f7);\u65e0\u6848\u53f7\u65f6\u7528 '\u539f\u544a\u8bc9\u88ab\u544aXX\u7ea0\u7eb7\u6848'\u3002\n    \"\"\"\n    case_no = (case_no or \"\").strip()\n    if case_no:\n        return f\"[{case_no}]\" if not case_no.startswith(\"[\") else case_no\n    p1 = (parties[0] if len(parties) > 0 else \"\u7532\").strip()\n    p2 = (parties[1] if len(parties) > 1 else \"\u4e59\").strip()\n    cause = (cause or \"\u7ea0\u7eb7\").strip()\n    return f\"{p1}\u8bc9{p2}{cause}\u6848\"\n\n\ndef _sanitize_dirname(name: str) -> str:\n    \"\"\"\u6e05\u6d17\u76ee\u5f55\u540d\u4e2d\u7684\u975e\u6cd5\u5b57\u7b26\"\"\"\n    return re.sub(r'[\\\\/:*?\"<>|]', \"\", name).strip()\n\n\ndef create_case_dirs(case_id: str) -> str:\n    \"\"\"\u521b\u5efa\u6848\u4ef6\u76ee\u5f55\u6811,\u8fd4\u56de\u6848\u4ef6\u76ee\u5f55\u8def\u5f84\"\"\"\n    from backend.config import get_settings\n    root = Path(get_settings().cases_root)\n    case_dir = root / _sanitize_dirname(case_id)\n    for d in CASE_DIRS.values():\n        (case_dir / d).mkdir(parents=True, exist_ok=True)\n    logger.info(\"output.case_dirs_created\", case_id=case_id, dir=str(case_dir))\n    return str(case_dir)\n\n\ndef get_case_dir(case_id: str) -> str:\n    from backend.config import get_settings\n    root = Path(get_settings().cases_root)\n    return str(root / _sanitize_dirname(case_id))\n\n\ndef save_markdown(case_id: str, stage: str, title: str, content: str) -> str:\n    \"\"\"\n    \u4fdd\u5b58 markdown \u5230\u6848\u4ef6\u76ee\u5f55\u5bf9\u5e94\u9636\u6bb5\u3002\n    \u547d\u540d:[\u65e5\u671f\u524d\u7f00] [\u6807\u9898].md,\u5982 260821 \u4e89\u8bae\u7126\u70b9\u5206\u6790.md\n    \u8fd4\u56de\u4fdd\u5b58\u7684\u5b8c\u6574\u8def\u5f84\u3002\n    \"\"\"\n    case_dir = Path(get_case_dir(case_id))\n    stage_dir = case_dir / CASE_DIRS[stage]\n    date_prefix = datetime.now().strftime(\"%y%m%d\")\n    filename = f\"{date_prefix} {title}.md\"\n    filepath = stage_dir / filename\n    filepath.write_text(content, encoding=\"utf-8\")\n    logger.info(\"output.saved\", case_id=case_id, stage=stage, file=str(filepath))\n    return str(filepath)\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 14
+    },
+    "ai_commit": "fe6900b729d8",
+    "evidence": "Co-Authored-By: Claude <noreply@anthropic.com>",
+    "ai_line_fraction": 1.0,
+    "span": [
+      60,
+      73
+    ]
+  }
+}

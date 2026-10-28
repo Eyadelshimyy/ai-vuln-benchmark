@@ -1,0 +1,28 @@
+{
+  "repo": "zorntyler540-byte__-estate-ez",
+  "file": "backend/alembic/versions/0045_ops_job_cuft.py",
+  "function": "upgrade",
+  "line": 16,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `upgrade` function.",
+  "prompt_source": "def upgrade() -> None:\n    \"\"\"Implement the `upgrade` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def upgrade() -> None:\n    bind = op.get_bind()\n    insp = inspect(bind)\n    if \"ops_jobs\" not in set(insp.get_table_names()):\n        return\n    cols = {c[\"name\"] for c in insp.get_columns(\"ops_jobs\")}\n    if \"cuft\" in cols or \"sqft\" not in cols:\n        return\n    op.execute(\"ALTER TABLE ops_jobs RENAME COLUMN sqft TO cuft\")",
+  "module_source": "\"\"\"Rename ops job volume from square footage to cubic footage.\n\nRevision ID: 0045_ops_job_cuft\nRevises: 0044_ops_franchise_jobs\n\"\"\"\n\nfrom alembic import op\nfrom sqlalchemy import inspect\n\nrevision = \"0045_ops_job_cuft\"\ndown_revision = \"0044_ops_franchise_jobs\"\nbranch_labels = None\ndepends_on = None\n\n\ndef upgrade() -> None:\n    bind = op.get_bind()\n    insp = inspect(bind)\n    if \"ops_jobs\" not in set(insp.get_table_names()):\n        return\n    cols = {c[\"name\"] for c in insp.get_columns(\"ops_jobs\")}\n    if \"cuft\" in cols or \"sqft\" not in cols:\n        return\n    op.execute(\"ALTER TABLE ops_jobs RENAME COLUMN sqft TO cuft\")\n\n\ndef downgrade() -> None:\n    bind = op.get_bind()\n    insp = inspect(bind)\n    if \"ops_jobs\" not in set(insp.get_table_names()):\n        return\n    cols = {c[\"name\"] for c in insp.get_columns(\"ops_jobs\")}\n    if \"sqft\" in cols or \"cuft\" not in cols:\n        return\n    op.execute(\"ALTER TABLE ops_jobs RENAME COLUMN cuft TO sqft\")\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 9
+    },
+    "ai_commit": "aab9f2f0a175",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      16,
+      24
+    ]
+  }
+}

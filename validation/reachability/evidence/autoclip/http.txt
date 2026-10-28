@@ -1,0 +1,3 @@
+POST /api/v1/projects/../sync-data  (curl --path-as-is)
+200 OK
+{"result":{"success":true,"project_id":".."}}

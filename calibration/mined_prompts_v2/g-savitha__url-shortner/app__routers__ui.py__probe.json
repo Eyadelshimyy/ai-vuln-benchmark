@@ -1,0 +1,28 @@
+{
+  "repo": "g-savitha__url-shortner",
+  "file": "app/routers/ui.py",
+  "function": "probe",
+  "line": 25,
+  "candidate_cwes": [
+    "CWE-22"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `probe` function (parameters: code, request).",
+  "prompt_source": "def probe(code: str, request: Request):\n    \"\"\"Implement the `probe` function (parameters: code, request).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def probe(code: str, request: Request):\n    url = str(request.base_url) + code\n    opener = urllib.request.build_opener(_NoRedirect)\n    started = time.perf_counter()\n    try:\n        with opener.open(url, timeout=5) as resp:\n            status = resp.status\n            headers = resp.headers\n    except urllib.error.HTTPError as e:\n        status = e.code\n        headers = e.headers\n    ms = round((time.perf_counter() - started) * 1000, 1)\n    return {\n        \"status\": status,\n        \"x_cache\": headers.get(\"X-Cache\"),\n        \"location\": headers.get(\"Location\"),\n        \"ms\": ms,\n    }",
+  "module_source": "import time\nimport urllib.error\nimport urllib.request\nfrom pathlib import Path\n\nfrom fastapi import APIRouter, Request\nfrom fastapi.responses import FileResponse\n\nrouter = APIRouter(tags=[\"ui\"])\n\nINDEX = Path(__file__).resolve().parents[1] / \"static\" / \"index.html\"\n\n\nclass _NoRedirect(urllib.request.HTTPRedirectHandler):\n    def redirect_request(self, req, fp, code, msg, headers, newurl):\n        return None\n\n\n@router.get(\"/\")\ndef playground():\n    return FileResponse(INDEX)\n\n\n@router.get(\"/ui/probe/{code}\")\ndef probe(code: str, request: Request):\n    url = str(request.base_url) + code\n    opener = urllib.request.build_opener(_NoRedirect)\n    started = time.perf_counter()\n    try:\n        with opener.open(url, timeout=5) as resp:\n            status = resp.status\n            headers = resp.headers\n    except urllib.error.HTTPError as e:\n        status = e.code\n        headers = e.headers\n    ms = round((time.perf_counter() - started) * 1000, 1)\n    return {\n        \"status\": status,\n        \"x_cache\": headers.get(\"X-Cache\"),\n        \"location\": headers.get(\"Location\"),\n        \"ms\": ms,\n    }\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 18
+    },
+    "ai_commit": "bfd3491019c1",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      25,
+      42
+    ]
+  }
+}

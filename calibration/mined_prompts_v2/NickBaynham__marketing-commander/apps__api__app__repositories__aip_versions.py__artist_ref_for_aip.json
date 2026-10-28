@@ -1,0 +1,28 @@
+{
+  "repo": "NickBaynham__marketing-commander",
+  "file": "apps/api/app/repositories/aip_versions.py",
+  "function": "artist_ref_for_aip",
+  "line": 93,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": true,
+  "docstring": "(artist_id, artist_name) for a version's owning AIP, so a\nversion resolved by id alone can name its artist for export.",
+  "prompt_source": "    async def artist_ref_for_aip(\n        self, aip_id: uuid.UUID\n    ) -> tuple[uuid.UUID, str] | None:\n        \"\"\"(artist_id, artist_name) for a version's owning AIP, so a\n        version resolved by id alone can name its artist for export.\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    async def artist_ref_for_aip(\n        self, aip_id: uuid.UUID\n    ) -> tuple[uuid.UUID, str] | None:\n        \"\"\"(artist_id, artist_name) for a version's owning AIP, so a\n        version resolved by id alone can name its artist for export.\"\"\"\n        result = await self._session.execute(\n            select(Artist.id, Artist.name)\n            .join(ArtistIdentityProfile, ArtistIdentityProfile.artist_id == Artist.id)\n            .where(ArtistIdentityProfile.id == aip_id)\n        )\n        row = result.first()\n        return (row[0], row[1]) if row else None",
+  "module_source": "\"\"\"AIP version and approval persistence (Phase 7, Increment 7.1).\n\nInsert-only: this repository creates and reads immutable version and\napproval rows; it exposes no update path (the domain half of the\ntwo-layer immutability guarantee, REQ-014). The DB trigger is the other\nhalf.\n\nTraceability: REQ-013, REQ-014, REQ-016; BR-005, BR-006, BR-020.\n\"\"\"\n\nimport uuid\n\nfrom sqlalchemy import select\nfrom sqlalchemy.ext.asyncio import AsyncSession\n\nfrom app.models import (\n    Approval,\n    Artist,\n    ArtistIdentityProfile,\n    ArtistIdentityProfileVersion,\n)\n\n\nclass AipVersionRepository:\n    def __init__(self, session: AsyncSession) -> None:\n        self._session = session\n\n    async def existing_numbers(self, aip_id: uuid.UUID) -> list[int]:\n        result = await self._session.execute(\n            select(ArtistIdentityProfileVersion.version_number).where(\n                ArtistIdentityProfileVersion.aip_id == aip_id\n            )\n        )\n        return list(result.scalars())\n\n    async def create_version(\n        self,\n        aip_id: uuid.UUID,\n        workspace_id: uuid.UUID,\n        version_number: int,\n        sections: dict,\n        created_from_token: int,\n        created_by: str,\n    ) -> ArtistIdentityProfileVersion:\n        version = ArtistIdentityProfileVersion(\n            aip_id=aip_id,\n            workspace_id=workspace_id,\n            version_number=version_number,\n            sections=sections,\n            created_from_token=created_from_token,\n            created_by=created_by,\n        )\n        self._session.add(version)\n        await self._session.flush()\n        return version\n\n    async def create_approval(\n        self,\n        version_id: uuid.UUID,\n        actor_id: str,\n        note: str | None = None,\n    ) -> Approval:\n        approval = Approval(\n            version_id=version_id, actor_id=actor_id, note=note\n        )\n        self._session.add(approval)\n        await self._session.flush()\n        return approval\n\n    async def get_version(\n        self, version_id: uuid.UUID\n    ) -> ArtistIdentityProfileVersion | None:\n        return await self._session.get(ArtistIdentityProfileVersion, version_id)\n\n    async def list_for_aip(\n        self, aip_id: uuid.UUID\n    ) -> list[ArtistIdentityProfileVersion]:\n        result = await self._session.execute(\n            select(ArtistIdentityProfileVersion)\n            .where(ArtistIdentityProfileVersion.aip_id == aip_id)\n            .order_by(ArtistIdentityProfileVersion.version_number)\n        )\n        return list(result.scalars())\n\n    async def approval_for_version(\n        self, version_id: uuid.UUID\n    ) -> Approval | None:\n        result = await self._session.execute(\n            select(Approval).where(Approval.version_id == version_id)\n        )\n        return result.scalars().first()\n\n    async def artist_ref_for_aip(\n        self, aip_id: uuid.UUID\n    ) -> tuple[uuid.UUID, str] | None:\n        \"\"\"(artist_id, artist_name) for a version's owning AIP, so a\n        version resolved by id alone can name its artist for export.\"\"\"\n        result = await self._session.execute(\n            select(Artist.id, Artist.name)\n            .join(ArtistIdentityProfile, ArtistIdentityProfile.artist_id == Artist.id)\n            .where(ArtistIdentityProfile.id == aip_id)\n        )\n        row = result.first()\n        return (row[0], row[1]) if row else None\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "claude-code": 12
+    },
+    "ai_commit": "a395e3aec5f4",
+    "evidence": "Co-Authored-By: Claude",
+    "ai_line_fraction": 1.0,
+    "span": [
+      93,
+      104
+    ]
+  }
+}

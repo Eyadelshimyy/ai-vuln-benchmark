@@ -18,7 +18,7 @@ contribution, so it is the structure of the labels, not a footnote.
 |---|---|---|
 | `CONFIRMED` | Deterministic Tier-2 exploit bank fired against the real code | `confirmed = true` |
 | `TRIGGERED_ONLY` | Tier-1 taint reached the hooked sink, but Tier-2 did not confirm | `triggered = true, confirmed = false` |
-| `DETECTION_ONLY` | CWE class the oracle cannot confirm by construction (CWE-89/502/611) | class ∈ detection-only set |
+| `DETECTION_ONLY` | *(legacy label; superseded)* a class with 0 confirmations in a corpus. Do NOT use as an umbrella — distinguish **exercised-zero** vs **not-exercised** via the four coverage states below and `TIER2_COVERAGE_AUDIT.md` | see four-state coverage audit |
 | `SAFE` | Executed, no taint trigger (a proven negative under tested conditions) | `executable = true, triggered = false` |
 | `NOT_EXECUTABLE` | Could not be executed in the harness (excluded; characterized separately) | `executable = false` |
 
@@ -35,8 +35,48 @@ carry several candidate CWE tags but is confirmed only via the ONE class that ac
 fired (`exec_cwe`). Grouping confirmations by raw tags double-counts and can falsely
 attribute a confirmation to a detection-only class the function merely carries as a tag
 (e.g. a CWE-22-confirmed function also tagged CWE-502 must NOT be counted as a CWE-502
-confirmation). Confirmed-by-class breakdown (by `exec_cwe`): CWE-22=122, CWE-918=24,
-CWE-78=3 (total 149); CWE-89/502/611 = 0 confirmations (detection-only, as designed).
+confirmation).
+
+> **COUNTING-UNIT KEY (read before quoting any by-class split).** An `exec_cwe` breakdown
+> depends on the unit. **Name-deduped functions (149, v1):** CWE-22=122, CWE-918=24, CWE-78=3;
+> CWE-89/502/611 = 0. **Candidate rows (160, v1; = MANIFEST.json):** CWE-22=130, CWE-918=26,
+> CWE-78=4; CWE-89/502/611 = 0. **Candidate rows (37, v2):** CWE-22=30, CWE-918=4, **CWE-89=3**.
+> Units: candidate row = one (function × injection-point) census row; name-deduped function =
+> one (repo, function name); source-unique function = one (repo, sha256(source)).
+
+**Three confirmability states (verified against `tier2/strategies.py`, 2026-10-28).** Do not
+describe a class's 0 as a tested negative unless a strategy for it exists. `STRATEGIES` registers
+CWE-22/78/89/94/502/611/918/1336 — so every class below has a strategy:
+
+- **(a) confirmable AND confirmed** — strategy exists and fired: CWE-22, CWE-78, CWE-918 (v1+v2); **CWE-89 (v2, 3 cases)**.
+- **(b) exercised, zero confirmed** — strategy **invoked** on N identified candidates, 0 confirmed
+  (state the tested denominator N; do NOT generalize to all tagged candidates):
+  CWE-89 v1 (N=3), CWE-611 v1 (N=3, all diag `EXECUTED_NO_SINK`), CWE-78 v2 (N=28).
+- **(c) registered but NOT exercised** — strategy exists but **no candidate invoked it** (not a tested
+  negative): CWE-502 (v1 and v2; 0 triggered the deserialization sink), CWE-611 v2 (0 invoked),
+  CWE-94 and CWE-1336 (0 tagged candidates in the main census; CWE-1336's SSTI sub-study is excluded
+  by `corpus_census.py`, so 1336 is UNKNOWN/out-of-scope for the frozen main counts).
+- **(d) no strategy** — none of the mined classes (all 8 are registered in `STRATEGIES`).
+
+Full matrix per CWE × corpus: `validation/TIER2_COVERAGE_AUDIT.json` / `.md`. **Do not describe
+CWE-502's 0 as a tested negative** (it was never exercised), and do not describe CWE-611 as a tested
+negative beyond its 3 v1 attempts.
+
+CWE-89 is therefore NOT a detection-only/unconfirmable class; it is (a) in v2 and (b) in v1.
+
+**CWE-89 is confirmable (reconciled 2026-10-27).** The earlier "detection-only, as designed"
+wording was v1-scoped and is corrected here. The Tier-2 bank *does* carry a SQL strategy
+(`tier2/strategies.py::_SqlInjection`, `STRATEGIES["CWE-89"]`), and it **fired on 3 v2
+candidates** (foodies `execute(sql)`, hacky-movies `fetch_all(query)`/`fetch_one(query)`),
+each proven by injected SQL invoking the seeded `vulcan_proof()` sentinel. v1 has **0** CWE-89
+confirmations (verified against `corpus_census_pinned.json`). **Behaviour-coupled limitation:**
+all three are *whole-statement raw-SQL execution sinks* — the parameter IS the entire SQL
+statement (DIRECT_CALLER_ARG for SQL, analogous to `execute_bash` for CWE-78). The oracle
+confirms that attacker-supplied SQL executes; whether a given caller passes attacker-controlled
+SQL is the Axis-B reachability question (the 3 are REFUTED on reachability — callers pass
+constant SQL with `?` placeholders; see `corpus_v2/REACHABILITY_V2.md`). CWE-502 was never
+exercised (0 invocations); CWE-611 was exercised only on 3 v1 candidates (0 confirmed). See
+`TIER2_COVERAGE_AUDIT.md`.
 
 ---
 
@@ -98,6 +138,31 @@ not of a single injection-point, so a function with three taintable params is ON
 confirmed vulnerability, not three. `classify_corpus.py` reports function-level as the
 headline and candidate-level as a secondary column.
 
+**Correction (unit audit, 2026-10-26, verified against `corpus_census_reproduced.json`).**
+The census writes ONE row per mined function record and tries parameters until one
+confirms. The 160 confirmed rows are therefore 160 distinct (repo, file, function)
+records, not injection points. The 160 → 149 step is a (repo, function-NAME) key, and
+it merges 7 genuinely different functions that share a name (for example 4 different
+civitas `fetch` functions and 3 different `_sha256` functions). The counts are:
+
+| dedup key | confirmed |
+|---|---|
+| (repo, file, function), i.e. census rows | 160 |
+| (repo, sha256(source)): source-unique, merges only true copies | **156** |
+| (repo, function name) | 149 |
+
+The RQ2 label set (`validation/rq2/`) uses the source-unique unit (156). The frozen 149
+is kept as-is for traceability. When quoting it, call it "name-deduplicated", not
+"distinct functions".
+
+**CWE-22 stratification.** By `analysis/cwe22_subtype.py`, 125 of the 130 CWE-22
+confirmed rows are `DIRECT_CALLER_PATH`: the function opens the path its caller passes.
+Only 5 are `BASE_JOIN_OVERRIDE`, where an intended base directory is escaped. Every
+CWE-22 proof uses an attacker-chosen absolute path; the `../` templates cannot satisfy
+any verifier. The label stays CONFIRMED (conditional exploitability). For DIRECT rows,
+whether this is a vulnerability is an Axis-B trust-boundary question. See
+`validation/rq1/RQ1_BY_GENERATOR.md`.
+
 Conversion is lossless and reproducible: candidate→function dedup keeps the strongest
 exploitability label per function (CONFIRMED > TRIGGERED_ONLY > DETECTION_ONLY > SAFE >
 NOT_EXECUTABLE) and the strongest/most-verified reachability label. The RQ2 label-set is
@@ -109,9 +174,15 @@ a further-filtered subset (balancing + exclusions) documented in the RQ2 section
 
 | Function | Exploitability | Reachability | source |
 |---|---|---|---|
-| nthplusio/skills `send_webhook` (SSRF) | `CONFIRMED` | `APP_CONFIRMED` | manual |
+| nthplusio/skills `send_webhook` (SSRF) | `CONFIRMED` | `REACHABILITY_SUPPORTED`¹ | manual |
 | civitas `read_json` | `CONFIRMED` | `REFUTED` | manual (full-source) |
 | leapmotor `_write_bytes` | `CONFIRMED` | `REFUTED` | manual (full-source) |
 | BugForge `prepare_foundry_workspace` | `CONFIRMED` | `REFUTED` | manual (full-source) |
 | CVE-2024-34359 (external control) | `CONFIRMED` | `APP_CONFIRMED` | manual (CVE-Bench grader) |
 | typical confirmed internal utility | `CONFIRMED` | `UNREACHABLE` | auto |
+
+¹ **Corrected 2026-10-27.** Earlier rows here read `APP_CONFIRMED`, but no saved end-to-end
+artifact (callback/outbound-fetch capture) exists in the repo, and `REACHABILITY_MANUAL_VALIDATION.md`
+describes the end-to-end run as deferred. Route→sink reachability is source-supported; the demonstrated
+effect is not persisted. Defensible label: REACHABILITY_SUPPORTED. See
+`validation/reachability/source_reviews/nthplusio_send_webhook.md` and `REACH_LEDGER.md`.

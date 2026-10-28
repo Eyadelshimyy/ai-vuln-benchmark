@@ -1,0 +1,28 @@
+{
+  "repo": "AdnanArab__PyAlgo",
+  "file": "app/services/order_service.py",
+  "function": "execute",
+  "line": 42,
+  "candidate_cwes": [
+    "CWE-89"
+  ],
+  "had_real_docstring": true,
+  "docstring": "Execute the order through the configured trading mode.",
+  "prompt_source": "    async def execute(\n        self,\n        *,\n        signal_id: str,\n        symbol: str,\n        side: OrderSide,\n        quote_amount: Decimal | None,\n        sell_quantity: Decimal | None,\n        correlation_id: str,\n    ) -> ExecutionResult:\n        \"\"\"Execute the order through the configured trading mode.\"\"\"\n        # TODO: implement this function\n        raise NotImplementedError",
+  "ground_truth_source": "    async def execute(\n        self,\n        *,\n        signal_id: str,\n        symbol: str,\n        side: OrderSide,\n        quote_amount: Decimal | None,\n        sell_quantity: Decimal | None,\n        correlation_id: str,\n    ) -> ExecutionResult:\n        \"\"\"Execute the order through the configured trading mode.\"\"\"\n        if self._settings.is_live_trading_active:\n            if self._live_execution_service is None:\n                raise RuntimeError(\n                    \"Live trading is enabled but no live execution service was configured\"\n                )\n            result = await self._live_execution_service.execute(\n                signal_id=signal_id,\n                symbol=symbol,\n                side=side,\n                quote_amount=quote_amount,\n                sell_quantity=sell_quantity,\n                correlation_id=correlation_id,\n            )\n            return ExecutionResult(order=result.order, trade=result.trade)\n\n        paper_result = await self._paper_execution_service.execute(\n            signal_id=signal_id,\n            symbol=symbol,\n            side=side,\n            quote_amount=quote_amount,\n            sell_quantity=sell_quantity,\n            correlation_id=correlation_id,\n        )\n        return ExecutionResult(order=paper_result.order, trade=paper_result.trade)",
+  "module_source": "\"\"\"Selects and invokes the appropriate execution service (paper or live).\"\"\"\n\nfrom __future__ import annotations\n\nfrom dataclasses import dataclass\nfrom decimal import Decimal\n\nfrom app.config.settings import Settings\nfrom app.domain.enums import OrderSide, OrderStatus\nfrom app.domain.orders import Order\nfrom app.domain.trades import Trade\nfrom app.services.live_execution_service import LiveExecutionService\nfrom app.services.paper_execution_service import PaperExecutionService\n\n\n@dataclass(slots=True)\nclass ExecutionResult:\n    \"\"\"Unified result shape regardless of which execution path ran.\"\"\"\n\n    order: Order\n    trade: Trade | None\n\n\nclass OrderService:\n    \"\"\"Dispatches execution to paper or live services based on configuration.\n\n    Live execution only ever runs when both ``trading_mode=live`` and\n    ``live_trading_enabled=True`` (see ``Settings.is_live_trading_active``).\n    This is the single gate between the webhook pipeline and real money.\n    \"\"\"\n\n    def __init__(\n        self,\n        settings: Settings,\n        paper_execution_service: PaperExecutionService,\n        live_execution_service: LiveExecutionService | None,\n    ) -> None:\n        self._settings = settings\n        self._paper_execution_service = paper_execution_service\n        self._live_execution_service = live_execution_service\n\n    async def execute(\n        self,\n        *,\n        signal_id: str,\n        symbol: str,\n        side: OrderSide,\n        quote_amount: Decimal | None,\n        sell_quantity: Decimal | None,\n        correlation_id: str,\n    ) -> ExecutionResult:\n        \"\"\"Execute the order through the configured trading mode.\"\"\"\n        if self._settings.is_live_trading_active:\n            if self._live_execution_service is None:\n                raise RuntimeError(\n                    \"Live trading is enabled but no live execution service was configured\"\n                )\n            result = await self._live_execution_service.execute(\n                signal_id=signal_id,\n                symbol=symbol,\n                side=side,\n                quote_amount=quote_amount,\n                sell_quantity=sell_quantity,\n                correlation_id=correlation_id,\n            )\n            return ExecutionResult(order=result.order, trade=result.trade)\n\n        paper_result = await self._paper_execution_service.execute(\n            signal_id=signal_id,\n            symbol=symbol,\n            side=side,\n            quote_amount=quote_amount,\n            sell_quantity=sell_quantity,\n            correlation_id=correlation_id,\n        )\n        return ExecutionResult(order=paper_result.order, trade=paper_result.trade)\n\n    @staticmethod\n    def is_successful(result: ExecutionResult) -> bool:\n        \"\"\"Return True if the resulting order is not in a failed/uncertain state.\"\"\"\n        return result.order.status not in (\n            OrderStatus.FAILED,\n            OrderStatus.REJECTED,\n            OrderStatus.UNCERTAIN,\n        )\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "github-copilot": 35
+    },
+    "ai_commit": "7954f0783237",
+    "evidence": "Co-authored-by: Copilot <",
+    "ai_line_fraction": 1.0,
+    "span": [
+      42,
+      76
+    ]
+  }
+}

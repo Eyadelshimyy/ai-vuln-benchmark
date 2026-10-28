@@ -1,0 +1,28 @@
+{
+  "repo": "AdnanArab__PyAlgo",
+  "file": "scripts/send_test_webhook.py",
+  "function": "main",
+  "line": 38,
+  "candidate_cwes": [
+    "CWE-918"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `main` function.",
+  "prompt_source": "def main() -> int:\n    \"\"\"Implement the `main` function.\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def main() -> int:\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument(\"--base-url\", default=os.environ.get(\"BASE_URL\", \"http://localhost:8000\"))\n    parser.add_argument(\"--symbol\", default=\"BTC-USD\")\n    parser.add_argument(\"--action\", choices=[\"buy\", \"sell\"], default=\"buy\")\n    parser.add_argument(\"--quote-amount\", default=\"10\")\n    args = parser.parse_args()\n\n    secret = os.environ.get(\"WEBHOOK_SECRET\")\n    if not secret:\n        print(\"ERROR: set the WEBHOOK_SECRET environment variable before running.\", file=sys.stderr)\n        return 1\n\n    payload = build_payload(args.symbol, args.action, secret, args.quote_amount)\n    url = f\"{args.base_url.rstrip('/')}/api/v1/webhooks/tradingview\"\n\n    response = httpx.post(url, json=payload, timeout=10)\n\n    sanitized_payload = {k: v for k, v in payload.items() if k != \"secret\"}\n    print(f\"POST {url}\")\n    print(f\"Payload (secret redacted): {sanitized_payload}\")\n    print(f\"Status: {response.status_code}\")\n    print(f\"Response: {response.json()}\")\n    return 0 if response.status_code < 500 else 1",
+  "module_source": "\"\"\"Send a single valid TradingView-style webhook to a running instance.\n\nUsage:\n    python scripts/send_test_webhook.py --base-url http://localhost:8000 \\\n        --symbol BTC-USD --action buy\n\nReads the webhook secret from the WEBHOOK_SECRET environment variable (never\nfrom a command-line argument) so it never appears in shell history or\nprocess listings. The secret value itself is never printed.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport argparse\nimport os\nimport sys\nimport uuid\nfrom datetime import UTC, datetime\nfrom decimal import Decimal\n\nimport httpx\n\n\ndef build_payload(symbol: str, action: str, secret: str, quote_amount: str) -> dict[str, object]:\n    return {\n        \"signal_id\": str(uuid.uuid4()),\n        \"secret\": secret,\n        \"symbol\": symbol,\n        \"action\": action.upper(),\n        \"order_type\": \"MARKET\",\n        \"quote_amount\": str(Decimal(quote_amount)),\n        \"strategy\": \"manual-test\",\n        \"timeframe\": \"1h\",\n        \"timestamp\": datetime.now(UTC).isoformat(),\n    }\n\n\ndef main() -> int:\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument(\"--base-url\", default=os.environ.get(\"BASE_URL\", \"http://localhost:8000\"))\n    parser.add_argument(\"--symbol\", default=\"BTC-USD\")\n    parser.add_argument(\"--action\", choices=[\"buy\", \"sell\"], default=\"buy\")\n    parser.add_argument(\"--quote-amount\", default=\"10\")\n    args = parser.parse_args()\n\n    secret = os.environ.get(\"WEBHOOK_SECRET\")\n    if not secret:\n        print(\"ERROR: set the WEBHOOK_SECRET environment variable before running.\", file=sys.stderr)\n        return 1\n\n    payload = build_payload(args.symbol, args.action, secret, args.quote_amount)\n    url = f\"{args.base_url.rstrip('/')}/api/v1/webhooks/tradingview\"\n\n    response = httpx.post(url, json=payload, timeout=10)\n\n    sanitized_payload = {k: v for k, v in payload.items() if k != \"secret\"}\n    print(f\"POST {url}\")\n    print(f\"Payload (secret redacted): {sanitized_payload}\")\n    print(f\"Status: {response.status_code}\")\n    print(f\"Response: {response.json()}\")\n    return 0 if response.status_code < 500 else 1\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "github-copilot": 24
+    },
+    "ai_commit": "7954f0783237",
+    "evidence": "Co-authored-by: Copilot <",
+    "ai_line_fraction": 1.0,
+    "span": [
+      38,
+      61
+    ]
+  }
+}

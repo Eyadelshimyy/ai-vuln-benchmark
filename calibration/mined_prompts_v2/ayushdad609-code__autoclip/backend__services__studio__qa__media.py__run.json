@@ -1,0 +1,28 @@
+{
+  "repo": "ayushdad609-code__autoclip",
+  "file": "backend/services/studio/qa/media.py",
+  "function": "run",
+  "line": 16,
+  "candidate_cwes": [
+    "CWE-78"
+  ],
+  "had_real_docstring": false,
+  "docstring": "Implement the `run` function (parameters: cmd, timeout).",
+  "prompt_source": "def run(cmd: list[str], timeout: float, *, text: bool = False):\n    \"\"\"Implement the `run` function (parameters: cmd, timeout).\"\"\"\n    # TODO: implement this function\n    raise NotImplementedError",
+  "ground_truth_source": "def run(cmd: list[str], timeout: float, *, text: bool = False):\n    try:\n        return subprocess.run(\n            cmd, capture_output=True, timeout=max(0.05, timeout), check=False, text=text,\n        )\n    except subprocess.TimeoutExpired:\n        raise ProbeError('timeout') from None\n    except OSError:\n        raise ProbeError('unreadable') from None",
+  "module_source": "\"\"\"Bounded ffmpeg helpers. Failures stay inside the checker; paths never leave it.\"\"\"\nfrom __future__ import annotations\n\nimport json\nimport subprocess\n\n\nclass ProbeError(Exception):\n    \"\"\"A measurement could not be read. `reason` is a skip bucket, not a path.\"\"\"\n\n    def __init__(self, reason: str):\n        super().__init__(reason)\n        self.reason = reason\n\n\ndef run(cmd: list[str], timeout: float, *, text: bool = False):\n    try:\n        return subprocess.run(\n            cmd, capture_output=True, timeout=max(0.05, timeout), check=False, text=text,\n        )\n    except subprocess.TimeoutExpired:\n        raise ProbeError('timeout') from None\n    except OSError:\n        raise ProbeError('unreadable') from None\n\n\ndef probe_json(path, timeout: float) -> dict:\n    from backend.utils.ffmpeg_utils import get_ffprobe_path\n    proc = run([\n        get_ffprobe_path(), '-v', 'error', '-show_entries', 'stream=codec_type,start_time',\n        '-of', 'json', str(path),\n    ], timeout, text=True)\n    if proc.returncode != 0 or not proc.stdout:\n        raise ProbeError('unreadable')\n    try:\n        data = json.loads(proc.stdout)\n    except json.JSONDecodeError as error:\n        raise ProbeError('unreadable') from error\n    if not isinstance(data, dict):\n        raise ProbeError('unreadable')\n    return data\n",
+  "construction_recipe": null,
+  "ai_provenance": {
+    "ai_attributed": true,
+    "ai_tools": {
+      "cursor": 9
+    },
+    "ai_commit": "1affde4ca162",
+    "evidence": "author/committer='Cursor Agent <cursoragent@cursor.com>'",
+    "ai_line_fraction": 1.0,
+    "span": [
+      16,
+      24
+    ]
+  }
+}
